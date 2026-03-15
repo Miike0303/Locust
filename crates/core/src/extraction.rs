@@ -1,9 +1,15 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use walkdir::WalkDir;
 
+use crate::backup::BackupManager;
+use crate::database::Database;
 use crate::error::{LocustError, Result};
-use crate::models::{OutputMode, StringEntry};
+use crate::models::{OutputMode, ProgressEvent, StringEntry};
 
 pub trait FormatPlugin: Send + Sync {
     fn id(&self) -> &str;
@@ -112,6 +118,233 @@ pub struct PluginInfo {
     pub description: String,
     pub extensions: Vec<String>,
     pub supported_modes: Vec<OutputMode>,
+}
+
+// ─── Multi-language injection pipeline ──────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct MultiLangReport {
+    pub mode: OutputMode,
+    pub languages_processed: Vec<String>,
+    pub languages_failed: Vec<(String, String)>,
+    pub backup_id: String,
+    pub reports: HashMap<String, InjectionReport>,
+}
+
+pub struct MultiLangInjector {
+    pub registry: Arc<FormatRegistry>,
+    pub db: Arc<Database>,
+    pub backup_manager: Arc<BackupManager>,
+}
+
+impl MultiLangInjector {
+    pub fn new(
+        registry: Arc<FormatRegistry>,
+        db: Arc<Database>,
+        backup_manager: Arc<BackupManager>,
+    ) -> Self {
+        Self {
+            registry,
+            db,
+            backup_manager,
+        }
+    }
+
+    pub async fn inject(
+        &self,
+        project_path: &Path,
+        format_id: &str,
+        mode: OutputMode,
+        languages: Vec<String>,
+        output_dir: Option<PathBuf>,
+        tx: mpsc::Sender<ProgressEvent>,
+    ) -> Result<MultiLangReport> {
+        // Create backup
+        let backup = self.backup_manager.create_backup(project_path)?;
+        let backup_id = backup.id.clone();
+
+        let plugin = self.registry.get(format_id).ok_or_else(|| {
+            LocustError::UnsupportedFormat(format!("format not found: {}", format_id))
+        })?;
+
+        match mode {
+            OutputMode::Replace => {
+                self.inject_replace(
+                    project_path,
+                    plugin,
+                    languages,
+                    output_dir.ok_or_else(|| {
+                        LocustError::InjectionError(
+                            "output_dir is required for Replace mode".to_string(),
+                        )
+                    })?,
+                    backup_id,
+                    tx,
+                )
+                .await
+            }
+            OutputMode::Add => {
+                self.inject_add(project_path, plugin, languages, backup_id, tx)
+                    .await
+            }
+        }
+    }
+
+    async fn inject_replace(
+        &self,
+        project_path: &Path,
+        plugin: &dyn FormatPlugin,
+        languages: Vec<String>,
+        output_dir: PathBuf,
+        backup_id: String,
+        tx: mpsc::Sender<ProgressEvent>,
+    ) -> Result<MultiLangReport> {
+        let total = languages.len();
+        let mut languages_processed = Vec::new();
+        let mut languages_failed = Vec::new();
+        let mut reports = HashMap::new();
+
+        let game_name = project_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        for (idx, lang) in languages.iter().enumerate() {
+            let dest = output_dir.join(format!("{}-{}", game_name, lang));
+
+            // Copy project to dest
+            if let Err(e) = copy_dir_for_inject(project_path, &dest) {
+                languages_failed.push((lang.clone(), e.to_string()));
+                continue;
+            }
+
+            // Load entries from db with tag filter for this language
+            let entries = self
+                .db
+                .get_entries(&crate::database::EntryFilter::default())?;
+
+            match plugin.inject(&dest, &entries) {
+                Ok(report) => {
+                    reports.insert(lang.clone(), report);
+                    languages_processed.push(lang.clone());
+                }
+                Err(e) => {
+                    languages_failed.push((lang.clone(), e.to_string()));
+                }
+            }
+
+            let _ = tx
+                .send(ProgressEvent::BatchCompleted {
+                    completed: idx + 1,
+                    total,
+                    cost_so_far: 0.0,
+                    language: Some(lang.clone()),
+                })
+                .await;
+        }
+
+        Ok(MultiLangReport {
+            mode: OutputMode::Replace,
+            languages_processed,
+            languages_failed,
+            backup_id,
+            reports,
+        })
+    }
+
+    async fn inject_add(
+        &self,
+        project_path: &Path,
+        plugin: &dyn FormatPlugin,
+        languages: Vec<String>,
+        backup_id: String,
+        tx: mpsc::Sender<ProgressEvent>,
+    ) -> Result<MultiLangReport> {
+        let total = languages.len();
+        let mut languages_processed = Vec::new();
+        let mut languages_failed = Vec::new();
+        let mut reports = HashMap::new();
+
+        for (idx, lang) in languages.iter().enumerate() {
+            let entries = self
+                .db
+                .get_entries(&crate::database::EntryFilter::default())?;
+
+            match plugin.inject_add(project_path, lang, &entries) {
+                Ok(report) => {
+                    reports.insert(lang.clone(), report);
+                    languages_processed.push(lang.clone());
+                }
+                Err(e) => {
+                    languages_failed.push((lang.clone(), e.to_string()));
+                }
+            }
+
+            let _ = tx
+                .send(ProgressEvent::BatchCompleted {
+                    completed: idx + 1,
+                    total,
+                    cost_so_far: 0.0,
+                    language: Some(lang.clone()),
+                })
+                .await;
+        }
+
+        Ok(MultiLangReport {
+            mode: OutputMode::Add,
+            languages_processed,
+            languages_failed,
+            backup_id,
+            reports,
+        })
+    }
+}
+
+fn copy_dir_for_inject(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+
+    let media_extensions = ["png", "ogg", "wav", "m4a", "mp4", "jpg", "jpeg", "bmp", "mp3"];
+
+    for entry in WalkDir::new(src).follow_links(false) {
+        let entry = entry.map_err(|e| LocustError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let rel = entry.path().strip_prefix(src).map_err(|e| {
+            LocustError::InjectionError(e.to_string())
+        })?;
+        let dest = dst.join(rel);
+
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&dest)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let is_media = entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| media_extensions.contains(&e.to_lowercase().as_str()))
+                .unwrap_or(false);
+
+            if is_media {
+                #[cfg(unix)]
+                {
+                    if std::fs::hard_link(entry.path(), &dest).is_err() {
+                        std::fs::copy(entry.path(), &dest)?;
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::copy(entry.path(), &dest)?;
+                }
+            } else {
+                std::fs::copy(entry.path(), &dest)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -329,5 +562,310 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("locust_test_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ─── MultiLangInjector tests ────────────────────────────
+
+    use crate::backup::BackupManager;
+    use crate::database::Database;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn make_game_dir() -> PathBuf {
+        let dir = tempdir().join("mygame");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("game.mock"), "").unwrap();
+        fs::write(dir.join("image.png"), "fake png data").unwrap();
+        dir
+    }
+
+    fn setup_injector() -> (MultiLangInjector, PathBuf, PathBuf) {
+        let game_dir = make_game_dir();
+        let backup_root = tempdir().join("backups");
+        let output_dir = tempdir().join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let backup = Arc::new(BackupManager::new(backup_root.clone()));
+
+        // Save some entries with translations
+        let mut entries = vec![
+            StringEntry::new("mock#0", "Hello", PathBuf::from("game.mock")),
+            StringEntry::new("mock#1", "World", PathBuf::from("game.mock")),
+            StringEntry::new("mock#2", "Test", PathBuf::from("game.mock")),
+        ];
+        for e in &mut entries {
+            e.translation = Some(format!("[translated] {}", e.source));
+        }
+        db.save_entries(&entries).unwrap();
+
+        let mut registry = FormatRegistry::new();
+        registry.register(Box::new(MockFormatPlugin));
+
+        let injector = MultiLangInjector::new(Arc::new(registry), db, backup);
+        (injector, game_dir, output_dir)
+    }
+
+    #[tokio::test]
+    async fn test_replace_single_language() {
+        let (injector, game_dir, output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let report = injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Replace,
+                vec!["es".to_string()],
+                Some(output_dir.clone()),
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(report.languages_processed, vec!["es"]);
+        let dest = output_dir.join("mygame-es");
+        assert!(dest.exists());
+        assert!(dest.join("game.mock").exists());
+    }
+
+    #[tokio::test]
+    async fn test_replace_multi_language() {
+        let (injector, game_dir, output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let report = injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Replace,
+                vec!["es".to_string(), "fr".to_string(), "de".to_string()],
+                Some(output_dir.clone()),
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(report.languages_processed.len(), 3);
+        assert!(output_dir.join("mygame-es").exists());
+        assert!(output_dir.join("mygame-fr").exists());
+        assert!(output_dir.join("mygame-de").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_replace_copies_on_windows() {
+        let (injector, game_dir, output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let report = injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Replace,
+                vec!["es".to_string()],
+                Some(output_dir.clone()),
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(report.languages_processed.len(), 1);
+        let png = output_dir.join("mygame-es").join("image.png");
+        assert!(png.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_replace_uses_hardlinks_on_unix() {
+        let (injector, game_dir, output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+
+        injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Replace,
+                vec!["es".to_string()],
+                Some(output_dir.clone()),
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        let png = output_dir.join("mygame-es").join("image.png");
+        let meta = fs::metadata(&png).unwrap();
+        assert!(meta.nlink() > 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_single_language() {
+        let (injector, game_dir, _output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let report = injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Add,
+                vec!["fr".to_string()],
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(report.languages_processed, vec!["fr"]);
+        assert!(game_dir.join("tl").join("fr").exists());
+    }
+
+    #[tokio::test]
+    async fn test_add_multi_language() {
+        let (injector, game_dir, _output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let report = injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Add,
+                vec!["fr".to_string(), "de".to_string()],
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(report.languages_processed.len(), 2);
+        assert!(game_dir.join("tl").join("fr").exists());
+        assert!(game_dir.join("tl").join("de").exists());
+    }
+
+    #[tokio::test]
+    async fn test_backup_created_before_inject() {
+        let (injector, game_dir, output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+
+        injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Replace,
+                vec!["es".to_string()],
+                Some(output_dir),
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        let backups = injector.backup_manager.list_backups().unwrap();
+        assert!(!backups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_failed_language_continues() {
+        // Use a plugin that fails for one specific call
+        let game_dir = make_game_dir();
+        let backup_root = tempdir().join("backups");
+
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let backup = Arc::new(BackupManager::new(backup_root));
+
+        let entries = vec![StringEntry::new("mock#0", "Hello", PathBuf::from("game.mock"))];
+        db.save_entries(&entries).unwrap();
+
+        // Register a plugin where inject_add fails for "bad" lang
+        struct FailOnBadLang;
+        impl FormatPlugin for FailOnBadLang {
+            fn id(&self) -> &str { "failmock" }
+            fn name(&self) -> &str { "Fail Mock" }
+            fn supported_extensions(&self) -> &[&str] { &[".mock"] }
+            fn supported_modes(&self) -> Vec<OutputMode> { vec![OutputMode::Add] }
+            fn extract(&self, _: &Path) -> Result<Vec<StringEntry>> { Ok(vec![]) }
+            fn inject(&self, _: &Path, _: &[StringEntry]) -> Result<InjectionReport> {
+                Ok(InjectionReport { files_modified: 0, strings_written: 0, strings_skipped: 0, warnings: vec![] })
+            }
+            fn inject_add(&self, _path: &Path, lang: &str, _entries: &[StringEntry]) -> Result<InjectionReport> {
+                if lang == "bad" {
+                    return Err(LocustError::InjectionError("bad language".to_string()));
+                }
+                fs::create_dir_all(_path.join("tl").join(lang))?;
+                Ok(InjectionReport { files_modified: 1, strings_written: 1, strings_skipped: 0, warnings: vec![] })
+            }
+        }
+
+        let mut registry = FormatRegistry::new();
+        registry.register(Box::new(FailOnBadLang));
+        let injector = MultiLangInjector::new(Arc::new(registry), db, backup);
+
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let report = injector
+            .inject(
+                &game_dir,
+                "failmock",
+                OutputMode::Add,
+                vec!["good".to_string(), "bad".to_string(), "also_good".to_string()],
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(report.languages_processed.len(), 2);
+        assert_eq!(report.languages_failed.len(), 1);
+        assert_eq!(report.languages_failed[0].0, "bad");
+    }
+
+    #[tokio::test]
+    async fn test_multilang_report_structure() {
+        let (injector, game_dir, output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let report = injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Replace,
+                vec!["es".to_string(), "fr".to_string()],
+                Some(output_dir),
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(report.mode, OutputMode::Replace);
+        assert_eq!(report.languages_processed.len(), 2);
+        assert!(report.languages_failed.is_empty());
+        assert!(!report.backup_id.is_empty());
+        assert!(report.reports.contains_key("es"));
+        assert!(report.reports.contains_key("fr"));
     }
 }

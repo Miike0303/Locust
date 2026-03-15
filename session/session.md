@@ -111,3 +111,13 @@
 - All extracted entries tagged with `extraction_method: "heuristic"` metadata
 - Fixture built programmatically with embedded Shift-JIS strings
 - Verified: `cargo test -p locust-formats -- wolf_rpg` — 8/8 passed
+
+### Prompt #14 — Multi-Language Injection Pipeline
+- Implemented `MultiLangInjector` in extraction.rs with Replace and Add mode injection
+- Replace mode: backup → copy project per language (hardlinks for media on Unix) → inject
+- Add mode: backup → sequential inject_add per language
+- `MultiLangReport` with processed/failed languages, backup_id, per-language reports
+- Implemented server with `/api/formats`, `/api/formats/:id/modes`, `/api/inject` endpoints
+- `copy_dir_for_inject` with platform-aware hardlink support
+- Verified: `cargo test -p locust-core -- extraction` — 18/18 passed
+- Verified: `cargo test -p locust-server` — 1/1 passed
