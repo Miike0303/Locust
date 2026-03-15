@@ -94,3 +94,12 @@
 - inject_add returns UnsupportedFormat (VXA doesn't support Add mode)
 - Registered in default_registry()
 - Verified: `cargo test -p locust-formats -- rpgmaker_vxa` — 8/8 passed
+
+### Prompt #12 — Ren'Py Plugin
+- Implemented `RenPyPlugin` for .rpy visual novel scripts
+- Extraction: say statements, menu choices, define strings, _() i18n calls
+- Inject Replace: in-place string replacement preserving formatting
+- Inject Add: Ren'Py native game/tl/{lang}/ translation files
+- Entry IDs use filename#line_number format
+- Fixture files: script.rpy and gui.rpy
+- Verified: `cargo test -p locust-formats -- renpy` — 11/11 passed
