@@ -81,17 +81,13 @@ impl Validator {
             .collect()
     }
 
-    pub fn validate_and_save(
+    pub async fn validate_and_save(
         entries: &[StringEntry],
         db: &Database,
     ) -> Result<ValidationReport> {
         let issues = Self::validate_all(entries);
 
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| crate::error::LocustError::Other(e.into()))?;
-        rt.block_on(async {
-            db.save_validation_issues(&issues).await
-        })?;
+        db.save_validation_issues(&issues).await?;
 
         let mut entries_with_issues = std::collections::HashSet::new();
         let mut by_kind: HashMap<String, usize> = HashMap::new();
@@ -198,8 +194,8 @@ mod tests {
         assert_eq!(issues.len(), 3);
     }
 
-    #[test]
-    fn test_validation_report_counts() {
+    #[tokio::test]
+    async fn test_validation_report_counts() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let entries = vec![
             make_entry("e1", "Hello", Some("")),
@@ -207,7 +203,7 @@ mod tests {
         ];
         db.save_entries(&entries).unwrap();
 
-        let report = Validator::validate_and_save(&entries, &db).unwrap();
+        let report = Validator::validate_and_save(&entries, &db).await.unwrap();
 
         assert_eq!(report.total_checked, 2);
         assert_eq!(report.issues_found, 1);

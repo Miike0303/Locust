@@ -465,7 +465,7 @@ async fn validate(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let entries = state.db.get_entries(&EntryFilter::default()).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let validation = Validator::validate_and_save(&entries, &state.db).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let validation = Validator::validate_and_save(&entries, &state.db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let proj = state.current_project.read().await;
     let fonts: Vec<FontCoverageReport> = if let Some(ref p) = *proj {
