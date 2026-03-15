@@ -26,6 +26,12 @@ chardet = "0.2"
 ttf-parser = "0.21"
 quick-xml = { version = "0.36", features = ["serialize"] }
 
+wasmtime = { version = "25", optional = true }
+
 [dependencies.tokio-util]
 version = "0.7"
 features = ["rt"]
+
+[features]
+default = []
+wasm-plugins = ["wasmtime"]

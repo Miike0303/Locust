@@ -53,7 +53,7 @@ pub trait FormatPlugin: Send + Sync {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InjectionReport {
     pub files_modified: usize,
     pub strings_written: usize,

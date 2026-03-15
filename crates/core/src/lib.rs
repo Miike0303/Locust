@@ -12,5 +12,6 @@ pub mod validation;
 pub mod backup;
 pub mod font_validation;
 pub mod export;
+pub mod wasm_plugin;
 
 pub use error::{LocustError, Result};

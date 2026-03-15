@@ -178,3 +178,14 @@
 - Integration tests with assert_cmd: help, version, formats, providers, extract errors, glossary
 - Verified: `cargo test -p locust-cli` — 8/8 passed (1 unit + 7 integration)
 - Verified: `cargo build --release -p locust-cli` — success
+
+### Prompt #22 — WASM Plugin System
+- Implemented `wasm_plugin.rs` with `WasmPlugin` struct backed by wasmtime
+- Plugin interface: locust_plugin_metadata, locust_extract, locust_inject, locust_alloc, locust_free
+- Host provides locust_log import for tracing
+- `load_wasm_plugin` and `scan_plugin_dir` for dynamic plugin discovery
+- Feature-gated behind `wasm-plugins` feature (optional wasmtime dependency)
+- Example WASM plugin skeleton in docs/plugin-example/ (txt line extractor)
+- Plugin development guide in docs/plugin-example/plugin.md
+- Verified: `cargo test -p locust-core -- wasm` — 4/4 passed (1 ignored, requires wasm32-wasi)
+- Verified: `cargo check -p locust-core --features wasm-plugins` — compiles
