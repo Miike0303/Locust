@@ -1,0 +1,18 @@
+[package]
+name = "locust-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "locust"
+path = "src/main.rs"
+
+[dependencies]
+locust-core = { path = "../core" }
+locust-server = { path = "../server" }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
