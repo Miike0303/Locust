@@ -8,5 +8,6 @@ use locust_core::extraction::FormatRegistry;
 pub fn default_registry() -> FormatRegistry {
     let mut r = FormatRegistry::new();
     r.register(Box::new(rpgmaker_mv::RpgMakerMvPlugin::new()));
+    r.register(Box::new(rpgmaker_vxa::RpgMakerVxaPlugin::new()));
     r
 }

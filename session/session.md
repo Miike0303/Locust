@@ -86,3 +86,11 @@
 - Created fixture JSON files for Actors, System, Map001
 - Stub modules: rpgmaker_vxa, renpy, wolf_rpg
 - Verified: `cargo test -p locust-formats -- rpgmaker_mv` — 15/15 passed
+
+### Prompt #11 — RPG Maker VX Ace Plugin (Ruby Marshal)
+- Implemented Ruby Marshal parser/writer (MarshalValue enum) supporting nil, bool, int, string, symbol, array, hash, object, user-defined, IVAR wrapper
+- RpgMakerVxaPlugin: detect Data/*.rvdata2, extract actor fields, map events, common events
+- Inject Replace mode: parse, modify strings, serialize back to valid Marshal binary
+- inject_add returns UnsupportedFormat (VXA doesn't support Add mode)
+- Registered in default_registry()
+- Verified: `cargo test -p locust-formats -- rpgmaker_vxa` — 8/8 passed
