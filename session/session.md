@@ -138,3 +138,10 @@
 - Stub modules: openai, claude, ollama
 - Verified: `cargo test -p locust-providers -- argos` — 5/5 passed
 - Verified: `cargo test -p locust-providers -- deepl` — 6/6 passed
+
+### Prompt #17 — OpenAI & Claude Providers
+- Implemented `OpenAiProvider`: chat completions API, JSON array response parsing, lenient parse for markdown-wrapped responses, token-based cost estimation
+- Implemented `ClaudeProvider`: Anthropic messages API, x-api-key + anthropic-version headers, haiku pricing
+- Both use shared system prompt with game context and glossary hints
+- Verified: `cargo test -p locust-providers -- openai` — 7/7 passed
+- Verified: `cargo test -p locust-providers -- claude` — 4/4 passed
