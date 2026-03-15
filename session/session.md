@@ -67,3 +67,12 @@
 - Added encoding_rs and chardet dependencies
 - Verified: `cargo test -p locust-core -- encoding` — 6/6 passed
 - Verified: `cargo test -p locust-core -- placeholder` — 10/10 passed
+
+### Prompt #9 — Backup & Validation Modules
+- Implemented `backup.rs`: `BackupManager` with create, restore, list, delete, delete_old_backups
+- Recursive file copy with walkdir, manifest.json per backup, sorted listing
+- Implemented `validation.rs`: `Validator` with validate_entry, validate_all, validate_and_save
+- Checks: EmptyTranslation, IdenticalToSource, ExceedsCharLimit, placeholder mismatches
+- `ValidationReport` with counts by kind
+- Verified: `cargo test -p locust-core -- backup` — 6/6 passed
+- Verified: `cargo test -p locust-core -- validation` — 7/7 passed
