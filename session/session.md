@@ -45,3 +45,9 @@
 - Implemented `Glossary` struct in glossary.rs (build_hint, add/get/delete entries)
 - Added tokio-util dependency for CancellationToken
 - Verified: `cargo test -p locust-core -- translation` — 9/9 passed
+
+### Prompt #6 — Glossary Module
+- Rewrote `glossary.rs` with `add`, `get_all`, `delete`, `build_hint(source_lang, target_lang)`
+- `build_hint` formats up to 50 entries as "term → translation" with header
+- Updated `translation.rs` to use new `build_hint` signature and format
+- Verified: `cargo test -p locust-core -- glossary` — 7/7 passed

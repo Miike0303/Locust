@@ -139,7 +139,7 @@ impl TranslationManager {
 
         // 4. Build glossary hint
         let glossary_hint = if opts.use_glossary {
-            self.glossary.build_hint(&lang_pair).unwrap_or(None)
+            self.glossary.build_hint(&opts.source_lang, &opts.target_lang)
         } else {
             None
         };
@@ -787,6 +787,6 @@ mod tests {
         assert!(contexts[0].as_ref().unwrap().contains("battle screen"));
 
         let hints = provider_ref.glossary_hints.lock().unwrap();
-        assert!(hints[0].as_ref().unwrap().contains("HP = Health Points"));
+        assert!(hints[0].as_ref().unwrap().contains("HP → Health Points"));
     }
 }
