@@ -20,3 +20,11 @@
 - Created stub modules: extraction, translation, project, database, glossary, config, encoding, placeholder, validation, backup
 - Updated `lib.rs` to `pub mod` all 12 modules and re-export `LocustError` + `Result`
 - Verified: `cargo test -p locust-core -- models` — 9/9 passed
+
+### Prompt #3 — Database Module
+- Implemented `database.rs` with `Database` struct using `Mutex<Connection>`
+- Schema: 4 tables (strings, glossary, translation_memory, validation_issues) with WAL mode
+- Structs: `EntryFilter`, `ProjectStats`, `GlossaryEntry`
+- 17 methods: CRUD for entries, translation memory, glossary, validation issues, stats
+- Async methods use `tokio::task::spawn_blocking`
+- Verified: `cargo test -p locust-core -- database` — 14/14 passed
