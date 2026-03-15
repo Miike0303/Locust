@@ -145,3 +145,11 @@
 - Both use shared system prompt with game context and glossary hints
 - Verified: `cargo test -p locust-providers -- openai` — 7/7 passed
 - Verified: `cargo test -p locust-providers -- claude` — 4/4 passed
+
+### Prompt #18 — Ollama Provider + Retry & Rate Limiting
+- Implemented `OllamaProvider`: local LLM via /api/chat, health check with model detection
+- Implemented `retry.rs`: `with_retry` with exponential backoff for retryable errors (429, 503, 502, timeout)
+- `RateLimiter` with requests-per-minute windowed throttling
+- `is_retryable` checks for rate limit, server errors, timeouts, IO errors
+- Updated `default_registry()` to register OpenAI, Claude, and Ollama
+- Verified: `cargo test -p locust-providers` — 32/32 passed

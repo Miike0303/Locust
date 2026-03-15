@@ -4,6 +4,7 @@ pub mod openai;
 pub mod claude;
 pub mod ollama;
 pub mod mock;
+pub mod retry;
 
 use std::sync::Arc;
 
@@ -32,6 +33,38 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
                 pc.free_tier,
             )));
         }
+    }
+
+    // Register OpenAI if API key is configured
+    if let Some(pc) = config.get_provider_config("openai") {
+        if let Some(ref api_key) = pc.api_key {
+            reg.register(Arc::new(openai::OpenAiProvider::new(
+                api_key.clone(),
+                pc.model.clone(),
+                pc.base_url.clone(),
+            )));
+        }
+    }
+
+    // Register Claude if API key is configured
+    if let Some(pc) = config.get_provider_config("claude") {
+        if let Some(ref api_key) = pc.api_key {
+            reg.register(Arc::new(claude::ClaudeProvider::new(
+                api_key.clone(),
+                pc.model.clone(),
+                pc.base_url.clone(),
+            )));
+        }
+    }
+
+    // Register Ollama if configured or use defaults
+    if let Some(pc) = config.get_provider_config("ollama") {
+        reg.register(Arc::new(ollama::OllamaProvider::new(
+            pc.base_url.clone(),
+            pc.model.clone(),
+        )));
+    } else {
+        reg.register(Arc::new(ollama::OllamaProvider::default()));
     }
 
     reg
