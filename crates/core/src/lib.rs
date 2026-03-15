@@ -10,5 +10,6 @@ pub mod encoding;
 pub mod placeholder;
 pub mod validation;
 pub mod backup;
+pub mod font_validation;
 
 pub use error::{LocustError, Result};

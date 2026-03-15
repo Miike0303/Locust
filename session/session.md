@@ -121,3 +121,11 @@
 - `copy_dir_for_inject` with platform-aware hardlink support
 - Verified: `cargo test -p locust-core -- extraction` — 18/18 passed
 - Verified: `cargo test -p locust-server` — 1/1 passed
+
+### Prompt #15 — Font Validation Module
+- Implemented `FontValidator` with check_coverage, find_game_fonts, check_game_fonts
+- `FontCoverageReport` with missing chars, coverage percent, full coverage flag
+- `suggest_replacement_font` for Latin Extended, CJK, Cyrillic, Arabic, etc.
+- Minimal TTF font builder for testing (ASCII 0x20-0x7E coverage)
+- Added ttf-parser dependency, pub mod font_validation in lib.rs
+- Verified: `cargo test -p locust-core -- font_validation` — 7/7 passed
