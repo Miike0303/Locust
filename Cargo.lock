@@ -904,6 +904,7 @@ dependencies = [
  "chrono",
  "dirs",
  "hex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
