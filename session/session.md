@@ -198,3 +198,12 @@
 - Welcome page with open folder, recent projects, supported formats grid
 - Editor and Settings placeholder pages
 - Verified: `npm run build` (tsc + vite) — success, dist/ produced
+
+### Prompt #24 — String Editor Page & Components
+- Zustand stores: projectStore (project/stats) and editorStore (filter/selection/job)
+- `StringTable`: TanStack Table v8 with sorting, inline editable translation cells, status badges, file/tag display
+- `FilterBar`: status pill buttons, debounced search, clear filters, showing X of Y count
+- `DetailPanel`: full source/translation view, status buttons, char limit warning, collapsible metadata
+- `TranslationModal`: 2-step (configure → progress), provider selector, WS progress updates, cost tracking
+- `Editor` page: top bar with stats, translate/inject/validate/export buttons, filter+table+detail layout
+- Verified: tsc --noEmit + vite build — success
