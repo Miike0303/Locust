@@ -12,3 +12,6 @@ serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true
+tracing.workspace = true
+encoding_rs = "0.8"
+uuid.workspace = true

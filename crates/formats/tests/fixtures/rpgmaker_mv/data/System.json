@@ -1,0 +1,1 @@
+{"gameTitle":"My RPG Game","terms":{"basic":["Max HP","Max MP","Attack"],"commands":["Fight","Escape"],"params":["Max HP","Max MP"],"messages":{"actionFailure":"Miss!","actorDamage":"%1 took %2 damage!"}}}

@@ -76,3 +76,13 @@
 - `ValidationReport` with counts by kind
 - Verified: `cargo test -p locust-core -- backup` — 6/6 passed
 - Verified: `cargo test -p locust-core -- validation` — 7/7 passed
+
+### Prompt #10 — RPG Maker MV/MZ Format Plugin
+- Implemented `crates/formats` with `RpgMakerMvPlugin` (FormatPlugin trait)
+- Detection: data dir with Actors.json/System.json/Map001.json, MV vs MZ version detection
+- Extraction: Actors, System (gameTitle, terms), Maps (code 401 dialogue, 102 choices), CommonEvents
+- Injection Replace: modify JSON in-place preserving structure
+- Injection Add: MZ Languages/{lang}.json or MV www/data/i18n/{lang}.json (Iavra format)
+- Created fixture JSON files for Actors, System, Map001
+- Stub modules: rpgmaker_vxa, renpy, wolf_rpg
+- Verified: `cargo test -p locust-formats -- rpgmaker_mv` — 15/15 passed

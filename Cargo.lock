@@ -942,10 +942,13 @@ name = "locust-formats"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "encoding_rs",
  "locust-core",
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
+ "uuid",
  "walkdir",
 ]
 

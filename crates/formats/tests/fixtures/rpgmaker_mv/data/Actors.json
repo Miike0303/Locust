@@ -1,0 +1,3 @@
+[null,
+ {"id":1,"name":"Hero","description":"The protagonist","profile":"A brave hero.","note":"","battlerName":"Actor1","characterIndex":0,"characterName":"Actor1","classId":1,"equips":[0,0,0,0,0],"faceIndex":0,"faceName":"Actor1","initialLevel":1,"maxLevel":99,"nickname":"The Brave","traits":[]},
+ {"id":2,"name":"Mage","description":"A powerful mage","profile":"","note":"","battlerName":"Actor2","characterIndex":1,"characterName":"Actor2","classId":2,"equips":[0,0,0,0,0],"faceIndex":1,"faceName":"Actor2","initialLevel":1,"maxLevel":99,"nickname":"The Wise","traits":[]}]
