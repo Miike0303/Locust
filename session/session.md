@@ -51,3 +51,10 @@
 - `build_hint` formats up to 50 entries as "term → translation" with header
 - Updated `translation.rs` to use new `build_hint` signature and format
 - Verified: `cargo test -p locust-core -- glossary` — 7/7 passed
+
+### Prompt #7 — Config Module
+- Implemented `AppConfig` with providers, UI settings, recent projects, load/save JSON
+- `ProviderConfig`, `UiConfig`, `RecentProject` structs with serde defaults
+- Platform-specific `config_dir()` (Windows/macOS/Linux)
+- `add_recent_project` with dedup and max 10
+- Verified: `cargo test -p locust-core -- config` — 10/10 passed
