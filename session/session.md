@@ -36,3 +36,12 @@
 - `PluginInfo` struct for serializable plugin metadata
 - MockFormatPlugin and MockFormatPlugin2 for testing
 - Verified: `cargo test -p locust-core -- extraction` — 10/10 passed
+
+### Prompt #5 — Translation Module
+- Implemented `TranslationProvider` trait (async_trait) with translate, estimate_cost, health_check
+- `TranslationOptions` with defaults (ja→en, batch_size=40, cost_limit, glossary, memory)
+- `TranslationManager` orchestrating batched translation with memory cache, glossary hints, cost limits, cancellation
+- `ProviderRegistry` for provider management
+- Implemented `Glossary` struct in glossary.rs (build_hint, add/get/delete entries)
+- Added tokio-util dependency for CancellationToken
+- Verified: `cargo test -p locust-core -- translation` — 9/9 passed

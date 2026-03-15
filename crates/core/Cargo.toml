@@ -17,3 +17,9 @@ hex.workspace = true
 dirs.workspace = true
 rusqlite.workspace = true
 tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dependencies.tokio-util]
+version = "0.7"
+features = ["rt"]

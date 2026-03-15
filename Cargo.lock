@@ -901,6 +901,7 @@ name = "locust-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "dirs",
  "hex",
@@ -910,6 +911,8 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -1772,6 +1775,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
