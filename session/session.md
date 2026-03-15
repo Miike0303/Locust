@@ -215,3 +215,12 @@
 - `SearchReplace` modal: batch search/replace across translations with preview
 - Added /review route, updated App.tsx
 - Verified: tsc --noEmit + vite build — success
+
+### Prompt #26 — Auto-update, Crash Reporting, Packaging, Release Workflow, Final Verification
+- Tauri config: updater with endpoints, window sizing, bundle config for macOS/Windows/Linux
+- human-panic for crash reporting in release builds
+- Update server spec in docs/update-server.md
+- GitHub Actions release workflow: build on 3 platforms, create GitHub Release with artifacts
+- Placeholder SVG icon for app branding
+- **Full workspace verification: `cargo test --workspace` — 214 tests passed, 0 failures**
+- Frontend build verified: tsc + vite build succeeds
