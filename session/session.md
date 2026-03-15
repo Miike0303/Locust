@@ -171,3 +171,10 @@
 - API key redaction in config endpoint
 - Project open with auto-detection, string CRUD, translation job management
 - Verified: `cargo test -p locust-server` — 16/16 passed
+
+### Prompt #21 — Full CLI with clap
+- Implemented CLI with clap derive macros: extract, translate, inject, validate, providers, formats, glossary, export, import, server
+- indicatif progress bars for translation, comfy-table for formatted output
+- Integration tests with assert_cmd: help, version, formats, providers, extract errors, glossary
+- Verified: `cargo test -p locust-cli` — 8/8 passed (1 unit + 7 integration)
+- Verified: `cargo build --release -p locust-cli` — success
