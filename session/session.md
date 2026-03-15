@@ -28,3 +28,11 @@
 - 17 methods: CRUD for entries, translation memory, glossary, validation issues, stats
 - Async methods use `tokio::task::spawn_blocking`
 - Verified: `cargo test -p locust-core -- database` — 14/14 passed
+
+### Prompt #4 — Extraction Module
+- Implemented `FormatPlugin` trait (detect, extract, inject, inject_add) with default methods
+- `InjectionReport` struct tracking files_modified, strings_written, strings_skipped, warnings
+- `FormatRegistry` for plugin registration, detection by extension, lookup by id, listing
+- `PluginInfo` struct for serializable plugin metadata
+- MockFormatPlugin and MockFormatPlugin2 for testing
+- Verified: `cargo test -p locust-core -- extraction` — 10/10 passed
