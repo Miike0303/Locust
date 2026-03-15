@@ -129,3 +129,12 @@
 - Minimal TTF font builder for testing (ASCII 0x20-0x7E coverage)
 - Added ttf-parser dependency, pub mod font_validation in lib.rs
 - Verified: `cargo test -p locust-core -- font_validation` — 7/7 passed
+
+### Prompt #16 — Translation Providers Crate
+- Implemented `crates/providers` with MockProvider, ArgosProvider, DeepLProvider
+- ArgosProvider: offline/free via local API, batch translation, health check with install hints
+- DeepLProvider: API with auth key, uppercase lang codes, Pro/Free tier cost estimation
+- `default_registry()` auto-registers providers based on AppConfig
+- Stub modules: openai, claude, ollama
+- Verified: `cargo test -p locust-providers -- argos` — 5/5 passed
+- Verified: `cargo test -p locust-providers -- deepl` — 6/6 passed
