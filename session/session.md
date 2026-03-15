@@ -207,3 +207,11 @@
 - `TranslationModal`: 2-step (configure → progress), provider selector, WS progress updates, cost tracking
 - `Editor` page: top bar with stats, translate/inject/validate/export buttons, filter+table+detail layout
 - Verified: tsc --noEmit + vite build — success
+
+### Prompt #25 — Settings, Review Mode, DiffView, Search & Replace
+- `Settings` page: Providers (per-provider config cards, test connection), Translation Defaults, Appearance (theme/font), Data (backups)
+- `DiffView` component: side-by-side source/translation diff with character-level highlighting via diff-match-patch
+- `Review` page: one-at-a-time review with keyboard shortcuts (A=approve, S=skip, P=previous, E=edit, Escape=exit), progress bar, diff toggle
+- `SearchReplace` modal: batch search/replace across translations with preview
+- Added /review route, updated App.tsx
+- Verified: tsc --noEmit + vite build — success
