@@ -153,3 +153,13 @@
 - `is_retryable` checks for rate limit, server errors, timeouts, IO errors
 - Updated `default_registry()` to register OpenAI, Claude, and Ollama
 - Verified: `cargo test -p locust-providers` — 32/32 passed
+
+### Prompt #19 — Global Memory + Export/Import (PO & XLIFF)
+- Added `GlobalMemoryDb` newtype in database.rs for cross-project translation memory
+- `memory_count()` method on Database and GlobalMemoryDb
+- Implemented `export.rs`: export_po, import_po, export_xliff, import_xliff
+- PO format: GNU gettext with proper header, context, references
+- XLIFF 1.2: XML with trans-unit elements, parsed via quick-xml
+- Added quick-xml dependency
+- Verified: `cargo test -p locust-core -- export` — 6/6 passed
+- Verified: `cargo test -p locust-core -- database` — 16/16 passed (incl. global memory)
