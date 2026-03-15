@@ -163,3 +163,11 @@
 - Added quick-xml dependency
 - Verified: `cargo test -p locust-core -- export` — 6/6 passed
 - Verified: `cargo test -p locust-core -- database` — 16/16 passed (incl. global memory)
+
+### Prompt #20 — Complete Axum HTTP Server
+- Full REST API with 25+ endpoints: health, formats, providers, project, strings, translate, inject, validate, glossary, export/import, config, memory, backups
+- AppState with Arc-wrapped shared state, DashMap for active jobs
+- CORS permissive layer, test server with ephemeral port binding
+- API key redaction in config endpoint
+- Project open with auto-detection, string CRUD, translation job management
+- Verified: `cargo test -p locust-server` — 16/16 passed
