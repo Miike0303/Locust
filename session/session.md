@@ -103,3 +103,11 @@
 - Entry IDs use filename#line_number format
 - Fixture files: script.rpy and gui.rpy
 - Verified: `cargo test -p locust-formats -- renpy` — 11/11 passed
+
+### Prompt #13 — Wolf RPG Plugin
+- Implemented `WolfRpgPlugin` with heuristic Shift-JIS string extraction from .wolf binaries
+- Detection: Data/ dir with .wolf files
+- Inject Replace: binary patching with null-byte padding, errors on longer translations
+- All extracted entries tagged with `extraction_method: "heuristic"` metadata
+- Fixture built programmatically with embedded Shift-JIS strings
+- Verified: `cargo test -p locust-formats -- wolf_rpg` — 8/8 passed

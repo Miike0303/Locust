@@ -10,5 +10,6 @@ pub fn default_registry() -> FormatRegistry {
     r.register(Box::new(rpgmaker_mv::RpgMakerMvPlugin::new()));
     r.register(Box::new(rpgmaker_vxa::RpgMakerVxaPlugin::new()));
     r.register(Box::new(renpy::RenPyPlugin::new()));
+    r.register(Box::new(wolf_rpg::WolfRpgPlugin::new()));
     r
 }
