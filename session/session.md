@@ -189,3 +189,12 @@
 - Plugin development guide in docs/plugin-example/plugin.md
 - Verified: `cargo test -p locust-core -- wasm` — 4/4 passed (1 ignored, requires wasm32-wasi)
 - Verified: `cargo check -p locust-core --features wasm-plugins` — compiles
+
+### Prompt #23 — Tauri Desktop App Scaffold (React + Vite + TypeScript)
+- Scaffolded apps/desktop/ with React 19, Vite 6, TypeScript, Tailwind CSS v4
+- API client (`src/lib/api.ts`) with typed functions for all 25+ server endpoints
+- WebSocket client (`src/lib/ws.ts`) for real-time translation progress
+- Layout with sidebar navigation (Home, Editor, Settings)
+- Welcome page with open folder, recent projects, supported formats grid
+- Editor and Settings placeholder pages
+- Verified: `npm run build` (tsc + vite) — success, dist/ produced
