@@ -58,3 +58,12 @@
 - Platform-specific `config_dir()` (Windows/macOS/Linux)
 - `add_recent_project` with dedup and max 10
 - Verified: `cargo test -p locust-core -- config` — 10/10 passed
+
+### Prompt #8 — Encoding & Placeholder Modules
+- Implemented `encoding.rs`: `EncodingDetector` with detect_and_decode, encode_to_original, read_file_auto, write_file_encoded
+- Supports UTF-8, UTF-8-BOM, Shift-JIS, EUC-JP, CP1252, CP1251, GB2312, Big5
+- Implemented `placeholder.rs`: `PlaceholderProcessor` with extract, restore, validate
+- Handles RPG Maker codes, HTML tags, Python/Rust/C format strings, custom brackets
+- Added encoding_rs and chardet dependencies
+- Verified: `cargo test -p locust-core -- encoding` — 6/6 passed
+- Verified: `cargo test -p locust-core -- placeholder` — 10/10 passed

@@ -20,6 +20,9 @@ tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 
+encoding_rs = "0.8"
+chardet = "0.2"
+
 [dependencies.tokio-util]
 version = "0.7"
 features = ["rt"]
