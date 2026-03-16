@@ -485,12 +485,14 @@ impl FormatPlugin for RenPyPlugin {
             let tl_file = tl_dir.join(filename);
             let mut lines = Vec::new();
 
-            for (idx, entry) in file_entries.iter().enumerate() {
+            for (_idx, entry) in file_entries.iter().enumerate() {
                 if let Some(ref translation) = entry.translation {
+                    // Extract just the line number from the entry ID (format: "filename#linenum")
+                    let line_part = entry.id.split('#').last().unwrap_or("0");
                     let block_id = format!(
                         "{}_{}",
                         filename.replace('.', "_"),
-                        entry.id.replace('#', "_")
+                        line_part
                     );
                     let speaker = entry.context.as_deref().unwrap_or("");
 

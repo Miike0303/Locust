@@ -139,6 +139,25 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
             in_macro = true;
             macro_depth += 1;
             i += 2;
+
+            // Check if this is a <<script>> block — skip everything until <</script>>
+            let remaining: String = chars[i..std::cmp::min(i + 8, len)].iter().collect();
+            if remaining.starts_with("script") {
+                // Skip until <</script>>
+                while i + 1 < len {
+                    if chars[i] == '<' && i + 10 < len {
+                        let close: String = chars[i..i + 11].iter().collect();
+                        if close == "<</script>>" {
+                            i += 11;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                in_macro = false;
+                continue;
+            }
+
             // Skip until >>
             while i + 1 < len {
                 if chars[i] == '>' && chars[i - 1] == '>' {
@@ -172,27 +191,33 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
         if i + 1 < len && chars[i] == '[' && chars[i + 1] == '[' {
             i += 2;
             let mut link_text = String::new();
+            let mut has_separator = false;
             while i < len {
                 if i + 1 < len && chars[i] == ']' && chars[i + 1] == ']' {
                     i += 2;
                     break;
                 }
-                if chars[i] == '|' || chars[i] == '-' && i + 1 < len && chars[i + 1] == '>' {
+                if chars[i] == '|' || (chars[i] == '-' && i + 1 < len && chars[i + 1] == '>') {
                     // Everything after | or -> is the target, text is before
+                    has_separator = true;
                     break;
                 }
                 link_text.push(chars[i]);
                 i += 1;
             }
             // Skip to ]]
-            while i < len {
-                if i + 1 < len && chars[i] == ']' && chars[i + 1] == ']' {
-                    i += 2;
-                    break;
+            if has_separator {
+                while i < len {
+                    if i + 1 < len && chars[i] == ']' && chars[i + 1] == ']' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
                 }
-                i += 1;
             }
-            if !link_text.trim().is_empty() {
+            // Only include link text if it has a separator (|/->)
+            // [[text]] links are passage names — translating them breaks navigation
+            if has_separator && !link_text.trim().is_empty() {
                 current_line.push_str(&link_text);
             }
             continue;
