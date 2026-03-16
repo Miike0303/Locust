@@ -84,7 +84,7 @@ impl UnrealPlugin {
         let regions = find_utf16le_strings(bytes);
 
         for (idx, (offset, text)) in regions.into_iter().enumerate() {
-            if text.chars().count() < 3 {
+            if text.chars().count() < 5 {
                 continue;
             }
             if !seen.insert(text.clone()) {
@@ -174,12 +174,42 @@ fn find_utf16le_strings(bytes: &[u8]) -> Vec<(usize, String)> {
 }
 
 fn has_natural_language(text: &str) -> bool {
-    // Must contain at least one space or be a meaningful word
-    let has_space = text.contains(' ');
-    let has_letters = text.chars().filter(|c| c.is_alphabetic()).count() >= 2;
-    let mostly_printable = text.chars().all(|c| c.is_alphanumeric() || c.is_whitespace() || ".,!?;:'\"()-@#$%&*+=".contains(c));
+    let char_count = text.chars().count();
+    if char_count < 4 {
+        return false;
+    }
 
-    has_letters && mostly_printable && (has_space || text.len() <= 30)
+    // Count ASCII letters vs total chars — real text should be mostly ASCII or CJK
+    let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let ascii_printable = text.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).count();
+
+    // For ASCII-heavy text: require high ratio of ASCII printable chars
+    let ascii_ratio = ascii_printable as f64 / char_count as f64;
+    if ascii_ratio < 0.8 {
+        return false; // Too much non-ASCII garbage
+    }
+
+    // Must have actual letters (not just punctuation/numbers)
+    if ascii_letters < 3 {
+        return false;
+    }
+
+    // Must contain a space (multi-word) or be a short single word
+    let has_space = text.contains(' ');
+    if !has_space && char_count > 25 {
+        return false; // Long strings without spaces are likely identifiers
+    }
+
+    // Filter out camelCase/PascalCase identifiers
+    let upper_lower_transitions = text.as_bytes().windows(2)
+        .filter(|w| w[0].is_ascii_uppercase() && w[1].is_ascii_lowercase())
+        .count();
+    if !has_space && upper_lower_transitions >= 3 {
+        return false; // Likely camelCase identifier
+    }
+
+    // All chars should be printable ASCII or common Unicode
+    text.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace() || c.is_alphabetic())
 }
 
 impl Default for UnrealPlugin {

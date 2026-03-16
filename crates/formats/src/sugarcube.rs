@@ -219,7 +219,67 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
         lines.push(trimmed);
     }
 
-    lines
+    // Filter out CSS, JS, and code-like lines
+    lines.into_iter().filter(|line| is_translatable_text(line)).collect()
+}
+
+/// Returns false for lines that look like CSS, JavaScript, or code.
+fn is_translatable_text(line: &str) -> bool {
+    let s = line.trim();
+    if s.is_empty() {
+        return false;
+    }
+
+    // CSS properties (contain : followed by values with units, colors, etc.)
+    if s.contains(':') && (
+        s.contains("px") || s.contains("em") || s.contains("rem") || s.contains("vh") || s.contains("vw") ||
+        s.contains("rgb") || s.contains("#") && s.len() < 50 ||
+        s.contains("var(--") || s.contains("solid") || s.contains("none;") ||
+        s.contains("flex") || s.contains("grid") || s.contains("block") ||
+        s.contains("absolute") || s.contains("relative") || s.contains("fixed")
+    ) {
+        return false;
+    }
+
+    // CSS-like patterns
+    if s.ends_with(';') && s.contains(':') {
+        return false;
+    }
+    if s.starts_with('.') && s.contains('{') {
+        return false;
+    }
+    if s.contains("background") || s.contains("font-size") || s.contains("margin") ||
+       s.contains("padding") || s.contains("border") || s.contains("display:") ||
+       s.contains("position:") || s.contains("color:") || s.contains("width:") ||
+       s.contains("height:") || s.contains("text-align") || s.contains("box-shadow") ||
+       s.contains("opacity") || s.contains("z-index") || s.contains("overflow") ||
+       s.contains("transform") || s.contains("transition") || s.contains("cursor:") {
+        return false;
+    }
+
+    // JavaScript patterns
+    if s.starts_with("var ") || s.starts_with("let ") || s.starts_with("const ") ||
+       s.starts_with("function") || s.starts_with("return ") || s.starts_with("if (") ||
+       s.starts_with("else") || s.starts_with("for (") || s.starts_with("while (") ||
+       s.contains("document.") || s.contains("window.") || s.contains("console.") ||
+       s.contains("addEventListener") || s.contains("querySelector") || s.contains("setTimeout") ||
+       s.contains("=>") || s.contains("===") || s.contains("!==") {
+        return false;
+    }
+
+    // HTML/CSS class/id references
+    if s.starts_with('#') && !s.contains(' ') {
+        return false;
+    }
+
+    // Only punctuation/symbols, no real words
+    let alpha_count = s.chars().filter(|c| c.is_alphabetic()).count();
+    let total = s.chars().count();
+    if total > 0 && (alpha_count as f64 / total as f64) < 0.3 {
+        return false;
+    }
+
+    true
 }
 
 impl Default for SugarCubePlugin {
@@ -269,26 +329,75 @@ impl FormatPlugin for SugarCubePlugin {
             message: "no SugarCube HTML file found".to_string(),
         })?;
 
-        let mut content = std::fs::read_to_string(&html_file)?;
+        let content = std::fs::read_to_string(&html_file)?;
         let mut written = 0;
         let mut skipped = 0;
 
-        for entry in entries {
-            if let Some(ref translation) = entry.translation {
-                let encoded_source = encode_html_entities(&entry.source);
-                let encoded_translation = encode_html_entities(translation);
-                if content.contains(&encoded_source) {
-                    content = content.replacen(&encoded_source, &encoded_translation, 1);
-                    written += 1;
-                } else {
-                    skipped += 1;
+        // Only replace text WITHIN <tw-passagedata> tags, not in JS/CSS/HTML structure
+        let mut result = String::with_capacity(content.len());
+        let mut search_from = 0;
+
+        while let Some(tag_start) = content[search_from..].find("<tw-passagedata") {
+            let abs_start = search_from + tag_start;
+
+            // Copy everything before this passage tag unchanged
+            result.push_str(&content[search_from..abs_start]);
+
+            // Find the closing > of the opening tag
+            let tag_header_end = match content[abs_start..].find('>') {
+                Some(pos) => abs_start + pos + 1,
+                None => {
+                    result.push_str(&content[abs_start..]);
+                    search_from = content.len();
+                    break;
                 }
-            } else {
+            };
+
+            // Find the closing </tw-passagedata>
+            let close_tag = "</tw-passagedata>";
+            let tag_end = match content[tag_header_end..].find(close_tag) {
+                Some(pos) => tag_header_end + pos,
+                None => {
+                    result.push_str(&content[abs_start..]);
+                    search_from = content.len();
+                    break;
+                }
+            };
+
+            // Copy the opening tag header
+            result.push_str(&content[abs_start..tag_header_end]);
+
+            // Get passage content and do replacements only within it
+            let mut passage_content = content[tag_header_end..tag_end].to_string();
+            for entry in entries {
+                if let Some(ref translation) = entry.translation {
+                    let encoded_source = encode_html_entities(&entry.source);
+                    let encoded_translation = encode_html_entities(translation);
+                    if passage_content.contains(&encoded_source) {
+                        passage_content = passage_content.replacen(&encoded_source, &encoded_translation, 1);
+                        written += 1;
+                    }
+                }
+            }
+
+            result.push_str(&passage_content);
+            result.push_str(close_tag);
+            search_from = tag_end + close_tag.len();
+        }
+
+        // Copy remainder after last passage
+        if search_from < content.len() {
+            result.push_str(&content[search_from..]);
+        }
+
+        // Count skipped
+        for entry in entries {
+            if entry.translation.is_none() {
                 skipped += 1;
             }
         }
 
-        std::fs::write(&html_file, &content)?;
+        std::fs::write(&html_file, &result)?;
 
         Ok(InjectionReport {
             files_modified: if written > 0 { 1 } else { 0 },

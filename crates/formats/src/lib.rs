@@ -4,6 +4,7 @@ pub mod renpy;
 pub mod wolf_rpg;
 pub mod sugarcube;
 pub mod unreal;
+pub mod unity;
 
 use locust_core::extraction::FormatRegistry;
 
@@ -15,5 +16,6 @@ pub fn default_registry() -> FormatRegistry {
     r.register(Box::new(wolf_rpg::WolfRpgPlugin::new()));
     r.register(Box::new(sugarcube::SugarCubePlugin::new()));
     r.register(Box::new(unreal::UnrealPlugin::new()));
+    r.register(Box::new(unity::UnityPlugin::new()));
     r
 }

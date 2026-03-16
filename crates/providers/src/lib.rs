@@ -1,5 +1,6 @@
 pub mod argos;
 pub mod deepl;
+pub mod google;
 pub mod openai;
 pub mod claude;
 pub mod ollama;
@@ -16,6 +17,9 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
 
     // Always register mock provider
     reg.register(Arc::new(mock::MockProvider));
+
+    // Always register Google Translate (free, no API key needed)
+    reg.register(Arc::new(google::GoogleTranslateProvider::new()));
 
     // Register Argos if configured or use defaults
     if let Some(pc) = config.get_provider_config("argos") {

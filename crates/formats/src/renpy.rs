@@ -168,6 +168,31 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
         || trimmed.starts_with("pass")
         || trimmed.starts_with("translate ")
         || trimmed.starts_with("_")
+        // Image/UI property keywords
+        || trimmed.starts_with("idle ")
+        || trimmed.starts_with("hover ")
+        || trimmed.starts_with("insensitive ")
+        || trimmed.starts_with("selected_idle ")
+        || trimmed.starts_with("selected_hover ")
+        || trimmed.starts_with("ground ")
+        || trimmed.starts_with("image ")
+        || trimmed.starts_with("add ")
+        || trimmed.starts_with("use ")
+        || trimmed.starts_with("screen ")
+        || trimmed.starts_with("style ")
+        || trimmed.starts_with("transform ")
+        || trimmed.starts_with("at ")
+        || trimmed.starts_with("xpos ")
+        || trimmed.starts_with("ypos ")
+        || trimmed.starts_with("xalign ")
+        || trimmed.starts_with("yalign ")
+        || trimmed.starts_with("xsize ")
+        || trimmed.starts_with("ysize ")
+        || trimmed.starts_with("text_align ")
+        || trimmed.starts_with("action ")
+        || trimmed.starts_with("hovered ")
+        || trimmed.starts_with("unhovered ")
+        || trimmed.starts_with("background ")
     {
         return None;
     }
@@ -175,7 +200,7 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
     // Narrator: just "text"
     if trimmed.starts_with('"') {
         let (text, _) = extract_quoted_string(trimmed)?;
-        if !text.is_empty() {
+        if !text.is_empty() && !is_file_reference(text) {
             return Some((None, text));
         }
         return None;
@@ -193,7 +218,7 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
             let rest = parts[1].trim();
             if rest.starts_with('"') {
                 let (text, _) = extract_quoted_string(rest)?;
-                if !text.is_empty() {
+                if !text.is_empty() && !is_file_reference(text) {
                     return Some((Some(character), text));
                 }
             }
@@ -201,6 +226,30 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
     }
 
     None
+}
+
+/// Check if a string looks like a file path/reference (not translatable text)
+fn is_file_reference(text: &str) -> bool {
+    let t = text.trim();
+    // File extensions
+    if t.ends_with(".png") || t.ends_with(".jpg") || t.ends_with(".jpeg") || t.ends_with(".webp") ||
+       t.ends_with(".gif") || t.ends_with(".svg") || t.ends_with(".bmp") ||
+       t.ends_with(".mp3") || t.ends_with(".ogg") || t.ends_with(".wav") || t.ends_with(".flac") ||
+       t.ends_with(".mp4") || t.ends_with(".webm") || t.ends_with(".avi") || t.ends_with(".ogv") ||
+       t.ends_with(".ttf") || t.ends_with(".otf") || t.ends_with(".woff") ||
+       t.ends_with(".rpy") || t.ends_with(".rpyc") || t.ends_with(".rpa") ||
+       t.ends_with(".json") || t.ends_with(".txt") || t.ends_with(".xml") || t.ends_with(".csv") {
+        return true;
+    }
+    // Path-like patterns
+    if (t.contains('/') || t.contains('\\')) && !t.contains(' ') {
+        return true;
+    }
+    // Color hex codes
+    if t.starts_with('#') && t.len() <= 9 && t[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    false
 }
 
 fn extract_menu_choice(line: &str) -> Option<&str> {
@@ -232,7 +281,7 @@ fn extract_define_string(line: &str) -> Option<&str> {
     let eq_pos = trimmed.find('=')?;
     let after_eq = trimmed[eq_pos + 1..].trim();
     let (text, _) = extract_quoted_string(after_eq)?;
-    if !text.is_empty() {
+    if !text.is_empty() && !is_file_reference(text) {
         Some(text)
     } else {
         None
