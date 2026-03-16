@@ -37,8 +37,7 @@
     "macOS": {
       "minimumSystemVersion": "10.15",
       "signingIdentity": null,
-      "frameworks": [],
-      "license": "../../../LICENSE"
+      "frameworks": []
     },
     "windows": {
       "certificateThumbprint": null,

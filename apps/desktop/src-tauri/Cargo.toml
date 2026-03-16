@@ -13,3 +13,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 human-panic = "2"
+tauri = { version = "2.10.3", features = ["custom-protocol"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
