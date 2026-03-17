@@ -460,7 +460,7 @@ impl RpgMakerVxaPlugin {
         file_path: &Path,
     ) -> Vec<StringEntry> {
         let mut entries = Vec::new();
-        let stem = filename.strip_suffix(".rvdata2").unwrap_or(filename);
+        let stem = strip_marshal_ext(filename);
         let fields = Self::fields_for_file(stem);
 
         if let Some(arr) = root.as_array() {
@@ -622,7 +622,7 @@ impl RpgMakerVxaPlugin {
             })
             .collect();
 
-        let stem = filename.strip_suffix(".rvdata2").unwrap_or(filename);
+        let stem = strip_marshal_ext(filename);
         let fields = Self::fields_for_file(stem);
 
         if let MarshalValue::Array(arr) = root {
@@ -653,21 +653,32 @@ impl Default for RpgMakerVxaPlugin {
     }
 }
 
+fn is_marshal_ext(ext: &std::ffi::OsStr) -> bool {
+    ext == "rvdata2" || ext == "rxdata"
+}
+
+fn strip_marshal_ext(filename: &str) -> &str {
+    filename
+        .strip_suffix(".rvdata2")
+        .or_else(|| filename.strip_suffix(".rxdata"))
+        .unwrap_or(filename)
+}
+
 impl FormatPlugin for RpgMakerVxaPlugin {
     fn id(&self) -> &str {
         "rpgmaker-vxa"
     }
 
     fn name(&self) -> &str {
-        "RPG Maker VX Ace"
+        "RPG Maker VX Ace / XP"
     }
 
     fn description(&self) -> &str {
-        "RPG Maker VX Ace .rvdata2 files (Ruby Marshal)"
+        "RPG Maker VX Ace (.rvdata2) and XP (.rxdata) files (Ruby Marshal)"
     }
 
     fn supported_extensions(&self) -> &[&str] {
-        &[".rvdata2"]
+        &[".rvdata2", ".rxdata"]
     }
 
     fn supported_modes(&self) -> Vec<OutputMode> {
@@ -684,7 +695,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                             .any(|e| {
                                 e.path()
                                     .extension()
-                                    .map_or(false, |ext| ext == "rvdata2")
+                                    .map_or(false, |ext| is_marshal_ext(ext))
                             })
                     })
                     .unwrap_or(false);
@@ -692,7 +703,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
             return false;
         }
         if path.is_file() {
-            return path.extension().map_or(false, |ext| ext == "rvdata2");
+            return path.extension().map_or(false, |ext| is_marshal_ext(ext));
         }
         false
     }
@@ -706,10 +717,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let stem_lower = filename
-                .strip_suffix(".rvdata2")
-                .unwrap_or(&filename)
-                .to_lowercase();
+            let stem_lower = strip_marshal_ext(&filename).to_lowercase();
 
             if stem_lower.starts_with("map") {
                 return Ok(Self::extract_map_file(&filename, &root, path));
@@ -729,15 +737,12 @@ impl FormatPlugin for RpgMakerVxaPlugin {
         for entry in std::fs::read_dir(&data_dir)? {
             let entry = entry?;
             let fpath = entry.path();
-            if fpath.extension().map_or(false, |e| e == "rvdata2") {
+            if fpath.extension().map_or(false, |e| is_marshal_ext(e)) {
                 let bytes = std::fs::read(&fpath)?;
                 match MarshalValue::parse(&bytes) {
                     Ok(root) => {
                         let fname = fpath.file_name().unwrap_or_default().to_string_lossy().to_string();
-                        let stem_lower = fname
-                            .strip_suffix(".rvdata2")
-                            .unwrap_or(&fname)
-                            .to_lowercase();
+                        let stem_lower = strip_marshal_ext(&fname).to_lowercase();
                         if stem_lower.starts_with("map") {
                             all.extend(Self::extract_map_file(&fname, &root, &fpath));
                         } else if stem_lower == "commonevents" {

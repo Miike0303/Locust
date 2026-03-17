@@ -224,3 +224,35 @@
 - Placeholder SVG icon for app branding
 - **Full workspace verification: `cargo test --workspace` — 214 tests passed, 0 failures**
 - Frontend build verified: tsc + vite build succeeds
+
+### Prompt #27 — Production State, WebSocket Progress, Tauri IPC Commands
+- **Production AppState** (`create_app_state`): persistent SQLite databases in user data directory, config loaded from disk, global translation memory persisted
+- **WebSocket endpoint** (`/api/translate/ws/:job_id`): real-time translation progress via axum WebSocket upgrade, broadcast channel bridges mpsc→WS, auto-cleanup on job completion
+- **Tauri IPC commands** (17 commands): `get_server_port`, `pick_game_folder`, `open_project`, `get_formats`, `get_providers`, `get_stats`, `get_strings`, `patch_string`, `start_translation`, `cancel_translation`, `run_validation`, `run_inject`, `get_config`, `save_config`, `get_backups`, `get_glossary`, `add_glossary_entry`
+- `commands.rs` module: full Tauri command handlers sharing Arc<AppState> with embedded server
+- **Dual-mode API client**: frontend detects Tauri runtime (`__TAURI_INTERNALS__`) and uses IPC for supported operations, HTTP fallback for others
+- **Native file dialog**: `@tauri-apps/plugin-dialog` for folder picker in desktop mode, prompt fallback for web
+- Tauri capabilities: dialog and shell plugins with proper permissions
+- Config persistence: `patch_config` endpoint and `save_config` command write to disk
+- Dynamic port: embedded server picks unused port via `portpicker`, frontend resolves WS URL dynamically
+- Added dependencies: `tauri-plugin-dialog`, `tauri-plugin-shell`, `portpicker`, `tokio-util`, `uuid` to desktop crate
+- Frontend deps: `@tauri-apps/api`, `@tauri-apps/plugin-dialog`, `@tauri-apps/plugin-shell`
+- **Full workspace verification: `cargo test --workspace` — 243 tests passed, 0 failures**
+- Frontend build verified: tsc + vite build succeeds
+
+### Prompt #28 — RPG Maker XP, Ren'Py RPA, Executable Detection, File Picker
+- **RPG Maker XP support**: Extended VXA plugin to handle `.rxdata` files (same Ruby Marshal format as `.rvdata2`)
+- **Ren'Py RPA archive extraction**: Full Python pickle parser (protocol 2-5) with zlib decompression, extracts `.rpy` scripts from `.rpa` archives
+  - Supports PROTO, FRAME, MEMOIZE, SHORT_BINUNICODE, SHORT_BINBYTES, BINBYTES, BINBYTES8, TUPLE/TUPLE1/2/3, BINGET, BINPUT, SETITEMS, APPEND, APPENDS
+  - Handles XOR key deobfuscation for offsets/lengths
+- **`resolve_game_root()`**: Resolves executable/file paths to game root directories for format detection
+  - `Game.exe` → parent dir (RPG Maker), `*.html` → direct file (SugarCube), `*.exe` → walks up to find game root
+- **File picker**: Welcome page opens file selector (not folder) with filters for `.exe`, `.html`, `.rpy`, `.rpa`, etc.
+- **Real game verification**:
+  - RPG Maker XP (`Legend of Queen Opala - Origin`): **180,636 strings** extracted from `.rxdata` files
+  - SugarCube/HTML (`The SUP v1.0`): **73,197 strings** extracted from HTML passages
+  - Ren'Py/RPA (`FindingCloud9-0.9.2-pc`): **1,455 strings** extracted from `scripts.rpa` archive
+- Added `miniz_oxide` dependency for zlib decompression
+- Real game integration tests (ignored by default): `cargo test -p locust-formats --test real_games -- --ignored`
+- **Full workspace verification: `cargo test --workspace` — 243 tests passed, 0 failures (+ 3 ignored real-game tests)**
+- Frontend build verified: tsc + vite build succeeds

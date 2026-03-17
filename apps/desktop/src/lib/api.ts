@@ -1,7 +1,30 @@
-const BASE = import.meta.env.DEV ? "/api" : "http://localhost:7842/api";
+import { invoke } from "@tauri-apps/api/core";
+
+// ─── Runtime detection ────────────────────────────────────────────────────
+const IS_TAURI = "__TAURI_INTERNALS__" in window;
+
+// ─── HTTP fallback helpers ────────────────────────────────────────────────
+let _serverPort = 7842;
+
+async function getBaseUrl(): Promise<string> {
+  if (IS_TAURI) {
+    try {
+      _serverPort = await invoke<number>("get_server_port");
+    } catch { /* use default */ }
+    return `http://localhost:${_serverPort}/api`;
+  }
+  return import.meta.env.DEV ? "/api" : `http://localhost:7842/api`;
+}
+
+let _basePromise: Promise<string> | null = null;
+function baseUrl(): Promise<string> {
+  if (!_basePromise) _basePromise = getBaseUrl();
+  return _basePromise;
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const base = await baseUrl();
+  const res = await fetch(`${base}${path}`, {
     headers: { "Content-Type": "application/json", ...options?.headers },
     ...options,
   });
@@ -13,7 +36,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 async function requestText(path: string): Promise<string> {
-  const res = await fetch(`${BASE}${path}`);
+  const base = await baseUrl();
+  const res = await fetch(`${base}${path}`);
   if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
   return res.text();
 }
@@ -116,38 +140,104 @@ export interface ProgressEventStringTranslated { type: "string_translated"; entr
 export interface ProgressEventCompleted { type: "completed"; total_translated: number; total_cost: number; duration_secs: number }
 export interface ProgressEventFailed { type: "failed"; entry_id: string | null; error: string }
 
-// ─── API functions ─────────────────────────────────────────────────────────
+// ─── API functions (Tauri IPC with HTTP fallback) ─────────────────────────
 
-export const getHealth = () => request<{ status: string; version: string }>("/health".replace("/api", ""));
-export const getFormats = () => request<PluginInfo[]>("/formats");
-export const getProviders = () => request<ProviderInfo[]>("/providers");
-export const checkProviderHealth = (id: string) => request<{ ok: boolean; message: string }>(`/providers/${id}/health`, { method: "POST" });
-export const openProject = (path: string) => request<ProjectOpenResponse>("/project/open", { method: "POST", body: JSON.stringify({ path }) });
-export const getCurrentProject = () => request<ProjectInfo | null>("/project/current");
-export const getStrings = (filter: StringFilter) => {
-  const params = new URLSearchParams();
-  if (filter.status) params.set("status", filter.status);
-  if (filter.file_path) params.set("file_path", filter.file_path);
-  if (filter.tag) params.set("tag", filter.tag);
-  if (filter.search) params.set("search", filter.search);
-  if (filter.limit) params.set("limit", String(filter.limit));
-  if (filter.offset) params.set("offset", String(filter.offset));
-  return request<StringsResponse>(`/strings?${params}`);
-};
-export const getString = (id: string) => request<StringEntry>(`/strings/${encodeURIComponent(id)}`);
-export const patchString = (id: string, data: Partial<StringEntry>) => request<StringEntry>(`/strings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
-export const getStats = () => request<ProjectStats>("/stats");
-export const startTranslation = (params: TranslationStartParams) => request<{ job_id: string }>("/translate/start", { method: "POST", body: JSON.stringify(params) });
-export const cancelTranslation = (jobId: string) => request<void>(`/translate/cancel/${jobId}`, { method: "POST" });
-export const inject = (params: InjectParams) => request<MultiLangReport>("/inject", { method: "POST", body: JSON.stringify(params) });
-export const validate = () => request<ValidationResponse>("/validate", { method: "POST" });
-export const getGlossary = (langPair: string) => request<GlossaryEntry[]>(`/glossary?lang_pair=${encodeURIComponent(langPair)}`);
-export const addGlossaryEntry = (entry: GlossaryEntry) => request<void>("/glossary", { method: "POST", body: JSON.stringify(entry) });
-export const deleteGlossaryEntry = (term: string, langPair: string) => request<void>(`/glossary/${encodeURIComponent(term)}?lang_pair=${encodeURIComponent(langPair)}`, { method: "DELETE" });
+export const getFormats = (): Promise<PluginInfo[]> =>
+  IS_TAURI ? invoke("get_formats") : request("/formats");
+
+export const getProviders = (): Promise<ProviderInfo[]> =>
+  IS_TAURI ? invoke("get_providers") : request("/providers");
+
+export const checkProviderHealth = (id: string) =>
+  request<{ ok: boolean; message: string }>(`/providers/${id}/health`, { method: "POST" });
+
+export const openProject = (path: string): Promise<ProjectOpenResponse> =>
+  IS_TAURI
+    ? invoke("open_project", { path })
+    : request("/project/open", { method: "POST", body: JSON.stringify({ path }) });
+
+export const getCurrentProject = () =>
+  request<ProjectInfo | null>("/project/current");
+
+export const getStrings = (filter: StringFilter): Promise<StringsResponse> =>
+  IS_TAURI
+    ? invoke("get_strings", { filter })
+    : (() => {
+        const params = new URLSearchParams();
+        if (filter.status) params.set("status", filter.status);
+        if (filter.file_path) params.set("file_path", filter.file_path);
+        if (filter.tag) params.set("tag", filter.tag);
+        if (filter.search) params.set("search", filter.search);
+        if (filter.limit) params.set("limit", String(filter.limit));
+        if (filter.offset) params.set("offset", String(filter.offset));
+        return request<StringsResponse>(`/strings?${params}`);
+      })();
+
+export const getString = (id: string) =>
+  request<StringEntry>(`/strings/${encodeURIComponent(id)}`);
+
+export const patchString = (id: string, data: Partial<Pick<StringEntry, "translation" | "status">>): Promise<StringEntry> =>
+  IS_TAURI
+    ? invoke("patch_string", { id, data })
+    : request(`/strings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
+
+export const getStats = (): Promise<ProjectStats> =>
+  IS_TAURI ? invoke("get_stats") : request("/stats");
+
+export const startTranslation = (params: TranslationStartParams): Promise<{ job_id: string }> =>
+  IS_TAURI
+    ? invoke<string>("start_translation", { params }).then(job_id => ({ job_id }))
+    : request("/translate/start", { method: "POST", body: JSON.stringify(params) });
+
+export const cancelTranslation = (jobId: string): Promise<void> =>
+  IS_TAURI
+    ? invoke("cancel_translation", { jobId })
+    : request(`/translate/cancel/${jobId}`, { method: "POST" });
+
+export const inject = (params: InjectParams): Promise<MultiLangReport> =>
+  IS_TAURI
+    ? invoke("run_inject", { params })
+    : request("/inject", { method: "POST", body: JSON.stringify(params) });
+
+export const validate = (): Promise<ValidationResponse> =>
+  IS_TAURI
+    ? invoke("run_validation")
+    : request("/validate", { method: "POST" });
+
+export const getGlossary = (langPair: string): Promise<GlossaryEntry[]> =>
+  IS_TAURI
+    ? invoke("get_glossary", { langPair })
+    : request(`/glossary?lang_pair=${encodeURIComponent(langPair)}`);
+
+export const addGlossaryEntry = (entry: GlossaryEntry): Promise<void> =>
+  IS_TAURI
+    ? invoke("add_glossary_entry", { entry })
+    : request("/glossary", { method: "POST", body: JSON.stringify(entry) });
+
+export const deleteGlossaryEntry = (term: string, langPair: string) =>
+  request<void>(`/glossary/${encodeURIComponent(term)}?lang_pair=${encodeURIComponent(langPair)}`, { method: "DELETE" });
+
 export const exportPo = (lang: string) => requestText(`/export/po?lang=${encodeURIComponent(lang)}`);
 export const exportXliff = (lang: string) => requestText(`/export/xliff?lang=${encodeURIComponent(lang)}`);
-export const importPo = (lang: string, content: string) => request<{ imported: number }>(`/import/po?lang=${encodeURIComponent(lang)}`, { method: "POST", body: content, headers: { "Content-Type": "text/plain" } });
-export const getConfig = () => request<AppConfig>("/config");
-export const updateConfig = (partial: Partial<AppConfig>) => request<AppConfig>("/config", { method: "PATCH", body: JSON.stringify(partial) });
-export const getBackups = () => request<BackupEntry[]>("/backups");
-export const restoreBackup = (id: string) => request<void>(`/backups/${id}/restore`, { method: "POST" });
+export const importPo = (lang: string, content: string) =>
+  request<{ imported: number }>(`/import/po?lang=${encodeURIComponent(lang)}`, { method: "POST", body: content, headers: { "Content-Type": "text/plain" } });
+
+export const getConfig = (): Promise<AppConfig> =>
+  IS_TAURI ? invoke("get_config") : request("/config");
+
+export const updateConfig = (partial: Partial<AppConfig>): Promise<AppConfig> =>
+  IS_TAURI
+    ? invoke("save_config", { partial })
+    : request("/config", { method: "PATCH", body: JSON.stringify(partial) });
+
+export const getBackups = (): Promise<BackupEntry[]> =>
+  IS_TAURI ? invoke("get_backups") : request("/backups");
+
+export const restoreBackup = (id: string) =>
+  request<void>(`/backups/${id}/restore`, { method: "POST" });
+
+/** Get the WebSocket URL for a translation job */
+export async function getWsUrl(jobId: string): Promise<string> {
+  const port = IS_TAURI ? _serverPort : 7842;
+  return `ws://localhost:${port}/api/translate/ws/${jobId}`;
+}

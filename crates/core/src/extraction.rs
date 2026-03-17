@@ -111,6 +111,32 @@ impl Default for FormatRegistry {
     }
 }
 
+/// Resolve a file path (executable, .html, .rpy, etc.) to the game root directory.
+/// If the path is already a directory, return it as-is.
+/// If it's a file, walk up to find the directory that a plugin can detect.
+pub fn resolve_game_root(path: &Path, registry: &FormatRegistry) -> PathBuf {
+    if path.is_dir() {
+        return path.to_path_buf();
+    }
+
+    // If a plugin can detect the file directly (e.g., .html, .rpy, .rpa), return it
+    if registry.detect(path).is_some() {
+        return path.to_path_buf();
+    }
+
+    // Walk up parent directories to find one a plugin recognizes
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if registry.detect(dir).is_some() {
+            return dir.to_path_buf();
+        }
+        current = dir.parent();
+    }
+
+    // Fallback: return the parent directory of the file
+    path.parent().unwrap_or(path).to_path_buf()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub id: String,

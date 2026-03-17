@@ -2,19 +2,40 @@ import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { FolderOpen, Globe } from "lucide-react";
 import { getFormats, getConfig, openProject } from "../lib/api";
+import { useProjectStore } from "../stores/projectStore";
+
+const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 export default function Welcome() {
   const navigate = useNavigate();
+  const setProject = useProjectStore((s) => s.setProject);
   const { data: formats } = useQuery({ queryKey: ["formats"], queryFn: getFormats });
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
 
-  const handleOpenFolder = async () => {
+  const handleOpenGame = async () => {
     try {
-      // In Tauri, use dialog.open({ directory: true })
-      // For web dev, prompt for path
-      const path = prompt("Enter game folder path:");
+      let path: string | null = null;
+
+      if (IS_TAURI) {
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const selected = await open({
+          title: "Select game executable or main file",
+          filters: [
+            {
+              name: "Game files",
+              extensions: ["exe", "html", "htm", "rpy", "rpa", "rpgproject", "rvproj2"],
+            },
+            { name: "All files", extensions: ["*"] },
+          ],
+        });
+        if (typeof selected === "string") path = selected;
+      } else {
+        path = prompt("Enter game executable or folder path:");
+      }
+
       if (!path) return;
-      await openProject(path);
+      const result = await openProject(path);
+      setProject({ path: result.project_path, format_id: result.format_id, name: result.project_name });
       navigate("/editor");
     } catch (err) {
       alert(`Failed to open project: ${err}`);
@@ -30,11 +51,11 @@ export default function Welcome() {
       </div>
 
       <button
-        onClick={handleOpenFolder}
+        onClick={handleOpenGame}
         className="flex items-center gap-3 px-8 py-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-lg font-medium transition-colors mb-8"
       >
         <FolderOpen size={24} />
-        Open game folder
+        Open game
       </button>
 
       {config?.recent_projects && config.recent_projects.length > 0 && (
@@ -46,7 +67,8 @@ export default function Welcome() {
                 key={i}
                 onClick={async () => {
                   try {
-                    await openProject(p.path);
+                    const result = await openProject(p.path);
+                    setProject({ path: result.project_path, format_id: result.format_id, name: result.project_name });
                     navigate("/editor");
                   } catch (err) {
                     alert(`Failed to open: ${err}`);

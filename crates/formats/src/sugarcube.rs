@@ -22,7 +22,6 @@ impl SugarCubePlugin {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if is_html(&p) {
-                        // Check if it's a SugarCube file
                         if let Ok(content) = std::fs::read_to_string(&p) {
                             if content.contains("tw-passagedata") || content.contains("SugarCube") {
                                 return Some(p);
@@ -38,56 +37,68 @@ impl SugarCubePlugin {
     fn extract_passages(content: &str, file_path: &Path) -> Vec<StringEntry> {
         let mut entries = Vec::new();
 
-        // Find all <tw-passagedata> tags
         let mut search_from = 0;
         while let Some(tag_start) = content[search_from..].find("<tw-passagedata") {
             let abs_start = search_from + tag_start;
 
-            // Find the closing >
             let tag_header_end = match content[abs_start..].find('>') {
                 Some(pos) => abs_start + pos + 1,
                 None => break,
             };
 
-            // Find closing tag
             let close_tag = "</tw-passagedata>";
             let tag_end = match content[tag_header_end..].find(close_tag) {
                 Some(pos) => tag_header_end + pos,
                 None => break,
             };
 
-            // Extract passage name from pid and name attributes
             let header = &content[abs_start..tag_header_end];
             let passage_name = extract_attr(header, "name").unwrap_or_default();
-            let pid = extract_attr(header, "pid").unwrap_or_default();
+            let _pid = extract_attr(header, "pid").unwrap_or_default();
+            let tags = extract_attr(header, "tags").unwrap_or_default();
 
-            // Get passage content (HTML-encoded)
             let raw_content = &content[tag_header_end..tag_end];
             let decoded = decode_html_entities(raw_content);
 
-            // Skip system/widget passages
-            if passage_name.starts_with("StoryInit")
-                || passage_name.starts_with("StoryCaption")
-                || passage_name.starts_with("PassageHeader")
-                || passage_name.starts_with("PassageFooter")
-                || decoded.trim().is_empty()
-            {
+            // Skip system/widget/script passages
+            if is_system_passage(&passage_name, &tags) || decoded.trim().is_empty() {
                 search_from = tag_end + close_tag.len();
                 continue;
             }
 
-            // Extract text lines from passage content
-            // SugarCube syntax: text between macros like <<if>>, <<set>>, etc.
             let lines = extract_text_from_passage(&decoded);
 
             for (line_idx, line) in lines.iter().enumerate() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let id = format!("passage_{}#{}#{}", pid, passage_name, line_idx);
-                let mut entry = StringEntry::new(id, line.as_str(), file_path.to_path_buf());
+
+                // Protect SugarCube variables ($var, _var) with placeholders
+                let (protected, var_map) = protect_variables(line);
+
+                if protected.trim().is_empty() {
+                    continue;
+                }
+
+                let id = format!("passage_{}#{}#{}", _pid, passage_name, line_idx);
+                let mut entry = StringEntry::new(id, protected.as_str(), file_path.to_path_buf());
                 entry.tags = vec!["dialogue".to_string()];
                 entry.context = Some(passage_name.clone());
+
+                // Store variable mapping in metadata for restoration during injection
+                if !var_map.is_empty() {
+                    let var_json: Vec<serde_json::Value> = var_map
+                        .iter()
+                        .map(|(placeholder, original)| {
+                            serde_json::json!({"p": placeholder, "v": original})
+                        })
+                        .collect();
+                    entry.metadata.insert(
+                        "sugarcube_vars".to_string(),
+                        serde_json::Value::Array(var_json),
+                    );
+                }
+
                 entries.push(entry);
             }
 
@@ -96,6 +107,29 @@ impl SugarCubePlugin {
 
         entries
     }
+}
+
+/// Check if a passage is a system/code passage that should not be translated.
+fn is_system_passage(name: &str, tags: &str) -> bool {
+    // Skip known system passages
+    let system_names = [
+        "StoryInit", "StoryCaption", "StoryBanner", "StoryMenu",
+        "StoryInterface", "StoryShare", "StoryAuthor", "StoryTitle",
+        "StorySubtitle", "StoryDisplayTitle",
+        "PassageHeader", "PassageFooter", "PassageReady", "PassageDone",
+    ];
+    if system_names.iter().any(|s| name.starts_with(s)) {
+        return true;
+    }
+
+    // Skip passages tagged as widget, script, or stylesheet
+    let skip_tags = ["widget", "script", "stylesheet", "init", "nobr-all"];
+    let passage_tags: Vec<&str> = tags.split_whitespace().collect();
+    if skip_tags.iter().any(|t| passage_tags.contains(t)) {
+        return true;
+    }
+
+    false
 }
 
 fn is_html(path: &Path) -> bool {
@@ -120,6 +154,82 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&apos;", "'")
 }
 
+/// Protect SugarCube variables ($var, _var) by replacing them with numbered placeholders.
+/// Returns the protected text and a list of (placeholder, original_variable) pairs.
+fn protect_variables(text: &str) -> (String, Vec<(String, String)>) {
+    let mut result = String::new();
+    let mut vars = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Detect SugarCube permanent variable $varname
+        if chars[i] == '$' && i + 1 < len && chars[i + 1].is_alphabetic() {
+            let start = i;
+            i += 1;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let var_name: String = chars[start..i].iter().collect();
+            let placeholder = format!("{{{}}}", vars.len());
+            vars.push((placeholder.clone(), var_name));
+            result.push_str(&placeholder);
+            continue;
+        }
+
+        // Detect SugarCube temporary variable _varname (at word boundary)
+        if chars[i] == '_' && i + 1 < len && chars[i + 1].is_alphabetic() {
+            // Only treat as variable if at start of text or after whitespace/punctuation
+            let is_word_start = i == 0 || !chars[i - 1].is_alphanumeric();
+            if is_word_start {
+                let start = i;
+                i += 1;
+                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let var_name: String = chars[start..i].iter().collect();
+                let placeholder = format!("{{{}}}", vars.len());
+                vars.push((placeholder.clone(), var_name));
+                result.push_str(&placeholder);
+                continue;
+            }
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    (result, vars)
+}
+
+/// Restore variable placeholders in translated text back to original SugarCube variables.
+fn restore_variables(text: &str, var_map: &[(String, String)]) -> String {
+    let mut result = text.to_string();
+    for (placeholder, original) in var_map {
+        result = result.replace(placeholder, original);
+    }
+    result
+}
+
+/// Extract variable mapping from entry metadata.
+fn get_var_map(entry: &StringEntry) -> Vec<(String, String)> {
+    entry
+        .metadata
+        .get("sugarcube_vars")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let p = item.get("p")?.as_str()?.to_string();
+                    let v = item.get("v")?.as_str()?.to_string();
+                    Some((p, v))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract readable text from SugarCube passage content.
 /// Strips macros (<<...>>), HTML tags, and SugarCube markup.
 fn extract_text_from_passage(content: &str) -> Vec<String> {
@@ -127,7 +237,6 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
     let mut current_line = String::new();
     let mut in_macro = false;
     let mut in_tag = false;
-    let mut macro_depth = 0;
 
     let chars: Vec<char> = content.chars().collect();
     let len = chars.len();
@@ -137,30 +246,35 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
         // Detect macro start <<
         if i + 1 < len && chars[i] == '<' && chars[i + 1] == '<' {
             in_macro = true;
-            macro_depth += 1;
             i += 2;
 
-            // Check if this is a <<script>> block — skip everything until <</script>>
-            let remaining: String = chars[i..std::cmp::min(i + 8, len)].iter().collect();
-            if remaining.starts_with("script") {
-                // Skip until <</script>>
-                while i + 1 < len {
-                    if chars[i] == '<' && i + 10 < len {
-                        let close: String = chars[i..i + 11].iter().collect();
-                        if close == "<</script>>" {
-                            i += 11;
+            // Check if this is a <<script>> or <<widget>> block — skip until closing tag
+            if i < len {
+                let remaining: String = chars[i..std::cmp::min(i + 10, len)].iter().collect();
+                if remaining.starts_with("script") || remaining.starts_with("widget") {
+                    let close_tag = if remaining.starts_with("script") {
+                        "<</script>>"
+                    } else {
+                        "<</widget>>"
+                    };
+                    let close_chars: Vec<char> = close_tag.chars().collect();
+                    let close_len = close_chars.len();
+                    while i + close_len <= len {
+                        let window: String = chars[i..i + close_len].iter().collect();
+                        if window == close_tag {
+                            i += close_len;
                             break;
                         }
+                        i += 1;
                     }
-                    i += 1;
+                    in_macro = false;
+                    continue;
                 }
-                in_macro = false;
-                continue;
             }
 
             // Skip until >>
             while i + 1 < len {
-                if chars[i] == '>' && chars[i - 1] == '>' {
+                if chars[i] == '>' && i > 0 && chars[i - 1] == '>' {
                     i += 1;
                     in_macro = false;
                     break;
@@ -170,7 +284,7 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
             continue;
         }
 
-        // HTML tags
+        // HTML tags — skip entirely including attributes
         if chars[i] == '<' && !in_macro {
             in_tag = true;
             i += 1;
@@ -187,7 +301,7 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
             continue;
         }
 
-        // SugarCube link syntax: [[text|target]] or [[text]]
+        // SugarCube link syntax: [[text|target]] or [[text->target]] or [[text]]
         if i + 1 < len && chars[i] == '[' && chars[i + 1] == '[' {
             i += 2;
             let mut link_text = String::new();
@@ -198,7 +312,6 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
                     break;
                 }
                 if chars[i] == '|' || (chars[i] == '-' && i + 1 < len && chars[i + 1] == '>') {
-                    // Everything after | or -> is the target, text is before
                     has_separator = true;
                     break;
                 }
@@ -215,8 +328,7 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
                     i += 1;
                 }
             }
-            // Only include link text if it has a separator (|/->)
-            // [[text]] links are passage names — translating them breaks navigation
+            // Only include link display text (with separator), not bare passage names
             if has_separator && !link_text.trim().is_empty() {
                 current_line.push_str(&link_text);
             }
@@ -226,7 +338,7 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
         // Newlines end current text block
         if chars[i] == '\n' {
             let trimmed = current_line.trim().to_string();
-            if !trimmed.is_empty() && !trimmed.starts_with('/') && !trimmed.starts_with('$') {
+            if !trimmed.is_empty() && is_extractable_line(&trimmed) {
                 lines.push(trimmed);
             }
             current_line.clear();
@@ -240,12 +352,39 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
 
     // Flush last line
     let trimmed = current_line.trim().to_string();
-    if !trimmed.is_empty() && !trimmed.starts_with('/') && !trimmed.starts_with('$') {
+    if !trimmed.is_empty() && is_extractable_line(&trimmed) {
         lines.push(trimmed);
     }
 
     // Filter out CSS, JS, and code-like lines
     lines.into_iter().filter(|line| is_translatable_text(line)).collect()
+}
+
+/// Check if a line is extractable (not just a variable, path, or code fragment).
+fn is_extractable_line(line: &str) -> bool {
+    let s = line.trim();
+
+    // Skip lines starting with / (comments) or $ (pure variable assignments)
+    if s.starts_with('/') || s.starts_with('$') {
+        return false;
+    }
+
+    // Skip lines that are just a bare SugarCube variable (_var or $var)
+    if (s.starts_with('_') || s.starts_with('$')) && s[1..].chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+
+    // Skip lines that look like file paths
+    if (s.contains('/') || s.contains('\\')) && !s.contains(' ') {
+        return false;
+    }
+
+    // Skip lines that are just numbers or punctuation
+    if s.chars().all(|c| !c.is_alphabetic()) {
+        return false;
+    }
+
+    true
 }
 
 /// Returns false for lines that look like CSS, JavaScript, or code.
@@ -255,10 +394,10 @@ fn is_translatable_text(line: &str) -> bool {
         return false;
     }
 
-    // CSS properties (contain : followed by values with units, colors, etc.)
+    // CSS properties
     if s.contains(':') && (
         s.contains("px") || s.contains("em") || s.contains("rem") || s.contains("vh") || s.contains("vw") ||
-        s.contains("rgb") || s.contains("#") && s.len() < 50 ||
+        s.contains("rgb") || (s.contains("#") && s.len() < 50) ||
         s.contains("var(--") || s.contains("solid") || s.contains("none;") ||
         s.contains("flex") || s.contains("grid") || s.contains("block") ||
         s.contains("absolute") || s.contains("relative") || s.contains("fixed")
@@ -266,7 +405,6 @@ fn is_translatable_text(line: &str) -> bool {
         return false;
     }
 
-    // CSS-like patterns
     if s.ends_with(';') && s.contains(':') {
         return false;
     }
@@ -358,17 +496,14 @@ impl FormatPlugin for SugarCubePlugin {
         let mut written = 0;
         let mut skipped = 0;
 
-        // Only replace text WITHIN <tw-passagedata> tags, not in JS/CSS/HTML structure
+        // Only replace text WITHIN <tw-passagedata> tags
         let mut result = String::with_capacity(content.len());
         let mut search_from = 0;
 
         while let Some(tag_start) = content[search_from..].find("<tw-passagedata") {
             let abs_start = search_from + tag_start;
-
-            // Copy everything before this passage tag unchanged
             result.push_str(&content[search_from..abs_start]);
 
-            // Find the closing > of the opening tag
             let tag_header_end = match content[abs_start..].find('>') {
                 Some(pos) => abs_start + pos + 1,
                 None => {
@@ -378,7 +513,6 @@ impl FormatPlugin for SugarCubePlugin {
                 }
             };
 
-            // Find the closing </tw-passagedata>
             let close_tag = "</tw-passagedata>";
             let tag_end = match content[tag_header_end..].find(close_tag) {
                 Some(pos) => tag_header_end + pos,
@@ -396,10 +530,19 @@ impl FormatPlugin for SugarCubePlugin {
             let mut passage_content = content[tag_header_end..tag_end].to_string();
             for entry in entries {
                 if let Some(ref translation) = entry.translation {
-                    let encoded_source = encode_html_entities(&entry.source);
-                    let encoded_translation = encode_html_entities(translation);
-                    if passage_content.contains(&encoded_source) {
-                        passage_content = passage_content.replacen(&encoded_source, &encoded_translation, 1);
+                    // Restore variables in both source and translation
+                    let var_map = get_var_map(entry);
+                    let original_source = restore_variables(&entry.source, &var_map);
+                    let final_translation = restore_variables(translation, &var_map);
+
+                    let encoded_source = encode_html_entities(&original_source);
+                    let encoded_translation = encode_html_entities(&final_translation);
+
+                    // Use tag-safe replacement to avoid replacing inside HTML attributes
+                    let (new_content, did_replace) =
+                        replace_in_text_only(&passage_content, &encoded_source, &encoded_translation);
+                    if did_replace {
+                        passage_content = new_content;
                         written += 1;
                     }
                 }
@@ -415,7 +558,6 @@ impl FormatPlugin for SugarCubePlugin {
             result.push_str(&content[search_from..]);
         }
 
-        // Count skipped
         for entry in entries {
             if entry.translation.is_none() {
                 skipped += 1;
@@ -438,6 +580,47 @@ fn encode_html_entities(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// Replace source text in passage content, but ONLY when the match is NOT inside
+/// an HTML-encoded tag (&lt;...&gt;). This prevents accidentally modifying
+/// image paths, href attributes, class names, etc.
+fn replace_in_text_only(passage: &str, source: &str, replacement: &str) -> (String, bool) {
+    if source.is_empty() {
+        return (passage.to_string(), false);
+    }
+
+    let mut pos = 0;
+    while let Some(match_pos) = passage[pos..].find(source) {
+        let abs_pos = pos + match_pos;
+
+        // Check if this position is inside an HTML-encoded tag
+        if !is_inside_encoded_tag(passage, abs_pos) {
+            let mut result = String::with_capacity(passage.len());
+            result.push_str(&passage[..abs_pos]);
+            result.push_str(replacement);
+            result.push_str(&passage[abs_pos + source.len()..]);
+            return (result, true);
+        }
+
+        pos = abs_pos + 1;
+    }
+
+    (passage.to_string(), false)
+}
+
+/// Check if a position in HTML-encoded passage content falls inside a tag.
+/// Tags are encoded as &lt;...&gt; in the passage data.
+fn is_inside_encoded_tag(s: &str, pos: usize) -> bool {
+    let before = &s[..pos];
+    let last_lt = before.rfind("&lt;");
+    let last_gt = before.rfind("&gt;");
+
+    match (last_lt, last_gt) {
+        (Some(lt_pos), Some(gt_pos)) => lt_pos > gt_pos,
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -505,7 +688,6 @@ The adventure awaits!</tw-passagedata>
         create_fixture(&dir);
         let plugin = SugarCubePlugin::new();
         let entries = plugin.extract(&dir).unwrap();
-        // No entry should contain <<set or <<if
         for e in &entries {
             assert!(!e.source.contains("<<"), "source should not contain macros: {}", e.source);
         }
@@ -536,5 +718,57 @@ The adventure awaits!</tw-passagedata>
         let entries = plugin.extract(&dir).unwrap();
         assert!(entries.iter().any(|e| e.context == Some("Start".to_string())));
         assert!(entries.iter().any(|e| e.context == Some("next".to_string())));
+    }
+
+    #[test]
+    fn test_protect_variables() {
+        let (protected, vars) = protect_variables("Hey $name, how are you?");
+        assert_eq!(protected, "Hey {0}, how are you?");
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].1, "$name");
+
+        let restored = restore_variables("Hola {0}, ¿cómo estás?", &vars);
+        assert_eq!(restored, "Hola $name, ¿cómo estás?");
+    }
+
+    #[test]
+    fn test_protect_temp_variables() {
+        let (protected, vars) = protect_variables("Value is _contents here");
+        assert!(protected.contains("{0}"));
+        assert_eq!(vars[0].1, "_contents");
+    }
+
+    #[test]
+    fn test_skip_system_passages() {
+        assert!(is_system_passage("PassageReady", ""));
+        assert!(is_system_passage("PassageDone", ""));
+        assert!(is_system_passage("StoryInit", ""));
+        assert!(is_system_passage("SomeWidget", "widget"));
+        assert!(!is_system_passage("Introduction", ""));
+    }
+
+    #[test]
+    fn test_tag_safe_replacement() {
+        let passage = "Clothes are nice &lt;img src=&quot;Images/Clothes/1.webp&quot;&gt;";
+        let (result, replaced) = replace_in_text_only(passage, "Clothes", "Ropa");
+        assert!(replaced);
+        // Should replace the visible text "Clothes" but NOT the one in the img tag
+        assert!(result.starts_with("Ropa"));
+        assert!(result.contains("Images/Clothes/1.webp"));
+    }
+
+    #[test]
+    fn test_skip_widget_passages() {
+        let html = r#"<tw-passagedata pid="1" name="widgets" tags="widget">&lt;&lt;widget "test"&gt;&gt;_contents&lt;&lt;/widget&gt;&gt;</tw-passagedata>"#;
+        let entries = SugarCubePlugin::extract_passages(html, Path::new("test.html"));
+        assert!(entries.is_empty(), "widget passages should be skipped");
+    }
+
+    #[test]
+    fn test_bare_variable_filtered() {
+        assert!(!is_extractable_line("_contents"));
+        assert!(!is_extractable_line("$name"));
+        assert!(!is_extractable_line("Images/Clothes/1.webp"));
+        assert!(is_extractable_line("Hello world"));
     }
 }

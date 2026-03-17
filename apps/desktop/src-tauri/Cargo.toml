@@ -8,12 +8,20 @@ license.workspace = true
 [dependencies]
 locust-core = { path = "../../../crates/core" }
 locust-server = { path = "../../../crates/server" }
+locust-formats = { path = "../../../crates/formats" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 human-panic = "2"
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
 tauri = { version = "2.10.3", features = ["custom-protocol"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+portpicker = "0.1"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::AbortHandle;
 use tower_http::cors::CorsLayer;
 
@@ -20,12 +22,18 @@ use locust_core::font_validation::{FontCoverageReport, FontValidator};
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
 use locust_core::translation::{ProviderRegistry, TranslationManager, TranslationOptions};
-use locust_core::validation::{ValidationReport, Validator};
+use locust_core::validation::Validator;
 
 type ApiError = (StatusCode, String);
 
 fn err(status: StatusCode, msg: impl ToString) -> ApiError {
     (status, msg.to_string())
+}
+
+/// Per-job state: abort handle + broadcast sender for progress events
+pub struct JobState {
+    pub abort_handle: AbortHandle,
+    pub progress_tx: broadcast::Sender<ProgressEvent>,
 }
 
 // ─── State ─────────────────────────────────────────────────────────────────
@@ -45,8 +53,39 @@ pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub backup_manager: Arc<BackupManager>,
     pub global_memory: Arc<GlobalMemoryDb>,
-    pub active_jobs: Arc<DashMap<String, AbortHandle>>,
+    pub active_jobs: Arc<DashMap<String, JobState>>,
     pub current_project: Arc<RwLock<Option<ProjectInfo>>>,
+}
+
+/// Create production AppState with persistent storage in the user data directory.
+pub fn create_app_state() -> Arc<AppState> {
+    let data_dir = AppConfig::config_dir();
+    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+
+    let db_path = data_dir.join("project.db");
+    let db = Arc::new(Database::open(&db_path).expect("Failed to open project database"));
+    let glossary = Arc::new(Glossary::new(db.clone()));
+    let backup_root = data_dir.join("backups");
+    std::fs::create_dir_all(&backup_root).ok();
+
+    let config = AppConfig::load(&AppConfig::default_path()).unwrap_or_default();
+    let format_registry = locust_formats::default_registry();
+    let provider_registry = locust_providers::default_registry(&config);
+
+    let global_memory = GlobalMemoryDb::open_default()
+        .unwrap_or_else(|_| GlobalMemoryDb::open_in_memory().unwrap());
+
+    Arc::new(AppState {
+        format_registry: Arc::new(format_registry),
+        provider_registry: Arc::new(RwLock::new(provider_registry)),
+        db,
+        glossary,
+        config: Arc::new(RwLock::new(config)),
+        backup_manager: Arc::new(BackupManager::new(backup_root)),
+        global_memory: Arc::new(global_memory),
+        active_jobs: Arc::new(DashMap::new()),
+        current_project: Arc::new(RwLock::new(None)),
+    })
 }
 
 pub fn create_test_state() -> Arc<AppState> {
@@ -86,6 +125,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/stats", get(get_stats))
         .route("/api/translate/start", post(translate_start))
         .route("/api/translate/cancel/:job_id", post(translate_cancel))
+        .route("/api/translate/ws/:job_id", get(translate_ws))
         .route("/api/inject", post(inject))
         .route("/api/validate", post(validate))
         .route("/api/glossary", get(get_glossary).post(add_glossary))
@@ -198,10 +238,13 @@ async fn project_open(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenProjectRequest>,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
-    let path = PathBuf::from(&req.path);
-    if !path.exists() {
+    let raw_path = PathBuf::from(&req.path);
+    if !raw_path.exists() {
         return Err(err(StatusCode::BAD_REQUEST, "path not found"));
     }
+
+    // Resolve executable/file path to game root
+    let path = locust_core::extraction::resolve_game_root(&raw_path, &state.format_registry);
 
     let plugin = state
         .format_registry
@@ -390,7 +433,9 @@ async fn translate_start(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "provider not found"))?;
 
     let job_id = uuid::Uuid::new_v4().to_string();
-    let (tx, _rx) = mpsc::channel::<ProgressEvent>(1000);
+    let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1000);
+    let (broadcast_tx, _) = broadcast::channel::<ProgressEvent>(1000);
+    let broadcast_tx_clone = broadcast_tx.clone();
 
     let entries = state
         .db
@@ -402,13 +447,31 @@ async fn translate_start(
     let cancel_clone = cancel.clone();
     let job_id_clone = job_id.clone();
 
+    // Bridge mpsc → broadcast so WebSocket clients can subscribe
+    let jobs = state.active_jobs.clone();
+    let cleanup_job_id = job_id.clone();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let is_terminal = matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
+            let _ = broadcast_tx_clone.send(event);
+            if is_terminal {
+                break;
+            }
+        }
+        // Clean up job after completion
+        jobs.remove(&cleanup_job_id);
+    });
+
     let handle = tokio::spawn(async move {
         let _ = manager
             .translate_entries(entries, req.options, tx, job_id_clone, cancel_clone)
             .await;
     });
 
-    state.active_jobs.insert(job_id.clone(), handle.abort_handle());
+    state.active_jobs.insert(job_id.clone(), JobState {
+        abort_handle: handle.abort_handle(),
+        progress_tx: broadcast_tx,
+    });
 
     Ok(Json(TranslateStartResponse { job_id }))
 }
@@ -417,12 +480,62 @@ async fn translate_cancel(
     State(state): State<Arc<AppState>>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    if let Some((_, handle)) = state.active_jobs.remove(&job_id) {
-        handle.abort();
+    if let Some((_, job)) = state.active_jobs.remove(&job_id) {
+        job.abort_handle.abort();
         Ok(StatusCode::OK)
     } else {
         Err(err(StatusCode::NOT_FOUND, "job not found"))
     }
+}
+
+async fn translate_ws(
+    State(state): State<Arc<AppState>>,
+    AxumPath(job_id): AxumPath<String>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let rx = state
+        .active_jobs
+        .get(&job_id)
+        .map(|job| job.progress_tx.subscribe());
+
+    ws.on_upgrade(move |socket| handle_translate_ws(socket, rx))
+}
+
+async fn handle_translate_ws(
+    mut socket: WebSocket,
+    rx: Option<broadcast::Receiver<ProgressEvent>>,
+) {
+    let Some(mut rx) = rx else {
+        let _ = socket
+            .send(Message::Text(
+                serde_json::json!({"type": "failed", "error": "job not found"}).to_string().into(),
+            ))
+            .await;
+        let _ = socket.close().await;
+        return;
+    };
+
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let is_terminal = matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
+                let json = serde_json::to_string(&event).unwrap_or_default();
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+                if is_terminal {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("WS client lagged by {} messages", n);
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                break;
+            }
+        }
+    }
+    let _ = socket.close().await;
 }
 
 #[derive(Deserialize)]
@@ -623,6 +736,8 @@ async fn patch_config(
         }
     }
     *config = serde_json::from_value(current.clone()).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    // Persist to disk
+    let _ = config.save(&AppConfig::default_path());
     Ok(Json(current))
 }
 

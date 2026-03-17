@@ -38,12 +38,12 @@ locust providers                    # List translation providers
 
 ## Session Log
 
-See `session/session.md` for full development history (26 prompts implemented).
+See `session/session.md` for full development history (28 prompts implemented).
 
 ## Pending Work
 
 - HTML game format plugin
-- Unity game format plugin
-- Unreal Engine format plugin
-- Full Tauri desktop build (needs Tauri CLI setup)
-- WebSocket endpoint implementation for live progress
+- Full Tauri desktop build verification (needs `tauri build` on each platform)
+- End-to-end testing with real game projects
+- Translation memory UI page
+- Keyboard shortcuts / hotkeys system
