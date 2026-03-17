@@ -932,13 +932,22 @@ impl FormatPlugin for RenPyPlugin {
         //   translate <lang> strings:
         //       old "source text"
         //       new "translated text"
-        let mut string_pairs: Vec<(&str, &str)> = Vec::new();
+        //
+        // IMPORTANT: Ren'Py throws an exception on duplicate `old` entries,
+        // so we deduplicate by source text (first translation wins).
+        use std::collections::HashSet;
+        let mut seen_sources: HashSet<String> = HashSet::new();
+        let mut string_pairs: Vec<(String, String)> = Vec::new();
 
         for entry in entries {
             if let Some(ref translation) = entry.translation {
                 if translation != &entry.source {
-                    string_pairs.push((&entry.source, translation.as_str()));
-                    strings_written += 1;
+                    if seen_sources.insert(entry.source.clone()) {
+                        string_pairs.push((entry.source.clone(), translation.clone()));
+                        strings_written += 1;
+                    } else {
+                        strings_skipped += 1;
+                    }
                 } else {
                     strings_skipped += 1;
                 }
