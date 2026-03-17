@@ -185,9 +185,14 @@ impl MultiLangInjector {
         output_dir: Option<PathBuf>,
         tx: mpsc::Sender<ProgressEvent>,
     ) -> Result<MultiLangReport> {
-        // Create backup
-        let backup = self.backup_manager.create_backup(project_path)?;
-        let backup_id = backup.id.clone();
+        // Create backup (best-effort — skip if paths too long on Windows)
+        let backup_id = match self.backup_manager.create_backup(project_path) {
+            Ok(backup) => backup.id.clone(),
+            Err(e) => {
+                tracing::warn!("Backup failed (continuing without backup): {}", e);
+                "none".to_string()
+            }
+        };
 
         let plugin = self.registry.get(format_id).ok_or_else(|| {
             LocustError::UnsupportedFormat(format!("format not found: {}", format_id))

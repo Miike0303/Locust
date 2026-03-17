@@ -361,7 +361,9 @@ async fn cmd_inject(
 
     let format_id = plugin.id().to_string();
 
-    let backup_root = game_path.join(".locust_backups");
+    // Use short temp path for backups to avoid Windows MAX_PATH issues
+    let backup_root = std::env::temp_dir().join("locust_bak");
+    std::fs::create_dir_all(&backup_root).ok();
     let backup_mgr = Arc::new(BackupManager::new(backup_root));
 
     println!("Creating backup...");
