@@ -926,54 +926,47 @@ impl FormatPlugin for RenPyPlugin {
         let mut strings_written = 0;
         let mut strings_skipped = 0;
 
-        // Group by source file
-        let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
+        // Ren'Py translate strings block: works for all string types (say, menu, define, etc.)
+        // This is the most reliable translation method as it doesn't depend on internal hash IDs.
+        // Format:
+        //   translate <lang> strings:
+        //       old "source text"
+        //       new "translated text"
+        let mut string_pairs: Vec<(&str, &str)> = Vec::new();
+
         for entry in entries {
-            let filename = entry
-                .file_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            by_file.entry(filename).or_default().push(entry);
-        }
-
-        for (filename, file_entries) in &by_file {
-            let tl_file = tl_dir.join(filename);
-            let mut lines = Vec::new();
-
-            for (_idx, entry) in file_entries.iter().enumerate() {
-                if let Some(ref translation) = entry.translation {
-                    // Extract just the line number from the entry ID (format: "filename#linenum")
-                    let line_part = entry.id.split('#').last().unwrap_or("0");
-                    let block_id = format!(
-                        "{}_{}",
-                        filename.replace('.', "_"),
-                        line_part
-                    );
-                    let speaker = entry.context.as_deref().unwrap_or("");
-
-                    lines.push(format!("translate {} {}:", lang, block_id));
-                    lines.push(format!("    # {}", entry.source));
-                    if speaker.is_empty() {
-                        lines.push(format!("    \"{}\"", translation));
-                    } else {
-                        lines.push(format!("    {} \"{}\"", speaker, translation));
-                    }
-                    lines.push(String::new());
+            if let Some(ref translation) = entry.translation {
+                if translation != &entry.source {
+                    string_pairs.push((&entry.source, translation.as_str()));
                     strings_written += 1;
                 } else {
                     strings_skipped += 1;
                 }
-            }
-
-            if !lines.is_empty() {
-                std::fs::write(&tl_file, lines.join("\n"))?;
+            } else {
+                strings_skipped += 1;
             }
         }
 
+        if !string_pairs.is_empty() {
+            let mut lines = Vec::new();
+            lines.push(format!("translate {} strings:", lang));
+            lines.push(String::new());
+
+            for (source, translation) in &string_pairs {
+                // Escape quotes in strings
+                let escaped_source = source.replace('\\', "\\\\").replace('"', "\\\"");
+                let escaped_translation = translation.replace('\\', "\\\\").replace('"', "\\\"");
+                lines.push(format!("    old \"{}\"", escaped_source));
+                lines.push(format!("    new \"{}\"", escaped_translation));
+                lines.push(String::new());
+            }
+
+            let tl_file = tl_dir.join("locust_strings.rpy");
+            std::fs::write(&tl_file, lines.join("\n"))?;
+        }
+
         Ok(InjectionReport {
-            files_modified: by_file.len(),
+            files_modified: 1,
             strings_written,
             strings_skipped,
             warnings: Vec::new(),
