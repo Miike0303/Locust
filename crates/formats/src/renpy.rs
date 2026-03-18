@@ -133,19 +133,66 @@ impl RenPyPlugin {
             };
 
             let mut modified = false;
-            let mut new_content = content.clone();
+            let mut new_lines: Vec<String> = Vec::new();
 
-            for (source, translation) in &translation_map {
-                let search = format!("\"{}\"", source);
-                // Escape unescaped quotes in translation to preserve Ren'Py syntax
-                let safe_trans = escape_inner_quotes(translation);
-                let replace = format!("\"{}\"", safe_trans);
-                if new_content.contains(&search) {
-                    new_content = new_content.replace(&search, &replace);
-                    modified = true;
-                    strings_written += 1;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                // Skip lines that are code/UI declarations — these contain Ren'Py keywords
+                // whose string arguments must NOT be translated
+                let is_code_line = trimmed.starts_with("screen ")
+                    || trimmed.starts_with("style ")
+                    || trimmed.starts_with("transform ")
+                    || trimmed.starts_with("define ")
+                    || trimmed.starts_with("default ")
+                    || trimmed.starts_with("init ")
+                    || trimmed.starts_with("label ")
+                    || trimmed.starts_with("image ")
+                    || trimmed.starts_with("$")
+                    || trimmed.starts_with("python:")
+                    || trimmed.contains("Preference(")
+                    || trimmed.contains("SetField(")
+                    || trimmed.contains("SetVariable(")
+                    || trimmed.contains("ToggleField(")
+                    || trimmed.contains("ToggleVariable(")
+                    || trimmed.contains("action ")
+                    || trimmed.contains("Function(")
+                    || trimmed.contains("renpy.")
+                    || trimmed.contains("config.")
+                    || trimmed.contains("persistent.")
+                    || trimmed.contains("style_prefix")
+                    || trimmed.starts_with("use ")
+                    || trimmed.starts_with("has ")
+                    || trimmed.starts_with("at ")
+                    || trimmed.starts_with("frame:")
+                    || trimmed.starts_with("vbox:")
+                    || trimmed.starts_with("hbox:")
+                    || trimmed.starts_with("grid ")
+                    || trimmed.starts_with("xalign ")
+                    || trimmed.starts_with("yalign ")
+                    || trimmed.starts_with("xsize ")
+                    || trimmed.starts_with("ysize ")
+                    || trimmed.starts_with("xpos ")
+                    || trimmed.starts_with("ypos ");
+
+                if is_code_line {
+                    new_lines.push(line.to_string());
+                    continue;
                 }
+
+                let mut new_line = line.to_string();
+                for (source, translation) in &translation_map {
+                    let search = format!("\"{}\"", source);
+                    if new_line.contains(&search) {
+                        let safe_trans = escape_inner_quotes(translation);
+                        let replace = format!("\"{}\"", safe_trans);
+                        new_line = new_line.replace(&search, &replace);
+                        modified = true;
+                        strings_written += 1;
+                    }
+                }
+                new_lines.push(new_line);
             }
+            let new_content = new_lines.join("\n");
 
             if modified {
                 // Write translated .rpy to game/ dir (preserving subdirectory structure)
