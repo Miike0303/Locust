@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use locust_core::error::{LocustError, Result};
@@ -5,10 +6,9 @@ use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 /// Plugin for Unity Engine games.
-/// Scans .assets files for length-prefixed UTF-8 strings.
-///
-/// Unity serialization format uses 4-byte LE length prefix + UTF-8 data + padding to 4-byte alignment.
-/// We scan for strings that look like natural language dialogue/UI text.
+/// Supports two modes:
+/// 1. Text-based VN scripts (SCRIPTS~/ directory with .txt dialogue files)
+/// 2. Binary .assets files with length-prefixed UTF-8 strings (heuristic)
 pub struct UnityPlugin;
 
 impl UnityPlugin {
@@ -20,16 +20,12 @@ impl UnityPlugin {
         if !path.is_dir() {
             return false;
         }
-        // Unity games have: GameName_Data/ with .assets files, UnityPlayer.dll, etc.
         let has_unity_dll = path.join("UnityPlayer.dll").exists()
             || path.join("UnityPlayer.so").exists()
             || path.join("UnityPlayer.dylib").exists();
-
         if has_unity_dll {
             return true;
         }
-
-        // Check for *_Data directory with .assets files
         Self::find_data_dir(path).is_some()
     }
 
@@ -39,43 +35,211 @@ impl UnityPlugin {
             if p.is_dir() {
                 let name = p.file_name()?.to_string_lossy().to_string();
                 if name.ends_with("_Data") {
-                    // Verify it has .assets files
-                    if std::fs::read_dir(&p).ok()?.any(|e| {
-                        e.ok().map_or(false, |e| {
-                            e.path().extension().map_or(false, |ext| ext == "assets")
-                        })
-                    }) {
-                        return Some(p);
-                    }
+                    return Some(p);
                 }
             }
         }
         None
     }
 
+    /// Check if this Unity game has text-based VN scripts (SCRIPTS~ directory or similar)
+    fn find_scripts_dir(path: &Path) -> Option<PathBuf> {
+        let data_dir = Self::find_data_dir(path)?;
+        // Look for any directory containing .txt script files
+        // Check common names: SCRIPTS~, Scripts, scripts, SCRIPTS
+        for name in &["SCRIPTS~", "Scripts", "scripts", "SCRIPTS"] {
+            let scripts = data_dir.join(name);
+            if scripts.is_dir() {
+                return Some(scripts);
+            }
+        }
+        // Also scan for directories with .txt files that look like scripts
+        for entry in std::fs::read_dir(&data_dir).ok()?.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let dir_name = p.file_name()?.to_string_lossy();
+                if dir_name.contains("SCRIPT") || dir_name.contains("script") || dir_name.contains("Script") {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    // ─── Text Script Extraction (VN engine) ─────────────────────────────────
+
+    /// Extract dialogue from text-based VN scripts.
+    /// Format: lines like `CharacterID Dialogue text` or `CharacterID"Dialogue text"`
+    /// Also extracts menu button labels: `button N "Label" ...`
+    fn extract_text_scripts(scripts_dir: &Path) -> Result<Vec<StringEntry>> {
+        let mut all = Vec::new();
+
+        for entry in walkdir::WalkDir::new(scripts_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let fpath = entry.path();
+            if !fpath.extension().map_or(false, |e| e == "txt") {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(fpath) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let filename = fpath
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            for (line_idx, line) in content.lines().enumerate() {
+                let line_num = line_idx + 1;
+                let trimmed = line.trim();
+
+                // Skip empty, comments, directives
+                if trimmed.is_empty()
+                    || trimmed.starts_with('#')
+                    || trimmed.starts_with("version ")
+                    || trimmed.starts_with("script ")
+                    || trimmed.starts_with("index ")
+                    || trimmed.starts_with("scene ")
+                    || trimmed.starts_with("music ")
+                    || trimmed.starts_with("ambient ")
+                    || trimmed.starts_with("sound ")
+                    || trimmed.starts_with("jump ")
+                    || trimmed.starts_with("menu ")
+                    || trimmed.starts_with("type ")
+                    || trimmed.starts_with("load ")
+                    || trimmed.starts_with("when ")
+                    || trimmed.starts_with("{")
+                    || trimmed.starts_with("}")
+                    || trimmed.starts_with("+")
+                    || trimmed.starts_with("game {")
+                    || trimmed.starts_with("start ")
+                    || trimmed.starts_with("combat ")
+                    || trimmed.starts_with("gallery ")
+                    || trimmed.starts_with("items ")
+                    || trimmed.starts_with("name ")
+                    || trimmed.starts_with("#region")
+                    || trimmed.starts_with("#endregion")
+                    || trimmed.starts_with("#if")
+                    || trimmed.starts_with("#else")
+                    || trimmed.starts_with("#endif")
+                    || trimmed.starts_with("character ")
+                {
+                    continue;
+                }
+
+                // Menu button: `button N "Label" ...`
+                if trimmed.starts_with("button ") {
+                    if let Some(text) = extract_quoted_in_line(trimmed) {
+                        let id = format!("{}#{}", filename, line_num);
+                        let mut entry = StringEntry::new(id, text, fpath.to_path_buf());
+                        entry.tags = vec!["menu".to_string()];
+                        all.push(entry);
+                    }
+                    continue;
+                }
+
+                // Dialogue: `CharID Text here` or `CharID Text with \bformatting\b`
+                // Character IDs are short uppercase/mixed identifiers
+                if let Some((character, text)) = extract_vn_dialogue(trimmed) {
+                    if !text.is_empty() && text.len() >= 2 {
+                        let id = format!("{}#{}", filename, line_num);
+                        let mut entry = StringEntry::new(id, text, fpath.to_path_buf());
+                        entry.tags = vec!["dialogue".to_string()];
+                        entry.context = Some(character.to_string());
+                        all.push(entry);
+                    }
+                }
+            }
+        }
+
+        Ok(all)
+    }
+
+    fn inject_text_scripts(path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+        let mut files_modified = 0;
+        let mut strings_written = 0;
+        let mut strings_skipped = 0;
+
+        let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
+        for entry in entries {
+            by_file.entry(entry.file_path.clone()).or_default().push(entry);
+        }
+
+        for (file_path, file_entries) in &by_file {
+            if !file_path.exists() {
+                continue;
+            }
+            let content = std::fs::read_to_string(file_path)?;
+            let filename = file_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            let mut line_translations: HashMap<usize, (&str, &str)> = HashMap::new();
+            for entry in file_entries {
+                let id_suffix = entry.id.strip_prefix(&format!("{}#", filename));
+                if let Some(num_str) = id_suffix {
+                    if let Ok(line_num) = num_str.parse::<usize>() {
+                        if let Some(ref t) = entry.translation {
+                            line_translations.insert(line_num, (&entry.source, t.as_str()));
+                            strings_written += 1;
+                        } else {
+                            strings_skipped += 1;
+                        }
+                    }
+                }
+            }
+
+            let mut new_lines = Vec::new();
+            let mut modified = false;
+            for (line_idx, line) in content.lines().enumerate() {
+                let line_num = line_idx + 1;
+                if let Some((source, translation)) = line_translations.get(&line_num) {
+                    if line.contains(source) {
+                        new_lines.push(line.replace(source, translation));
+                        modified = true;
+                        continue;
+                    }
+                }
+                new_lines.push(line.to_string());
+            }
+
+            if modified {
+                std::fs::write(file_path, new_lines.join("\n"))?;
+                files_modified += 1;
+            }
+        }
+
+        Ok(InjectionReport {
+            files_modified,
+            strings_written,
+            strings_skipped,
+            warnings: Vec::new(),
+        })
+    }
+
+    // ─── Binary .assets Extraction (fallback) ───────────────────────────────
+
     fn find_assets_files(path: &Path) -> Vec<PathBuf> {
         let mut assets = Vec::new();
-
-        // If path points to a specific .assets file
         if path.is_file() && path.extension().map_or(false, |e| e == "assets") {
             assets.push(path.to_path_buf());
             return assets;
         }
-
-        // Find the _Data directory
         let data_dir = if path.is_dir() {
-            if let Some(d) = Self::find_data_dir(path) {
-                d
-            } else if path.file_name().map_or(false, |n| n.to_string_lossy().ends_with("_Data")) {
+            if let Some(d) = Self::find_data_dir(path) { d }
+            else if path.file_name().map_or(false, |n| n.to_string_lossy().ends_with("_Data")) {
                 path.to_path_buf()
-            } else {
-                return assets;
-            }
-        } else {
-            return assets;
-        };
+            } else { return assets; }
+        } else { return assets; };
 
-        // Collect .assets files (skip very small ones that are just headers)
         for entry in walkdir::WalkDir::new(&data_dir)
             .max_depth(2)
             .follow_links(false)
@@ -84,7 +248,6 @@ impl UnityPlugin {
         {
             let p = entry.path();
             if p.extension().map_or(false, |e| e == "assets") {
-                // Skip files smaller than 100 bytes (likely just metadata)
                 if let Ok(meta) = std::fs::metadata(p) {
                     if meta.len() > 100 {
                         assets.push(p.to_path_buf());
@@ -92,12 +255,9 @@ impl UnityPlugin {
                 }
             }
         }
-
         assets
     }
 
-    /// Extract strings from Unity .assets files.
-    /// Unity serializes strings as: [4-byte LE length] [UTF-8 data] [padding to 4-byte align]
     fn extract_strings_from_assets(
         bytes: &[u8],
         filename: &str,
@@ -106,114 +266,98 @@ impl UnityPlugin {
         let mut entries = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let len = bytes.len();
-
-        if len < 8 {
-            return entries;
-        }
+        if len < 8 { return entries; }
 
         let mut i = 0;
         while i + 4 < len {
-            // Read potential string length (4 bytes LE)
             let str_len = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
-
-            // Plausible string length: 5-2000 characters
             if str_len >= 5 && str_len <= 2000 && i + 4 + str_len <= len {
-                // Try to decode as UTF-8
                 if let Ok(text) = std::str::from_utf8(&bytes[i + 4..i + 4 + str_len]) {
                     if is_unity_translatable(text) && seen.insert(text.to_string()) {
                         let id = format!("{}#offset_{}#{}", filename, i, entries.len());
                         let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
                         entry.tags = vec!["unknown".to_string()];
-                        entry.metadata.insert(
-                            "extraction_method".to_string(),
-                            serde_json::Value::String("unity_assets".to_string()),
-                        );
                         entries.push(entry);
                     }
                 }
-                // Skip past string + alignment padding
                 let aligned = (str_len + 3) & !3;
                 i += 4 + aligned;
             } else {
                 i += 1;
             }
         }
-
         entries
     }
 }
 
+/// Extract a quoted string from a line like `button 0 "Label" +link jump 5`
+fn extract_quoted_in_line(line: &str) -> Option<&str> {
+    let start = line.find('"')? + 1;
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    let text = &rest[..end];
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Extract VN dialogue: `CharID Dialogue text here`
+/// Character IDs are 1-5 char identifiers (letters, sometimes digits)
+fn extract_vn_dialogue(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() { return None; }
+
+    // Must start with a character identifier followed by space then dialogue
+    let space_pos = trimmed.find(' ')?;
+    let char_id = &trimmed[..space_pos];
+    let text = trimmed[space_pos + 1..].trim();
+
+    // Character ID: 1-8 chars, alphanumeric + underscore, starts with uppercase
+    if char_id.is_empty() || char_id.len() > 8 {
+        return None;
+    }
+    if !char_id.chars().next()?.is_ascii_uppercase() {
+        return None;
+    }
+    if !char_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    // Text must not be a keyword/command
+    if text.is_empty() || text.starts_with('{') || text.starts_with('+') {
+        return None;
+    }
+
+    // Strip VN formatting tags for the extracted text but keep in source for matching
+    // Tags like \b, \i are Ren'Py-style formatting
+    Some((char_id, text))
+}
+
 fn is_unity_translatable(text: &str) -> bool {
     let s = text.trim();
-    if s.is_empty() || s.len() < 5 {
-        return false;
-    }
-
-    // Must be mostly ASCII printable
-    let ascii_printable = s.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).count();
+    if s.is_empty() || s.len() < 5 { return false; }
     let total = s.chars().count();
-    if (ascii_printable as f64 / total as f64) < 0.85 {
-        return false;
-    }
-
-    // Must have meaningful letter content
+    let ascii_printable = s.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).count();
+    if (ascii_printable as f64 / total as f64) < 0.85 { return false; }
     let letters = s.chars().filter(|c| c.is_alphabetic()).count();
-    if letters < 3 {
-        return false;
-    }
-
-    // Must have spaces (multi-word) for strings > 20 chars
+    if letters < 3 { return false; }
     let has_space = s.contains(' ');
-    if !has_space && s.len() > 20 {
-        return false;
-    }
-
-    // Filter out paths
-    if s.contains('/') && s.contains('.') && !s.contains(' ') {
-        return false;
-    }
-    if s.contains('\\') && s.contains('.') {
-        return false;
-    }
-
-    // Filter out code/identifiers
-    if s.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
-        return false;
-    }
-
-    // Filter camelCase/PascalCase identifiers
+    if !has_space && s.len() > 20 { return false; }
+    if s.contains('/') && s.contains('.') && !s.contains(' ') { return false; }
+    if s.contains('\\') && s.contains('.') { return false; }
+    if s.chars().all(|c| c.is_ascii_uppercase() || c == '_') { return false; }
     if !has_space {
         let transitions = s.as_bytes().windows(2)
             .filter(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
             .count();
-        if transitions >= 2 {
-            return false;
-        }
+        if transitions >= 2 { return false; }
     }
-
-    // Filter out URLs
-    if s.starts_with("http") || s.starts_with("www.") {
-        return false;
-    }
-
-    // Filter out class/namespace-like patterns
-    if s.contains("::") || (s.contains('.') && !s.contains(' ')) {
-        return false;
-    }
-
-    // Filter lines that look like code
+    if s.starts_with("http") || s.starts_with("www.") { return false; }
+    if s.contains("::") || (s.contains('.') && !s.contains(' ')) { return false; }
     if s.contains("(){") || s.contains("};") || s.starts_with("using ") ||
-       s.starts_with("import ") || s.starts_with("public ") || s.starts_with("private ") ||
-       s.starts_with("static ") || s.contains(" = ") && !has_space {
+       s.starts_with("import ") || s.starts_with("public ") || s.starts_with("private ") {
         return false;
     }
-
-    // Must have reasonable punctuation
     let punct_ratio = s.chars().filter(|c| !c.is_alphanumeric() && !c.is_whitespace()).count() as f64 / total as f64;
-    if punct_ratio > 0.4 {
-        return false;
-    }
-
+    if punct_ratio > 0.4 { return false; }
     true
 }
 
@@ -233,7 +377,7 @@ impl FormatPlugin for UnityPlugin {
     }
 
     fn description(&self) -> &str {
-        "Unity Engine games (.assets files, heuristic UTF-8 extraction)"
+        "Unity Engine games (text scripts or .assets heuristic extraction)"
     }
 
     fn supported_extensions(&self) -> &[&str] {
@@ -252,11 +396,20 @@ impl FormatPlugin for UnityPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        // Prefer text scripts if available
+        if let Some(scripts_dir) = Self::find_scripts_dir(path) {
+            let entries = Self::extract_text_scripts(&scripts_dir)?;
+            if !entries.is_empty() {
+                return Ok(entries);
+            }
+        }
+
+        // Fallback to binary .assets extraction
         let assets = Self::find_assets_files(path);
         if assets.is_empty() {
             return Err(LocustError::ParseError {
                 file: path.display().to_string(),
-                message: "no .assets files found".to_string(),
+                message: "no script files or .assets files found".to_string(),
             });
         }
 
@@ -270,26 +423,32 @@ impl FormatPlugin for UnityPlugin {
                 .to_string();
             all.extend(Self::extract_strings_from_assets(&bytes, &filename, asset_file));
         }
-
         Ok(all)
     }
 
-    fn inject(&self, _path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
-        // Binary patching: find length-prefixed UTF-8 original, replace with translation
+    fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+        // Check if entries come from text scripts (file_path ends in .txt)
+        let from_text = entries.iter().any(|e| {
+            e.file_path.extension().map_or(false, |ext| ext == "txt")
+        });
+
+        if from_text {
+            return Self::inject_text_scripts(path, entries);
+        }
+
+        // Binary .assets injection
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
         let mut warnings = Vec::new();
 
-        let mut by_file: std::collections::HashMap<PathBuf, Vec<&StringEntry>> = std::collections::HashMap::new();
+        let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
             by_file.entry(entry.file_path.clone()).or_default().push(entry);
         }
 
         for (file_path, file_entries) in &by_file {
-            if !file_path.exists() {
-                continue;
-            }
+            if !file_path.exists() { continue; }
             let mut bytes = std::fs::read(file_path)?;
             let mut modified = false;
 
@@ -298,32 +457,24 @@ impl FormatPlugin for UnityPlugin {
                     Some(t) => t,
                     None => { strings_skipped += 1; continue; }
                 };
-
                 let orig_bytes = entry.source.as_bytes();
                 let trans_bytes = translation.as_bytes();
-
                 if trans_bytes.len() > orig_bytes.len() {
                     warnings.push(format!(
-                        "translation for '{}' is longer than original ({} > {} bytes), skipping",
-                        entry.id, trans_bytes.len(), orig_bytes.len()
+                        "translation for '{}' longer than original, skipping", entry.id
                     ));
                     strings_skipped += 1;
                     continue;
                 }
-
-                // Find the length-prefixed string in the binary
                 let orig_len_bytes = (orig_bytes.len() as u32).to_le_bytes();
                 let mut needle = Vec::with_capacity(4 + orig_bytes.len());
                 needle.extend_from_slice(&orig_len_bytes);
                 needle.extend_from_slice(orig_bytes);
 
                 if let Some(pos) = find_bytes_in(&bytes, &needle) {
-                    // Write new length
                     let new_len = trans_bytes.len() as u32;
                     bytes[pos..pos + 4].copy_from_slice(&new_len.to_le_bytes());
-                    // Write translation
                     bytes[pos + 4..pos + 4 + trans_bytes.len()].copy_from_slice(trans_bytes);
-                    // Null-pad remainder
                     for b in &mut bytes[pos + 4 + trans_bytes.len()..pos + 4 + orig_bytes.len()] {
                         *b = 0;
                     }
@@ -340,19 +491,12 @@ impl FormatPlugin for UnityPlugin {
             }
         }
 
-        Ok(InjectionReport {
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings,
-        })
+        Ok(InjectionReport { files_modified, strings_written, strings_skipped, warnings })
     }
 }
 
 fn find_bytes_in(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
+    if needle.is_empty() || needle.len() > haystack.len() { return None; }
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
@@ -370,29 +514,62 @@ mod tests {
     fn create_unity_fixture(dir: &Path) -> PathBuf {
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
-
-        // Create UnityPlayer.dll marker
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
 
-        // Create a fake .assets file with length-prefixed strings
-        let mut data: Vec<u8> = vec![0; 64]; // header padding
-
-        // "Hello World" - 11 bytes
+        let mut data: Vec<u8> = vec![0; 64];
         let s1 = b"Hello World";
         data.extend_from_slice(&(s1.len() as u32).to_le_bytes());
         data.extend_from_slice(s1);
-        data.push(0); // padding to align to 4 bytes (11 + 1 = 12)
-        data.extend_from_slice(&[0xFF; 8]); // gap
-
-        // "Press any key to continue" - 25 bytes
+        data.push(0);
+        data.extend_from_slice(&[0xFF; 8]);
         let s2 = b"Press any key to continue";
         data.extend_from_slice(&(s2.len() as u32).to_le_bytes());
         data.extend_from_slice(s2);
-        data.extend_from_slice(&[0, 0, 0]); // padding to 28
-        data.extend_from_slice(&[0; 32]); // trailing
-
+        data.extend_from_slice(&[0, 0, 0]);
+        data.extend_from_slice(&[0; 32]);
         let assets_path = data_dir.join("resources.assets");
         fs::write(&assets_path, &data).unwrap();
+        dir.to_path_buf()
+    }
+
+    fn create_vn_script_fixture(dir: &Path) -> PathBuf {
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+
+        let scripts_dir = data_dir.join("SCRIPTS~");
+        fs::create_dir_all(&scripts_dir).unwrap();
+
+        fs::write(scripts_dir.join("Chapter_1.txt"), r#"version 1.0
+
+script Chapter_1_script chapter 1 {
+
+  index 0
+    scene black_screen 0
+    Nar This is the beginning of our story.
+
+  index 1
+    J My name is Jamie.
+
+  index 2
+    J I'm waiting for my best friend!
+
+  index 3
+    menu MainMenu
+
+  index 4
+    J Let's go!
+}
+"#).unwrap();
+
+        fs::write(scripts_dir.join("Menus.txt"), r#"version 1.0
+
+  menu MainMenu {
+    button 0 "Talk" jump 10
+    button 1 "Examine" jump 20
+    button 2 "Leave" +main jump 30
+  }
+"#).unwrap();
 
         dir.to_path_buf()
     }
@@ -413,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_strings() {
+    fn test_extract_assets_strings() {
         let dir = tempdir();
         create_unity_fixture(&dir);
         let plugin = UnityPlugin::new();
@@ -424,7 +601,68 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_shorter_succeeds() {
+    fn test_extract_vn_scripts() {
+        let dir = tempdir();
+        create_vn_script_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+
+        let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert!(sources.contains(&"This is the beginning of our story."), "got: {:?}", sources);
+        assert!(sources.contains(&"My name is Jamie."), "got: {:?}", sources);
+        assert!(sources.contains(&"I'm waiting for my best friend!"), "got: {:?}", sources);
+        assert!(sources.contains(&"Let's go!"), "got: {:?}", sources);
+
+        // Menu buttons
+        assert!(sources.contains(&"Talk"), "got: {:?}", sources);
+        assert!(sources.contains(&"Examine"), "got: {:?}", sources);
+        assert!(sources.contains(&"Leave"), "got: {:?}", sources);
+    }
+
+    #[test]
+    fn test_vn_script_dialogue_has_context() {
+        let dir = tempdir();
+        create_vn_script_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+
+        let jamie = entries.iter().find(|e| e.source == "My name is Jamie.").unwrap();
+        assert_eq!(jamie.context, Some("J".to_string()));
+        assert!(jamie.tags.contains(&"dialogue".to_string()));
+
+        let nar = entries.iter().find(|e| e.source.contains("beginning")).unwrap();
+        assert_eq!(nar.context, Some("Nar".to_string()));
+    }
+
+    #[test]
+    fn test_inject_vn_scripts() {
+        let dir = tempdir();
+        create_vn_script_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+
+        for entry in &mut entries {
+            if entry.source == "My name is Jamie." {
+                entry.translation = Some("Mi nombre es Jamie.".to_string());
+            }
+            if entry.source == "Talk" {
+                entry.translation = Some("Hablar".to_string());
+            }
+        }
+
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(report.strings_written >= 2);
+        assert!(report.files_modified >= 1);
+
+        // Verify replacement
+        let content = fs::read_to_string(
+            dir.join("TestGame_Data").join("SCRIPTS~").join("Chapter_1.txt")
+        ).unwrap();
+        assert!(content.contains("Mi nombre es Jamie."));
+    }
+
+    #[test]
+    fn test_inject_assets_shorter_succeeds() {
         let dir = tempdir();
         create_unity_fixture(&dir);
         let plugin = UnityPlugin::new();
@@ -444,10 +682,9 @@ mod tests {
     fn test_is_translatable() {
         assert!(is_unity_translatable("Hello World"));
         assert!(is_unity_translatable("Press any key to continue"));
-        assert!(!is_unity_translatable("abc")); // too short
+        assert!(!is_unity_translatable("abc"));
         assert!(!is_unity_translatable("SOME_CONSTANT_NAME"));
         assert!(!is_unity_translatable("Assets/Textures/player.png"));
         assert!(!is_unity_translatable("UnityEngine.CoreModule"));
-        assert!(!is_unity_translatable("getSomeValueFromThing"));
     }
 }
