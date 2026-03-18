@@ -463,17 +463,34 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
         return None;
     }
 
-    // Character say: `identifier "text"`
+    // Character say: `identifier "text"` or `identifier"text"` (no space)
+    // First try with space
     let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
     if parts.len() == 2 {
         let character = parts[0];
-        // Character must be a simple identifier
         if character
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             let rest = parts[1].trim();
             if rest.starts_with('"') {
+                let (text, _) = extract_quoted_string(rest)?;
+                if !text.is_empty() && !is_file_reference(text) {
+                    return Some((Some(character), text));
+                }
+            }
+        }
+    }
+
+    // Try no-space pattern: `identifier"text"` (e.g., mc"Hello")
+    if let Some(quote_pos) = trimmed.find('"') {
+        if quote_pos > 0 {
+            let character = &trimmed[..quote_pos];
+            if !character.is_empty()
+                && character.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !is_renpy_keyword(character)
+            {
+                let rest = &trimmed[quote_pos..];
                 let (text, _) = extract_quoted_string(rest)?;
                 if !text.is_empty() && !is_file_reference(text) {
                     return Some((Some(character), text));
@@ -507,19 +524,30 @@ fn is_dialogue_line(trimmed: &str) -> bool {
         return true;
     }
 
-    // Character say: `identifier "text"`
-    // Must be: simple_identifier<space>"text"
+    // Character say: `identifier "text"` or `identifier"text"` (no space)
     if let Some(space_pos) = trimmed.find(' ') {
         let before = &trimmed[..space_pos];
         let after = trimmed[space_pos + 1..].trim();
 
-        // Before must be a simple identifier (character variable name)
         let is_identifier = !before.is_empty()
             && before.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             && !is_renpy_keyword(before);
 
         if is_identifier && after.starts_with('"') {
             return true;
+        }
+    }
+
+    // No-space pattern: `mc"text"`
+    if let Some(quote_pos) = trimmed.find('"') {
+        if quote_pos > 0 {
+            let before = &trimmed[..quote_pos];
+            if !before.is_empty()
+                && before.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !is_renpy_keyword(before)
+            {
+                return true;
+            }
         }
     }
 
