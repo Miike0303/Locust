@@ -202,10 +202,33 @@ impl UnityPlugin {
             for (line_idx, line) in content.lines().enumerate() {
                 let line_num = line_idx + 1;
                 if let Some((source, translation)) = line_translations.get(&line_num) {
-                    if line.contains(source) {
-                        new_lines.push(line.replace(source, translation));
-                        modified = true;
+                    let trimmed = line.trim();
+
+                    // Button lines: only replace the quoted label
+                    if trimmed.starts_with("button ") {
+                        let search = format!("\"{}\"", source);
+                        let replace = format!("\"{}\"", translation);
+                        if line.contains(&search) {
+                            new_lines.push(line.replacen(&search, &replace, 1));
+                            modified = true;
+                            continue;
+                        }
+                        new_lines.push(line.to_string());
                         continue;
+                    }
+
+                    // Dialogue lines: CharID Text → CharID TranslatedText
+                    // Only replace the text AFTER the character ID
+                    if let Some(space_pos) = trimmed.find(' ') {
+                        let char_id = &trimmed[..space_pos];
+                        let indent = &line[..line.len() - trimmed.len()];
+                        if char_id.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                            && char_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            new_lines.push(format!("{}{} {}", indent, char_id, translation));
+                            modified = true;
+                            continue;
+                        }
                     }
                 }
                 new_lines.push(line.to_string());
