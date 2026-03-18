@@ -71,6 +71,103 @@ impl RenPyPlugin {
         Ok(all)
     }
 
+    /// For RPA-sourced entries: extract .rpy from the archive, apply translations in-place,
+    /// and write the translated .rpy files into game/ directory.
+    /// Ren'Py loads loose .rpy files with priority over .rpa archives.
+    fn inject_replace_rpa(&self, path: &Path, entries: &[StringEntry]) -> locust_core::error::Result<InjectionReport> {
+        let game_dir = if path.is_dir() {
+            Self::find_game_dir(path).unwrap_or_else(|| path.join("game"))
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+
+        // Find unique RPA files referenced by entries
+        let mut rpa_files: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for entry in entries {
+            if entry.file_path.extension().map_or(false, |ext| ext == "rpa") {
+                rpa_files.insert(entry.file_path.clone());
+            }
+        }
+
+        // Extract .rpy files from each RPA to a temp dir
+        let temp_dir = std::env::temp_dir().join(format!("locust_rpa_inject_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        for rpa_path in &rpa_files {
+            let _ = Self::extract_rpa(rpa_path, &temp_dir);
+        }
+
+        // Build a lookup: source_text -> translation (for all entries)
+        let mut translation_map: HashMap<String, String> = HashMap::new();
+        for entry in entries {
+            if let Some(ref t) = entry.translation {
+                if t != &entry.source {
+                    translation_map.entry(entry.source.clone()).or_insert_with(|| t.clone());
+                }
+            }
+        }
+
+        let mut files_modified = 0;
+        let mut strings_written = 0;
+
+        // Walk all extracted .rpy files and apply translations
+        for dir_entry in walkdir::WalkDir::new(&temp_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let fpath = dir_entry.path();
+            if !fpath.extension().map_or(false, |e| e == "rpy") {
+                continue;
+            }
+            // Skip tl/ directory
+            if let Ok(rel) = fpath.strip_prefix(&temp_dir) {
+                let rel_str = rel.to_string_lossy();
+                if rel_str.starts_with("tl/") || rel_str.starts_with("tl\\") {
+                    continue;
+                }
+            }
+
+            let content = match std::fs::read_to_string(fpath) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let mut modified = false;
+            let mut new_content = content.clone();
+
+            for (source, translation) in &translation_map {
+                let search = format!("\"{}\"", source);
+                let replace = format!("\"{}\"", translation);
+                if new_content.contains(&search) {
+                    new_content = new_content.replace(&search, &replace);
+                    modified = true;
+                    strings_written += 1;
+                }
+            }
+
+            if modified {
+                // Write translated .rpy to game/ dir (preserving subdirectory structure)
+                let rel = fpath.strip_prefix(&temp_dir).unwrap_or(fpath);
+                let dest = game_dir.join(rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&dest, &new_content)?;
+                files_modified += 1;
+            }
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        Ok(InjectionReport {
+            files_modified,
+            strings_written,
+            strings_skipped: entries.len().saturating_sub(strings_written),
+            warnings: Vec::new(),
+        })
+    }
+
     fn has_rpa_files(dir: &Path) -> bool {
         std::fs::read_dir(dir)
             .map(|entries| {
@@ -838,6 +935,17 @@ impl FormatPlugin for RenPyPlugin {
         let mut strings_written = 0;
         let mut strings_skipped = 0;
 
+        // Check if entries come from an RPA archive
+        let from_rpa = entries.iter().any(|e| {
+            e.file_path.extension().map_or(false, |ext| ext == "rpa")
+        });
+
+        if from_rpa {
+            // For RPA-sourced entries: extract .rpy files from archive, apply translations,
+            // then place translated .rpy files in game/ dir where Ren'Py loads them with priority.
+            return self.inject_replace_rpa(path, entries);
+        }
+
         // Group by file
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
@@ -881,7 +989,6 @@ impl FormatPlugin for RenPyPlugin {
                 let line_num = line_idx + 1;
                 if let Some(&translation) = line_translations.get(&line_num) {
                     if let Some(&source) = source_lookup.get(&line_num) {
-                        // Replace the source string with translation in-place
                         let new_line = line.replacen(
                             &format!("\"{}\"", source),
                             &format!("\"{}\"", translation),
