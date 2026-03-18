@@ -137,44 +137,14 @@ impl RenPyPlugin {
 
             for line in content.lines() {
                 let trimmed = line.trim();
-                // Skip lines that are code/UI declarations — these contain Ren'Py keywords
-                // whose string arguments must NOT be translated
-                let is_code_line = trimmed.starts_with("screen ")
-                    || trimmed.starts_with("style ")
-                    || trimmed.starts_with("transform ")
-                    || trimmed.starts_with("define ")
-                    || trimmed.starts_with("default ")
-                    || trimmed.starts_with("init ")
-                    || trimmed.starts_with("label ")
-                    || trimmed.starts_with("image ")
-                    || trimmed.starts_with("$")
-                    || trimmed.starts_with("python:")
-                    || trimmed.contains("Preference(")
-                    || trimmed.contains("SetField(")
-                    || trimmed.contains("SetVariable(")
-                    || trimmed.contains("ToggleField(")
-                    || trimmed.contains("ToggleVariable(")
-                    || trimmed.contains("action ")
-                    || trimmed.contains("Function(")
-                    || trimmed.contains("renpy.")
-                    || trimmed.contains("config.")
-                    || trimmed.contains("persistent.")
-                    || trimmed.contains("style_prefix")
-                    || trimmed.starts_with("use ")
-                    || trimmed.starts_with("has ")
-                    || trimmed.starts_with("at ")
-                    || trimmed.starts_with("frame:")
-                    || trimmed.starts_with("vbox:")
-                    || trimmed.starts_with("hbox:")
-                    || trimmed.starts_with("grid ")
-                    || trimmed.starts_with("xalign ")
-                    || trimmed.starts_with("yalign ")
-                    || trimmed.starts_with("xsize ")
-                    || trimmed.starts_with("ysize ")
-                    || trimmed.starts_with("xpos ")
-                    || trimmed.starts_with("ypos ");
 
-                if is_code_line {
+                // ONLY translate dialogue lines:
+                // - Say statements: `character "text"` or `"text"` (narrator)
+                // - Menu choices: `"choice text":`
+                // Skip everything else (screens, defines, actions, code, etc.)
+                let is_dialogue = is_dialogue_line(trimmed);
+
+                if !is_dialogue {
                     new_lines.push(line.to_string());
                     continue;
                 }
@@ -501,22 +471,87 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
     None
 }
 
+/// Check if a line is a dialogue line (say statement or menu choice) that should be translated.
+/// Returns true ONLY for lines like:
+///   - `character "dialogue text"` (say statement)
+///   - `"narrator text"` (narrator say)
+///   - `"menu choice":` (menu choice)
+/// Returns false for everything else (code, screens, defines, labels, etc.)
+fn is_dialogue_line(trimmed: &str) -> bool {
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+
+    // Menu choice: starts with " and ends with ":  or just ":"
+    if trimmed.starts_with('"') && (trimmed.ends_with("\":") || trimmed.ends_with("\":")){
+        return true;
+    }
+
+    // Narrator say: line is just "text" (possibly with line continuation)
+    if trimmed.starts_with('"') && !trimmed.contains('(') && !trimmed.contains("action") {
+        // But not if it's a textbutton, text, or other UI element
+        return true;
+    }
+
+    // Character say: `identifier "text"`
+    // Must be: simple_identifier<space>"text"
+    if let Some(space_pos) = trimmed.find(' ') {
+        let before = &trimmed[..space_pos];
+        let after = trimmed[space_pos + 1..].trim();
+
+        // Before must be a simple identifier (character variable name)
+        let is_identifier = !before.is_empty()
+            && before.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !is_renpy_keyword(before);
+
+        if is_identifier && after.starts_with('"') {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_renpy_keyword(word: &str) -> bool {
+    matches!(word,
+        "screen" | "style" | "transform" | "define" | "default" | "init" | "label" |
+        "image" | "python" | "if" | "elif" | "else" | "while" | "for" | "return" |
+        "jump" | "call" | "pass" | "menu" | "scene" | "show" | "hide" | "with" |
+        "play" | "stop" | "pause" | "use" | "has" | "at" | "frame" | "vbox" | "hbox" |
+        "grid" | "text" | "textbutton" | "add" | "window" | "null" | "timer" |
+        "input" | "key" | "on" | "action" | "bar" | "viewport" | "imagemap" |
+        "hotspot" | "hotbar" | "button" | "fixed" | "side" | "drag" | "draggroup" |
+        "translate" | "class" | "import" | "from" | "as" | "in" | "not" | "and" | "or" |
+        "id" | "layout" | "xalign" | "yalign" | "xpos" | "ypos" | "xsize" | "ysize" |
+        "xoffset" | "yoffset" | "xanchor" | "yanchor" | "pos" | "anchor" | "align" |
+        "area" | "size" | "xysize" | "idle" | "hover" | "insensitive" | "selected_idle" |
+        "selected_hover" | "ground" | "background" | "foreground" | "child" |
+        "font" | "color" | "outlines" | "kerning" | "spacing" | "first_indent" |
+        "rest_indent" | "prefix" | "suffix" | "alt" | "tooltip" | "focus" |
+        "selected" | "sensitive" | "keysym" | "alternate" | "hovered" | "unhovered" |
+        "clicked" | "released" | "activate_sound" | "hover_sound"
+    )
+}
+
 /// Escape unescaped double quotes inside a translation string.
 /// Turns `"word"` into `\"word\"` but leaves already-escaped `\"` alone.
 fn escape_inner_quotes(s: &str) -> String {
     let mut result = String::with_capacity(s.len() + 8);
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b'"' {
-            // Check if already escaped
-            if i > 0 && bytes[i - 1] == b'\\' {
+    let mut chars = s.chars().peekable();
+    let mut prev_was_backslash = false;
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            if prev_was_backslash {
+                // Already escaped, just push the quote
                 result.push('"');
             } else {
                 result.push('\\');
                 result.push('"');
             }
+            prev_was_backslash = false;
         } else {
-            result.push(bytes[i] as char);
+            prev_was_backslash = ch == '\\';
+            result.push(ch);
         }
     }
     result
