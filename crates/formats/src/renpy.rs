@@ -137,7 +137,9 @@ impl RenPyPlugin {
 
             for (source, translation) in &translation_map {
                 let search = format!("\"{}\"", source);
-                let replace = format!("\"{}\"", translation);
+                // Escape unescaped quotes in translation to preserve Ren'Py syntax
+                let safe_trans = escape_inner_quotes(translation);
+                let replace = format!("\"{}\"", safe_trans);
                 if new_content.contains(&search) {
                     new_content = new_content.replace(&search, &replace);
                     modified = true;
@@ -450,6 +452,27 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
     }
 
     None
+}
+
+/// Escape unescaped double quotes inside a translation string.
+/// Turns `"word"` into `\"word\"` but leaves already-escaped `\"` alone.
+fn escape_inner_quotes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 8);
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'"' {
+            // Check if already escaped
+            if i > 0 && bytes[i - 1] == b'\\' {
+                result.push('"');
+            } else {
+                result.push('\\');
+                result.push('"');
+            }
+        } else {
+            result.push(bytes[i] as char);
+        }
+    }
+    result
 }
 
 /// Check if a string looks like a file path/reference (not translatable text)
