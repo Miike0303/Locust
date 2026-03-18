@@ -97,12 +97,27 @@ impl RenPyPlugin {
             let _ = Self::extract_rpa(rpa_path, &temp_dir);
         }
 
-        // Build a lookup: source_text -> translation (for all entries)
-        let mut translation_map: HashMap<String, String> = HashMap::new();
+        // Build a lookup: (filename, line_number) -> (source, translation)
+        let mut line_translations: HashMap<(String, usize), (String, String)> = HashMap::new();
         for entry in entries {
             if let Some(ref t) = entry.translation {
                 if t != &entry.source {
-                    translation_map.entry(entry.source.clone()).or_insert_with(|| t.clone());
+                    // Entry IDs are "filename.rpy#linenumber" or "archive.rpa#filename.rpy#linenumber"
+                    let parts: Vec<&str> = entry.id.split('#').collect();
+                    if parts.len() >= 2 {
+                        let filename = if parts.len() == 3 {
+                            parts[1].to_string() // archive.rpa#filename.rpy#line
+                        } else {
+                            parts[0].to_string() // filename.rpy#line
+                        };
+                        let line_str = parts.last().unwrap_or(&"0");
+                        if let Ok(line_num) = line_str.parse::<usize>() {
+                            line_translations.insert(
+                                (filename, line_num),
+                                (entry.source.clone(), t.clone()),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -110,7 +125,7 @@ impl RenPyPlugin {
         let mut files_modified = 0;
         let mut strings_written = 0;
 
-        // Walk all extracted .rpy files and apply translations
+        // Walk all extracted .rpy files and apply translations by line number
         for dir_entry in walkdir::WalkDir::new(&temp_dir)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -132,35 +147,34 @@ impl RenPyPlugin {
                 Err(_) => continue,
             };
 
+            // Get the filename (with subdirectory path from temp_dir)
+            let rel_path = fpath.strip_prefix(&temp_dir).unwrap_or(fpath);
+            let filename = rel_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
             let mut modified = false;
             let mut new_lines: Vec<String> = Vec::new();
 
-            for line in content.lines() {
-                let trimmed = line.trim();
+            for (line_idx, line) in content.lines().enumerate() {
+                let line_num = line_idx + 1;
+                let key = (filename.clone(), line_num);
 
-                // ONLY translate dialogue lines:
-                // - Say statements: `character "text"` or `"text"` (narrator)
-                // - Menu choices: `"choice text":`
-                // Skip everything else (screens, defines, actions, code, etc.)
-                let is_dialogue = is_dialogue_line(trimmed);
-
-                if !is_dialogue {
-                    new_lines.push(line.to_string());
-                    continue;
-                }
-
-                let mut new_line = line.to_string();
-                for (source, translation) in &translation_map {
-                    let search = format!("\"{}\"", source);
-                    if new_line.contains(&search) {
-                        let safe_trans = escape_inner_quotes(translation);
-                        let replace = format!("\"{}\"", safe_trans);
-                        new_line = new_line.replace(&search, &replace);
-                        modified = true;
-                        strings_written += 1;
+                if let Some((source, translation)) = line_translations.get(&key) {
+                    let trimmed = line.trim();
+                    // Only translate dialogue lines, not code
+                    if is_dialogue_line(trimmed) {
+                        let search = format!("\"{}\"", source);
+                        if line.contains(&search) {
+                            let safe_trans = escape_inner_quotes(translation);
+                            let replace = format!("\"{}\"", safe_trans);
+                            let new_line = line.replace(&search, &replace);
+                            new_lines.push(new_line);
+                            modified = true;
+                            strings_written += 1;
+                            continue;
+                        }
                     }
                 }
-                new_lines.push(new_line);
+                new_lines.push(line.to_string());
             }
             let new_content = new_lines.join("\n");
 
