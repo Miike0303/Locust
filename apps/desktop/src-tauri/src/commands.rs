@@ -45,6 +45,7 @@ pub struct ProjectOpenResponse {
 #[tauri::command]
 pub async fn open_project(
     path: String,
+    format_id: Option<String>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<ProjectOpenResponse, String> {
     let s = &state.0;
@@ -56,10 +57,15 @@ pub async fn open_project(
     // Resolve executable/file path to game root
     let path = locust_core::extraction::resolve_game_root(&raw_path, &s.format_registry);
 
-    let plugin = s
-        .format_registry
-        .detect(&path)
-        .ok_or_else(|| "Could not detect game format".to_string())?;
+    let plugin = if let Some(ref fid) = format_id {
+        s.format_registry
+            .get(fid)
+            .ok_or_else(|| format!("Unknown format: {}", fid))?
+    } else {
+        s.format_registry
+            .detect(&path)
+            .ok_or_else(|| "Could not detect game format".to_string())?
+    };
 
     let format_id = plugin.id().to_string();
     let format_name = plugin.name().to_string();

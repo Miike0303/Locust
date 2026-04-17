@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Search, X } from "lucide-react";
+import { Search, X, ChevronLeft, ChevronRight } from "lucide-react";
 import clsx from "clsx";
 import { useEditorStore } from "../stores/editorStore";
 import type { StringStatus } from "../lib/api";
@@ -83,9 +83,29 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
         </button>
       )}
 
-      <span className="text-xs text-gray-500 ml-auto">
-        Showing {showing} of {total}
-      </span>
+      <div className="flex items-center gap-2 ml-auto">
+        <span className="text-xs text-gray-500">
+          {total > 0 ? `${(filter.offset ?? 0) + 1}–${Math.min((filter.offset ?? 0) + showing, total)} of ${total}` : "0 results"}
+        </span>
+        {total > (filter.limit ?? 100) && (
+          <div className="flex items-center gap-0.5">
+            <button
+              onClick={() => setFilter({ offset: Math.max(0, (filter.offset ?? 0) - (filter.limit ?? 100)) })}
+              disabled={(filter.offset ?? 0) === 0}
+              className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30"
+            >
+              <ChevronLeft size={14} />
+            </button>
+            <button
+              onClick={() => setFilter({ offset: (filter.offset ?? 0) + (filter.limit ?? 100) })}
+              disabled={(filter.offset ?? 0) + (filter.limit ?? 100) >= total}
+              className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30"
+            >
+              <ChevronRight size={14} />
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

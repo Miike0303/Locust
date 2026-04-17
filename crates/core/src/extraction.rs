@@ -185,12 +185,16 @@ impl MultiLangInjector {
         output_dir: Option<PathBuf>,
         tx: mpsc::Sender<ProgressEvent>,
     ) -> Result<MultiLangReport> {
-        // Create backup (best-effort — skip if paths too long on Windows)
-        let backup_id = match self.backup_manager.create_backup(project_path) {
-            Ok(backup) => backup.id.clone(),
-            Err(e) => {
-                tracing::warn!("Backup failed (continuing without backup): {}", e);
-                "none".to_string()
+        // For Replace mode with output_dir, the original is untouched — skip full backup
+        let backup_id = if mode == OutputMode::Replace && output_dir.is_some() {
+            "skip-replace-mode".to_string()
+        } else {
+            match self.backup_manager.create_backup(project_path) {
+                Ok(backup) => backup.id.clone(),
+                Err(e) => {
+                    tracing::warn!("Backup failed (continuing without backup): {}", e);
+                    "none".to_string()
+                }
             }
         };
 
@@ -335,9 +339,24 @@ impl MultiLangInjector {
 fn copy_dir_for_inject(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
 
+    // Canonicalize dst so we can skip it during the walk — prevents infinite
+    // recursion when dst is a subdirectory of src (e.g. inject output placed
+    // next to the game inside the same parent folder).
+    let dst_canon = dst.canonicalize().ok();
+
     let media_extensions = ["png", "ogg", "wav", "m4a", "mp4", "jpg", "jpeg", "bmp", "mp3"];
 
-    for entry in WalkDir::new(src).follow_links(false) {
+    for entry in WalkDir::new(src).follow_links(false).into_iter().filter_entry(|e| {
+        // Skip the destination directory itself to avoid recursive copy loops
+        if let Some(ref dc) = dst_canon {
+            if let Ok(entry_canon) = e.path().canonicalize() {
+                if entry_canon == *dc {
+                    return false;
+                }
+            }
+        }
+        true
+    }) {
         let entry = entry.map_err(|e| LocustError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         let rel = entry.path().strip_prefix(src).map_err(|e| {
             LocustError::InjectionError(e.to_string())
@@ -359,14 +378,8 @@ fn copy_dir_for_inject(src: &Path, dst: &Path) -> Result<()> {
                 .unwrap_or(false);
 
             if is_media {
-                #[cfg(unix)]
-                {
-                    if std::fs::hard_link(entry.path(), &dest).is_err() {
-                        std::fs::copy(entry.path(), &dest)?;
-                    }
-                }
-                #[cfg(not(unix))]
-                {
+                // Try hardlink first (works on all platforms), fall back to copy
+                if std::fs::hard_link(entry.path(), &dest).is_err() {
                     std::fs::copy(entry.path(), &dest)?;
                 }
             } else {
@@ -795,13 +808,38 @@ mod tests {
         let (injector, game_dir, output_dir) = setup_injector();
         let (tx, mut rx) = mpsc::channel(100);
 
-        injector
+        // Replace mode with output_dir skips backup (original untouched)
+        let report = injector
             .inject(
                 &game_dir,
                 "mock",
                 OutputMode::Replace,
                 vec!["es".to_string()],
                 Some(output_dir),
+                tx,
+            )
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(report.backup_id, "skip-replace-mode");
+    }
+
+    #[tokio::test]
+    async fn test_backup_created_for_add_mode() {
+        let (injector, game_dir, _output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+
+        // Add mode should create a real backup
+        injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Add,
+                vec!["es".to_string()],
+                None,
                 tx,
             )
             .await

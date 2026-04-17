@@ -4,6 +4,10 @@ import { useQuery } from "@tanstack/react-query";
 import { getProviders, startTranslation } from "../lib/api";
 import { subscribeToJob } from "../lib/ws";
 import { useEditorStore } from "../stores/editorStore";
+import { useQueueStore } from "../stores/queueStore";
+import { useProjectStore } from "../stores/projectStore";
+import { addLog } from "../stores/logStore";
+import { addToast } from "../stores/toastStore";
 
 interface TranslationModalProps {
   open: boolean;
@@ -12,13 +16,41 @@ interface TranslationModalProps {
   onComplete: () => void;
 }
 
+const LANGUAGES: { code: string; name: string }[] = [
+  { code: "en", name: "English" },
+  { code: "es", name: "Español (Spanish)" },
+  { code: "ja", name: "日本語 (Japanese)" },
+  { code: "zh-CN", name: "简体中文 (Chinese Simplified)" },
+  { code: "zh-TW", name: "繁體中文 (Chinese Traditional)" },
+  { code: "ko", name: "한국어 (Korean)" },
+  { code: "fr", name: "Français (French)" },
+  { code: "de", name: "Deutsch (German)" },
+  { code: "it", name: "Italiano (Italian)" },
+  { code: "pt", name: "Português (Portuguese)" },
+  { code: "pt-BR", name: "Português Brasileiro" },
+  { code: "ru", name: "Русский (Russian)" },
+  { code: "nl", name: "Nederlands (Dutch)" },
+  { code: "pl", name: "Polski (Polish)" },
+  { code: "tr", name: "Türkçe (Turkish)" },
+  { code: "ar", name: "العربية (Arabic)" },
+  { code: "vi", name: "Tiếng Việt (Vietnamese)" },
+  { code: "th", name: "ไทย (Thai)" },
+  { code: "id", name: "Bahasa Indonesia" },
+];
+
+const LANG_STORAGE_KEY = "locust.translation.langs";
+
 export default function TranslationModal({ open, onClose, totalPending, onComplete }: TranslationModalProps) {
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders, enabled: open });
   const { setJob, setTranslating } = useEditorStore();
 
-  const [providerId, setProviderId] = useState("mock");
-  const [sourceLang, setSourceLang] = useState("ja");
-  const [targetLang, setTargetLang] = useState("en");
+  const [providerId, setProviderId] = useState("google");
+  // Load saved language preferences (fallback: auto-detect source, Spanish target)
+  const saved = (() => {
+    try { return JSON.parse(localStorage.getItem(LANG_STORAGE_KEY) || "{}"); } catch { return {}; }
+  })();
+  const [sourceLang, setSourceLang] = useState<string>(saved.source ?? "auto");
+  const [targetLang, setTargetLang] = useState<string>(saved.target ?? "es");
   const [batchSize, setBatchSize] = useState(40);
   const [costLimit, setCostLimit] = useState("");
   const [gameContext, setGameContext] = useState("");
@@ -42,12 +74,16 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
       setCostSoFar(0);
       setDone(false);
       setError(null);
+      setLastTranslated("");
     }
   }, [open]);
 
   const handleStart = async () => {
+    // Persist language selection for next time
+    try { localStorage.setItem(LANG_STORAGE_KEY, JSON.stringify({ source: sourceLang, target: targetLang })); } catch {}
+    addLog("info", `Starting translation with provider: ${providerId}, source: ${sourceLang}, target: ${targetLang}, batch: ${batchSize}`, undefined, "translation");
     try {
-      const result = await startTranslation({
+      const params = {
         provider_id: providerId,
         options: {
           source_lang: sourceLang,
@@ -60,24 +96,65 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
           use_memory: useMemory,
           skip_approved: true,
         },
-      });
+      };
+      addLog("info", `Calling startTranslation API...`, JSON.stringify(params, null, 2), "translation");
+      const result = await startTranslation(params);
+      addLog("info", `Got job_id: ${result.job_id}`, undefined, "translation");
 
       setJob(result.job_id);
       setTranslating(true);
       setStep("progress");
+      addLog("info", `Translation started (${providerId}), subscribing to WebSocket...`, undefined, "translation");
+
+      const projectName = useProjectStore.getState().project?.name ?? "Project";
 
       const unsub = subscribeToJob(result.job_id, {
-        onStarted: (e) => setTotal(e.total),
-        onBatchCompleted: (e) => { setCompleted(e.completed); setCostSoFar(e.cost_so_far); },
+        onStarted: (e) => {
+          setTotal(e.total);
+          useQueueStore.getState().setGlobalProgress({
+            projectName,
+            completed: 0,
+            total: e.total,
+            costSoFar: 0,
+            startedAt: Date.now(),
+          });
+        },
+        onBatchCompleted: (e) => {
+          setCompleted(e.completed);
+          setCostSoFar(e.cost_so_far);
+          useQueueStore.getState().setGlobalProgress({
+            projectName,
+            completed: e.completed,
+            total: e.total,
+            costSoFar: e.cost_so_far,
+            startedAt: useQueueStore.getState().globalProgress?.startedAt ?? Date.now(),
+          });
+        },
         onStringTranslated: (e) => setLastTranslated(e.translation),
-        onCompleted: () => { setDone(true); setTranslating(false); setJob(null); },
-        onFailed: (e) => { setError(e.error); setTranslating(false); setJob(null); },
+        onCompleted: (e) => {
+          setDone(true);
+          setTranslating(false);
+          setJob(null);
+          useQueueStore.getState().setGlobalProgress(null);
+          addLog("info", `Translation complete: ${e.total_translated} strings, $${e.total_cost?.toFixed(4) ?? "0"}`, undefined, "translation");
+          addToast("success", `Translation complete: ${e.total_translated} strings`);
+        },
+        onFailed: (e) => {
+          setError(e.error);
+          setTranslating(false);
+          setJob(null);
+          useQueueStore.getState().setGlobalProgress(null);
+          addLog("error", `Translation failed`, e.error, "translation");
+          addToast("error", `Translation failed: ${e.error}`);
+        },
       });
 
       // Cleanup on unmount
       return unsub;
     } catch (err: any) {
-      setError(err.message);
+      addLog("error", `Translation start failed: ${err.message ?? err}`, err.stack ?? String(err), "translation");
+      addToast("error", `Translation failed to start: ${err.message ?? err}`);
+      setError(err.message ?? String(err));
     }
   };
 
@@ -105,13 +182,18 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-sm font-medium">Source</label>
-                <input value={sourceLang} onChange={(e) => setSourceLang(e.target.value)}
-                  className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm" />
+                <select value={sourceLang} onChange={(e) => setSourceLang(e.target.value)}
+                  className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm">
+                  <option value="auto">Auto-detect</option>
+                  {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
+                </select>
               </div>
               <div>
                 <label className="text-sm font-medium">Target</label>
-                <input value={targetLang} onChange={(e) => setTargetLang(e.target.value)}
-                  className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm" />
+                <select value={targetLang} onChange={(e) => setTargetLang(e.target.value)}
+                  className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm">
+                  {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
+                </select>
               </div>
             </div>
             <div>

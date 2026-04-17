@@ -496,6 +496,25 @@ impl FormatPlugin for SugarCubePlugin {
         let mut written = 0;
         let mut skipped = 0;
 
+        // Collect all passage names — these must NEVER be translated
+        let mut passage_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        {
+            let mut scan = 0;
+            while let Some(pos) = content[scan..].find("<tw-passagedata") {
+                let abs = scan + pos;
+                if let Some(header_end) = content[abs..].find('>') {
+                    let header = &content[abs..abs + header_end + 1];
+                    if let Some(name) = extract_attr(header, "name") {
+                        passage_names.insert(name);
+                    }
+                    scan = abs + header_end + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
         // Only replace text WITHIN <tw-passagedata> tags
         let mut result = String::with_capacity(content.len());
         let mut search_from = 0;
@@ -535,12 +554,20 @@ impl FormatPlugin for SugarCubePlugin {
                     let original_source = restore_variables(&entry.source, &var_map);
                     let final_translation = restore_variables(translation, &var_map);
 
+                    // Skip if the source text matches a passage name
+                    if passage_names.contains(&original_source) {
+                        continue;
+                    }
+
                     let encoded_source = encode_html_entities(&original_source);
                     let encoded_translation = encode_html_entities(&final_translation);
 
-                    // Use tag-safe replacement to avoid replacing inside HTML attributes
-                    let (new_content, did_replace) =
-                        replace_in_text_only(&passage_content, &encoded_source, &encoded_translation);
+                    // Safe replacement: skip macros, links, and HTML tags
+                    let (new_content, did_replace) = replace_safe(
+                        &passage_content,
+                        &encoded_source,
+                        &encoded_translation,
+                    );
                     if did_replace {
                         passage_content = new_content;
                         written += 1;
@@ -582,10 +609,13 @@ fn encode_html_entities(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Replace source text in passage content, but ONLY when the match is NOT inside
-/// an HTML-encoded tag (&lt;...&gt;). This prevents accidentally modifying
-/// image paths, href attributes, class names, etc.
-fn replace_in_text_only(passage: &str, source: &str, replacement: &str) -> (String, bool) {
+/// Safe replacement in SugarCube passage content.
+/// Avoids replacing inside:
+/// - HTML-encoded tags (&lt;...&gt;)
+/// - SugarCube macros (&lt;&lt;...&gt;&gt;)
+/// - SugarCube link targets ([[...|TARGET]] or [[...->TARGET]] or [[TARGET]])
+/// - SugarCube variable expressions
+fn replace_safe(passage: &str, source: &str, replacement: &str) -> (String, bool) {
     if source.is_empty() {
         return (passage.to_string(), false);
     }
@@ -593,34 +623,91 @@ fn replace_in_text_only(passage: &str, source: &str, replacement: &str) -> (Stri
     let mut pos = 0;
     while let Some(match_pos) = passage[pos..].find(source) {
         let abs_pos = pos + match_pos;
+        let match_end = abs_pos + source.len();
 
-        // Check if this position is inside an HTML-encoded tag
-        if !is_inside_encoded_tag(passage, abs_pos) {
-            let mut result = String::with_capacity(passage.len());
-            result.push_str(&passage[..abs_pos]);
-            result.push_str(replacement);
-            result.push_str(&passage[abs_pos + source.len()..]);
-            return (result, true);
+        // Check if inside an HTML-encoded tag
+        if is_inside_unsafe_context(passage, abs_pos, match_end) {
+            pos = abs_pos + 1;
+            continue;
         }
 
-        pos = abs_pos + 1;
+        let mut result = String::with_capacity(passage.len());
+        result.push_str(&passage[..abs_pos]);
+        result.push_str(replacement);
+        result.push_str(&passage[match_end..]);
+        return (result, true);
     }
 
     (passage.to_string(), false)
 }
 
-/// Check if a position in HTML-encoded passage content falls inside a tag.
-/// Tags are encoded as &lt;...&gt; in the passage data.
-fn is_inside_encoded_tag(s: &str, pos: usize) -> bool {
+/// Check if a position falls inside a context that should not be modified:
+/// encoded HTML tags, SugarCube macros, link targets, or code blocks.
+fn is_inside_unsafe_context(s: &str, pos: usize, end: usize) -> bool {
     let before = &s[..pos];
+
+    // Inside HTML-encoded tag: &lt;...&gt;
     let last_lt = before.rfind("&lt;");
     let last_gt = before.rfind("&gt;");
-
-    match (last_lt, last_gt) {
-        (Some(lt_pos), Some(gt_pos)) => lt_pos > gt_pos,
-        (Some(_), None) => true,
-        _ => false,
+    if let Some(lt_pos) = last_lt {
+        match last_gt {
+            Some(gt_pos) if lt_pos > gt_pos => return true,
+            None => return true,
+            _ => {}
+        }
     }
+
+    // Inside SugarCube macro: &lt;&lt;...&gt;&gt;
+    let last_macro_open = before.rfind("&lt;&lt;");
+    let last_macro_close = before.rfind("&gt;&gt;");
+    if let Some(mo) = last_macro_open {
+        match last_macro_close {
+            Some(mc) if mo > mc => return true,
+            None => return true,
+            _ => {}
+        }
+    }
+
+    // Inside SugarCube link: [[...]]
+    // Check if we're between [[ and ]]
+    let last_link_open = before.rfind("[[");
+    let last_link_close = before.rfind("]]");
+    if let Some(lo) = last_link_open {
+        let inside_link = match last_link_close {
+            Some(lc) => lo > lc,
+            None => true,
+        };
+        if inside_link {
+            // We're inside [[ ... ]]. Only allow replacing the DISPLAY text
+            // (before | or ->), never the target (after | or ->)
+            let link_content = &s[lo + 2..];
+            let link_end = link_content.find("]]").unwrap_or(link_content.len());
+            let link_inner = &link_content[..link_end];
+
+            // Find separator position relative to link start
+            let sep_pipe = link_inner.find('|');
+            let sep_arrow = link_inner.find("-&gt;");
+
+            let rel_pos = pos - (lo + 2);
+
+            if let Some(sp) = sep_pipe {
+                // [[display|target]] — only translate display part (before |)
+                if rel_pos >= sp {
+                    return true; // in target part
+                }
+            } else if let Some(sa) = sep_arrow {
+                // [[display->target]] — only translate display part (before ->)
+                if rel_pos >= sa {
+                    return true; // in target part
+                }
+            } else {
+                // [[bare passage name]] — do NOT translate (it's a passage reference)
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -750,11 +837,40 @@ The adventure awaits!</tw-passagedata>
     #[test]
     fn test_tag_safe_replacement() {
         let passage = "Clothes are nice &lt;img src=&quot;Images/Clothes/1.webp&quot;&gt;";
-        let (result, replaced) = replace_in_text_only(passage, "Clothes", "Ropa");
+        let (result, replaced) = replace_safe(passage, "Clothes", "Ropa");
         assert!(replaced);
         // Should replace the visible text "Clothes" but NOT the one in the img tag
         assert!(result.starts_with("Ropa"));
         assert!(result.contains("Images/Clothes/1.webp"));
+    }
+
+    #[test]
+    fn test_no_replace_in_link_target() {
+        // [[display text|PassageName]] — should NOT translate PassageName
+        let passage = "[[Open laptop|Open laptop]]";
+        let (result, replaced) = replace_safe(passage, "Open laptop", "Abrir portátil");
+        assert!(replaced);
+        // Display text should be translated, target should NOT
+        assert!(result.contains("Abrir portátil|Open laptop"));
+    }
+
+    #[test]
+    fn test_no_replace_bare_link() {
+        // [[PassageName]] — bare link, should NOT translate
+        let passage = "some text [[Open laptop]] more text";
+        let (result, _) = replace_safe(passage, "Open laptop", "Abrir portátil");
+        // The text inside bare link should NOT be translated
+        assert!(result.contains("[[Open laptop]]"));
+    }
+
+    #[test]
+    fn test_no_replace_in_macro() {
+        let passage = "&lt;&lt;set $name to &quot;John&quot;&gt;&gt; Hello John!";
+        let (result, replaced) = replace_safe(passage, "John", "Juan");
+        assert!(replaced);
+        // Should replace "John" in text but NOT inside the macro
+        assert!(result.contains("Hello Juan!"));
+        assert!(result.contains("&lt;&lt;set $name to &quot;John&quot;&gt;&gt;"));
     }
 
     #[test]

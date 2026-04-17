@@ -15,9 +15,6 @@ use locust_core::translation::ProviderRegistry;
 pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
     let mut reg = ProviderRegistry::new();
 
-    // Always register mock provider
-    reg.register(Arc::new(mock::MockProvider));
-
     // Always register Google Translate (free, no API key needed)
     reg.register(Arc::new(google::GoogleTranslateProvider::new()));
 

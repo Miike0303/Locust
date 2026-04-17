@@ -65,6 +65,9 @@ enum Commands {
         languages: Vec<String>,
         #[arg(short, long)]
         output_dir: Option<PathBuf>,
+        /// Inject directly into game files without copying (fast, modifies originals)
+        #[arg(long)]
+        direct: bool,
     },
     /// Validate translations
     Validate { project: PathBuf },
@@ -167,7 +170,14 @@ async fn main() -> anyhow::Result<()> {
             mode,
             languages,
             output_dir,
-        } => cmd_inject(game_path, project, mode, languages, output_dir).await?,
+            direct,
+        } => {
+            if direct {
+                cmd_inject_direct(game_path, project, languages).await?
+            } else {
+                cmd_inject(game_path, project, mode, languages, output_dir).await?
+            }
+        }
         Commands::Validate { project } => cmd_validate(project)?,
         Commands::Providers => cmd_providers()?,
         Commands::Formats => cmd_formats()?,
@@ -366,6 +376,13 @@ async fn cmd_inject(
     std::fs::create_dir_all(&backup_root).ok();
     let backup_mgr = Arc::new(BackupManager::new(backup_root));
 
+    // Auto-rotate: keep only the 3 most recent backups to prevent disk bloat
+    if let Ok(deleted) = backup_mgr.delete_old_backups(3) {
+        if deleted > 0 {
+            println!("Cleaned {} old backup(s)", deleted);
+        }
+    }
+
     println!("Creating backup...");
     let injector =
         locust_core::extraction::MultiLangInjector::new(registry, db, backup_mgr);
@@ -398,6 +415,46 @@ async fn cmd_inject(
             &format!("{} strings written", lang),
             &rep.strings_written.to_string(),
         ]);
+    }
+    println!("{table}");
+
+    Ok(())
+}
+
+async fn cmd_inject_direct(
+    game_path: PathBuf,
+    project: PathBuf,
+    _languages: Vec<String>,
+) -> anyhow::Result<()> {
+    let db = Database::open(&project)?;
+    let registry = locust_formats::default_registry();
+
+    let plugin = registry
+        .detect(&game_path)
+        .ok_or_else(|| anyhow::anyhow!("format not detected for: {}", game_path.display()))?;
+
+    let entries = db.get_entries(&EntryFilter::default())?;
+    let translated: Vec<_> = entries
+        .into_iter()
+        .filter(|e| e.translation.is_some())
+        .collect();
+
+    println!(
+        "Direct inject: {} translated strings into {} ({})",
+        translated.len(),
+        game_path.display(),
+        plugin.name()
+    );
+
+    let report = plugin.inject(&game_path, &translated)?;
+
+    let mut table = Table::new();
+    table.set_header(vec!["Metric", "Value"]);
+    table.add_row(vec!["Files modified", &report.files_modified.to_string()]);
+    table.add_row(vec!["Strings written", &report.strings_written.to_string()]);
+    table.add_row(vec!["Strings skipped", &report.strings_skipped.to_string()]);
+    if !report.warnings.is_empty() {
+        table.add_row(vec!["Warnings", &report.warnings.len().to_string()]);
     }
     println!("{table}");
 
@@ -576,7 +633,7 @@ async fn cmd_import(
 }
 
 async fn cmd_server(port: u16) -> anyhow::Result<()> {
-    let state = locust_server::create_test_state();
+    let state = locust_server::create_app_state();
     println!("Starting Project Locust server on http://localhost:{}", port);
     println!("Press Ctrl+C to stop");
     locust_server::start_server(state, port).await?;

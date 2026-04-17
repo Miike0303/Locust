@@ -16,6 +16,20 @@ interface JobHandlers {
   onPaused?: () => void;
 }
 
+interface WaitOptions {
+  onProgress?: (completed: number, total: number, costSoFar: number) => void;
+}
+
+export function waitForJob(jobId: string, opts?: WaitOptions): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const unsub = subscribeToJob(jobId, {
+      onBatchCompleted: (e) => opts?.onProgress?.(e.completed, e.total, e.cost_so_far),
+      onCompleted: () => { unsub(); resolve(); },
+      onFailed: (e) => { unsub(); reject(new Error(e.error)); },
+    });
+  });
+}
+
 export function subscribeToJob(jobId: string, handlers: JobHandlers): () => void {
   let ws: WebSocket | null = null;
 

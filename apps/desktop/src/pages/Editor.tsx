@@ -4,17 +4,19 @@ import { Languages, Shield, Download, FileCheck } from "lucide-react";
 import { getStrings, getStats, getString } from "../lib/api";
 import { useEditorStore } from "../stores/editorStore";
 import { useProjectStore } from "../stores/projectStore";
+import { useHotkey } from "../lib/hotkeys";
 import FilterBar from "../components/FilterBar";
 import StringTable from "../components/StringTable";
 import DetailPanel from "../components/DetailPanel";
 import TranslationModal from "../components/TranslationModal";
-import type { StringEntry } from "../lib/api";
+import InjectModal from "../components/InjectModal";
 
 export default function Editor() {
   const { filter, selectedEntryId, setSelected } = useEditorStore();
-  const { project, stats, setStats } = useProjectStore();
+  const { project } = useProjectStore();
   const queryClient = useQueryClient();
   const [showTranslateModal, setShowTranslateModal] = useState(false);
+  const [showInjectModal, setShowInjectModal] = useState(false);
 
   const { data: stringsData, refetch } = useQuery({
     queryKey: ["strings", filter],
@@ -42,6 +44,18 @@ export default function Editor() {
     }
   }, [refetch, queryClient, selectedEntryId]);
 
+  // Hotkeys
+  useHotkey("translate", () => setShowTranslateModal(true));
+  useHotkey("inject", () => setShowInjectModal(true));
+  useHotkey("closePanel", () => {
+    if (showInjectModal) setShowInjectModal(false);
+    else if (showTranslateModal) setShowTranslateModal(false);
+    else if (selectedEntryId) setSelected(null);
+  });
+  useHotkey("search", () => {
+    document.querySelector<HTMLInputElement>('[data-search-input]')?.focus();
+  });
+
   const entries = stringsData?.entries || [];
   const total = stringsData?.total || 0;
 
@@ -66,19 +80,30 @@ export default function Editor() {
         <button
           onClick={() => setShowTranslateModal(true)}
           className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium transition-colors"
+          title="Ctrl+T"
         >
           <Languages size={16} /> Translate
         </button>
 
-        <button className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors">
+        <button
+          onClick={() => setShowInjectModal(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
+          title="Ctrl+I"
+        >
           <FileCheck size={16} /> Inject
         </button>
 
-        <button className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors">
+        <button
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
+          title="Ctrl+Shift+V"
+        >
           <Shield size={16} /> Validate
         </button>
 
-        <button className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors">
+        <button
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
+          title="Ctrl+E"
+        >
           <Download size={16} /> Export
         </button>
       </div>
@@ -103,6 +128,12 @@ export default function Editor() {
         onClose={() => setShowTranslateModal(false)}
         totalPending={statsData?.pending || 0}
         onComplete={handleRefetch}
+      />
+
+      {/* Inject Modal */}
+      <InjectModal
+        open={showInjectModal}
+        onClose={() => setShowInjectModal(false)}
       />
     </div>
   );

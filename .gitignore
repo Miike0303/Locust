@@ -2,9 +2,21 @@
 node_modules/
 .env
 *.db
+*.db-shm
+*.db-wal
+*.locust.db*
 dist/
 .DS_Store
 Thumbs.db
 *.suo
 .idea/
 .vscode/settings.json
+
+# Logs
+*.log
+
+# Project databases
+data/
+
+# Claude Code local settings
+.claude/settings.local.json

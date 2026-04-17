@@ -5,6 +5,7 @@ pub mod wolf_rpg;
 pub mod sugarcube;
 pub mod unreal;
 pub mod unity;
+pub mod html_game;
 
 use locust_core::extraction::FormatRegistry;
 
@@ -17,5 +18,7 @@ pub fn default_registry() -> FormatRegistry {
     r.register(Box::new(sugarcube::SugarCubePlugin::new()));
     r.register(Box::new(unreal::UnrealPlugin::new()));
     r.register(Box::new(unity::UnityPlugin::new()));
+    // html-game must be AFTER sugarcube (more specific wins first)
+    r.register(Box::new(html_game::HtmlGamePlugin::new()));
     r
 }

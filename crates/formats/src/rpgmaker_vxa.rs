@@ -60,6 +60,13 @@ impl MarshalValue {
         }
     }
 
+    pub fn get_ivar_mut(&mut self, name: &str) -> Option<&mut MarshalValue> {
+        match self {
+            MarshalValue::Object { ivars, .. } => ivars.get_mut(name),
+            _ => None,
+        }
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut writer = MarshalWriter::new();
         writer.write_header();
@@ -622,6 +629,25 @@ impl RpgMakerVxaPlugin {
             })
             .collect();
 
+        if lookup.is_empty() {
+            return;
+        }
+
+        let stem_lower = strip_marshal_ext(filename).to_lowercase();
+
+        if stem_lower.starts_with("map") && stem_lower != "mapinfos" {
+            // Map files: navigate @events → @pages → @list → commands
+            Self::apply_map_translations(root, filename, &lookup);
+        } else if stem_lower == "commonevents" {
+            // CommonEvents: navigate array → @list → commands
+            Self::apply_common_event_translations(root, filename, &lookup);
+        } else {
+            // Array data files (Actors, Items, etc.): update ivars
+            Self::apply_array_translations(root, filename, &lookup);
+        }
+    }
+
+    fn apply_array_translations(root: &mut MarshalValue, filename: &str, lookup: &HashMap<&str, &str>) {
         let stem = strip_marshal_ext(filename);
         let fields = Self::fields_for_file(stem);
 
@@ -639,6 +665,102 @@ impl RpgMakerVxaPlugin {
                                     *s = translation.to_string();
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_map_translations(root: &mut MarshalValue, filename: &str, lookup: &HashMap<&str, &str>) {
+        let events = match root.get_ivar_mut("@events") {
+            Some(v) => v,
+            None => return,
+        };
+
+        let event_pairs = match events {
+            MarshalValue::Hash(pairs) => pairs,
+            _ => return,
+        };
+
+        for (ev_key, ev_val) in event_pairs.iter_mut() {
+            let ev_id = match ev_key {
+                MarshalValue::Int(i) => *i,
+                _ => continue,
+            };
+            let pages = match ev_val.get_ivar_mut("@pages") {
+                Some(MarshalValue::Array(a)) => a,
+                _ => continue,
+            };
+            for (page_idx, page) in pages.iter_mut().enumerate() {
+                let list = match page.get_ivar_mut("@list") {
+                    Some(MarshalValue::Array(a)) => a,
+                    _ => continue,
+                };
+                for (cmd_idx, cmd) in list.iter_mut().enumerate() {
+                    let code = match cmd.get_ivar("@code") {
+                        Some(MarshalValue::Int(c)) => *c,
+                        _ => continue,
+                    };
+                    let params = match cmd.get_ivar_mut("@parameters") {
+                        Some(MarshalValue::Array(a)) => a,
+                        _ => continue,
+                    };
+                    match code {
+                        401 => {
+                            let id = format!("{}#0#event_{}#page_{}#cmd_{}", filename, ev_id, page_idx, cmd_idx);
+                            if let Some(&translation) = lookup.get(id.as_str()) {
+                                if let Some(MarshalValue::Str(s)) = params.first_mut() {
+                                    *s = translation.to_string();
+                                }
+                            }
+                        }
+                        102 => {
+                            if let Some(MarshalValue::Array(choices)) = params.first_mut() {
+                                for (ci, choice) in choices.iter_mut().enumerate() {
+                                    let id = format!("{}#0#event_{}#page_{}#cmd_{}#choice_{}", filename, ev_id, page_idx, cmd_idx, ci);
+                                    if let Some(&translation) = lookup.get(id.as_str()) {
+                                        if let MarshalValue::Str(s) = choice {
+                                            *s = translation.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_common_event_translations(root: &mut MarshalValue, filename: &str, lookup: &HashMap<&str, &str>) {
+        let arr = match root {
+            MarshalValue::Array(a) => a,
+            _ => return,
+        };
+        for (ev_idx, event) in arr.iter_mut().enumerate() {
+            if matches!(event, MarshalValue::Nil) {
+                continue;
+            }
+            let list = match event.get_ivar_mut("@list") {
+                Some(MarshalValue::Array(a)) => a,
+                _ => continue,
+            };
+            for (cmd_idx, cmd) in list.iter_mut().enumerate() {
+                let code = match cmd.get_ivar("@code") {
+                    Some(MarshalValue::Int(c)) => *c,
+                    _ => continue,
+                };
+                if code == 401 {
+                    let id = format!("{}#{}#cmd_{}", filename, ev_idx, cmd_idx);
+                    if let Some(&translation) = lookup.get(id.as_str()) {
+                        let params = match cmd.get_ivar_mut("@parameters") {
+                            Some(MarshalValue::Array(a)) => a,
+                            _ => continue,
+                        };
+                        if let Some(MarshalValue::Str(s)) = params.first_mut() {
+                            *s = translation.to_string();
                         }
                     }
                 }

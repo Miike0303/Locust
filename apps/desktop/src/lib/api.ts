@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { addLog } from "../stores/logStore";
 
 // ─── Runtime detection ────────────────────────────────────────────────────
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
@@ -30,6 +31,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const text = await res.text();
+    addLog("error", `API ${res.status}: ${path}`, text, "api");
     throw new Error(`${res.status}: ${text}`);
   }
   return res.json();
@@ -151,10 +153,10 @@ export const getProviders = (): Promise<ProviderInfo[]> =>
 export const checkProviderHealth = (id: string) =>
   request<{ ok: boolean; message: string }>(`/providers/${id}/health`, { method: "POST" });
 
-export const openProject = (path: string): Promise<ProjectOpenResponse> =>
+export const openProject = (path: string, formatId?: string): Promise<ProjectOpenResponse> =>
   IS_TAURI
-    ? invoke("open_project", { path })
-    : request("/project/open", { method: "POST", body: JSON.stringify({ path }) });
+    ? invoke("open_project", { path, formatId })
+    : request("/project/open", { method: "POST", body: JSON.stringify({ path, format_id: formatId }) });
 
 export const getCurrentProject = () =>
   request<ProjectInfo | null>("/project/current");
@@ -236,8 +238,55 @@ export const getBackups = (): Promise<BackupEntry[]> =>
 export const restoreBackup = (id: string) =>
   request<void>(`/backups/${id}/restore`, { method: "POST" });
 
+// ─── Translation Memory ──────────────────────────────────────────────────
+
+export interface MemoryEntry {
+  source_hash: string;
+  lang_pair: string;
+  source: string;
+  translation: string;
+  uses: number;
+  last_used: string;
+}
+
+export interface MemoryListResponse {
+  entries: MemoryEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface MemoryFilter {
+  search?: string;
+  lang_pair?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export const getTranslationMemoryStats = (): Promise<{ project_entries: number; global_entries: number }> =>
+  request("/memory/stats");
+
+export const getTranslationMemoryLangPairs = (): Promise<string[]> =>
+  request("/memory/lang-pairs");
+
+export const getTranslationMemory = (filter: MemoryFilter): Promise<MemoryListResponse> => {
+  const params = new URLSearchParams();
+  if (filter.search) params.set("search", filter.search);
+  if (filter.lang_pair) params.set("lang_pair", filter.lang_pair);
+  if (filter.limit) params.set("limit", String(filter.limit));
+  if (filter.offset) params.set("offset", String(filter.offset));
+  return request(`/memory?${params}`);
+};
+
+export const deleteTranslationMemoryEntry = (hash: string, langPair: string): Promise<void> =>
+  request(`/memory/${encodeURIComponent(hash)}/${encodeURIComponent(langPair)}`, { method: "DELETE" });
+
+export const clearTranslationMemory = (): Promise<void> =>
+  request("/memory", { method: "DELETE" });
+
 /** Get the WebSocket URL for a translation job */
 export async function getWsUrl(jobId: string): Promise<string> {
+  await baseUrl(); // ensure _serverPort is resolved
   const port = IS_TAURI ? _serverPort : 7842;
   return `ws://localhost:${port}/api/translate/ws/${jobId}`;
 }

@@ -254,16 +254,8 @@ async fn test_full_rpgmaker_mv_flow() {
     let name = json[1]["name"].as_str().unwrap();
     assert!(name.contains("[MOCK:es]"), "name should be translated: {}", name);
 
-    // 12. Check backups
-    let backups: Vec<serde_json::Value> = client()
-        .get(format!("{}/api/backups", base_url))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(!backups.is_empty(), "should have at least 1 backup");
+    // 12. Replace mode with output_dir skips backup (original untouched)
+    assert_eq!(report.backup_id, "skip-replace-mode");
 }
 
 // ─── Ren'Py Add mode flow ──────────────────────────────────────────────────
@@ -445,18 +437,14 @@ async fn test_backup_restore() {
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    // Inject (creates backup) — short path for Windows
-    let output_dir = std::env::temp_dir().join("locust_bk_out");
-    let _ = std::fs::remove_dir_all(&output_dir);
-    std::fs::create_dir_all(&output_dir).unwrap();
+    // Inject with Add mode (creates backup; Replace+output_dir skips backup)
     client()
         .post(format!("{}/api/inject", base_url))
         .json(&serde_json::json!({
             "project_path": tmpdir.path().to_string_lossy(),
             "format_id": "rpgmaker-mv",
-            "mode": "replace",
-            "languages": ["es"],
-            "output_dir": output_dir.to_string_lossy()
+            "mode": "add",
+            "languages": ["es"]
         }))
         .send()
         .await

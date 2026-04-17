@@ -15,7 +15,7 @@ use tower_http::cors::CorsLayer;
 
 use locust_core::backup::{BackupEntry, BackupManager};
 use locust_core::config::AppConfig;
-use locust_core::database::{Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, ProjectStats};
+use locust_core::database::{Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, MemoryEntry, ProjectStats};
 use locust_core::export;
 use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
 use locust_core::font_validation::{FontCoverageReport, FontValidator};
@@ -55,6 +55,16 @@ pub struct AppState {
     pub global_memory: Arc<GlobalMemoryDb>,
     pub active_jobs: Arc<DashMap<String, JobState>>,
     pub current_project: Arc<RwLock<Option<ProjectInfo>>>,
+    /// Temp directory to clean up on drop (only set for test states)
+    temp_backup_dir: Option<PathBuf>,
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        if let Some(ref dir) = self.temp_backup_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 /// Create production AppState with persistent storage in the user data directory.
@@ -67,6 +77,12 @@ pub fn create_app_state() -> Arc<AppState> {
     let glossary = Arc::new(Glossary::new(db.clone()));
     let backup_root = data_dir.join("backups");
     std::fs::create_dir_all(&backup_root).ok();
+
+    // Auto-clean old backups on startup (keep last 5)
+    let backup_mgr_tmp = BackupManager::new(backup_root.clone());
+    if let Err(e) = backup_mgr_tmp.delete_old_backups(5) {
+        tracing::warn!("Failed to clean old backups: {}", e);
+    }
 
     let config = AppConfig::load(&AppConfig::default_path()).unwrap_or_default();
     let format_registry = locust_formats::default_registry();
@@ -85,6 +101,7 @@ pub fn create_app_state() -> Arc<AppState> {
         global_memory: Arc::new(global_memory),
         active_jobs: Arc::new(DashMap::new()),
         current_project: Arc::new(RwLock::new(None)),
+        temp_backup_dir: None,
     })
 }
 
@@ -102,10 +119,11 @@ pub fn create_test_state() -> Arc<AppState> {
         db,
         glossary,
         config: Arc::new(RwLock::new(config)),
-        backup_manager: Arc::new(BackupManager::new(backup_root)),
+        backup_manager: Arc::new(BackupManager::new(backup_root.clone())),
         global_memory: Arc::new(GlobalMemoryDb::open_in_memory().unwrap()),
         active_jobs: Arc::new(DashMap::new()),
         current_project: Arc::new(RwLock::new(None)),
+        temp_backup_dir: Some(backup_root),
     })
 }
 
@@ -136,6 +154,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/import/xliff", post(import_xliff))
         .route("/api/config", get(get_config).patch(patch_config))
         .route("/api/memory/stats", get(memory_stats))
+        .route("/api/memory", get(list_memory).delete(clear_memory))
+        .route("/api/memory/:hash/:lang_pair", delete(delete_memory_entry))
+        .route("/api/memory/lang-pairs", get(memory_lang_pairs))
         .route("/api/backups", get(list_backups))
         .route("/api/backups/:id/restore", post(restore_backup))
         .route("/api/backups/:id", delete(delete_backup))
@@ -222,6 +243,7 @@ async fn provider_health(
 #[derive(Deserialize)]
 struct OpenProjectRequest {
     path: String,
+    format_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -246,10 +268,17 @@ async fn project_open(
     // Resolve executable/file path to game root
     let path = locust_core::extraction::resolve_game_root(&raw_path, &state.format_registry);
 
-    let plugin = state
-        .format_registry
-        .detect(&path)
-        .ok_or_else(|| err(StatusCode::UNPROCESSABLE_ENTITY, "format not detected"))?;
+    let plugin = if let Some(ref fid) = req.format_id {
+        state
+            .format_registry
+            .get(fid)
+            .ok_or_else(|| err(StatusCode::UNPROCESSABLE_ENTITY, format!("Unknown format: {}", fid)))?
+    } else {
+        state
+            .format_registry
+            .detect(&path)
+            .ok_or_else(|| err(StatusCode::UNPROCESSABLE_ENTITY, "format not detected"))?
+    };
 
     let format_id = plugin.id().to_string();
     let format_name = plugin.name().to_string();
@@ -458,8 +487,15 @@ async fn translate_start(
                 break;
             }
         }
-        // Clean up job after completion
+        // Delay cleanup so WebSocket clients have time to connect and receive final events
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         jobs.remove(&cleanup_job_id);
+    });
+
+    // Insert job BEFORE spawning so WebSocket can find it immediately
+    state.active_jobs.insert(job_id.clone(), JobState {
+        abort_handle: tokio::spawn(async {}).abort_handle(), // placeholder
+        progress_tx: broadcast_tx,
     });
 
     let handle = tokio::spawn(async move {
@@ -468,10 +504,10 @@ async fn translate_start(
             .await;
     });
 
-    state.active_jobs.insert(job_id.clone(), JobState {
-        abort_handle: handle.abort_handle(),
-        progress_tx: broadcast_tx,
-    });
+    // Update with real abort handle
+    if let Some(mut job) = state.active_jobs.get_mut(&job_id) {
+        job.abort_handle = handle.abort_handle();
+    }
 
     Ok(Json(TranslateStartResponse { job_id }))
 }
@@ -493,10 +529,15 @@ async fn translate_ws(
     AxumPath(job_id): AxumPath<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let rx = state
-        .active_jobs
-        .get(&job_id)
-        .map(|job| job.progress_tx.subscribe());
+    // Retry briefly to handle race condition where WS connects before job insert completes
+    let mut rx = None;
+    for _ in 0..20 {
+        if let Some(job) = state.active_jobs.get(&job_id) {
+            rx = Some(job.progress_tx.subscribe());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     ws.on_upgrade(move |socket| handle_translate_ws(socket, rx))
 }
@@ -750,6 +791,64 @@ async fn memory_stats(
         "project_entries": project,
         "global_entries": global,
     })))
+}
+
+async fn list_memory(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let search = params.get("search").map(|s| s.as_str());
+    let lang_pair = params.get("lang_pair").map(|s| s.as_str());
+    let limit: usize = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let offset: usize = params.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let (entries, total) = state
+        .global_memory
+        .list_memory(search, lang_pair, limit, offset)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "entries": entries,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+async fn delete_memory_entry(
+    State(state): State<Arc<AppState>>,
+    AxumPath((hash, lang_pair)): AxumPath<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .global_memory
+        .delete_memory(&hash, &lang_pair)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn clear_memory(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Clear both global memory and project-level memory
+    state
+        .global_memory
+        .clear_memory()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    state
+        .db
+        .clear_memory()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn memory_lang_pairs(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    state
+        .global_memory
+        .memory_lang_pairs()
+        .map(Json)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 async fn list_backups(

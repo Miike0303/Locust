@@ -93,8 +93,23 @@ impl RenPyPlugin {
         let temp_dir = std::env::temp_dir().join(format!("locust_rpa_inject_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir)?;
 
-        for rpa_path in &rpa_files {
-            let _ = Self::extract_rpa(rpa_path, &temp_dir);
+        // Run the actual injection logic, ensuring temp_dir is always cleaned up
+        let result = Self::inject_rpa_inner(&game_dir, &temp_dir, &rpa_files, entries);
+
+        // Always cleanup temp dir, even on error
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        result
+    }
+
+    fn inject_rpa_inner(
+        game_dir: &Path,
+        temp_dir: &Path,
+        rpa_files: &std::collections::HashSet<PathBuf>,
+        entries: &[StringEntry],
+    ) -> locust_core::error::Result<InjectionReport> {
+        for rpa_path in rpa_files {
+            let _ = Self::extract_rpa(rpa_path, temp_dir);
         }
 
         // Build a lookup: (filename, line_number) -> (source, translation)
@@ -126,7 +141,7 @@ impl RenPyPlugin {
         let mut strings_written = 0;
 
         // Walk all extracted .rpy files and apply translations by line number
-        for dir_entry in walkdir::WalkDir::new(&temp_dir)
+        for dir_entry in walkdir::WalkDir::new(temp_dir)
             .into_iter()
             .filter_map(|e| e.ok())
         {
@@ -135,7 +150,7 @@ impl RenPyPlugin {
                 continue;
             }
             // Skip tl/ directory
-            if let Ok(rel) = fpath.strip_prefix(&temp_dir) {
+            if let Ok(rel) = fpath.strip_prefix(temp_dir) {
                 let rel_str = rel.to_string_lossy();
                 if rel_str.starts_with("tl/") || rel_str.starts_with("tl\\") {
                     continue;
@@ -148,7 +163,7 @@ impl RenPyPlugin {
             };
 
             // Get the filename (with subdirectory path from temp_dir)
-            let rel_path = fpath.strip_prefix(&temp_dir).unwrap_or(fpath);
+            let rel_path = fpath.strip_prefix(temp_dir).unwrap_or(fpath);
             let filename = rel_path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
             let mut modified = false;
@@ -180,18 +195,21 @@ impl RenPyPlugin {
 
             if modified {
                 // Write translated .rpy to game/ dir (preserving subdirectory structure)
-                let rel = fpath.strip_prefix(&temp_dir).unwrap_or(fpath);
+                let rel = fpath.strip_prefix(temp_dir).unwrap_or(fpath);
                 let dest = game_dir.join(rel);
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&dest, &new_content)?;
                 files_modified += 1;
+
+                // Delete corresponding .rpyc so Ren'Py recompiles from the modified .rpy
+                let rpyc_path = dest.with_extension("rpyc");
+                if rpyc_path.exists() {
+                    let _ = std::fs::remove_file(&rpyc_path);
+                }
             }
         }
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&temp_dir);
 
         Ok(InjectionReport {
             files_modified,
@@ -299,13 +317,63 @@ impl RenPyPlugin {
 
         let mut entries = Vec::new();
         let mut in_menu = false;
+        let mut in_python = false;
+        let mut python_indent = 0usize;
+        // Track multi-line define blocks (dicts, lists, parenthesized values).
+        // These contain internal identifiers/config values, not translatable text.
+        let mut define_bracket_depth: i32 = 0;
 
         for (line_idx, line) in content.lines().enumerate() {
             let line_num = line_idx + 1;
             let trimmed = line.trim();
 
+            // Track multi-line define blocks: `define x = { ... }`, `define x = [ ... ]`, `define x = ( ... )`
+            // When opened, skip all content until closed.
+            if define_bracket_depth == 0 && trimmed.starts_with("define ") {
+                // Count opening vs closing brackets on this line
+                let opens = trimmed.matches(|c| c == '{' || c == '[' || c == '(').count() as i32;
+                let closes = trimmed.matches(|c| c == '}' || c == ']' || c == ')').count() as i32;
+                if opens > closes {
+                    define_bracket_depth = opens - closes;
+                    // Still process this line (the `define x = {` might have extract logic)
+                    // But don't skip — the first line is the define itself
+                }
+            } else if define_bracket_depth > 0 {
+                let opens = trimmed.matches(|c| c == '{' || c == '[' || c == '(').count() as i32;
+                let closes = trimmed.matches(|c| c == '}' || c == ']' || c == ')').count() as i32;
+                define_bracket_depth += opens - closes;
+                if define_bracket_depth < 0 {
+                    define_bracket_depth = 0;
+                }
+                // Skip all content inside the multi-line define block
+                continue;
+            }
+
+            // Track python blocks (skip most content inside them)
+            if trimmed.starts_with("python:") || trimmed.starts_with("init python:")
+                || trimmed.starts_with("init -") && trimmed.contains("python:")
+            {
+                in_python = true;
+                python_indent = line.len() - line.trim_start().len();
+                // But still check for translatable calls inside python
+            }
+            if in_python && !trimmed.is_empty() {
+                let cur_indent = line.len() - line.trim_start().len();
+                if cur_indent <= python_indent && !trimmed.starts_with("python:")
+                    && !trimmed.starts_with("init ")
+                    && !trimmed.starts_with('#')
+                {
+                    in_python = false;
+                }
+            }
+
+            // Skip comments
+            if trimmed.starts_with('#') {
+                continue;
+            }
+
             // Track menu blocks
-            if trimmed == "menu:" {
+            if trimmed == "menu:" || trimmed.starts_with("menu ") && trimmed.ends_with(':') {
                 in_menu = true;
                 continue;
             }
@@ -333,7 +401,7 @@ impl RenPyPlugin {
                 }
             }
 
-            // _("text") pattern
+            // _("text") and __("text") patterns — always translatable
             if let Some(text) = extract_underscore_call(trimmed) {
                 let id = format!("{}#{}", filename, line_num);
                 let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
@@ -342,13 +410,77 @@ impl RenPyPlugin {
                 continue;
             }
 
-            // define gui.xxx = "text"
+            // _p("""text""") — multi-paragraph translatable text
+            if let Some(text) = extract_p_call(trimmed) {
+                let id = format!("{}#{}", filename, line_num);
+                let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
+                entry.tags = vec!["ui_label".to_string()];
+                entries.push(entry);
+                continue;
+            }
+
+            // Character("Name") in define or $ — extract the character name
+            if let Some(name) = extract_character_name(trimmed) {
+                let id = format!("{}#{}", filename, line_num);
+                let mut entry = StringEntry::new(id, name, file_path.to_path_buf());
+                entry.tags = vec!["actor_name".to_string()];
+                entries.push(entry);
+                continue;
+            }
+
+            // renpy.notify("text") — player-visible notification
+            if let Some(text) = extract_renpy_call(trimmed, "renpy.notify(") {
+                let id = format!("{}#{}", filename, line_num);
+                let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
+                entry.tags = vec!["ui_label".to_string()];
+                entries.push(entry);
+                continue;
+            }
+
+            // renpy.input("prompt") — input prompt text
+            if let Some(text) = extract_renpy_call(trimmed, "renpy.input(") {
+                let id = format!("{}#{}", filename, line_num);
+                let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
+                entry.tags = vec!["ui_label".to_string()];
+                entries.push(entry);
+                continue;
+            }
+
+            // Inside python blocks, skip everything else
+            if in_python {
+                continue;
+            }
+
+            // define gui.xxx = "text" (but not file paths, colors, etc.)
             if let Some(text) = extract_define_string(trimmed) {
                 let id = format!("{}#{}", filename, line_num);
                 let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
                 entry.tags = vec!["ui_label".to_string()];
                 entries.push(entry);
                 continue;
+            }
+
+            // Screen UI text: text "string", textbutton "string", tooltip "string"
+            if let Some(text) = extract_screen_text(trimmed) {
+                let id = format!("{}#{}", filename, line_num);
+                let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
+                entry.tags = vec!["ui_label".to_string()];
+                entries.push(entry);
+                continue;
+            }
+
+            // centered "text" — always translatable
+            if trimmed.starts_with("centered ") {
+                let rest = trimmed["centered ".len()..].trim();
+                if let Some((text, _)) = extract_quoted_string(rest) {
+                    if !text.is_empty() && !is_file_reference(text) {
+                        let id = format!("{}#{}", filename, line_num);
+                        let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
+                        entry.tags = vec!["dialogue".to_string()];
+                        entries.push(entry);
+                        continue;
+                    }
+                }
             }
 
             // say statement: character "text" or just "text"
@@ -450,6 +582,35 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
         || trimmed.starts_with("hovered ")
         || trimmed.starts_with("unhovered ")
         || trimmed.starts_with("background ")
+        // Screen/style property keywords (common false positive sources)
+        || trimmed.starts_with("style_prefix ")
+        || trimmed.starts_with("variant ")
+        || trimmed.starts_with("scrollbars ")
+        || trimmed.starts_with("layout ")
+        || trimmed.starts_with("size_group ")
+        || trimmed.starts_with("tag ")
+        || trimmed.starts_with("key ")
+        || trimmed.starts_with("id ")
+        || trimmed.starts_with("foreground ")
+        || trimmed.starts_with("side ")
+        || trimmed.starts_with("child ")
+        || trimmed.starts_with("has ")
+        || trimmed.starts_with("focus_mask ")
+        || trimmed.starts_with("alt ")
+        || trimmed.starts_with("group ")
+        || trimmed.starts_with("prefix ")
+        || trimmed.starts_with("suffix ")
+        || trimmed.starts_with("clicked ")
+        || trimmed.starts_with("released ")
+        || trimmed.starts_with("activate_sound ")
+        || trimmed.starts_with("hover_sound ")
+        || trimmed.starts_with("sensitive ")
+        || trimmed.starts_with("selected ")
+        || trimmed.starts_with("tooltip ")
+        // Handled by dedicated extractors
+        || trimmed.starts_with("text ")
+        || trimmed.starts_with("textbutton ")
+        || trimmed.starts_with("centered ")
     {
         return None;
     }
@@ -463,37 +624,32 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
         return None;
     }
 
-    // Character say: `identifier "text"` or `identifier"text"` (no space)
-    // First try with space
-    let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
-    if parts.len() == 2 {
-        let character = parts[0];
-        if character
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            let rest = parts[1].trim();
-            if rest.starts_with('"') {
-                let (text, _) = extract_quoted_string(rest)?;
-                if !text.is_empty() && !is_file_reference(text) {
-                    return Some((Some(character), text));
-                }
-            }
-        }
-    }
-
-    // Try no-space pattern: `identifier"text"` (e.g., mc"Hello")
+    // Character say: `identifier "text"`, `identifier expression "text"`,
+    // `identifier expression_num "text"`, or `identifier"text"` (no space)
+    // Find the first quote to locate where dialogue text begins
     if let Some(quote_pos) = trimmed.find('"') {
         if quote_pos > 0 {
-            let character = &trimmed[..quote_pos];
-            if !character.is_empty()
-                && character.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !is_renpy_keyword(character)
-            {
-                let rest = &trimmed[quote_pos..];
-                let (text, _) = extract_quoted_string(rest)?;
-                if !text.is_empty() && !is_file_reference(text) {
-                    return Some((Some(character), text));
+            let before_quote = trimmed[..quote_pos].trim_end();
+            // Split the part before the quote into words
+            let words: Vec<&str> = before_quote.split_whitespace().collect();
+            if !words.is_empty() {
+                let character = words[0];
+                // Character must be a valid identifier and not a keyword
+                if character.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !is_renpy_keyword(character)
+                {
+                    // All words between character and quote must be identifiers/numbers (expression tags)
+                    let valid_middle = words[1..].iter().all(|w| {
+                        w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                    if valid_middle {
+                        let rest = &trimmed[quote_pos..];
+                        if let Some((text, _)) = extract_quoted_string(rest) {
+                            if !text.is_empty() && !is_file_reference(text) {
+                                return Some((Some(character), text));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -524,31 +680,30 @@ fn is_dialogue_line(trimmed: &str) -> bool {
         return true;
     }
 
-    // Character say: `identifier "text"` or `identifier"text"` (no space)
-    if let Some(space_pos) = trimmed.find(' ') {
-        let before = &trimmed[..space_pos];
-        let after = trimmed[space_pos + 1..].trim();
-
-        let is_identifier = !before.is_empty()
-            && before.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && !is_renpy_keyword(before);
-
-        if is_identifier && after.starts_with('"') {
-            return true;
+    // Character say: `identifier "text"`, `identifier expression "text"`, or `identifier"text"`
+    if let Some(quote_pos) = trimmed.find('"') {
+        if quote_pos > 0 {
+            let before_quote = trimmed[..quote_pos].trim_end();
+            let words: Vec<&str> = before_quote.split_whitespace().collect();
+            if !words.is_empty() {
+                let first = words[0];
+                if first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !is_renpy_keyword(first)
+                {
+                    let valid_middle = words[1..].iter().all(|w| {
+                        w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                    if valid_middle {
+                        return true;
+                    }
+                }
+            }
         }
     }
 
-    // No-space pattern: `mc"text"`
-    if let Some(quote_pos) = trimmed.find('"') {
-        if quote_pos > 0 {
-            let before = &trimmed[..quote_pos];
-            if !before.is_empty()
-                && before.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !is_renpy_keyword(before)
-            {
-                return true;
-            }
-        }
+    // centered "text"
+    if trimmed.starts_with("centered ") && trimmed.contains('"') {
+        return true;
     }
 
     false
@@ -649,10 +804,36 @@ fn extract_define_string(line: &str) -> Option<&str> {
     if trimmed.contains("_(") {
         return None;
     }
+    // Skip Character() definitions — handled separately
+    if trimmed.contains("Character(") {
+        return None;
+    }
+    // Skip non-translatable define patterns
+    let before_eq = &trimmed[7..trimmed.find('=')?];
+    let var_name = before_eq.trim();
+    if var_name.starts_with("config.version")
+        || var_name.starts_with("config.save_directory")
+        || var_name.starts_with("config.window_title")
+        || var_name.starts_with("config.window")
+        || var_name.starts_with("config.screen_width")
+        || var_name.starts_with("config.screen_height")
+        || var_name.starts_with("config.name") && !var_name.contains("_(")
+        || var_name.starts_with("config.language")
+        || var_name.starts_with("config.layer")
+        || var_name.starts_with("build.")
+        || var_name.starts_with("bubble.")
+        || is_gui_non_translatable(var_name)
+    {
+        return None;
+    }
     let eq_pos = trimmed.find('=')?;
     let after_eq = trimmed[eq_pos + 1..].trim();
     let (text, _) = extract_quoted_string(after_eq)?;
     if !text.is_empty() && !is_file_reference(text) {
+        // Skip pure numeric/version strings
+        if text.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return None;
+        }
         Some(text)
     } else {
         None
@@ -661,14 +842,147 @@ fn extract_define_string(line: &str) -> Option<&str> {
 
 fn extract_underscore_call(line: &str) -> Option<&str> {
     let trimmed = line.trim();
-    let start = trimmed.find("_(\"")?;
-    let inner = &trimmed[start + 2..]; // after `_(`
+    // Match _("text") or __("text") but not _p("text")
+    let start = trimmed.find("_(\"").or_else(|| trimmed.find("__(\""))?;
+    let paren_pos = trimmed[start..].find("(\"")? + start;
+    let inner = &trimmed[paren_pos + 1..]; // after `(`
     let (text, _) = extract_quoted_string(inner)?;
     if !text.is_empty() {
         Some(text)
     } else {
         None
     }
+}
+
+/// Extract _p("""multi-line text""") — Ren'Py multi-paragraph translatable text
+fn extract_p_call(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let start = trimmed.find("_p(\"\"\"")?;
+    let inner = &trimmed[start + 6..]; // after `_p("""`
+    let end = inner.find("\"\"\")")?;
+    let text = &inner[..end];
+    if !text.trim().is_empty() {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+/// Extract character name from Character("Name", ...) definitions
+fn extract_character_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    // Must be a define or $ assignment with Character(...)
+    if !trimmed.starts_with("define ") && !trimmed.starts_with("$ ") {
+        return None;
+    }
+    // Find Character( call
+    let char_pos = trimmed.find("Character(")?;
+    let after = &trimmed[char_pos + 10..]; // after `Character(`
+    let after_trimmed = after.trim();
+    // Skip Character(None, ...) and Character(_("..."), ...) (already handled by _() extractor)
+    if after_trimmed.starts_with("None") || after_trimmed.starts_with("_(") {
+        return None;
+    }
+    // Extract the quoted name
+    if let Some((name, _)) = extract_quoted_string(after_trimmed) {
+        // Skip empty names and pure variable references like "[name]"
+        if name.is_empty() {
+            return None;
+        }
+        // Pure variable reference: skip (e.g., "[name]" or "[l]")
+        if name.starts_with('[') && name.ends_with(']') && !name.contains(' ') {
+            return None;
+        }
+        return Some(name);
+    }
+    None
+}
+
+/// Extract text from renpy.notify("text") or renpy.input("text") calls
+fn extract_renpy_call<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let trimmed = line.trim();
+    let start = trimmed.find(prefix)?;
+    let after = &trimmed[start + prefix.len()..];
+    // The argument might start with _(" for translated calls — skip those (handled by _() extractor)
+    let after_trimmed = after.trim();
+    if after_trimmed.starts_with("_(") {
+        return None;
+    }
+    let (text, _) = extract_quoted_string(after_trimmed)?;
+    if !text.is_empty() && !is_file_reference(text) {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+/// Extract translatable text from screen UI elements:
+/// text "string", textbutton "string", tooltip "string"
+fn extract_screen_text(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+
+    // Match: text "string", textbutton "string", tooltip "string", tooltip ("string")
+    let prefixes = &[
+        "text ", "textbutton ", "tooltip ",
+    ];
+
+    for &prefix in prefixes {
+        if !trimmed.starts_with(prefix) {
+            continue;
+        }
+        let rest = trimmed[prefix.len()..].trim();
+
+        // Skip if already uses _() — handled by underscore call extractor
+        if rest.starts_with("_(") || rest.starts_with("__(") {
+            return None;
+        }
+        // Skip variable references (no quote)
+        if !rest.starts_with('"') && !rest.starts_with("(\"") {
+            return None;
+        }
+        // Handle tooltip ("string") with parens
+        let rest = if rest.starts_with("(\"") {
+            &rest[1..]
+        } else {
+            rest
+        };
+        let (text, _) = extract_quoted_string(rest)?;
+        if text.is_empty() || is_file_reference(text) {
+            return None;
+        }
+        // Skip very short non-word strings that are likely identifiers
+        // e.g., text "window" as a style reference
+        if text.len() <= 2 && !text.contains(|c: char| c.is_whitespace()) {
+            return None;
+        }
+        return Some(text);
+    }
+    None
+}
+
+/// Check if a gui.xxx variable is non-translatable (colors, sizes, fonts, layout values).
+fn is_gui_non_translatable(var: &str) -> bool {
+    if !var.starts_with("gui.") {
+        return false;
+    }
+    let prop = &var[4..];
+    // Explicit non-translatable system values
+    if prop == "language" || prop == "unscrollable" || prop == "rollback_side"
+        || prop == "history_allow_tags"
+    {
+        return true;
+    }
+    // Skip color, size, font, border, padding, spacing, position properties
+    prop.contains("color") || prop.contains("size") || prop.contains("font")
+        || prop.contains("border") || prop.contains("padding") || prop.contains("spacing")
+        || prop.contains("height") || prop.contains("width") || prop.contains("align")
+        || prop.contains("offset") || prop.contains("xpos") || prop.contains("ypos")
+        || prop.contains("tile") || prop.contains("opacity") || prop.contains("outlines")
+        || prop.contains("background") || prop.contains("icon")
+        || prop.ends_with("_idle") || prop.ends_with("_hover") || prop.ends_with("_insensitive")
+        || prop.starts_with("show_") || prop.starts_with("button_")
+        || prop.starts_with("choice_") || prop.starts_with("navigation_")
+        || prop.starts_with("slot_") || prop.starts_with("namebox_")
 }
 
 /// Simplified Python pickle parser for RPA index data.
@@ -1136,9 +1450,10 @@ impl FormatPlugin for RenPyPlugin {
                 let line_num = line_idx + 1;
                 if let Some(&translation) = line_translations.get(&line_num) {
                     if let Some(&source) = source_lookup.get(&line_num) {
+                        let safe_trans = escape_inner_quotes(translation);
                         let new_line = line.replacen(
                             &format!("\"{}\"", source),
-                            &format!("\"{}\"", translation),
+                            &format!("\"{}\"", safe_trans),
                             1,
                         );
                         new_lines.push(new_line);
@@ -1150,6 +1465,12 @@ impl FormatPlugin for RenPyPlugin {
 
             std::fs::write(file_path, new_lines.join("\n"))?;
             files_modified += 1;
+
+            // Delete corresponding .rpyc so Ren'Py recompiles from the modified .rpy
+            let rpyc_path = file_path.with_extension("rpyc");
+            if rpyc_path.exists() {
+                let _ = std::fs::remove_file(&rpyc_path);
+            }
         }
 
         Ok(InjectionReport {
@@ -1173,6 +1494,11 @@ impl FormatPlugin for RenPyPlugin {
                 .unwrap_or(path)
                 .to_path_buf()
         };
+
+        // Also do a direct inject on .rpy files — this is the most reliable way to get
+        // dialogue translations to actually appear in the game. The `translate strings:`
+        // block works for UI/menu text but isn't always reliable for character dialogue.
+        let _ = self.inject(path, entries);
 
         let tl_dir = game_dir.join("tl").join(lang);
         std::fs::create_dir_all(&tl_dir)?;
@@ -1226,6 +1552,34 @@ impl FormatPlugin for RenPyPlugin {
 
             let tl_file = tl_dir.join("locust_strings.rpy");
             std::fs::write(&tl_file, lines.join("\n"))?;
+
+            // Delete the .rpyc if it exists so Ren'Py recompiles with the new translations
+            let tl_rpyc = tl_dir.join("locust_strings.rpyc");
+            if tl_rpyc.exists() {
+                let _ = std::fs::remove_file(&tl_rpyc);
+            }
+
+            // Create locust_languages.rpy with an in-game language picker.
+            // Scans the tl/ folder for available languages and adds a selector button
+            // to the main menu and game menu (preferences).
+            let langs_file_content = build_language_picker_script(&game_dir, lang);
+            let langs_file = game_dir.join("locust_languages.rpy");
+            std::fs::write(&langs_file, langs_file_content)?;
+            // Delete .rpyc so Ren'Py picks up the new .rpy
+            let langs_rpyc = game_dir.join("locust_languages.rpyc");
+            if langs_rpyc.exists() {
+                let _ = std::fs::remove_file(&langs_rpyc);
+            }
+
+            // Remove old locust_language.rpy from previous versions if it exists
+            let old_lang_file = game_dir.join("locust_language.rpy");
+            if old_lang_file.exists() {
+                let _ = std::fs::remove_file(&old_lang_file);
+            }
+            let old_lang_rpyc = game_dir.join("locust_language.rpyc");
+            if old_lang_rpyc.exists() {
+                let _ = std::fs::remove_file(&old_lang_rpyc);
+            }
         }
 
         Ok(InjectionReport {
@@ -1235,6 +1589,126 @@ impl FormatPlugin for RenPyPlugin {
             warnings: Vec::new(),
         })
     }
+}
+
+/// Build a Ren'Py script that adds an in-game language picker.
+/// Scans game/tl/ for available language folders and creates a picker screen
+/// accessible from the main menu and game menu (preferences).
+fn build_language_picker_script(game_dir: &Path, just_added_lang: &str) -> String {
+    // Scan tl/ for available languages
+    let tl_dir = game_dir.join("tl");
+    let mut langs: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&tl_dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_dir() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        // Skip "None" pseudo-directory and empty entries
+                        if !name.is_empty() && name != "None" {
+                            langs.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Ensure the just-added language is included (tl/<lang>/ might not be created yet)
+    if !langs.iter().any(|l| l == just_added_lang) {
+        langs.push(just_added_lang.to_string());
+    }
+    langs.sort();
+    langs.dedup();
+
+    // Human-readable language names
+    fn lang_name(code: &str) -> &str {
+        match code {
+            "es" => "Español",
+            "en" => "English",
+            "ja" => "日本語",
+            "zh-CN" | "zh_CN" | "zhCN" => "简体中文",
+            "zh-TW" | "zh_TW" | "zhTW" => "繁體中文",
+            "ko" => "한국어",
+            "fr" => "Français",
+            "de" => "Deutsch",
+            "it" => "Italiano",
+            "pt" => "Português",
+            "pt-BR" | "pt_BR" | "ptBR" => "Português BR",
+            "ru" => "Русский",
+            "nl" => "Nederlands",
+            "pl" => "Polski",
+            "tr" => "Türkçe",
+            "ar" => "العربية",
+            "vi" => "Tiếng Việt",
+            "th" => "ไทย",
+            "id" => "Bahasa Indonesia",
+            other => other,
+        }
+    }
+
+    let mut buttons = String::new();
+    // Original language button (None = use original game language)
+    buttons.push_str("                textbutton \"Original\" action Language(None) xalign 0.5 text_size 22\n");
+    for code in &langs {
+        let name = lang_name(code);
+        buttons.push_str(&format!(
+            "                textbutton \"{}\" action Language(\"{}\") xalign 0.5 text_size 22\n",
+            name.replace('"', "\\\""),
+            code.replace('"', "\\\"")
+        ));
+    }
+
+    format!(
+        r##"# Auto-generated by Locust — adds an in-game language picker.
+# Players can change language via the floating button on the main menu,
+# or from the preferences screen.
+
+screen locust_language_picker():
+    modal True
+    zorder 200
+    frame:
+        align (0.5, 0.5)
+        background "#000000dd"
+        padding (40, 30)
+        xmaximum 500
+        vbox:
+            spacing 10
+            text "Language / Idioma" xalign 0.5 size 28 color "#ffffff"
+            null height 15
+{}            null height 15
+            textbutton "Close / Cerrar" action Hide("locust_language_picker") xalign 0.5 text_size 20
+
+screen locust_language_button():
+    zorder 150
+    textbutton "🌐 Language" action Show("locust_language_picker"):
+        xalign 1.0
+        yalign 0.0
+        xoffset -20
+        yoffset 20
+        text_size 18
+        background "#00000088"
+        padding (12, 6)
+
+# Show the language button on the main menu
+init python:
+    config.after_load_callbacks = getattr(config, "after_load_callbacks", [])
+
+    def _locust_show_lang_button():
+        try:
+            current = renpy.current_screen()
+            name = current.screen_name[0] if current else ""
+            if name in ("main_menu", "navigation"):
+                if not renpy.get_screen("locust_language_button"):
+                    renpy.show_screen("locust_language_button")
+            else:
+                if renpy.get_screen("locust_language_button"):
+                    renpy.hide_screen("locust_language_button")
+        except Exception:
+            pass
+
+    config.interact_callbacks.append(_locust_show_lang_button)
+"##,
+        buttons
+    )
 }
 
 #[cfg(test)]

@@ -145,14 +145,22 @@ impl UnityPlugin {
                 }
 
                 // Dialogue: `CharID Text here` or `CharID Text with \bformatting\b`
-                // Character IDs are short uppercase/mixed identifiers
                 if let Some((character, text)) = extract_vn_dialogue(trimmed) {
                     if !text.is_empty() && text.len() >= 2 {
-                        let id = format!("{}#{}", filename, line_num);
-                        let mut entry = StringEntry::new(id, text, fpath.to_path_buf());
-                        entry.tags = vec!["dialogue".to_string()];
-                        entry.context = Some(character.to_string());
-                        all.push(entry);
+                        // Strip format codes for translation, store clean text
+                        let clean = strip_vn_format_codes(text);
+                        if !clean.is_empty() && clean.len() >= 2 {
+                            let id = format!("{}#{}", filename, line_num);
+                            let mut entry = StringEntry::new(&id, &clean, fpath.to_path_buf());
+                            entry.tags = vec!["dialogue".to_string()];
+                            entry.context = Some(character.to_string());
+                            // Store original text with format codes in metadata
+                            entry.metadata.insert(
+                                "original_with_codes".to_string(),
+                                serde_json::Value::String(text.to_string()),
+                            );
+                            all.push(entry);
+                        }
                     }
                 }
             }
@@ -218,17 +226,24 @@ impl UnityPlugin {
                     }
 
                     // Dialogue lines: CharID Text → CharID TranslatedText
-                    // Only replace the text AFTER the character ID
-                    if let Some(space_pos) = trimmed.find(' ') {
-                        let char_id = &trimmed[..space_pos];
-                        let indent = &line[..line.len() - trimmed.len()];
-                        if char_id.chars().next().map_or(false, |c| c.is_ascii_uppercase())
-                            && char_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        {
-                            new_lines.push(format!("{}{} {}", indent, char_id, translation));
-                            modified = true;
-                            continue;
-                        }
+                    // Source was stored with format codes stripped.
+                    // Find the original text (with codes) in the line and replace,
+                    // preserving format codes around the translation.
+                    let trimmed_line = line.trim();
+                    if let Some(space_pos) = trimmed_line.find(' ') {
+                        let after_char = &trimmed_line[space_pos + 1..];
+                        let (prefix_codes, _inner, suffix_codes) = split_format_codes(after_char);
+                        // Reconstruct: indent + CharID + space + prefix_codes + translation + suffix_codes
+                        let indent = &line[..line.len() - trimmed_line.len()];
+                        let char_id = &trimmed_line[..space_pos];
+                        let translated_with_codes = format!(
+                            "{}{} {}{}{}",
+                            indent, char_id,
+                            prefix_codes, translation, suffix_codes
+                        );
+                        new_lines.push(translated_with_codes);
+                        modified = true;
+                        continue;
                     }
                 }
                 new_lines.push(line.to_string());
@@ -324,34 +339,75 @@ fn extract_quoted_in_line(line: &str) -> Option<&str> {
 
 /// Extract VN dialogue: `CharID Dialogue text here`
 /// Character IDs are 1-5 char identifiers (letters, sometimes digits)
+/// Returns (char_id, clean_text) where clean_text has format codes stripped
 fn extract_vn_dialogue(line: &str) -> Option<(&str, &str)> {
     let trimmed = line.trim();
     if trimmed.is_empty() { return None; }
 
-    // Must start with a character identifier followed by space then dialogue
     let space_pos = trimmed.find(' ')?;
     let char_id = &trimmed[..space_pos];
     let text = trimmed[space_pos + 1..].trim();
 
-    // Character ID: 1-8 chars, alphanumeric + underscore, starts with uppercase
-    if char_id.is_empty() || char_id.len() > 8 {
-        return None;
-    }
-    if !char_id.chars().next()?.is_ascii_uppercase() {
-        return None;
-    }
-    if !char_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
+    if char_id.is_empty() || char_id.len() > 8 { return None; }
+    if !char_id.chars().next()?.is_ascii_uppercase() { return None; }
+    if !char_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return None; }
+    if text.is_empty() || text.starts_with('{') || text.starts_with('+') { return None; }
 
-    // Text must not be a keyword/command
-    if text.is_empty() || text.starts_with('{') || text.starts_with('+') {
-        return None;
-    }
-
-    // Strip VN formatting tags for the extracted text but keep in source for matching
-    // Tags like \b, \i are Ren'Py-style formatting
     Some((char_id, text))
+}
+
+/// Strip VN format codes from text for translation.
+/// Codes like \i, \b, \- are engine formatting and should not be translated.
+fn strip_vn_format_codes(text: &str) -> String {
+    text.replace("\\i", "")
+        .replace("\\b", "")
+        .replace("\\-", "")
+        .replace("\\p", "")
+        .replace("\\n", " ")
+        .trim()
+        .to_string()
+}
+
+/// Find format code prefix/suffixes in the original text so we can restore them.
+/// Returns (prefix_codes, inner_text, suffix_codes)
+fn split_format_codes(text: &str) -> (String, String, String) {
+    let mut prefix = String::new();
+    let mut suffix = String::new();
+    let inner = text.to_string();
+
+    // Extract leading format codes
+    let mut chars = inner.chars().peekable();
+    let mut prefix_end = 0;
+    while let Some(&ch) = chars.peek() {
+        if ch == '\\' {
+            chars.next();
+            if let Some(&next) = chars.peek() {
+                prefix.push('\\');
+                prefix.push(next);
+                chars.next();
+                prefix_end += 2;
+                // Skip any following whitespace
+                while let Some(&ws) = chars.peek() {
+                    if ws == ' ' { chars.next(); prefix_end += 1; }
+                    else { break; }
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    let remaining = &inner[prefix_end..];
+
+    // Check for trailing format codes
+    let trimmed_end = remaining.trim_end();
+    if trimmed_end.ends_with("\\i") || trimmed_end.ends_with("\\b") {
+        let code_start = trimmed_end.len() - 2;
+        suffix = remaining[code_start..].to_string();
+        return (prefix, remaining[..code_start].trim().to_string(), suffix);
+    }
+
+    (prefix, remaining.to_string(), suffix)
 }
 
 fn is_unity_translatable(text: &str) -> bool {

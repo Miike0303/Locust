@@ -12,6 +12,7 @@ use crate::glossary::Glossary;
 use crate::models::{
     ProgressEvent, StringEntry, StringStatus, TranslationRequest, TranslationResult,
 };
+use crate::placeholder::{Placeholder, PlaceholderProcessor};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LangPair {
@@ -169,7 +170,10 @@ impl TranslationManager {
                 }
             }
 
-            // 5c. Build TranslationRequests
+            // 5c. Build TranslationRequests — sanitize placeholders so the translator
+            // doesn't translate variable names like [player_name] or Ren'Py tags {i}{/i}
+            let mut placeholders_by_id: std::collections::HashMap<String, Vec<Placeholder>> =
+                std::collections::HashMap::new();
             let requests: Vec<TranslationRequest> = chunk
                 .iter()
                 .map(|entry| {
@@ -179,9 +183,11 @@ impl TranslationManager {
                         (None, Some(gc)) => Some(gc.clone()),
                         (None, None) => None,
                     };
+                    let (sanitized, phs) = PlaceholderProcessor::extract(&entry.source);
+                    placeholders_by_id.insert(entry.id.clone(), phs);
                     TranslationRequest {
                         entry_id: entry.id.clone(),
-                        source: entry.source.clone(),
+                        source: sanitized,
                         source_lang: opts.source_lang.clone(),
                         target_lang: opts.target_lang.clone(),
                         context,
@@ -192,7 +198,29 @@ impl TranslationManager {
 
             // 5d. Call provider
             match self.provider.translate(&requests).await {
-                Ok(results) => {
+                Ok(mut results) => {
+                    // Restore placeholders in translations before saving
+                    for result in &mut results {
+                        if let Some(phs) = placeholders_by_id.get(&result.entry_id) {
+                            if !phs.is_empty() {
+                                match PlaceholderProcessor::restore(&result.translation, phs) {
+                                    Ok(restored) => result.translation = restored,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to restore placeholders for {}: {}. Falling back to original with any missing tokens replaced.",
+                                            result.entry_id, e
+                                        );
+                                        // Best-effort restore: replace each token even if some missing
+                                        let mut t = result.translation.clone();
+                                        for ph in phs {
+                                            t = t.replace(&ph.token, &ph.original);
+                                        }
+                                        result.translation = t;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // 5e. Process results
                     for result in &results {
                         let _ = self
@@ -204,7 +232,8 @@ impl TranslationManager {
                             )
                             .await;
 
-                        if opts.use_memory {
+                        // Don't cache mock translations in memory
+                        if opts.use_memory && result.provider != "mock" {
                             if let Some(req) =
                                 requests.iter().find(|r| r.entry_id == result.entry_id)
                             {

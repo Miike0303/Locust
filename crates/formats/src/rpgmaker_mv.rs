@@ -13,13 +13,117 @@ const ARRAY_FILES: &[&str] = &[
 const EXTRACTABLE_FIELDS: &[(&str, &str)] = &[
     ("name", "actor_name"),
     ("description", "description"),
-    ("note", "note"),
     ("profile", "description"),
     ("message1", "dialogue"),
     ("message2", "dialogue"),
     ("message3", "dialogue"),
     ("message4", "dialogue"),
 ];
+
+/// System.json type arrays that are shown to the player in menus.
+const SYSTEM_TYPE_ARRAYS: &[(&str, &str)] = &[
+    ("armorTypes", "ui_label"),
+    ("elements", "ui_label"),
+    ("equipTypes", "ui_label"),
+    ("skillTypes", "ui_label"),
+    ("weaponTypes", "ui_label"),
+];
+
+/// Known text-display plugin command prefixes (MV code 356).
+const TEXT_DISPLAY_PLUGINS: &[&str] = &[
+    "D_TEXT",      // Dynamic Text plugin (shows text on screen)
+    "SHOW_TEXT",   // Various show-text plugins
+    "T_TEXT",      // Text plugins
+    "GN_TEXT",     // Game Note text
+];
+
+/// Argument keys in MZ plugin commands (code 357) that contain translatable text.
+const MZ_TRANSLATABLE_ARG_KEYS: &[&str] = &[
+    "text",        // DTextPicture text
+    "destination", // DestinationWindow quest objective
+    "label",       // Choice labels (may be nested JSON)
+    "message",     // Various message texts
+    "description", // Description fields
+    "choices",     // Choice arrays (nested JSON with labels)
+];
+
+/// Extract translatable text from a plugin command (code 356).
+/// Returns Some(full_command) only if it's a known text-display plugin command
+/// containing CJK characters. Returns None for technical/audio/system commands.
+fn extract_plugin_command_text(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Check if the command starts with a known text-display plugin prefix
+    for prefix in TEXT_DISPLAY_PLUGINS {
+        if trimmed.starts_with(prefix) {
+            // Verify it has CJK text content
+            if trimmed.chars().any(|c| {
+                ('\u{3000}'..='\u{9FFF}').contains(&c)
+                    || ('\u{FF00}'..='\u{FFEF}').contains(&c)
+            }) {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract translatable strings from an MZ plugin command (code 357).
+/// MZ format: [pluginName, commandName, commandDesc, {args}]
+/// Returns Vec of (arg_key, text_value) pairs.
+fn extract_mz_plugin_command(params: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    if params.len() < 4 {
+        return results;
+    }
+    let args = match params[3].as_object() {
+        Some(a) => a,
+        None => return results,
+    };
+
+    for &key in MZ_TRANSLATABLE_ARG_KEYS {
+        if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
+            if val.trim().is_empty() {
+                continue;
+            }
+            // "choices" field contains nested JSON array of objects with "label" keys
+            if key == "choices" {
+                if let Ok(choices_arr) = serde_json::from_str::<Vec<serde_json::Value>>(val) {
+                    for (ci, choice) in choices_arr.iter().enumerate() {
+                        // Each choice might be a string (nested JSON) or an object
+                        let choice_obj = if let Some(s) = choice.as_str() {
+                            serde_json::from_str::<serde_json::Value>(s).ok()
+                        } else {
+                            Some(choice.clone())
+                        };
+                        if let Some(obj) = choice_obj {
+                            if let Some(label) = obj.get("label").and_then(|v| v.as_str()) {
+                                if !label.trim().is_empty() && label.chars().any(|c| {
+                                    ('\u{3000}'..='\u{9FFF}').contains(&c)
+                                        || ('\u{FF00}'..='\u{FFEF}').contains(&c)
+                                }) {
+                                    results.push((format!("choices#{}#label", ci), label.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            // Regular text field — only if it contains CJK characters
+            if val.chars().any(|c| {
+                ('\u{3000}'..='\u{9FFF}').contains(&c)
+                    || ('\u{FF00}'..='\u{FFEF}').contains(&c)
+            }) {
+                results.push((key.to_string(), val.to_string()));
+            }
+        }
+    }
+    results
+}
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MvMzVersion {
@@ -41,16 +145,30 @@ impl RpgMakerMvPlugin {
 
     fn find_data_dir(path: &Path) -> Option<PathBuf> {
         if path.is_dir() {
+            // Check www/data first (MV typically uses www/data/)
+            let www = path.join("www").join("data");
+            if www.is_dir() && Self::has_rpgmaker_json(&www) {
+                return Some(www);
+            }
             let direct = path.join("data");
-            if direct.is_dir() {
+            if direct.is_dir() && Self::has_rpgmaker_json(&direct) {
                 return Some(direct);
             }
-            let www = path.join("www").join("data");
+            // Fallback: return any existing data dir even without known files
             if www.is_dir() {
                 return Some(www);
             }
+            if direct.is_dir() {
+                return Some(direct);
+            }
         }
         None
+    }
+
+    fn has_rpgmaker_json(dir: &Path) -> bool {
+        dir.join("Actors.json").exists()
+            || dir.join("System.json").exists()
+            || dir.join("Map001.json").exists()
     }
 
     fn detect_version(game_root: &Path) -> MvMzVersion {
@@ -154,9 +272,112 @@ impl RpgMakerMvPlugin {
                     entries.push(entry);
                 }
             }
+
+            // Troops (and similar) have pages with event commands (battle dialogue)
+            if let Some(pages) = obj.get("pages").and_then(|v| v.as_array()) {
+                for (page_idx, page) in pages.iter().enumerate() {
+                    let list = match page.get("list").and_then(|v| v.as_array()) {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    Self::extract_event_commands(
+                        &mut entries,
+                        list,
+                        file_path,
+                        &format!("{}#{}#page_{}", filename, idx, page_idx),
+                    );
+                }
+            }
         }
 
         Ok(entries)
+    }
+
+    /// Extract translatable strings from a list of RPG Maker event commands.
+    /// Used by maps, common events, and troops.
+    fn extract_event_commands(
+        entries: &mut Vec<StringEntry>,
+        list: &[serde_json::Value],
+        file_path: &Path,
+        id_prefix: &str,
+    ) {
+        for (cmd_idx, cmd) in list.iter().enumerate() {
+            let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            let params = match cmd.get("parameters").and_then(|v| v.as_array()) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            match code {
+                // Show Text / Scrolling Text content
+                401 | 405 => {
+                    if let Some(text) = params.first().and_then(|v| v.as_str()) {
+                        if !text.trim().is_empty() {
+                            let id = format!("{}#cmd_{}", id_prefix, cmd_idx);
+                            let tag = if code == 405 { "scroll_text" } else { "dialogue" };
+                            let mut entry =
+                                StringEntry::new(id, text, file_path.to_path_buf());
+                            entry.tags = vec![tag.to_string()];
+                            entries.push(entry);
+                        }
+                    }
+                }
+                // Show Choices
+                102 => {
+                    if let Some(choices) = params.first().and_then(|v| v.as_array()) {
+                        for (ci, choice) in choices.iter().enumerate() {
+                            if let Some(text) = choice.as_str() {
+                                if !text.trim().is_empty() {
+                                    let id = format!(
+                                        "{}#cmd_{}#choice_{}",
+                                        id_prefix, cmd_idx, ci
+                                    );
+                                    let mut entry =
+                                        StringEntry::new(id, text, file_path.to_path_buf());
+                                    entry.tags = vec!["menu".to_string()];
+                                    entries.push(entry);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Change Actor Name
+                320 => {
+                    if let Some(text) = params.get(1).and_then(|v| v.as_str()) {
+                        if !text.trim().is_empty() {
+                            let id = format!("{}#cmd_{}", id_prefix, cmd_idx);
+                            let mut entry =
+                                StringEntry::new(id, text, file_path.to_path_buf());
+                            entry.tags = vec!["actor_name".to_string()];
+                            entries.push(entry);
+                        }
+                    }
+                }
+                // Plugin Command (MV: code 356)
+                356 => {
+                    if let Some(text) = params.first().and_then(|v| v.as_str()) {
+                        if let Some(extracted) = extract_plugin_command_text(text) {
+                            let id = format!("{}#cmd_{}", id_prefix, cmd_idx);
+                            let mut entry =
+                                StringEntry::new(id, &extracted, file_path.to_path_buf());
+                            entry.tags = vec!["plugin_cmd".to_string()];
+                            entries.push(entry);
+                        }
+                    }
+                }
+                // MZ Plugin Command (code 357): structured args
+                357 => {
+                    for (arg_key, text) in extract_mz_plugin_command(params) {
+                        let id = format!("{}#cmd_{}#arg_{}", id_prefix, cmd_idx, arg_key);
+                        let mut entry =
+                            StringEntry::new(id, &text, file_path.to_path_buf());
+                        entry.tags = vec!["plugin_cmd".to_string()];
+                        entries.push(entry);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn extract_system(
@@ -246,6 +467,60 @@ impl RpgMakerMvPlugin {
             }
         }
 
+        // Type arrays (armorTypes, elements, equipTypes, skillTypes, weaponTypes)
+        for &(arr_name, tag) in SYSTEM_TYPE_ARRAYS {
+            if let Some(arr) = json.get(arr_name).and_then(|v| v.as_array()) {
+                for (i, val) in arr.iter().enumerate() {
+                    if let Some(s) = val.as_str() {
+                        if !s.trim().is_empty() {
+                            let mut entry = StringEntry::new(
+                                format!("{}#{}#{}", filename, arr_name, i),
+                                s,
+                                file_path.to_path_buf(),
+                            );
+                            entry.tags = vec![tag.to_string()];
+                            entries.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Plugin parameters — custom menus, buttons, UI text
+        if let Some(plugins) = json.get("plugins").and_then(|v| v.as_array()) {
+            for (pi, plugin) in plugins.iter().enumerate() {
+                let plugin_name = plugin
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                if let Some(params) = plugin.get("parameters").and_then(|v| v.as_object()) {
+                    for (key, val) in params {
+                        if let Some(s) = val.as_str() {
+                            if s.trim().is_empty() {
+                                continue;
+                            }
+                            // Only extract strings that contain CJK characters (actual Japanese text)
+                            if !s.chars().any(|c| {
+                                ('\u{3000}'..='\u{9FFF}').contains(&c)
+                                    || ('\u{F900}'..='\u{FAFF}').contains(&c)
+                                    || ('\u{FF00}'..='\u{FFEF}').contains(&c)
+                            }) {
+                                continue;
+                            }
+                            let id = format!(
+                                "{}#plugins#{}#{}#{}",
+                                filename, pi, plugin_name, key
+                            );
+                            let mut entry =
+                                StringEntry::new(id, s, file_path.to_path_buf());
+                            entry.tags = vec!["plugin_param".to_string()];
+                            entries.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(entries)
     }
 
@@ -255,6 +530,19 @@ impl RpgMakerMvPlugin {
         file_path: &Path,
     ) -> Result<Vec<StringEntry>> {
         let mut entries = Vec::new();
+
+        // Map display name (shown when player enters the area)
+        if let Some(dn) = json.get("displayName").and_then(|v| v.as_str()) {
+            if !dn.trim().is_empty() {
+                let mut entry = StringEntry::new(
+                    format!("{}#displayName", filename),
+                    dn,
+                    file_path.to_path_buf(),
+                );
+                entry.tags = vec!["location".to_string()];
+                entries.push(entry);
+            }
+        }
 
         let events = match json.get("events").and_then(|v| v.as_array()) {
             Some(e) => e,
@@ -275,59 +563,12 @@ impl RpgMakerMvPlugin {
                     Some(l) => l,
                     None => continue,
                 };
-
-                for (cmd_idx, cmd) in list.iter().enumerate() {
-                    let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let params = cmd.get("parameters").and_then(|v| v.as_array());
-
-                    match code {
-                        401 => {
-                            if let Some(params) = params {
-                                if let Some(text) = params.first().and_then(|v| v.as_str()) {
-                                    if !text.trim().is_empty() {
-                                        let id = format!(
-                                            "{}#0#event_{}#page_{}#cmd_{}",
-                                            filename, ev_idx, page_idx, cmd_idx
-                                        );
-                                        let mut entry = StringEntry::new(
-                                            id,
-                                            text,
-                                            file_path.to_path_buf(),
-                                        );
-                                        entry.tags = vec!["dialogue".to_string()];
-                                        entries.push(entry);
-                                    }
-                                }
-                            }
-                        }
-                        102 => {
-                            if let Some(params) = params {
-                                if let Some(choices) =
-                                    params.first().and_then(|v| v.as_array())
-                                {
-                                    for (ci, choice) in choices.iter().enumerate() {
-                                        if let Some(text) = choice.as_str() {
-                                            if !text.trim().is_empty() {
-                                                let id = format!(
-                                                    "{}#0#event_{}#page_{}#cmd_{}#choice_{}",
-                                                    filename, ev_idx, page_idx, cmd_idx, ci
-                                                );
-                                                let mut entry = StringEntry::new(
-                                                    id,
-                                                    text,
-                                                    file_path.to_path_buf(),
-                                                );
-                                                entry.tags = vec!["menu".to_string()];
-                                                entries.push(entry);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                Self::extract_event_commands(
+                    &mut entries,
+                    list,
+                    file_path,
+                    &format!("{}#0#event_{}#page_{}", filename, ev_idx, page_idx),
+                );
             }
         }
 
@@ -353,54 +594,12 @@ impl RpgMakerMvPlugin {
                 Some(l) => l,
                 None => continue,
             };
-
-            for (cmd_idx, cmd) in list.iter().enumerate() {
-                let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-                let params = cmd.get("parameters").and_then(|v| v.as_array());
-
-                match code {
-                    401 => {
-                        if let Some(params) = params {
-                            if let Some(text) = params.first().and_then(|v| v.as_str()) {
-                                if !text.trim().is_empty() {
-                                    let id = format!(
-                                        "{}#{}#cmd_{}",
-                                        filename, ev_idx, cmd_idx
-                                    );
-                                    let mut entry =
-                                        StringEntry::new(id, text, file_path.to_path_buf());
-                                    entry.tags = vec!["dialogue".to_string()];
-                                    entries.push(entry);
-                                }
-                            }
-                        }
-                    }
-                    102 => {
-                        if let Some(params) = params {
-                            if let Some(choices) = params.first().and_then(|v| v.as_array()) {
-                                for (ci, choice) in choices.iter().enumerate() {
-                                    if let Some(text) = choice.as_str() {
-                                        if !text.trim().is_empty() {
-                                            let id = format!(
-                                                "{}#{}#cmd_{}#choice_{}",
-                                                filename, ev_idx, cmd_idx, ci
-                                            );
-                                            let mut entry = StringEntry::new(
-                                                id,
-                                                text,
-                                                file_path.to_path_buf(),
-                                            );
-                                            entry.tags = vec!["menu".to_string()];
-                                            entries.push(entry);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            Self::extract_event_commands(
+                &mut entries,
+                list,
+                file_path,
+                &format!("{}#{}", filename, ev_idx),
+            );
         }
 
         Ok(entries)
@@ -420,8 +619,8 @@ impl RpgMakerMvPlugin {
 
         let parts: Vec<&str> = suffix.split('#').collect();
 
-        // Array file: "1#name"
-        if parts.len() == 2 {
+        // Array file: "1#name" (but NOT CommonEvent commands like "201#cmd_97")
+        if parts.len() == 2 && !parts[1].starts_with("cmd_") {
             if let Ok(idx) = parts[0].parse::<usize>() {
                 let field = parts[1];
                 if let Some(arr) = json.as_array_mut() {
@@ -479,11 +678,72 @@ impl RpgMakerMvPlugin {
             return;
         }
 
-        // Map/CommonEvents commands: "0#event_1#page_0#cmd_5" or "1#cmd_3"
-        // Find the command by navigating the event structure
+        // System type arrays: "armorTypes#1", "elements#2", etc.
+        if parts.len() == 2 {
+            let arr_name = parts[0];
+            let is_type_array = SYSTEM_TYPE_ARRAYS.iter().any(|&(name, _)| name == arr_name);
+            if is_type_array {
+                if let Ok(idx) = parts[1].parse::<usize>() {
+                    if let Some(arr) = json
+                        .as_object_mut()
+                        .and_then(|o| o.get_mut(arr_name))
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        if idx < arr.len() {
+                            arr[idx] = serde_json::Value::String(translation.to_string());
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // Plugin parameters: "plugins#0#PluginName#paramKey"
+        if parts.len() >= 4 && parts[0] == "plugins" {
+            if let Ok(pi) = parts[1].parse::<usize>() {
+                let param_key = parts[3];
+                if let Some(plugins) = json
+                    .as_object_mut()
+                    .and_then(|o| o.get_mut("plugins"))
+                    .and_then(|v| v.as_array_mut())
+                {
+                    if let Some(plugin) = plugins.get_mut(pi) {
+                        if let Some(params) =
+                            plugin.get_mut("parameters").and_then(|v| v.as_object_mut())
+                        {
+                            if params.contains_key(param_key) {
+                                params.insert(
+                                    param_key.to_string(),
+                                    serde_json::Value::String(translation.to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Map displayName
+        if parts.len() == 1 && parts[0] == "displayName" {
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert(
+                    "displayName".to_string(),
+                    serde_json::Value::String(translation.to_string()),
+                );
+            }
+            return;
+        }
+
+        // Map/CommonEvents/Troops commands
         if suffix.contains("event_") && suffix.contains("cmd_") {
+            // Map: "0#event_1#page_0#cmd_5"
             Self::apply_map_translation(json, suffix, translation);
+        } else if suffix.contains("page_") && suffix.contains("cmd_") {
+            // Troops: "1#page_2#cmd_13" (array item with pages)
+            Self::apply_troops_translation(json, suffix, translation);
         } else if suffix.contains("cmd_") {
+            // CommonEvents: "1#cmd_3"
             Self::apply_common_event_translation(json, suffix, translation);
         }
     }
@@ -544,9 +804,74 @@ impl RpgMakerMvPlugin {
                     }
                 }
             }
-        } else if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
-            if let Some(first) = params.first_mut() {
-                *first = serde_json::Value::String(translation.to_string());
+        } else if parts.len() >= 5 && parts[4].starts_with("arg_") {
+            // MZ Plugin Command (code 357): inject into structured args
+            let arg_suffix = &suffix[suffix.find("#arg_").unwrap_or(suffix.len())..];
+            Self::apply_mz_plugin_arg(cmd, arg_suffix, translation);
+        } else {
+            let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
+                if code == 320 {
+                    // Change Actor Name: text is in params[1]
+                    if let Some(val) = params.get_mut(1) {
+                        *val = serde_json::Value::String(translation.to_string());
+                    }
+                } else if let Some(first) = params.first_mut() {
+                    *first = serde_json::Value::String(translation.to_string());
+                }
+            }
+        }
+    }
+
+    fn apply_mz_plugin_arg(cmd: &mut serde_json::Value, arg_suffix: &str, translation: &str) {
+        // arg_suffix is like "#arg_text" or "#arg_choices#0#label" or "#arg_destination"
+        let arg_parts: Vec<&str> = arg_suffix.trim_start_matches('#').split('#').collect();
+        if arg_parts.is_empty() {
+            return;
+        }
+        let arg_key = arg_parts[0].strip_prefix("arg_").unwrap_or(arg_parts[0]);
+
+        let params = match cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
+            Some(p) => p,
+            None => return,
+        };
+        let args = match params.get_mut(3).and_then(|v| v.as_object_mut()) {
+            Some(a) => a,
+            None => return,
+        };
+
+        if arg_key == "choices" && arg_parts.len() >= 3 {
+            // Handle nested choice labels: "arg_choices#0#label"
+            let choice_idx: usize = arg_parts[1].parse().unwrap_or(0);
+            if let Some(choices_str) = args.get(arg_key).and_then(|v| v.as_str()) {
+                if let Ok(mut choices_arr) = serde_json::from_str::<Vec<serde_json::Value>>(choices_str) {
+                    if let Some(choice_val) = choices_arr.get_mut(choice_idx) {
+                        // Choice may be a string containing JSON
+                        let mut choice_obj = if let Some(s) = choice_val.as_str() {
+                            serde_json::from_str::<serde_json::Value>(s).unwrap_or_default()
+                        } else {
+                            choice_val.clone()
+                        };
+                        if let Some(obj) = choice_obj.as_object_mut() {
+                            obj.insert("label".to_string(), serde_json::Value::String(translation.to_string()));
+                        }
+                        // Write back
+                        if choice_val.is_string() {
+                            *choice_val = serde_json::Value::String(choice_obj.to_string());
+                        } else {
+                            *choice_val = choice_obj;
+                        }
+                        // Serialize choices array back
+                        if let Ok(new_str) = serde_json::to_string(&choices_arr) {
+                            args.insert(arg_key.to_string(), serde_json::Value::String(new_str));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Simple arg replacement (text, destination, message, etc.)
+            if args.contains_key(arg_key) {
+                args.insert(arg_key.to_string(), serde_json::Value::String(translation.to_string()));
             }
         }
     }
@@ -595,9 +920,93 @@ impl RpgMakerMvPlugin {
                     }
                 }
             }
-        } else if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
-            if let Some(first) = params.first_mut() {
-                *first = serde_json::Value::String(translation.to_string());
+        } else if parts.len() >= 3 && parts[2].starts_with("arg_") {
+            let arg_suffix = &suffix[suffix.find("#arg_").unwrap_or(suffix.len())..];
+            Self::apply_mz_plugin_arg(cmd, arg_suffix, translation);
+        } else {
+            let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
+                if code == 320 {
+                    if let Some(val) = params.get_mut(1) {
+                        *val = serde_json::Value::String(translation.to_string());
+                    }
+                } else if let Some(first) = params.first_mut() {
+                    *first = serde_json::Value::String(translation.to_string());
+                }
+            }
+        }
+    }
+
+    fn apply_troops_translation(
+        json: &mut serde_json::Value,
+        suffix: &str,
+        translation: &str,
+    ) {
+        let parts: Vec<&str> = suffix.split('#').collect();
+        // Format: "idx#page_N#cmd_N[#choice_N|#arg_X]"
+        if parts.len() < 3 {
+            return;
+        }
+        let item_idx: usize = parts[0].parse().unwrap_or(0);
+        let page_idx: usize = parts[1]
+            .strip_prefix("page_")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let cmd_idx: usize = parts[2]
+            .strip_prefix("cmd_")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let arr = match json.as_array_mut() {
+            Some(a) => a,
+            None => return,
+        };
+        let item = match arr.get_mut(item_idx) {
+            Some(e) if !e.is_null() => e,
+            _ => return,
+        };
+        let pages = match item.get_mut("pages").and_then(|v| v.as_array_mut()) {
+            Some(p) => p,
+            None => return,
+        };
+        let page = match pages.get_mut(page_idx) {
+            Some(p) => p,
+            None => return,
+        };
+        let list = match page.get_mut("list").and_then(|v| v.as_array_mut()) {
+            Some(l) => l,
+            None => return,
+        };
+        let cmd = match list.get_mut(cmd_idx) {
+            Some(c) => c,
+            None => return,
+        };
+
+        if parts.len() == 4 && parts[3].starts_with("choice_") {
+            let ci: usize = parts[3]
+                .strip_prefix("choice_")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
+                if let Some(choices) = params.first_mut().and_then(|v| v.as_array_mut()) {
+                    if ci < choices.len() {
+                        choices[ci] = serde_json::Value::String(translation.to_string());
+                    }
+                }
+            }
+        } else if parts.len() >= 4 && parts[3].starts_with("arg_") {
+            let arg_suffix = &suffix[suffix.find("#arg_").unwrap_or(suffix.len())..];
+            Self::apply_mz_plugin_arg(cmd, arg_suffix, translation);
+        } else {
+            let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
+                if code == 320 {
+                    if let Some(val) = params.get_mut(1) {
+                        *val = serde_json::Value::String(translation.to_string());
+                    }
+                } else if let Some(first) = params.first_mut() {
+                    *first = serde_json::Value::String(translation.to_string());
+                }
             }
         }
     }

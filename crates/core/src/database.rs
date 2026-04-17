@@ -35,6 +35,16 @@ pub struct ProjectStats {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryEntry {
+    pub source_hash: String,
+    pub lang_pair: String,
+    pub source: String,
+    pub translation: String,
+    pub uses: i64,
+    pub last_used: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GlossaryEntry {
     pub term: String,
     pub translation: String,
@@ -528,6 +538,97 @@ impl Database {
         )?;
         Ok(count)
     }
+
+    pub fn list_memory(
+        &self,
+        search: Option<&str>,
+        lang_pair: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<MemoryEntry>, usize)> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut where_clauses = Vec::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(s) = search {
+            let like = format!("%{}%", s);
+            params_vec.push(Box::new(like.clone()));
+            params_vec.push(Box::new(like));
+            where_clauses.push(format!(
+                "(source LIKE ?{} OR translation LIKE ?{})",
+                params_vec.len() - 1,
+                params_vec.len()
+            ));
+        }
+        if let Some(lp) = lang_pair {
+            params_vec.push(Box::new(lp.to_string()));
+            where_clauses.push(format!("lang_pair = ?{}", params_vec.len()));
+        }
+
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM translation_memory {}", where_sql);
+        let total: usize = conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
+            |row| row.get(0),
+        )?;
+
+        let query_sql = format!(
+            "SELECT source_hash, lang_pair, source, translation, uses, last_used
+             FROM translation_memory {} ORDER BY last_used DESC LIMIT {} OFFSET {}",
+            where_sql, limit, offset
+        );
+        let mut stmt = conn.prepare(&query_sql)?;
+        let entries = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
+                |row| {
+                    Ok(MemoryEntry {
+                        source_hash: row.get(0)?,
+                        lang_pair: row.get(1)?,
+                        source: row.get(2)?,
+                        translation: row.get(3)?,
+                        uses: row.get(4)?,
+                        last_used: row.get(5)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok((entries, total))
+    }
+
+    pub fn delete_memory(&self, source_hash: &str, lang_pair: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM translation_memory WHERE source_hash = ?1 AND lang_pair = ?2",
+            params![source_hash, lang_pair],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_memory(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM translation_memory", [])?;
+        Ok(())
+    }
+
+    pub fn memory_lang_pairs(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT lang_pair FROM translation_memory ORDER BY lang_pair",
+        )?;
+        let pairs = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(pairs)
+    }
 }
 
 /// Global translation memory database — shared across projects.
@@ -568,6 +669,28 @@ impl GlobalMemoryDb {
 
     pub fn memory_count(&self) -> Result<usize> {
         self.db.memory_count()
+    }
+
+    pub fn list_memory(
+        &self,
+        search: Option<&str>,
+        lang_pair: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<MemoryEntry>, usize)> {
+        self.db.list_memory(search, lang_pair, limit, offset)
+    }
+
+    pub fn delete_memory(&self, source_hash: &str, lang_pair: &str) -> Result<()> {
+        self.db.delete_memory(source_hash, lang_pair)
+    }
+
+    pub fn clear_memory(&self) -> Result<()> {
+        self.db.clear_memory()
+    }
+
+    pub fn memory_lang_pairs(&self) -> Result<Vec<String>> {
+        self.db.memory_lang_pairs()
     }
 }
 
