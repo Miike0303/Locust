@@ -73,14 +73,14 @@ When you're ready to play the translated game:
 2. Pick one or more target languages (checkboxes).
 3. Pick a mode:
 
-### Mode: Add (recommended)
+### Mode: Add 
 
 - Writes translation files into `<game>/game/tl/<lang>/`.
 - Adds a floating **🌐 Language** button to the game's main menu.
 - **Original game files are untouched** — you can toggle between languages in-game.
 - Best for casual testing or when you want multiple languages.
 
-### Mode: Replace
+### Mode: Replace (recommended)
 
 - Copies the game to a new folder, e.g. `<game>-es/`, with translations applied.
 - Modifies dialogue `.rpy` / `.json` files in the copy.
