@@ -60,7 +60,7 @@
     "updater": {
       "pubkey": "",
       "endpoints": [
-        "https://releases.projectlocust.com/{{target}}/{{arch}}/{{current_version}}"
+        "https://github.com/Miike0303/Locust/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

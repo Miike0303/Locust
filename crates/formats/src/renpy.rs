@@ -322,10 +322,23 @@ impl RenPyPlugin {
         // Track multi-line define blocks (dicts, lists, parenthesized values).
         // These contain internal identifiers/config values, not translatable text.
         let mut define_bracket_depth: i32 = 0;
+        // Track the current label — needed to generate Ren'Py translation identifiers
+        // in the format `<label>_<hash>`.
+        let mut current_label: Option<String> = None;
 
         for (line_idx, line) in content.lines().enumerate() {
             let line_num = line_idx + 1;
             let trimmed = line.trim();
+
+            // Track label definitions: `label start:`, `label foo(arg):`
+            if trimmed.starts_with("label ") && trimmed.ends_with(':') {
+                let after_label = trimmed[6..trimmed.len() - 1].trim();
+                // Strip parameters: `label foo(x):` → `foo`
+                let name = after_label.split('(').next().unwrap_or(after_label).trim();
+                if !name.is_empty() {
+                    current_label = Some(name.to_string());
+                }
+            }
 
             // Track multi-line define blocks: `define x = { ... }`, `define x = [ ... ]`, `define x = ( ... )`
             // When opened, skip all content until closed.
@@ -477,6 +490,13 @@ impl RenPyPlugin {
                         let id = format!("{}#{}", filename, line_num);
                         let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
                         entry.tags = vec!["dialogue".to_string()];
+                        // Store label in metadata for proper Ren'Py translation block generation
+                        if let Some(ref lbl) = current_label {
+                            entry.metadata.insert(
+                                "label".to_string(),
+                                serde_json::Value::String(lbl.clone()),
+                            );
+                        }
                         entries.push(entry);
                         continue;
                     }
@@ -491,6 +511,13 @@ impl RenPyPlugin {
                     entry.tags = vec!["dialogue".to_string()];
                     if let Some(ch) = character {
                         entry.context = Some(ch.to_string());
+                    }
+                    // Store label in metadata for proper Ren'Py translation block generation
+                    if let Some(ref lbl) = current_label {
+                        entry.metadata.insert(
+                            "label".to_string(),
+                            serde_json::Value::String(lbl.clone()),
+                        );
                     }
                     entries.push(entry);
                 }
@@ -1487,103 +1514,173 @@ impl FormatPlugin for RenPyPlugin {
         lang: &str,
         entries: &[StringEntry],
     ) -> Result<InjectionReport> {
+        use md5::{Digest, Md5};
+        use std::collections::HashMap;
+
         let game_dir = if path.is_dir() {
             Self::find_game_dir(path).unwrap_or_else(|| path.join("game"))
         } else {
-            path.parent()
-                .unwrap_or(path)
-                .to_path_buf()
+            path.parent().unwrap_or(path).to_path_buf()
         };
-
-        // Also do a direct inject on .rpy files — this is the most reliable way to get
-        // dialogue translations to actually appear in the game. The `translate strings:`
-        // block works for UI/menu text but isn't always reliable for character dialogue.
-        let _ = self.inject(path, entries);
 
         let tl_dir = game_dir.join("tl").join(lang);
         std::fs::create_dir_all(&tl_dir)?;
 
+        // Group dialogue entries by source .rpy filename.
+        // Each source file gets a corresponding tl/<lang>/<filename>.rpy with
+        // `translate <lang> <label>_<hash>:` blocks (Ren'Py's proper translation format).
+        let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
+        let mut string_entries: Vec<&StringEntry> = Vec::new();
         let mut strings_written = 0;
         let mut strings_skipped = 0;
 
-        // Ren'Py translate strings block: works for all string types (say, menu, define, etc.)
-        // This is the most reliable translation method as it doesn't depend on internal hash IDs.
-        // Format:
-        //   translate <lang> strings:
-        //       old "source text"
-        //       new "translated text"
-        //
-        // IMPORTANT: Ren'Py throws an exception on duplicate `old` entries,
-        // so we deduplicate by source text (first translation wins).
-        use std::collections::HashSet;
-        let mut seen_sources: HashSet<String> = HashSet::new();
-        let mut string_pairs: Vec<(String, String)> = Vec::new();
-
         for entry in entries {
-            if let Some(ref translation) = entry.translation {
-                if translation != &entry.source {
-                    if seen_sources.insert(entry.source.clone()) {
-                        string_pairs.push((entry.source.clone(), translation.clone()));
-                        strings_written += 1;
-                    } else {
-                        strings_skipped += 1;
-                    }
-                } else {
+            let translation = match &entry.translation {
+                Some(t) if t != &entry.source && !t.trim().is_empty() => t,
+                _ => {
                     strings_skipped += 1;
+                    continue;
                 }
+            };
+            let _ = translation;
+
+            // Dialogue entries (with known label) go into per-file translate blocks
+            let is_dialogue = entry.tags.iter().any(|t| t == "dialogue" || t == "scroll_text" || t == "menu");
+            let has_label = entry.metadata.get("label").and_then(|v| v.as_str()).is_some();
+
+            if is_dialogue && has_label {
+                let filename = entry
+                    .file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                by_file.entry(filename).or_default().push(entry);
             } else {
-                strings_skipped += 1;
+                // UI labels, ui_label entries, and dialogue without known label
+                // go into a strings block
+                string_entries.push(entry);
             }
         }
 
-        if !string_pairs.is_empty() {
+        // Generate one .rpy file per source file with proper translate blocks
+        for (filename, file_entries) in &by_file {
             let mut lines = Vec::new();
+            lines.push("# Auto-generated by Locust — Ren'Py translation file.".to_string());
+            lines.push("# Format: `translate <lang> <label>_<md5hash[:8]>:`".to_string());
+            lines.push(String::new());
+
+            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for entry in file_entries {
+                let translation = entry.translation.as_ref().unwrap();
+                let label = entry
+                    .metadata
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                // Compute hash like Ren'Py does: MD5(source_text)[:8]
+                let mut hasher = Md5::new();
+                hasher.update(entry.source.as_bytes());
+                let digest = hasher.finalize();
+                let hash: String = digest.iter().take(4).map(|b| format!("{:02x}", b)).collect();
+
+                let translation_id = format!("{}_{}", label, hash);
+                if !seen_ids.insert(translation_id.clone()) {
+                    // Ren'Py errors on duplicate translate block IDs — skip dupes
+                    strings_skipped += 1;
+                    continue;
+                }
+
+                // Extract line number from entry ID (format: filename.rpy#N)
+                let line_num = entry
+                    .id
+                    .split('#')
+                    .last()
+                    .unwrap_or("0")
+                    .parse::<usize>()
+                    .unwrap_or(0);
+
+                // Reconstruct the original "character text" or just "text" line
+                let safe_source = escape_inner_quotes(&entry.source);
+                let safe_trans = escape_inner_quotes(translation);
+                let (orig_line, trans_line) = match &entry.context {
+                    Some(ch) => (
+                        format!("{} \"{}\"", ch, safe_source),
+                        format!("{} \"{}\"", ch, safe_trans),
+                    ),
+                    None => (format!("\"{}\"", safe_source), format!("\"{}\"", safe_trans)),
+                };
+
+                lines.push(format!("# game/{}:{}", filename, line_num));
+                lines.push(format!("translate {} {}:", lang, translation_id));
+                lines.push(String::new());
+                lines.push(format!("    # {}", orig_line));
+                lines.push(format!("    {}", trans_line));
+                lines.push(String::new());
+
+                strings_written += 1;
+            }
+
+            let tl_file = tl_dir.join(filename);
+            std::fs::write(&tl_file, lines.join("\n"))?;
+            let tl_rpyc = tl_file.with_extension("rpyc");
+            if tl_rpyc.exists() {
+                let _ = std::fs::remove_file(&tl_rpyc);
+            }
+        }
+
+        // Generate strings block for UI labels and entries without known labels
+        if !string_entries.is_empty() {
+            let mut lines = Vec::new();
+            lines.push("# Auto-generated by Locust — UI strings translation".to_string());
+            lines.push(String::new());
             lines.push(format!("translate {} strings:", lang));
             lines.push(String::new());
 
-            for (source, translation) in &string_pairs {
-                // Escape quotes in strings
-                let escaped_source = source.replace('\\', "\\\\").replace('"', "\\\"");
-                let escaped_translation = translation.replace('\\', "\\\\").replace('"', "\\\"");
+            let mut seen_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for entry in &string_entries {
+                let translation = entry.translation.as_ref().unwrap();
+                if !seen_sources.insert(entry.source.clone()) {
+                    strings_skipped += 1;
+                    continue;
+                }
+                let escaped_source = escape_inner_quotes(&entry.source);
+                let escaped_translation = escape_inner_quotes(translation);
                 lines.push(format!("    old \"{}\"", escaped_source));
                 lines.push(format!("    new \"{}\"", escaped_translation));
                 lines.push(String::new());
+                strings_written += 1;
             }
 
             let tl_file = tl_dir.join("locust_strings.rpy");
             std::fs::write(&tl_file, lines.join("\n"))?;
-
-            // Delete the .rpyc if it exists so Ren'Py recompiles with the new translations
-            let tl_rpyc = tl_dir.join("locust_strings.rpyc");
+            let tl_rpyc = tl_file.with_extension("rpyc");
             if tl_rpyc.exists() {
                 let _ = std::fs::remove_file(&tl_rpyc);
             }
+        }
 
-            // Create locust_languages.rpy with an in-game language picker.
-            // Scans the tl/ folder for available languages and adds a selector button
-            // to the main menu and game menu (preferences).
-            let langs_file_content = build_language_picker_script(&game_dir, lang);
-            let langs_file = game_dir.join("locust_languages.rpy");
-            std::fs::write(&langs_file, langs_file_content)?;
-            // Delete .rpyc so Ren'Py picks up the new .rpy
-            let langs_rpyc = game_dir.join("locust_languages.rpyc");
-            if langs_rpyc.exists() {
-                let _ = std::fs::remove_file(&langs_rpyc);
-            }
+        // Create locust_languages.rpy with an in-game language picker.
+        let langs_file_content = build_language_picker_script(&game_dir, lang);
+        let langs_file = game_dir.join("locust_languages.rpy");
+        std::fs::write(&langs_file, langs_file_content)?;
+        let langs_rpyc = game_dir.join("locust_languages.rpyc");
+        if langs_rpyc.exists() {
+            let _ = std::fs::remove_file(&langs_rpyc);
+        }
 
-            // Remove old locust_language.rpy from previous versions if it exists
-            let old_lang_file = game_dir.join("locust_language.rpy");
-            if old_lang_file.exists() {
-                let _ = std::fs::remove_file(&old_lang_file);
-            }
-            let old_lang_rpyc = game_dir.join("locust_language.rpyc");
-            if old_lang_rpyc.exists() {
-                let _ = std::fs::remove_file(&old_lang_rpyc);
+        // Remove old locust_language.rpy from previous versions
+        for old_name in &["locust_language.rpy", "locust_language.rpyc"] {
+            let p = game_dir.join(old_name);
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
             }
         }
 
         Ok(InjectionReport {
-            files_modified: 1,
+            files_modified: by_file.len() + 1,
             strings_written,
             strings_skipped,
             warnings: Vec::new(),
@@ -1647,11 +1744,11 @@ fn build_language_picker_script(game_dir: &Path, just_added_lang: &str) -> Strin
 
     let mut buttons = String::new();
     // Original language button (None = use original game language)
-    buttons.push_str("                textbutton \"Original\" action Language(None) xalign 0.5 text_size 22\n");
+    buttons.push_str("            textbutton \"Original\" action Language(None) xalign 0.5 text_size 22\n");
     for code in &langs {
         let name = lang_name(code);
         buttons.push_str(&format!(
-            "                textbutton \"{}\" action Language(\"{}\") xalign 0.5 text_size 22\n",
+            "            textbutton \"{}\" action Language(\"{}\") xalign 0.5 text_size 22\n",
             name.replace('"', "\\\""),
             code.replace('"', "\\\"")
         ));
