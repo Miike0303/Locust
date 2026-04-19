@@ -129,7 +129,7 @@ export default function Welcome() {
       <div className="text-center mb-8">
         <Globe size={48} className="mx-auto mb-3 text-emerald-500" />
         <h1 className="text-3xl font-bold mb-1">Project Locust</h1>
-        <p className="text-gray-500">Universal game translation tool</p>
+        <p className="text-gray-500">LOCalization Universal Scripting Tool</p>
       </div>
 
       {/* Open buttons */}
@@ -182,7 +182,7 @@ export default function Welcome() {
                 </div>
               </button>
 
-              {formats?.map((f) => {
+              {formats?.filter(f => f.stability !== "comingsoon").map((f) => {
                 const Icon = FORMAT_ICONS[f.id] ?? Globe;
                 const colorClass = FORMAT_COLORS[f.id] ?? "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
                 return (
@@ -270,52 +270,92 @@ export default function Welcome() {
         </div>
       )}
 
-      {/* Supported Formats Grid */}
-      {formats && formats.length > 0 && (
-        <div>
-          <h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
-            Supported Formats
-          </h2>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-            {formats.map((f) => {
-              const Icon = FORMAT_ICONS[f.id] ?? Globe;
-              const colorClass = FORMAT_COLORS[f.id] ?? "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
-              return (
-                <div
-                  key={f.id}
-                  className="p-3 rounded-lg border border-gray-200 dark:border-gray-700"
-                >
-                  <div className="flex items-center gap-2 mb-1">
-                    <div className={`p-1.5 rounded ${colorClass}`}>
-                      <Icon size={14} />
+      {/* Supported Formats — split into Available + Coming Soon */}
+      {formats && formats.length > 0 && (() => {
+        const available = formats.filter(f => f.stability !== "comingsoon");
+        const comingSoon = formats.filter(f => f.stability === "comingsoon");
+        return (
+          <>
+            <div>
+              <h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
+                Available Formats
+              </h2>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                {available.map((f) => {
+                  const Icon = FORMAT_ICONS[f.id] ?? Globe;
+                  const colorClass = FORMAT_COLORS[f.id] ?? "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+                  return (
+                    <div
+                      key={f.id}
+                      className="p-3 rounded-lg border border-gray-200 dark:border-gray-700"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <div className={`p-1.5 rounded ${colorClass}`}>
+                          <Icon size={14} />
+                        </div>
+                        <span className="text-sm font-medium">{f.name}</span>
+                      </div>
+                      {f.description && (
+                        <p className="text-xs text-gray-500 line-clamp-2">
+                          {f.description}
+                        </p>
+                      )}
+                      <div className="mt-1.5 flex flex-wrap gap-1">
+                        {f.extensions.slice(0, 3).map((ext) => (
+                          <span
+                            key={ext}
+                            className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-gray-500"
+                          >
+                            {ext}
+                          </span>
+                        ))}
+                      </div>
                     </div>
-                    <span className="text-sm font-medium">{f.name}</span>
-                  </div>
-                  {f.description && (
-                    <p className="text-xs text-gray-500 line-clamp-2">
-                      {f.description}
-                    </p>
-                  )}
-                  <div className="mt-1.5 flex flex-wrap gap-1">
-                    {f.extensions.slice(0, 3).map((ext) => (
-                      <span
-                        key={ext}
-                        className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-gray-500"
+                  );
+                })}
+              </div>
+            </div>
+
+            {comingSoon.length > 0 && (
+              <div className="mt-8">
+                <h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
+                  Coming Soon
+                </h2>
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                  {comingSoon.map((f) => {
+                    const Icon = FORMAT_ICONS[f.id] ?? Globe;
+                    return (
+                      <div
+                        key={f.id}
+                        className="p-3 rounded-lg border border-dashed border-gray-300 dark:border-gray-700 opacity-60"
                       >
-                        {ext}
-                      </span>
-                    ))}
-                  </div>
+                        <div className="flex items-center gap-2 mb-1">
+                          <div className="p-1.5 rounded bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">
+                            <Icon size={14} />
+                          </div>
+                          <span className="text-sm font-medium">{f.name}</span>
+                          <span className="ml-auto text-xs px-1.5 py-0.5 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 rounded">
+                            soon
+                          </span>
+                        </div>
+                        {f.description && (
+                          <p className="text-xs text-gray-500 line-clamp-2">
+                            {f.description}
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+              </div>
+            )}
+          </>
+        );
+      })()}
 
       {/* Footer stats */}
       <div className="mt-auto pt-8 flex justify-center gap-6 text-xs text-gray-400">
-        <span>{formats?.length ?? 0} formats supported</span>
+        <span>{formats?.filter(f => f.stability !== "comingsoon").length ?? 0} formats available</span>
         <span>{recentProjects.length} recent projects</span>
         <span>
           <a href="https://github.com/Miike0303/Locust" className="hover:underline">

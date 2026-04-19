@@ -459,6 +459,10 @@ impl FormatPlugin for UnityPlugin {
         "Unity Engine games (text scripts or .assets heuristic extraction)"
     }
 
+    fn stability(&self) -> locust_core::extraction::FormatStability {
+        locust_core::extraction::FormatStability::ComingSoon
+    }
+
     fn supported_extensions(&self) -> &[&str] {
         &[".assets"]
     }

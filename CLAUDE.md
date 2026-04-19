@@ -36,14 +36,10 @@ locust formats                      # List supported formats
 locust providers                    # List translation providers
 ```
 
-## Session Log
-
-See `session/session.md` for full development history (28 prompts implemented).
-
 ## Pending Work
 
-- HTML game format plugin
-- Full Tauri desktop build verification (needs `tauri build` on each platform)
-- End-to-end testing with real game projects
-- Translation memory UI page
-- Keyboard shortcuts / hotkeys system
+- Unity .assets extraction (VN games)
+- Unreal .pak extraction
+- HTML / Twine / SugarCube plugin
+- QSP and Japanese light novel engines
+- End-to-end testing with real game projects across all formats

@@ -464,6 +464,10 @@ impl FormatPlugin for SugarCubePlugin {
         "SugarCube/Twine interactive fiction HTML games"
     }
 
+    fn stability(&self) -> locust_core::extraction::FormatStability {
+        locust_core::extraction::FormatStability::ComingSoon
+    }
+
     fn supported_extensions(&self) -> &[&str] {
         &[".html", ".htm"]
     }

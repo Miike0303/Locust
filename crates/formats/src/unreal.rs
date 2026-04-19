@@ -231,6 +231,10 @@ impl FormatPlugin for UnrealPlugin {
         "Unreal Engine games (.pak files, heuristic UTF-16LE extraction)"
     }
 
+    fn stability(&self) -> locust_core::extraction::FormatStability {
+        locust_core::extraction::FormatStability::ComingSoon
+    }
+
     fn supported_extensions(&self) -> &[&str] {
         &[".pak"]
     }

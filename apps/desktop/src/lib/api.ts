@@ -49,9 +49,12 @@ async function requestText(path: string): Promise<string> {
 export type StringStatus = "pending" | "translated" | "reviewed" | "approved" | "error";
 export type OutputMode = "replace" | "add";
 
+export type FormatStability = "stable" | "experimental" | "comingsoon";
+
 export interface PluginInfo {
   id: string; name: string; description: string;
   extensions: string[]; supported_modes: OutputMode[];
+  stability?: FormatStability;
 }
 
 export interface ProviderInfo {

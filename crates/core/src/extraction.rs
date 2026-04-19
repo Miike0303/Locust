@@ -11,6 +11,17 @@ use crate::database::Database;
 use crate::error::{LocustError, Result};
 use crate::models::{OutputMode, ProgressEvent, StringEntry};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FormatStability {
+    /// Extensively tested and reliable.
+    Stable,
+    /// Works but has known edge cases or limited testing.
+    Experimental,
+    /// Not yet functional — shown as "coming soon" in the UI.
+    ComingSoon,
+}
+
 pub trait FormatPlugin: Send + Sync {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
@@ -20,6 +31,11 @@ pub trait FormatPlugin: Send + Sync {
     fn supported_extensions(&self) -> &[&str];
     fn supported_modes(&self) -> Vec<OutputMode> {
         vec![OutputMode::Replace]
+    }
+    /// Indicates how reliable this format plugin is for production use.
+    /// The UI uses this to label/hide formats appropriately.
+    fn stability(&self) -> FormatStability {
+        FormatStability::Stable
     }
 
     fn detect(&self, path: &Path) -> bool {
@@ -88,7 +104,8 @@ impl FormatRegistry {
     }
 
     pub fn list(&self) -> Vec<PluginInfo> {
-        self.plugins
+        let mut out: Vec<PluginInfo> = self
+            .plugins
             .iter()
             .map(|p| PluginInfo {
                 id: p.id().to_string(),
@@ -100,8 +117,30 @@ impl FormatRegistry {
                     .map(|e| e.to_string())
                     .collect(),
                 supported_modes: p.supported_modes(),
+                stability: p.stability(),
             })
-            .collect()
+            .collect();
+
+        // Add display-only "coming soon" formats that don't have plugins yet.
+        // These show up in the UI so users know they're planned.
+        out.push(PluginInfo {
+            id: "qsp".to_string(),
+            name: "QSP (QuestSoft Player)".to_string(),
+            description: "Russian-style text adventure engine (.qsp, .gam)".to_string(),
+            extensions: vec![".qsp".to_string(), ".gam".to_string()],
+            supported_modes: Vec::new(),
+            stability: FormatStability::ComingSoon,
+        });
+        out.push(PluginInfo {
+            id: "light-novel".to_string(),
+            name: "Light Novel Engines".to_string(),
+            description: "Japanese light novel engines (KiriKiri, NScripter, Yuris, TyranoBuilder)".to_string(),
+            extensions: vec![".ks".to_string(), ".tjs".to_string(), ".xp3".to_string()],
+            supported_modes: Vec::new(),
+            stability: FormatStability::ComingSoon,
+        });
+
+        out
     }
 }
 
@@ -144,6 +183,12 @@ pub struct PluginInfo {
     pub description: String,
     pub extensions: Vec<String>,
     pub supported_modes: Vec<OutputMode>,
+    #[serde(default = "default_stability")]
+    pub stability: FormatStability,
+}
+
+fn default_stability() -> FormatStability {
+    FormatStability::Stable
 }
 
 // ─── Multi-language injection pipeline ──────────────────────────────────────
