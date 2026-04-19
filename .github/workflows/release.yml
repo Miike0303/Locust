@@ -15,14 +15,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Windows x64 (most common)
           - platform: 'windows-latest'
             target: 'x86_64-pc-windows-msvc'
+            args: ''
+          # Windows ARM64 (Surface Pro X, some Copilot+ PCs)
+          - platform: 'windows-latest'
+            target: 'aarch64-pc-windows-msvc'
+            args: '--target aarch64-pc-windows-msvc'
+          # macOS Apple Silicon (M1/M2/M3)
           - platform: 'macos-latest'
             target: 'aarch64-apple-darwin'
+            args: '--target aarch64-apple-darwin'
+          # macOS Intel
           - platform: 'macos-latest'
             target: 'x86_64-apple-darwin'
+            args: '--target x86_64-apple-darwin'
+          # Linux x64
           - platform: 'ubuntu-22.04'
             target: 'x86_64-unknown-linux-gnu'
+            args: ''
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -48,6 +60,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './apps/desktop/src-tauri -> target'
+          key: ${{ matrix.target }}
 
       - name: Install frontend deps
         working-directory: apps/desktop
@@ -66,25 +79,29 @@ jobs:
           releaseBody: 'See CHANGELOG for details. The app will auto-update from this release.'
           releaseDraft: false
           prerelease: false
-          args: ${{ matrix.target == 'aarch64-apple-darwin' && '--target aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin' && '--target x86_64-apple-darwin' || '' }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
 
+  # The update-manifest job does NOT depend on all builds succeeding —
+  # if one platform fails to upload (e.g. AppImage timeout), we still want
+  # latest.json generated for the platforms that succeeded.
   update-manifest:
+    if: always()
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate latest.json
+      - name: Generate latest.json from uploaded signatures
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          # Fetch the release and assets, generate latest.json with signatures.
-          # tauri-action already uploads .sig files for each bundle.
+          chmod +x scripts/generate-updater-manifest.sh
           bash scripts/generate-updater-manifest.sh "$RELEASE_TAG"
 
       - name: Upload latest.json to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "$RELEASE_TAG" latest.json --clobber
+          gh release upload "${{ github.ref_name }}" latest.json --clobber
