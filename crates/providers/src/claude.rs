@@ -23,35 +23,7 @@ impl ClaudeProvider {
     }
 }
 
-fn build_system_prompt(req: &TranslationRequest) -> String {
-    let mut prompt = format!(
-        "You are a professional game translator. Translate the following strings from {} to {}.",
-        req.source_lang, req.target_lang
-    );
-    if let Some(ref ctx) = req.context {
-        prompt.push_str(&format!("\nGame context: {}", ctx));
-    }
-    if let Some(ref hint) = req.glossary_hint {
-        prompt.push_str(&format!("\n{}", hint));
-    }
-    prompt.push_str(
-        "\nRules:\n- Preserve all placeholder tokens like {PL_0}, {PL_1} exactly as-is\n- Return ONLY a JSON array of translated strings, in the same order as input\n- Do not add explanations or notes",
-    );
-    prompt
-}
-
-fn parse_json_array(text: &str) -> std::result::Result<Vec<String>, String> {
-    if let Ok(arr) = serde_json::from_str::<Vec<String>>(text) {
-        return Ok(arr);
-    }
-    if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
-        let substr = &text[start..=end];
-        if let Ok(arr) = serde_json::from_str::<Vec<String>>(substr) {
-            return Ok(arr);
-        }
-    }
-    Err(format!("could not parse JSON array from response: {}", text))
-}
+use crate::openai::{build_system_prompt, parse_json_array};
 
 #[derive(Serialize)]
 struct ClaudeRequest {
@@ -155,22 +127,35 @@ impl TranslationProvider for ClaudeProvider {
         let translations =
             parse_json_array(content).map_err(|e| LocustError::ProviderError(e))?;
 
+        // A count mismatch would silently shift every translation onto the
+        // wrong entry via zip; discard the whole batch instead.
+        if translations.len() != requests.len() {
+            return Err(LocustError::ProviderError(format!(
+                "translation count mismatch: sent {} strings, got {} back",
+                requests.len(),
+                translations.len()
+            )));
+        }
+
         let usage = claude_resp.usage.as_ref();
         let tokens_used = usage.map(|u| u.input_tokens + u.output_tokens);
         let cost_usd = usage.map(|u| {
             (u.input_tokens as f64 * 0.00025 + u.output_tokens as f64 * 0.00125) / 1000.0
         });
 
+        // Usage is batch-level; attach it to the first result only so that
+        // summing across results yields the true totals.
         Ok(requests
             .iter()
             .zip(translations.iter())
-            .map(|(req, trans)| TranslationResult {
+            .enumerate()
+            .map(|(i, (req, trans))| TranslationResult {
                 entry_id: req.entry_id.clone(),
                 translation: trans.clone(),
                 detected_source_lang: None,
                 provider: "claude".to_string(),
-                tokens_used,
-                cost_usd,
+                tokens_used: if i == 0 { tokens_used } else { None },
+                cost_usd: if i == 0 { cost_usd } else { None },
             })
             .collect())
     }
