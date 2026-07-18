@@ -52,6 +52,7 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
   const [sourceLang, setSourceLang] = useState<string>(saved.source ?? "auto");
   const [targetLang, setTargetLang] = useState<string>(saved.target ?? "es");
   const [batchSize, setBatchSize] = useState(40);
+  const [maxConcurrent, setMaxConcurrent] = useState(1);
   const [costLimit, setCostLimit] = useState("");
   const [gameContext, setGameContext] = useState("");
   const [useGlossary, setUseGlossary] = useState(true);
@@ -89,7 +90,7 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
           source_lang: sourceLang,
           target_lang: targetLang,
           batch_size: batchSize,
-          max_concurrent: 3,
+          max_concurrent: maxConcurrent,
           cost_limit_usd: costLimit ? parseFloat(costLimit) : null,
           game_context: gameContext || null,
           use_glossary: useGlossary,
@@ -206,11 +207,20 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
               <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={useGlossary} onChange={(e) => setUseGlossary(e.target.checked)} /> Use glossary</label>
               <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={useMemory} onChange={(e) => setUseMemory(e.target.checked)} /> Use memory</label>
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-3 gap-3">
               <div>
                 <label className="text-sm font-medium">Batch size</label>
                 <input type="number" value={batchSize} onChange={(e) => setBatchSize(+e.target.value)} min={1} max={100}
                   className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm" />
+              </div>
+              <div>
+                <label className="text-sm font-medium" title="Parallel requests. Use 1 for local models (LM Studio/Ollama); higher values only speed up remote APIs.">Parallel requests</label>
+                <select value={maxConcurrent} onChange={(e) => setMaxConcurrent(+e.target.value)}
+                  className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm">
+                  {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
               </div>
               <div>
                 <label className="text-sm font-medium">Cost limit ($)</label>
