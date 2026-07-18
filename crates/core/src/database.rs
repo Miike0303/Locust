@@ -23,6 +23,20 @@ pub struct EntryFilter {
     pub offset: Option<usize>,
 }
 
+/// One completed translation run — the unit of the per-project
+/// tokens/time/cost ledger.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TranslationRun {
+    pub started_at: String,
+    pub duration_secs: f64,
+    pub provider: String,
+    pub source_lang: String,
+    pub target_lang: String,
+    pub strings_translated: usize,
+    pub tokens_used: u64,
+    pub cost_usd: f64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProjectStats {
     pub total: usize,
@@ -80,6 +94,7 @@ impl Database {
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS strings (
@@ -127,6 +142,18 @@ impl Database {
                 message TEXT NOT NULL,
                 resolved INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS translation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                duration_secs REAL NOT NULL,
+                provider TEXT NOT NULL,
+                source_lang TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                strings_translated INTEGER NOT NULL,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0
+            );
             ",
         )?;
         Ok(())
@@ -134,6 +161,9 @@ impl Database {
 
     pub fn save_entries(&self, entries: &[StringEntry]) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
+        // Single transaction: per-row implicit transactions fsync each insert,
+        // which takes minutes for a full game extraction.
+        let tx = conn.unchecked_transaction()?;
         let mut count = 0usize;
         for entry in entries {
             let tags_json = serde_json::to_string(&entry.tags)?;
@@ -145,7 +175,7 @@ impl Database {
             let reviewed_at_str = entry.reviewed_at.map(|d| d.to_rfc3339());
             let char_limit = entry.char_limit.map(|l| l as i64);
 
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO strings
                  (id, source, translation, status, file_path, context, tags, metadata,
                   char_limit, provider_used, created_at, translated_at, reviewed_at)
@@ -168,6 +198,7 @@ impl Database {
             )?;
             count += 1;
         }
+        tx.commit()?;
         Ok(count)
     }
 
@@ -378,6 +409,59 @@ impl Database {
         })
         .await
         .unwrap()
+    }
+
+    pub async fn record_translation_run(&self, run: &TranslationRun) -> Result<()> {
+        let conn = self.conn.clone();
+        let run = run.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO translation_runs
+                 (started_at, duration_secs, provider, source_lang, target_lang,
+                  strings_translated, tokens_used, cost_usd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    run.started_at,
+                    run.duration_secs,
+                    run.provider,
+                    run.source_lang,
+                    run.target_lang,
+                    run.strings_translated as i64,
+                    run.tokens_used as i64,
+                    run.cost_usd,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap()
+    }
+
+    pub fn get_translation_runs(&self) -> Result<Vec<TranslationRun>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT started_at, duration_secs, provider, source_lang, target_lang,
+                    strings_translated, tokens_used, cost_usd
+             FROM translation_runs ORDER BY started_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TranslationRun {
+                started_at: row.get(0)?,
+                duration_secs: row.get(1)?,
+                provider: row.get(2)?,
+                source_lang: row.get(3)?,
+                target_lang: row.get(4)?,
+                strings_translated: row.get::<_, i64>(5)? as usize,
+                tokens_used: row.get::<_, i64>(6)? as u64,
+                cost_usd: row.get(7)?,
+            })
+        })?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
     }
 
     pub fn get_stats(&self) -> Result<ProjectStats> {

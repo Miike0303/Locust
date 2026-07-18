@@ -579,8 +579,11 @@ mod tests {
     fn test_registry_list() {
         let reg = make_registry();
         let list = reg.list();
-        assert_eq!(list.len(), 1);
+        // One registered plugin plus the display-only "coming soon" formats
+        assert_eq!(list.len(), 3);
         assert_eq!(list[0].id, "mock");
+        assert!(list.iter().any(|p| p.id == "qsp"));
+        assert!(list.iter().any(|p| p.id == "light-novel"));
     }
 
     #[test]

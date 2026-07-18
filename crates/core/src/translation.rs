@@ -53,7 +53,9 @@ impl Default for TranslationOptions {
             source_lang: "ja".to_string(),
             target_lang: "en".to_string(),
             batch_size: 40,
-            max_concurrent: 3,
+            // Sequential by default: local GPU models degrade under parallel
+            // requests; API providers can opt in via --concurrency.
+            max_concurrent: 1,
             cost_limit_usd: None,
             game_context: None,
             use_glossary: true,
@@ -112,6 +114,8 @@ impl TranslationManager {
 
         let mut completed = 0usize;
         let mut total_cost = 0.0f64;
+        let mut total_tokens = 0u64;
+        let started_at = chrono::Utc::now().to_rfc3339();
         let lang_pair = format!("{}-{}", opts.source_lang, opts.target_lang);
 
         // 3. Check translation memory for each entry
@@ -145,59 +149,99 @@ impl TranslationManager {
             None
         };
 
-        // 5. Process remaining in chunks
-        for chunk in remaining.chunks(opts.batch_size) {
-            // 5a. Check cancellation
-            if cancel.is_cancelled() {
-                let _ = tx.send(ProgressEvent::Paused).await;
-                return Ok(());
-            }
+        // 5. Process remaining in chunks — up to `max_concurrent` provider calls
+        // in flight at once. Result handling (DB writes, progress, cost) stays on
+        // this task. Cost-limited runs stay sequential so the pre-dispatch
+        // estimate cannot be overtaken by batches already in flight.
+        let concurrency = if opts.cost_limit_usd.is_some() {
+            1
+        } else {
+            opts.max_concurrent.max(1)
+        };
 
-            // 5b. Check cost limit
-            if let Some(limit) = opts.cost_limit_usd {
-                let char_count: usize = chunk.iter().map(|e| e.source.len()).sum();
-                if let Some(estimated) = self
-                    .provider
-                    .estimate_cost(char_count, &opts.target_lang)
-                    .await
-                {
-                    if total_cost + estimated > limit {
-                        return Err(LocustError::CostLimitExceeded {
-                            estimated: total_cost + estimated,
-                            limit,
-                        });
+        type BatchOutcome = (
+            Vec<TranslationRequest>,
+            std::collections::HashMap<String, Vec<Placeholder>>,
+            Result<Vec<TranslationResult>>,
+        );
+        let mut in_flight: tokio::task::JoinSet<BatchOutcome> = tokio::task::JoinSet::new();
+        let mut chunk_iter = remaining.chunks(opts.batch_size);
+        let mut cancelled = false;
+
+        loop {
+            // 5a. Fill the in-flight window
+            while in_flight.len() < concurrency && !cancelled {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+
+                let Some(chunk) = chunk_iter.next() else { break };
+
+                // 5b. Check cost limit
+                if let Some(limit) = opts.cost_limit_usd {
+                    let char_count: usize = chunk.iter().map(|e| e.source.len()).sum();
+                    if let Some(estimated) = self
+                        .provider
+                        .estimate_cost(char_count, &opts.target_lang)
+                        .await
+                    {
+                        if total_cost + estimated > limit {
+                            return Err(LocustError::CostLimitExceeded {
+                                estimated: total_cost + estimated,
+                                limit,
+                            });
+                        }
                     }
                 }
-            }
 
-            // 5c. Build TranslationRequests — sanitize placeholders so the translator
-            // doesn't translate variable names like [player_name] or Ren'Py tags {i}{/i}
-            let mut placeholders_by_id: std::collections::HashMap<String, Vec<Placeholder>> =
-                std::collections::HashMap::new();
-            let requests: Vec<TranslationRequest> = chunk
-                .iter()
-                .map(|entry| {
-                    let context = match (&entry.context, &opts.game_context) {
-                        (Some(ec), Some(gc)) => Some(format!("{} | {}", gc, ec)),
-                        (Some(ec), None) => Some(ec.clone()),
-                        (None, Some(gc)) => Some(gc.clone()),
-                        (None, None) => None,
-                    };
-                    let (sanitized, phs) = PlaceholderProcessor::extract(&entry.source);
-                    placeholders_by_id.insert(entry.id.clone(), phs);
-                    TranslationRequest {
-                        entry_id: entry.id.clone(),
-                        source: sanitized,
-                        source_lang: opts.source_lang.clone(),
-                        target_lang: opts.target_lang.clone(),
-                        context,
-                        glossary_hint: glossary_hint.clone(),
+                // 5c. Build TranslationRequests — sanitize placeholders so the translator
+                // doesn't translate variable names like [player_name] or Ren'Py tags {i}{/i}
+                let mut placeholders_by_id: std::collections::HashMap<String, Vec<Placeholder>> =
+                    std::collections::HashMap::new();
+                let requests: Vec<TranslationRequest> = chunk
+                    .iter()
+                    .map(|entry| {
+                        let context = match (&entry.context, &opts.game_context) {
+                            (Some(ec), Some(gc)) => Some(format!("{} | {}", gc, ec)),
+                            (Some(ec), None) => Some(ec.clone()),
+                            (None, Some(gc)) => Some(gc.clone()),
+                            (None, None) => None,
+                        };
+                        let (sanitized, phs) = PlaceholderProcessor::extract(&entry.source);
+                        placeholders_by_id.insert(entry.id.clone(), phs);
+                        TranslationRequest {
+                            entry_id: entry.id.clone(),
+                            source: sanitized,
+                            source_lang: opts.source_lang.clone(),
+                            target_lang: opts.target_lang.clone(),
+                            context,
+                            glossary_hint: glossary_hint.clone(),
                     }
                 })
                 .collect();
 
-            // 5d. Call provider
-            match self.provider.translate(&requests).await {
+                // 5d. Dispatch provider call to the in-flight window
+                let provider = self.provider.clone();
+                in_flight.spawn(async move {
+                    let result = provider.translate(&requests).await;
+                    (requests, placeholders_by_id, result)
+                });
+            }
+
+            // 5e. Wait for the next batch to finish; done when nothing is in flight
+            let Some(joined) = in_flight.join_next().await else {
+                break;
+            };
+            let (requests, placeholders_by_id, batch_result) = match joined {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::error!("Translation batch task panicked: {}", e);
+                    continue;
+                }
+            };
+
+            match batch_result {
                 Ok(mut results) => {
                     // Restore placeholders in translations before saving
                     for result in &mut results {
@@ -262,6 +306,9 @@ impl TranslationManager {
                         if let Some(cost) = result.cost_usd {
                             total_cost += cost;
                         }
+                        if let Some(tokens) = result.tokens_used {
+                            total_tokens += tokens as u64;
+                        }
                         completed += 1;
                     }
                 }
@@ -288,7 +335,12 @@ impl TranslationManager {
                 .await;
         }
 
-        // 6. Send Completed
+        if cancelled {
+            let _ = tx.send(ProgressEvent::Paused).await;
+            return Ok(());
+        }
+
+        // 6. Send Completed and record the run in the project ledger
         let duration = start.elapsed().as_secs_f64();
         let _ = tx
             .send(ProgressEvent::Completed {
@@ -297,6 +349,22 @@ impl TranslationManager {
                 duration_secs: duration,
             })
             .await;
+
+        if completed > 0 {
+            let run = crate::database::TranslationRun {
+                started_at,
+                duration_secs: duration,
+                provider: self.provider.id().to_string(),
+                source_lang: opts.source_lang.clone(),
+                target_lang: opts.target_lang.clone(),
+                strings_translated: completed,
+                tokens_used: total_tokens,
+                cost_usd: total_cost,
+            };
+            if let Err(e) = self.db.record_translation_run(&run).await {
+                tracing::warn!("failed to record translation run: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -505,6 +573,66 @@ mod tests {
         while rx.recv().await.is_some() {}
 
         for i in 0..5 {
+            let entry = db.get_entry(&format!("e{}", i)).unwrap().unwrap();
+            assert_eq!(entry.status, StringStatus::Translated);
+            assert!(entry.translation.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_translation_run_recorded() {
+        let (db, glossary) = setup();
+        let entries = make_entries(5);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(MockProvider::new());
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+
+        manager
+            .translate_entries(
+                entries,
+                TranslationOptions::default(),
+                tx,
+                "job-stats".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        let runs = db.get_translation_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].strings_translated, 5);
+        assert_eq!(runs[0].provider, "mock");
+        assert_eq!(runs[0].source_lang, "ja");
+        assert_eq!(runs[0].target_lang, "en");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_batches_translate_all() {
+        let (db, glossary) = setup();
+        let entries = make_entries(25);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(MockProvider::new());
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let cancel = CancellationToken::new();
+
+        let opts = TranslationOptions {
+            batch_size: 3,
+            max_concurrent: 8,
+            ..Default::default()
+        };
+        manager
+            .translate_entries(entries, opts, tx, "job-conc".into(), cancel)
+            .await
+            .unwrap();
+
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        for i in 0..25 {
             let entry = db.get_entry(&format!("e{}", i)).unwrap().unwrap();
             assert_eq!(entry.status, StringStatus::Translated);
             assert!(entry.translation.is_some());
