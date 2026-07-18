@@ -301,7 +301,15 @@ impl RpgMakerMvPlugin {
         file_path: &Path,
         id_prefix: &str,
     ) {
+        // Speaker name from the last Show Text header (code 101, MZ params[4]);
+        // passed as translation context so the model gets tone/gender right.
+        let mut speaker: Option<String> = None;
+        let mut skip_until = 0usize;
+
         for (cmd_idx, cmd) in list.iter().enumerate() {
+            if cmd_idx < skip_until {
+                continue;
+            }
             let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
             let params = match cmd.get("parameters").and_then(|v| v.as_array()) {
                 Some(p) => p,
@@ -309,17 +317,45 @@ impl RpgMakerMvPlugin {
             };
 
             match code {
-                // Show Text / Scrolling Text content
+                // Show Text header — remember the speaker for the lines that follow
+                101 => {
+                    speaker = params
+                        .get(4)
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string());
+                }
+                // Show Text / Scrolling Text content. Consecutive lines form ONE
+                // message box, so merge the run into a single entry — the model
+                // translates whole sentences and the injector re-wraps (#msg).
                 401 | 405 => {
-                    if let Some(text) = params.first().and_then(|v| v.as_str()) {
-                        if !text.trim().is_empty() {
-                            let id = format!("{}#cmd_{}", id_prefix, cmd_idx);
-                            let tag = if code == 405 { "scroll_text" } else { "dialogue" };
-                            let mut entry =
-                                StringEntry::new(id, text, file_path.to_path_buf());
-                            entry.tags = vec![tag.to_string()];
-                            entries.push(entry);
+                    let mut lines: Vec<String> = Vec::new();
+                    let mut end = cmd_idx;
+                    while let Some(next) = list.get(end) {
+                        if next.get("code").and_then(|v| v.as_i64()) != Some(code) {
+                            break;
                         }
+                        let line = next
+                            .get("parameters")
+                            .and_then(|v| v.as_array())
+                            .and_then(|p| p.first())
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        lines.push(line.to_string());
+                        end += 1;
+                    }
+                    skip_until = end;
+
+                    let text = lines.join("\n");
+                    if !text.trim().is_empty() {
+                        let id = format!("{}#cmd_{}#msg", id_prefix, cmd_idx);
+                        let tag = if code == 405 { "scroll_text" } else { "dialogue" };
+                        let mut entry = StringEntry::new(id, &text, file_path.to_path_buf());
+                        entry.tags = vec![tag.to_string()];
+                        if code == 401 {
+                            entry.context = speaker.clone();
+                        }
+                        entries.push(entry);
                     }
                 }
                 // Show Choices
@@ -787,6 +823,12 @@ impl RpgMakerMvPlugin {
             Some(l) => l,
             None => return,
         };
+
+        if parts.last() == Some(&"msg") {
+            Self::apply_message_block(list, cmd_idx, translation);
+            return;
+        }
+
         let cmd = match list.get_mut(cmd_idx) {
             Some(c) => c,
             None => return,
@@ -903,6 +945,12 @@ impl RpgMakerMvPlugin {
             Some(l) => l,
             None => return,
         };
+
+        if parts.last() == Some(&"msg") {
+            Self::apply_message_block(list, cmd_idx, translation);
+            return;
+        }
+
         let cmd = match list.get_mut(cmd_idx) {
             Some(c) => c,
             None => return,
@@ -977,6 +1025,12 @@ impl RpgMakerMvPlugin {
             Some(l) => l,
             None => return,
         };
+
+        if parts.last() == Some(&"msg") {
+            Self::apply_message_block(list, cmd_idx, translation);
+            return;
+        }
+
         let cmd = match list.get_mut(cmd_idx) {
             Some(c) => c,
             None => return,
@@ -1010,6 +1064,165 @@ impl RpgMakerMvPlugin {
             }
         }
     }
+
+    /// Replace a run of consecutive message lines (code 401/405) starting at
+    /// `cmd_idx` with the translation re-wrapped to the original line width.
+    /// The run may grow or shrink; callers must apply entries in descending
+    /// cmd_idx order so earlier indices stay valid.
+    fn apply_message_block(
+        list: &mut Vec<serde_json::Value>,
+        cmd_idx: usize,
+        translation: &str,
+    ) {
+        let code = match list
+            .get(cmd_idx)
+            .and_then(|c| c.get("code"))
+            .and_then(|v| v.as_i64())
+        {
+            Some(c @ (401 | 405)) => c,
+            _ => return,
+        };
+
+        let mut run_len = 0usize;
+        let mut max_width = 0usize;
+        while let Some(cmd) = list.get(cmd_idx + run_len) {
+            if cmd.get("code").and_then(|v| v.as_i64()) != Some(code) {
+                break;
+            }
+            if let Some(text) = cmd
+                .get("parameters")
+                .and_then(|v| v.as_array())
+                .and_then(|p| p.first())
+                .and_then(|v| v.as_str())
+            {
+                max_width = max_width.max(visible_len(text));
+            }
+            run_len += 1;
+        }
+        if run_len == 0 {
+            return;
+        }
+
+        // Wrap to the width the game's own text was wrapped at; the floor
+        // keeps messages with only short lines from wrapping absurdly early.
+        let width = max_width.max(40);
+        let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
+        // A leading name tag (\n<Name>) must stay intact at the start of the
+        // first line — it may contain spaces, so wrap only the body.
+        let (name_tag, body) = split_name_tag(&flat);
+        let mut lines = wrap_message(body, width);
+        if !name_tag.is_empty() {
+            lines[0] = format!("{}{}", name_tag, lines[0]);
+        }
+
+        let template = list[cmd_idx].clone();
+        let new_cmds: Vec<serde_json::Value> = lines
+            .into_iter()
+            .map(|line| {
+                let mut cmd = template.clone();
+                if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
+                    if let Some(first) = params.first_mut() {
+                        *first = serde_json::Value::String(line);
+                    }
+                }
+                cmd
+            })
+            .collect();
+
+        list.splice(cmd_idx..cmd_idx + run_len, new_cmds);
+    }
+}
+
+/// Visible length of a message line, skipping RPG Maker control codes such
+/// as \C[6], \N[1], \V[2], \G, \{, \}, \$, \., \|, \!, \>, \<, \^.
+pub(crate) fn visible_len(s: &str) -> usize {
+    let mut chars = s.chars().peekable();
+    let mut n = 0usize;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let mut had_letters = false;
+            while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                chars.next();
+                had_letters = true;
+            }
+            if chars.peek() == Some(&'[') {
+                for c in chars.by_ref() {
+                    if c == ']' {
+                        break;
+                    }
+                }
+            } else if had_letters && chars.peek() == Some(&'<') {
+                // YEP-style name tag (\n<Name>) renders in its own box
+                for c in chars.by_ref() {
+                    if c == '>' {
+                        break;
+                    }
+                }
+            } else if !had_letters
+                && chars.peek().is_some_and(|c| "{}$.|!><^\\".contains(*c))
+            {
+                chars.next();
+            }
+        } else {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Word-wrap to lines whose visible length fits `width`. A word longer than
+/// the width gets its own line rather than being split.
+pub(crate) fn wrap_message(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current = word.to_string();
+        } else if visible_len(&current) + 1 + visible_len(word) <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Split a leading YEP-style name tag (`\n<Name>`) off a message, returning
+/// (tag, rest). Returns an empty tag when the message doesn't start with one.
+fn split_name_tag(text: &str) -> (&str, &str) {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'\\') {
+        return ("", text);
+    }
+    let mut i = 1;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i == 1 || bytes.get(i) != Some(&b'<') {
+        return ("", text);
+    }
+    match text[i..].find('>') {
+        Some(end) => {
+            let split = i + end + 1;
+            (&text[..split], text[split..].trim_start())
+        }
+        None => ("", text),
+    }
+}
+
+/// Highest cmd_ index embedded in an entry id, used to order injection.
+fn last_cmd_index(id: &str) -> usize {
+    id.rsplit('#')
+        .find_map(|p| p.strip_prefix("cmd_").and_then(|s| s.parse().ok()))
+        .unwrap_or(0)
 }
 
 impl Default for RpgMakerMvPlugin {
@@ -1121,7 +1334,12 @@ impl FormatPlugin for RpgMakerMvPlugin {
             let (content, _enc) = EncodingDetector::read_file_auto(&file_path)?;
             let mut json: serde_json::Value = serde_json::from_str(&content)?;
 
-            for entry in file_entries {
+            // Message-block splices change command counts, so apply from the
+            // bottom of each event list up: earlier indices stay valid.
+            let mut ordered = file_entries.clone();
+            ordered.sort_by_key(|e| std::cmp::Reverse(last_cmd_index(&e.id)));
+
+            for entry in ordered {
                 if let Some(ref translation) = entry.translation {
                     Self::apply_translation(&mut json, filename, &entry.id, translation);
                     strings_written += 1;
@@ -1310,14 +1528,116 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_map_dialogue() {
+    fn test_extract_map_dialogue_merges_message_block() {
         let plugin = RpgMakerMvPlugin::new();
         let entries = plugin.extract(&fixture_dir()).unwrap();
+        // Two consecutive 401 lines form one message block
         let hello = entries
             .iter()
-            .find(|e| e.source == "Hello, traveler!");
-        assert!(hello.is_some());
-        assert!(hello.unwrap().tags.contains(&"dialogue".to_string()));
+            .find(|e| e.source == "Hello, traveler!\nWelcome to our town.");
+        assert!(hello.is_some(), "block entry missing: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>());
+        let hello = hello.unwrap();
+        assert!(hello.tags.contains(&"dialogue".to_string()));
+        assert!(hello.id.ends_with("#msg"));
+    }
+
+    #[test]
+    fn test_visible_len_ignores_control_codes() {
+        assert_eq!(visible_len("Hello"), 5);
+        assert_eq!(visible_len("\\C[6]Hello\\C[0]"), 5);
+        assert_eq!(visible_len("\\N[1] says hi"), 8);
+        assert_eq!(visible_len("wait\\."), 4);
+        // YEP name tags render in their own box — zero visible width
+        assert_eq!(visible_len("\\n<Demon Girl>Hello"), 5);
+    }
+
+    #[test]
+    fn test_split_name_tag() {
+        assert_eq!(split_name_tag("\\n<Demon Girl>Hola"), ("\\n<Demon Girl>", "Hola"));
+        assert_eq!(split_name_tag("Hola"), ("", "Hola"));
+        assert_eq!(split_name_tag("\\C[6]Hola"), ("", "\\C[6]Hola"));
+    }
+
+    #[test]
+    fn test_inject_block_preserves_name_tag() {
+        let game_dir = temp_game_dir();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&game_dir).unwrap();
+
+        for entry in &mut entries {
+            if entry.id.ends_with("#msg") {
+                entry.translation = Some(
+                    "\\n<Chica Demonio>No es de extrañar que tus amigos te miren por encima del hombro todo el tiempo, de verdad."
+                        .to_string(),
+                );
+            }
+        }
+        plugin.inject(&game_dir, &entries).unwrap();
+
+        let content = fs::read_to_string(game_dir.join("data").join("Map001.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let list = json["events"][1]["pages"][0]["list"].as_array().unwrap();
+        let first_line = list[1]["parameters"][0].as_str().unwrap();
+        // Tag intact at the start of the first line despite containing a space
+        assert!(first_line.starts_with("\\n<Chica Demonio>"), "{}", first_line);
+        // No other line contains a fragment of the tag
+        let mut i = 2;
+        while list[i]["code"].as_i64() == Some(401) {
+            let l = list[i]["parameters"][0].as_str().unwrap();
+            assert!(!l.contains('<') && !l.contains('>'), "{}", l);
+            assert!(visible_len(l) <= 40, "{}", l);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn test_wrap_message_respects_width() {
+        let lines = wrap_message("uno dos tres cuatro cinco seis", 12);
+        assert!(lines.iter().all(|l| visible_len(l) <= 12), "{:?}", lines);
+        assert_eq!(lines.join(" "), "uno dos tres cuatro cinco seis");
+    }
+
+    #[test]
+    fn test_inject_message_block_rewraps_lines() {
+        let game_dir = temp_game_dir();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&game_dir).unwrap();
+
+        // Spanish translation longer than the original two lines
+        for entry in &mut entries {
+            if entry.id.ends_with("#msg") {
+                entry.translation = Some(
+                    "¡Hola, viajero cansado de tantos caminos! Bienvenido a nuestro humilde pueblo, espero que disfrutes tu estadía aquí."
+                        .to_string(),
+                );
+            }
+        }
+
+        plugin.inject(&game_dir, &entries).unwrap();
+
+        let content = fs::read_to_string(game_dir.join("data").join("Map001.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let list = json["events"][1]["pages"][0]["list"].as_array().unwrap();
+
+        // First command is still the 101 header
+        assert_eq!(list[0]["code"].as_i64().unwrap(), 101);
+        // Message lines follow, all 401, all within wrap width
+        let mut msg_lines = Vec::new();
+        let mut i = 1;
+        while list[i]["code"].as_i64() == Some(401) {
+            msg_lines.push(list[i]["parameters"][0].as_str().unwrap().to_string());
+            i += 1;
+        }
+        assert!(msg_lines.len() >= 2, "expected rewrapped lines: {:?}", msg_lines);
+        assert!(msg_lines.iter().all(|l| visible_len(l) <= 40), "{:?}", msg_lines);
+        assert_eq!(
+            msg_lines.join(" "),
+            "¡Hola, viajero cansado de tantos caminos! Bienvenido a nuestro humilde pueblo, espero que disfrutes tu estadía aquí."
+        );
+        // The end-of-list command (code 0) survived the splice
+        assert_eq!(list[i]["code"].as_i64().unwrap(), 0);
+        assert_eq!(list.len(), i + 1);
     }
 
     #[test]

@@ -523,7 +523,11 @@ impl RpgMakerVxaPlugin {
                     Some(MarshalValue::Array(a)) => a,
                     _ => continue,
                 };
+                let mut skip_until = 0usize;
                 for (cmd_idx, cmd) in list.iter().enumerate() {
+                    if cmd_idx < skip_until {
+                        continue;
+                    }
                     let code = match cmd.get_ivar("@code") {
                         Some(MarshalValue::Int(c)) => *c,
                         _ => continue,
@@ -533,18 +537,43 @@ impl RpgMakerVxaPlugin {
                         _ => continue,
                     };
                     match code {
-                        401 => {
-                            if let Some(MarshalValue::Str(text)) = params.first() {
-                                if !text.trim().is_empty() {
-                                    let id = format!(
-                                        "{}#0#event_{}#page_{}#cmd_{}",
-                                        filename, ev_id, page_idx, cmd_idx
-                                    );
-                                    let mut entry =
-                                        StringEntry::new(id, text.as_str(), file_path.to_path_buf());
-                                    entry.tags = vec!["dialogue".to_string()];
-                                    entries.push(entry);
+                        // Message text. XP carries the FIRST line inside the
+                        // Show Text command (101); VX Ace keeps 101 as a
+                        // face/position header and puts all lines in 401s.
+                        // Either way the whole box merges into one #msg entry.
+                        101 | 401 => {
+                            let mut lines: Vec<String> = Vec::new();
+                            match params.first() {
+                                Some(MarshalValue::Str(text))
+                                    if code == 401 || !text.trim().is_empty() =>
+                                {
+                                    lines.push(text.clone());
                                 }
+                                // VX Ace header, or XP Show Text with an empty
+                                // first line: the 401 run that follows anchors
+                                // its own block instead.
+                                _ => continue,
+                            }
+                            let mut end = cmd_idx + 1;
+                            while let Some(next) = list.get(end) {
+                                if cmd_code(next) != Some(401) {
+                                    break;
+                                }
+                                lines.push(cmd_first_str(next).unwrap_or_default());
+                                end += 1;
+                            }
+                            skip_until = end;
+
+                            let text = lines.join("\n");
+                            if !text.trim().is_empty() {
+                                let id = format!(
+                                    "{}#0#event_{}#page_{}#cmd_{}#msg",
+                                    filename, ev_id, page_idx, cmd_idx
+                                );
+                                let mut entry =
+                                    StringEntry::new(id, &text, file_path.to_path_buf());
+                                entry.tags = vec!["dialogue".to_string()];
+                                entries.push(entry);
                             }
                         }
                         102 => {
@@ -594,7 +623,11 @@ impl RpgMakerVxaPlugin {
                 Some(MarshalValue::Array(a)) => a,
                 _ => continue,
             };
+            let mut skip_until = 0usize;
             for (cmd_idx, cmd) in list.iter().enumerate() {
+                if cmd_idx < skip_until {
+                    continue;
+                }
                 let code = match cmd.get_ivar("@code") {
                     Some(MarshalValue::Int(c)) => *c,
                     _ => continue,
@@ -603,15 +636,33 @@ impl RpgMakerVxaPlugin {
                     Some(MarshalValue::Array(a)) => a,
                     _ => continue,
                 };
-                if code == 401 {
-                    if let Some(MarshalValue::Str(text)) = params.first() {
-                        if !text.trim().is_empty() {
-                            let id = format!("{}#{}#cmd_{}", filename, ev_idx, cmd_idx);
-                            let mut entry =
-                                StringEntry::new(id, text.as_str(), file_path.to_path_buf());
-                            entry.tags = vec!["dialogue".to_string()];
-                            entries.push(entry);
+                if code == 101 || code == 401 {
+                    let mut lines: Vec<String> = Vec::new();
+                    match params.first() {
+                        Some(MarshalValue::Str(text))
+                            if code == 401 || !text.trim().is_empty() =>
+                        {
+                            lines.push(text.clone());
                         }
+                        _ => continue,
+                    }
+                    let mut end = cmd_idx + 1;
+                    while let Some(next) = list.get(end) {
+                        if cmd_code(next) != Some(401) {
+                            break;
+                        }
+                        lines.push(cmd_first_str(next).unwrap_or_default());
+                        end += 1;
+                    }
+                    skip_until = end;
+
+                    let text = lines.join("\n");
+                    if !text.trim().is_empty() {
+                        let id = format!("{}#{}#cmd_{}#msg", filename, ev_idx, cmd_idx);
+                        let mut entry =
+                            StringEntry::new(id, &text, file_path.to_path_buf());
+                        entry.tags = vec!["dialogue".to_string()];
+                        entries.push(entry);
                     }
                 }
             }
@@ -697,39 +748,8 @@ impl RpgMakerVxaPlugin {
                     Some(MarshalValue::Array(a)) => a,
                     _ => continue,
                 };
-                for (cmd_idx, cmd) in list.iter_mut().enumerate() {
-                    let code = match cmd.get_ivar("@code") {
-                        Some(MarshalValue::Int(c)) => *c,
-                        _ => continue,
-                    };
-                    let params = match cmd.get_ivar_mut("@parameters") {
-                        Some(MarshalValue::Array(a)) => a,
-                        _ => continue,
-                    };
-                    match code {
-                        401 => {
-                            let id = format!("{}#0#event_{}#page_{}#cmd_{}", filename, ev_id, page_idx, cmd_idx);
-                            if let Some(&translation) = lookup.get(id.as_str()) {
-                                if let Some(MarshalValue::Str(s)) = params.first_mut() {
-                                    *s = translation.to_string();
-                                }
-                            }
-                        }
-                        102 => {
-                            if let Some(MarshalValue::Array(choices)) = params.first_mut() {
-                                for (ci, choice) in choices.iter_mut().enumerate() {
-                                    let id = format!("{}#0#event_{}#page_{}#cmd_{}#choice_{}", filename, ev_id, page_idx, cmd_idx, ci);
-                                    if let Some(&translation) = lookup.get(id.as_str()) {
-                                        if let MarshalValue::Str(s) = choice {
-                                            *s = translation.to_string();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                let prefix = format!("{}#0#event_{}#page_{}", filename, ev_id, page_idx);
+                Self::apply_list_translations(list, lookup, &prefix);
             }
         }
     }
@@ -747,26 +767,161 @@ impl RpgMakerVxaPlugin {
                 Some(MarshalValue::Array(a)) => a,
                 _ => continue,
             };
-            for (cmd_idx, cmd) in list.iter_mut().enumerate() {
-                let code = match cmd.get_ivar("@code") {
-                    Some(MarshalValue::Int(c)) => *c,
-                    _ => continue,
-                };
-                if code == 401 {
-                    let id = format!("{}#{}#cmd_{}", filename, ev_idx, cmd_idx);
-                    if let Some(&translation) = lookup.get(id.as_str()) {
-                        let params = match cmd.get_ivar_mut("@parameters") {
-                            Some(MarshalValue::Array(a)) => a,
-                            _ => continue,
-                        };
-                        if let Some(MarshalValue::Str(s)) = params.first_mut() {
-                            *s = translation.to_string();
+            let prefix = format!("{}#{}", filename, ev_idx);
+            Self::apply_list_translations(list, lookup, &prefix);
+        }
+    }
+
+    /// Apply every translation belonging to one event command list. Message
+    /// blocks (#msg) splice the command run and may change its length, so
+    /// operations run in descending command order to keep indices valid.
+    fn apply_list_translations(
+        list: &mut Vec<MarshalValue>,
+        lookup: &HashMap<&str, &str>,
+        prefix: &str,
+    ) {
+        enum Op<'a> {
+            Msg(&'a str),
+            Line(&'a str),
+            Choice(usize, &'a str),
+        }
+
+        let mut ops: Vec<(usize, Op)> = Vec::new();
+        for (id, translation) in lookup {
+            let Some(suffix) = id.strip_prefix(prefix) else { continue };
+            let Some(rest) = suffix.strip_prefix("#cmd_") else { continue };
+            let mut parts = rest.splitn(2, '#');
+            let Some(idx) = parts.next().and_then(|s| s.parse::<usize>().ok()) else {
+                continue;
+            };
+            match parts.next() {
+                None => ops.push((idx, Op::Line(translation))),
+                Some("msg") => ops.push((idx, Op::Msg(translation))),
+                Some(c) => {
+                    if let Some(ci) = c.strip_prefix("choice_").and_then(|s| s.parse().ok()) {
+                        ops.push((idx, Op::Choice(ci, translation)));
+                    }
+                }
+            }
+        }
+        ops.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
+
+        for (idx, op) in ops {
+            match op {
+                Op::Msg(t) => Self::apply_message_block(list, idx, t),
+                Op::Line(t) => {
+                    if let Some(cmd) = list.get_mut(idx) {
+                        set_cmd_text(cmd, t);
+                    }
+                }
+                Op::Choice(ci, t) => {
+                    if let Some(cmd) = list.get_mut(idx) {
+                        if let Some(MarshalValue::Array(params)) =
+                            cmd.get_ivar_mut("@parameters")
+                        {
+                            if let Some(MarshalValue::Array(choices)) = params.first_mut() {
+                                if let Some(MarshalValue::Str(s)) = choices.get_mut(ci) {
+                                    *s = t.to_string();
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
+
+    /// Replace a message block anchored at `cmd_idx` (XP: a 101 carrying the
+    /// first line; VX Ace: the first 401 of a run) with the translation
+    /// re-wrapped to the original line width. Continuation 401s are spliced,
+    /// so the run may grow or shrink.
+    fn apply_message_block(list: &mut Vec<MarshalValue>, cmd_idx: usize, translation: &str) {
+        let anchor_code = match list.get(cmd_idx).and_then(cmd_code) {
+            Some(c @ (101 | 401)) => c,
+            _ => return,
+        };
+        if anchor_code == 101 && cmd_first_str(&list[cmd_idx]).is_none() {
+            // VX Ace header without text — blocks are anchored at 401s there
+            return;
+        }
+
+        let mut max_width = cmd_first_str(&list[cmd_idx])
+            .map(|t| crate::rpgmaker_mv::visible_len(&t))
+            .unwrap_or(0);
+        let mut end = cmd_idx + 1;
+        while let Some(next) = list.get(end) {
+            if cmd_code(next) != Some(401) {
+                break;
+            }
+            if let Some(t) = cmd_first_str(next) {
+                max_width = max_width.max(crate::rpgmaker_mv::visible_len(&t));
+            }
+            end += 1;
+        }
+
+        let width = max_width.max(40);
+        let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut lines = crate::rpgmaker_mv::wrap_message(&flat, width).into_iter();
+
+        // First line goes into the anchor command itself
+        let first = lines.next().unwrap_or_default();
+        set_cmd_text(&mut list[cmd_idx], &first);
+
+        // Continuation lines become 401s modeled on an existing one (or the anchor)
+        let template = if end > cmd_idx + 1 {
+            list[cmd_idx + 1].clone()
+        } else {
+            make_401_like(&list[cmd_idx])
+        };
+        let new_401s: Vec<MarshalValue> = lines
+            .map(|line| {
+                let mut cmd = template.clone();
+                set_cmd_text(&mut cmd, &line);
+                cmd
+            })
+            .collect();
+        list.splice(cmd_idx + 1..end, new_401s);
+    }
+}
+
+fn cmd_code(cmd: &MarshalValue) -> Option<i64> {
+    match cmd.get_ivar("@code") {
+        Some(MarshalValue::Int(c)) => Some(*c),
+        _ => None,
+    }
+}
+
+fn cmd_first_str(cmd: &MarshalValue) -> Option<String> {
+    match cmd.get_ivar("@parameters") {
+        Some(MarshalValue::Array(a)) => match a.first() {
+            Some(MarshalValue::Str(s)) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn set_cmd_text(cmd: &mut MarshalValue, text: &str) {
+    if let Some(MarshalValue::Array(params)) = cmd.get_ivar_mut("@parameters") {
+        if let Some(first) = params.first_mut() {
+            *first = MarshalValue::Str(text.to_string());
+        } else {
+            params.push(MarshalValue::Str(text.to_string()));
+        }
+    }
+}
+
+/// Clone `anchor` into a continuation-line command (@code 401, single text param).
+fn make_401_like(anchor: &MarshalValue) -> MarshalValue {
+    let mut cmd = anchor.clone();
+    if let MarshalValue::Object { ivars, .. } = &mut cmd {
+        ivars.insert("@code".to_string(), MarshalValue::Int(401));
+        ivars.insert(
+            "@parameters".to_string(),
+            MarshalValue::Array(vec![MarshalValue::Str(String::new())]),
+        );
+    }
+    cmd
 }
 
 impl Default for RpgMakerVxaPlugin {
@@ -997,6 +1152,98 @@ mod tests {
         let bytes = build_test_fixture();
         fs::write(data_dir.join("Actors.rvdata2"), &bytes).unwrap();
         dir
+    }
+
+    fn make_cmd(code: i64, params: Vec<MarshalValue>) -> MarshalValue {
+        MarshalValue::Object {
+            class: "RPG::EventCommand".to_string(),
+            ivars: {
+                let mut m = HashMap::new();
+                m.insert("@code".to_string(), MarshalValue::Int(code));
+                m.insert("@indent".to_string(), MarshalValue::Int(0));
+                m.insert("@parameters".to_string(), MarshalValue::Array(params));
+                m
+            },
+        }
+    }
+
+    /// XP-style map: Show Text (101) carries the first line, 401s continue it.
+    fn create_xp_map_fixture() -> PathBuf {
+        let dir = tempdir();
+        let data_dir = dir.join("Data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let list = MarshalValue::Array(vec![
+            make_cmd(101, vec![MarshalValue::Str("Hello there, brave".to_string())]),
+            make_cmd(401, vec![MarshalValue::Str("adventurer of the realm!".to_string())]),
+            make_cmd(0, vec![]),
+        ]);
+        let page = MarshalValue::Object {
+            class: "RPG::Event::Page".to_string(),
+            ivars: {
+                let mut m = HashMap::new();
+                m.insert("@list".to_string(), list);
+                m
+            },
+        };
+        let event = MarshalValue::Object {
+            class: "RPG::Event".to_string(),
+            ivars: {
+                let mut m = HashMap::new();
+                m.insert("@pages".to_string(), MarshalValue::Array(vec![page]));
+                m
+            },
+        };
+        let map = MarshalValue::Object {
+            class: "RPG::Map".to_string(),
+            ivars: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "@events".to_string(),
+                    MarshalValue::Hash(vec![(MarshalValue::Int(1), event)]),
+                );
+                m
+            },
+        };
+        fs::write(data_dir.join("Map001.rxdata"), map.serialize()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_xp_message_block_extract_and_rewrap() {
+        let dir = create_xp_map_fixture();
+        let plugin = RpgMakerVxaPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+
+        // 101 first line + 401 continuation merged into one block
+        let msg = entries
+            .iter()
+            .find(|e| e.id.ends_with("#msg"))
+            .unwrap_or_else(|| panic!("no #msg entry: {:?}",
+                entries.iter().map(|e| &e.id).collect::<Vec<_>>()));
+        assert_eq!(msg.source, "Hello there, brave\nadventurer of the realm!");
+
+        // Inject a longer Spanish translation and verify structure
+        let mut entries = entries;
+        for e in &mut entries {
+            if e.id.ends_with("#msg") {
+                e.translation = Some(
+                    "¡Hola, valiente aventurero de todos los reinos conocidos y por conocer, bienvenido seas a estas tierras!"
+                        .to_string(),
+                );
+            }
+        }
+        plugin.inject(&dir, &entries).unwrap();
+
+        let re = plugin.extract(&dir).unwrap();
+        let msg = re.iter().find(|e| e.id.ends_with("#msg")).unwrap();
+        // Round-trip: merged text equals the flat translation
+        assert_eq!(
+            msg.source.replace('\n', " "),
+            "¡Hola, valiente aventurero de todos los reinos conocidos y por conocer, bienvenido seas a estas tierras!"
+        );
+        // And it re-wrapped into more than one line
+        assert!(msg.source.contains('\n'), "{}", msg.source);
     }
 
     #[test]
