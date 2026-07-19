@@ -80,6 +80,14 @@ enum Commands {
     Validate { project: PathBuf },
     /// Show translation stats: tokens, time, and cost per run
     Stats { project: PathBuf },
+    /// Pivot: seed a new project whose SOURCE is another project's translations,
+    /// so you can translate e.g. JA→EN once, then EN→ES / EN→FR / EN→PT from it.
+    Pivot {
+        /// Existing project whose translations become the new source (e.g. the EN one)
+        source: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Package translated files into a distributable patch zip (patch-only:
     /// just the translated game files, not the whole game)
     Patch {
@@ -218,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Validate { project } => cmd_validate(project)?,
         Commands::Stats { project } => cmd_stats(project)?,
+        Commands::Pivot { source, output } => cmd_pivot(source, output)?,
         Commands::Patch {
             game_path,
             project,
@@ -398,6 +407,49 @@ fn write_astro_stub(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, md)?;
+    Ok(())
+}
+
+fn cmd_pivot(source: PathBuf, output: PathBuf) -> anyhow::Result<()> {
+    use locust_core::models::StringEntry;
+
+    let src_db = Database::open(&source)?;
+    let entries = src_db.get_entries(&EntryFilter::default())?;
+
+    // Each translated entry becomes a pending entry in the new project whose
+    // SOURCE is the old translation. Ids, file paths, tags and speaker context
+    // carry over unchanged, so inject/patch still target the same game files
+    // and the next language keeps the same context.
+    let mut pivoted: Vec<StringEntry> = Vec::new();
+    for e in entries {
+        let Some(translation) = e.translation.filter(|t| !t.trim().is_empty()) else {
+            continue;
+        };
+        let mut ne = StringEntry::new(e.id, translation, e.file_path);
+        ne.context = e.context;
+        ne.tags = e.tags;
+        ne.char_limit = e.char_limit;
+        ne.metadata = e.metadata;
+        pivoted.push(ne);
+    }
+
+    if pivoted.is_empty() {
+        anyhow::bail!("no translated entries in {} to pivot from", source.display());
+    }
+
+    let out_db = Database::open(&output)?;
+    let count = out_db.save_entries(&pivoted)?;
+
+    let mut table = Table::new();
+    table.set_header(vec!["Metric", "Value"]);
+    table.add_row(vec!["Pivoted project", &output.display().to_string()]);
+    table.add_row(vec!["Source entries used", &count.to_string()]);
+    println!("{table}");
+    println!(
+        "\nNow translate the new project into any language, e.g.:\n  \
+         locust translate \"{}\" -p grok-sub -s en -t fr",
+        output.display()
+    );
     Ok(())
 }
 
