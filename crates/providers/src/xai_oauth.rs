@@ -49,6 +49,13 @@ fn save_tokens(tokens: &TokenStore) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(tokens)?)?;
+    // Tokens are secrets — restrict to the owner on Unix (Windows relies on the
+    // NTFS ACLs already applied under the per-user data dir).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 

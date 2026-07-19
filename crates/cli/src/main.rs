@@ -317,7 +317,18 @@ fn cmd_patch(
 
     let mut added = 0usize;
     let mut missing = 0usize;
+    let mut skipped_unsafe = 0usize;
     for rel in &files {
+        // Defense-in-depth: never read or pack a path that escapes the game
+        // root. Guards against a corrupt/untrusted DB producing a zip-slip
+        // entry, since this archive is redistributed to end users.
+        if rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            skipped_unsafe += 1;
+            continue;
+        }
         let src = game_path.join(rel);
         let bytes = match std::fs::read(&src) {
             Ok(b) => b,
@@ -354,6 +365,9 @@ fn cmd_patch(
     table.add_row(vec!["Files packed", &added.to_string()]);
     if missing > 0 {
         table.add_row(vec!["Files missing (inject first?)", &missing.to_string()]);
+    }
+    if skipped_unsafe > 0 {
+        table.add_row(vec!["Skipped unsafe paths", &skipped_unsafe.to_string()]);
     }
     table.add_row(vec!["Translated strings", &translated.to_string()]);
     table.add_row(vec!["Size", &format!("{:.1} KB", size as f64 / 1024.0)]);
@@ -663,11 +677,16 @@ async fn run_provider_pass(
     glossary: Arc<Glossary>,
     opts: TranslationOptions,
 ) -> anyhow::Result<()> {
-    let entries = db.get_entries(&EntryFilter::default())?;
-    let pending = entries
-        .iter()
+    // Only translate PENDING entries. Fetching all statuses would let a
+    // fallback provider re-translate (and possibly overwrite/re-bill) strings
+    // an earlier provider already finished, and would clobber human-reviewed
+    // work. Restricting to pending also makes re-runs a clean resume.
+    let entries: Vec<_> = db
+        .get_entries(&EntryFilter::default())?
+        .into_iter()
         .filter(|e| e.status == StringStatus::Pending)
-        .count();
+        .collect();
+    let pending = entries.len();
     if pending == 0 {
         return Ok(());
     }
