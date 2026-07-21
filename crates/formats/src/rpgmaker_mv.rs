@@ -171,6 +171,26 @@ impl RpgMakerMvPlugin {
             || dir.join("Map001.json").exists()
     }
 
+    /// True when the game's data files are wrapped by a protection plugin:
+    /// System.json is `{"uid", "bid", "data": "<encoded>"}` instead of the
+    /// real object. Cheap check: parse System.json and look for the `data`
+    /// string wrapper plus the absence of any normal top-level field.
+    fn is_encrypted(data_dir: &Path) -> bool {
+        let Ok(text) = std::fs::read_to_string(data_dir.join("System.json")) else {
+            return false;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return false;
+        };
+        let Some(obj) = json.as_object() else {
+            return false;
+        };
+        obj.get("data").is_some_and(|d| d.is_string())
+            && obj.contains_key("uid")
+            && !obj.contains_key("gameTitle")
+            && !obj.contains_key("terms")
+    }
+
     fn detect_version(game_root: &Path) -> MvMzVersion {
         if game_root.join("js").join("rmmz_core.js").exists() {
             return MvMzVersion::Mz;
@@ -1282,6 +1302,18 @@ impl FormatPlugin for RpgMakerMvPlugin {
             }
         })?;
 
+        // Fail loudly on encrypted games instead of silently extracting 0
+        // strings. Protection plugins (common on DLsite) replace each data
+        // file's contents with a wrapper: {"uid", "bid", "data": "<encoded>"}.
+        if Self::is_encrypted(&data_dir) {
+            return Err(LocustError::ParseError {
+                file: data_dir.join("System.json").display().to_string(),
+                message: "game data is encrypted (uid/bid/data wrapper) — decrypt it first \
+                    (e.g. with an RPG Maker MV/MZ decrypter) and then extract the decrypted copy"
+                    .to_string(),
+            });
+        }
+
         let mut all_entries = Vec::new();
         for dir_entry in std::fs::read_dir(&data_dir)? {
             let dir_entry = dir_entry?;
@@ -1481,6 +1513,24 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let plugin = RpgMakerMvPlugin::new();
         assert!(!plugin.detect(&dir));
+    }
+
+    #[test]
+    fn test_encrypted_game_errors_clearly() {
+        let dir = std::env::temp_dir().join(format!("locust_enc_{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        // Encryption-plugin wrapper, not a real System.json
+        fs::write(
+            data.join("System.json"),
+            r#"{"uid":"abc","bid":"MV.1.6.2","data":"VQxPSlhP"}"#,
+        )
+        .unwrap();
+
+        let plugin = RpgMakerMvPlugin::new();
+        let err = plugin.extract(&dir).unwrap_err().to_string();
+        assert!(err.contains("encrypted"), "got: {}", err);
+        assert!(err.contains("decrypt"), "got: {}", err);
     }
 
     #[test]
