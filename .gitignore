@@ -1,5 +1,6 @@
 # Build output
 /target
+/target-alt
 /dist
 **/dist/
 node_modules/
