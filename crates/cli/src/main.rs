@@ -478,9 +478,10 @@ fn cmd_stats(project: PathBuf) -> anyhow::Result<()> {
 
     let mut table = Table::new();
     table.set_header(vec![
-        "Date", "Provider", "Langs", "Strings", "Tokens", "Cost ($)", "Time",
+        "Date", "Provider", "Langs", "Strings", "Tokens", "In", "Out", "Cost ($)", "Time",
     ]);
-    let (mut t_strings, mut t_tokens, mut t_cost, mut t_secs) = (0usize, 0u64, 0f64, 0f64);
+    let (mut t_strings, mut t_tokens, mut t_in, mut t_out, mut t_cost, mut t_secs) =
+        (0usize, 0u64, 0u64, 0u64, 0f64, 0f64);
     for run in &runs {
         table.add_row(vec![
             run.started_at.chars().take(16).collect::<String>(),
@@ -488,11 +489,15 @@ fn cmd_stats(project: PathBuf) -> anyhow::Result<()> {
             format!("{}→{}", run.source_lang, run.target_lang),
             run.strings_translated.to_string(),
             run.tokens_used.to_string(),
+            run.input_tokens.to_string(),
+            run.output_tokens.to_string(),
             format!("{:.4}", run.cost_usd),
             format_duration(run.duration_secs),
         ]);
         t_strings += run.strings_translated;
         t_tokens += run.tokens_used;
+        t_in += run.input_tokens;
+        t_out += run.output_tokens;
         t_cost += run.cost_usd;
         t_secs += run.duration_secs;
     }
@@ -502,6 +507,8 @@ fn cmd_stats(project: PathBuf) -> anyhow::Result<()> {
         String::new(),
         t_strings.to_string(),
         t_tokens.to_string(),
+        t_in.to_string(),
+        t_out.to_string(),
         format!("{:.4}", t_cost),
         format_duration(t_secs),
     ]);

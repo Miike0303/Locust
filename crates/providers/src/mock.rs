@@ -33,6 +33,8 @@ impl TranslationProvider for MockProvider {
                 detected_source_lang: None,
                 provider: "mock".to_string(),
                 tokens_used: None,
+                input_tokens: None,
+                output_tokens: None,
                 cost_usd: None,
             })
             .collect())

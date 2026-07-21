@@ -98,6 +98,8 @@ impl TranslationProvider for GoogleTranslateProvider {
                         detected_source_lang: None,
                         provider: "google".to_string(),
                         tokens_used: None,
+                        input_tokens: None,
+                        output_tokens: None,
                         cost_usd: None,
                     });
                 }

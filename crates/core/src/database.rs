@@ -34,6 +34,8 @@ pub struct TranslationRun {
     pub target_lang: String,
     pub strings_translated: usize,
     pub tokens_used: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub cost_usd: f64,
 }
 
@@ -152,10 +154,22 @@ impl Database {
                 target_lang TEXT NOT NULL,
                 strings_translated INTEGER NOT NULL,
                 tokens_used INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL NOT NULL DEFAULT 0
             );
             ",
         )?;
+        // Migrate older DBs that predate the input/output token columns.
+        // ADD COLUMN errors if the column already exists — ignore that.
+        let _ = conn.execute(
+            "ALTER TABLE translation_runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE translation_runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(())
     }
 
@@ -419,8 +433,8 @@ impl Database {
             conn.execute(
                 "INSERT INTO translation_runs
                  (started_at, duration_secs, provider, source_lang, target_lang,
-                  strings_translated, tokens_used, cost_usd)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  strings_translated, tokens_used, input_tokens, output_tokens, cost_usd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     run.started_at,
                     run.duration_secs,
@@ -429,6 +443,8 @@ impl Database {
                     run.target_lang,
                     run.strings_translated as i64,
                     run.tokens_used as i64,
+                    run.input_tokens as i64,
+                    run.output_tokens as i64,
                     run.cost_usd,
                 ],
             )?;
@@ -442,7 +458,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT started_at, duration_secs, provider, source_lang, target_lang,
-                    strings_translated, tokens_used, cost_usd
+                    strings_translated, tokens_used, input_tokens, output_tokens, cost_usd
              FROM translation_runs ORDER BY started_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -454,7 +470,9 @@ impl Database {
                 target_lang: row.get(4)?,
                 strings_translated: row.get::<_, i64>(5)? as usize,
                 tokens_used: row.get::<_, i64>(6)? as u64,
-                cost_usd: row.get(7)?,
+                input_tokens: row.get::<_, i64>(7)? as u64,
+                output_tokens: row.get::<_, i64>(8)? as u64,
+                cost_usd: row.get(9)?,
             })
         })?;
         let mut runs = Vec::new();

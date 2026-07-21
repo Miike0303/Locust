@@ -45,7 +45,10 @@ struct OllamaMessage {
 #[derive(Deserialize)]
 struct OllamaResponse {
     message: OllamaRespMessage,
+    /// Output tokens generated.
     eval_count: Option<u32>,
+    /// Input tokens (prompt) evaluated.
+    prompt_eval_count: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -140,9 +143,14 @@ impl TranslationProvider for OllamaProvider {
             )));
         }
 
-        let tokens_used = ollama_resp.eval_count;
+        let input_tokens = ollama_resp.prompt_eval_count;
+        let output_tokens = ollama_resp.eval_count;
+        let tokens_used = match (input_tokens, output_tokens) {
+            (Some(i), Some(o)) => Some(i + o),
+            (a, b) => a.or(b),
+        };
 
-        // eval_count is batch-level; attach it to the first result only so
+        // Counts are batch-level; attach them to the first result only so
         // that summing across results yields the true totals.
         Ok(requests
             .iter()
@@ -154,6 +162,8 @@ impl TranslationProvider for OllamaProvider {
                 detected_source_lang: None,
                 provider: "ollama".to_string(),
                 tokens_used: if i == 0 { tokens_used } else { None },
+                input_tokens: if i == 0 { input_tokens } else { None },
+                output_tokens: if i == 0 { output_tokens } else { None },
                 cost_usd: None,
             })
             .collect())

@@ -138,6 +138,12 @@ pub struct TranslationResult {
     pub detected_source_lang: Option<String>,
     pub provider: String,
     pub tokens_used: Option<u32>,
+    /// Prompt (input) tokens for the batch, when the provider reports them.
+    #[serde(default)]
+    pub input_tokens: Option<u32>,
+    /// Completion (output) tokens for the batch, when the provider reports them.
+    #[serde(default)]
+    pub output_tokens: Option<u32>,
     pub cost_usd: Option<f64>,
 }
 

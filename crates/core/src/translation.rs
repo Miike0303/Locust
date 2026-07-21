@@ -115,6 +115,8 @@ impl TranslationManager {
         let mut completed = 0usize;
         let mut total_cost = 0.0f64;
         let mut total_tokens = 0u64;
+        let mut total_input_tokens = 0u64;
+        let mut total_output_tokens = 0u64;
         let started_at = chrono::Utc::now().to_rfc3339();
         let lang_pair = format!("{}-{}", opts.source_lang, opts.target_lang);
 
@@ -309,6 +311,12 @@ impl TranslationManager {
                         if let Some(tokens) = result.tokens_used {
                             total_tokens += tokens as u64;
                         }
+                        if let Some(t) = result.input_tokens {
+                            total_input_tokens += t as u64;
+                        }
+                        if let Some(t) = result.output_tokens {
+                            total_output_tokens += t as u64;
+                        }
                         completed += 1;
                     }
                 }
@@ -359,6 +367,8 @@ impl TranslationManager {
                 target_lang: opts.target_lang.clone(),
                 strings_translated: completed,
                 tokens_used: total_tokens,
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
                 cost_usd: total_cost,
             };
             if let Err(e) = self.db.record_translation_run(&run).await {
@@ -464,6 +474,8 @@ mod tests {
                     detected_source_lang: None,
                     provider: "mock".to_string(),
                     tokens_used: None,
+                    input_tokens: None,
+                    output_tokens: None,
                     cost_usd: Some(0.0001),
                 })
                 .collect())
@@ -518,6 +530,8 @@ mod tests {
                     detected_source_lang: None,
                     provider: "fail-once".to_string(),
                     tokens_used: None,
+                    input_tokens: None,
+                    output_tokens: None,
                     cost_usd: Some(0.0001),
                 })
                 .collect())
@@ -903,6 +917,8 @@ mod tests {
                         detected_source_lang: None,
                         provider: "ctx".to_string(),
                         tokens_used: None,
+                        input_tokens: None,
+                        output_tokens: None,
                         cost_usd: None,
                     })
                     .collect())

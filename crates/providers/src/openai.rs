@@ -233,6 +233,8 @@ impl TranslationProvider for OpenAiProvider {
 
         let usage = chat_resp.usage.as_ref();
         let tokens_used = usage.map(|u| u.total_tokens);
+        let input_tokens = usage.map(|u| u.prompt_tokens);
+        let output_tokens = usage.map(|u| u.completion_tokens);
         let cost_usd = self.pricing.and_then(|(input_rate, output_rate)| {
             usage.map(|u| {
                 (u.prompt_tokens as f64 * input_rate + u.completion_tokens as f64 * output_rate)
@@ -252,6 +254,8 @@ impl TranslationProvider for OpenAiProvider {
                 detected_source_lang: None,
                 provider: self.id.clone(),
                 tokens_used: if i == 0 { tokens_used } else { None },
+                input_tokens: if i == 0 { input_tokens } else { None },
+                output_tokens: if i == 0 { output_tokens } else { None },
                 cost_usd: if i == 0 { cost_usd } else { None },
             })
             .collect())

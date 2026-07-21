@@ -108,6 +108,8 @@ impl TranslationProvider for ArgosProvider {
                 detected_source_lang: None,
                 provider: "argos".to_string(),
                 tokens_used: None,
+                input_tokens: None,
+                output_tokens: None,
                 cost_usd: None,
             })
             .collect())

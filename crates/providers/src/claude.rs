@@ -139,6 +139,8 @@ impl TranslationProvider for ClaudeProvider {
 
         let usage = claude_resp.usage.as_ref();
         let tokens_used = usage.map(|u| u.input_tokens + u.output_tokens);
+        let input_tokens = usage.map(|u| u.input_tokens);
+        let output_tokens = usage.map(|u| u.output_tokens);
         let cost_usd = usage.map(|u| {
             (u.input_tokens as f64 * 0.00025 + u.output_tokens as f64 * 0.00125) / 1000.0
         });
@@ -155,6 +157,8 @@ impl TranslationProvider for ClaudeProvider {
                 detected_source_lang: None,
                 provider: "claude".to_string(),
                 tokens_used: if i == 0 { tokens_used } else { None },
+                input_tokens: if i == 0 { input_tokens } else { None },
+                output_tokens: if i == 0 { output_tokens } else { None },
                 cost_usd: if i == 0 { cost_usd } else { None },
             })
             .collect())
