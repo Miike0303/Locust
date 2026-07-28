@@ -226,7 +226,10 @@ pub struct GrokSubscriptionProvider {
 impl GrokSubscriptionProvider {
     pub fn new(model: Option<String>) -> Self {
         Self {
-            model: model.unwrap_or_else(|| "grok-4.3".to_string()),
+            // Non-reasoning variant: ~8x faster and ~3.5x fewer tokens than the
+            // reasoning models for translation, with equivalent quality (Grok's
+            // chain-of-thought is wasted effort on straight translation).
+            model: model.unwrap_or_else(|| "grok-4.20-0309-non-reasoning".to_string()),
         }
     }
 
