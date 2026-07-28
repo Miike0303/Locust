@@ -82,7 +82,7 @@ pub(crate) fn build_system_prompt(req: &TranslationRequest) -> String {
         prompt.push_str(&format!("\n{}", hint));
     }
     prompt.push_str(
-        "\nRules:\n- Preserve all placeholder tokens like {PL_0}, {PL_1} exactly as-is\n- Return ONLY a JSON array of translated strings, in the same order as input\n- Do not add explanations or notes",
+        "\nRules:\n- Preserve all placeholder tokens like {PL_0}, {PL_1} exactly as-is\n- Preserve control codes such as \\C[6], \\N[1], \\V[2] exactly, but DO translate any visible text around or between them (e.g. a title inside \\C[5]...\\C[0])\n- Translate EVERY line fully, including labels, speaker prefixes and menu text; do not lazily echo untranslated source text just because translating feels redundant. It is fine for the output to equal the input ONLY when that is genuinely correct: lines made solely of placeholders/control codes, bare numbers, proper nouns, or words that are identical in both languages\n- Return ONLY a JSON array of translated strings, in the same order as input\n- Do not add explanations or notes",
     );
     prompt.push_str(target_language_rules(&req.target_lang));
     prompt
@@ -380,6 +380,30 @@ mod tests {
         let requests = vec![make_request(None, Some("HP = Health Points"))];
         provider.translate(&requests).await.unwrap();
         mock.assert();
+    }
+
+    #[test]
+    fn test_system_prompt_does_not_forbid_identical_output_for_protected_cases() {
+        let req = make_request(None, None);
+        let prompt = build_system_prompt(&req);
+
+        // The old wording ("NEVER return a line unchanged from the source")
+        // contradicts placeholder/control-code preservation and pressures the
+        // model into mutating protected tokens on legitimately-identical lines
+        // (pure placeholder lines, numbers, proper nouns, identical words).
+        assert!(
+            !prompt.contains("NEVER return a line unchanged"),
+            "prompt must not contain an absolute never-unchanged directive: {prompt}"
+        );
+        // The rule's original intent — stop lazy echoing of untranslated text —
+        // must still be present.
+        assert!(
+            prompt.contains("do not lazily echo untranslated source text"),
+            "prompt must still discourage untranslated echoes: {prompt}"
+        );
+        // And it must explicitly carve out the legitimate identical-output cases.
+        assert!(prompt.contains("placeholders/control codes"));
+        assert!(prompt.contains("proper nouns"));
     }
 
     #[tokio::test]
