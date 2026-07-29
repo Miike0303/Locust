@@ -406,20 +406,14 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join("wolf_rpg")
-    }
-
+    /// Every test gets its OWN fixture directory. This used to build into a
+    /// fixed, git-tracked path under `tests/fixtures/wolf_rpg`, which four tests
+    /// then wrote and read concurrently — cargo runs tests in a binary in
+    /// parallel, so one test could read the `.wolf` file while another was
+    /// mid-write, intermittently failing on missing strings. It also meant the
+    /// suite overwrote a tracked repo file on every run.
     fn setup_fixture() -> PathBuf {
-        let dir = fixture_dir();
-        let data_dir = dir.join("Data");
-        fs::create_dir_all(&data_dir).unwrap();
-        let bytes = build_test_fixture();
-        fs::write(data_dir.join("BasicData.wolf"), &bytes).unwrap();
-        dir
+        temp_wolf_dir()
     }
 
     fn temp_wolf_dir() -> PathBuf {
