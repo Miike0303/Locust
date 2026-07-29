@@ -1,7 +1,12 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// tokio's Instant, not std's: it is virtualized under `tokio::time::pause()`, which
+// lets the rate-limiter tests assert on the limiter's own logic instead of on how
+// loaded the host happens to be. Outside a paused runtime it reads the real clock,
+// so production behavior is unchanged.
+use tokio::time::Instant;
 
 use locust_core::error::{LocustError, Result};
 
@@ -247,34 +252,46 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
     }
 
-    #[tokio::test]
+    // Both rate-limiter tests run on a PAUSED clock and assert on VIRTUAL elapsed
+    // time. Virtual time only moves when the limiter actually awaits a sleep, so
+    // "did it throttle" becomes an exact question rather than a guess about wall
+    // clock. These previously asserted on real elapsed time and failed under CPU
+    // contention with nothing broken.
+
+    #[tokio::test(start_paused = true)]
     async fn test_rate_limiter_allows_under_limit() {
         let limiter = RateLimiter::new(60);
         let start = Instant::now();
         for _ in 0..5 {
             limiter.acquire().await;
         }
-        let elapsed = start.elapsed();
-        // Should be nearly instant
-        assert!(elapsed < Duration::from_secs(1));
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "5 requests against a 60/min limit must not wait at all"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_rate_limiter_throttles_over_limit() {
         let limiter = RateLimiter::new(3);
-        // Fill the window
         for _ in 0..3 {
             limiter.acquire().await;
         }
-        // Next acquire should block
+
+        // The 4th request cannot proceed until the oldest of the 3 leaves the
+        // 60s window, so the limiter must sleep out roughly the whole window.
         let start = Instant::now();
-        // Use a timeout to avoid hanging
-        let result = tokio::time::timeout(Duration::from_secs(2), limiter.acquire()).await;
-        // It should either complete (after waiting) or timeout
-        // Since we set 3/min, the 4th request should wait ~60s — so it will timeout
+        limiter.acquire().await;
+        let waited = start.elapsed();
+
         assert!(
-            result.is_err() || start.elapsed() > Duration::from_millis(100),
-            "rate limiter should have throttled"
+            waited >= Duration::from_secs(60),
+            "the 4th request against a 3/min limit must wait out the window, waited {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(61),
+            "the wait must be the window and not longer, waited {waited:?}"
         );
     }
 }
