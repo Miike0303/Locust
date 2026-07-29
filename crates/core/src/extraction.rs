@@ -38,6 +38,23 @@ pub trait FormatPlugin: Send + Sync {
         FormatStability::Stable
     }
 
+    /// Names of the top-level directory component(s), relative to the game
+    /// root, under which this format's translatable content lives — e.g.
+    /// `["game"]` for Ren'Py, `["www", "data"]` for RPG Maker MV/MZ (MV
+    /// nests data under `www/`, MZ does not — both component names are
+    /// tried). Used to compute a patch archive's game-root-relative paths
+    /// so packaging never depends on a hardcoded, format-agnostic anchor
+    /// list.
+    ///
+    /// The default (empty slice) means this format has no single
+    /// recognized content root. Callers MUST treat an empty match here as
+    /// a hard error naming the unresolved path — never silently fall back
+    /// to a bare filename, which flattens directory structure and can
+    /// cause distinct source files to collide.
+    fn content_roots(&self) -> &[&str] {
+        &[]
+    }
+
     fn detect(&self, path: &Path) -> bool {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();

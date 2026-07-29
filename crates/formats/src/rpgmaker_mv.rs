@@ -1272,6 +1272,10 @@ impl FormatPlugin for RpgMakerMvPlugin {
         vec![OutputMode::Replace, OutputMode::Add]
     }
 
+    fn content_roots(&self) -> &[&str] {
+        &["www", "data"]
+    }
+
     fn detect(&self, path: &Path) -> bool {
         if path.is_dir() {
             if let Some(data_dir) = Self::find_data_dir(path) {

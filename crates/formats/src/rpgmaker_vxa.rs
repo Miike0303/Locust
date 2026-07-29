@@ -962,6 +962,10 @@ impl FormatPlugin for RpgMakerVxaPlugin {
         vec![OutputMode::Replace]
     }
 
+    fn content_roots(&self) -> &[&str] {
+        &["Data"]
+    }
+
     fn detect(&self, path: &Path) -> bool {
         if path.is_dir() {
             if let Some(data_dir) = Self::find_data_dir(path) {

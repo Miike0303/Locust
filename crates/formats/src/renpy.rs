@@ -1726,6 +1726,10 @@ impl FormatPlugin for RenPyPlugin {
         vec![OutputMode::Replace, OutputMode::Add]
     }
 
+    fn content_roots(&self) -> &[&str] {
+        &["game"]
+    }
+
     fn detect(&self, path: &Path) -> bool {
         if path.is_file() {
             let ext = path.extension().unwrap_or_default();

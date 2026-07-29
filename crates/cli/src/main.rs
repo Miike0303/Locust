@@ -256,19 +256,64 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Path of a game file relative to the game root — from the first
-/// data/Data/www component onward — so the patch zip mirrors the game's own
-/// layout and extracts cleanly over any copy of the game.
-fn rel_in_game(p: &std::path::Path) -> PathBuf {
-    let comps: Vec<_> = p.components().collect();
-    if let Some(i) = comps
-        .iter()
-        .position(|c| matches!(c.as_os_str().to_str(), Some("data" | "Data" | "www")))
-    {
-        comps[i..].iter().collect()
-    } else {
-        PathBuf::from(p.file_name().unwrap_or_default())
+/// Path of a game file relative to the game root, so the patch zip mirrors the
+/// game's own layout and extracts cleanly over any copy of the game.
+///
+/// Resolution is `game_path`-relative first. That is correct for EVERY engine
+/// with no per-format knowledge at all — `game/script.rpy` for Ren'Py,
+/// `www/data/Map001.json` for RPG Maker, `Data/x.wolf` for Wolf RPG, and a
+/// bare `game.html` for the engines that keep their content at the game root.
+///
+/// `content_roots` is only a fallback, for entries whose stored path is not
+/// under `game_path` (a moved game, or a differently-spelled path). Anchoring
+/// on a component is second choice because it searches the whole absolute path:
+/// a game living at `D:\game\MyVN\game\script.rpy` anchors on the OUTER `game`
+/// and yields a path that resolves nowhere.
+///
+/// Returns `None` when neither resolves. Callers MUST treat that as a hard
+/// error naming the unresolved path. There is deliberately no bare-filename
+/// fallback: flattening a path discards the directory structure that made it
+/// unique, which is what made patch archives pack nothing — or silently drop
+/// colliding files — for every engine without a recognized content root.
+fn rel_in_game(p: &std::path::Path, game_path: &std::path::Path, content_roots: &[&str]) -> Option<PathBuf> {
+    if let Ok(rel) = p.strip_prefix(game_path) {
+        if rel.as_os_str().is_empty() {
+            return None;
+        }
+        return Some(rel.to_path_buf());
     }
+
+    let comps: Vec<_> = p.components().collect();
+    comps
+        .iter()
+        .position(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| content_roots.contains(&s))
+        })
+        .map(|i| comps[i..].iter().collect())
+}
+
+/// Containers whose entries hold the SOURCE archive path rather than a file that
+/// injection writes. Packing one ships the game's own original content in a patch
+/// that claims to carry translated text only, and carries no translation at all,
+/// because the output went somewhere else entirely.
+///
+/// Ren'Py `.rpa` is the verified case: `renpy.rs` rewrites `file_path` to the
+/// archive for archive-sourced entries, while injection writes loose `.rpy` into
+/// `game/` or generates `zzz_locust_translate.rpy` — neither of which is a
+/// database entry.
+///
+/// Only add an extension here after confirming in that plugin's `inject` that it
+/// does NOT write back to `entry.file_path`. Wolf RPG `.wolf`, Unity `.assets`
+/// and Unreal `.pak` are byte-scan injectors that DO edit their file in place,
+/// so excluding them would break packaging for those engines.
+const SOURCE_ARCHIVE_EXTENSIONS: &[&str] = &["rpa"];
+
+fn is_source_archive(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| SOURCE_ARCHIVE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 fn cmd_patch(
@@ -283,17 +328,61 @@ fn cmd_patch(
     let db = Database::open(&project)?;
     let entries = db.get_entries(&EntryFilter::default())?;
 
-    // Distinct game files that actually received a translation.
+    // The content root is derived from the format plugin that recognizes
+    // this game — never guessed from a hardcoded, format-agnostic list.
+    let registry = locust_formats::default_registry();
+    let content_roots: &[&str] = registry
+        .detect(&game_path)
+        .map(|p| p.content_roots())
+        .unwrap_or(&[]);
+
+    // Distinct game files that actually received a translation, keyed by
+    // their game-root-relative archive path. Two different source files
+    // that would collide on that path are a hard error, never a silent
+    // drop.
     let mut files: Vec<PathBuf> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
     let mut translated = 0usize;
+    let mut source_archives: Vec<PathBuf> = Vec::new();
     for e in &entries {
         let has_text = e.translation.as_deref().is_some_and(|t| !t.trim().is_empty());
         if has_text && e.status == StringStatus::Translated {
             translated += 1;
-            let rel = rel_in_game(&e.file_path);
-            if seen.insert(rel.clone()) {
-                files.push(rel);
+            // Entries sourced from a container name the archive they were READ
+            // from, not a file injection wrote. Packing it would put the game's
+            // own original content in the patch and no translation at all.
+            if is_source_archive(&e.file_path) {
+                if !source_archives.contains(&e.file_path) {
+                    source_archives.push(e.file_path.clone());
+                }
+                continue;
+            }
+            let rel = rel_in_game(&e.file_path, &game_path, content_roots).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot determine the game-relative path for \"{}\": it is not under \
+                     the game directory \"{}\", and none of its components match a known \
+                     content root {:?} for this format. Packaging an unresolved layout \
+                     would silently discard the file, so this is refused instead.",
+                    e.file_path.display(),
+                    game_path.display(),
+                    content_roots
+                )
+            })?;
+            match seen.get(&rel) {
+                Some(existing) if existing != &e.file_path => {
+                    anyhow::bail!(
+                        "two different source files map to the same patch archive path \
+                         \"{}\": \"{}\" and \"{}\"",
+                        rel.display(),
+                        existing.display(),
+                        e.file_path.display()
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(rel.clone(), e.file_path.clone());
+                    files.push(rel);
+                }
             }
         }
     }
@@ -316,7 +405,7 @@ fn cmd_patch(
         .compression_method(zip::CompressionMethod::Deflated);
 
     let mut added = 0usize;
-    let mut missing = 0usize;
+    let mut missing_paths: Vec<PathBuf> = Vec::new();
     let mut skipped_unsafe = 0usize;
     for rel in &files {
         // Defense-in-depth: never read or pack a path that escapes the game
@@ -333,7 +422,7 @@ fn cmd_patch(
         let bytes = match std::fs::read(&src) {
             Ok(b) => b,
             Err(_) => {
-                missing += 1;
+                missing_paths.push(src);
                 continue;
             }
         };
@@ -342,6 +431,37 @@ fn cmd_patch(
         zip.start_file(name, opts)?;
         zip.write_all(&bytes)?;
         added += 1;
+    }
+    let missing = missing_paths.len();
+
+    // A patch holding nothing but the README is worse than a failure: it looks
+    // like a success and ships to end users. This guard is what makes any
+    // remaining path-resolution problem loud instead of silent.
+    if added == 0 {
+        drop(zip);
+        let _ = std::fs::remove_file(&out);
+        let shown: Vec<String> = missing_paths
+            .iter()
+            .take(5)
+            .map(|p| p.display().to_string())
+            .collect();
+        anyhow::bail!(
+            "packed 0 files, so no patch was written. {} translated file(s) were expected \
+             but not found on disk{}{}. Run `locust inject \"{}\" -P <db> --direct` first, \
+             or check that this is the same game copy the strings were extracted from.",
+            missing,
+            if shown.is_empty() {
+                String::new()
+            } else {
+                format!(":\n  {}", shown.join("\n  "))
+            },
+            if missing > shown.len() {
+                format!("\n  ... and {} more", missing - shown.len())
+            } else {
+                String::new()
+            },
+            game_path.display()
+        );
     }
 
     let readme = "rule95 translation patch\n\n\
@@ -364,7 +484,7 @@ fn cmd_patch(
     table.add_row(vec!["Patch file", &out.display().to_string()]);
     table.add_row(vec!["Files packed", &added.to_string()]);
     if missing > 0 {
-        table.add_row(vec!["Files missing (inject first?)", &missing.to_string()]);
+        table.add_row(vec!["Files not found on disk", &missing.to_string()]);
     }
     if skipped_unsafe > 0 {
         table.add_row(vec!["Skipped unsafe paths", &skipped_unsafe.to_string()]);
@@ -372,6 +492,21 @@ fn cmd_patch(
     table.add_row(vec!["Translated strings", &translated.to_string()]);
     table.add_row(vec!["Size", &format!("{:.1} KB", size as f64 / 1024.0)]);
     println!("{table}");
+
+    // Report what was actually observed (a file expected at path X was not
+    // there) rather than asserting a cause — a prior version of this
+    // message guessed "inject first?", which sent users toward a fix that
+    // could not help when the real problem was an unresolved content root.
+    if !missing_paths.is_empty() {
+        println!("\nExpected file(s) not found on disk:");
+        for p in missing_paths.iter().take(5) {
+            println!("  {}", p.display());
+        }
+        if missing_paths.len() > 5 {
+            println!("  ... and {} more", missing_paths.len() - 5);
+        }
+    }
+
     Ok(())
 }
 
@@ -1054,6 +1189,7 @@ async fn cmd_server(port: u16) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_cli_parses() {
@@ -1063,27 +1199,312 @@ mod tests {
     }
 
     #[test]
-    fn test_rel_in_game() {
+    fn test_rel_in_game_is_game_path_relative() {
         use std::path::Path;
-        // MV: www/data
+        let game = Path::new("/games/Game");
+
+        // The game-relative path is correct for every engine WITHOUT consulting
+        // content roots at all — that is the point of resolving against the game
+        // directory first.
+        for (abs, want) in [
+            ("/games/Game/www/data/Map001.json", "www/data/Map001.json"), // RPG Maker MV
+            ("/games/Game/data/System.json", "data/System.json"),         // RPG Maker MZ
+            ("/games/Game/Data/Map084.rxdata", "Data/Map084.rxdata"),     // VX Ace / XP
+            ("/games/Game/game/script.rpy", "game/script.rpy"),           // Ren'Py
+            ("/games/Game/Data/BasicData.wolf", "Data/BasicData.wolf"),   // Wolf RPG
+            ("/games/Game/story.html", "story.html"),                     // SugarCube: game root
+            ("/games/Game/scene01.json", "scene01.json"),                 // VNTextPatch: game root
+        ] {
+            assert_eq!(
+                rel_in_game(Path::new(abs), game, &[]),
+                Some(PathBuf::from(want)),
+                "{abs} should resolve relative to the game directory"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rel_in_game_falls_back_to_content_root_when_outside_game_dir() {
+        use std::path::Path;
+        // A stored path that is not under the game directory (moved game, or a
+        // differently spelled path) falls back to anchoring on a content root.
         assert_eq!(
-            rel_in_game(Path::new("/games/Game/www/data/Map001.json")),
-            PathBuf::from("www/data/Map001.json")
+            rel_in_game(
+                Path::new("/elsewhere/OldCopy/www/data/Map001.json"),
+                Path::new("/games/Game"),
+                &["www", "data"]
+            ),
+            Some(PathBuf::from("www/data/Map001.json"))
         );
-        // MZ: data
+    }
+
+    #[test]
+    fn test_rel_in_game_unresolvable_is_none_never_a_bare_filename() {
+        use std::path::Path;
+        // Neither under the game dir nor anchorable: the caller must hard-error.
+        // A bare-filename fallback here is what silently discarded directory
+        // structure and produced README-only patch archives.
         assert_eq!(
-            rel_in_game(Path::new("/games/Game/data/System.json")),
-            PathBuf::from("data/System.json")
+            rel_in_game(
+                Path::new("/weird/place/strings.txt"),
+                Path::new("/games/Game"),
+                &["www", "data"]
+            ),
+            None
         );
-        // XP/VX Ace: capital Data with binary files
+    }
+
+    #[test]
+    fn test_rel_in_game_prefers_game_dir_over_ancestor_named_like_a_root() {
+        use std::path::Path;
+        // A game living under an ancestor directory literally named `game`.
+        // Anchoring on the first matching component would pick the OUTER one and
+        // yield `game/MyVN/game/script.rpy`, which resolves nowhere.
         assert_eq!(
-            rel_in_game(Path::new("D:/juegos/LoQO/Data/Map084.rxdata")),
-            PathBuf::from("Data/Map084.rxdata")
+            rel_in_game(
+                Path::new("/game/MyVN/game/script.rpy"),
+                Path::new("/game/MyVN"),
+                &["game"]
+            ),
+            Some(PathBuf::from("game/script.rpy"))
         );
-        // No known marker: fall back to the bare file name.
-        assert_eq!(
-            rel_in_game(Path::new("/weird/place/strings.txt")),
-            PathBuf::from("strings.txt")
+    }
+
+    #[test]
+    fn test_source_archive_detection() {
+        use std::path::Path;
+        // Ren'Py rewrites file_path to the .rpa for archive-sourced entries,
+        // while injection writes loose .rpy files instead. Packing the .rpa
+        // would ship the game's original content and no translation.
+        assert!(is_source_archive(Path::new("/g/game/scripts.rpa")));
+        assert!(is_source_archive(Path::new("/g/game/SCRIPTS.RPA")));
+        // In-place byte-scan injectors write back to these, so they must remain
+        // packable.
+        assert!(!is_source_archive(Path::new("/g/Data/BasicData.wolf")));
+        assert!(!is_source_archive(Path::new("/g/G_Data/resources.assets")));
+        assert!(!is_source_archive(Path::new("/g/game/script.rpy")));
+    }
+
+    // ─── cmd_patch packaging tests (bug: content-root fallback flattens
+    // paths for every non-RPG-Maker engine, see auto-patch-apply design
+    // Decision 7) ────────────────────────────────────────────────────────
+
+    use locust_core::models::StringEntry;
+
+    fn patch_test_tempdir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("locust_patch_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_patch_packages_renpy_game_files_under_game_root() {
+        let base = patch_test_tempdir();
+        let game_dir = base.join("mygame");
+        let game_sub = game_dir.join("game");
+        fs::create_dir_all(&game_sub).unwrap();
+        let script_path = game_sub.join("script.rpy");
+        let contents = "label start:\n    \"Hola\"\n";
+        fs::write(&script_path, contents).unwrap();
+
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+        let mut entry = StringEntry::new("renpy#0", "Hello", script_path.clone());
+        entry.translation = Some("Hola".to_string());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+
+        let out_zip = base.join("out-patch.zip");
+        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None).unwrap();
+
+        let file = fs::File::open(&out_zip).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut zf = archive
+            .by_name("game/script.rpy")
+            .expect("game/script.rpy must be packed in the archive");
+        let mut read_back = String::new();
+        use std::io::Read as _;
+        zf.read_to_string(&mut read_back).unwrap();
+        assert_eq!(read_back, contents);
+    }
+
+    #[test]
+    fn test_patch_errors_instead_of_writing_a_readme_only_archive() {
+        let base = patch_test_tempdir();
+        let game_dir = base.join("mygame");
+        let game_sub = game_dir.join("game");
+        fs::create_dir_all(&game_sub).unwrap();
+
+        // The entry resolves to a sane game-relative path, but the file is not on
+        // disk (a pre-inject database, or a different copy of the game).
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+        let mut entry = StringEntry::new("renpy#0", "Hello", game_sub.join("script.rpy"));
+        entry.translation = Some("Hola".to_string());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+
+        let out_zip = base.join("out-patch.zip");
+        let err = cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None)
+            .expect_err("packing zero files must be an error, not a README-only archive");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("packed 0 files"),
+            "error must say nothing was packed, got: {msg}"
+        );
+        assert!(
+            msg.contains("script.rpy"),
+            "error must name the file it could not find, got: {msg}"
+        );
+        assert!(
+            !out_zip.exists(),
+            "no archive may be left behind when nothing was packed"
+        );
+    }
+
+    #[test]
+    fn test_patch_never_packs_a_source_archive() {
+        let base = patch_test_tempdir();
+        let game_dir = base.join("renpygame");
+        let game_sub = game_dir.join("game");
+        fs::create_dir_all(&game_sub).unwrap();
+
+        // Ren'Py rewrites file_path to the .rpa for archive-sourced entries. The
+        // archive exists on disk, so nothing stops it from being read — packing it
+        // would ship the game's original content and zero translations.
+        let rpa_path = game_sub.join("scripts.rpa");
+        fs::write(&rpa_path, b"RPA-3.0 fake original archive bytes").unwrap();
+        // A real translated file alongside it, so the run has something to pack
+        // and does not merely trip the zero-files guard.
+        let loose = game_sub.join("zzz_locust_translate.rpy");
+        fs::write(&loose, "# translations\n").unwrap();
+
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+        let mut from_rpa = StringEntry::new("scripts.rpa#0", "Hello", rpa_path.clone());
+        from_rpa.translation = Some("Hola".to_string());
+        from_rpa.status = StringStatus::Translated;
+        let mut from_loose = StringEntry::new("zzz#0", "Hi", loose.clone());
+        from_loose.translation = Some("Hola".to_string());
+        from_loose.status = StringStatus::Translated;
+        db.save_entries(&[from_rpa, from_loose]).unwrap();
+
+        let out_zip = base.join("out-patch.zip");
+        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None).unwrap();
+
+        let file = fs::File::open(&out_zip).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(".rpa")),
+            "a source archive must never be packed, got entries: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "game/zzz_locust_translate.rpy"),
+            "the actual translated file must still be packed, got entries: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_patch_packages_rpgmaker_www_data_unchanged() {
+        let base = patch_test_tempdir();
+        let game_dir = base.join("rpggame");
+        let data_dir = game_dir.join("www").join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let map_path = data_dir.join("Map001.json");
+        let contents = r#"{"displayName":"Hola"}"#;
+        fs::write(&map_path, contents).unwrap();
+
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+        let mut entry = StringEntry::new("rpg#0", "Hello", map_path.clone());
+        entry.translation = Some("Hola".to_string());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+
+        let out_zip = base.join("out-patch.zip");
+        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None).unwrap();
+
+        let file = fs::File::open(&out_zip).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut zf = archive
+            .by_name("www/data/Map001.json")
+            .expect("www/data/Map001.json must be packed in the archive");
+        let mut read_back = String::new();
+        use std::io::Read as _;
+        zf.read_to_string(&mut read_back).unwrap();
+        assert_eq!(read_back, contents);
+    }
+
+    #[test]
+    fn test_patch_errors_on_archive_path_collision_between_distinct_files() {
+        let base = patch_test_tempdir();
+        // Only used so the Ren'Py plugin is detected (content root "game");
+        // the colliding entries below point at unrelated fabricated paths.
+        let game_dir = base.join("realgame");
+        let game_sub = game_dir.join("game");
+        fs::create_dir_all(&game_sub).unwrap();
+        fs::write(game_sub.join("dummy.rpy"), "").unwrap();
+
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+
+        // Two DISTINCT source files that both reduce to the same archive
+        // path "game/script.rpy" once the "game" content-root anchor is
+        // applied — e.g. two different copies of the game contributing a
+        // same-named script.
+        let path_a = base.join("copyA").join("game").join("script.rpy");
+        let path_b = base.join("copyB").join("game").join("script.rpy");
+
+        let mut entry_a = StringEntry::new("a#0", "Hello", path_a.clone());
+        entry_a.translation = Some("Hola".to_string());
+        entry_a.status = StringStatus::Translated;
+        let mut entry_b = StringEntry::new("b#0", "World", path_b.clone());
+        entry_b.translation = Some("Mundo".to_string());
+        entry_b.status = StringStatus::Translated;
+        db.save_entries(&[entry_a, entry_b]).unwrap();
+
+        let out_zip = base.join("out-patch.zip");
+        let err = cmd_patch(game_dir, db_path, None, Some(out_zip), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&path_a.display().to_string()),
+            "error should name {}: {}",
+            path_a.display(),
+            msg
+        );
+        assert!(
+            msg.contains(&path_b.display().to_string()),
+            "error should name {}: {}",
+            path_b.display(),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_patch_errors_on_unresolvable_layout_instead_of_flattening() {
+        let base = patch_test_tempdir();
+        // A directory with no plugin-recognized layout at all.
+        let game_dir = base.join("unknown_engine_game");
+        fs::create_dir_all(&game_dir).unwrap();
+
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+        let orphan_path = base.join("somewhere").join("deep").join("strings.txt");
+        let mut entry = StringEntry::new("x#0", "Hello", orphan_path.clone());
+        entry.translation = Some("Hola".to_string());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+
+        let out_zip = base.join("out-patch.zip");
+        let err = cmd_patch(game_dir, db_path, None, Some(out_zip), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&orphan_path.display().to_string()),
+            "error should name the unresolved path: {}",
+            msg
         );
     }
 }
