@@ -8,6 +8,20 @@ use locust_core::models::{OutputMode, StringEntry};
 
 pub struct RenPyPlugin;
 
+/// Removes the RPA extraction temp directory on EVERY exit path — including
+/// each `?` between creating the directory and finishing the harvest, which
+/// previously early-returned past a manual cleanup and leaked one
+/// `locust_rpa_<uuid>` directory per failing archive per run. Mirrors the
+/// `TempFileGuard` precedent in the CLI crate; deliberately duplicated locally
+/// rather than adding a cross-crate dependency for a six-line guard.
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 impl RenPyPlugin {
     pub fn new() -> Self {
         Self
@@ -39,10 +53,16 @@ impl RenPyPlugin {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&temp_dir)?;
+        // Dropped on every exit path below, including the `?` on extract_rpa.
+        let _temp_guard = TempDirGuard(temp_dir.clone());
 
         let extracted_files = Self::extract_rpa(rpa_path, &temp_dir)?;
 
         let mut all = Vec::new();
+        // Members the harvest loop actually considers — tl/ members are
+        // extracted from the archive but deliberately skipped below, so they
+        // must not arm the "no strings were harvested" warning.
+        let mut considered = 0usize;
         for file in &extracted_files {
             // Skip tl/ directory files
             let rel_str = file
@@ -52,6 +72,7 @@ impl RenPyPlugin {
             if rel_str.starts_with("tl/") {
                 continue;
             }
+            considered += 1;
 
             // Compiled scripts: mine the pickled AST for display strings.
             // These are injected via a runtime text filter, not file edits.
@@ -90,8 +111,19 @@ impl RenPyPlugin {
             }
         }
 
-        // Cleanup temp dir
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        // Script members went through the harvest loop but not a single string
+        // came out of them. Legitimate for pure-code scripts, so no error —
+        // but it is also the symptom of a harvester regression, and staying
+        // silent here is exactly what let the index-parser bug go unnoticed.
+        // Counted over CONSIDERED members only: a translations-only archive
+        // (every member under tl/) harvests nothing by design and must not warn.
+        if considered > 0 && all.is_empty() {
+            tracing::warn!(
+                "{}: {} script member(s) considered for harvest but no strings were harvested",
+                rpa_path.display(),
+                considered
+            );
+        }
 
         Ok(all)
     }
@@ -454,8 +486,23 @@ impl RenPyPlugin {
 
         // Parse the Python pickle to extract file entries
         // We use a simplified pickle parser that handles the common RPA format
-        let index = parse_rpa_pickle(&decompressed, key)?;
+        let index = parse_rpa_pickle(&decompressed, key, &rpa_path.display().to_string())?;
 
+        // Reaching this point with zero members means the pickle parsed
+        // CLEANLY to an empty dict (a derailed parse is a hard error naming
+        // the offending opcode, above). That is what rpatool or a placeholder
+        // archive produces from `{}` — legitimately empty, but a direct
+        // `extract <file>.rpa` naming this archive can only ever yield zero
+        // strings, so it still fails loudly rather than "succeeding" with
+        // nothing. Directory scans degrade this to a warning and move on.
+        if index.is_empty() {
+            return Err(locust_core::error::LocustError::ParseError {
+                file: rpa_path.display().to_string(),
+                message: "RPA index parsed cleanly to zero members — the archive is \
+                          genuinely empty, nothing to extract"
+                    .to_string(),
+            });
+        }
 
         let mut extracted_files = Vec::new();
         for (name, offset, length) in &index {
@@ -1430,7 +1477,7 @@ fn python_escape(s: &str) -> String {
     out
 }
 
-fn parse_rpa_pickle(data: &[u8], key: i64) -> Result<Vec<(String, u64, usize)>> {
+fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u64, usize)>> {
     let mut result = Vec::new();
     let mut pos = 0;
     let len = data.len();
@@ -1526,6 +1573,15 @@ fn parse_rpa_pickle(data: &[u8], key: i64) -> Result<Vec<(String, u64, usize)>> 
                 if pos + 8 > len { break; }
                 let slen = u64::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3], data[pos+4], data[pos+5], data[pos+6], data[pos+7]]) as usize;
                 pos += 8;
+                if pos + slen > len { break; }
+                let s = String::from_utf8_lossy(&data[pos..pos+slen]).to_string();
+                pos += slen;
+                stack.push(PickleVal::Str(s));
+            }
+            0x58 => { // BINUNICODE (4-byte length + utf8) — how real RPA indexes encode filenames
+                if pos + 4 > len { break; }
+                let slen = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                pos += 4;
                 if pos + slen > len { break; }
                 let s = String::from_utf8_lossy(&data[pos..pos+slen]).to_string();
                 pos += slen;
@@ -1682,7 +1738,28 @@ fn parse_rpa_pickle(data: &[u8], key: i64) -> Result<Vec<(String, u64, usize)>> 
             0x88 => stack.push(PickleVal::Int(1)), // NEWTRUE
             0x89 => stack.push(PickleVal::Int(0)), // NEWFALSE
             0x2e => break, // STOP
-            _ => {} // Skip unknown opcodes
+            op => {
+                // Every no-argument opcode a real index emits has an explicit
+                // arm above. Anything else carries an argument of unknown
+                // width: "skipping" only the opcode byte leaves its argument
+                // bytes to be misread as opcodes, silently derailing the
+                // stream — exactly how one missing BINUNICODE arm turned a
+                // 271-member index into zero members with no diagnostic. And
+                // once at least one SETITEMS batch has been harvested, the
+                // index is non-empty, so a derail past that point would
+                // truncate the member list with no detector at all. Hard-stop
+                // and name the byte so the next such report arrives with the
+                // answer attached.
+                return Err(locust_core::error::LocustError::ParseError {
+                    file: file.to_string(),
+                    message: format!(
+                        "unsupported pickle opcode {op:#04x} at index byte offset {} — \
+                         refusing to skip it: its argument width is unknown, so the \
+                         stream cannot be re-synchronized",
+                        pos - 1
+                    ),
+                });
+            }
         }
     }
 

@@ -8,56 +8,124 @@
 /// Extracts, assigns a translation to every entry, injects, then checks
 /// whether the loose file's translation actually made it to disk.
 use std::fs;
-use std::path::Path;
 
 use locust_core::extraction::FormatPlugin;
 use locust_core::models::StringEntry;
 use locust_formats::renpy::RenPyPlugin;
 
-/// Hand-build a minimal RPA-3.0 archive (no obfuscation key) containing the
-/// given (filename, content) pairs, based on the format documented and read
-/// by `RenPyPlugin::extract_rpa` / `parse_rpa_pickle`:
+/// The RPA-3.0 obfuscation key real Ren'Py builds ship with.
+const RPA_KEY: i64 = 0x42424242;
+
+/// BINPUT below memo index 256, LONG_BINPUT above — exactly what a real index
+/// does once it holds more than ~85 members. Returns the memo index used.
+fn emit_put(pickle: &mut Vec<u8>, memo: &mut u32) -> u32 {
+    let idx = *memo;
+    *memo += 1;
+    if idx < 256 {
+        pickle.push(0x71); // BINPUT
+        pickle.push(idx as u8);
+    } else {
+        pickle.push(0x72); // LONG_BINPUT
+        pickle.extend_from_slice(&idx.to_le_bytes());
+    }
+    idx
+}
+
+/// Python's LONG1: 1-byte length + minimal little-endian two's-complement,
+/// `n = bit_length() // 8 + 1`. Fixture values are always non-negative
+/// (offset/length XORed with the key).
+fn emit_long1(pickle: &mut Vec<u8>, v: i64) {
+    assert!(v >= 0, "fixture LONG1 values are always non-negative");
+    pickle.push(0x8a);
+    if v == 0 {
+        pickle.push(0);
+        return;
+    }
+    let bit_length = 64 - (v as u64).leading_zeros();
+    let n = (bit_length / 8 + 1) as usize;
+    pickle.push(n as u8);
+    pickle.extend_from_slice(&v.to_le_bytes()[..n]);
+}
+
+/// Hand-build an RPA-3.0 archive whose index uses the SAME pickle opcodes a
+/// shipped Ren'Py game emits (verified opcode-for-opcode against a real
+/// 271-member scripts.rpa — see docs/vn-tools/make_real_rpa.py):
+///
 ///   header: "RPA-3.0 <hex index_offset> <hex key>\n"
 ///   body:   raw concatenated file contents
-///   index:  zlib-compressed pickle of { filename: [(offset, length, prefix="")] }
+///   index:  zlib-compressed pickle of { filename: [(offset^key, length^key, prefix="")] }
+///
+///   PROTO 2 · EMPTY_DICT · put · MARK
+///   per member: BINUNICODE(name) · put · EMPTY_LIST · put ·
+///               LONG1(offset^key) · BININT(length^key) ·
+///               (SHORT_BINSTRING("") + put ONCE, BINGET thereafter) ·
+///               TUPLE3 · APPEND
+///   SETITEMS · STOP
+///
+/// The previous fixture used SHORT_BINUNICODE + TUPLE2 + SETITEM with key 0 —
+/// a shape no shipped game produces — which is exactly how the parser passed
+/// its tests while reading zero members out of every real archive.
 fn build_rpa(files: &[(&str, &[u8])]) -> Vec<u8> {
     // Placeholder header to get a stable length: 16 hex digits for the offset,
-    // key fixed to "0" (no obfuscation) — both stay the same length once we
-    // substitute the real offset later.
-    let header_len = format!("RPA-3.0 {:016x} {:x}\n", 0u64, 0u32).len();
+    // 8 for the key — both stay the same length once the real values go in.
+    let header_len = format!("RPA-3.0 {:016x} {:08x}\n", 0u64, 0u32).len();
 
     let mut body = Vec::new();
-    let mut index_entries: Vec<(String, u64, usize)> = Vec::new();
-    let mut pos = header_len as u64;
+    let mut index_entries: Vec<(String, i64, i64)> = Vec::new();
+    let mut pos = header_len as i64;
     for (name, content) in files {
-        index_entries.push((name.to_string(), pos, content.len()));
+        index_entries.push((name.to_string(), pos, content.len() as i64));
         body.extend_from_slice(content);
-        pos += content.len() as u64;
+        pos += content.len() as i64;
     }
     let index_offset = pos;
 
-    // Build the pickle: PROTO 2, EMPTY_DICT, then per file:
-    //   SHORT_BINUNICODE(key) EMPTY_LIST BININT(offset) BININT(length) TUPLE2 APPEND SETITEM
-    let mut pickle: Vec<u8> = vec![0x80, 0x02, 0x7d]; // PROTO 2, EMPTY_DICT
+    let mut pickle: Vec<u8> = vec![0x80, 0x02]; // PROTO 2
+    let mut memo: u32 = 0;
+    pickle.push(0x7d); // EMPTY_DICT
+    emit_put(&mut pickle, &mut memo);
+    pickle.push(0x28); // MARK
+
+    // A real index writes the empty prefix string ONCE and fetches it from the
+    // memo for every later member — that is where its BINGETs go.
+    let mut prefix_memo: Option<u32> = None;
     for (name, offset, length) in &index_entries {
-        pickle.push(0x8c); // SHORT_BINUNICODE
-        pickle.push(name.len() as u8);
+        pickle.push(0x58); // BINUNICODE — real indexes use the 4-byte form
+        pickle.extend_from_slice(&(name.len() as u32).to_le_bytes());
         pickle.extend_from_slice(name.as_bytes());
+        emit_put(&mut pickle, &mut memo);
 
         pickle.push(0x5d); // EMPTY_LIST
+        emit_put(&mut pickle, &mut memo);
+
+        emit_long1(&mut pickle, offset ^ RPA_KEY);
         pickle.push(0x4a); // BININT
-        pickle.extend_from_slice(&(*offset as i32).to_le_bytes());
-        pickle.push(0x4a); // BININT
-        pickle.extend_from_slice(&(*length as i32).to_le_bytes());
-        pickle.push(0x86); // TUPLE2
+        pickle.extend_from_slice(&((length ^ RPA_KEY) as i32).to_le_bytes());
+
+        match prefix_memo {
+            None => {
+                pickle.push(0x55); // SHORT_BINSTRING — the empty prefix
+                pickle.push(0);
+                prefix_memo = Some(emit_put(&mut pickle, &mut memo));
+            }
+            Some(idx) if idx < 256 => {
+                pickle.push(0x68); // BINGET
+                pickle.push(idx as u8);
+            }
+            Some(idx) => {
+                pickle.push(0x6a); // LONG_BINGET
+                pickle.extend_from_slice(&idx.to_le_bytes());
+            }
+        }
+        pickle.push(0x87); // TUPLE3
         pickle.push(0x61); // APPEND
-        pickle.push(0x73); // SETITEM
     }
+    pickle.push(0x75); // SETITEMS
     pickle.push(0x2e); // STOP
 
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&pickle, 6);
 
-    let header = format!("RPA-3.0 {:016x} {:x}\n", index_offset, 0u32);
+    let header = format!("RPA-3.0 {:016x} {:08x}\n", index_offset, RPA_KEY as u32);
     assert_eq!(header.len(), header_len, "header length must match placeholder");
 
     let mut out = Vec::new();
@@ -437,5 +505,417 @@ fn test_stale_filter_removal_warning_reaches_caller_in_mixed_batch() {
     assert!(
         on_disk.contains("[ES] Hello there!"),
         "a non-fatal stale-removal failure must not prevent loose translations"
+    );
+}
+
+/// Walk the fixture's decompressed index pickle and collect the SET of opcodes
+/// it emits. Panics on any opcode outside the 15 a real archive uses, so the
+/// fixture can never silently drift back to an unrepresentative shape.
+fn index_opcode_set(rpa: &[u8]) -> std::collections::BTreeSet<u8> {
+    let newline = rpa.iter().position(|&b| b == b'\n').expect("no header line");
+    let header = std::str::from_utf8(&rpa[..newline]).expect("header not utf-8");
+    let mut parts = header.split_whitespace();
+    parts.next(); // "RPA-3.0"
+    let index_offset =
+        usize::from_str_radix(parts.next().expect("no index offset"), 16).expect("bad offset");
+    let pickle = miniz_oxide::inflate::decompress_to_vec_zlib(&rpa[index_offset..])
+        .expect("index must decompress");
+
+    let mut ops = std::collections::BTreeSet::new();
+    let mut i = 0usize;
+    while i < pickle.len() {
+        let op = pickle[i];
+        i += 1;
+        ops.insert(op);
+        match op {
+            0x80 | 0x71 | 0x68 => i += 1, // PROTO / BINPUT / BINGET
+            0x72 | 0x6a | 0x4a => i += 4, // LONG_BINPUT / LONG_BINGET / BININT
+            0x58 => {
+                // BINUNICODE: u32 length + utf8
+                let n = u32::from_le_bytes(pickle[i..i + 4].try_into().unwrap()) as usize;
+                i += 4 + n;
+            }
+            0x55 | 0x8a => {
+                // SHORT_BINSTRING / LONG1: u8 length + payload
+                let n = pickle[i] as usize;
+                i += 1 + n;
+            }
+            0x7d | 0x28 | 0x5d | 0x87 | 0x61 | 0x75 => {} // no argument
+            0x2e => break,                                // STOP
+            other => panic!(
+                "fixture emitted opcode {other:#04x}, which the real archive's index never uses"
+            ),
+        }
+    }
+    ops
+}
+
+/// The fixture must emit exactly the 15 opcodes measured on a real shipped
+/// archive's index (Area69 scripts.rpa, protocol 2) — nothing more, nothing
+/// less. Encoders switch encodings by size, so structural resemblance is not
+/// enough: the opcode histogram is what decides representativeness.
+#[test]
+fn test_fixture_index_opcode_set_matches_real_archive() {
+    // 152 members: enough for the memo index to pass 255 (LONG_BINPUT) and for
+    // the shared empty prefix to be fetched via BINGET — two details that only
+    // appear at scale and that a two-entry fixture silently misses.
+    let contents: Vec<(String, Vec<u8>)> = (0..152)
+        .map(|i| {
+            (
+                format!("kNPCs/npc_{i:03}.rpy"),
+                format!("label npc_{i:03}:\n    e \"NPC {i:03} says something unique.\"\n")
+                    .into_bytes(),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, &[u8])> =
+        contents.iter().map(|(n, c)| (n.as_str(), c.as_slice())).collect();
+    let rpa_bytes = build_rpa(&files);
+
+    let expected: std::collections::BTreeSet<u8> = [
+        0x80, // PROTO
+        0x7d, // EMPTY_DICT
+        0x71, // BINPUT
+        0x72, // LONG_BINPUT
+        0x28, // MARK
+        0x58, // BINUNICODE
+        0x5d, // EMPTY_LIST
+        0x8a, // LONG1
+        0x4a, // BININT
+        0x55, // SHORT_BINSTRING
+        0x68, // BINGET
+        0x87, // TUPLE3
+        0x61, // APPEND
+        0x75, // SETITEMS
+        0x2e, // STOP
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        index_opcode_set(&rpa_bytes),
+        expected,
+        "fixture index must use exactly the opcode set a real archive emits"
+    );
+}
+
+/// Regression test for the field failure: a real-shaped index (BINUNICODE
+/// filenames, LONG1 offsets, memoized prefix, SETITEMS batch) at a scale where
+/// LONG_BINPUT and BINGET appear must have EVERY member extracted, each entry
+/// carrying the .rpa as its file_path.
+#[test]
+fn test_real_shape_152_member_archive_extracts_every_member() {
+    let dir = std::env::temp_dir().join(format!("locust_renpy_scale_{}", uuid::Uuid::new_v4()));
+    let game_dir = dir.join("game");
+    fs::create_dir_all(&game_dir).unwrap();
+
+    let contents: Vec<(String, Vec<u8>)> = (0..152)
+        .map(|i| {
+            (
+                format!("kNPCs/npc_{i:03}.rpy"),
+                format!("label npc_{i:03}:\n    e \"NPC {i:03} says something unique.\"\n")
+                    .into_bytes(),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, &[u8])> =
+        contents.iter().map(|(n, c)| (n.as_str(), c.as_slice())).collect();
+    let rpa_path = game_dir.join("scripts.rpa");
+    fs::write(&rpa_path, build_rpa(&files)).unwrap();
+
+    let plugin = RenPyPlugin::new();
+    let entries = plugin.extract(&rpa_path).expect("extract failed");
+
+    for i in 0..152 {
+        let needle = format!("NPC {i:03} says something unique.");
+        assert!(
+            entries.iter().any(|e| e.source == needle),
+            "member {i} dialogue missing — index not fully parsed (got {} entries)",
+            entries.len()
+        );
+    }
+    assert!(
+        entries.iter().all(|e| e.file_path == rpa_path),
+        "every archive entry must carry the .rpa as its file_path"
+    );
+}
+
+/// Build a complete RPA-3.0 archive around an arbitrary raw index pickle.
+/// `body` is the concatenated member contents (may be empty for a memberless
+/// index); the index offset in the header points just past it.
+fn wrap_index_pickle(pickle: &[u8], body: &[u8]) -> Vec<u8> {
+    let header_len = format!("RPA-3.0 {:016x} {:08x}\n", 0u64, 0u32).len();
+    let index_offset = header_len + body.len();
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(pickle, 6);
+    let header = format!("RPA-3.0 {:016x} {:08x}\n", index_offset as u64, RPA_KEY as u32);
+    assert_eq!(header.len(), header_len, "header length must match placeholder");
+    let mut out = header.into_bytes();
+    out.extend_from_slice(body);
+    out.extend_from_slice(&compressed);
+    out
+}
+
+/// A structurally valid archive whose index is a genuinely EMPTY dict —
+/// `PROTO · EMPTY_DICT · STOP`, exactly what rpatool or a placeholder archive
+/// produces from `{}`. Direct extraction of a named .rpa that can only ever
+/// yield zero strings must still fail loudly (directory scans degrade this to
+/// a warning) — but since the parse was CLEAN, the message must say the
+/// archive is empty, not blame unsupported opcodes: a derailed parse is now a
+/// hard error of its own that names the offending opcode.
+#[test]
+fn test_index_with_zero_members_is_a_loud_error_not_empty_success() {
+    let dir = std::env::temp_dir().join(format!("locust_renpy_empty_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+
+    let pickle: Vec<u8> = vec![0x80, 0x02, 0x7d, 0x2e]; // PROTO 2 · EMPTY_DICT · STOP
+    let rpa_path = dir.join("scripts.rpa");
+    fs::write(&rpa_path, wrap_index_pickle(&pickle, b"")).unwrap();
+
+    let plugin = RenPyPlugin::new();
+    let err = plugin
+        .extract(&rpa_path)
+        .expect_err("a memberless index must be reported loudly, not returned as zero strings");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("zero members"),
+        "the error must say the index parsed to zero members, got: {msg}"
+    );
+    assert!(
+        !msg.contains("does not support"),
+        "a cleanly parsed empty index must not claim unsupported opcodes — that \
+         diagnosis is false for this input, got: {msg}"
+    );
+}
+
+/// An unknown ARGUMENTED opcode mid-index must be a hard stop naming the byte
+/// in hex and its offset — never a silent skip. The killer scenario: at least
+/// one SETITEMS batch was already harvested when the unknown opcode arrives,
+/// so the index is non-empty, the memberless guard can never fire, and a skip
+/// would silently drop every remaining member — the same silent-truncation
+/// class the BINUNICODE fix exists to kill, previously detectable only in its
+/// total form. The fixture uses the exact member shape a shipped archive emits
+/// (see build_rpa) poisoned with BINFLOAT (0x47) — a REAL protocol-2 opcode
+/// this parser has no arm for, which is precisely the class of input (real
+/// opcode, missing arm) that caused the original field failure.
+#[test]
+fn test_unknown_argumented_opcode_after_harvested_members_is_a_hard_error() {
+    let dir = std::env::temp_dir().join(format!("locust_renpy_derail_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+
+    let header_len = format!("RPA-3.0 {:016x} {:08x}\n", 0u64, 0u32).len();
+    let member_a = b"label a:\n    e \"From member a.\"\n";
+    let member_b = b"label b:\n    e \"From member b.\"\n";
+    let a_off = header_len as i64;
+    let b_off = a_off + member_a.len() as i64;
+    let mut body = member_a.to_vec();
+    body.extend_from_slice(member_b);
+
+    // Same opcode-for-opcode member emission as build_rpa, but with each member
+    // committed by its OWN MARK + SETITEMS batch so member a is already in the
+    // index when the poison opcode appears inside member b's batch.
+    fn emit_member(pickle: &mut Vec<u8>, memo: &mut u32, name: &str, off: i64, len: i64) {
+        pickle.push(0x28); // MARK
+        pickle.push(0x58); // BINUNICODE
+        pickle.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        pickle.extend_from_slice(name.as_bytes());
+        emit_put(pickle, memo);
+        pickle.push(0x5d); // EMPTY_LIST
+        emit_put(pickle, memo);
+        emit_long1(pickle, off ^ RPA_KEY);
+        pickle.push(0x4a); // BININT
+        pickle.extend_from_slice(&((len ^ RPA_KEY) as i32).to_le_bytes());
+        pickle.push(0x55); // SHORT_BINSTRING — the empty prefix
+        pickle.push(0);
+        emit_put(pickle, memo);
+        pickle.push(0x87); // TUPLE3
+        pickle.push(0x61); // APPEND
+    }
+
+    let mut pickle: Vec<u8> = vec![0x80, 0x02, 0x7d]; // PROTO 2 · EMPTY_DICT
+    let mut memo: u32 = 0;
+    emit_put(&mut pickle, &mut memo);
+
+    emit_member(&mut pickle, &mut memo, "a.rpy", a_off, member_a.len() as i64);
+    pickle.push(0x75); // SETITEMS — member a is harvested; the index is non-empty
+
+    emit_member(&mut pickle, &mut memo, "b.rpy", b_off, member_b.len() as i64);
+    // BINFLOAT: opcode byte + 8-byte big-endian float argument. Skipping only
+    // the opcode byte would feed those 8 argument bytes back into the opcode
+    // loop and derail the stream past member b.
+    let poison_offset = pickle.len();
+    pickle.push(0x47);
+    pickle.extend_from_slice(&1.0f64.to_be_bytes());
+    pickle.push(0x75); // SETITEMS
+    pickle.push(0x2e); // STOP
+
+    let rpa_path = dir.join("scripts.rpa");
+    fs::write(&rpa_path, wrap_index_pickle(&pickle, &body)).unwrap();
+
+    let plugin = RenPyPlugin::new();
+    let err = plugin.extract(&rpa_path).expect_err(
+        "an unknown argumented opcode mid-index must be a hard error, \
+         not a silently truncated member list",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("0x47"),
+        "the error must name the offending opcode in hex, got: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("offset {poison_offset}")),
+        "the error must name the byte offset ({poison_offset}) of the opcode, got: {msg}"
+    );
+}
+
+/// A failing archive must not leak its extraction temp directory. The temp dir
+/// is created BEFORE the archive is read, and every `?` between creation and
+/// the end-of-function cleanup previously early-returned past it — one leaked
+/// `locust_rpa_<uuid>` per failing archive per run. A Drop guard must cover
+/// every exit path.
+#[test]
+fn test_failing_archive_extraction_leaks_no_temp_directory() {
+    let dir = std::env::temp_dir().join(format!("locust_renpy_leak_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+
+    // Memberless index: parses cleanly to zero members, so extraction errors
+    // AFTER the temp dir has been created — the exact leaking path.
+    let pickle: Vec<u8> = vec![0x80, 0x02, 0x7d, 0x2e]; // PROTO 2 · EMPTY_DICT · STOP
+    let rpa_path = dir.join("scripts.rpa");
+    fs::write(&rpa_path, wrap_index_pickle(&pickle, b"")).unwrap();
+
+    let temp_root = std::env::temp_dir();
+    let rpa_dirs = || -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(&temp_root)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("locust_rpa_"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let before = rpa_dirs();
+
+    let plugin = RenPyPlugin::new();
+    plugin
+        .extract(&rpa_path)
+        .expect_err("a memberless archive must error (see the zero-members test)");
+
+    // Concurrent tests in this binary create their own locust_rpa_ dirs and
+    // remove them within milliseconds; a leak from OUR failed call never
+    // disappears. Poll so transients settle, then require zero new dirs.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut leaked: Vec<String>;
+    loop {
+        leaked = rpa_dirs().difference(&before).cloned().collect();
+        if leaked.is_empty() || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        leaked.is_empty(),
+        "failed archive extraction leaked temp dir(s) in {}: {leaked:?}",
+        temp_root.display()
+    );
+}
+
+/// Shared writer that captures tracing output so a test can assert on it.
+#[derive(Clone, Default)]
+struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogBuffer {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = LogBuffer;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The other half of the loud-failure contract: script members WERE extracted
+/// from the archive but zero strings came out of them. That can be legitimate
+/// (an archive of pure-code scripts) so it must not abort — but it must warn,
+/// because it is also the symptom of a harvester regression.
+#[test]
+fn test_script_members_without_harvestable_strings_warn_instead_of_silence() {
+    let dir = std::env::temp_dir().join(format!("locust_renpy_nostr_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+
+    let script = b"# configuration only, nothing translatable\n$ flag = True\n";
+    let rpa_path = dir.join("scripts.rpa");
+    fs::write(&rpa_path, build_rpa(&[("script.rpy", script)])).unwrap();
+
+    let buf = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+
+    let plugin = RenPyPlugin::new();
+    let entries = tracing::subscriber::with_default(subscriber, || {
+        plugin.extract(&rpa_path).expect("extract failed")
+    });
+
+    assert!(
+        entries.is_empty(),
+        "precondition: this archive's scripts contain nothing translatable"
+    );
+    let logs = buf.contents();
+    assert!(
+        logs.contains("no strings were harvested"),
+        "extracting script members without harvesting a single string must warn, got logs: {logs:?}"
+    );
+}
+
+/// The inverse guard: a translations-only archive (every member under tl/) is a
+/// state real games ship in, and the harvest loop DELIBERATELY skips tl/
+/// members. Counting them toward "members extracted but no strings harvested"
+/// made every such archive warn spuriously. Only members the harvester actually
+/// considers may arm the warning.
+#[test]
+fn test_translations_only_archive_does_not_warn_about_no_strings() {
+    let dir = std::env::temp_dir().join(format!("locust_renpy_tlonly_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+
+    let tl_script = b"translate spanish start_x1:\n    e \"Hola desde tl!\"\n";
+    let rpa_path = dir.join("scripts.rpa");
+    fs::write(&rpa_path, build_rpa(&[("tl/spanish/script.rpy", tl_script)])).unwrap();
+
+    let buf = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+
+    let plugin = RenPyPlugin::new();
+    let entries = tracing::subscriber::with_default(subscriber, || {
+        plugin.extract(&rpa_path).expect("extract failed")
+    });
+
+    assert!(
+        entries.is_empty(),
+        "precondition: tl/ members are deliberately not harvested"
+    );
+    let logs = buf.contents();
+    assert!(
+        !logs.contains("no strings were harvested"),
+        "a translations-only archive is legitimate and must not trigger the \
+         no-strings warning, got logs: {logs:?}"
     );
 }
