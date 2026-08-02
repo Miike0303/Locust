@@ -32,6 +32,33 @@ pub enum LocustError {
     #[error("backup error: {0}")]
     BackupError(String),
 
+    #[error("patch verification failed: {0}")]
+    PatchVerificationFailed(String),
+
+    #[error("patch downgrade blocked: installed {installed}, incoming {incoming}")]
+    PatchDowngradeBlocked { installed: String, incoming: String },
+
+    #[error("unsafe zip entry: {0}")]
+    PatchUnsafeEntry(String),
+
+    #[error("legacy patch requires explicit confirmation: {0}")]
+    PatchLegacyUnconfirmed(String),
+
+    #[error("patch already applied: {0}")]
+    PatchAlreadyApplied(String),
+
+    #[error("patch apply interrupted — run rollback first: {0}")]
+    PatchInterrupted(String),
+
+    #[error("game directory not writable: {0}")]
+    GameDirNotWritable(String),
+
+    #[error("patch backup incomplete: {0}")]
+    PatchBackupIncomplete(String),
+
+    #[error("patch error: {0}")]
+    PatchError(String),
+
     #[error("database error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
 

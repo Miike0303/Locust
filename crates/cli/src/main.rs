@@ -10,7 +10,6 @@ use locust_core::backup::BackupManager;
 use locust_core::config::AppConfig;
 use locust_core::database::{Database, EntryFilter};
 use locust_core::export;
-use locust_core::extraction::FormatRegistry;
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringStatus};
 use locust_core::translation::{TranslationManager, TranslationOptions};
@@ -110,6 +109,39 @@ enum Commands {
         /// Also write an Astro content stub (.md) for rule95 to this path
         #[arg(long)]
         astro: Option<PathBuf>,
+        /// Optional pristine (pre-inject) game tree used to fill original_sha256
+        /// in the patch manifest. Enables strict-tier verification on apply.
+        /// Resolution order when omitted: <game>/.locust/backup/ if valid → none.
+        #[arg(long)]
+        pristine: Option<PathBuf>,
+    },
+    /// Apply a patch zip to a game folder (verify → backup → write → receipt)
+    Apply {
+        /// Game root to patch
+        game_path: PathBuf,
+        /// Patch zip produced by `locust patch` (or a legacy zip)
+        zip: PathBuf,
+        /// Override verification blocks (mismatch, already-applied, unknown, downgrade)
+        #[arg(long)]
+        force: bool,
+        /// Accept legacy zips without locust-patch.json, and structural-tier
+        /// patches that lack original hashes
+        #[arg(long)]
+        confirm_legacy: bool,
+        /// Plan only — no files written
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Roll a game back to the pre-apply state stored in .locust/backup/
+    PatchRollback {
+        game_path: PathBuf,
+        /// Delete user-edited patch-added files without confirmation
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show whether a game has a Locust patch applied
+    PatchStatus {
+        game_path: PathBuf,
     },
     /// Authenticate with a provider via OAuth (currently: grok)
     Auth {
@@ -239,7 +271,17 @@ async fn main() -> anyhow::Result<()> {
             lang,
             output,
             astro,
-        } => cmd_patch(game_path, project, lang, output, astro)?,
+            pristine,
+        } => cmd_patch(game_path, project, lang, output, astro, pristine)?,
+        Commands::Apply {
+            game_path,
+            zip,
+            force,
+            confirm_legacy,
+            dry_run,
+        } => cmd_apply(game_path, zip, force, confirm_legacy, dry_run)?,
+        Commands::PatchRollback { game_path, force } => cmd_patch_rollback(game_path, force)?,
+        Commands::PatchStatus { game_path } => cmd_patch_status(game_path)?,
         Commands::Auth { provider } => cmd_auth(provider).await?,
         Commands::Providers => cmd_providers(&config)?,
         Commands::Formats => cmd_formats()?,
@@ -487,8 +529,11 @@ fn cmd_patch(
     lang: Option<String>,
     output: Option<PathBuf>,
     astro: Option<PathBuf>,
+    pristine: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use locust_core::database::{paths_identical, sha256_hex};
+    use locust_core::patch::manifest::{PatchFileEntry, PatchManifest};
+    use locust_core::patch::PatchStore;
     use std::io::Write as _;
 
     let db = Database::open(&project)?;
@@ -698,9 +743,31 @@ fn cmd_patch(
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
+    // Resolve pristine source for original_sha256 (strict-tier apply).
+    let pristine_root: Option<PathBuf> = if let Some(p) = pristine {
+        if !p.is_dir() {
+            anyhow::bail!("--pristine path is not a directory: {}", p.display());
+        }
+        Some(p)
+    } else {
+        let store = PatchStore::new(&game_path);
+        if store.backup_manifest_valid() {
+            Some(store.backup_files_dir())
+        } else {
+            None
+        }
+    };
+    if pristine_root.is_none() {
+        println!(
+            "note: packing without original hashes (no --pristine, no .locust/backup). \
+             Apply will use structural verification."
+        );
+    }
+
     let mut added = 0usize;
     let mut missing: Vec<PathBuf> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
+    let mut manifest_files: Vec<PatchFileEntry> = Vec::new();
     for f in &recording.files {
         let rel = std::path::Path::new(&f.rel);
         // Zip-slip defense in depth: record time cannot emit anything but
@@ -736,6 +803,16 @@ fn cmd_patch(
             changed.push(f.rel.clone());
             continue;
         }
+        let original_sha256 = pristine_root.as_ref().and_then(|root| {
+            let src = root.join(rel.components().collect::<PathBuf>());
+            std::fs::read(&src).ok().map(|b| sha256_hex(&b))
+        });
+        manifest_files.push(PatchFileEntry {
+            path: f.rel.clone(),
+            patched_sha256: f.hash.clone(),
+            size: f.size,
+            original_sha256,
+        });
         zip.start_file(f.rel.clone(), opts)?;
         zip.write_all(&bytes)?;
         added += 1;
@@ -779,9 +856,32 @@ fn cmd_patch(
         );
     }
 
-    let readme = "rule95 translation patch\n\n\
-        Apply: extract this archive over your game folder, replacing the files\n\
-        when asked. Back up your game folder first.\n\n\
+    // Emit locust-patch.json so `locust apply` can verify and journal.
+    let engine = detect_engine_label(&game_path);
+    let patch_manifest = PatchManifest {
+        schema_version: PatchManifest::SCHEMA_VERSION,
+        patch_id: uuid::Uuid::new_v4().to_string(),
+        game_name: game_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "game".into()),
+        engine,
+        language: lang
+            .clone()
+            .or(recording.lang.clone())
+            .unwrap_or_else(|| "unknown".into()),
+        patch_version: "1.0.0".into(),
+        generator_version: env!("CARGO_PKG_VERSION").into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        files: manifest_files,
+    };
+    zip.start_file(PatchManifest::FILENAME, opts)?;
+    zip.write_all(serde_json::to_string_pretty(&patch_manifest)?.as_bytes())?;
+
+    let readme = "rule95 / Locust translation patch\n\n\
+        Preferred apply:  locust apply <game> <this.zip>\n\
+        Manual apply:     extract over your game folder, replacing files.\n\
+        Back up your game folder first (locust apply does this for you).\n\n\
         This patch contains translated text only. Get the game itself from the\n\
         original creator.\n";
     zip.start_file("README.txt", opts)?;
@@ -861,6 +961,136 @@ fn write_astro_stub(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, md)?;
+    Ok(())
+}
+
+fn detect_engine_label(game_path: &std::path::Path) -> String {
+    let registry = locust_formats::default_registry();
+    registry
+        .detect(game_path)
+        .map(|p| p.id().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn cmd_apply(
+    game_path: PathBuf,
+    zip: PathBuf,
+    force: bool,
+    confirm_legacy: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use locust_core::patch::{apply, ApplyOptions};
+
+    if !game_path.is_dir() {
+        anyhow::bail!("game path is not a directory: {}", game_path.display());
+    }
+    if !zip.is_file() {
+        anyhow::bail!("patch zip not found: {}", zip.display());
+    }
+
+    let opts = ApplyOptions {
+        force,
+        confirm_legacy,
+        dry_run,
+    };
+    let report = apply(&game_path, &zip, opts, |p| {
+        println!("[{}/{}] {} ({})", p.current, p.total, p.path, p.phase);
+    })?;
+
+    if !report.user_edits_overwritten.is_empty() {
+        println!(
+            "warning: overwriting {} user-edited added file(s):",
+            report.user_edits_overwritten.len()
+        );
+        for p in &report.user_edits_overwritten {
+            println!("  {p}");
+        }
+    }
+    for m in &report.messages {
+        println!("{m}");
+    }
+    println!(
+        "patch {}@{} {} — replaced {}, added {} (baseline: {:?})",
+        report.patch_id,
+        report.patch_version,
+        if report.dry_run { "planned" } else { "applied" },
+        report.replaced,
+        report.added,
+        report.baseline
+    );
+    Ok(())
+}
+
+fn cmd_patch_rollback(game_path: PathBuf, force: bool) -> anyhow::Result<()> {
+    use locust_core::patch::{rollback, RollbackOptions};
+
+    if !game_path.is_dir() {
+        anyhow::bail!("game path is not a directory: {}", game_path.display());
+    }
+    let report = rollback(
+        &game_path,
+        RollbackOptions {
+            delete_modified_added: force,
+        },
+    )?;
+    if !report.aborted_edited.is_empty() {
+        println!("rollback aborted — edited added files need --force:");
+        for p in &report.aborted_edited {
+            println!("  {p}");
+        }
+        return Ok(());
+    }
+    for m in &report.messages {
+        println!("{m}");
+    }
+    if !report.torn_deleted.is_empty() {
+        println!("torn files deleted (interrupted apply):");
+        for p in &report.torn_deleted {
+            println!("  {p}");
+        }
+    }
+    println!(
+        "rollback complete — restored {}, deleted {}",
+        report.restored, report.deleted
+    );
+    Ok(())
+}
+
+fn cmd_patch_status(game_path: PathBuf) -> anyhow::Result<()> {
+    use locust_core::patch::{PatchStatus, PatchStore};
+
+    if !game_path.is_dir() {
+        anyhow::bail!("game path is not a directory: {}", game_path.display());
+    }
+    let store = PatchStore::new(&game_path);
+    match store.status()? {
+        PatchStatus::NotPatched => println!("not patched"),
+        PatchStatus::Patched(r) => {
+            println!(
+                "patched: {}@{} (engine {}, lang {}, baseline {:?}, forced={})",
+                r.patch_id, r.patch_version, r.engine, r.language, r.baseline, r.forced
+            );
+            println!(
+                "  replaced {} file(s), added {} file(s), applied_at {}",
+                r.replaced.len(),
+                r.added.len(),
+                r.applied_at
+            );
+        }
+        PatchStatus::Interrupted(j) => {
+            println!(
+                "INTERRUPTED apply of {} — run `locust patch-rollback \"{}\"`",
+                j.patch_id,
+                game_path.display()
+            );
+        }
+        PatchStatus::Unknown => {
+            println!(
+                "unknown — .locust/ present but no usable receipt (run patch-status after apply, \
+                 or patch-rollback if a backup exists)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1683,7 +1913,7 @@ mod tests {
         drop(db);
 
         let out_zip = base.join("out-patch.zip");
-        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None).unwrap();
+        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None, None).unwrap();
 
         let file = fs::File::open(&out_zip).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -1710,7 +1940,7 @@ mod tests {
 
         let respelled = base.join("MYGAME");
         let out_zip = base.join("out-patch.zip");
-        cmd_patch(respelled, db_path, None, Some(out_zip.clone()), None)
+        cmd_patch(respelled, db_path, None, Some(out_zip.clone()), None, None)
             .expect("a case-divergent spelling of the recorded root must still pack");
 
         let file = fs::File::open(&out_zip).unwrap();
@@ -1744,7 +1974,7 @@ mod tests {
         drop(db);
 
         let out_zip = base.join("out-patch.zip");
-        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None)
+        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None, None)
             .expect("an all-archive database with recorded injection output must pack");
 
         let file = fs::File::open(&out_zip).unwrap();
@@ -1783,7 +2013,7 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-        )
+            None)
         .expect_err("no recording must be a hard error, never an entry-derived guess");
         let msg = err.to_string();
         assert!(
@@ -1821,7 +2051,7 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip),
             None,
-        )
+            None)
         .expect_err("a language with no recording must be a hard error");
         let msg = err.to_string();
         assert!(
@@ -1857,7 +2087,7 @@ mod tests {
             None,
             Some(out_zip.clone()),
             None,
-        )
+            None)
         .expect("the language-unspecified recording must pack without -l");
         assert!(out_zip.exists());
 
@@ -1867,7 +2097,7 @@ mod tests {
             Some("es".to_string()),
             Some(base.join("other.zip")),
             None,
-        )
+            None)
         .expect_err("a named language must never silently match the unspecified key");
         let msg = err.to_string();
         assert!(
@@ -1900,7 +2130,7 @@ mod tests {
             None,
             Some(out_zip.clone()),
             None,
-        )
+            None)
         .expect_err("multiple keys without -l must be a hard error, not a guess");
         let msg = err.to_string();
         assert!(msg.contains("es"), "error must list the named key: {msg}");
@@ -1920,7 +2150,7 @@ mod tests {
         assert!(!out_zip.exists());
 
         // The advised choice unblocks.
-        cmd_patch(game_dir, db_path, Some("es".to_string()), Some(out_zip.clone()), None)
+        cmd_patch(game_dir, db_path, Some("es".to_string()), Some(out_zip.clone()), None, None)
             .expect("choosing a key with -l must unblock");
         assert!(out_zip.exists());
     }
@@ -1986,7 +2216,7 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, _wolf_file, db_path) = make_wolf_game(&base);
 
-        let err = cmd_patch(game_dir.clone(), db_path.clone(), Some("es".to_string()), None, None)
+        let err = cmd_patch(game_dir.clone(), db_path.clone(), Some("es".to_string()), None, None, None)
             .expect_err("no recording must be a hard error");
         let msg = err.to_string();
         assert!(msg.contains("no injection has been recorded"), "{msg}");
@@ -2001,7 +2231,7 @@ mod tests {
         let (game2, _script, db2, _) = make_renpy_game(&base2);
         // Ren'Py mutates loose scripts, so it gets the note too; an HTML game
         // (pure path-derived writes) must not.
-        let err2 = cmd_patch(game2, db2, Some("es".to_string()), None, None).unwrap_err();
+        let err2 = cmd_patch(game2, db2, Some("es".to_string()), None, None, None).unwrap_err();
         assert!(err2.to_string().contains("restore the original"), "{err2}");
 
         let base3 = patch_test_tempdir();
@@ -2012,7 +2242,7 @@ mod tests {
         let dbh = Database::open(&db3).unwrap();
         save_translated(&dbh, "index.html#0", "Hi there world", &game3.join("index.html"), "Hola");
         drop(dbh);
-        let err3 = cmd_patch(game3, db3, Some("es".to_string()), None, None).unwrap_err();
+        let err3 = cmd_patch(game3, db3, Some("es".to_string()), None, None, None).unwrap_err();
         let msg3 = err3.to_string();
         assert!(msg3.contains("no injection has been recorded"), "{msg3}");
         assert!(
@@ -2032,7 +2262,7 @@ mod tests {
         db.record_injection(Some("fr"), &game_dir, &[wolf_file]).unwrap();
         drop(db);
 
-        let err = cmd_patch(game_dir, db_path, Some("es".to_string()), None, None)
+        let err = cmd_patch(game_dir, db_path, Some("es".to_string()), None, None, None)
             .expect_err("a key miss must be a hard error");
         let msg = err.to_string();
         assert!(msg.contains("no injection recorded for language \"es\""), "{msg}");
@@ -2076,7 +2306,7 @@ mod tests {
             None,
             Some(out_zip.clone()),
             None,
-        )
+            None)
         .expect_err("an absolute recorded rel must be refused, never packed");
         assert!(
             err.to_string().contains("escapes the game root"),
@@ -2089,7 +2319,7 @@ mod tests {
         conn.execute("UPDATE injected_files SET rel = '../evil.txt'", [])
             .unwrap();
         drop(conn);
-        let err = cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None)
+        let err = cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None, None)
             .expect_err("a parent-dir rel must be refused");
         assert!(err.to_string().contains("escapes the game root"), "{err}");
         assert!(!out_zip.exists());
@@ -2115,7 +2345,7 @@ mod tests {
             db.save_entries(&[entry]).unwrap();
             drop(db);
 
-            let err = cmd_patch(game_dir, db_path, Some("es".to_string()), None, None)
+            let err = cmd_patch(game_dir, db_path, Some("es".to_string()), None, None, None)
                 .expect_err("no recording exists, so patch still errors — but LATER");
             let msg = err.to_string();
             assert!(
@@ -2139,7 +2369,7 @@ mod tests {
         db.save_entries(&[StringEntry::new("script.rpy#2", "Hello", script)])
             .unwrap();
         drop(db);
-        let err = cmd_patch(game_dir, db_path, None, None, None).unwrap_err();
+        let err = cmd_patch(game_dir, db_path, None, None, None, None).unwrap_err();
         assert!(
             err.to_string().contains("nothing to pack yet"),
             "an untranslated project must still be told to translate: {err}"
@@ -2171,7 +2401,7 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-        )
+            None)
         .expect_err("packing recorded rels out of a different tree must be refused");
         let msg = err.to_string();
         assert!(
@@ -2187,7 +2417,7 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-        )
+            None)
         .expect("patch pointed at the recorded root must pack");
         assert!(out_zip.exists());
     }
@@ -2213,7 +2443,7 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-        )
+            None)
         .expect_err("a changed file must refuse to pack");
         let msg = err.to_string();
         assert!(
@@ -2251,7 +2481,7 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-        )
+            None)
         .expect_err("a missing recorded file must be an error, not a silent skip");
         let msg = err.to_string();
         assert!(msg.contains("missing from disk"), "{msg}");
@@ -2364,7 +2594,7 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-        )
+            None)
         .expect_err("a recording that cannot be honored must remain an error");
         assert!(err.to_string().contains("missing from disk"), "{err}");
         assert_eq!(
