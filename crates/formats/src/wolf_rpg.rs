@@ -242,6 +242,7 @@ impl FormatPlugin for WolfRpgPlugin {
         let mut strings_written = 0;
         let mut strings_skipped = 0;
         let mut warnings = Vec::new();
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         // Group by file
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
@@ -345,6 +346,7 @@ impl FormatPlugin for WolfRpgPlugin {
             if modified {
                 std::fs::write(&actual_path, &bytes)?;
                 files_modified += 1;
+                files_written.push(actual_path);
             }
         }
 
@@ -353,6 +355,7 @@ impl FormatPlugin for WolfRpgPlugin {
             strings_written,
             strings_skipped,
             warnings,
+            files_written,
         })
     }
 }

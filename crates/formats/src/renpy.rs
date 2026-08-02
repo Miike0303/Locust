@@ -168,6 +168,8 @@ impl RenPyPlugin {
                 strings_written,
                 strings_skipped,
                 warnings,
+                // Removal only — nothing was written this run.
+                files_written: Vec::new(),
             });
         }
 
@@ -191,7 +193,8 @@ impl RenPyPlugin {
              \x20       return locust_translations.get(text, text)\n\
              \x20   config.say_menu_text_filter = locust_text_filter\n"
         );
-        std::fs::write(game_dir.join("zzz_locust_translate.rpy"), file)?;
+        let filter_path = game_dir.join("zzz_locust_translate.rpy");
+        std::fs::write(&filter_path, file)?;
         // Remove a stale compiled twin so Ren'Py recompiles our new file
         let _ = std::fs::remove_file(game_dir.join("zzz_locust_translate.rpyc"));
 
@@ -200,6 +203,9 @@ impl RenPyPlugin {
             strings_written,
             strings_skipped,
             warnings: Vec::new(),
+            // Extraction deliberately skips `zzz_locust*`, so this file can
+            // only reach a patch through the report — never through entries.
+            files_written: vec![filter_path],
         })
     }
 
@@ -278,6 +284,7 @@ impl RenPyPlugin {
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut collision_skipped = 0usize;
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         // Walk all extracted .rpy files and apply translations by line number
         for dir_entry in walkdir::WalkDir::new(temp_dir)
@@ -365,6 +372,7 @@ impl RenPyPlugin {
                 std::fs::write(&dest, &new_content)?;
                 files_modified += 1;
                 strings_written += local_matched;
+                files_written.push(dest.clone());
 
                 // Delete corresponding .rpyc so Ren'Py recompiles from the modified .rpy
                 let rpyc_path = dest.with_extension("rpyc");
@@ -389,6 +397,7 @@ impl RenPyPlugin {
             strings_written,
             strings_skipped: entries.len().saturating_sub(strings_written),
             warnings,
+            files_written,
         })
     }
 
@@ -1726,10 +1735,6 @@ impl FormatPlugin for RenPyPlugin {
         vec![OutputMode::Replace, OutputMode::Add]
     }
 
-    fn content_roots(&self) -> &[&str] {
-        &["game"]
-    }
-
     fn detect(&self, path: &Path) -> bool {
         if path.is_file() {
             let ext = path.extension().unwrap_or_default();
@@ -1859,6 +1864,7 @@ impl FormatPlugin for RenPyPlugin {
                 strings_written: 0,
                 strings_skipped: 0,
                 warnings: Vec::new(),
+                files_written: Vec::new(),
             }));
         }
 
@@ -1898,6 +1904,7 @@ impl FormatPlugin for RenPyPlugin {
 
         let mut files_modified = 0;
         let mut strings_written = 0;
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         // Group loose (non-archive) entries by file
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
@@ -1988,6 +1995,7 @@ impl FormatPlugin for RenPyPlugin {
             if modified {
                 std::fs::write(file_path, new_lines.join("\n"))?;
                 files_modified += 1;
+                files_written.push(file_path.clone());
 
                 // Delete corresponding .rpyc so Ren'Py recompiles from the modified .rpy
                 let rpyc_path = file_path.with_extension("rpyc");
@@ -2002,12 +2010,14 @@ impl FormatPlugin for RenPyPlugin {
             strings_written += r.strings_written;
             strings_skipped += r.strings_skipped;
             warnings.extend(r.warnings);
+            files_written.extend(r.files_written);
         }
         if let Some(r) = rpyc_report {
             files_modified += r.files_modified;
             strings_written += r.strings_written;
             strings_skipped += r.strings_skipped;
             warnings.extend(r.warnings);
+            files_written.extend(r.files_written);
         }
 
         Ok(InjectionReport {
@@ -2015,6 +2025,7 @@ impl FormatPlugin for RenPyPlugin {
             strings_written,
             strings_skipped,
             warnings,
+            files_written,
         })
     }
 
@@ -2043,6 +2054,7 @@ impl FormatPlugin for RenPyPlugin {
         let mut string_entries: Vec<&StringEntry> = Vec::new();
         let mut strings_written = 0;
         let mut strings_skipped = 0;
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         for entry in entries {
             let translation = match &entry.translation {
@@ -2135,6 +2147,7 @@ impl FormatPlugin for RenPyPlugin {
 
             let tl_file = tl_dir.join(filename);
             std::fs::write(&tl_file, lines.join("\n"))?;
+            files_written.push(tl_file.clone());
             let tl_rpyc = tl_file.with_extension("rpyc");
             if tl_rpyc.exists() {
                 let _ = std::fs::remove_file(&tl_rpyc);
@@ -2166,6 +2179,7 @@ impl FormatPlugin for RenPyPlugin {
 
             let tl_file = tl_dir.join("locust_strings.rpy");
             std::fs::write(&tl_file, lines.join("\n"))?;
+            files_written.push(tl_file.clone());
             let tl_rpyc = tl_file.with_extension("rpyc");
             if tl_rpyc.exists() {
                 let _ = std::fs::remove_file(&tl_rpyc);
@@ -2176,6 +2190,7 @@ impl FormatPlugin for RenPyPlugin {
         let langs_file_content = build_language_picker_script(&game_dir, lang);
         let langs_file = game_dir.join("locust_languages.rpy");
         std::fs::write(&langs_file, langs_file_content)?;
+        files_written.push(langs_file.clone());
         let langs_rpyc = game_dir.join("locust_languages.rpyc");
         if langs_rpyc.exists() {
             let _ = std::fs::remove_file(&langs_rpyc);
@@ -2194,6 +2209,7 @@ impl FormatPlugin for RenPyPlugin {
             strings_written,
             strings_skipped,
             warnings: Vec::new(),
+            files_written,
         })
     }
 }
@@ -2685,6 +2701,46 @@ mod tests {
         let content = fs::read_to_string(dir.join("game").join("script.rpy")).unwrap();
         assert!(content.contains("\"Hola, mundo!\""));
         assert!(!content.contains("\"Hello, world!\""));
+    }
+
+    #[test]
+    fn test_inject_reports_the_paths_it_wrote() {
+        // `locust patch` packs from the paths injection reports, because for
+        // archive-shipped games the written files never become database
+        // entries: extraction skips `zzz_locust*` and rewrites entry paths to
+        // the .rpa. Both the in-place loose edit and the generated runtime
+        // filter must therefore be reported.
+        let dir = temp_renpy_dir();
+        let plugin = RenPyPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for entry in &mut entries {
+            if entry.source == "Hello, world!" {
+                entry.translation = Some("Hola, mundo!".to_string());
+            }
+        }
+        let mut rpyc = StringEntry::new(
+            "scripts.rpa#a.rpyc#s0",
+            "Compiled line",
+            dir.join("game").join("scripts.rpa"),
+        );
+        rpyc.tags = vec!["dialogue".to_string(), "rpyc".to_string()];
+        rpyc.translation = Some("Línea compilada".to_string());
+        entries.push(rpyc);
+
+        let report = plugin.inject(&dir, &entries).unwrap();
+
+        let script = dir.join("game").join("script.rpy");
+        let filter = dir.join("game").join("zzz_locust_translate.rpy");
+        assert!(
+            report.files_written.contains(&script),
+            "the loose .rpy edited in place must be reported, got: {:?}",
+            report.files_written
+        );
+        assert!(
+            report.files_written.contains(&filter),
+            "the generated runtime filter must be reported, got: {:?}",
+            report.files_written
+        );
     }
 
     #[test]

@@ -3130,6 +3130,7 @@ dependencies = [
  "locust-providers",
  "locust-server",
  "predicates",
+ "rusqlite",
  "tokio",
  "tokio-util",
  "tracing",

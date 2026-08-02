@@ -1272,10 +1272,6 @@ impl FormatPlugin for RpgMakerMvPlugin {
         vec![OutputMode::Replace, OutputMode::Add]
     }
 
-    fn content_roots(&self) -> &[&str] {
-        &["www", "data"]
-    }
-
     fn detect(&self, path: &Path) -> bool {
         if path.is_dir() {
             if let Some(data_dir) = Self::find_data_dir(path) {
@@ -1342,6 +1338,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
         let mut strings_written = 0;
         let mut strings_skipped = 0;
         let warnings = Vec::new();
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         // Group entries by file
         let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
@@ -1387,6 +1384,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
             let output = serde_json::to_string_pretty(&json)?;
             std::fs::write(&file_path, output)?;
             files_modified += 1;
+            files_written.push(file_path.clone());
         }
 
         Ok(InjectionReport {
@@ -1394,6 +1392,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
             strings_written,
             strings_skipped,
             warnings,
+            files_written,
         })
     }
 
@@ -1407,6 +1406,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
         let version = Self::detect_version(game_root);
         let mut strings_written = 0;
         let mut strings_skipped = 0;
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         match version {
             MvMzVersion::Mz | MvMzVersion::Unknown => {
@@ -1426,6 +1426,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
                 }
                 let output = serde_json::to_string_pretty(&serde_json::Value::Object(map))?;
                 std::fs::write(&lang_file, output)?;
+                files_written.push(lang_file);
             }
             MvMzVersion::Mv => {
                 // MV Iavra format: www/data/i18n/{lang}.json
@@ -1452,6 +1453,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
                 );
                 let output = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
                 std::fs::write(&lang_file, output)?;
+                files_written.push(lang_file);
             }
         }
 
@@ -1460,6 +1462,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
             strings_written,
             strings_skipped,
             warnings: Vec::new(),
+            files_written,
         })
     }
 }

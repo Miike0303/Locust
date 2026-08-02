@@ -164,6 +164,7 @@ impl FormatPlugin for VnTextPatchPlugin {
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
+        let mut files_written: Vec<std::path::PathBuf> = Vec::new();
 
         for (fname, file_entries) in &by_file {
             let file_path = dir.join(fname);
@@ -204,6 +205,7 @@ impl FormatPlugin for VnTextPatchPlugin {
                 let out = serde_json::to_string_pretty(&arr)?;
                 std::fs::write(&file_path, out)?;
                 files_modified += 1;
+                files_written.push(file_path);
             }
         }
 
@@ -212,6 +214,7 @@ impl FormatPlugin for VnTextPatchPlugin {
             strings_written,
             strings_skipped,
             warnings: Vec::new(),
+            files_written,
         })
     }
 }

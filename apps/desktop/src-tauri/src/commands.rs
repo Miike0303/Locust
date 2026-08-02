@@ -326,6 +326,18 @@ pub struct InjectParams {
     pub output_dir: Option<String>,
 }
 
+/// Unblocking advice attached to a containment failure when recording an
+/// injection made through the desktop app. The app cannot know the exact
+/// paths the user's shell will use, so it names the shape of the working
+/// command rather than a copy-pasteable line.
+const INJECT_RECORD_REMEDY: &str =
+    "Restore the original game files from the backup listed above (or from a \
+     clean copy) first — this engine writes translations into the ORIGINAL \
+     tree, and a re-run against the mutated tree writes and records nothing. \
+     Then record the injection with the CLI's direct mode: locust inject \
+     <game folder> -P <project db> --direct -l <lang> — `locust patch` packs \
+     from that recording.";
+
 #[tauri::command]
 pub async fn run_inject(
     params: InjectParams,
@@ -340,6 +352,7 @@ pub async fn run_inject(
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
+    let languages = params.languages.clone();
     let report = injector
         .inject(
             &PathBuf::from(&params.project_path),
@@ -351,6 +364,17 @@ pub async fn run_inject(
         )
         .await
         .map_err(|e| e.to_string())?;
+
+    // Persist what each language's injection wrote — `locust patch` packs
+    // exclusively from this recording, so an inject seam that skips it
+    // produces projects that can never be packed.
+    locust_core::extraction::record_multilang_injection(
+        &s.db,
+        &report,
+        &languages,
+        &|_lang| INJECT_RECORD_REMEDY.to_string(),
+    )
+    .map_err(|e| e.to_string())?;
 
     serde_json::to_value(report).map_err(|e| e.to_string())
 }

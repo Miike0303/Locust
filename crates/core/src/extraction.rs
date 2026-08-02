@@ -38,23 +38,6 @@ pub trait FormatPlugin: Send + Sync {
         FormatStability::Stable
     }
 
-    /// Names of the top-level directory component(s), relative to the game
-    /// root, under which this format's translatable content lives — e.g.
-    /// `["game"]` for Ren'Py, `["www", "data"]` for RPG Maker MV/MZ (MV
-    /// nests data under `www/`, MZ does not — both component names are
-    /// tried). Used to compute a patch archive's game-root-relative paths
-    /// so packaging never depends on a hardcoded, format-agnostic anchor
-    /// list.
-    ///
-    /// The default (empty slice) means this format has no single
-    /// recognized content root. Callers MUST treat an empty match here as
-    /// a hard error naming the unresolved path — never silently fall back
-    /// to a bare filename, which flattens directory structure and can
-    /// cause distinct source files to collide.
-    fn content_roots(&self) -> &[&str] {
-        &[]
-    }
-
     fn detect(&self, path: &Path) -> bool {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
@@ -92,6 +75,18 @@ pub struct InjectionReport {
     pub strings_written: usize,
     pub strings_skipped: usize,
     pub warnings: Vec<String>,
+    /// Paths of every file this injection actually wrote. `locust patch`
+    /// packs from this list (persisted per language in the project database)
+    /// because entries only name where text was READ: for archive-based
+    /// engines that diverges — Ren'Py rewrites `file_path` to the `.rpa`
+    /// while injection writes loose `.rpy` files plus a generated
+    /// `zzz_locust_translate.rpy` that extraction deliberately skips, so the
+    /// written files can never become database entries.
+    ///
+    /// `serde(default)` keeps reports from older WASM plugins deserializable;
+    /// they simply record nothing.
+    #[serde(default)]
+    pub files_written: Vec<PathBuf>,
 }
 
 pub struct FormatRegistry {
@@ -217,6 +212,11 @@ pub struct MultiLangReport {
     pub languages_failed: Vec<(String, String)>,
     pub backup_id: String,
     pub reports: HashMap<String, InjectionReport>,
+    /// The root each language's injection targeted: the per-language copy in
+    /// Replace mode, the game path itself in Add mode. The recording `locust
+    /// patch` packs from is keyed on this root — only the injector knows
+    /// which tree it wrote into, so it must say so per language.
+    pub injected_roots: HashMap<String, PathBuf>,
 }
 
 pub struct MultiLangInjector {
@@ -247,18 +247,37 @@ impl MultiLangInjector {
         output_dir: Option<PathBuf>,
         tx: mpsc::Sender<ProgressEvent>,
     ) -> Result<MultiLangReport> {
-        // For Replace mode with output_dir, the original is untouched — skip full backup
-        let backup_id = if mode == OutputMode::Replace && output_dir.is_some() {
-            "skip-replace-mode".to_string()
-        } else {
-            match self.backup_manager.create_backup(project_path) {
-                Ok(backup) => backup.id.clone(),
-                Err(e) => {
-                    tracing::warn!("Backup failed (continuing without backup): {}", e);
-                    "none".to_string()
-                }
-            }
-        };
+        // Always back up. This used to skip the backup for Replace mode with an
+        // output_dir on the assumption that "the original is untouched", and that
+        // assumption is false: Unity (unity.rs), Unreal (unreal.rs) and Wolf RPG
+        // (wolf_rpg.rs) key their injection on `entry.file_path` and write straight
+        // back to the ORIGINAL file, and Ren'Py does the same for loose scripts —
+        // they never write into the copy at all. So the one mode users reach for
+        // BECAUSE it is meant to be safe was the mode that mutated their game with
+        // no way back.
+        //
+        // ponytail: unconditional backup costs a full copy on every Replace run.
+        // Narrow it again only once each plugin provably writes inside the root it
+        // is handed, and prove that with a containment check rather than a comment.
+        //
+        // A FAILED backup is fatal, for the same reason the backup is
+        // unconditional: the entry-tree writers mutate the original game in
+        // every mode, and every recovery path this pipeline advises
+        // ("restore it from the backup listed above") starts at the backup.
+        // Continuing with backup_id "none" made those remedies hollow
+        // exactly when they were needed.
+        let backup_id = self
+            .backup_manager
+            .create_backup(project_path)
+            .map(|backup| backup.id)
+            .map_err(|e| {
+                LocustError::BackupError(format!(
+                    "{e} — injection is refused without a backup: several engines \
+                     write translations into the ORIGINAL game files, and recovering \
+                     from a bad injection starts at this backup. Free up disk space \
+                     or fix the backup directory, then re-run."
+                ))
+            })?;
 
         let plugin = self.registry.get(format_id).ok_or_else(|| {
             LocustError::UnsupportedFormat(format!("format not found: {}", format_id))
@@ -300,6 +319,7 @@ impl MultiLangInjector {
         let mut languages_processed = Vec::new();
         let mut languages_failed = Vec::new();
         let mut reports = HashMap::new();
+        let mut injected_roots = HashMap::new();
 
         let game_name = project_path
             .file_name()
@@ -324,6 +344,7 @@ impl MultiLangInjector {
             match plugin.inject(&dest, &entries) {
                 Ok(report) => {
                     reports.insert(lang.clone(), report);
+                    injected_roots.insert(lang.clone(), dest.clone());
                     languages_processed.push(lang.clone());
                 }
                 Err(e) => {
@@ -347,6 +368,7 @@ impl MultiLangInjector {
             languages_failed,
             backup_id,
             reports,
+            injected_roots,
         })
     }
 
@@ -362,6 +384,7 @@ impl MultiLangInjector {
         let mut languages_processed = Vec::new();
         let mut languages_failed = Vec::new();
         let mut reports = HashMap::new();
+        let mut injected_roots = HashMap::new();
 
         for (idx, lang) in languages.iter().enumerate() {
             let entries = self
@@ -371,6 +394,7 @@ impl MultiLangInjector {
             match plugin.inject_add(project_path, lang, &entries) {
                 Ok(report) => {
                     reports.insert(lang.clone(), report);
+                    injected_roots.insert(lang.clone(), project_path.to_path_buf());
                     languages_processed.push(lang.clone());
                 }
                 Err(e) => {
@@ -394,8 +418,123 @@ impl MultiLangInjector {
             languages_failed,
             backup_id,
             reports,
+            injected_roots,
         })
     }
+}
+
+/// What [`record_injection_for_lang`] did for one language key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecordOutcome {
+    /// The written files were containment-checked and persisted.
+    Recorded { files: usize },
+    /// Zero files written; the previous recording for this key (dated
+    /// `recorded_at`) was kept — its files are still on disk, and the
+    /// pack-time hash check catches real staleness. Callers MUST surface
+    /// this: silent keeps were the stale-recording hazard.
+    KeptPrevious { recorded_at: String },
+    /// Zero files written and no previous recording exists — `locust patch`
+    /// will refuse until an inject writes at least one file. Callers MUST
+    /// tell the user why nothing was recorded and name a remedy that fits
+    /// (skipped translations, or an already-mutated original tree).
+    NothingRecorded,
+}
+
+/// Containment-check `files` against `root`, then persist the recording for
+/// `lang` (`None` = the reserved language-unspecified key). Any file outside
+/// the root records NOTHING for the language and fails loudly with `remedy` —
+/// recording it would point `locust patch` at a tree injection never targeted,
+/// which is exactly how patches silently shipped original files.
+pub fn record_injection_for_lang(
+    db: &Database,
+    lang: Option<&str>,
+    root: &Path,
+    files: &[PathBuf],
+    remedy: &str,
+    backup_id: Option<&str>,
+) -> Result<RecordOutcome> {
+    use crate::database::rel_under_root;
+    let root_abs = std::path::absolute(root)?;
+    let label = lang.unwrap_or("(unspecified)");
+    let outside: Vec<&PathBuf> = files
+        .iter()
+        .filter(|p| rel_under_root(p, &root_abs).is_none())
+        .collect();
+    if !outside.is_empty() {
+        let shown: Vec<String> = outside
+            .iter()
+            .take(3)
+            .map(|p| format!("  {}", p.display()))
+            .collect();
+        let more = if outside.len() > shown.len() {
+            format!("\n  ... and {} more", outside.len() - shown.len())
+        } else {
+            String::new()
+        };
+        let backup_note = match backup_id {
+            Some(id) if id != "none" => {
+                format!("\nBackup {id} holds the pre-injection files.")
+            }
+            _ => String::new(),
+        };
+        return Err(LocustError::InjectionError(format!(
+            "injection for language \"{label}\" wrote {} file(s) OUTSIDE its target \
+             root \"{}\":\n{}{more}\nNothing was recorded for \"{label}\" — the output \
+             at \"{}\" does not contain these translations.{backup_note}\n{remedy}",
+            outside.len(),
+            root_abs.display(),
+            shown.join("\n"),
+            root_abs.display(),
+        )));
+    }
+    if files.is_empty() {
+        return Ok(match db.get_injection(lang)? {
+            Some(prev) => RecordOutcome::KeptPrevious {
+                recorded_at: prev.recorded_at,
+            },
+            None => RecordOutcome::NothingRecorded,
+        });
+    }
+    db.record_injection(lang, &root_abs, files)?;
+    Ok(RecordOutcome::Recorded { files: files.len() })
+}
+
+/// Persist, for EVERY language `report` successfully injected, the files that
+/// injection actually wrote under the root it wrote them into. This is THE
+/// mandatory companion to [`MultiLangInjector::inject`]: every caller — the
+/// CLI, the HTTP server, the desktop app — must record through here, or
+/// `locust patch` on that project hard-errors with "no injection has been
+/// recorded". `remedy(lang)` supplies the caller's unblocking advice, appended
+/// to a containment hard-error. Languages are visited in `languages` order so
+/// a failure reports the same way every run; the returned outcomes let the
+/// caller surface zero-write runs (see [`RecordOutcome`]).
+pub fn record_multilang_injection(
+    db: &Database,
+    report: &MultiLangReport,
+    languages: &[String],
+    remedy: &dyn Fn(&str) -> String,
+) -> Result<Vec<(String, RecordOutcome)>> {
+    let mut outcomes = Vec::new();
+    for lang in languages {
+        let Some(rep) = report.reports.get(lang) else {
+            continue; // failed language — the caller reports it, nothing to record
+        };
+        let root = report.injected_roots.get(lang).ok_or_else(|| {
+            LocustError::InjectionError(format!(
+                "internal error: no injection root reported for language \"{lang}\""
+            ))
+        })?;
+        let outcome = record_injection_for_lang(
+            db,
+            Some(lang),
+            root,
+            &rep.files_written,
+            &remedy(lang),
+            Some(&report.backup_id),
+        )?;
+        outcomes.push((lang.clone(), outcome));
+    }
+    Ok(outcomes)
 }
 
 fn copy_dir_for_inject(src: &Path, dst: &Path) -> Result<()> {
@@ -503,6 +642,7 @@ mod tests {
                 strings_written: written,
                 strings_skipped: skipped,
                 warnings: Vec::new(),
+                files_written: vec![out_path],
             })
         }
 
@@ -532,6 +672,7 @@ mod tests {
                 strings_written: written,
                 strings_skipped: skipped,
                 warnings: Vec::new(),
+                files_written: vec![out_path],
             })
         }
     }
@@ -557,6 +698,7 @@ mod tests {
                 strings_written: 0,
                 strings_skipped: 0,
                 warnings: Vec::new(),
+                files_written: Vec::new(),
             })
         }
     }
@@ -739,6 +881,13 @@ mod tests {
         let dest = output_dir.join("mygame-es");
         assert!(dest.exists());
         assert!(dest.join("game.mock").exists());
+        // The injector is the only party that knows which tree it targeted;
+        // the recording `locust patch` packs from is keyed on this root.
+        assert_eq!(
+            report.injected_roots.get("es"),
+            Some(&dest),
+            "Replace mode must report the per-language copy as the injected root"
+        );
     }
 
     #[tokio::test]
@@ -841,6 +990,11 @@ mod tests {
 
         assert_eq!(report.languages_processed, vec!["fr"]);
         assert!(game_dir.join("tl").join("fr").exists());
+        assert_eq!(
+            report.injected_roots.get("fr"),
+            Some(&game_dir),
+            "Add mode must report the game path itself as the injected root"
+        );
     }
 
     #[tokio::test]
@@ -889,7 +1043,71 @@ mod tests {
         rx.close();
         while rx.recv().await.is_some() {}
 
-        assert_eq!(report.backup_id, "skip-replace-mode");
+        // Replace-with-output_dir MUST still take a backup. Several plugins (Unity,
+        // Unreal, Wolf RPG, and Ren'Py for loose scripts) write to entry.file_path
+        // and so mutate the ORIGINAL game even in this mode. This assertion used to
+        // require the sentinel "skip-replace-mode", which locked the unsafe
+        // assumption in as the expected contract.
+        assert_ne!(
+            report.backup_id, "skip-replace-mode",
+            "Replace mode with an output_dir must not skip the backup"
+        );
+        assert_ne!(
+            report.backup_id, "none",
+            "a backup must have been created, not merely attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backup_failure_is_fatal_and_nothing_is_injected() {
+        // Every recovery path this pipeline advises ("restore it from the
+        // backup listed above") starts at the backup, and several engines
+        // mutate the ORIGINAL game files in every mode. Continuing with
+        // backup_id "none" after a failed backup made those remedies hollow
+        // exactly when they were needed.
+        let game_dir = make_game_dir();
+        let output_dir = tempdir().join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+        // A backup root that is a FILE: create_backup cannot create its
+        // timestamp directory under it, on any platform.
+        let bad_backup_root = tempdir().join("not_a_dir");
+        fs::write(&bad_backup_root, b"occupied").unwrap();
+
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut entries = vec![StringEntry::new("mock#0", "Hello", PathBuf::from("game.mock"))];
+        entries[0].translation = Some("Hola".to_string());
+        db.save_entries(&entries).unwrap();
+        let mut registry = FormatRegistry::new();
+        registry.register(Box::new(MockFormatPlugin));
+        let injector = MultiLangInjector::new(
+            Arc::new(registry),
+            db,
+            Arc::new(BackupManager::new(bad_backup_root)),
+        );
+
+        let (tx, mut rx) = mpsc::channel(100);
+        let err = injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Replace,
+                vec!["es".to_string()],
+                Some(output_dir.clone()),
+                tx,
+            )
+            .await
+            .expect_err("a failed backup must refuse the injection, not shrug");
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert!(
+            err.to_string().contains("without a backup"),
+            "the refusal must say why the backup matters: {err}"
+        );
+        assert!(
+            !output_dir.join("mygame-es").exists(),
+            "nothing may be copied or injected after the backup failed"
+        );
     }
 
     #[tokio::test]
@@ -938,14 +1156,14 @@ mod tests {
             fn supported_modes(&self) -> Vec<OutputMode> { vec![OutputMode::Add] }
             fn extract(&self, _: &Path) -> Result<Vec<StringEntry>> { Ok(vec![]) }
             fn inject(&self, _: &Path, _: &[StringEntry]) -> Result<InjectionReport> {
-                Ok(InjectionReport { files_modified: 0, strings_written: 0, strings_skipped: 0, warnings: vec![] })
+                Ok(InjectionReport { files_modified: 0, strings_written: 0, strings_skipped: 0, warnings: vec![], files_written: vec![] })
             }
             fn inject_add(&self, _path: &Path, lang: &str, _entries: &[StringEntry]) -> Result<InjectionReport> {
                 if lang == "bad" {
                     return Err(LocustError::InjectionError("bad language".to_string()));
                 }
                 fs::create_dir_all(_path.join("tl").join(lang))?;
-                Ok(InjectionReport { files_modified: 1, strings_written: 1, strings_skipped: 0, warnings: vec![] })
+                Ok(InjectionReport { files_modified: 1, strings_written: 1, strings_skipped: 0, warnings: vec![], files_written: vec![] })
             }
         }
 
@@ -975,6 +1193,196 @@ mod tests {
         assert_eq!(report.languages_failed[0].0, "bad");
     }
 
+    // ─── Recording seam tests: record_multilang_injection is the mandatory
+    // companion to MultiLangInjector::inject for EVERY caller ───────────────
+
+    /// A plugin that writes INSIDE the tree it is handed — the containment
+    /// check must pass and the write must be recorded under that root.
+    struct ContainedMock;
+
+    impl FormatPlugin for ContainedMock {
+        fn id(&self) -> &str {
+            "contained"
+        }
+        fn name(&self) -> &str {
+            "Contained Mock"
+        }
+        fn supported_extensions(&self) -> &[&str] {
+            &[".mock"]
+        }
+        fn supported_modes(&self) -> Vec<OutputMode> {
+            vec![OutputMode::Replace]
+        }
+        fn extract(&self, _path: &Path) -> Result<Vec<StringEntry>> {
+            Ok(vec![])
+        }
+        fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+            let out = path.join("game.injected");
+            let lines: Vec<String> = entries
+                .iter()
+                .filter_map(|e| e.translation.as_ref().map(|t| format!("{}={}", e.id, t)))
+                .collect();
+            fs::write(&out, lines.join("\n"))?;
+            Ok(InjectionReport {
+                files_modified: 1,
+                strings_written: lines.len(),
+                strings_skipped: 0,
+                warnings: Vec::new(),
+                files_written: vec![out],
+            })
+        }
+    }
+
+    fn setup_contained_injector() -> (MultiLangInjector, PathBuf, PathBuf) {
+        let game_dir = make_game_dir();
+        let backup_root = tempdir().join("backups");
+        let output_dir = tempdir().join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let backup = Arc::new(BackupManager::new(backup_root));
+        let mut entries = vec![StringEntry::new("mock#0", "Hello", PathBuf::from("game.mock"))];
+        entries[0].translation = Some("Hola".to_string());
+        db.save_entries(&entries).unwrap();
+
+        let mut registry = FormatRegistry::new();
+        registry.register(Box::new(ContainedMock));
+        let injector = MultiLangInjector::new(Arc::new(registry), db, backup);
+        (injector, game_dir, output_dir)
+    }
+
+    #[tokio::test]
+    async fn test_record_multilang_injection_records_every_processed_language() {
+        let (injector, game_dir, output_dir) = setup_contained_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+        let langs = vec!["es".to_string(), "fr".to_string()];
+        let report = injector
+            .inject(
+                &game_dir,
+                "contained",
+                OutputMode::Replace,
+                langs.clone(),
+                Some(output_dir.clone()),
+                tx,
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        let outcomes =
+            record_multilang_injection(&injector.db, &report, &langs, &|_| "remedy".to_string())
+                .unwrap();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("es".to_string(), RecordOutcome::Recorded { files: 1 }),
+                ("fr".to_string(), RecordOutcome::Recorded { files: 1 }),
+            ]
+        );
+
+        for lang in ["es", "fr"] {
+            let rec = injector
+                .db
+                .get_injection(Some(lang))
+                .unwrap()
+                .unwrap_or_else(|| panic!("a recording must exist for {lang}"));
+            assert!(
+                crate::database::paths_identical(
+                    &rec.root,
+                    &output_dir.join(format!("mygame-{lang}"))
+                ),
+                "the recording root must be the per-language copy, got {}",
+                rec.root.display()
+            );
+            assert_eq!(rec.files.len(), 1);
+            assert_eq!(rec.files[0].rel, "game.injected");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_record_multilang_injection_containment_failure_is_loud_and_records_nothing() {
+        // MockFormatPlugin writes `<dest>.injected` — a SIBLING of the
+        // per-language copy, outside its root. Recording must hard-fail with
+        // the caller's remedy attached and persist nothing for that language.
+        let (injector, game_dir, output_dir) = setup_injector();
+        let (tx, mut rx) = mpsc::channel(100);
+        let langs = vec!["es".to_string()];
+        let report = injector
+            .inject(
+                &game_dir,
+                "mock",
+                OutputMode::Replace,
+                langs.clone(),
+                Some(output_dir),
+                tx,
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        let err = record_multilang_injection(&injector.db, &report, &langs, &|l| {
+            format!("REMEDY-FOR-{l}")
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OUTSIDE its target root"),
+            "the containment violation must be loud: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing was recorded"),
+            "the caller must know no recording exists: {msg}"
+        );
+        assert!(
+            msg.contains("REMEDY-FOR-es"),
+            "the caller's remedy must be attached verbatim: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("Backup {}", report.backup_id)),
+            "the backup that holds the pre-injection files must be named: {msg}"
+        );
+        assert!(
+            injector.db.get_injection(Some("es")).unwrap().is_none(),
+            "a containment failure must record NOTHING"
+        );
+    }
+
+    #[test]
+    fn test_record_injection_for_lang_zero_write_outcomes() {
+        let db = Database::open_in_memory().unwrap();
+        let root = tempdir();
+        let file = root.join("data.bin");
+        fs::write(&file, b"translated bytes").unwrap();
+
+        // First-ever zero-write run: nothing to keep, nothing recorded.
+        let outcome =
+            record_injection_for_lang(&db, Some("es"), &root, &[], "remedy", None).unwrap();
+        assert_eq!(outcome, RecordOutcome::NothingRecorded);
+        assert!(db.get_injection(Some("es")).unwrap().is_none());
+
+        // A real write records.
+        let outcome =
+            record_injection_for_lang(&db, Some("es"), &root, &[file], "remedy", None).unwrap();
+        assert_eq!(outcome, RecordOutcome::Recorded { files: 1 });
+
+        // A later zero-write run keeps the previous recording, visibly.
+        let prev = db.get_injection(Some("es")).unwrap().unwrap();
+        let outcome =
+            record_injection_for_lang(&db, Some("es"), &root, &[], "remedy", None).unwrap();
+        assert_eq!(
+            outcome,
+            RecordOutcome::KeptPrevious {
+                recorded_at: prev.recorded_at.clone()
+            }
+        );
+        assert!(
+            db.get_injection(Some("es")).unwrap().is_some(),
+            "a zero-write run must not clobber the last good recording"
+        );
+    }
+
     #[tokio::test]
     async fn test_multilang_report_structure() {
         let (injector, game_dir, output_dir) = setup_injector();
@@ -1001,5 +1409,8 @@ mod tests {
         assert!(!report.backup_id.is_empty());
         assert!(report.reports.contains_key("es"));
         assert!(report.reports.contains_key("fr"));
+        // Every processed language carries the root its injection targeted.
+        assert!(report.injected_roots.contains_key("es"));
+        assert!(report.injected_roots.contains_key("fr"));
     }
 }

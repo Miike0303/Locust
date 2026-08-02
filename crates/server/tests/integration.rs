@@ -254,8 +254,99 @@ async fn test_full_rpgmaker_mv_flow() {
     let name = json[1]["name"].as_str().unwrap();
     assert!(name.contains("[MOCK:es]"), "name should be translated: {}", name);
 
-    // 12. Replace mode with output_dir skips backup (original untouched)
-    assert_eq!(report.backup_id, "skip-replace-mode");
+    // 12. Replace mode with output_dir must still take a backup. The original is NOT
+    // reliably untouched: Unity, Unreal, Wolf RPG and Ren'Py loose scripts inject via
+    // entry.file_path and write straight back to the original game.
+    assert_ne!(
+        report.backup_id, "skip-replace-mode",
+        "Replace mode with an output_dir must not skip the backup"
+    );
+}
+
+// ─── Injection recording through the HTTP seam ──────────────────────────────
+
+#[tokio::test]
+async fn test_inject_records_the_injection_for_patch() {
+    // `locust patch` packs EXCLUSIVELY from the recording an injection
+    // persisted. The HTTP seam used to call MultiLangInjector::inject with
+    // no record_injection at all, so every project injected through the
+    // server (or the desktop app, which shares the core seam) hard-errored
+    // at patch time with "no injection has been recorded".
+    let tmpdir = TempDir::new().unwrap();
+    create_rpgmaker_mv_fixture(tmpdir.path());
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("project.locust.db");
+
+    let state = locust_server::create_test_state_with_db(&db_path);
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+
+    let resp: ProjectOpenResponse = client()
+        .post(format!("{}/api/project/open", base_url))
+        .json(&serde_json::json!({"path": tmpdir.path().to_string_lossy()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp.format_id, "rpgmaker-mv");
+
+    client()
+        .post(format!("{}/api/translate/start", base_url))
+        .json(&serde_json::json!({
+            "provider_id": "mock",
+            "options": {
+                "source_lang": "en", "target_lang": "es",
+                "batch_size": 100, "max_concurrent": 1,
+                "cost_limit_usd": null, "game_context": null,
+                "use_glossary": false, "use_memory": false, "skip_approved": true
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let output_dir = TempDir::new().unwrap();
+    let resp = client()
+        .post(format!("{}/api/inject", base_url))
+        .json(&serde_json::json!({
+            "project_path": tmpdir.path().to_string_lossy(),
+            "format_id": "rpgmaker-mv",
+            "mode": "replace",
+            "languages": ["es"],
+            "output_dir": output_dir.path().to_string_lossy()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The load-bearing side effect, read back from the SAME database file
+    // the server wrote: a recording for "es" whose root is the per-language
+    // copy the injection reported writing into.
+    let db = locust_core::database::Database::open(&db_path).unwrap();
+    let rec = db
+        .get_injection(Some("es"))
+        .unwrap()
+        .expect("the HTTP inject seam must record the injection for `locust patch`");
+    let game_name = tmpdir.path().file_name().unwrap().to_string_lossy().to_string();
+    let expected_root = output_dir.path().join(format!("{}-es", game_name));
+    assert!(
+        locust_core::database::paths_identical(&rec.root, &expected_root),
+        "the recording root must be the per-language copy: got {}, want {}",
+        rec.root.display(),
+        expected_root.display()
+    );
+    assert!(
+        !rec.files.is_empty(),
+        "the recording must list the files injection wrote"
+    );
+    assert!(
+        rec.files.iter().any(|f| f.rel == "data/Actors.json"),
+        "the injected data files must be recorded, got: {:?}",
+        rec.files.iter().map(|f| &f.rel).collect::<Vec<_>>()
+    );
 }
 
 // ─── Ren'Py Add mode flow ──────────────────────────────────────────────────

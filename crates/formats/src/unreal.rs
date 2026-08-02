@@ -279,6 +279,7 @@ impl FormatPlugin for UnrealPlugin {
         let mut strings_written = 0;
         let mut strings_skipped = 0;
         let mut warnings = Vec::new();
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         let mut by_file: std::collections::HashMap<PathBuf, Vec<&StringEntry>> = std::collections::HashMap::new();
         for entry in entries {
@@ -326,6 +327,7 @@ impl FormatPlugin for UnrealPlugin {
             if modified {
                 std::fs::write(file_path, &bytes)?;
                 files_modified += 1;
+                files_written.push(file_path.clone());
             }
         }
 
@@ -334,6 +336,7 @@ impl FormatPlugin for UnrealPlugin {
             strings_written,
             strings_skipped,
             warnings,
+            files_written,
         })
     }
 }

@@ -106,7 +106,18 @@ pub fn create_app_state() -> Arc<AppState> {
 }
 
 pub fn create_test_state() -> Arc<AppState> {
-    let db = Arc::new(Database::open_in_memory().unwrap());
+    create_test_state_inner(Arc::new(Database::open_in_memory().unwrap()))
+}
+
+/// Test state whose project database lives at `db_path` — for integration
+/// tests that must verify persisted side effects (e.g., the injection
+/// recording `locust patch` packs from) by reopening the same file after a
+/// request completes.
+pub fn create_test_state_with_db(db_path: &std::path::Path) -> Arc<AppState> {
+    create_test_state_inner(Arc::new(Database::open(db_path).unwrap()))
+}
+
+fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
     let glossary = Arc::new(Glossary::new(db.clone()));
     let backup_root = std::env::temp_dir().join(format!("locust_srv_{}", uuid::Uuid::new_v4()));
     let format_registry = locust_formats::default_registry();
@@ -588,6 +599,18 @@ struct InjectRequest {
     output_dir: Option<String>,
 }
 
+/// Unblocking advice attached to a containment failure when recording an
+/// injection made through the HTTP API. The server cannot know the exact
+/// paths the user's shell will use, so it names the shape of the working
+/// command rather than a copy-pasteable line.
+const INJECT_RECORD_REMEDY: &str =
+    "Restore the original game files from the backup listed above (or from a \
+     clean copy) first — this engine writes translations into the ORIGINAL \
+     tree, and a re-run against the mutated tree writes and records nothing. \
+     Then record the injection with the CLI's direct mode: locust inject \
+     <game folder> -P <project db> --direct -l <lang> — `locust patch` packs \
+     from that recording.";
+
 async fn inject(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InjectRequest>,
@@ -600,6 +623,7 @@ async fn inject(
     let (tx, mut rx) = mpsc::channel(100);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
+    let languages = req.languages.clone();
     let report = injector
         .inject(
             &PathBuf::from(&req.project_path),
@@ -611,6 +635,17 @@ async fn inject(
         )
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Persist what each language's injection wrote — `locust patch` packs
+    // exclusively from this recording, so an inject seam that skips it
+    // produces projects that can never be packed.
+    locust_core::extraction::record_multilang_injection(
+        &state.db,
+        &report,
+        &languages,
+        &|_lang| INJECT_RECORD_REMEDY.to_string(),
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }

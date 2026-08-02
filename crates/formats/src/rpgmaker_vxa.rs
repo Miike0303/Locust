@@ -962,10 +962,6 @@ impl FormatPlugin for RpgMakerVxaPlugin {
         vec![OutputMode::Replace]
     }
 
-    fn content_roots(&self) -> &[&str] {
-        &["Data"]
-    }
-
     fn detect(&self, path: &Path) -> bool {
         if path.is_dir() {
             if let Some(data_dir) = Self::find_data_dir(path) {
@@ -1045,6 +1041,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
@@ -1087,6 +1084,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
             let new_bytes = root.serialize();
             std::fs::write(&file_path, new_bytes)?;
             files_modified += 1;
+            files_written.push(file_path);
         }
 
         Ok(InjectionReport {
@@ -1094,6 +1092,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
             strings_written,
             strings_skipped,
             warnings: Vec::new(),
+            files_written,
         })
     }
 }

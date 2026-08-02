@@ -173,6 +173,7 @@ impl UnityPlugin {
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
@@ -252,6 +253,7 @@ impl UnityPlugin {
             if modified {
                 std::fs::write(file_path, new_lines.join("\n"))?;
                 files_modified += 1;
+                files_written.push(file_path.clone());
             }
         }
 
@@ -260,6 +262,7 @@ impl UnityPlugin {
             strings_written,
             strings_skipped,
             warnings: Vec::new(),
+            files_written,
         })
     }
 
@@ -524,6 +527,7 @@ impl FormatPlugin for UnityPlugin {
         let mut strings_written = 0;
         let mut strings_skipped = 0;
         let mut warnings = Vec::new();
+        let mut files_written: Vec<PathBuf> = Vec::new();
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
@@ -571,10 +575,11 @@ impl FormatPlugin for UnityPlugin {
             if modified {
                 std::fs::write(file_path, &bytes)?;
                 files_modified += 1;
+                files_written.push(file_path.clone());
             }
         }
 
-        Ok(InjectionReport { files_modified, strings_written, strings_skipped, warnings })
+        Ok(InjectionReport { files_modified, strings_written, strings_skipped, warnings, files_written })
     }
 }
 

@@ -231,6 +231,7 @@ impl FormatPlugin for HtmlGamePlugin {
             strings_written: 0,
             strings_skipped: 0,
             warnings: Vec::new(),
+            files_written: Vec::new(),
         };
 
         for file in &files {
@@ -258,6 +259,7 @@ impl FormatPlugin for HtmlGamePlugin {
             if file_changed {
                 std::fs::write(file, &modified)?;
                 report.files_modified += 1;
+                report.files_written.push(file.clone());
             }
         }
 

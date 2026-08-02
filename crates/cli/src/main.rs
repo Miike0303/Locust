@@ -68,6 +68,10 @@ enum Commands {
         project: PathBuf,
         #[arg(short, long)]
         mode: Option<String>,
+        /// Target language(s). Selects the recording `locust patch` packs; also
+        /// names Replace output folders and Add-mode language files. Required for
+        /// Replace/Add; optional with --direct (the recording is then
+        /// language-unspecified and packed by `patch` without -l)
         #[arg(short, long, num_args = 1..)]
         languages: Vec<String>,
         #[arg(short, long)]
@@ -95,7 +99,9 @@ enum Commands {
         game_path: PathBuf,
         #[arg(short = 'P', long)]
         project: PathBuf,
-        /// Target language, used only for naming and the Astro stub
+        /// Target language. Selects which injection recording to pack; also names
+        /// the zip and the Astro stub. Required when more than one language is
+        /// recorded
         #[arg(short, long)]
         lang: Option<String>,
         /// Output zip path (default: <game>-<lang>-patch.zip)
@@ -256,64 +262,223 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Path of a game file relative to the game root, so the patch zip mirrors the
-/// game's own layout and extracts cleanly over any copy of the game.
-///
-/// Resolution is `game_path`-relative first. That is correct for EVERY engine
-/// with no per-format knowledge at all — `game/script.rpy` for Ren'Py,
-/// `www/data/Map001.json` for RPG Maker, `Data/x.wolf` for Wolf RPG, and a
-/// bare `game.html` for the engines that keep their content at the game root.
-///
-/// `content_roots` is only a fallback, for entries whose stored path is not
-/// under `game_path` (a moved game, or a differently-spelled path). Anchoring
-/// on a component is second choice because it searches the whole absolute path:
-/// a game living at `D:\game\MyVN\game\script.rpy` anchors on the OUTER `game`
-/// and yields a path that resolves nowhere.
-///
-/// Returns `None` when neither resolves. Callers MUST treat that as a hard
-/// error naming the unresolved path. There is deliberately no bare-filename
-/// fallback: flattening a path discards the directory structure that made it
-/// unique, which is what made patch archives pack nothing — or silently drop
-/// colliding files — for every engine without a recognized content root.
-fn rel_in_game(p: &std::path::Path, game_path: &std::path::Path, content_roots: &[&str]) -> Option<PathBuf> {
-    if let Ok(rel) = p.strip_prefix(game_path) {
-        if rel.as_os_str().is_empty() {
-            return None;
-        }
-        return Some(rel.to_path_buf());
-    }
-
-    let comps: Vec<_> = p.components().collect();
-    comps
-        .iter()
-        .position(|c| {
-            c.as_os_str()
-                .to_str()
-                .is_some_and(|s| content_roots.contains(&s))
-        })
-        .map(|i| comps[i..].iter().collect())
+/// Removes a half-written temp file on any exit path, so a failed run never litters
+/// the directory holding the user's published patch. `disarm` hands ownership of the
+/// file over once it has become the real destination.
+struct TempFileGuard {
+    path: Option<PathBuf>,
 }
 
-/// Containers whose entries hold the SOURCE archive path rather than a file that
-/// injection writes. Packing one ships the game's own original content in a patch
-/// that claims to carry translated text only, and carries no translation at all,
-/// because the output went somewhere else entirely.
-///
-/// Ren'Py `.rpa` is the verified case: `renpy.rs` rewrites `file_path` to the
-/// archive for archive-sourced entries, while injection writes loose `.rpy` into
-/// `game/` or generates `zzz_locust_translate.rpy` — neither of which is a
-/// database entry.
-///
-/// Only add an extension here after confirming in that plugin's `inject` that it
-/// does NOT write back to `entry.file_path`. Wolf RPG `.wolf`, Unity `.assets`
-/// and Unreal `.pak` are byte-scan injectors that DO edit their file in place,
-/// so excluding them would break packaging for those engines.
-const SOURCE_ARCHIVE_EXTENSIONS: &[&str] = &["rpa"];
+impl TempFileGuard {
+    fn new(path: &std::path::Path) -> Self {
+        Self { path: Some(path.to_path_buf()) }
+    }
 
-fn is_source_archive(p: &std::path::Path) -> bool {
-    p.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| SOURCE_ARCHIVE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Engines whose `inject` writes into the tree the ENTRIES name instead of the
+/// tree it is handed, verified plugin by plugin: Unity and Unreal ignore the
+/// path argument entirely; Wolf RPG prefers `entry.file_path` whenever the
+/// original file still exists. For these, Replace mode's per-language copy
+/// never receives the writes, so only `--direct` (where the entry tree IS the
+/// target tree) records correctly today.
+///
+/// ponytail: a hand-maintained list until plugins declare which tree they
+/// write to; ceiling — a NEW entry-tree-writing plugin gets the generic
+/// remedy text until it is added here.
+fn writes_to_entry_tree(format_id: &str) -> bool {
+    matches!(format_id, "unity" | "unreal" | "wolf-rpg")
+}
+
+/// Engines whose `inject` mutates the ORIGINAL game tree: the entry-tree
+/// writers, plus Ren'Py, whose loose scripts are rewritten in place (writes
+/// go to `entry.file_path`) even in Replace mode. Once such an inject has
+/// run, the original source text its injector scans for is gone: a bare
+/// re-run writes nothing (or, for a mixed Ren'Py game, only the
+/// archive-derived files) and the recording silently omits the rest — so
+/// EVERY remedy issued from a mutated (or possibly mutated) state must
+/// carry the restore step. `replace_containment_remedy` and
+/// `maybe_mutated_note` are the two renderers of that step; any new error
+/// branch that advises a re-run must go through one of them.
+fn mutates_original_tree(format_id: &str) -> bool {
+    writes_to_entry_tree(format_id) || format_id == "renpy"
+}
+
+/// The restore step shared by every remedy issued from a state where the
+/// ORIGINAL game tree was provably already mutated. Advice without it is a
+/// closed loop: the re-run finds no original text, writes nothing, and
+/// records nothing.
+const RESTORE_ORIGINAL_FIRST: &str =
+    "Your original game was modified — restore it from the backup listed above \
+     (or from a clean copy) first.";
+
+/// Appended to `patch`-side advice that names a `--direct` re-run, for
+/// engines that mutate the original tree. `patch` cannot know whether a
+/// prior inject already ran (a legacy database records nothing), so this
+/// note is conditional where the containment remedies are imperative —
+/// without it, a legacy database on an already-injected game loops on the
+/// identical error forever.
+fn maybe_mutated_note(game_path: &std::path::Path) -> &'static str {
+    let mutates = locust_formats::default_registry()
+        .detect(game_path)
+        .is_some_and(|p| mutates_original_tree(p.id()));
+    if mutates {
+        "\nThis engine writes translations into the ORIGINAL game files: if this \
+         game was already injected (for example through an older Locust that kept \
+         no recording), that command will report 0 files written and record \
+         nothing — restore the original game files from a backup or a clean copy \
+         first, then re-run it."
+    } else {
+        ""
+    }
+}
+
+/// Remedy for a Replace-mode containment failure, per engine — advice that
+/// cannot work for the engine that produced the error is a closed loop, so
+/// each branch names only commands proven to unblock that engine class.
+fn replace_containment_remedy(
+    format_id: &str,
+    game_path: &std::path::Path,
+    project: &std::path::Path,
+    lang: &str,
+) -> String {
+    let g = game_path.display();
+    let p = project.display();
+    if writes_to_entry_tree(format_id) {
+        // A bare `--direct` re-run from this state writes nothing (the
+        // original bytes were already replaced) and records nothing, so the
+        // restore step is part of the remedy, not optional advice.
+        format!(
+            "This engine writes translations into the ORIGINAL game files, so Replace \
+             mode cannot produce a translated copy for it yet. {RESTORE_ORIGINAL_FIRST} \
+             Then run: locust inject \"{g}\" -P \"{p}\" --direct -l {lang} — \
+             direct mode records what it writes, and `locust patch \"{g}\" -P \"{p}\" \
+             -l {lang}` packs from that recording."
+        )
+    } else if format_id == "renpy" {
+        // The loose scripts were already rewritten in place when this error
+        // fires, so the restore step applies exactly as it does for the
+        // entry-tree writers: without it a `--direct` re-run skips every
+        // already-translated line — zero writes for a loose-only game, or a
+        // recording that silently omits the loose translations for a mixed
+        // loose+.rpa game.
+        format!(
+            "Ren'Py writes loose scripts into the ORIGINAL tree even in Replace mode. \
+             {RESTORE_ORIGINAL_FIRST} Then use Add mode: locust inject \"{g}\" -P \
+             \"{p}\" -m add -l {lang}, or direct mode: locust inject \"{g}\" -P \
+             \"{p}\" --direct -l {lang}."
+        )
+    } else {
+        format!("Run: locust inject \"{g}\" -P \"{p}\" --direct -l {lang}")
+    }
+}
+
+/// Remedy for a direct-mode containment failure: the entries point outside
+/// the tree inject was handed, which means the project was extracted from a
+/// different copy of the game.
+fn direct_containment_remedy(project: &std::path::Path, languages: &[String]) -> String {
+    let p = project.display();
+    let lang_flag = if languages.is_empty() {
+        String::new()
+    } else {
+        format!(" -l {}", languages.join(" "))
+    };
+    format!(
+        "The project database references files outside this directory — it was likely \
+         extracted from a DIFFERENT copy of the game (the one containing the file(s) \
+         above). Run inject against that copy instead: locust inject \
+         \"<that game folder>\" -P \"{p}\" --direct{lang_flag}"
+    )
+}
+
+/// Remedy for a per-language Add-mode failure on an engine without Add
+/// support, per engine: Replace works for path-derived engines, but for
+/// entry-tree writers it hits the containment hard-error, so advising it
+/// there would be a dead end.
+fn add_mode_remedy(
+    format_id: &str,
+    game_path: &std::path::Path,
+    project: &std::path::Path,
+    languages: &[String],
+) -> String {
+    let g = game_path.display();
+    let p = project.display();
+    let langs = languages.join(" ");
+    if writes_to_entry_tree(format_id) {
+        format!(
+            "This engine does not support Add mode, and it writes translations into \
+             the original game files, so Replace mode cannot work for it either. Use \
+             direct mode: locust inject \"{g}\" -P \"{p}\" --direct -l {langs}"
+        )
+    } else {
+        format!(
+            "This engine does not support Add mode. Use Replace mode: locust inject \
+             \"{g}\" -P \"{p}\" -l {langs} -o <output_dir>, or direct mode: locust \
+             inject \"{g}\" -P \"{p}\" --direct -l {langs}"
+        )
+    }
+}
+
+/// Surface a recording outcome to the user. The zero-write cases MUST be
+/// printed: a silent keep was the stale-recording hazard, and a silent
+/// nothing-recorded run sends the user into `locust patch` advising the very
+/// command that just reported zero writes.
+fn print_record_outcome(
+    label: &str,
+    outcome: &locust_core::extraction::RecordOutcome,
+    rep: &locust_core::extraction::InjectionReport,
+    format_id: &str,
+) {
+    use locust_core::extraction::RecordOutcome;
+    match outcome {
+        RecordOutcome::Recorded { .. } => {}
+        RecordOutcome::KeptPrevious { recorded_at } => println!(
+            "{label}: 0 files written — previous recording (dated {recorded_at}) kept"
+        ),
+        RecordOutcome::NothingRecorded => {
+            // Say WHY nothing was recorded and name a remedy that fits this
+            // state — `locust patch` on this project will only ever advise
+            // the inject that just wrote zero files.
+            let cause = if rep.strings_skipped > 0 {
+                format!(
+                    " {} string(s) could not be applied (see the warnings below) — \
+                     fix those translations and re-run.",
+                    rep.strings_skipped
+                )
+            } else {
+                String::new()
+            };
+            let restore = if mutates_original_tree(format_id) {
+                " If this game was ALREADY injected, the original text this engine \
+                 scans for is gone and every re-run will keep writing 0 files — \
+                 restore the original game files from a backup or a clean copy, \
+                 then re-run the inject."
+            } else {
+                ""
+            };
+            println!(
+                "{label}: 0 files written — nothing was recorded, and `locust patch` \
+                 refuses to pack until an inject writes at least one file.{cause}{restore}"
+            );
+            for w in rep.warnings.iter().take(5) {
+                println!("  warning: {w}");
+            }
+            if rep.warnings.len() > 5 {
+                println!("  ... and {} more warning(s)", rep.warnings.len() - 5);
+            }
+        }
+    }
 }
 
 fn cmd_patch(
@@ -323,73 +488,189 @@ fn cmd_patch(
     output: Option<PathBuf>,
     astro: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    use locust_core::database::{paths_identical, sha256_hex};
     use std::io::Write as _;
 
     let db = Database::open(&project)?;
+
+    // Friendly pre-check: a project with no translations has nothing to
+    // record or pack yet, and "inject first" would be misdirection.
     let entries = db.get_entries(&EntryFilter::default())?;
-
-    // The content root is derived from the format plugin that recognizes
-    // this game — never guessed from a hardcoded, format-agnostic list.
-    let registry = locust_formats::default_registry();
-    let content_roots: &[&str] = registry
-        .detect(&game_path)
-        .map(|p| p.content_roots())
-        .unwrap_or(&[]);
-
-    // Distinct game files that actually received a translation, keyed by
-    // their game-root-relative archive path. Two different source files
-    // that would collide on that path are a hard error, never a silent
-    // drop.
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut seen: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
-    let mut translated = 0usize;
-    let mut source_archives: Vec<PathBuf> = Vec::new();
-    for e in &entries {
-        let has_text = e.translation.as_deref().is_some_and(|t| !t.trim().is_empty());
-        if has_text && e.status == StringStatus::Translated {
-            translated += 1;
-            // Entries sourced from a container name the archive they were READ
-            // from, not a file injection wrote. Packing it would put the game's
-            // own original content in the patch and no translation at all.
-            if is_source_archive(&e.file_path) {
-                if !source_archives.contains(&e.file_path) {
-                    source_archives.push(e.file_path.clone());
-                }
-                continue;
-            }
-            let rel = rel_in_game(&e.file_path, &game_path, content_roots).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "cannot determine the game-relative path for \"{}\": it is not under \
-                     the game directory \"{}\", and none of its components match a known \
-                     content root {:?} for this format. Packaging an unresolved layout \
-                     would silently discard the file, so this is refused instead.",
-                    e.file_path.display(),
-                    game_path.display(),
-                    content_roots
+    // Reviewed and Approved count as translated here: the desktop Review
+    // page advances strings to `approved`, and telling a fully approved
+    // project to "run `locust translate` first" would re-translate finished
+    // work.
+    let translated = entries
+        .iter()
+        .filter(|e| {
+            e.translation.as_deref().is_some_and(|t| !t.trim().is_empty())
+                && matches!(
+                    e.status,
+                    StringStatus::Translated | StringStatus::Reviewed | StringStatus::Approved
                 )
-            })?;
-            match seen.get(&rel) {
-                Some(existing) if existing != &e.file_path => {
-                    anyhow::bail!(
-                        "two different source files map to the same patch archive path \
-                         \"{}\": \"{}\" and \"{}\"",
-                        rel.display(),
-                        existing.display(),
-                        e.file_path.display()
-                    );
+        })
+        .count();
+    if translated == 0 {
+        anyhow::bail!(
+            "no translated, reviewed, or approved strings in \"{}\" — there is \
+             nothing to pack yet. Run `locust translate` first.",
+            project.display()
+        );
+    }
+
+    let lang_flag = lang
+        .as_deref()
+        .map(|l| format!(" -l {l}"))
+        .unwrap_or_default();
+
+    // `locust patch` packs EXCLUSIVELY from the recording injection persisted:
+    // the root it wrote into, the rels it wrote there, and the hash of every
+    // written file. There is deliberately NO fallback to an entry-derived
+    // list — entries name where text was READ, not what injection wrote, and
+    // packing them is how patches silently shipped original, untranslated
+    // files while claiming to carry translated text only.
+    let keys = db.list_recorded_langs()?;
+    if keys.is_empty() {
+        anyhow::bail!(
+            "no injection has been recorded in \"{}\". `locust patch` packs exactly \
+             the files a recorded injection wrote — never a list guessed from the \
+             database. Run `locust inject \"{}\" -P \"{}\" --direct{}` first, then \
+             re-run patch.{}",
+            project.display(),
+            game_path.display(),
+            project.display(),
+            lang_flag,
+            maybe_mutated_note(&game_path)
+        );
+    }
+
+    let key_label =
+        |k: &Option<String>| -> String { k.clone().unwrap_or_else(|| "(unspecified)".to_string()) };
+
+    let recording = match lang.as_deref() {
+        Some(l) => match db.get_injection(Some(l))? {
+            Some(rec) => rec,
+            None => {
+                // A key mismatch is a loud error listing the recorded keys,
+                // never a silent fallback. Alternatives are offered only when
+                // they provably work from this exact state (their recorded
+                // root must be the tree patch was pointed at).
+                let mut alternatives = String::new();
+                for k in &keys {
+                    let Some(rec) = db.get_injection(k.as_deref())? else {
+                        continue;
+                    };
+                    if !paths_identical(&game_path, &rec.root) {
+                        continue;
+                    }
+                    match k {
+                        Some(kk) => alternatives
+                            .push_str(&format!(", or re-run patch with -l {kk}")),
+                        None if keys.len() == 1 => {
+                            alternatives.push_str(", or re-run patch without -l")
+                        }
+                        None => {}
+                    }
                 }
-                Some(_) => {}
-                None => {
-                    seen.insert(rel.clone(), e.file_path.clone());
-                    files.push(rel);
+                let listed = keys
+                    .iter()
+                    .map(|k| format!("\"{}\"", key_label(k)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "no injection recorded for language \"{l}\"; recorded: [{listed}]. \
+                     Run `locust inject \"{}\" -P \"{}\" --direct -l {l}` to record \
+                     it{alternatives}.{}",
+                    game_path.display(),
+                    project.display(),
+                    maybe_mutated_note(&game_path)
+                );
+            }
+        },
+        None => {
+            if keys.len() == 1 {
+                db.get_injection(keys[0].as_deref())?
+                    .expect("a listed key must resolve to its recording")
+            } else {
+                // Several recordings exist: packing their union produced
+                // mixed-language zips and cross-copy collisions, and silently
+                // picking one — including the language-unspecified key when
+                // it coexists with named ones — would be a guess. Ambiguity
+                // must be the user's explicit choice.
+                let mut listed = String::new();
+                let mut example: Option<String> = None;
+                let mut fallback_example: Option<String> = None;
+                for k in &keys {
+                    let Some(rec) = db.get_injection(k.as_deref())? else {
+                        continue;
+                    };
+                    listed.push_str(&format!(
+                        "\n  {} → {}",
+                        key_label(k),
+                        rec.root.display()
+                    ));
+                    if let Some(kk) = k {
+                        if example.is_none() && paths_identical(&game_path, &rec.root) {
+                            example = Some(format!(
+                                "locust patch \"{}\" -P \"{}\" -l {kk}",
+                                game_path.display(),
+                                project.display()
+                            ));
+                        }
+                        if fallback_example.is_none() {
+                            fallback_example = Some(format!(
+                                "locust patch \"{}\" -P \"{}\" -l {kk}",
+                                rec.root.display(),
+                                project.display()
+                            ));
+                        }
+                    }
                 }
+                let example = example.or(fallback_example).unwrap_or_default();
+                // "Pass -l" alone cannot reach the language-unspecified
+                // recording — no -l value names the NULL key — so listing it
+                // without a way to select it would advertise a dead entry.
+                let unspecified_note = match keys.iter().find(|k| k.is_none()) {
+                    Some(_) => {
+                        let root = db
+                            .get_injection(None)?
+                            .map(|rec| rec.root.display().to_string())
+                            .unwrap_or_else(|| game_path.display().to_string());
+                        format!(
+                            "\nNo -l value can name the \"(unspecified)\" recording; \
+                             to pack it, re-record it under a named language first: \
+                             locust inject \"{root}\" -P \"{}\" --direct -l <lang>, \
+                             then re-run patch with that -l.",
+                            project.display()
+                        )
+                    }
+                    None => String::new(),
+                };
+                anyhow::bail!(
+                    "multiple injection recordings exist in \"{}\", so `patch` without \
+                     -l is ambiguous and refused:{listed}\nPass -l <lang> to choose \
+                     one. Example: {example}{unspecified_note}",
+                    project.display()
+                );
             }
         }
-    }
-    if files.is_empty() {
+    };
+
+    // Bytes are read from the RECORDED root. The game path on the command
+    // line must name that same tree: reading the recorded rels out of any
+    // other tree is exactly how a patch shipped the original files while the
+    // translated copy sat elsewhere.
+    if !paths_identical(&game_path, &recording.root) {
         anyhow::bail!(
-            "no translated files found. Run `locust inject \"{}\" -P <db> --direct` first.",
-            game_path.display()
+            "the recorded injection for {} wrote into \"{}\", not \"{}\". Packing from \
+             a different tree would ship files injection never wrote, so this is \
+             refused. Re-run: locust patch \"{}\" -P \"{}\"{}",
+            key_label(&recording.lang),
+            recording.root.display(),
+            game_path.display(),
+            recording.root.display(),
+            project.display(),
+            lang_flag
         );
     }
 
@@ -399,68 +680,102 @@ fn cmd_patch(
         PathBuf::from(format!("{}{}-patch.zip", base, suffix))
     });
 
-    let zip_file = std::fs::File::create(&out)?;
+    // Never touch whatever already sits at `out` until the new archive is
+    // complete: a user re-running after moving files must not lose their last
+    // published patch to a run that then fails. Build in a temp file in the
+    // same directory and rename over the destination only on success.
+    let tmp = out.with_file_name(format!(
+        "{}.tmp-{}",
+        out.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let zip_file = std::fs::File::create(&tmp)?;
+    // Every fallible step between here and the rename propagates with `?`, and each
+    // one would otherwise leave a stray .tmp-<pid> beside the user's published patch.
+    // A drop guard covers all of them, including early returns added later.
+    let mut tmp_guard = TempFileGuard::new(&tmp);
     let mut zip = zip::ZipWriter::new(zip_file);
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
     let mut added = 0usize;
-    let mut missing_paths: Vec<PathBuf> = Vec::new();
-    let mut skipped_unsafe = 0usize;
-    for rel in &files {
-        // Defense-in-depth: never read or pack a path that escapes the game
-        // root. Guards against a corrupt/untrusted DB producing a zip-slip
-        // entry, since this archive is redistributed to end users.
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+    for f in &recording.files {
+        let rel = std::path::Path::new(&f.rel);
+        // Zip-slip defense in depth: record time cannot emit anything but
+        // plain relative components, but `patch` trusts DB TEXT it did not
+        // derive (a shared .locust.db is a plausible input) and this archive
+        // is redistributed to end users. Only `Normal` components may pass:
+        // a RootDir/Prefix rel is ABSOLUTE, and `root.join(absolute)`
+        // REPLACES the root — the patch would read a file outside the game
+        // tree and ship it, hash-verified from the same row.
         if rel
             .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
         {
-            skipped_unsafe += 1;
-            continue;
+            anyhow::bail!(
+                "recorded path \"{}\" escapes the game root — refusing to pack it",
+                f.rel
+            );
         }
-        let src = game_path.join(rel);
+        // Re-join through components so the path renders with native
+        // separators (rels are stored with `/`; a mixed-separator path in an
+        // error message reads like a corrupted path).
+        let src = recording.root.join(rel.components().collect::<PathBuf>());
         let bytes = match std::fs::read(&src) {
             Ok(b) => b,
             Err(_) => {
-                missing_paths.push(src);
+                missing.push(src);
                 continue;
             }
         };
-        // Zip entry names always use forward slashes.
-        let name = rel.to_string_lossy().replace('\\', "/");
-        zip.start_file(name, opts)?;
+        // Verify BEFORE packing, on the same bytes the zip receives: a packed
+        // file is provably the file injection reported writing.
+        if bytes.len() as u64 != f.size || sha256_hex(&bytes) != f.hash {
+            changed.push(f.rel.clone());
+            continue;
+        }
+        zip.start_file(f.rel.clone(), opts)?;
         zip.write_all(&bytes)?;
         added += 1;
     }
-    let missing = missing_paths.len();
 
-    // A patch holding nothing but the README is worse than a failure: it looks
-    // like a success and ships to end users. This guard is what makes any
-    // remaining path-resolution problem loud instead of silent.
-    if added == 0 {
-        drop(zip);
-        let _ = std::fs::remove_file(&out);
-        let shown: Vec<String> = missing_paths
-            .iter()
-            .take(5)
-            .map(|p| p.display().to_string())
-            .collect();
+    // A recording names every file the patch promised to carry; a missing or
+    // altered one is a hard error, never a silent skip under a README that
+    // claims "translated text only".
+    if !missing.is_empty() || !changed.is_empty() {
+        drop(zip); // release the temp file handle so the guard can remove it
+        let mut detail = String::new();
+        if !changed.is_empty() {
+            detail.push_str("\n  changed on disk since injection recorded them:");
+            for rel in changed.iter().take(5) {
+                detail.push_str(&format!("\n    {rel}"));
+            }
+            if changed.len() > 5 {
+                detail.push_str(&format!("\n    ... and {} more", changed.len() - 5));
+            }
+        }
+        if !missing.is_empty() {
+            detail.push_str("\n  missing from disk:");
+            for p in missing.iter().take(5) {
+                detail.push_str(&format!("\n    {}", p.display()));
+            }
+            if missing.len() > 5 {
+                detail.push_str(&format!("\n    ... and {} more", missing.len() - 5));
+            }
+        }
         anyhow::bail!(
-            "packed 0 files, so no patch was written. {} translated file(s) were expected \
-             but not found on disk{}{}. Run `locust inject \"{}\" -P <db> --direct` first, \
-             or check that this is the same game copy the strings were extracted from.",
-            missing,
-            if shown.is_empty() {
-                String::new()
-            } else {
-                format!(":\n  {}", shown.join("\n  "))
-            },
-            if missing > shown.len() {
-                format!("\n  ... and {} more", missing - shown.len())
-            } else {
-                String::new()
-            },
-            game_path.display()
+            "{} of {} recorded file(s) no longer match what injection wrote:{detail}\n\
+             The patch would not ship the files injection wrote, so it is refused. If \
+             the game files were replaced or restored since injection, re-run `locust \
+             inject \"{}\" -P \"{}\" --direct{}` to re-inject and refresh the \
+             recording, then re-run patch.",
+            missing.len() + changed.len(),
+            recording.files.len(),
+            game_path.display(),
+            project.display(),
+            lang_flag
         );
     }
 
@@ -473,6 +788,14 @@ fn cmd_patch(
     zip.write_all(readme.as_bytes())?;
     zip.finish()?;
 
+    // The archive is complete and durable in `tmp`; only now replace the
+    // destination. `std::fs::rename` replaces an existing file on both
+    // Windows (MOVEFILE_REPLACE_EXISTING) and Unix.
+    if let Err(e) = std::fs::rename(&tmp, &out) {
+        return Err(e.into()); // the guard removes the temp
+    }
+    tmp_guard.disarm(); // the temp is now the destination
+
     if let Some(astro_path) = astro {
         write_astro_stub(&astro_path, &game_path, lang.as_deref())?;
         println!("Astro stub written to {}", astro_path.display());
@@ -482,30 +805,12 @@ fn cmd_patch(
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
     table.add_row(vec!["Patch file", &out.display().to_string()]);
+    table.add_row(vec!["Recording", &key_label(&recording.lang)]);
+    table.add_row(vec!["Recorded root", &recording.root.display().to_string()]);
     table.add_row(vec!["Files packed", &added.to_string()]);
-    if missing > 0 {
-        table.add_row(vec!["Files not found on disk", &missing.to_string()]);
-    }
-    if skipped_unsafe > 0 {
-        table.add_row(vec!["Skipped unsafe paths", &skipped_unsafe.to_string()]);
-    }
     table.add_row(vec!["Translated strings", &translated.to_string()]);
     table.add_row(vec!["Size", &format!("{:.1} KB", size as f64 / 1024.0)]);
     println!("{table}");
-
-    // Report what was actually observed (a file expected at path X was not
-    // there) rather than asserting a cause — a prior version of this
-    // message guessed "inject first?", which sent users toward a fix that
-    // could not help when the real problem was an unresolved content root.
-    if !missing_paths.is_empty() {
-        println!("\nExpected file(s) not found on disk:");
-        for p in missing_paths.iter().take(5) {
-            println!("  {}", p.display());
-        }
-        if missing_paths.len() > 5 {
-            println!("  ... and {} more", missing_paths.len() - 5);
-        }
-    }
 
     Ok(())
 }
@@ -909,6 +1214,31 @@ async fn cmd_inject(
     languages: Vec<String>,
     output_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let mode = match mode.as_deref() {
+        Some("add") => OutputMode::Add,
+        _ => OutputMode::Replace,
+    };
+    let mode_name = match mode {
+        OutputMode::Add => "Add",
+        OutputMode::Replace => "Replace",
+    };
+
+    // A language-less Replace/Add run used to iterate over zero languages:
+    // nothing copied, nothing injected, nothing recorded — and exit 0. That
+    // silent no-op became an untranslated "patch" two commands later.
+    if languages.is_empty() {
+        anyhow::bail!(
+            "{mode_name} mode requires at least one language: pass -l <lang>. The \
+             language names the output (the Replace copy / the Add language files) \
+             and selects the recording `locust patch` packs. Example: locust inject \
+             \"{}\" -P \"{}\"{} -l es{}",
+            game_path.display(),
+            project.display(),
+            if matches!(mode, OutputMode::Add) { " -m add" } else { "" },
+            if matches!(mode, OutputMode::Replace) { " -o <output_dir>" } else { "" },
+        );
+    }
+
     let db = Arc::new(Database::open(&project)?);
     let registry = Arc::new(locust_formats::default_registry());
 
@@ -932,19 +1262,39 @@ async fn cmd_inject(
 
     println!("Creating backup...");
     let injector =
-        locust_core::extraction::MultiLangInjector::new(registry, db, backup_mgr);
-
-    let mode = match mode.as_deref() {
-        Some("add") => OutputMode::Add,
-        _ => OutputMode::Replace,
-    };
+        locust_core::extraction::MultiLangInjector::new(registry, db.clone(), backup_mgr);
 
     let (tx, mut rx) = mpsc::channel(100);
     let report = injector
-        .inject(&game_path, &format_id, mode, languages, output_dir, tx)
+        .inject(
+            &game_path,
+            &format_id,
+            mode,
+            languages.clone(),
+            output_dir,
+            tx,
+        )
         .await?;
 
     while rx.recv().await.is_some() {}
+
+    // Persist, for EVERY processed language, the files its injection actually
+    // wrote and the root it wrote them under — `locust patch` packs from this
+    // recording. The recording itself lives in core (`record_multilang_injection`,
+    // shared with the HTTP server and the desktop app so no inject seam can
+    // skip it); the CLI supplies the per-engine remedy and surfaces the
+    // zero-write outcomes.
+    let outcomes = locust_core::extraction::record_multilang_injection(
+        &db,
+        &report,
+        &languages,
+        &|lang| replace_containment_remedy(&format_id, &game_path, &project, lang),
+    )?;
+    for (lang, outcome) in &outcomes {
+        if let Some(rep) = report.reports.get(lang) {
+            print_record_outcome(lang, outcome, rep, &format_id);
+        }
+    }
 
     let mut table = Table::new();
     table.set_header(vec!["Property", "Value"]);
@@ -965,13 +1315,37 @@ async fn cmd_inject(
     }
     println!("{table}");
 
+    // Surface per-language failures. These used to be swallowed silently:
+    // injection could fail for EVERY language while the command printed a
+    // success table and exited 0 — and the user then shipped an untranslated
+    // "patch" that claimed otherwise.
+    if !report.languages_failed.is_empty() {
+        let mut msg = format!(
+            "injection failed for {} of {} language(s):",
+            report.languages_failed.len(),
+            languages.len()
+        );
+        for (lang, err) in &report.languages_failed {
+            msg.push_str(&format!("\n  {lang}: {err}"));
+        }
+        if report
+            .languages_failed
+            .iter()
+            .any(|(_, e)| e.contains("does not support Add mode"))
+        {
+            msg.push('\n');
+            msg.push_str(&add_mode_remedy(&format_id, &game_path, &project, &languages));
+        }
+        anyhow::bail!("{msg}");
+    }
+
     Ok(())
 }
 
 async fn cmd_inject_direct(
     game_path: PathBuf,
     project: PathBuf,
-    _languages: Vec<String>,
+    languages: Vec<String>,
 ) -> anyhow::Result<()> {
     let db = Database::open(&project)?;
     let registry = locust_formats::default_registry();
@@ -994,6 +1368,34 @@ async fn cmd_inject_direct(
     );
 
     let report = plugin.inject(&game_path, &translated)?;
+
+    // Persist the paths this injection actually wrote — under EVERY requested
+    // language key (recording only the first one silently orphaned `patch -l
+    // <other>`), or under the reserved language-unspecified key when no -l
+    // was given (matched by `patch` without -l). `locust patch` packs from
+    // this recording, because for archive-based engines the written files
+    // never become database entries (Ren'Py extraction skips `zzz_locust*`
+    // and rewrites entry paths to the .rpa).
+    use locust_core::extraction::record_injection_for_lang;
+    let format_id = plugin.id().to_string();
+    let remedy = direct_containment_remedy(&project, &languages);
+    if languages.is_empty() {
+        let outcome =
+            record_injection_for_lang(&db, None, &game_path, &report.files_written, &remedy, None)?;
+        print_record_outcome("(unspecified)", &outcome, &report, &format_id);
+    } else {
+        for lang in &languages {
+            let outcome = record_injection_for_lang(
+                &db,
+                Some(lang),
+                &game_path,
+                &report.files_written,
+                &remedy,
+                None,
+            )?;
+            print_record_outcome(lang, &outcome, &report, &format_id);
+        }
+    }
 
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
@@ -1199,96 +1601,41 @@ mod tests {
     }
 
     #[test]
-    fn test_rel_in_game_is_game_path_relative() {
-        use std::path::Path;
-        let game = Path::new("/games/Game");
+    fn test_temp_file_guard_removes_on_drop_and_survives_disarm() {
+        let dir = patch_test_tempdir();
+        fs::create_dir_all(&dir).unwrap();
 
-        // The game-relative path is correct for every engine WITHOUT consulting
-        // content roots at all — that is the point of resolving against the game
-        // directory first.
-        for (abs, want) in [
-            ("/games/Game/www/data/Map001.json", "www/data/Map001.json"), // RPG Maker MV
-            ("/games/Game/data/System.json", "data/System.json"),         // RPG Maker MZ
-            ("/games/Game/Data/Map084.rxdata", "Data/Map084.rxdata"),     // VX Ace / XP
-            ("/games/Game/game/script.rpy", "game/script.rpy"),           // Ren'Py
-            ("/games/Game/Data/BasicData.wolf", "Data/BasicData.wolf"),   // Wolf RPG
-            ("/games/Game/story.html", "story.html"),                     // SugarCube: game root
-            ("/games/Game/scene01.json", "scene01.json"),                 // VNTextPatch: game root
-        ] {
-            assert_eq!(
-                rel_in_game(Path::new(abs), game, &[]),
-                Some(PathBuf::from(want)),
-                "{abs} should resolve relative to the game directory"
-            );
+        // Dropped while armed: the half-written temp must not be left behind. This is
+        // what covers every `?` between creating the temp archive and renaming it, a
+        // set of exits too numerous to guard one at a time.
+        let armed = dir.join("armed.tmp-1");
+        fs::write(&armed, b"partial").unwrap();
+        {
+            let _g = TempFileGuard::new(&armed);
         }
-    }
+        assert!(
+            !armed.exists(),
+            "an armed guard must remove the temp file when dropped"
+        );
 
-    #[test]
-    fn test_rel_in_game_falls_back_to_content_root_when_outside_game_dir() {
-        use std::path::Path;
-        // A stored path that is not under the game directory (moved game, or a
-        // differently spelled path) falls back to anchoring on a content root.
-        assert_eq!(
-            rel_in_game(
-                Path::new("/elsewhere/OldCopy/www/data/Map001.json"),
-                Path::new("/games/Game"),
-                &["www", "data"]
-            ),
-            Some(PathBuf::from("www/data/Map001.json"))
+        // Disarmed: the file has become the real destination and must survive.
+        let kept = dir.join("kept.tmp-1");
+        fs::write(&kept, b"complete").unwrap();
+        {
+            let mut g = TempFileGuard::new(&kept);
+            g.disarm();
+        }
+        assert!(
+            kept.exists(),
+            "a disarmed guard must leave the file alone — it is the destination now"
         );
     }
 
-    #[test]
-    fn test_rel_in_game_unresolvable_is_none_never_a_bare_filename() {
-        use std::path::Path;
-        // Neither under the game dir nor anchorable: the caller must hard-error.
-        // A bare-filename fallback here is what silently discarded directory
-        // structure and produced README-only patch archives.
-        assert_eq!(
-            rel_in_game(
-                Path::new("/weird/place/strings.txt"),
-                Path::new("/games/Game"),
-                &["www", "data"]
-            ),
-            None
-        );
-    }
+    // ─── cmd_patch packaging tests: `patch` packs EXCLUSIVELY from the
+    // recording injection persisted (root + rel + hash per language key);
+    // every mismatch is a loud error naming a remedy that works ─────────────
 
-    #[test]
-    fn test_rel_in_game_prefers_game_dir_over_ancestor_named_like_a_root() {
-        use std::path::Path;
-        // A game living under an ancestor directory literally named `game`.
-        // Anchoring on the first matching component would pick the OUTER one and
-        // yield `game/MyVN/game/script.rpy`, which resolves nowhere.
-        assert_eq!(
-            rel_in_game(
-                Path::new("/game/MyVN/game/script.rpy"),
-                Path::new("/game/MyVN"),
-                &["game"]
-            ),
-            Some(PathBuf::from("game/script.rpy"))
-        );
-    }
-
-    #[test]
-    fn test_source_archive_detection() {
-        use std::path::Path;
-        // Ren'Py rewrites file_path to the .rpa for archive-sourced entries,
-        // while injection writes loose .rpy files instead. Packing the .rpa
-        // would ship the game's original content and no translation.
-        assert!(is_source_archive(Path::new("/g/game/scripts.rpa")));
-        assert!(is_source_archive(Path::new("/g/game/SCRIPTS.RPA")));
-        // In-place byte-scan injectors write back to these, so they must remain
-        // packable.
-        assert!(!is_source_archive(Path::new("/g/Data/BasicData.wolf")));
-        assert!(!is_source_archive(Path::new("/g/G_Data/resources.assets")));
-        assert!(!is_source_archive(Path::new("/g/game/script.rpy")));
-    }
-
-    // ─── cmd_patch packaging tests (bug: content-root fallback flattens
-    // paths for every non-RPG-Maker engine, see auto-patch-apply design
-    // Decision 7) ────────────────────────────────────────────────────────
-
+    use locust_core::database::{paths_identical, sha256_hex};
     use locust_core::models::StringEntry;
 
     fn patch_test_tempdir() -> PathBuf {
@@ -1297,22 +1644,43 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn test_patch_packages_renpy_game_files_under_game_root() {
-        let base = patch_test_tempdir();
+    /// One translated entry, in the exact shape `locust extract` +
+    /// `locust translate`/`locust import` leave in the database.
+    fn save_translated(db: &Database, id: &str, source: &str, path: &std::path::Path, t: &str) {
+        let mut entry = StringEntry::new(id, source, path.to_path_buf());
+        entry.translation = Some(t.to_string());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+    }
+
+    /// A Ren'Py-shaped game tree with one loose script (a state extraction
+    /// genuinely ingests: loose `.rpy` files become entries with their own
+    /// path), plus a project database holding its translated entry.
+    fn make_renpy_game(base: &std::path::Path) -> (PathBuf, PathBuf, PathBuf, String) {
         let game_dir = base.join("mygame");
         let game_sub = game_dir.join("game");
         fs::create_dir_all(&game_sub).unwrap();
-        let script_path = game_sub.join("script.rpy");
-        let contents = "label start:\n    \"Hola\"\n";
-        fs::write(&script_path, contents).unwrap();
+        let script = game_sub.join("script.rpy");
+        let contents = "label start:\n    \"Hola\"\n".to_string();
+        fs::write(&script, &contents).unwrap();
 
         let db_path = base.join("project.locust.db");
         let db = Database::open(&db_path).unwrap();
-        let mut entry = StringEntry::new("renpy#0", "Hello", script_path.clone());
-        entry.translation = Some("Hola".to_string());
-        entry.status = StringStatus::Translated;
-        db.save_entries(&[entry]).unwrap();
+        save_translated(&db, "script.rpy#2", "Hello", &script, "Hola");
+        drop(db);
+        (game_dir, script, db_path, contents)
+    }
+
+    #[test]
+    fn test_patch_packs_the_recorded_files_and_bytes() {
+        // A recording exists for one key ("es", from a direct inject on the
+        // game root); `patch` without -l resolves the single key and packs
+        // exactly the recorded rels, byte-for-byte.
+        let base = patch_test_tempdir();
+        let (game_dir, script, db_path, contents) = make_renpy_game(&base);
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script]).unwrap();
+        drop(db);
 
         let out_zip = base.join("out-patch.zip");
         cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None).unwrap();
@@ -1328,69 +1696,56 @@ mod tests {
         assert_eq!(read_back, contents);
     }
 
+    #[cfg(windows)]
     #[test]
-    fn test_patch_errors_instead_of_writing_a_readme_only_archive() {
+    fn test_patch_resolves_when_game_path_case_differs_from_record_time() {
+        // The recorded root and the patch-time game path are the same on-disk
+        // directory spelled with different case. The identity check must fold
+        // case where the filesystem does, not refuse a spelling difference.
         let base = patch_test_tempdir();
-        let game_dir = base.join("mygame");
-        let game_sub = game_dir.join("game");
-        fs::create_dir_all(&game_sub).unwrap();
-
-        // The entry resolves to a sane game-relative path, but the file is not on
-        // disk (a pre-inject database, or a different copy of the game).
-        let db_path = base.join("project.locust.db");
+        let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        let mut entry = StringEntry::new("renpy#0", "Hello", game_sub.join("script.rpy"));
-        entry.translation = Some("Hola".to_string());
-        entry.status = StringStatus::Translated;
-        db.save_entries(&[entry]).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script]).unwrap();
+        drop(db);
 
+        let respelled = base.join("MYGAME");
         let out_zip = base.join("out-patch.zip");
-        let err = cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None)
-            .expect_err("packing zero files must be an error, not a README-only archive");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("packed 0 files"),
-            "error must say nothing was packed, got: {msg}"
-        );
-        assert!(
-            msg.contains("script.rpy"),
-            "error must name the file it could not find, got: {msg}"
-        );
-        assert!(
-            !out_zip.exists(),
-            "no archive may be left behind when nothing was packed"
-        );
+        cmd_patch(respelled, db_path, None, Some(out_zip.clone()), None)
+            .expect("a case-divergent spelling of the recorded root must still pack");
+
+        let file = fs::File::open(&out_zip).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert!(archive.by_name("game/script.rpy").is_ok());
     }
 
     #[test]
-    fn test_patch_never_packs_a_source_archive() {
+    fn test_patch_all_rpa_database_packs_recorded_injection_output() {
+        // Archive-shipped Ren'Py game: EVERY database entry names the .rpa it
+        // was READ from, while injection wrote loose .rpy files that
+        // extraction deliberately never re-ingests (it skips `zzz_locust*`).
+        // The patch must come from what injection RECORDED, not from entries.
         let base = patch_test_tempdir();
         let game_dir = base.join("renpygame");
         let game_sub = game_dir.join("game");
         fs::create_dir_all(&game_sub).unwrap();
-
-        // Ren'Py rewrites file_path to the .rpa for archive-sourced entries. The
-        // archive exists on disk, so nothing stops it from being read — packing it
-        // would ship the game's original content and zero translations.
         let rpa_path = game_sub.join("scripts.rpa");
         fs::write(&rpa_path, b"RPA-3.0 fake original archive bytes").unwrap();
-        // A real translated file alongside it, so the run has something to pack
-        // and does not merely trip the zero-files guard.
-        let loose = game_sub.join("zzz_locust_translate.rpy");
-        fs::write(&loose, "# translations\n").unwrap();
+        // What injection actually wrote for the archive content.
+        let loose = game_sub.join("script.rpy");
+        fs::write(&loose, "label start:\n    \"Hola\"\n").unwrap();
+        let filter = game_sub.join("zzz_locust_translate.rpy");
+        fs::write(&filter, "# runtime filter\n").unwrap();
 
         let db_path = base.join("project.locust.db");
         let db = Database::open(&db_path).unwrap();
-        let mut from_rpa = StringEntry::new("scripts.rpa#0", "Hello", rpa_path.clone());
-        from_rpa.translation = Some("Hola".to_string());
-        from_rpa.status = StringStatus::Translated;
-        let mut from_loose = StringEntry::new("zzz#0", "Hi", loose.clone());
-        from_loose.translation = Some("Hola".to_string());
-        from_loose.status = StringStatus::Translated;
-        db.save_entries(&[from_rpa, from_loose]).unwrap();
+        save_translated(&db, "scripts.rpa#script.rpy#2", "Hello", &rpa_path, "Hola");
+        db.record_injection(Some("es"), &game_dir, &[loose.clone(), filter.clone()])
+            .unwrap();
+        drop(db);
 
         let out_zip = base.join("out-patch.zip");
-        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None).unwrap();
+        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None)
+            .expect("an all-archive database with recorded injection output must pack");
 
         let file = fs::File::open(&out_zip).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -1398,113 +1753,632 @@ mod tests {
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .collect();
         assert!(
-            !names.iter().any(|n| n.ends_with(".rpa")),
-            "a source archive must never be packed, got entries: {names:?}"
+            names.iter().any(|n| n == "game/script.rpy"),
+            "the loose .rpy injection wrote must be packed, got: {names:?}"
         );
         assert!(
             names.iter().any(|n| n == "game/zzz_locust_translate.rpy"),
-            "the actual translated file must still be packed, got entries: {names:?}"
+            "the generated filter file must be packed, got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with(".rpa")),
+            "the source archive was never recorded as written, so it must not pack: {names:?}"
         );
     }
 
     #[test]
-    fn test_patch_packages_rpgmaker_www_data_unchanged() {
+    fn test_patch_without_recording_names_the_exact_inject_command() {
+        // A legacy database (or one whose old-format recording was dropped by
+        // the migration): entries are translated, but nothing was ever
+        // recorded. There is deliberately NO entry-derived fallback — the
+        // fallback was the mechanism of every silently-wrong patch — so this
+        // must hard-error naming the exact command that records an injection.
         let base = patch_test_tempdir();
-        let game_dir = base.join("rpggame");
-        let data_dir = game_dir.join("www").join("data");
-        fs::create_dir_all(&data_dir).unwrap();
-        let map_path = data_dir.join("Map001.json");
-        let contents = r#"{"displayName":"Hola"}"#;
-        fs::write(&map_path, contents).unwrap();
-
-        let db_path = base.join("project.locust.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut entry = StringEntry::new("rpg#0", "Hello", map_path.clone());
-        entry.translation = Some("Hola".to_string());
-        entry.status = StringStatus::Translated;
-        db.save_entries(&[entry]).unwrap();
+        let (game_dir, _script, db_path, _) = make_renpy_game(&base);
 
         let out_zip = base.join("out-patch.zip");
-        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None).unwrap();
-
-        let file = fs::File::open(&out_zip).unwrap();
-        let mut archive = zip::ZipArchive::new(file).unwrap();
-        let mut zf = archive
-            .by_name("www/data/Map001.json")
-            .expect("www/data/Map001.json must be packed in the archive");
-        let mut read_back = String::new();
-        use std::io::Read as _;
-        zf.read_to_string(&mut read_back).unwrap();
-        assert_eq!(read_back, contents);
+        let err = cmd_patch(
+            game_dir.clone(),
+            db_path.clone(),
+            Some("es".to_string()),
+            Some(out_zip.clone()),
+            None,
+        )
+        .expect_err("no recording must be a hard error, never an entry-derived guess");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no injection has been recorded"),
+            "error must say what is missing: {msg}"
+        );
+        let advised = format!(
+            "locust inject \"{}\" -P \"{}\" --direct -l es",
+            game_dir.display(),
+            db_path.display()
+        );
+        assert!(
+            msg.contains(&advised),
+            "error must name the exact inject command\nwant: {advised}\ngot: {msg}"
+        );
+        assert!(!out_zip.exists(), "no archive may be written on this path");
     }
 
     #[test]
-    fn test_patch_errors_on_archive_path_collision_between_distinct_files() {
+    fn test_patch_key_miss_is_a_loud_error_listing_recorded_keys() {
+        // A recording exists — for a DIFFERENT language. The old code fell
+        // back to the entry-derived list silently; now the mismatch is loud,
+        // lists what IS recorded, and offers only remedies that work from
+        // this state ( `-l fr` is offered because fr's root IS this tree).
         let base = patch_test_tempdir();
-        // Only used so the Ren'Py plugin is detected (content root "game");
-        // the colliding entries below point at unrelated fabricated paths.
-        let game_dir = base.join("realgame");
+        let (game_dir, script, db_path, _) = make_renpy_game(&base);
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("fr"), &game_dir, &[script]).unwrap();
+        drop(db);
+
+        let out_zip = base.join("out-patch.zip");
+        let err = cmd_patch(
+            game_dir.clone(),
+            db_path.clone(),
+            Some("es".to_string()),
+            Some(out_zip),
+            None,
+        )
+        .expect_err("a language with no recording must be a hard error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no injection recorded for language \"es\""),
+            "error must name the missing key: {msg}"
+        );
+        assert!(msg.contains("\"fr\""), "error must list the recorded keys: {msg}");
+        assert!(
+            msg.contains("--direct -l es"),
+            "error must advise recording the requested language: {msg}"
+        );
+        assert!(
+            msg.contains("-l fr"),
+            "error must offer the recorded key whose root is this tree: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_patch_null_key_is_packed_without_lang_and_never_by_a_named_lang() {
+        // `--direct` without -l records under the reserved language-unspecified
+        // key: `patch` without -l packs it, `patch -l es` must NOT silently
+        // match it.
+        let base = patch_test_tempdir();
+        let (game_dir, script, db_path, _) = make_renpy_game(&base);
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(None, &game_dir, &[script]).unwrap();
+        drop(db);
+
+        let out_zip = base.join("out-patch.zip");
+        cmd_patch(
+            game_dir.clone(),
+            db_path.clone(),
+            None,
+            Some(out_zip.clone()),
+            None,
+        )
+        .expect("the language-unspecified recording must pack without -l");
+        assert!(out_zip.exists());
+
+        let err = cmd_patch(
+            game_dir,
+            db_path,
+            Some("es".to_string()),
+            Some(base.join("other.zip")),
+            None,
+        )
+        .expect_err("a named language must never silently match the unspecified key");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("(unspecified)"),
+            "error must list the unspecified key so the state is visible: {msg}"
+        );
+        assert!(
+            msg.contains("without -l"),
+            "the working remedy here is re-running patch without -l: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_patch_without_lang_and_multiple_keys_requires_an_explicit_choice() {
+        // Key set {es, (unspecified)} with `patch` invoked without -l is
+        // claimed by two rules: "NULL key is matched by patch without -l" and
+        // "multiple keys without -l is an error". The error wins — packing a
+        // silent guess (or the union) is how mixed-language zips shipped.
+        let base = patch_test_tempdir();
+        let (game_dir, script, db_path, _) = make_renpy_game(&base);
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script.clone()]).unwrap();
+        db.record_injection(None, &game_dir, &[script]).unwrap();
+        drop(db);
+
+        let out_zip = base.join("out-patch.zip");
+        let err = cmd_patch(
+            game_dir.clone(),
+            db_path.clone(),
+            None,
+            Some(out_zip.clone()),
+            None,
+        )
+        .expect_err("multiple keys without -l must be a hard error, not a guess");
+        let msg = err.to_string();
+        assert!(msg.contains("es"), "error must list the named key: {msg}");
+        assert!(
+            msg.contains("(unspecified)"),
+            "error must list the unspecified key too: {msg}"
+        );
+        assert!(msg.contains("-l"), "error must require an explicit -l: {msg}");
+        // "Pass -l <lang>" alone cannot reach the (unspecified) recording —
+        // no -l value names the NULL key. The error must say how to reach it:
+        // re-record it under a named key.
+        assert!(
+            msg.contains("re-record") && msg.contains("--direct -l <lang>"),
+            "the unspecified recording must be reachable, not a dead entry \
+             in a list: {msg}"
+        );
+        assert!(!out_zip.exists());
+
+        // The advised choice unblocks.
+        cmd_patch(game_dir, db_path, Some("es".to_string()), Some(out_zip.clone()), None)
+            .expect("choosing a key with -l must unblock");
+        assert!(out_zip.exists());
+    }
+
+    /// A Wolf-RPG-shaped game (engine class E5, an entry-tree writer whose
+    /// originals are byte-patched in place) with one translated entry, for
+    /// exercising the mutated-originals advice on `patch`'s error paths.
+    fn make_wolf_game(base: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let game_dir = base.join("wolfgame");
+        let data = game_dir.join("Data");
+        fs::create_dir_all(&data).unwrap();
+        let wolf_file = data.join("BasicData.wolf");
+        fs::write(&wolf_file, locust_formats::wolf_rpg::build_test_fixture()).unwrap();
+
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+        save_translated(&db, "BasicData.wolf#0", "テストデータ", &wolf_file, "test");
+        drop(db);
+        (game_dir, wolf_file, db_path)
+    }
+
+    #[test]
+    fn test_replace_containment_remedy_says_restore_first_for_every_mutating_engine() {
+        // Both engine classes that mutate the ORIGINAL tree in Replace mode
+        // must lead with the restore step: a bare re-run against the mutated
+        // tree finds no original source text, writes nothing (or, for a mixed
+        // Ren'Py game, only the archive-derived files), and records a
+        // recording that silently omits the loose translations.
+        let game = PathBuf::from("game");
+        let project = PathBuf::from("proj.db");
+
+        // Ren'Py: loose scripts were already rewritten in place when the
+        // containment error fires (renpy.rs writes to entry.file_path).
+        let renpy = replace_containment_remedy("renpy", &game, &project, "es");
+        assert!(
+            renpy.contains("restore"),
+            "the Ren'Py remedy must lead with restoring the original: {renpy}"
+        );
+        assert!(renpy.contains("-m add"), "{renpy}");
+        assert!(renpy.contains("--direct -l es"), "{renpy}");
+
+        // Entry-tree writers already carried the restore step; keep it.
+        let wolf = replace_containment_remedy("wolf-rpg", &game, &project, "es");
+        assert!(wolf.contains("restore"), "{wolf}");
+        assert!(wolf.contains("--direct -l es"), "{wolf}");
+
+        // Path-derived engines never mutate the original: no restore step.
+        let html = replace_containment_remedy("html-game", &game, &project, "es");
+        assert!(
+            !html.contains("restore"),
+            "a non-mutating engine must not be told to restore anything: {html}"
+        );
+    }
+
+    #[test]
+    fn test_patch_no_recording_advice_warns_when_the_originals_may_be_mutated() {
+        // A legacy database on an already-injected entry-tree game: `patch`
+        // advises a bare `--direct` re-run, but for engines that mutate the
+        // originals that re-run writes 0 files and records nothing — the
+        // identical error forever. The advice must carry the restore-first
+        // note. `patch` cannot know whether a prior inject ran, so the note
+        // is conditional where the containment remedies are imperative.
+        let base = patch_test_tempdir();
+        let (game_dir, _wolf_file, db_path) = make_wolf_game(&base);
+
+        let err = cmd_patch(game_dir.clone(), db_path.clone(), Some("es".to_string()), None, None)
+            .expect_err("no recording must be a hard error");
+        let msg = err.to_string();
+        assert!(msg.contains("no injection has been recorded"), "{msg}");
+        assert!(
+            msg.contains("0 files written") && msg.contains("restore the original"),
+            "the advice must explain the already-injected dead end and its way \
+             out for an engine that mutates originals: {msg}"
+        );
+
+        // Triangulate: a path-derived engine's advice stays unconditional.
+        let base2 = patch_test_tempdir();
+        let (game2, _script, db2, _) = make_renpy_game(&base2);
+        // Ren'Py mutates loose scripts, so it gets the note too; an HTML game
+        // (pure path-derived writes) must not.
+        let err2 = cmd_patch(game2, db2, Some("es".to_string()), None, None).unwrap_err();
+        assert!(err2.to_string().contains("restore the original"), "{err2}");
+
+        let base3 = patch_test_tempdir();
+        let game3 = base3.join("htmlgame");
+        fs::create_dir_all(&game3).unwrap();
+        fs::write(game3.join("index.html"), "<html><body><p>Hi there world</p></body></html>").unwrap();
+        let db3 = base3.join("project.locust.db");
+        let dbh = Database::open(&db3).unwrap();
+        save_translated(&dbh, "index.html#0", "Hi there world", &game3.join("index.html"), "Hola");
+        drop(dbh);
+        let err3 = cmd_patch(game3, db3, Some("es".to_string()), None, None).unwrap_err();
+        let msg3 = err3.to_string();
+        assert!(msg3.contains("no injection has been recorded"), "{msg3}");
+        assert!(
+            !msg3.contains("restore the original"),
+            "a non-mutating engine's advice must stay unconditional: {msg3}"
+        );
+    }
+
+    #[test]
+    fn test_patch_key_miss_advice_warns_when_the_originals_may_be_mutated() {
+        // A recording exists for another language on an entry-tree game: its
+        // originals were provably byte-patched by that inject, so the advised
+        // `--direct -l <missing>` re-run needs the same restore-first note.
+        let base = patch_test_tempdir();
+        let (game_dir, wolf_file, db_path) = make_wolf_game(&base);
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("fr"), &game_dir, &[wolf_file]).unwrap();
+        drop(db);
+
+        let err = cmd_patch(game_dir, db_path, Some("es".to_string()), None, None)
+            .expect_err("a key miss must be a hard error");
+        let msg = err.to_string();
+        assert!(msg.contains("no injection recorded for language \"es\""), "{msg}");
+        assert!(
+            msg.contains("0 files written") && msg.contains("restore the original"),
+            "the advised --direct re-run dead-ends on the already-patched \
+             originals without the restore note: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_patch_refuses_recorded_rels_that_are_not_plain_relative_paths() {
+        // Record time cannot emit an absolute rel, but `patch` trusts DB TEXT
+        // it did not derive (a shared .locust.db is a plausible input). An
+        // absolute rel survives a ParentDir-only guard, and
+        // `recording.root.join(abs)` REPLACES the root — the patch would read
+        // a file outside the game tree and ship it, hash-verified from the
+        // same row.
+        let base = patch_test_tempdir();
+        let (game_dir, script, db_path, _) = make_renpy_game(&base);
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script]).unwrap();
+        drop(db);
+
+        let secret = base.join("secret.txt");
+        let payload: &[u8] = b"outside the game tree";
+        fs::write(&secret, payload).unwrap();
+        let abs_rel = secret.display().to_string().replace('\\', "/");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE injected_files SET rel = ?1, hash = ?2, size = ?3",
+            rusqlite::params![abs_rel, sha256_hex(payload), payload.len() as i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let out_zip = base.join("out-patch.zip");
+        let err = cmd_patch(
+            game_dir.clone(),
+            db_path.clone(),
+            None,
+            Some(out_zip.clone()),
+            None,
+        )
+        .expect_err("an absolute recorded rel must be refused, never packed");
+        assert!(
+            err.to_string().contains("escapes the game root"),
+            "the refusal must name the escape: {err}"
+        );
+        assert!(!out_zip.exists(), "no archive may ship an out-of-tree file");
+
+        // Triangulate: a `..` rel is refused by the same guard.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE injected_files SET rel = '../evil.txt'", [])
+            .unwrap();
+        drop(conn);
+        let err = cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None)
+            .expect_err("a parent-dir rel must be refused");
+        assert!(err.to_string().contains("escapes the game root"), "{err}");
+        assert!(!out_zip.exists());
+    }
+
+    #[test]
+    fn test_patch_counts_reviewed_and_approved_strings_as_translated() {
+        // The desktop Review page sets `approved` (Review.tsx); `patch`'s
+        // pre-check must not send a fully reviewed/approved project back to
+        // `locust translate` — that advice would re-translate finished work.
+        for status in [StringStatus::Approved, StringStatus::Reviewed] {
+            let base = patch_test_tempdir();
+            let game_dir = base.join("mygame");
+            let game_sub = game_dir.join("game");
+            fs::create_dir_all(&game_sub).unwrap();
+            let script = game_sub.join("script.rpy");
+            fs::write(&script, "label start:\n    \"Hola\"\n").unwrap();
+            let db_path = base.join("project.locust.db");
+            let db = Database::open(&db_path).unwrap();
+            let mut entry = StringEntry::new("script.rpy#2", "Hello", script.clone());
+            entry.translation = Some("Hola".to_string());
+            entry.status = status.clone();
+            db.save_entries(&[entry]).unwrap();
+            drop(db);
+
+            let err = cmd_patch(game_dir, db_path, Some("es".to_string()), None, None)
+                .expect_err("no recording exists, so patch still errors — but LATER");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no injection has been recorded"),
+                "a {status:?} project must pass the translated-strings gate: {msg}"
+            );
+            assert!(
+                !msg.contains("locust translate"),
+                "re-translating finished work must never be the advice: {msg}"
+            );
+        }
+
+        // Triangulate: a project with nothing translated still gets the gate.
+        let base = patch_test_tempdir();
+        let game_dir = base.join("mygame");
+        fs::create_dir_all(game_dir.join("game")).unwrap();
+        let script = game_dir.join("game").join("script.rpy");
+        fs::write(&script, "label start:\n    \"Hello\"\n").unwrap();
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+        db.save_entries(&[StringEntry::new("script.rpy#2", "Hello", script)])
+            .unwrap();
+        drop(db);
+        let err = cmd_patch(game_dir, db_path, None, None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to pack yet"),
+            "an untranslated project must still be told to translate: {err}"
+        );
+    }
+
+    #[test]
+    fn test_patch_refuses_the_wrong_tree_and_names_the_recorded_root() {
+        // R6: Replace-mode injection recorded under the per-language COPY;
+        // the user points patch at the ORIGINAL. The old content-root anchor
+        // silently re-read the rels out of the original — an untranslated zip
+        // claiming "translated text only". Now: hard error naming the root.
+        let base = patch_test_tempdir();
+        let (game_dir, _script, db_path, _) = make_renpy_game(&base);
+        // The Replace copy, injected and recorded.
+        let copy_dir = base.join("out").join("mygame-es");
+        let copy_sub = copy_dir.join("game");
+        fs::create_dir_all(&copy_sub).unwrap();
+        let copy_script = copy_sub.join("script.rpy");
+        fs::write(&copy_script, "label start:\n    \"Hola\"\n").unwrap();
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("es"), &copy_dir, &[copy_script]).unwrap();
+        drop(db);
+
+        let out_zip = base.join("out-patch.zip");
+        let err = cmd_patch(
+            game_dir,
+            db_path.clone(),
+            Some("es".to_string()),
+            Some(out_zip.clone()),
+            None,
+        )
+        .expect_err("packing recorded rels out of a different tree must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&copy_dir.display().to_string()),
+            "error must name the recorded root to point patch at: {msg}"
+        );
+        assert!(!out_zip.exists());
+
+        // The advised command — patch pointed at the recorded root — unblocks.
+        cmd_patch(
+            copy_dir,
+            db_path,
+            Some("es".to_string()),
+            Some(out_zip.clone()),
+            None,
+        )
+        .expect("patch pointed at the recorded root must pack");
+        assert!(out_zip.exists());
+    }
+
+    #[test]
+    fn test_patch_refuses_a_recorded_file_that_changed_since_injection() {
+        // The recording carries the hash of what injection wrote; a file that
+        // no longer matches must fail loudly instead of shipping bytes nobody
+        // verified (F8: nothing ever checked a packed file was the file
+        // injection reported writing).
+        let base = patch_test_tempdir();
+        let (game_dir, script, db_path, _) = make_renpy_game(&base);
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script.clone()]).unwrap();
+        drop(db);
+
+        fs::write(&script, "label start:\n    \"Overwritten\"\n").unwrap();
+
+        let out_zip = base.join("out-patch.zip");
+        let err = cmd_patch(
+            game_dir,
+            db_path,
+            Some("es".to_string()),
+            Some(out_zip.clone()),
+            None,
+        )
+        .expect_err("a changed file must refuse to pack");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("changed on disk since injection"),
+            "error must say what happened: {msg}"
+        );
+        assert!(
+            msg.contains("game/script.rpy"),
+            "error must name the changed rel: {msg}"
+        );
+        assert!(
+            msg.contains("--direct -l es"),
+            "error must advise re-injecting to refresh the recording: {msg}"
+        );
+        assert!(!out_zip.exists(), "no archive may be written on this path");
+    }
+
+    #[test]
+    fn test_patch_errors_when_a_recorded_file_is_missing() {
+        // A recording names every file the patch promised to carry. A missing
+        // one must be a hard error naming the path — the old flow listed it
+        // under "Files not found on disk" and shipped the zip anyway.
+        let base = patch_test_tempdir();
+        let (game_dir, script, db_path, _) = make_renpy_game(&base);
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script.clone()]).unwrap();
+        drop(db);
+
+        fs::remove_file(&script).unwrap();
+
+        let out_zip = base.join("out-patch.zip");
+        let err = cmd_patch(
+            game_dir,
+            db_path,
+            Some("es".to_string()),
+            Some(out_zip.clone()),
+            None,
+        )
+        .expect_err("a missing recorded file must be an error, not a silent skip");
+        let msg = err.to_string();
+        assert!(msg.contains("missing from disk"), "{msg}");
+        assert!(
+            msg.contains(&script.display().to_string()),
+            "error must name the missing path: {msg}"
+        );
+        assert!(
+            !out_zip.exists(),
+            "no archive may be left behind when the recording cannot be honored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inject_direct_records_rel_root_and_hash_per_language() {
+        // The bridge that makes the recorded-injection patch path reachable:
+        // `locust inject --direct` must persist root + rel + hash for EVERY
+        // requested language (recording only the first orphaned `patch -l
+        // <other>` — today's F1 bug).
+        let base = patch_test_tempdir();
+        let game_dir = base.join("renpygame");
         let game_sub = game_dir.join("game");
         fs::create_dir_all(&game_sub).unwrap();
-        fs::write(game_sub.join("dummy.rpy"), "").unwrap();
+        let script = game_sub.join("script.rpy");
+        fs::write(&script, "label start:\n    \"Hello, world!\"\n").unwrap();
 
         let db_path = base.join("project.locust.db");
         let db = Database::open(&db_path).unwrap();
+        save_translated(&db, "script.rpy#2", "Hello, world!", &script, "Hola, mundo!");
+        drop(db);
 
-        // Two DISTINCT source files that both reduce to the same archive
-        // path "game/script.rpy" once the "game" content-root anchor is
-        // applied — e.g. two different copies of the game contributing a
-        // same-named script.
-        let path_a = base.join("copyA").join("game").join("script.rpy");
-        let path_b = base.join("copyB").join("game").join("script.rpy");
+        cmd_inject_direct(
+            game_dir.clone(),
+            db_path.clone(),
+            vec!["es".to_string(), "fr".to_string()],
+        )
+        .await
+        .unwrap();
 
-        let mut entry_a = StringEntry::new("a#0", "Hello", path_a.clone());
-        entry_a.translation = Some("Hola".to_string());
-        entry_a.status = StringStatus::Translated;
-        let mut entry_b = StringEntry::new("b#0", "World", path_b.clone());
-        entry_b.translation = Some("Mundo".to_string());
-        entry_b.status = StringStatus::Translated;
-        db.save_entries(&[entry_a, entry_b]).unwrap();
+        let db = Database::open(&db_path).unwrap();
+        for lang in ["es", "fr"] {
+            let rec = db
+                .get_injection(Some(lang))
+                .unwrap()
+                .unwrap_or_else(|| panic!("a recording must exist for {lang}"));
+            assert!(
+                paths_identical(&rec.root, &game_dir),
+                "{lang}: the recorded root must be the injected game dir"
+            );
+            assert_eq!(rec.files.len(), 1, "{lang}: exactly the written file");
+            assert_eq!(rec.files[0].rel, "game/script.rpy");
+            let on_disk = fs::read(&script).unwrap();
+            assert_eq!(
+                rec.files[0].hash,
+                sha256_hex(&on_disk),
+                "{lang}: the recorded hash must be the hash of the written bytes"
+            );
+        }
+    }
 
-        let out_zip = base.join("out-patch.zip");
-        let err = cmd_patch(game_dir, db_path, None, Some(out_zip), None).unwrap_err();
-        let msg = err.to_string();
+    #[tokio::test]
+    async fn test_inject_direct_without_lang_records_the_unspecified_key() {
+        let base = patch_test_tempdir();
+        let game_dir = base.join("renpygame");
+        let game_sub = game_dir.join("game");
+        fs::create_dir_all(&game_sub).unwrap();
+        let script = game_sub.join("script.rpy");
+        fs::write(&script, "label start:\n    \"Hello, world!\"\n").unwrap();
+
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+        save_translated(&db, "script.rpy#2", "Hello, world!", &script, "Hola, mundo!");
+        drop(db);
+
+        cmd_inject_direct(game_dir, db_path.clone(), Vec::new())
+            .await
+            .unwrap();
+
+        let db = Database::open(&db_path).unwrap();
         assert!(
-            msg.contains(&path_a.display().to_string()),
-            "error should name {}: {}",
-            path_a.display(),
-            msg
+            db.get_injection(None).unwrap().is_some(),
+            "no -l must record under the reserved language-unspecified key"
         );
         assert!(
-            msg.contains(&path_b.display().to_string()),
-            "error should name {}: {}",
-            path_b.display(),
-            msg
+            db.get_injection(Some("es")).unwrap().is_none(),
+            "no named key may be invented"
         );
     }
 
     #[test]
-    fn test_patch_errors_on_unresolvable_layout_instead_of_flattening() {
+    fn test_patch_failed_run_leaves_existing_output_untouched() {
+        // A previously published patch sits at `-o`. A re-run that fails the
+        // recording verification (file missing since) must not truncate or
+        // delete it: the archive is built in a temp file and renamed over the
+        // destination only on success; the drop guard removes the temp.
         let base = patch_test_tempdir();
-        // A directory with no plugin-recognized layout at all.
-        let game_dir = base.join("unknown_engine_game");
-        fs::create_dir_all(&game_dir).unwrap();
-
-        let db_path = base.join("project.locust.db");
+        let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        let orphan_path = base.join("somewhere").join("deep").join("strings.txt");
-        let mut entry = StringEntry::new("x#0", "Hello", orphan_path.clone());
-        entry.translation = Some("Hola".to_string());
-        entry.status = StringStatus::Translated;
-        db.save_entries(&[entry]).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script.clone()]).unwrap();
+        drop(db);
+        fs::remove_file(&script).unwrap();
 
-        let out_zip = base.join("out-patch.zip");
-        let err = cmd_patch(game_dir, db_path, None, Some(out_zip), None).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains(&orphan_path.display().to_string()),
-            "error should name the unresolved path: {}",
-            msg
+        let out_zip = base.join("published-patch.zip");
+        let published = b"previously published good patch bytes";
+        fs::write(&out_zip, published).unwrap();
+
+        let err = cmd_patch(
+            game_dir,
+            db_path,
+            Some("es".to_string()),
+            Some(out_zip.clone()),
+            None,
+        )
+        .expect_err("a recording that cannot be honored must remain an error");
+        assert!(err.to_string().contains("missing from disk"), "{err}");
+        assert_eq!(
+            fs::read(&out_zip).unwrap(),
+            published,
+            "the previously published patch must survive a failed run byte-for-byte"
         );
+        // No temp litter either.
+        let leftovers: Vec<_> = fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
     }
 }

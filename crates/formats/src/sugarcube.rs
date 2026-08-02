@@ -602,6 +602,9 @@ impl FormatPlugin for SugarCubePlugin {
             strings_written: written,
             strings_skipped: skipped,
             warnings: Vec::new(),
+            // Reported only when a translation landed, matching
+            // `files_modified`: a zero-replacement rewrite is byte-identical.
+            files_written: if written > 0 { vec![html_file] } else { Vec::new() },
         })
     }
 }
