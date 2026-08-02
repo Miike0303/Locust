@@ -25,7 +25,12 @@ in --dll-dir, the locust binary, and the sibling vn-tools scripts.
 import os, sys, subprocess, time, glob, argparse, struct, re, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOCUST = os.environ.get("LOCUST_BIN", r"C:/Projects/Locust/target-alt/debug/locust.exe")
+# Default to the release binary in the standard cargo output. This used to point at
+# target-alt/debug — a non-standard build directory holding a debug build, which kept
+# ~5 GB alive purely to satisfy this default and ran the slow binary besides.
+# Override with LOCUST_BIN when the binary lives elsewhere.
+_DEFAULT_LOCUST = os.path.join(HERE, "..", "..", "target", "release", "locust.exe")
+LOCUST = os.environ.get("LOCUST_BIN", os.path.normpath(_DEFAULT_LOCUST))
 
 def log(msg): print(f"[autopatch] {msg}", flush=True)
 
