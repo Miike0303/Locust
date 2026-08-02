@@ -156,6 +156,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/translate/cancel/:job_id", post(translate_cancel))
         .route("/api/translate/ws/:job_id", get(translate_ws))
         .route("/api/inject", post(inject))
+        .route("/api/patch/verify", post(patch_verify))
+        .route("/api/patch/apply", post(patch_apply))
+        .route("/api/patch/rollback", post(patch_rollback))
+        .route("/api/patch/status", post(patch_status))
         .route("/api/validate", post(validate))
         .route("/api/glossary", get(get_glossary).post(add_glossary))
         .route("/api/glossary/:term", delete(delete_glossary))
@@ -648,6 +652,148 @@ async fn inject(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+}
+
+// ─── Patch apply / rollback / status ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PatchPathsRequest {
+    game_path: String,
+    zip_path: Option<String>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    confirm_legacy: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn map_patch_err(e: locust_core::error::LocustError) -> ApiError {
+    use locust_core::error::LocustError::*;
+    let status = match &e {
+        PatchAlreadyApplied(_) | PatchDowngradeBlocked { .. } | PatchInterrupted(_)
+        | PatchLegacyUnconfirmed(_) | PatchVerificationFailed(_) | PatchBackupIncomplete(_) => {
+            StatusCode::CONFLICT
+        }
+        PatchUnsafeEntry(_) | GameDirNotWritable(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(status, e)
+}
+
+async fn patch_verify(
+    Json(req): Json<PatchPathsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let zip = req
+        .zip_path
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "zip_path required"))?;
+    let report = locust_core::patch::verify(
+        &PathBuf::from(&req.game_path),
+        &PathBuf::from(&zip),
+    )
+    .map_err(map_patch_err)?;
+    Ok(Json(serde_json::json!({
+        "outcome": format!("{:?}", report.outcome),
+        "tier": report.tier.map(|t| format!("{:?}", t)),
+        "replaced": report.replaced,
+        "added": report.added,
+        "conflicts": report.conflicts,
+        "backup_compromised": report.backup_compromised,
+        "messages": report.messages,
+        "manifest": report.manifest,
+    })))
+}
+
+async fn patch_apply(
+    Json(req): Json<PatchPathsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let zip = req
+        .zip_path
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "zip_path required"))?;
+    let opts = locust_core::patch::ApplyOptions {
+        force: req.force,
+        confirm_legacy: req.confirm_legacy,
+        dry_run: req.dry_run,
+    };
+    // Apply is disk-bound and journaled; run off the async runtime.
+    let game = PathBuf::from(&req.game_path);
+    let zip = PathBuf::from(&zip);
+    let report = tokio::task::spawn_blocking(move || {
+        locust_core::patch::apply(&game, &zip, opts, |_| {})
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(map_patch_err)?;
+    Ok(Json(serde_json::json!({
+        "patch_id": report.patch_id,
+        "patch_version": report.patch_version,
+        "replaced": report.replaced,
+        "added": report.added,
+        "forced": report.forced,
+        "baseline": format!("{:?}", report.baseline),
+        "dry_run": report.dry_run,
+        "user_edits_overwritten": report.user_edits_overwritten,
+        "messages": report.messages,
+    })))
+}
+
+async fn patch_rollback(
+    Json(req): Json<PatchPathsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let game = PathBuf::from(&req.game_path);
+    let force = req.force;
+    let report = tokio::task::spawn_blocking(move || {
+        locust_core::patch::rollback(
+            &game,
+            locust_core::patch::RollbackOptions {
+                delete_modified_added: force,
+            },
+        )
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(map_patch_err)?;
+    Ok(Json(serde_json::json!({
+        "restored": report.restored,
+        "deleted": report.deleted,
+        "baseline": report.baseline.map(|b| format!("{:?}", b)),
+        "messages": report.messages,
+        "aborted_edited": report.aborted_edited,
+        "torn_deleted": report.torn_deleted,
+    })))
+}
+
+async fn patch_status(
+    Json(req): Json<PatchPathsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = locust_core::patch::PatchStore::new(PathBuf::from(&req.game_path));
+    let status = store.status().map_err(map_patch_err)?;
+    let body = match status {
+        locust_core::patch::PatchStatus::NotPatched => {
+            serde_json::json!({ "status": "not_patched" })
+        }
+        locust_core::patch::PatchStatus::Patched(r) => serde_json::json!({
+            "status": "patched",
+            "patch_id": r.patch_id,
+            "patch_version": r.patch_version,
+            "engine": r.engine,
+            "language": r.language,
+            "baseline": format!("{:?}", r.baseline),
+            "forced": r.forced,
+            "applied_at": r.applied_at,
+            "replaced": r.replaced.len(),
+            "added": r.added.len(),
+        }),
+        locust_core::patch::PatchStatus::Interrupted(j) => serde_json::json!({
+            "status": "interrupted",
+            "patch_id": j.patch_id,
+            "state": format!("{:?}", j.state),
+        }),
+        locust_core::patch::PatchStatus::Unknown => {
+            serde_json::json!({ "status": "unknown" })
+        }
+    };
+    Ok(Json(body))
 }
 
 async fn validate(
