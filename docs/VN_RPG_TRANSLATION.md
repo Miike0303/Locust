@@ -37,6 +37,8 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
 - **Unreal**: translations must be **≤ source UTF-16LE byte length** or inject skips them (no hard fail).
   The `mock` provider is length-safe for **both UTF-8 and UTF-16LE** slots (ASCII
   tags no longer blow Unreal's UTF-16 budget on short CJK); SJIS usually follows.
+  Extract tags entries with `metadata.binary_slot` (`utf8` / `utf16le` / `sjis`);
+  `locust validate <db>` reports `ExceedsBinarySlot` before inject.
 
 **Phase-2 apply proven (copies only, mock or equal-length where needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube, HTML generic (non-SugarCube fixture), Unity (BOXMAN), Unreal (Last Hope `_P.pak` subset — full 8GB base pak not copied), Wolf RPG (synthetic `Data/*.wolf` fixture — no commercial title on disk yet).
 

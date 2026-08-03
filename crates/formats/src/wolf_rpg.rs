@@ -58,6 +58,11 @@ impl WolfRpgPlugin {
                 "extraction_method".to_string(),
                 serde_json::Value::String("heuristic".to_string()),
             );
+            // Inject pads/truncates in Shift-JIS; validate before inject.
+            entry.metadata.insert(
+                "binary_slot".to_string(),
+                serde_json::Value::String("sjis".to_string()),
+            );
             entry.metadata.insert(
                 "byte_offset".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(offset as u64)),

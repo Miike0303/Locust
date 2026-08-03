@@ -318,6 +318,11 @@ impl UnityPlugin {
                         let id = format!("{}#offset_{}#{}", filename, i, entries.len());
                         let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
                         entry.tags = vec!["unknown".to_string()];
+                        // .assets inject is length-prefixed UTF-8; validate before inject.
+                        entry.metadata.insert(
+                            "binary_slot".to_string(),
+                            serde_json::Value::String("utf8".to_string()),
+                        );
                         entries.push(entry);
                     }
                 }

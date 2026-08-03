@@ -9,6 +9,24 @@ use crate::placeholder::PlaceholderProcessor;
 
 pub struct Validator;
 
+/// Byte length of `text` under a binary inject encoding.
+/// Returns `None` if the text cannot be encoded (e.g. unmappable Shift-JIS).
+pub fn encoded_byte_len(encoding: &str, text: &str) -> Option<usize> {
+    match encoding {
+        "utf8" => Some(text.len()),
+        "utf16le" => Some(text.encode_utf16().count() * 2),
+        "sjis" | "shift_jis" | "shift-jis" => {
+            let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(text);
+            if had_errors {
+                None
+            } else {
+                Some(bytes.len())
+            }
+        }
+        _ => None,
+    }
+}
+
 impl Validator {
     pub fn validate_entry(entry: &StringEntry) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
@@ -71,6 +89,34 @@ impl Validator {
             }
         }
 
+        // Check 5 — Binary inject slot (Unity UTF-8 / Unreal UTF-16LE / Wolf SJIS)
+        if !translation.is_empty() {
+            if let Some(enc) = entry
+                .metadata
+                .get("binary_slot")
+                .and_then(|v| v.as_str())
+            {
+                if let (Some(src_len), Some(tr_len)) = (
+                    encoded_byte_len(enc, &entry.source),
+                    encoded_byte_len(enc, translation),
+                ) {
+                    if tr_len > src_len {
+                        issues.push(ValidationIssue {
+                            entry_id: entry.id.clone(),
+                            kind: ValidationKind::ExceedsBinarySlot {
+                                encoding: enc.to_string(),
+                                limit: src_len,
+                                actual: tr_len,
+                            },
+                            message: format!(
+                                "translation exceeds binary inject slot ({enc}): {tr_len} > {src_len} bytes"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
         issues
     }
 
@@ -97,6 +143,7 @@ impl Validator {
                 ValidationKind::MissingPlaceholder { .. } => "MissingPlaceholder",
                 ValidationKind::ExtraPlaceholder { .. } => "ExtraPlaceholder",
                 ValidationKind::ExceedsCharLimit { .. } => "ExceedsCharLimit",
+                ValidationKind::ExceedsBinarySlot { .. } => "ExceedsBinarySlot",
                 ValidationKind::EmptyTranslation => "EmptyTranslation",
                 ValidationKind::IdenticalToSource => "IdenticalToSource",
             };
@@ -177,6 +224,47 @@ mod tests {
         let entry = make_entry("e1", "Hello", Some("Hola"));
         let issues = Validator::validate_entry(&entry);
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn test_validate_exceeds_binary_slot_utf8() {
+        let mut entry = make_entry("e1", "Hi", Some("Hola amigos"));
+        entry.metadata.insert(
+            "binary_slot".to_string(),
+            serde_json::Value::String("utf8".to_string()),
+        );
+        let issues = Validator::validate_entry(&entry);
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i.kind, ValidationKind::ExceedsBinarySlot { .. })),
+            "expected ExceedsBinarySlot, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_binary_slot_utf16_ok_when_fits() {
+        // Same char count → same UTF-16LE length for BMP.
+        let mut entry = make_entry("e1", "Hero", Some("oreH"));
+        entry.metadata.insert(
+            "binary_slot".to_string(),
+            serde_json::Value::String("utf16le".to_string()),
+        );
+        let issues = Validator::validate_entry(&entry);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| matches!(i.kind, ValidationKind::ExceedsBinarySlot { .. })),
+            "unexpected binary slot issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_encoded_byte_len_sjis() {
+        let n = encoded_byte_len("sjis", "テスト").unwrap();
+        assert_eq!(n, 6); // 3 CJK × 2 SJIS
+        assert!(encoded_byte_len("utf16le", "テスト").unwrap() == 6);
+        assert!(encoded_byte_len("utf8", "テスト").unwrap() == 9);
     }
 
     #[test]

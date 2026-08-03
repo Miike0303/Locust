@@ -159,6 +159,12 @@ pub enum ValidationKind {
     MissingPlaceholder { placeholder: String },
     ExtraPlaceholder { placeholder: String },
     ExceedsCharLimit { limit: usize, actual: usize },
+    /// Binary inject slot overflow (Unity UTF-8 / Unreal UTF-16LE / Wolf Shift-JIS).
+    ExceedsBinarySlot {
+        encoding: String,
+        limit: usize,
+        actual: usize,
+    },
     EmptyTranslation,
     IdenticalToSource,
 }

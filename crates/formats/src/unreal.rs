@@ -108,6 +108,11 @@ impl UnrealPlugin {
                 "extraction_method".to_string(),
                 serde_json::Value::String("heuristic_utf16".to_string()),
             );
+            // Inject replaces UTF-16LE in-place; validate before inject.
+            entry.metadata.insert(
+                "binary_slot".to_string(),
+                serde_json::Value::String("utf16le".to_string()),
+            );
             entries.push(entry);
         }
 
