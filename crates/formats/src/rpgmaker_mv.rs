@@ -132,15 +132,11 @@ pub enum MvMzVersion {
     Unknown,
 }
 
-pub struct RpgMakerMvPlugin {
-    version: MvMzVersion,
-}
+pub struct RpgMakerMvPlugin;
 
 impl RpgMakerMvPlugin {
     pub fn new() -> Self {
-        Self {
-            version: MvMzVersion::Unknown,
-        }
+        Self
     }
 
     fn find_data_dir(path: &Path) -> Option<PathBuf> {

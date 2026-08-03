@@ -651,7 +651,7 @@ fn replace_safe(passage: &str, source: &str, replacement: &str) -> (String, bool
 
 /// Check if a position falls inside a context that should not be modified:
 /// encoded HTML tags, SugarCube macros, link targets, or code blocks.
-fn is_inside_unsafe_context(s: &str, pos: usize, end: usize) -> bool {
+fn is_inside_unsafe_context(s: &str, pos: usize, _end: usize) -> bool {
     let before = &s[..pos];
 
     // Inside HTML-encoded tag: &lt;...&gt;

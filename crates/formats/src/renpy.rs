@@ -763,7 +763,6 @@ fn extract_quoted_string(s: &str) -> Option<(&str, usize)> {
         return None;
     }
     let inner = &s[1..];
-    let mut end = 0;
     let mut escaped = false;
     for (i, ch) in inner.char_indices() {
         if escaped {
@@ -775,8 +774,7 @@ fn extract_quoted_string(s: &str) -> Option<(&str, usize)> {
             continue;
         }
         if ch == '"' {
-            end = i;
-            return Some((&inner[..end], 1 + end + 1));
+            return Some((&inner[..i], 1 + i + 1));
         }
     }
     None

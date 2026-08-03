@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { X, FolderOpen, FileCheck, AlertCircle } from "lucide-react";
-import { inject, type OutputMode } from "../lib/api";
+import { inject, validate, type OutputMode } from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -82,6 +82,28 @@ export default function InjectModal({ open, onClose }: InjectModalProps) {
     setLoading(true);
     setResult(null);
     try {
+      // Same signal as CLI inject preflight: catch binary-slot oversize before
+      // Unity/Unreal/Wolf silently skip those strings.
+      try {
+        const pre = await validate();
+        const binary = pre.validation.by_kind?.ExceedsBinarySlot ?? 0;
+        if (binary > 0) {
+          addToast(
+            "warning",
+            `${binary} translation(s) exceed binary inject slots and will be skipped — shorten them or re-run Validate`,
+            8000
+          );
+          addLog(
+            "warning",
+            `Inject preflight: ${binary} ExceedsBinarySlot`,
+            "UTF-8 / UTF-16LE / Shift-JIS length must be ≤ source",
+            "inject"
+          );
+        }
+      } catch {
+        // Validate optional — inject may still proceed if validation endpoint fails.
+      }
+
       const report = await inject({
         project_path: project.path,
         format_id: project.format_id,

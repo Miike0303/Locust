@@ -169,7 +169,7 @@ impl UnityPlugin {
         Ok(all)
     }
 
-    fn inject_text_scripts(path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+    fn inject_text_scripts(_path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
