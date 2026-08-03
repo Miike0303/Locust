@@ -85,7 +85,7 @@ where
                     m.files.iter().map(|f| f.path.clone()).collect();
                 if prior_set != incoming_set {
                     // File-set drift → rollback-then-fresh.
-                    rollback(
+                    require_full_rollback(
                         game_root,
                         RollbackOptions {
                             delete_modified_added: true,
@@ -115,7 +115,9 @@ where
                 }
                 // Upgrade or forced downgrade / different patch_id → rollback then fresh.
                 if store.backup_manifest_valid() {
-                    rollback(
+                    // Soft-abort on edited added files must NOT continue into
+                    // apply_fresh on a still-patched tree (CRITICAL review finding).
+                    require_full_rollback(
                         game_root,
                         RollbackOptions {
                             delete_modified_added: opts.force,
@@ -134,6 +136,22 @@ where
     }
 
     apply_fresh(game_root, zip_path, &opts, &mut on_progress, None)
+}
+
+/// Rollback that must fully succeed before a subsequent apply. A soft abort
+/// (user-edited added files without force) is an error so callers cannot
+/// treat it as "pristine enough" and continue writing.
+fn require_full_rollback(game_root: &Path, opts: RollbackOptions) -> Result<()> {
+    let report = rollback(game_root, opts)?;
+    if !report.aborted_edited.is_empty() {
+        return Err(LocustError::PatchVerificationFailed(format!(
+            "rollback aborted before reapply — {} added file(s) were edited after the \
+             previous apply and need --force (or restore them manually): {}",
+            report.aborted_edited.len(),
+            report.aborted_edited.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn enforce_verify_gates(
@@ -350,35 +368,26 @@ where
         VerificationTier::Legacy
     };
 
-    // Baseline: pristine only when strict and not forced-over-unknown.
-    let baseline = match (&report_outcome_needs_unverified(opts, prior_receipt.is_some()), tier) {
-        (false, VerificationTier::Strict) if !opts.force || prior_receipt.is_some() => {
-            // Forced same-version reapply keeps pristine backup.
-            if prior_receipt.is_some() {
-                BackupBaseline::Pristine
-            } else if opts.force {
-                // force over Clean is still pristine originals.
-                BackupBaseline::Pristine
-            } else {
-                BackupBaseline::Pristine
-            }
-        }
-        (false, VerificationTier::Strict) => BackupBaseline::Pristine,
-        _ => {
-            if prior_receipt.is_some() && store.backup_manifest_valid() {
-                // In-place reapply: keep existing baseline.
-                store
-                    .read_backup_manifest()?
-                    .map(|m| m.baseline)
-                    .unwrap_or(BackupBaseline::Pristine)
-            } else if opts.force {
-                BackupBaseline::Unverified
-            } else if tier == VerificationTier::Strict {
-                BackupBaseline::Pristine
-            } else {
-                BackupBaseline::Unverified
-            }
-        }
+    // Baseline: pristine when we backup verified originals under strict tier.
+    // Forced same-version reapply keeps the existing committed baseline.
+    // Force over Unknown/Mismatch (no prior receipt) is unverified.
+    // Force alone over a clean strict first apply remains pristine.
+    let baseline = if prior_receipt.is_some() && store.backup_manifest_valid() {
+        store
+            .read_backup_manifest()?
+            .map(|m| m.baseline)
+            .unwrap_or(BackupBaseline::Pristine)
+    } else if tier == VerificationTier::Strict
+        && matches!(store.status()?, PatchStatus::NotPatched)
+    {
+        BackupBaseline::Pristine
+    } else if tier == VerificationTier::Strict && !opts.force {
+        BackupBaseline::Pristine
+    } else if tier == VerificationTier::Strict && opts.force {
+        // Force on a tree that is not a clean NotPatched game (Unknown, etc.).
+        BackupBaseline::Unverified
+    } else {
+        BackupBaseline::Unverified
     };
 
     let (patch_id, patch_version, language, engine, generator_version) =
@@ -569,10 +578,6 @@ where
         user_edits_overwritten: user_edits,
         messages: vec![],
     })
-}
-
-fn report_outcome_needs_unverified(opts: &ApplyOptions, _has_prior: bool) -> bool {
-    opts.force
 }
 
 /// RULE R2: decide whether an existing backup/ may be discarded or is incomplete.

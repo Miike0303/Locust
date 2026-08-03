@@ -365,3 +365,43 @@ fn r1_deletion_set_never_includes_backup_manifest_paths() {
 // Silence unused import if BackupManifest only used via side effects.
 #[allow(dead_code)]
 fn _touch_backup_type(_: &BackupManifest) {}
+
+
+#[test]
+fn upgrade_aborts_when_rollback_soft_fails_on_edited_added_file() {
+    // CRITICAL: apply must not continue after a soft-abort rollback.
+    let game = tmp_game("upgrade_abort");
+    write_file(&game, "data/base.json", b"BASE_ORIG");
+    let zip_v1 = game.join("v1.zip");
+    build_patch_zip(
+        &zip_v1,
+        &[
+            ("data/base.json", b"BASE_V1", Some(b"BASE_ORIG")),
+            ("data/extra.json", b"EXTRA_V1", None),
+        ],
+        "1.0.0",
+        "id-up",
+    );
+    apply(&game, &zip_v1, ApplyOptions::default(), |_| {}).unwrap();
+    write_file(&game, "data/extra.json", b"USER_EDIT");
+
+    let zip_v2 = game.join("v2.zip");
+    build_patch_zip(
+        &zip_v2,
+        &[
+            ("data/base.json", b"BASE_V2", Some(b"BASE_ORIG")),
+            ("data/extra.json", b"EXTRA_V2", None),
+        ],
+        "1.1.0",
+        "id-up",
+    );
+    let err = apply(&game, &zip_v2, ApplyOptions::default(), |_| {}).unwrap_err();
+    assert!(
+        matches!(err, LocustError::PatchVerificationFailed(_)),
+        "upgrade must hard-fail when rollback aborts, got {err:?}"
+    );
+    assert_eq!(fs::read(game.join("data").join("base.json")).unwrap(), b"BASE_V1");
+    assert_eq!(fs::read(game.join("data").join("extra.json")).unwrap(), b"USER_EDIT");
+    let _ = fs::remove_dir_all(&game);
+}
+

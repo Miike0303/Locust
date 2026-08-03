@@ -180,9 +180,19 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 }
 
 pub async fn start_server(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
+    // Loopback only by default: patch apply/rollback take absolute filesystem
+    // paths and must not be reachable from the LAN without an explicit opt-in
+    // (see start_server_on). Desktop and CLI talk over localhost.
+    start_server_on(state, format!("127.0.0.1:{port}")).await
+}
+
+/// Bind the API on an explicit address (`127.0.0.1:7842` or `0.0.0.0:7842`).
+/// Prefer loopback unless the operator knowingly exposes the process.
+pub async fn start_server_on(state: Arc<AppState>, addr: impl AsRef<str>) -> anyhow::Result<()> {
     let app = create_router(state);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    tracing::info!("Server listening on port {}", port);
+    let addr = addr.as_ref();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("Server listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
