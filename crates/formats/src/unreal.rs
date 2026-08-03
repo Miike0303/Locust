@@ -274,16 +274,25 @@ impl FormatPlugin for UnrealPlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
-        // Binary patching: find UTF-16LE original, replace with UTF-16LE translation
+        // Binary patching: find UTF-16LE original, replace with UTF-16LE translation.
+        // Same resilience/perf posture as Unity: identity skip, oversize skip (not hard
+        // fail), first-byte scan, and capped pad noise so multi‑GB paks stay usable.
+        let _ = path;
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
+        let mut length_skipped = 0usize;
+        let mut pad_noted = 0usize;
         let mut warnings = Vec::new();
         let mut files_written: Vec<PathBuf> = Vec::new();
 
-        let mut by_file: std::collections::HashMap<PathBuf, Vec<&StringEntry>> = std::collections::HashMap::new();
+        let mut by_file: std::collections::HashMap<PathBuf, Vec<&StringEntry>> =
+            std::collections::HashMap::new();
         for entry in entries {
-            by_file.entry(entry.file_path.clone()).or_default().push(entry);
+            by_file
+                .entry(entry.file_path.clone())
+                .or_default()
+                .push(entry);
         }
 
         for (file_path, file_entries) in &by_file {
@@ -296,17 +305,40 @@ impl FormatPlugin for UnrealPlugin {
             for entry in file_entries {
                 let translation = match &entry.translation {
                     Some(t) => t,
-                    None => { strings_skipped += 1; continue; }
+                    None => {
+                        strings_skipped += 1;
+                        continue;
+                    }
                 };
 
-                let orig_utf16: Vec<u8> = entry.source.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-                let trans_utf16: Vec<u8> = translation.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+                let orig_utf16: Vec<u8> = entry
+                    .source
+                    .encode_utf16()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect();
+                let trans_utf16: Vec<u8> = translation
+                    .encode_utf16()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect();
+
+                // Identity: nothing to rewrite; skip the multi‑MB/GB scan.
+                if trans_utf16 == orig_utf16 {
+                    strings_skipped += 1;
+                    continue;
+                }
 
                 if trans_utf16.len() > orig_utf16.len() {
-                    return Err(LocustError::InjectionError(format!(
-                        "translation for '{}' is longer than original in UTF-16LE ({} > {} bytes)",
-                        entry.id, trans_utf16.len(), orig_utf16.len()
-                    )));
+                    if length_skipped < 5 {
+                        warnings.push(format!(
+                            "translation for '{}' longer than original in UTF-16LE ({} > {} bytes), skipping",
+                            entry.id,
+                            trans_utf16.len(),
+                            orig_utf16.len()
+                        ));
+                    }
+                    length_skipped += 1;
+                    strings_skipped += 1;
+                    continue;
                 }
 
                 if let Some(pos) = find_bytes_in(&bytes, &orig_utf16) {
@@ -317,7 +349,14 @@ impl FormatPlugin for UnrealPlugin {
                     strings_written += 1;
                     modified = true;
                     if trans_utf16.len() < orig_utf16.len() {
-                        warnings.push(format!("padded {} null bytes for '{}'", orig_utf16.len() - trans_utf16.len(), entry.id));
+                        if pad_noted < 5 {
+                            warnings.push(format!(
+                                "padded {} null bytes for '{}'",
+                                orig_utf16.len() - trans_utf16.len(),
+                                entry.id
+                            ));
+                        }
+                        pad_noted += 1;
                     }
                 } else {
                     strings_skipped += 1;
@@ -331,6 +370,14 @@ impl FormatPlugin for UnrealPlugin {
             }
         }
 
+        if length_skipped > 0 {
+            warnings.push(format!(
+                "{length_skipped} translation(s) skipped because they are longer than the \
+                 original Unreal string (UTF-16LE byte length must be ≤ source). Shorten them or \
+                 use a length-aware model; equal-length translations inject cleanly."
+            ));
+        }
+
         Ok(InjectionReport {
             files_modified,
             strings_written,
@@ -341,11 +388,28 @@ impl FormatPlugin for UnrealPlugin {
     }
 }
 
+/// Locate `needle` in `haystack`. Prefer scanning for the first byte before
+/// full compares — Unreal .pak files can be multi‑GB; naive windows() over every
+/// offset dominates inject cost the same way it did for Unity .assets.
 fn find_bytes_in(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    let first = needle[0];
+    let nlen = needle.len();
+    let mut i = 0;
+    let end = haystack.len() - nlen + 1;
+    while i < end {
+        if haystack[i] != first {
+            i += 1;
+            continue;
+        }
+        if &haystack[i..i + nlen] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -428,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_longer_fails() {
+    fn test_inject_longer_skips_not_hard_fail() {
         let dir = tempdir();
         create_pak_fixture(&dir);
         let plugin = UnrealPlugin::new();
@@ -436,11 +500,37 @@ mod tests {
 
         for entry in &mut entries {
             if entry.source == "Hello World" {
-                entry.translation = Some("This is a much longer translation that exceeds the original".to_string());
+                entry.translation = Some(
+                    "This is a much longer translation that exceeds the original".to_string(),
+                );
             }
         }
 
-        let result = plugin.inject(&dir, &entries);
-        assert!(matches!(result, Err(LocustError::InjectionError(_))));
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert_eq!(report.files_modified, 0);
+        assert!(report.strings_skipped >= 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("skipped because they are longer")),
+            "expected length-skip summary, got: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn test_inject_identity_skips_write() {
+        let dir = tempdir();
+        create_pak_fixture(&dir);
+        let plugin = UnrealPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for entry in &mut entries {
+            entry.translation = Some(entry.source.clone());
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert_eq!(report.files_modified, 0);
+        assert_eq!(report.strings_written, 0);
+        assert!(report.strings_skipped >= 1);
     }
 }
