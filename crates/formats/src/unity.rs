@@ -463,7 +463,8 @@ impl FormatPlugin for UnityPlugin {
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
-        locust_core::extraction::FormatStability::ComingSoon
+        // Phase-2 apply proven (BOXMAN mock E2E); binary length constraints remain.
+        locust_core::extraction::FormatStability::Experimental
     }
 
     fn supported_extensions(&self) -> &[&str] {

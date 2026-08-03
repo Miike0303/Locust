@@ -279,13 +279,8 @@ impl PlaceholderProcessor {
                 if let Some(close) = source[i..].find('}') {
                     let end = i + close + 1;
                     let inner = &source[i + 1..end - 1];
-                    // {} or {0} or {name} or {name_here}
-                    if inner.is_empty()
-                        || inner.chars().all(|c| c.is_ascii_digit())
-                        || inner
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    {
+                    // {} / {0} / {name} / Ren'Py-style {i} — not binary-noise {P}
+                    if is_rust_format_inner(inner) {
                         matches.push(PatternMatch {
                             start: i,
                             end,
@@ -372,6 +367,36 @@ impl PlaceholderProcessor {
     }
 }
 
+/// Whether `{inner}` looks like a real format/text tag, not binary-scan noise.
+///
+/// Accepts `{}`, `{0}`, `{name}`, and single **lowercase** letters used by Ren'Py
+/// (`{i}`, `{b}`, `{s}`, `{u}`, `{a}`, `{w}`, `{p}`…). Rejects single **uppercase**
+/// letters (`{P}`, `{F}`, `{G}`) that dominate Unreal/Unity heuristic dumps and
+/// only produce restore-fail noise under mock/length-safe translate.
+fn is_rust_format_inner(inner: &str) -> bool {
+    if inner.is_empty() {
+        return true;
+    }
+    if inner.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if !inner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return false;
+    }
+    let n = inner.chars().count();
+    if n >= 2 {
+        return true;
+    }
+    // n == 1: lowercase Ren'Py-style only
+    inner
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +430,41 @@ mod tests {
         assert_eq!(placeholders.len(), 2);
         assert_eq!(placeholders[0].original, "{name}");
         assert_eq!(placeholders[1].original, "{count}");
+    }
+
+    #[test]
+    fn test_extract_renpy_single_letter_tags() {
+        let source = "{i}italic{/i} and {b}bold{/b}";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        // Opening single-letter tags are protected; closing {/i} has '/' and is not
+        // matched by the rust-format scanner (pre-existing).
+        assert!(
+            placeholders.iter().any(|p| p.original == "{i}"),
+            "expected {{i}} protected, got {placeholders:?} sanitized={sanitized}"
+        );
+        assert!(placeholders.iter().any(|p| p.original == "{b}"));
+    }
+
+    #[test]
+    fn test_extract_ignores_uppercase_single_letter_noise() {
+        // Unreal/Unity heuristic scans often emit lone {P}/{F}/{G} fragments.
+        let source = "Score {P} and flag {F} then {G} done";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        assert_eq!(sanitized, source, "noise braces must stay as plain text");
+        assert!(
+            placeholders.is_empty(),
+            "expected no placeholders, got {placeholders:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_still_keeps_digit_and_empty_braces() {
+        let source = "Hi {} player {0}";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        assert_eq!(sanitized, "Hi {PL_0} player {PL_1}");
+        assert_eq!(placeholders.len(), 2);
+        assert_eq!(placeholders[0].original, "{}");
+        assert_eq!(placeholders[1].original, "{0}");
     }
 
     #[test]

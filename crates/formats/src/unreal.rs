@@ -232,7 +232,8 @@ impl FormatPlugin for UnrealPlugin {
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
-        locust_core::extraction::FormatStability::ComingSoon
+        // Phase-2 apply proven on Last Hope patch pak; base multi-GB paks are heuristic.
+        locust_core::extraction::FormatStability::Experimental
     }
 
     fn supported_extensions(&self) -> &[&str] {

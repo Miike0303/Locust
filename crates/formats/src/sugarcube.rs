@@ -465,7 +465,8 @@ impl FormatPlugin for SugarCubePlugin {
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
-        locust_core::extraction::FormatStability::ComingSoon
+        // Phase-2 apply proven (Zabulon's Archive); HTML twin stays ComingSoon.
+        locust_core::extraction::FormatStability::Experimental
     }
 
     fn supported_extensions(&self) -> &[&str] {
