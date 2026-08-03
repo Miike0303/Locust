@@ -369,30 +369,38 @@ impl PlaceholderProcessor {
 
 /// Whether `{inner}` looks like a real format/text tag, not binary-scan noise.
 ///
-/// Accepts `{}`, `{0}`, `{name}`, and single **lowercase** letters used by Ren'Py
-/// (`{i}`, `{b}`, `{s}`, `{u}`, `{a}`, `{w}`, `{p}`…). Rejects single **uppercase**
+/// Accepts `{}`, `{0}`, `{name}`, Ren'Py open tags (`{i}`, `{b}`, …), and Ren'Py
+/// **closing** tags (`{/i}`, `{/b}`, `{/color}`). Rejects single **uppercase**
 /// letters (`{P}`, `{F}`, `{G}`) that dominate Unreal/Unity heuristic dumps and
 /// only produce restore-fail noise under mock/length-safe translate.
 fn is_rust_format_inner(inner: &str) -> bool {
+    // Ren'Py closing tag: same rules on the name after the leading '/'.
+    if let Some(rest) = inner.strip_prefix('/') {
+        return !rest.is_empty() && is_rust_format_name(rest);
+    }
     if inner.is_empty() {
         return true;
     }
     if inner.chars().all(|c| c.is_ascii_digit()) {
         return true;
     }
-    if !inner
+    is_rust_format_name(inner)
+}
+
+/// Identifier body for open tags / names: `{name}`, `{i}`, not `{P}`.
+fn is_rust_format_name(name: &str) -> bool {
+    if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return false;
     }
-    let n = inner.chars().count();
+    let n = name.chars().count();
     if n >= 2 {
         return true;
     }
     // n == 1: lowercase Ren'Py-style only
-    inner
-        .chars()
+    name.chars()
         .next()
         .is_some_and(|c| c.is_ascii_lowercase())
 }
@@ -436,13 +444,26 @@ mod tests {
     fn test_extract_renpy_single_letter_tags() {
         let source = "{i}italic{/i} and {b}bold{/b}";
         let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
-        // Opening single-letter tags are protected; closing {/i} has '/' and is not
-        // matched by the rust-format scanner (pre-existing).
-        assert!(
-            placeholders.iter().any(|p| p.original == "{i}"),
-            "expected {{i}} protected, got {placeholders:?} sanitized={sanitized}"
+        let originals: Vec<&str> = placeholders.iter().map(|p| p.original.as_str()).collect();
+        for expected in ["{i}", "{/i}", "{b}", "{/b}"] {
+            assert!(
+                originals.contains(&expected),
+                "expected {expected} protected, got {originals:?} sanitized={sanitized}"
+            );
+        }
+        assert_eq!(
+            sanitized, "{PL_0}italic{PL_1} and {PL_2}bold{PL_3}",
+            "open+close tags must both become tokens"
         );
-        assert!(placeholders.iter().any(|p| p.original == "{b}"));
+    }
+
+    #[test]
+    fn test_extract_renpy_closing_rejects_uppercase_noise() {
+        // {/P} is not a real Ren'Py close tag we care about; still name-rule based.
+        let source = "noise {/P} end";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        assert_eq!(sanitized, source);
+        assert!(placeholders.is_empty());
     }
 
     #[test]
