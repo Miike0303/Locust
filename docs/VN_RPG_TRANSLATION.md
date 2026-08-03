@@ -32,9 +32,10 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
 - Backups and receipts live in `<game>/.locust/` (hidden on Windows).
 - Server: `POST /api/patch/{verify,apply,rollback,status}` (binds **127.0.0.1** by default).
 - Desktop: Editor → **Patch** (Ctrl+Shift+P).
-- **Unity / Wolf**: translations must be **≤ source UTF-8 byte length** or inject skips them.
+- **Unity**: translations must be **≤ source UTF-8 byte length** or inject skips them (no hard fail).
+- **Wolf**: translations must be **≤ source Shift-JIS byte length** or inject skips them (no hard fail).
 - **Unreal**: translations must be **≤ source UTF-16LE byte length** or inject skips them (no hard fail).
-  The `mock` provider is length-safe (UTF-8 fit also keeps UTF-16 ≤ for typical ASCII/Latin).
+  The `mock` provider is length-safe (UTF-8 fit also keeps UTF-16/SJIS ≤ for typical ASCII/Latin).
 
 **Phase-2 apply proven (copies only, mock or equal-length where needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube/HTML, Unity (BOXMAN), Unreal (Last Hope `_P.pak` subset — full 8GB base pak not copied).
 

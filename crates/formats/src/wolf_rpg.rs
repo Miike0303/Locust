@@ -238,9 +238,14 @@ impl FormatPlugin for WolfRpgPlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+        // Same resilience/perf posture as Unity/Unreal: identity skip, oversize
+        // skip (not hard fail), first-byte scan, capped pad/length noise.
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
+        let mut length_skipped = 0usize;
+        let mut pad_noted = 0usize;
+        let mut find_missed = 0usize;
         let mut warnings = Vec::new();
         let mut files_written: Vec<PathBuf> = Vec::new();
 
@@ -308,13 +313,24 @@ impl FormatPlugin for WolfRpgPlugin {
                     continue;
                 }
 
+                // Identity: nothing to rewrite; skip the multi-MB scan.
+                if trans_bytes.as_ref() == orig_bytes.as_ref() {
+                    strings_skipped += 1;
+                    continue;
+                }
+
                 if trans_bytes.len() > orig_bytes.len() {
-                    return Err(LocustError::InjectionError(format!(
-                        "translation for '{}' is longer than original ({} > {} bytes), cannot expand binary",
-                        entry.id,
-                        trans_bytes.len(),
-                        orig_bytes.len()
-                    )));
+                    if length_skipped < 5 {
+                        warnings.push(format!(
+                            "translation for '{}' longer than original in Shift-JIS ({} > {} bytes), skipping",
+                            entry.id,
+                            trans_bytes.len(),
+                            orig_bytes.len()
+                        ));
+                    }
+                    length_skipped += 1;
+                    strings_skipped += 1;
+                    continue;
                 }
 
                 // Find original bytes in file and replace
@@ -326,19 +342,25 @@ impl FormatPlugin for WolfRpgPlugin {
                         for b in &mut bytes[pos + trans_bytes.len()..pos + orig_bytes.len()] {
                             *b = 0;
                         }
-                        warnings.push(format!(
-                            "padded {} null bytes for '{}'",
-                            orig_bytes.len() - trans_bytes.len(),
-                            entry.id
-                        ));
+                        if pad_noted < 5 {
+                            warnings.push(format!(
+                                "padded {} null bytes for '{}'",
+                                orig_bytes.len() - trans_bytes.len(),
+                                entry.id
+                            ));
+                        }
+                        pad_noted += 1;
                     }
                     strings_written += 1;
                     modified = true;
                 } else {
-                    warnings.push(format!(
-                        "could not find original bytes for '{}' in file",
-                        entry.id
-                    ));
+                    if find_missed < 5 {
+                        warnings.push(format!(
+                            "could not find original bytes for '{}' in file",
+                            entry.id
+                        ));
+                    }
+                    find_missed += 1;
                     strings_skipped += 1;
                 }
             }
@@ -348,6 +370,14 @@ impl FormatPlugin for WolfRpgPlugin {
                 files_modified += 1;
                 files_written.push(actual_path);
             }
+        }
+
+        if length_skipped > 0 {
+            warnings.push(format!(
+                "{length_skipped} translation(s) skipped because they are longer than the \
+                 original Wolf string (Shift-JIS byte length must be ≤ source). Shorten them or \
+                 use a length-aware model; equal-length translations inject cleanly."
+            ));
         }
 
         Ok(InjectionReport {
@@ -360,13 +390,28 @@ impl FormatPlugin for WolfRpgPlugin {
     }
 }
 
+/// Locate `needle` in `haystack`. Prefer scanning for the first byte before
+/// full compares — Wolf data files can be multi‑MB; naive windows() over every
+/// offset dominates inject the same way it did for Unity/Unreal.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    let first = needle[0];
+    let nlen = needle.len();
+    let mut i = 0;
+    let end = haystack.len() - nlen + 1;
+    while i < end {
+        if haystack[i] != first {
+            i += 1;
+            continue;
+        }
+        if &haystack[i..i + nlen] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Build a minimal test fixture: a binary blob with embedded Shift-JIS strings
@@ -500,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_longer_string_fails() {
+    fn test_inject_longer_string_skips_not_hard_fail() {
         let dir = temp_wolf_dir();
         let plugin = WolfRpgPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -513,12 +558,30 @@ mod tests {
             }
         }
 
-        let result = plugin.inject(&dir, &entries);
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(report.strings_skipped >= 1);
         assert!(
-            matches!(result, Err(LocustError::InjectionError(_))),
-            "expected InjectionError, got {:?}",
-            result
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("skipped because they are longer")),
+            "expected length-skip summary, got: {:?}",
+            report.warnings
         );
+    }
+
+    #[test]
+    fn test_inject_identity_skips_write() {
+        let dir = temp_wolf_dir();
+        let plugin = WolfRpgPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for entry in &mut entries {
+            entry.translation = Some(entry.source.clone());
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert_eq!(report.files_modified, 0);
+        assert_eq!(report.strings_written, 0);
+        assert!(report.strings_skipped >= 1);
     }
 
     #[test]
