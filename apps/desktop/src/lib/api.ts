@@ -262,6 +262,43 @@ export const exportXliff = (lang: string) => requestText(`/export/xliff?lang=${e
 export const importPo = (lang: string, content: string) =>
   request<{ imported: number }>(`/import/po?lang=${encodeURIComponent(lang)}`, { method: "POST", body: content, headers: { "Content-Type": "text/plain" } });
 
+export type ExportFormat = "po" | "xliff";
+
+export interface ExportResult {
+  path: string;
+  format: string;
+  lang: string;
+  entries: number;
+  bytes: number;
+}
+
+/** Save translations to a PO or XLIFF file.
+ *  Tauri: writes via `export_translations` after the UI picks a path.
+ *  Browser: fetches text and triggers a download (path ignored).
+ */
+export async function exportTranslations(
+  format: ExportFormat,
+  lang: string,
+  path?: string
+): Promise<ExportResult> {
+  if (IS_TAURI) {
+    if (!path) throw new Error("path required for Tauri export");
+    return invoke<ExportResult>("export_translations", { format, lang, path });
+  }
+  const text = format === "po" ? await exportPo(lang) : await exportXliff(lang);
+  const filename = path?.split(/[/\\]/).pop() || `translation_${lang}.${format === "po" ? "po" : "xliff"}`;
+  const blob = new Blob([text], {
+    type: format === "po" ? "text/plain;charset=utf-8" : "application/xml;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+  return { path: filename, format, lang, entries: 0, bytes: text.length };
+}
+
 export const getConfig = (): Promise<AppConfig> =>
   IS_TAURI ? invoke("get_config") : request("/config");
 

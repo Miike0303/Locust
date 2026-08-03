@@ -317,6 +317,53 @@ pub async fn run_validation(state: State<'_, AppStateWrapper>) -> Result<serde_j
     }))
 }
 
+/// Export current project translations to a PO or XLIFF file at `path`.
+/// Frontend picks the path via the native save dialog.
+#[tauri::command]
+pub async fn export_translations(
+    format: String,
+    lang: String,
+    path: String,
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
+    let s = &state.0;
+    let entries = s
+        .db
+        .get_entries(&EntryFilter::default())
+        .map_err(|e| e.to_string())?;
+    if entries.is_empty() {
+        return Err("no strings in project — open a game and extract first".into());
+    }
+    let config = s.config.read().await;
+    let source = s
+        .db
+        .resolve_export_source_lang(&lang, &config.default_source_lang)
+        .map_err(|e| e.to_string())?;
+    let body = match format.as_str() {
+        "po" => locust_core::export::export_po(&entries, &source, &lang),
+        "xliff" => locust_core::export::export_xliff(&entries, &source, &lang),
+        other => {
+            return Err(format!(
+                "unknown export format \"{other}\" — use \"po\" or \"xliff\""
+            ))
+        }
+    };
+    let out = PathBuf::from(&path);
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::write(&out, body.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "path": path,
+        "format": format,
+        "lang": lang,
+        "entries": entries.len(),
+        "bytes": body.len(),
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct InjectParams {
     pub project_path: String,

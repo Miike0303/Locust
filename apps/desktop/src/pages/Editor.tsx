@@ -13,6 +13,7 @@ import DetailPanel from "../components/DetailPanel";
 import TranslationModal from "../components/TranslationModal";
 import InjectModal from "../components/InjectModal";
 import PatchModal from "../components/PatchModal";
+import ExportModal from "../components/ExportModal";
 
 export default function Editor() {
   const { filter, selectedEntryId, setSelected } = useEditorStore();
@@ -21,6 +22,7 @@ export default function Editor() {
   const [showTranslateModal, setShowTranslateModal] = useState(false);
   const [showInjectModal, setShowInjectModal] = useState(false);
   const [showPatchModal, setShowPatchModal] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
   const [validating, setValidating] = useState(false);
 
   const { data: stringsData, refetch } = useQuery({
@@ -88,8 +90,10 @@ export default function Editor() {
   useHotkey("inject", () => setShowInjectModal(true));
   useHotkey("applyPatch", () => setShowPatchModal(true));
   useHotkey("validate", () => { void handleValidate(); });
+  useHotkey("exportFile", () => setShowExportModal(true));
   useHotkey("closePanel", () => {
-    if (showPatchModal) setShowPatchModal(false);
+    if (showExportModal) setShowExportModal(false);
+    else if (showPatchModal) setShowPatchModal(false);
     else if (showInjectModal) setShowInjectModal(false);
     else if (showTranslateModal) setShowTranslateModal(false);
     else if (selectedEntryId) setSelected(null);
@@ -154,6 +158,7 @@ export default function Editor() {
         </button>
 
         <button
+          onClick={() => setShowExportModal(true)}
           className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
           title="Ctrl+E"
         >
@@ -194,6 +199,12 @@ export default function Editor() {
         open={showPatchModal}
         onClose={() => setShowPatchModal(false)}
         defaultGamePath={project?.path}
+      />
+
+      {/* PO / XLIFF export */}
+      <ExportModal
+        open={showExportModal}
+        onClose={() => setShowExportModal(false)}
       />
     </div>
   );

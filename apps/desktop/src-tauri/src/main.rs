@@ -59,6 +59,7 @@ fn main() {
             commands::start_translation,
             commands::cancel_translation,
             commands::run_validation,
+            commands::export_translations,
             commands::run_inject,
             commands::get_config,
             commands::save_config,
