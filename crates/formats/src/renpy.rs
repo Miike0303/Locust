@@ -925,15 +925,28 @@ fn is_dialogue_line(trimmed: &str) -> bool {
         return false;
     }
 
-    // Menu choice: starts with " and ends with ":  or just ":"
-    if trimmed.starts_with('"') && (trimmed.ends_with("\":") || trimmed.ends_with("\":")){
+    // Menu choice: `"Choice text":` (task #6 — the old condition listed the same
+    // ends_with twice, so any line starting with `"` that was not a menu choice
+    // still fell through to the overly-broad narrator branch).
+    if trimmed.starts_with('"') && trimmed.ends_with("\":") {
         return true;
     }
 
-    // Narrator say: line is just "text" (possibly with line continuation)
-    if trimmed.starts_with('"') && !trimmed.contains('(') && !trimmed.contains("action") {
-        // But not if it's a textbutton, text, or other UI element
-        return true;
+    // Narrator say: a complete quoted string on its own line — must end with `"`
+    // and not be a screen language fragment (`textbutton "x" action ...`).
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("action ")
+            || lower.contains("textbutton")
+            || lower.contains("sensitive ")
+            || lower.contains("hovered ")
+        {
+            return false;
+        }
+        // Exactly one opening and one closing quote (simple say, not multi-arg).
+        if trimmed.matches('"').count() == 2 {
+            return true;
+        }
     }
 
     // Character say: `identifier "text"`, `identifier expression "text"`, or `identifier"text"`
@@ -2489,6 +2502,23 @@ mod tests {
         assert!(!is_renpy_dialogue_like("store.thing"));
         assert!(!is_renpy_dialogue_like("game/kNPCs/npc_paula.rpy"));
         assert!(!is_renpy_dialogue_like("some_variable_name"));
+    }
+
+    #[test]
+    fn test_is_dialogue_line_menu_narrator_and_rejects_screen_lang() {
+        // Menu choices
+        assert!(is_dialogue_line("\"Yes\":"));
+        assert!(is_dialogue_line("\"Leave the room\":"));
+        // Narrator say (complete quoted line)
+        assert!(is_dialogue_line("\"Hello, world.\""));
+        // Character say
+        assert!(is_dialogue_line("e \"What are you doing?\""));
+        // Screen language / code — must NOT be harvested as dialogue (task #6)
+        assert!(!is_dialogue_line("textbutton \"OK\" action Return()"));
+        assert!(!is_dialogue_line("\"OK\" action Return()"));
+        assert!(!is_dialogue_line("define e = Character(\"Eileen\")"));
+        assert!(!is_dialogue_line("label start:"));
+        assert!(!is_dialogue_line("# \"commented dialogue\""));
     }
 
     #[test]
