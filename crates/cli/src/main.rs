@@ -1749,7 +1749,7 @@ fn cmd_formats() -> anyhow::Result<()> {
     let formats = registry.list();
 
     let mut table = Table::new();
-    table.set_header(vec!["ID", "Name", "Extensions", "Modes"]);
+    table.set_header(vec!["ID", "Name", "Extensions", "Modes", "Stability"]);
     for f in &formats {
         let modes: Vec<&str> = f
             .supported_modes
@@ -1764,6 +1764,7 @@ fn cmd_formats() -> anyhow::Result<()> {
             &f.name,
             &f.extensions.join(", "),
             &modes.join(", "),
+            f.stability.label(),
         ]);
     }
     println!("{table}");

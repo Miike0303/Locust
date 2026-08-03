@@ -11,7 +11,7 @@ use crate::database::Database;
 use crate::error::{LocustError, Result};
 use crate::models::{OutputMode, ProgressEvent, StringEntry};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum FormatStability {
     /// Extensively tested and reliable.
@@ -20,6 +20,35 @@ pub enum FormatStability {
     Experimental,
     /// Not yet functional — shown as "coming soon" in the UI.
     ComingSoon,
+}
+
+impl FormatStability {
+    /// Wire / JSON value (`stable` | `experimental` | `comingsoon`).
+    pub fn as_api_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Experimental => "experimental",
+            Self::ComingSoon => "comingsoon",
+        }
+    }
+
+    /// Human label for CLI tables and logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Experimental => "experimental",
+            Self::ComingSoon => "coming soon",
+        }
+    }
+
+    /// Sort key: usable formats first (stable → experimental → coming soon).
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Stable => 0,
+            Self::Experimental => 1,
+            Self::ComingSoon => 2,
+        }
+    }
 }
 
 pub trait FormatPlugin: Send + Sync {
@@ -150,6 +179,14 @@ impl FormatRegistry {
             extensions: vec![".ks".to_string(), ".tjs".to_string(), ".xp3".to_string()],
             supported_modes: Vec::new(),
             stability: FormatStability::ComingSoon,
+        });
+
+        // Usable engines first: stable → experimental → coming soon, then id.
+        out.sort_by(|a, b| {
+            a.stability
+                .rank()
+                .cmp(&b.stability.rank())
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         out
@@ -597,6 +634,16 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn format_stability_labels_and_rank() {
+        assert_eq!(FormatStability::Stable.as_api_str(), "stable");
+        assert_eq!(FormatStability::Experimental.as_api_str(), "experimental");
+        assert_eq!(FormatStability::ComingSoon.as_api_str(), "comingsoon");
+        assert_eq!(FormatStability::ComingSoon.label(), "coming soon");
+        assert!(FormatStability::Stable.rank() < FormatStability::Experimental.rank());
+        assert!(FormatStability::Experimental.rank() < FormatStability::ComingSoon.rank());
+    }
 
     struct MockFormatPlugin;
 
