@@ -31,15 +31,16 @@ npm run build
 locust extract <game_path>          # Auto-detect format and extract strings
 locust translate <db> -p mock       # Translate with provider
 locust inject <game> -P <db> -l es  # Inject translations
+locust validate <db>                # Placeholders + binary slot length (Unity/Unreal/Wolf)
+locust patch … / apply …            # Package + apply patch zip (see docs/VN_RPG_TRANSLATION.md)
 locust server --port 7842           # Start web server
-locust formats                      # List supported formats
+locust formats                      # List supported formats (+ stability)
 locust providers                    # List translation providers
 ```
 
 ## Pending Work
 
-- Unity .assets extraction (VN games)
-- Unreal .pak extraction
-- HTML / Twine / SugarCube plugin
-- QSP and Japanese light novel engines
-- End-to-end testing with real game projects across all formats
+- QSP and Japanese light novel engines (still ComingSoon stubs)
+- Length-aware *real* ES for binary engines (validate flags oversize; mock is dual-slot safe)
+- Commercial Wolf RPG title E2E; Unreal full multi-GB base pak (patch `_P.pak` proven)
+- Deeper Unity/Unreal parsers beyond heuristics
