@@ -796,6 +796,28 @@ impl Database {
         Ok(runs)
     }
 
+    /// Source language for export headers: prefer the latest run that targeted
+    /// `target_lang`, else the latest run of any target, else `fallback`.
+    /// Config defaults are not project ground truth once a run exists.
+    pub fn resolve_export_source_lang(
+        &self,
+        target_lang: &str,
+        fallback: &str,
+    ) -> Result<String> {
+        let runs = self.get_translation_runs()?;
+        if let Some(run) = runs
+            .iter()
+            .rev()
+            .find(|r| r.target_lang.eq_ignore_ascii_case(target_lang) && !r.source_lang.is_empty())
+        {
+            return Ok(run.source_lang.clone());
+        }
+        if let Some(run) = runs.iter().rev().find(|r| !r.source_lang.is_empty()) {
+            return Ok(run.source_lang.clone());
+        }
+        Ok(fallback.to_string())
+    }
+
     pub fn get_stats(&self) -> Result<ProjectStats> {
         let conn = self.conn.lock().unwrap();
         let total: usize =
@@ -1734,5 +1756,52 @@ mod tests {
         // Simulate new project checking global memory
         let result = gm.lookup_memory("hash_g2", "en-es").unwrap();
         assert_eq!(result, Some("Mundo".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_export_source_lang_prefers_matching_target_run() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        rt.block_on(async {
+            db.record_translation_run(&TranslationRun {
+                started_at: "2026-01-01T00:00:00Z".into(),
+                duration_secs: 1.0,
+                provider: "mock".into(),
+                source_lang: "ja".into(),
+                target_lang: "en".into(),
+                strings_translated: 1,
+                tokens_used: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            })
+            .await
+            .unwrap();
+            db.record_translation_run(&TranslationRun {
+                started_at: "2026-01-02T00:00:00Z".into(),
+                duration_secs: 1.0,
+                provider: "mock".into(),
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                strings_translated: 1,
+                tokens_used: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(
+            db.resolve_export_source_lang("es", "ja").unwrap(),
+            "en"
+        );
+        assert_eq!(
+            db.resolve_export_source_lang("fr", "xx").unwrap(),
+            "en",
+            "unknown target falls back to latest run overall"
+        );
+        let empty = Database::open_in_memory().unwrap();
+        assert_eq!(empty.resolve_export_source_lang("es", "ja").unwrap(), "ja");
     }
 }

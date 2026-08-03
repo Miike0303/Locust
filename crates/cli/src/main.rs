@@ -1763,7 +1763,7 @@ fn cmd_export(
     // Prefer the source language of the latest translation run for this
     // target — config.default_source_lang is a user preference default, not
     // what was actually used for the strings in this project.
-    let source_lang = resolve_export_source_lang(&db, &lang, &config.default_source_lang)?;
+    let source_lang = db.resolve_export_source_lang(&lang, &config.default_source_lang)?;
 
     let content = match format.as_str() {
         "po" => export::export_po(&entries, &source_lang, &lang),
@@ -1780,27 +1780,6 @@ fn cmd_export(
         lang
     );
     Ok(())
-}
-
-/// Latest non-empty source_lang from translation_runs matching `target_lang`,
-/// else the most recent run of any target, else `fallback`.
-fn resolve_export_source_lang(
-    db: &Database,
-    target_lang: &str,
-    fallback: &str,
-) -> anyhow::Result<String> {
-    let runs = db.get_translation_runs()?;
-    if let Some(run) = runs
-        .iter()
-        .rev()
-        .find(|r| r.target_lang.eq_ignore_ascii_case(target_lang) && !r.source_lang.is_empty())
-    {
-        return Ok(run.source_lang.clone());
-    }
-    if let Some(run) = runs.iter().rev().find(|r| !r.source_lang.is_empty()) {
-        return Ok(run.source_lang.clone());
-    }
-    Ok(fallback.to_string())
 }
 
 async fn cmd_import(

@@ -869,7 +869,11 @@ async fn export_po(
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
     let entries = state.db.get_entries(&EntryFilter::default()).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let config = state.config.read().await;
-    let po = export::export_po(&entries, &config.default_source_lang, &q.lang);
+    let source = state
+        .db
+        .resolve_export_source_lang(&q.lang, &config.default_source_lang)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let po = export::export_po(&entries, &source, &q.lang);
     Ok((
         StatusCode::OK,
         [
@@ -903,7 +907,11 @@ async fn export_xliff(
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
     let entries = state.db.get_entries(&EntryFilter::default()).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let config = state.config.read().await;
-    let xliff = export::export_xliff(&entries, &config.default_source_lang, &q.lang);
+    let source = state
+        .db
+        .resolve_export_source_lang(&q.lang, &config.default_source_lang)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let xliff = export::export_xliff(&entries, &source, &q.lang);
     Ok((
         StatusCode::OK,
         [
