@@ -507,12 +507,15 @@ impl Database {
         Ok(count)
     }
 
+    /// Update an existing string's translation. Returns `true` if a row was
+    /// updated, `false` if `entry_id` is unknown (import must not count misses
+    /// as successes).
     pub async fn save_translation(
         &self,
         entry_id: &str,
         translation: &str,
         provider: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let conn = self.conn.clone();
         let entry_id = entry_id.to_string();
         let translation = translation.to_string();
@@ -520,11 +523,11 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let now = Utc::now().to_rfc3339();
-            conn.execute(
+            let n = conn.execute(
                 "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3 WHERE id = ?4",
                 params![translation, provider, now, entry_id],
             )?;
-            Ok(())
+            Ok(n > 0)
         })
         .await
         .unwrap()
@@ -1603,13 +1606,69 @@ mod tests {
     async fn test_save_translation_updates_status() {
         let db = Database::open_in_memory().unwrap();
         db.save_entries(&[make_entry("tr1", "Hello")]).unwrap();
-        db.save_translation("tr1", "Hola", "test-provider")
-            .await
-            .unwrap();
+        assert!(
+            db.save_translation("tr1", "Hola", "test-provider")
+                .await
+                .unwrap()
+        );
         let entry = db.get_entry("tr1").unwrap().unwrap();
         assert_eq!(entry.translation, Some("Hola".to_string()));
         assert_eq!(entry.status, StringStatus::Translated);
         assert_eq!(entry.provider_used, Some("test-provider".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_save_translation_unknown_id_returns_false() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(
+            !db.save_translation("missing", "Hola", "import")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_import_po_multi_hash_id_through_db() {
+        use crate::export::{export_po, import_po};
+        use crate::models::StringEntry;
+        use std::path::PathBuf;
+
+        let db = Database::open_in_memory().unwrap();
+        let id = "S004b.ks.json#0#message";
+        let mut entry = StringEntry::new(id, "Hello there", PathBuf::from(r"C:\work\S004b.ks.json"));
+        entry.translation = Some("PLACEHOLDER".to_string());
+        db.save_entries(&[entry]).unwrap();
+
+        // External CAT tool "edits" the PO.
+        let mut e = db.get_entry(id).unwrap().unwrap();
+        e.translation = Some("Hola alli".to_string());
+        let po = export_po(std::slice::from_ref(&e), "en", "es");
+        let imported = import_po(&po).unwrap();
+        assert_eq!(imported[0].id.as_deref(), Some(id));
+
+        let mut applied = 0usize;
+        let mut missed = 0usize;
+        for pe in &imported {
+            if pe.translation.is_empty() {
+                continue;
+            }
+            if let Some(ref pe_id) = pe.id {
+                if db
+                    .save_translation(pe_id, &pe.translation, "import")
+                    .await
+                    .unwrap()
+                {
+                    applied += 1;
+                } else {
+                    missed += 1;
+                }
+            }
+        }
+        assert_eq!(applied, 1);
+        assert_eq!(missed, 0);
+        let again = db.get_entry(id).unwrap().unwrap();
+        assert_eq!(again.translation.as_deref(), Some("Hola alli"));
+        assert_eq!(again.status, StringStatus::Translated);
     }
 
     #[test]

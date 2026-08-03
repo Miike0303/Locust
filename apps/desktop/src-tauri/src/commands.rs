@@ -391,11 +391,15 @@ pub async fn import_translations(
                     skipped += 1;
                     continue;
                 };
-                s.db
+                if s.db
                     .save_translation(id, &pe.translation, "import")
                     .await
-                    .map_err(|e| e.to_string())?;
-                imported += 1;
+                    .map_err(|e| e.to_string())?
+                {
+                    imported += 1;
+                } else {
+                    skipped += 1;
+                }
             }
         }
         "xliff" => {
@@ -406,11 +410,15 @@ pub async fn import_translations(
                     skipped += 1;
                     continue;
                 }
-                s.db
+                if s.db
                     .save_translation(&unit.id, &unit.target, "import")
                     .await
-                    .map_err(|e| e.to_string())?;
-                imported += 1;
+                    .map_err(|e| e.to_string())?
+                {
+                    imported += 1;
+                } else {
+                    skipped += 1;
+                }
             }
         }
         other => {

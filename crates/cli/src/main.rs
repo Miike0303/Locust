@@ -1863,7 +1863,7 @@ fn cmd_export(
 async fn cmd_import(
     project: PathBuf,
     format: String,
-    lang: String,
+    _lang: String,
     input: PathBuf,
 ) -> anyhow::Result<()> {
     let db = Database::open(&project)?;
@@ -1876,8 +1876,9 @@ async fn cmd_import(
             for pe in &entries {
                 if !pe.translation.is_empty() {
                     if let Some(ref id) = pe.id {
-                        db.save_translation(id, &pe.translation, "import").await?;
-                        imported += 1;
+                        if db.save_translation(id, &pe.translation, "import").await? {
+                            imported += 1;
+                        }
                     }
                 }
             }
@@ -1886,9 +1887,12 @@ async fn cmd_import(
             let units = export::import_xliff(&content)?;
             for unit in &units {
                 if !unit.target.is_empty() {
-                    db.save_translation(&unit.id, &unit.target, "import")
-                        .await?;
-                    imported += 1;
+                    if db
+                        .save_translation(&unit.id, &unit.target, "import")
+                        .await?
+                    {
+                        imported += 1;
+                    }
                 }
             }
         }

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use locust_core::error::Result;
 use locust_core::models::{TranslationRequest, TranslationResult};
-use locust_core::translation::{LangPair, TranslationProvider};
+use locust_core::translation::TranslationProvider;
 
 pub struct MockProvider;
 

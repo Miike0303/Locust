@@ -15,7 +15,7 @@ use tower_http::cors::CorsLayer;
 
 use locust_core::backup::{BackupEntry, BackupManager};
 use locust_core::config::AppConfig;
-use locust_core::database::{Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, MemoryEntry, ProjectStats};
+use locust_core::database::{Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, ProjectStats};
 use locust_core::export;
 use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
 use locust_core::font_validation::{FontCoverageReport, FontValidator};
@@ -908,15 +908,23 @@ async fn import_po(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let po_entries = export::import_po(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let mut imported = 0;
+    let mut skipped = 0;
     for pe in &po_entries {
-        if !pe.translation.is_empty() {
-            if let Some(ref id) = pe.id {
-                let _ = state.db.save_translation(id, &pe.translation, "import").await;
-                imported += 1;
-            }
+        if pe.translation.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let Some(ref id) = pe.id else {
+            skipped += 1;
+            continue;
+        };
+        match state.db.save_translation(id, &pe.translation, "import").await {
+            Ok(true) => imported += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     }
-    Ok(Json(serde_json::json!({"imported": imported})))
+    Ok(Json(serde_json::json!({"imported": imported, "skipped": skipped})))
 }
 
 async fn export_xliff(
@@ -946,13 +954,19 @@ async fn import_xliff(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let units = export::import_xliff(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let mut imported = 0;
+    let mut skipped = 0;
     for unit in &units {
-        if !unit.target.is_empty() {
-            let _ = state.db.save_translation(&unit.id, &unit.target, "import").await;
-            imported += 1;
+        if unit.target.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        match state.db.save_translation(&unit.id, &unit.target, "import").await {
+            Ok(true) => imported += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     }
-    Ok(Json(serde_json::json!({"imported": imported})))
+    Ok(Json(serde_json::json!({"imported": imported, "skipped": skipped})))
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

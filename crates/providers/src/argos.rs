@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use locust_core::error::{LocustError, Result};
 use locust_core::models::{TranslationRequest, TranslationResult};
-use locust_core::translation::{LangPair, TranslationProvider};
+use locust_core::translation::TranslationProvider;
 
 pub struct ArgosProvider {
     base_url: String,
