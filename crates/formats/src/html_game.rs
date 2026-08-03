@@ -151,7 +151,8 @@ impl FormatPlugin for HtmlGamePlugin {
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
-        locust_core::extraction::FormatStability::ComingSoon
+        // Phase-2 apply proven on synthetic non-SugarCube HTML fixture.
+        locust_core::extraction::FormatStability::Experimental
     }
 
     fn supported_extensions(&self) -> &[&str] {
@@ -535,6 +536,15 @@ mod tests {
         assert_eq!(strip_inner_tags("Hello <b>world</b>!"), "Hello world!");
         assert_eq!(strip_inner_tags("Plain text"), "Plain text");
         assert_eq!(strip_inner_tags("&amp; &lt; &gt;"), "& < >");
+    }
+
+    #[test]
+    fn test_stability_is_experimental_after_phase2() {
+        let plugin = HtmlGamePlugin::new();
+        assert_eq!(
+            plugin.stability(),
+            locust_core::extraction::FormatStability::Experimental
+        );
     }
 
     #[test]

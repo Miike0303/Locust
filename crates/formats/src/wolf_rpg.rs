@@ -169,7 +169,8 @@ impl FormatPlugin for WolfRpgPlugin {
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
-        locust_core::extraction::FormatStability::ComingSoon
+        // Phase-2 apply proven on synthetic Data/*.wolf fixture; no commercial title yet.
+        locust_core::extraction::FormatStability::Experimental
     }
 
     fn supported_extensions(&self) -> &[&str] {
@@ -471,6 +472,15 @@ mod tests {
         let bytes = build_test_fixture();
         fs::write(data_dir.join("BasicData.wolf"), &bytes).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_stability_is_experimental_after_phase2() {
+        let plugin = WolfRpgPlugin::new();
+        assert_eq!(
+            plugin.stability(),
+            locust_core::extraction::FormatStability::Experimental
+        );
     }
 
     #[test]
