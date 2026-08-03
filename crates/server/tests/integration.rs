@@ -199,11 +199,19 @@ async fn test_full_rpgmaker_mv_flow() {
     assert_eq!(translated_count, total, "expected {} translated, got {}", total, translated_count);
     for e in &strings.entries {
         let t = e["translation"].as_str().unwrap_or("");
+        let src = e["source"].as_str().unwrap_or("");
+        // Mock is length-safe (≤ source bytes). Long strings keep the tag;
+        // short ones may be a same-length reverse without the full marker.
         assert!(
-            t.contains("[MOCK:es]"),
-            "translation should contain [MOCK:es], got: {}",
-            t
+            t.len() <= src.len(),
+            "mock must not exceed source bytes: {t:?} vs {src:?}"
         );
+        if src.len() >= 12 {
+            assert!(
+                t.starts_with("[MOCK:es]"),
+                "long mock should keep tag, got: {t}"
+            );
+        }
     }
 
     // 9. Check stats after translation
@@ -250,9 +258,10 @@ async fn test_full_rpgmaker_mv_flow() {
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
     // characterIndex should be preserved
     assert_eq!(json[1]["characterIndex"], 0);
-    // name should be translated
+    // name should be mock-transformed (length-safe; short strings reverse)
     let name = json[1]["name"].as_str().unwrap();
-    assert!(name.contains("[MOCK:es]"), "name should be translated: {}", name);
+    assert_ne!(name, "Hero", "name should be mock-transformed: {name}");
+    assert!(name.len() <= "Hero".len(), "mock must not grow short Unity/MV slots");
 
     // 12. Replace mode with output_dir must still take a backup. The original is NOT
     // reliably untouched: Unity, Unreal, Wolf RPG and Ren'Py loose scripts inject via
