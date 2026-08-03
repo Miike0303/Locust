@@ -15,6 +15,7 @@ export const HOTKEY_MAP: Record<string, HotkeyBinding> = {
   openProject:    { key: "o", ctrl: true, description: "Open project", group: "General" },
   translate:      { key: "t", ctrl: true, description: "Start translation", group: "Editor" },
   inject:         { key: "i", ctrl: true, description: "Inject translations", group: "Editor" },
+  applyPatch:     { key: "p", ctrl: true, shift: true, description: "Apply patch zip", group: "Editor" },
   exportFile:     { key: "e", ctrl: true, description: "Export translations", group: "Editor" },
   validate:       { key: "v", ctrl: true, shift: true, description: "Validate translations", group: "Editor" },
   search:         { key: "f", ctrl: true, description: "Focus search / filter", group: "Editor" },

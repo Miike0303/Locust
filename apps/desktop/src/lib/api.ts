@@ -241,6 +241,74 @@ export const getBackups = (): Promise<BackupEntry[]> =>
 export const restoreBackup = (id: string) =>
   request<void>(`/backups/${id}/restore`, { method: "POST" });
 
+// ─── Patch apply / rollback (HTTP — server embeds the core engine) ────────
+
+export interface PatchPathsParams {
+  game_path: string;
+  zip_path?: string;
+  force?: boolean;
+  confirm_legacy?: boolean;
+  dry_run?: boolean;
+}
+
+export interface PatchVerifyResult {
+  outcome: string;
+  tier: string | null;
+  replaced: string[];
+  added: string[];
+  conflicts: string[];
+  backup_compromised: boolean;
+  messages: string[];
+  manifest: any;
+}
+
+export interface PatchApplyResult {
+  patch_id: string;
+  patch_version: string;
+  replaced: number;
+  added: number;
+  forced: boolean;
+  baseline: string;
+  dry_run: boolean;
+  user_edits_overwritten: string[];
+  messages: string[];
+}
+
+export interface PatchRollbackResult {
+  restored: number;
+  deleted: number;
+  baseline: string | null;
+  messages: string[];
+  aborted_edited: string[];
+  torn_deleted: string[];
+}
+
+export interface PatchStatusResult {
+  status: "not_patched" | "patched" | "interrupted" | "unknown";
+  patch_id?: string;
+  patch_version?: string;
+  engine?: string;
+  language?: string;
+  baseline?: string;
+  forced?: boolean;
+  applied_at?: string;
+  replaced?: number;
+  added?: number;
+  state?: string;
+}
+
+export const patchVerify = (params: PatchPathsParams): Promise<PatchVerifyResult> =>
+  request("/patch/verify", { method: "POST", body: JSON.stringify(params) });
+
+export const patchApply = (params: PatchPathsParams): Promise<PatchApplyResult> =>
+  request("/patch/apply", { method: "POST", body: JSON.stringify(params) });
+
+export const patchRollback = (params: PatchPathsParams): Promise<PatchRollbackResult> =>
+  request("/patch/rollback", { method: "POST", body: JSON.stringify(params) });
+
+export const patchStatus = (params: Pick<PatchPathsParams, "game_path">): Promise<PatchStatusResult> =>
+  request("/patch/status", { method: "POST", body: JSON.stringify(params) });
+
 // ─── Translation Memory ──────────────────────────────────────────────────
 
 export interface MemoryEntry {

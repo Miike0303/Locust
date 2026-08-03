@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Languages, Shield, Download, FileCheck } from "lucide-react";
+import { Languages, Shield, Download, FileCheck, Package } from "lucide-react";
 import { getStrings, getStats, getString } from "../lib/api";
 import { useEditorStore } from "../stores/editorStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -10,6 +10,7 @@ import StringTable from "../components/StringTable";
 import DetailPanel from "../components/DetailPanel";
 import TranslationModal from "../components/TranslationModal";
 import InjectModal from "../components/InjectModal";
+import PatchModal from "../components/PatchModal";
 
 export default function Editor() {
   const { filter, selectedEntryId, setSelected } = useEditorStore();
@@ -17,6 +18,7 @@ export default function Editor() {
   const queryClient = useQueryClient();
   const [showTranslateModal, setShowTranslateModal] = useState(false);
   const [showInjectModal, setShowInjectModal] = useState(false);
+  const [showPatchModal, setShowPatchModal] = useState(false);
 
   const { data: stringsData, refetch } = useQuery({
     queryKey: ["strings", filter],
@@ -47,8 +49,10 @@ export default function Editor() {
   // Hotkeys
   useHotkey("translate", () => setShowTranslateModal(true));
   useHotkey("inject", () => setShowInjectModal(true));
+  useHotkey("applyPatch", () => setShowPatchModal(true));
   useHotkey("closePanel", () => {
-    if (showInjectModal) setShowInjectModal(false);
+    if (showPatchModal) setShowPatchModal(false);
+    else if (showInjectModal) setShowInjectModal(false);
     else if (showTranslateModal) setShowTranslateModal(false);
     else if (selectedEntryId) setSelected(null);
   });
@@ -94,6 +98,14 @@ export default function Editor() {
         </button>
 
         <button
+          onClick={() => setShowPatchModal(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
+          title="Ctrl+Shift+P"
+        >
+          <Package size={16} /> Patch
+        </button>
+
+        <button
           className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
           title="Ctrl+Shift+V"
         >
@@ -134,6 +146,13 @@ export default function Editor() {
       <InjectModal
         open={showInjectModal}
         onClose={() => setShowInjectModal(false)}
+      />
+
+      {/* Patch apply / rollback */}
+      <PatchModal
+        open={showPatchModal}
+        onClose={() => setShowPatchModal(false)}
+        defaultGamePath={project?.path}
       />
     </div>
   );
