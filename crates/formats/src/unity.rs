@@ -547,6 +547,11 @@ impl FormatPlugin for UnityPlugin {
                 };
                 let orig_bytes = entry.source.as_bytes();
                 let trans_bytes = translation.as_bytes();
+                // Identity: nothing to rewrite; skip the multi-MB scan.
+                if trans_bytes == orig_bytes {
+                    strings_skipped += 1;
+                    continue;
+                }
                 if trans_bytes.len() > orig_bytes.len() {
                     // Cap per-entry noise: first few examples + one summary at end.
                     if length_skipped < 5 {
@@ -599,9 +604,29 @@ impl FormatPlugin for UnityPlugin {
     }
 }
 
+/// Locate `needle` in `haystack`. Prefer scanning for the first byte before
+/// full compares — Unity .assets are multi‑MB and naive windows() over every
+/// offset was the dominant cost of inject (BOXMAN: minutes for 1.6k strings).
 fn find_bytes_in(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() { return None; }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let first = needle[0];
+    let nlen = needle.len();
+    let mut i = 0;
+    let end = haystack.len() - nlen + 1;
+    while i < end {
+        // Skip runs that cannot match.
+        if haystack[i] != first {
+            i += 1;
+            continue;
+        }
+        if &haystack[i..i + nlen] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
