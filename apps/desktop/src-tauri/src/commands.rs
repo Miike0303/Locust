@@ -364,6 +364,69 @@ pub async fn export_translations(
     }))
 }
 
+/// Import translations from a PO or XLIFF file into the open project DB.
+#[tauri::command]
+pub async fn import_translations(
+    format: String,
+    path: String,
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
+    let s = &state.0;
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    if content.trim().is_empty() {
+        return Err("import file is empty".into());
+    }
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    match format.as_str() {
+        "po" => {
+            let entries =
+                locust_core::export::import_po(&content).map_err(|e| e.to_string())?;
+            for pe in &entries {
+                if pe.translation.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+                let Some(ref id) = pe.id else {
+                    skipped += 1;
+                    continue;
+                };
+                s.db
+                    .save_translation(id, &pe.translation, "import")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                imported += 1;
+            }
+        }
+        "xliff" => {
+            let units =
+                locust_core::export::import_xliff(&content).map_err(|e| e.to_string())?;
+            for unit in &units {
+                if unit.target.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+                s.db
+                    .save_translation(&unit.id, &unit.target, "import")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                imported += 1;
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown import format \"{other}\" — use \"po\" or \"xliff\""
+            ))
+        }
+    }
+    Ok(serde_json::json!({
+        "path": path,
+        "format": format,
+        "imported": imported,
+        "skipped": skipped,
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct InjectParams {
     pub project_path: String,

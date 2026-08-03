@@ -259,8 +259,19 @@ export const deleteGlossaryEntry = (term: string, langPair: string) =>
 
 export const exportPo = (lang: string) => requestText(`/export/po?lang=${encodeURIComponent(lang)}`);
 export const exportXliff = (lang: string) => requestText(`/export/xliff?lang=${encodeURIComponent(lang)}`);
-export const importPo = (lang: string, content: string) =>
-  request<{ imported: number }>(`/import/po?lang=${encodeURIComponent(lang)}`, { method: "POST", body: content, headers: { "Content-Type": "text/plain" } });
+export const importPo = (content: string) =>
+  request<{ imported: number }>(`/import/po`, {
+    method: "POST",
+    body: content,
+    headers: { "Content-Type": "text/plain" },
+  });
+
+export const importXliff = (content: string) =>
+  request<{ imported: number }>(`/import/xliff`, {
+    method: "POST",
+    body: content,
+    headers: { "Content-Type": "text/plain" },
+  });
 
 export type ExportFormat = "po" | "xliff";
 
@@ -270,6 +281,13 @@ export interface ExportResult {
   lang: string;
   entries: number;
   bytes: number;
+}
+
+export interface ImportResult {
+  path: string;
+  format: string;
+  imported: number;
+  skipped: number;
 }
 
 /** Save translations to a PO or XLIFF file.
@@ -297,6 +315,28 @@ export async function exportTranslations(
   a.click();
   URL.revokeObjectURL(url);
   return { path: filename, format, lang, entries: 0, bytes: text.length };
+}
+
+/** Import translations from a PO/XLIFF file path (Tauri) or raw content (browser). */
+export async function importTranslations(
+  format: ExportFormat,
+  pathOrContent: string
+): Promise<ImportResult> {
+  if (IS_TAURI) {
+    return invoke<ImportResult>("import_translations", {
+      format,
+      path: pathOrContent,
+    });
+  }
+  const content = pathOrContent;
+  const res =
+    format === "po" ? await importPo(content) : await importXliff(content);
+  return {
+    path: "(browser upload)",
+    format,
+    imported: res.imported,
+    skipped: 0,
+  };
 }
 
 export const getConfig = (): Promise<AppConfig> =>

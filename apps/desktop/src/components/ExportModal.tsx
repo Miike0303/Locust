@@ -1,6 +1,10 @@
-import { useState } from "react";
-import { X, Download, FolderOpen } from "lucide-react";
-import { exportTranslations, type ExportFormat } from "../lib/api";
+import { useState, useRef } from "react";
+import { X, Download, Upload, FolderOpen } from "lucide-react";
+import {
+  exportTranslations,
+  importTranslations,
+  type ExportFormat,
+} from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -19,16 +23,21 @@ const LANGUAGES: { code: string; name: string }[] = [
   { code: "ru", name: "Русский" },
 ];
 
+type Mode = "export" | "import";
+
 interface ExportModalProps {
   open: boolean;
   onClose: () => void;
+  onImported?: () => void;
 }
 
-export default function ExportModal({ open, onClose }: ExportModalProps) {
+export default function ExportModal({ open, onClose, onImported }: ExportModalProps) {
   const { project } = useProjectStore();
+  const [mode, setMode] = useState<Mode>("export");
   const [format, setFormat] = useState<ExportFormat>("po");
   const [lang, setLang] = useState("es");
   const [loading, setLoading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   if (!open || !project) return null;
 
@@ -74,15 +83,111 @@ export default function ExportModal({ open, onClose }: ExportModalProps) {
     }
   };
 
+  const runImportFromPath = async (path: string) => {
+    setLoading(true);
+    try {
+      const result = await importTranslations(format, path);
+      addToast(
+        "success",
+        `Imported ${result.imported} translation(s)${
+          result.skipped ? ` (${result.skipped} skipped)` : ""
+        }`
+      );
+      addLog(
+        "info",
+        `Import ${format}: ${result.imported} applied, ${result.skipped} skipped`,
+        result.path,
+        "import"
+      );
+      onImported?.();
+      onClose();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast("error", `Import failed: ${msg}`);
+      addLog("error", "Import failed", msg, "import");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleImport = async () => {
+    if (IS_TAURI) {
+      const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
+      const selected = await openDialog({
+        title: "Import translations",
+        multiple: false,
+        filters: [
+          format === "po"
+            ? { name: "Gettext PO", extensions: ["po"] }
+            : { name: "XLIFF", extensions: ["xliff", "xlf", "xml"] },
+        ],
+      });
+      if (typeof selected !== "string" || !selected) return;
+      await runImportFromPath(selected);
+      return;
+    }
+    fileInputRef.current?.click();
+  };
+
+  const handleBrowserFile = async (file: File | null) => {
+    if (!file) return;
+    const text = await file.text();
+    setLoading(true);
+    try {
+      const result = await importTranslations(format, text);
+      addToast("success", `Imported ${result.imported} translation(s)`);
+      addLog(
+        "info",
+        `Import ${format}: ${result.imported} applied`,
+        file.name,
+        "import"
+      );
+      onImported?.();
+      onClose();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast("error", `Import failed: ${msg}`);
+      addLog("error", "Import failed", msg, "import");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
       <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-md p-6">
         <div className="flex justify-between items-center mb-4">
           <h2 className="text-lg font-bold flex items-center gap-2">
-            <Download size={18} /> Export Translations
+            {mode === "export" ? <Download size={18} /> : <Upload size={18} />}
+            {mode === "export" ? "Export Translations" : "Import Translations"}
           </h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
             <X size={20} />
+          </button>
+        </div>
+
+        <div className="flex gap-1 mb-4 p-1 bg-gray-100 dark:bg-gray-800 rounded">
+          <button
+            type="button"
+            onClick={() => setMode("export")}
+            className={`flex-1 py-1.5 text-sm rounded transition-colors ${
+              mode === "export"
+                ? "bg-white dark:bg-gray-700 shadow font-medium"
+                : "text-gray-500 hover:text-gray-700"
+            }`}
+          >
+            Export
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("import")}
+            className={`flex-1 py-1.5 text-sm rounded transition-colors ${
+              mode === "import"
+                ? "bg-white dark:bg-gray-700 shadow font-medium"
+                : "text-gray-500 hover:text-gray-700"
+            }`}
+          >
+            Import
           </button>
         </div>
 
@@ -97,25 +202,42 @@ export default function ExportModal({ open, onClose }: ExportModalProps) {
               <option value="po">Gettext PO (.po)</option>
               <option value="xliff">XLIFF 1.2 (.xliff)</option>
             </select>
-            <p className="text-xs text-gray-500 mt-1">
-              For external CAT tools or handoff. Re-import via CLI when needed.
-            </p>
           </div>
 
-          <div>
-            <label className="text-sm font-medium">Target language</label>
-            <select
-              value={lang}
-              onChange={(e) => setLang(e.target.value)}
-              className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
-            >
-              {LANGUAGES.map((l) => (
-                <option key={l.code} value={l.code}>
-                  {l.name} ({l.code})
-                </option>
-              ))}
-            </select>
-          </div>
+          {mode === "export" && (
+            <div>
+              <label className="text-sm font-medium">Target language</label>
+              <select
+                value={lang}
+                onChange={(e) => setLang(e.target.value)}
+                className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+              >
+                {LANGUAGES.map((l) => (
+                  <option key={l.code} value={l.code}>
+                    {l.name} ({l.code})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {mode === "import" && (
+            <p className="text-xs text-gray-500">
+              Matches entries by Locust string id embedded in the file. Empty
+              translations are skipped. Re-open strings in the editor after import.
+            </p>
+          )}
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept={format === "po" ? ".po,text/plain" : ".xliff,.xlf,.xml,application/xml"}
+            className="hidden"
+            onChange={(e) => {
+              void handleBrowserFile(e.target.files?.[0] ?? null);
+              e.target.value = "";
+            }}
+          />
 
           <div className="flex justify-end gap-2 pt-2">
             <button
@@ -126,17 +248,22 @@ export default function ExportModal({ open, onClose }: ExportModalProps) {
             </button>
             <button
               onClick={() => {
-                void handleExport();
+                void (mode === "export" ? handleExport() : handleImport());
               }}
               disabled={loading}
               className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white"
             >
               {loading ? (
-                "Exporting..."
-              ) : (
+                mode === "export" ? "Exporting..." : "Importing..."
+              ) : mode === "export" ? (
                 <>
                   <FolderOpen size={16} />
                   {IS_TAURI ? "Save as…" : "Download"}
+                </>
+              ) : (
+                <>
+                  <Upload size={16} />
+                  {IS_TAURI ? "Choose file…" : "Upload file"}
                 </>
               )}
             </button>

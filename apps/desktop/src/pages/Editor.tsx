@@ -201,10 +201,11 @@ export default function Editor() {
         defaultGamePath={project?.path}
       />
 
-      {/* PO / XLIFF export */}
+      {/* PO / XLIFF export + import */}
       <ExportModal
         open={showExportModal}
         onClose={() => setShowExportModal(false)}
+        onImported={handleRefetch}
       />
     </div>
   );
