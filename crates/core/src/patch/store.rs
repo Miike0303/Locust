@@ -149,23 +149,46 @@ impl PatchStore {
         Ok(())
     }
 
-    /// Replace `dest` with `tmp` (Windows-safe: remove dest first if present).
+    /// Replace `dest` with `tmp`.
+    ///
+    /// On Unix, `rename` replaces atomically. On Windows it fails if `dest`
+    /// exists, so we move the old file aside first (`*.locust-old`), then
+    /// rename `tmp` into place, then delete the aside copy. That keeps a
+    /// recoverable copy across the crash window (review W3) instead of
+    /// delete-then-rename, which could leave the path empty.
     pub fn replace_file(tmp: &Path, dest: &Path) -> Result<()> {
-        if dest.exists() {
-            fs::remove_file(dest).map_err(|e| {
+        if !dest.exists() {
+            return fs::rename(tmp, dest).map_err(|e| {
                 LocustError::PatchError(format!(
-                    "remove {} before replace: {e}",
+                    "rename {} → {}: {e}",
+                    tmp.display(),
                     dest.display()
                 ))
-            })?;
+            });
         }
-        fs::rename(tmp, dest).map_err(|e| {
+        let aside = {
+            let mut p = dest.as_os_str().to_owned();
+            p.push(".locust-old");
+            PathBuf::from(p)
+        };
+        let _ = fs::remove_file(&aside);
+        fs::rename(dest, &aside).map_err(|e| {
             LocustError::PatchError(format!(
-                "rename {} → {}: {e}",
-                tmp.display(),
-                dest.display()
+                "move aside {} → {}: {e}",
+                dest.display(),
+                aside.display()
             ))
         })?;
+        if let Err(e) = fs::rename(tmp, dest) {
+            // Best-effort restore of the previous file.
+            let _ = fs::rename(&aside, dest);
+            return Err(LocustError::PatchError(format!(
+                "rename {} → {} after aside: {e}",
+                tmp.display(),
+                dest.display()
+            )));
+        }
+        let _ = fs::remove_file(&aside);
         Ok(())
     }
 

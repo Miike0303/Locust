@@ -11,9 +11,30 @@ Reusable scripts live next to this file in `docs/vn-tools/`.
 ## 0. General pipeline (engine-agnostic)
 
 ```
-extract text ──► Locust DB ──► translate JA→EN ──► pivot ──► translate EN→ES ──► reinject ──► repack ──► apply
-   (per engine)   (sqlite)     (grok-sub)         (new DB)   (grok-sub)          (per engine) (per engine)
+extract text ──► Locust DB ──► translate JA→EN ──► pivot ──► translate EN→ES ──► reinject ──► pack patch ──► apply
+   (per engine)   (sqlite)     (grok-sub)         (new DB)   (grok-sub)          (per engine) (locust patch) (locust apply)
 ```
+
+### Locust patch apply (shared by all engines)
+
+After inject has **recorded** what it wrote, package and apply without hand-unzipping:
+
+```bash
+# Prefer a pristine tree for original hashes (strict verify on apply)
+locust patch "<injected_or_recorded_game>" -P project.locust.db -l es -o game-es-patch.zip --pristine "<pristine_game>"
+
+# Apply onto a clean copy of the game (never the only original without backup)
+locust apply "<clean_game_copy>" game-es-patch.zip
+locust patch-status "<clean_game_copy>"
+locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
+```
+
+- Backups and receipts live in `<game>/.locust/` (hidden on Windows).
+- Server: `POST /api/patch/{verify,apply,rollback,status}` (binds **127.0.0.1** by default).
+- Desktop: Editor → **Patch** (Ctrl+Shift+P).
+- **Unity / Wolf / Unreal**: translations must be **≤ source UTF-8 byte length** or inject skips them. The `mock` provider is length-safe for tests.
+
+**Phase-2 apply proven (copies only, mock or equal-length where needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube/HTML, Unity (BOXMAN).
 
 - **Locust DB**: each string has `id`, `source`, `translation`, `status`, `file_path`.
   For VNTextPatch-format games the `id` is `<jsonname>.json#<index>#message`, which
