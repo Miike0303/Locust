@@ -526,6 +526,7 @@ impl FormatPlugin for UnityPlugin {
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
+        let mut length_skipped = 0usize;
         let mut warnings = Vec::new();
         let mut files_written: Vec<PathBuf> = Vec::new();
 
@@ -547,9 +548,16 @@ impl FormatPlugin for UnityPlugin {
                 let orig_bytes = entry.source.as_bytes();
                 let trans_bytes = translation.as_bytes();
                 if trans_bytes.len() > orig_bytes.len() {
-                    warnings.push(format!(
-                        "translation for '{}' longer than original, skipping", entry.id
-                    ));
+                    // Cap per-entry noise: first few examples + one summary at end.
+                    if length_skipped < 5 {
+                        warnings.push(format!(
+                            "translation for '{}' longer than original ({} > {} bytes), skipping",
+                            entry.id,
+                            trans_bytes.len(),
+                            orig_bytes.len()
+                        ));
+                    }
+                    length_skipped += 1;
                     strings_skipped += 1;
                     continue;
                 }
@@ -577,6 +585,14 @@ impl FormatPlugin for UnityPlugin {
                 files_modified += 1;
                 files_written.push(file_path.clone());
             }
+        }
+
+        if length_skipped > 0 {
+            warnings.push(format!(
+                "{length_skipped} translation(s) skipped because they are longer than the \
+                 original Unity string (UTF-8 byte length must be ≤ source). Shorten them or \
+                 use a length-aware model; equal-length translations inject cleanly."
+            ));
         }
 
         Ok(InjectionReport { files_modified, strings_written, strings_skipped, warnings, files_written })
