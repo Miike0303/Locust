@@ -465,7 +465,7 @@ impl FormatPlugin for SugarCubePlugin {
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
-        // Phase-2 apply proven (Zabulon's Archive); HTML twin stays ComingSoon.
+        // Phase-2 apply proven (Zabulon's Archive); html-game is separate Experimental.
         locust_core::extraction::FormatStability::Experimental
     }
 

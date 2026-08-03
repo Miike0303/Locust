@@ -185,6 +185,7 @@ export default function Welcome() {
               {formats?.filter(f => f.stability !== "comingsoon").map((f) => {
                 const Icon = FORMAT_ICONS[f.id] ?? Globe;
                 const colorClass = FORMAT_COLORS[f.id] ?? "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+                const experimental = f.stability === "experimental";
                 return (
                   <button
                     key={f.id}
@@ -198,8 +199,15 @@ export default function Welcome() {
                     <div className={`p-1.5 rounded ${colorClass}`}>
                       <Icon size={16} />
                     </div>
-                    <div>
-                      <div className="text-sm font-medium">{f.name}</div>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-medium flex items-center gap-2">
+                        <span className="truncate">{f.name}</span>
+                        {experimental && (
+                          <span className="shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+                            experimental
+                          </span>
+                        )}
+                      </div>
                       <div className="text-xs text-gray-500">{f.extensions.join(", ")}</div>
                     </div>
                   </button>
@@ -284,6 +292,7 @@ export default function Welcome() {
                 {available.map((f) => {
                   const Icon = FORMAT_ICONS[f.id] ?? Globe;
                   const colorClass = FORMAT_COLORS[f.id] ?? "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+                  const experimental = f.stability === "experimental";
                   return (
                     <div
                       key={f.id}
@@ -293,7 +302,12 @@ export default function Welcome() {
                         <div className={`p-1.5 rounded ${colorClass}`}>
                           <Icon size={14} />
                         </div>
-                        <span className="text-sm font-medium">{f.name}</span>
+                        <span className="text-sm font-medium truncate">{f.name}</span>
+                        {experimental && (
+                          <span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+                            exp
+                          </span>
+                        )}
                       </div>
                       {f.description && (
                         <p className="text-xs text-gray-500 line-clamp-2">
