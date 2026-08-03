@@ -343,6 +343,13 @@ pub async fn run_inject(
     params: InjectParams,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
+    // Same guard as CLI/server: empty languages used to return success with
+    // zero work and zero recording — a silent no-op that breaks `locust patch`.
+    if params.languages.is_empty() {
+        return Err(
+            "inject requires at least one language (e.g. [\"es\"])".into(),
+        );
+    }
     let s = &state.0;
     let injector = locust_core::extraction::MultiLangInjector::new(
         s.format_registry.clone(),
