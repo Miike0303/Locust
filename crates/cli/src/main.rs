@@ -11,9 +11,25 @@ use locust_core::config::AppConfig;
 use locust_core::database::{Database, EntryFilter};
 use locust_core::export;
 use locust_core::glossary::Glossary;
-use locust_core::models::{OutputMode, ProgressEvent, StringStatus};
+use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus, ValidationKind};
 use locust_core::translation::{TranslationManager, TranslationOptions};
 use locust_core::validation::Validator;
+
+/// Surface binary inject oversize (Unity/Unreal/Wolf) before the engine silently
+/// skips those strings. Full detail: `locust validate`.
+fn warn_binary_slot_oversize(entries: &[StringEntry]) {
+    let n = Validator::validate_all(entries)
+        .into_iter()
+        .filter(|i| matches!(i.kind, ValidationKind::ExceedsBinarySlot { .. }))
+        .count();
+    if n > 0 {
+        eprintln!(
+            "Warning: {n} translation(s) exceed binary inject slot length \
+             (UTF-8 / UTF-16LE / Shift-JIS) and will be skipped by the engine. \
+             Run `locust validate` for entry IDs, or shorten those strings."
+        );
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "locust", about = "Project Locust — Universal game translation tool")]
@@ -1500,6 +1516,9 @@ async fn cmd_inject(
         }
     }
 
+    let preflight_entries = db.get_entries(&EntryFilter::default())?;
+    warn_binary_slot_oversize(&preflight_entries);
+
     println!("Creating backup...");
     let injector =
         locust_core::extraction::MultiLangInjector::new(registry, db.clone(), backup_mgr);
@@ -1606,6 +1625,7 @@ async fn cmd_inject_direct(
         game_path.display(),
         plugin.name()
     );
+    warn_binary_slot_oversize(&translated);
 
     // Task #14: every remedy funnels users here, but direct used to take NO
     // backup while mutating entry-tree engines (and Ren'Py loose scripts) in

@@ -633,6 +633,12 @@ mod tests {
                 "entry {} missing heuristic metadata",
                 entry.id
             );
+            assert_eq!(
+                entry.metadata.get("binary_slot"),
+                Some(&serde_json::Value::String("sjis".to_string())),
+                "entry {} missing binary_slot for validate/inject preflight",
+                entry.id
+            );
         }
     }
 }

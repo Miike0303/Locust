@@ -45,7 +45,7 @@ Stability matches `locust formats` / the desktop Welcome screen
 | **Unity**                 | `.assets`        | Binary length-limited inject (UTF-8 ≤ source) |
 | **Unreal Engine**         | `.pak`           | UTF-16LE heuristic; length ≤ source |
 | **Wolf RPG Editor**       | `.wolf`          | Shift-JIS binary; length ≤ source |
-| **VNTextPatch JSON**      | `.json`          | Visual-novel intermediate format |
+| **VNTextPatch JSON**      | `.json`          | VN intermediate (KiriKiri/YU-RIS/… via VNTextPatch); Phase-2 patch apply proven on fixture |
 
 ### Coming soon
 

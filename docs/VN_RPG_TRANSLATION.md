@@ -40,7 +40,9 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
   Extract tags entries with `metadata.binary_slot` (`utf8` / `utf16le` / `sjis`);
   `locust validate <db>` reports `ExceedsBinarySlot` before inject.
 
-**Phase-2 apply proven (copies only, mock or equal-length where needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube, HTML generic (non-SugarCube fixture), Unity (BOXMAN), Unreal (Last Hope `_P.pak` subset — full 8GB base pak not copied), Wolf RPG (synthetic `Data/*.wolf` fixture — no commercial title on disk yet).
+**Phase-2 apply proven (copies only, mock or equal-length where needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube, HTML generic (non-SugarCube fixture), Unity (BOXMAN), Unreal (Last Hope `_P.pak` subset — full 8GB base pak not copied), Wolf RPG (synthetic `Data/*.wolf` fixture — no commercial title on disk yet), VNTextPatch JSON (synthetic `yst*.json` fixture — re-run VNTextPatch to pack into the original engine).
+
+`locust inject` / `inject --direct` preflight: warns if any translation exceeds a tagged binary inject slot (see `locust validate`).
 
 - **Locust DB**: each string has `id`, `source`, `translation`, `status`, `file_path`.
   For VNTextPatch-format games the `id` is `<jsonname>.json#<index>#message`, which
