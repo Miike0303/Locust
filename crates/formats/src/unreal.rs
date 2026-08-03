@@ -60,17 +60,6 @@ impl UnrealPlugin {
         has_engine || game_name || has_content_paks
     }
 
-    fn find_content_dir(path: &Path) -> Option<PathBuf> {
-        // Look for */Content/ directory
-        for entry in std::fs::read_dir(path).ok()?.flatten() {
-            let content = entry.path().join("Content");
-            if content.is_dir() {
-                return Some(content);
-            }
-        }
-        None
-    }
-
     /// Extract UTF-16LE strings from PAK file using heuristic scanning.
     /// Unreal PAK format: magic 0xE1 12 6F 5A at end of file, entries packed.
     /// We scan for consecutive UTF-16LE character sequences.

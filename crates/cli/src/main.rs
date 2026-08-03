@@ -11,17 +11,15 @@ use locust_core::config::AppConfig;
 use locust_core::database::{Database, EntryFilter};
 use locust_core::export;
 use locust_core::glossary::Glossary;
-use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus, ValidationKind};
+use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
 use locust_core::translation::{TranslationManager, TranslationOptions};
-use locust_core::validation::Validator;
+use locust_core::validation::{count_binary_slot_oversize, Validator};
 
 /// Surface binary inject oversize (Unity/Unreal/Wolf) before the engine silently
-/// skips those strings. Full detail: `locust validate`.
+/// skips those strings. Full detail: `locust validate`. MultiLangInjector also
+/// emits a ValidationFailed progress event for server/desktop injects.
 fn warn_binary_slot_oversize(entries: &[StringEntry]) {
-    let n = Validator::validate_all(entries)
-        .into_iter()
-        .filter(|i| matches!(i.kind, ValidationKind::ExceedsBinarySlot { .. }))
-        .count();
+    let n = count_binary_slot_oversize(entries);
     if n > 0 {
         eprintln!(
             "Warning: {n} translation(s) exceed binary inject slot length \

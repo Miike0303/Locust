@@ -27,6 +27,21 @@ pub fn encoded_byte_len(encoding: &str, text: &str) -> Option<usize> {
     }
 }
 
+/// Issues where translation exceeds a tagged binary inject slot
+/// (`metadata.binary_slot` = utf8 / utf16le / sjis). Shared by CLI inject
+/// preflight and [`crate::extraction::MultiLangInjector`] so every inject seam
+/// surfaces the same problem.
+pub fn binary_slot_oversize_issues(entries: &[StringEntry]) -> Vec<ValidationIssue> {
+    Validator::validate_all(entries)
+        .into_iter()
+        .filter(|i| matches!(i.kind, ValidationKind::ExceedsBinarySlot { .. }))
+        .collect()
+}
+
+pub fn count_binary_slot_oversize(entries: &[StringEntry]) -> usize {
+    binary_slot_oversize_issues(entries).len()
+}
+
 impl Validator {
     pub fn validate_entry(entry: &StringEntry) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
@@ -265,6 +280,21 @@ mod tests {
         assert_eq!(n, 6); // 3 CJK × 2 SJIS
         assert!(encoded_byte_len("utf16le", "テスト").unwrap() == 6);
         assert!(encoded_byte_len("utf8", "テスト").unwrap() == 9);
+    }
+
+    #[test]
+    fn test_count_binary_slot_oversize() {
+        let mut over = make_entry("e1", "Hi", Some("Hola amigos"));
+        over.metadata.insert(
+            "binary_slot".to_string(),
+            serde_json::Value::String("utf8".to_string()),
+        );
+        let mut ok = make_entry("e2", "Hello", Some("Hola!"));
+        ok.metadata.insert(
+            "binary_slot".to_string(),
+            serde_json::Value::String("utf8".to_string()),
+        );
+        assert_eq!(count_binary_slot_oversize(&[over, ok]), 1);
     }
 
     #[test]

@@ -378,6 +378,8 @@ impl MultiLangInjector {
                 .db
                 .get_entries(&crate::database::EntryFilter::default())?;
 
+            emit_binary_slot_preflight(&entries, &tx).await;
+
             match plugin.inject(&dest, &entries) {
                 Ok(report) => {
                     reports.insert(lang.clone(), report);
@@ -428,6 +430,8 @@ impl MultiLangInjector {
                 .db
                 .get_entries(&crate::database::EntryFilter::default())?;
 
+            emit_binary_slot_preflight(&entries, &tx).await;
+
             match plugin.inject_add(project_path, lang, &entries) {
                 Ok(report) => {
                     reports.insert(lang.clone(), report);
@@ -458,6 +462,27 @@ impl MultiLangInjector {
             injected_roots,
         })
     }
+}
+
+/// Warn (trace + progress event) when translations exceed tagged binary inject
+/// slots so Unity/Unreal/Wolf injects do not silently skip oversize strings
+/// without a client-visible signal. CLI `inject --direct` also prints a count.
+async fn emit_binary_slot_preflight(
+    entries: &[crate::models::StringEntry],
+    tx: &mpsc::Sender<ProgressEvent>,
+) {
+    let issues = crate::validation::binary_slot_oversize_issues(entries);
+    if issues.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        count = issues.len(),
+        "translations exceed binary inject slot length (UTF-8 / UTF-16LE / Shift-JIS); \
+         engine will skip them — run locust validate for entry IDs"
+    );
+    let _ = tx
+        .send(ProgressEvent::ValidationFailed { issues })
+        .await;
 }
 
 /// What [`record_injection_for_lang`] did for one language key.
