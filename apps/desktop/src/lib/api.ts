@@ -221,6 +221,24 @@ export const patchString = (id: string, data: Partial<Pick<StringEntry, "transla
     ? invoke("patch_string", { id, data })
     : request(`/strings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
 
+export interface BatchPatchResult {
+  requested: number;
+  applied: number;
+  skipped: number;
+}
+
+/** Bulk update translations in one transaction (search-replace). */
+export const batchPatchStrings = (
+  updates: { id: string; translation: string }[],
+  provider = "manual"
+): Promise<BatchPatchResult> =>
+  IS_TAURI
+    ? invoke("batch_patch_strings", { data: { updates, provider } })
+    : request("/strings/batch", {
+        method: "POST",
+        body: JSON.stringify({ updates, provider }),
+      });
+
 export const getStats = (): Promise<ProjectStats> =>
   IS_TAURI ? invoke("get_stats") : request("/stats");
 

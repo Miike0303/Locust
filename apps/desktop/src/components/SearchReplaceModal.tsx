@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { X, Replace, AlertCircle } from "lucide-react";
-import { getStrings, patchString, type StringEntry } from "../lib/api";
+import { batchPatchStrings, getStrings, type StringEntry } from "../lib/api";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 
@@ -112,31 +112,30 @@ export default function SearchReplaceModal({
     setLoading(true);
     try {
       const res = await getStrings({ search: find, limit: 50_000, offset: 0 });
-      let updated = 0;
       let occurrences = 0;
-      const failed: string[] = [];
+      const updates: { id: string; translation: string }[] = [];
       for (const e of res.entries as StringEntry[]) {
         if (!e.translation) continue;
         const n = countMatches(e.translation, find, caseSensitive);
         if (n === 0) continue;
         const next = replaceAll(e.translation, find, replace, caseSensitive);
         if (next === e.translation) continue;
-        try {
-          await patchString(e.id, { translation: next });
-          updated++;
-          occurrences += n;
-        } catch {
-          failed.push(e.id);
-        }
+        updates.push({ id: e.id, translation: next });
+        occurrences += n;
       }
+      if (updates.length === 0) {
+        addToast("info", "Nothing to replace");
+        return;
+      }
+      const result = await batchPatchStrings(updates, "search-replace");
       addToast(
-        failed.length ? "warning" : "success",
-        `Replaced in ${updated} string(s) (${occurrences} occurrence(s))` +
-          (failed.length ? ` — ${failed.length} failed` : "")
+        result.skipped ? "warning" : "success",
+        `Replaced in ${result.applied} string(s) (${occurrences} occurrence(s))` +
+          (result.skipped ? ` — ${result.skipped} skipped` : "")
       );
       addLog(
         "info",
-        `Search-replace: ${updated} entries, ${occurrences} hits`,
+        `Search-replace batch: ${result.applied}/${result.requested} applied, ${occurrences} hits`,
         find.length > 40 ? `${find.slice(0, 40)}…` : find,
         "replace"
       );

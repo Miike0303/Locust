@@ -150,6 +150,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/project/open", post(project_open))
         .route("/api/project/current", get(project_current))
         .route("/api/strings", get(get_strings))
+        // Static path before `:id` so "batch" is never captured as an entry id.
+        .route("/api/strings/batch", post(batch_patch_strings))
         .route("/api/strings/:id", get(get_string).patch(patch_string))
         .route("/api/stats", get(get_stats))
         .route("/api/translate/start", post(translate_start))
@@ -454,6 +456,51 @@ async fn patch_string(
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .map(Json)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "entry not found"))
+}
+
+#[derive(Deserialize)]
+struct BatchPatchItem {
+    id: String,
+    translation: String,
+}
+
+#[derive(Deserialize)]
+struct BatchPatchRequest {
+    updates: Vec<BatchPatchItem>,
+    #[serde(default = "default_batch_provider")]
+    provider: String,
+}
+
+fn default_batch_provider() -> String {
+    "manual".into()
+}
+
+async fn batch_patch_strings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BatchPatchRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.updates.len() > 50_000 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "batch too large (max 50000 updates)",
+        ));
+    }
+    let pairs: Vec<(String, String)> = req
+        .updates
+        .into_iter()
+        .map(|u| (u.id, u.translation))
+        .collect();
+    let requested = pairs.len();
+    let applied = state
+        .db
+        .save_translations_batch(pairs, &req.provider)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({
+        "requested": requested,
+        "applied": applied,
+        "skipped": requested.saturating_sub(applied),
+    })))
 }
 
 async fn get_stats(

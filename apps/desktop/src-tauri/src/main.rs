@@ -56,6 +56,7 @@ fn main() {
             commands::get_stats,
             commands::get_strings,
             commands::patch_string,
+            commands::batch_patch_strings,
             commands::start_translation,
             commands::cancel_translation,
             commands::run_validation,

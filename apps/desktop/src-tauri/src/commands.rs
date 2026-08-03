@@ -208,6 +208,51 @@ pub async fn patch_string(
         .ok_or_else(|| "Entry not found".to_string())
 }
 
+#[derive(Deserialize)]
+pub struct BatchPatchItem {
+    pub id: String,
+    pub translation: String,
+}
+
+#[derive(Deserialize)]
+pub struct BatchPatchReq {
+    pub updates: Vec<BatchPatchItem>,
+    #[serde(default = "default_batch_provider")]
+    pub provider: String,
+}
+
+fn default_batch_provider() -> String {
+    "manual".into()
+}
+
+/// Bulk translation updates in one SQLite transaction (search-replace).
+#[tauri::command]
+pub async fn batch_patch_strings(
+    data: BatchPatchReq,
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
+    if data.updates.len() > 50_000 {
+        return Err("batch too large (max 50000 updates)".into());
+    }
+    let pairs: Vec<(String, String)> = data
+        .updates
+        .into_iter()
+        .map(|u| (u.id, u.translation))
+        .collect();
+    let requested = pairs.len();
+    let applied = state
+        .0
+        .db
+        .save_translations_batch(pairs, &data.provider)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "requested": requested,
+        "applied": applied,
+        "skipped": requested.saturating_sub(applied),
+    }))
+}
+
 // ─── Translation commands ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]

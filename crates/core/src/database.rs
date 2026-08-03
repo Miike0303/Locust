@@ -533,6 +533,42 @@ impl Database {
         .unwrap()
     }
 
+    /// Apply many translation updates in one transaction (search-replace, bulk
+    /// import). Each item is `(entry_id, translation)`. Returns how many rows
+    /// were actually updated (unknown ids are skipped, not errors).
+    pub async fn save_translations_batch(
+        &self,
+        updates: Vec<(String, String)>,
+        provider: &str,
+    ) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.clone();
+        let provider = provider.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            let tx = conn.unchecked_transaction()?;
+            let mut applied = 0usize;
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3 WHERE id = ?4",
+                )?;
+                for (id, translation) in &updates {
+                    let n = stmt.execute(params![translation, provider, now, id])?;
+                    if n > 0 {
+                        applied += 1;
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(applied)
+        })
+        .await
+        .unwrap()
+    }
+
     pub async fn update_entry_status(&self, entry_id: &str, status: StringStatus) -> Result<()> {
         let conn = self.conn.clone();
         let entry_id = entry_id.to_string();
@@ -1625,6 +1661,37 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_save_translations_batch_applies_known_skips_unknown() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[
+            make_entry("a", "Hello"),
+            make_entry("b", "World"),
+        ])
+        .unwrap();
+        let applied = db
+            .save_translations_batch(
+                vec![
+                    ("a".into(), "Hola".into()),
+                    ("missing".into(), "X".into()),
+                    ("b".into(), "Mundo".into()),
+                ],
+                "batch",
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied, 2);
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().translation.as_deref(),
+            Some("Hola")
+        );
+        assert_eq!(
+            db.get_entry("b").unwrap().unwrap().translation.as_deref(),
+            Some("Mundo")
+        );
+        assert!(db.get_entry("missing").unwrap().is_none());
     }
 
     #[tokio::test]
