@@ -1,10 +1,12 @@
 import { useState, useCallback } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Languages, Shield, Download, FileCheck, Package } from "lucide-react";
-import { getStrings, getStats, getString } from "../lib/api";
+import { Languages, Shield, Download, FileCheck, Package, Loader2 } from "lucide-react";
+import { getStrings, getStats, getString, validate } from "../lib/api";
 import { useEditorStore } from "../stores/editorStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useHotkey } from "../lib/hotkeys";
+import { addToast } from "../stores/toastStore";
+import { addLog } from "../stores/logStore";
 import FilterBar from "../components/FilterBar";
 import StringTable from "../components/StringTable";
 import DetailPanel from "../components/DetailPanel";
@@ -19,6 +21,7 @@ export default function Editor() {
   const [showTranslateModal, setShowTranslateModal] = useState(false);
   const [showInjectModal, setShowInjectModal] = useState(false);
   const [showPatchModal, setShowPatchModal] = useState(false);
+  const [validating, setValidating] = useState(false);
 
   const { data: stringsData, refetch } = useQuery({
     queryKey: ["strings", filter],
@@ -46,10 +49,45 @@ export default function Editor() {
     }
   }, [refetch, queryClient, selectedEntryId]);
 
+  const handleValidate = useCallback(async () => {
+    if (validating) return;
+    setValidating(true);
+    try {
+      const res = await validate();
+      const v = res.validation;
+      const kinds = Object.entries(v.by_kind || {})
+        .map(([k, n]) => `${k}: ${n}`)
+        .join(", ");
+      const binary = v.by_kind?.ExceedsBinarySlot ?? 0;
+      if (v.issues_found === 0) {
+        addToast("success", `Validation clean (${v.total_checked} checked)`);
+        addLog("info", `Validate: no issues in ${v.total_checked} strings`, undefined, "validate");
+      } else {
+        const msg = `${v.issues_found} issue(s) in ${v.entries_with_issues} entries${kinds ? ` (${kinds})` : ""}`;
+        addToast(binary > 0 ? "warning" : "error", msg, 8000);
+        addLog(
+          "warning",
+          `Validate: ${msg}`,
+          binary > 0
+            ? "ExceedsBinarySlot: shorten UTF-8/UTF-16LE/SJIS translations before inject"
+            : undefined,
+          "validate"
+        );
+      }
+    } catch (e) {
+      const err = e instanceof Error ? e.message : String(e);
+      addToast("error", `Validate failed: ${err}`);
+      addLog("error", "Validate failed", err, "validate");
+    } finally {
+      setValidating(false);
+    }
+  }, [validating]);
+
   // Hotkeys
   useHotkey("translate", () => setShowTranslateModal(true));
   useHotkey("inject", () => setShowInjectModal(true));
   useHotkey("applyPatch", () => setShowPatchModal(true));
+  useHotkey("validate", () => { void handleValidate(); });
   useHotkey("closePanel", () => {
     if (showPatchModal) setShowPatchModal(false);
     else if (showInjectModal) setShowInjectModal(false);
@@ -106,10 +144,13 @@ export default function Editor() {
         </button>
 
         <button
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
+          onClick={() => { void handleValidate(); }}
+          disabled={validating}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 rounded text-sm font-medium transition-colors"
           title="Ctrl+Shift+V"
         >
-          <Shield size={16} /> Validate
+          {validating ? <Loader2 size={16} className="animate-spin" /> : <Shield size={16} />}
+          Validate
         </button>
 
         <button

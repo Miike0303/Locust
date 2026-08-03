@@ -73,6 +73,8 @@ export interface ProjectOpenResponse {
 export interface StringEntry {
   id: string; source: string; translation: string | null;
   file_path: string; context: string | null; tags: string[];
+  /** Engine extract tags e.g. binary_slot: "utf8" | "utf16le" | "sjis" */
+  metadata?: Record<string, unknown>;
   status: StringStatus; provider_used: string | null;
   char_limit: number | null; created_at: string;
   translated_at: string | null; reviewed_at: string | null;
@@ -135,8 +137,41 @@ export interface MultiLangReport {
   reports: Record<string, any>;
 }
 
+export interface ValidationReport {
+  total_checked: number;
+  issues_found: number;
+  entries_with_issues: number;
+  /** Counts by kind name, e.g. ExceedsBinarySlot, MissingPlaceholder */
+  by_kind: Record<string, number>;
+}
+
 export interface ValidationResponse {
-  validation: any; fonts: any[];
+  validation: ValidationReport;
+  fonts: unknown[];
+}
+
+/** UTF-8 / UTF-16LE byte length of text for inject-slot UI.
+ *  JS strings are UTF-16 code units, so utf16le = length × 2.
+ *  Shift-JIS needs a native encoder — live UI returns null; full check is Rust `validate`.
+ */
+export function encodedByteLen(encoding: string, text: string): number | null {
+  switch (encoding) {
+    case "utf8":
+      return new TextEncoder().encode(text).length;
+    case "utf16le":
+      return text.length * 2;
+    case "sjis":
+    case "shift_jis":
+    case "shift-jis":
+      return null;
+    default:
+      return null;
+  }
+}
+
+export function binarySlotOf(entry: StringEntry): string | null {
+  const v = entry.metadata?.binary_slot;
+  return typeof v === "string" ? v : null;
 }
 
 export interface ProgressEventStarted { type: "started"; total: number; job_id: string }
