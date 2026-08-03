@@ -19,7 +19,7 @@ use super::store::{PatchStatus, PatchStore};
 use super::verify::{
     classify_files, verify, VerificationOutcome, VerificationReport,
 };
-use super::zipsec::{normalize_entry_name, safe_entry_path};
+use super::zipsec::{check_entry_budget, normalize_entry_name, safe_entry_path};
 
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
@@ -267,10 +267,11 @@ where
     let mut archive = ZipArchive::new(file)
         .map_err(|e| LocustError::PatchError(format!("open zip: {e}")))?;
 
-    // Load zip bytes by relative path.
+    // Load zip bytes by relative path (same budget as verify — W4).
     let mut zip_files: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
     let mut manifest: Option<PatchManifest> = None;
+    let mut total_bytes = 0u64;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -280,10 +281,15 @@ where
         }
         let original = entry.name().to_string();
         let normalized = normalize_entry_name(&original);
+        total_bytes = check_entry_budget(&original, entry.size(), total_bytes)?;
         let mut data = Vec::new();
         entry
             .read_to_end(&mut data)
             .map_err(|e| LocustError::PatchError(format!("read {original}: {e}")))?;
+        if (data.len() as u64) > entry.size() {
+            let prior = total_bytes.saturating_sub(entry.size());
+            total_bytes = check_entry_budget(&original, data.len() as u64, prior)?;
+        }
         if normalized == PatchManifest::FILENAME {
             manifest = Some(serde_json::from_slice(&data).map_err(|e| {
                 LocustError::PatchError(format!("manifest parse: {e}"))

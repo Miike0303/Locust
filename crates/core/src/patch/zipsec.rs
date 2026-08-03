@@ -117,6 +117,72 @@ pub fn safe_stored_rel(rel: &str) -> Result<PathBuf> {
     safe_entry_path(&normalized, rel)
 }
 
+/// Cap a single uncompressed zip entry (bytes). Above this we refuse to
+/// buffer the entry in memory (zip-bomb / multi-GB patch DoS — review W4).
+pub const MAX_ZIP_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Cap total uncompressed content read from one patch zip.
+pub const MAX_ZIP_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Refuse entries whose declared uncompressed size is absurd before reading.
+pub fn check_entry_budget(
+    entry_name: &str,
+    uncompressed_size: u64,
+    total_so_far: u64,
+) -> Result<u64> {
+    if uncompressed_size > MAX_ZIP_ENTRY_BYTES {
+        return Err(LocustError::PatchError(format!(
+            "zip entry \"{entry_name}\" is {uncompressed_size} bytes uncompressed \
+             (limit {} per entry) — refusing to load into memory",
+            MAX_ZIP_ENTRY_BYTES
+        )));
+    }
+    let next = total_so_far.saturating_add(uncompressed_size);
+    if next > MAX_ZIP_TOTAL_BYTES {
+        return Err(LocustError::PatchError(format!(
+            "patch zip would expand to at least {next} bytes (limit {}) — \
+             refusing to load into memory",
+            MAX_ZIP_TOTAL_BYTES
+        )));
+    }
+    Ok(next)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_oversized_entry() {
+        let err = check_entry_budget("huge.bin", MAX_ZIP_ENTRY_BYTES + 1, 0).unwrap_err();
+        assert!(err.to_string().contains("per entry"));
+    }
+
+    #[test]
+    fn rejects_total_over_budget() {
+        // Use max-per-entry chunks until the total budget trips.
+        let chunk = MAX_ZIP_ENTRY_BYTES;
+        let mut total = 0u64;
+        let mut last_err = None;
+        for i in 0..20 {
+            match check_entry_budget(&format!("e{i}"), chunk, total) {
+                Ok(n) => total = n,
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(last_err.is_some(), "must eventually hit total budget");
+        assert!(last_err.unwrap().to_string().contains("limit"));
+    }
+
+    #[test]
+    fn accepts_small() {
+        assert_eq!(check_entry_budget("a", 100, 0).unwrap(), 100);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

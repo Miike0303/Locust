@@ -13,7 +13,9 @@ use crate::error::{LocustError, Result};
 
 use super::manifest::{PatchFileEntry, PatchManifest, Receipt, VerificationTier};
 use super::store::{PatchStatus, PatchStore};
-use super::zipsec::{case_fold_key, normalize_entry_name, safe_entry_path};
+use super::zipsec::{
+    case_fold_key, check_entry_budget, normalize_entry_name, safe_entry_path,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationOutcome {
@@ -109,6 +111,7 @@ struct ZipEntryMeta {
 fn scan_zip_entries(archive: &mut ZipArchive<File>) -> Result<Vec<ZipEntryMeta>> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut total_bytes = 0u64;
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| {
@@ -149,10 +152,19 @@ fn scan_zip_entries(archive: &mut ZipArchive<File>) -> Result<Vec<ZipEntryMeta>>
             }
         }
 
+        // Declared uncompressed size — refuse zip-bombs before buffering (W4).
+        total_bytes = check_entry_budget(&original, entry.size(), total_bytes)?;
+
         let mut data = Vec::new();
         entry
             .read_to_end(&mut data)
             .map_err(|e| LocustError::PatchError(format!("read {original}: {e}")))?;
+        // Actual bytes can differ from the header; re-check and charge actual.
+        if (data.len() as u64) > entry.size() {
+            // Header understated size — re-budget with actual length from prior total.
+            let prior = total_bytes.saturating_sub(entry.size());
+            total_bytes = check_entry_budget(&original, data.len() as u64, prior)?;
+        }
 
         out.push(ZipEntryMeta {
             original,
