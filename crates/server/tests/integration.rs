@@ -496,6 +496,73 @@ async fn test_validation_catches_placeholder_issues() {
     }
 }
 
+// ─── Batch string patch (search-replace) ───────────────────────────────────
+
+#[tokio::test]
+async fn test_batch_patch_strings_applies_known_skips_unknown() {
+    let tmpdir = TempDir::new().unwrap();
+    create_rpgmaker_mv_fixture(tmpdir.path());
+
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+
+    client()
+        .post(format!("{}/api/project/open", base_url))
+        .json(&serde_json::json!({"path": tmpdir.path().to_string_lossy()}))
+        .send()
+        .await
+        .unwrap();
+
+    let strings: StringsResponse = client()
+        .get(format!("{}/api/strings?limit=100", base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!strings.entries.is_empty());
+
+    let id0 = strings.entries[0]["id"].as_str().unwrap().to_string();
+    let id1 = strings
+        .entries
+        .get(1)
+        .and_then(|e| e["id"].as_str())
+        .unwrap_or(&id0)
+        .to_string();
+
+    let resp: serde_json::Value = client()
+        .post(format!("{}/api/strings/batch", base_url))
+        .json(&serde_json::json!({
+            "provider": "search-replace",
+            "updates": [
+                {"id": id0, "translation": "BATCH_A"},
+                {"id": "does-not-exist-id", "translation": "NOPE"},
+                {"id": id1, "translation": "BATCH_B"},
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(resp["requested"].as_u64(), Some(3));
+    assert_eq!(resp["applied"].as_u64(), Some(2));
+    assert_eq!(resp["skipped"].as_u64(), Some(1));
+
+    let e0: serde_json::Value = client()
+        .get(format!("{}/api/strings/{}", base_url, urlencoding(&id0)))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(e0["translation"].as_str(), Some("BATCH_A"));
+}
+
 fn urlencoding(s: &str) -> String {
     s.replace('#', "%23")
         .replace('[', "%5B")

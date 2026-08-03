@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde::Deserialize;
+
 
 use locust_core::error::{LocustError, Result};
 use locust_core::models::{TranslationRequest, TranslationResult};

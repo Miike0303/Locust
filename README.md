@@ -103,12 +103,16 @@ cargo build --release -p locust-desktop
 3. Locust auto-detects the format and extracts all translatable strings.
 4. Click **Translate** in the editor toolbar, choose a provider and target language (Spanish by default).
 5. Watch the progress — translations are saved to the database as they come in.
-6. When done, click **Inject**, pick language(s), and choose:
+6. Edit in the desktop editor as needed:
+   - **Validate** (Ctrl+Shift+V) — placeholders + binary inject-slot length (Unity/Unreal/Wolf).
+   - **Search & replace** (Ctrl+Shift+F) — bulk edit translations only (one DB batch).
+   - **Export / Import** (Ctrl+E) — PO or XLIFF for external CAT tools (ids survive round-trip).
+7. Click **Inject**, pick language(s), and choose:
    - **Add mode** *(where supported, e.g. Ren'Py)* — language packs beside the original tree.
    - **Replace mode** — writes into a work copy (always keep a pristine original).
-7. Package and apply a patch (recommended distribution path):
+8. Package and apply a patch (recommended distribution path):
    - Desktop: Editor → **Patch** (Ctrl+Shift+P), or CLI below.
-8. Play your translated game.
+9. Play your translated game.
 
 ### CLI sketch
 
