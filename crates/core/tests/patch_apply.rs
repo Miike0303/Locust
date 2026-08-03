@@ -405,3 +405,64 @@ fn upgrade_aborts_when_rollback_soft_fails_on_edited_added_file() {
     let _ = fs::remove_dir_all(&game);
 }
 
+#[test]
+fn r2_discards_manifest_less_backup_when_strict_clean() {
+    // W1: leftover backup/ without receipt made status Unknown and blocked
+    // discard even when game content was Clean at strict tier.
+    let game = tmp_game("r2_discard");
+    write_file(&game, "data/a.json", b"ORIG");
+    let junk = game.join(".locust").join("backup").join("files");
+    fs::create_dir_all(&junk).unwrap();
+    fs::write(junk.join("junk.bin"), b"stale").unwrap();
+    // No receipt, no journal, no backup manifest.
+
+    let zip = game.join("p.zip");
+    build_patch_zip(
+        &zip,
+        &[("data/a.json", b"NEW", Some(b"ORIG"))],
+        "1.0.0",
+        "id-r2",
+    );
+    let report = apply(&game, &zip, ApplyOptions::default(), |_| {}).unwrap();
+    assert_eq!(report.replaced, 1);
+    assert_eq!(fs::read(game.join("data").join("a.json")).unwrap(), b"NEW");
+    // Junk was discarded and a real backup commit marker exists.
+    assert!(game.join(".locust").join("backup").join("manifest.json").is_file());
+    assert!(!junk.join("junk.bin").exists());
+    let _ = fs::remove_dir_all(&game);
+}
+
+#[test]
+fn restore_rejects_path_escape_in_backup_manifest() {
+    let game = tmp_game("w5_escape");
+    write_file(&game, "data/a.json", b"ORIG");
+    let zip = game.join("p.zip");
+    build_patch_zip(
+        &zip,
+        &[("data/a.json", b"NEW", Some(b"ORIG"))],
+        "1.0.0",
+        "id-w5",
+    );
+    apply(&game, &zip, ApplyOptions::default(), |_| {}).unwrap();
+
+    // Tamper backup manifest with a traversal path.
+    let mpath = game.join(".locust").join("backup").join("manifest.json");
+    let mut m: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&mpath).unwrap()).unwrap();
+    m["files"] = serde_json::json!([{
+        "path": "../escape.txt",
+        "sha256": "00",
+        "size": 0
+    }]);
+    fs::write(&mpath, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+
+    let err = rollback(&game, RollbackOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, LocustError::PatchUnsafeEntry(_))
+            || matches!(err, LocustError::PatchBackupIncomplete(_))
+            || matches!(err, LocustError::PatchError(_)),
+        "must refuse path escape, got {err:?}"
+    );
+    let _ = fs::remove_dir_all(&game);
+}
+

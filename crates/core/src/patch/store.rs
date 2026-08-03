@@ -8,6 +8,7 @@ use crate::database::sha256_hex;
 use crate::error::{LocustError, Result};
 
 use super::manifest::{BackupFileEntry, BackupManifest, Journal, Receipt};
+use super::zipsec::safe_stored_rel;
 
 /// Well-known directory beside the game root.
 pub const LOCUST_DIR: &str = ".locust";
@@ -199,7 +200,8 @@ impl PatchStore {
 
     /// Copy `src` into the backup files tree at `rel`, hash-verify, fsync.
     pub fn backup_file(&self, src: &Path, rel: &str) -> Result<BackupFileEntry> {
-        let dest = self.backup_files_dir().join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let rel_path = safe_stored_rel(rel)?;
+        let dest = self.backup_files_dir().join(&rel_path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 LocustError::PatchError(format!("mkdir {}: {e}", parent.display()))
@@ -250,9 +252,8 @@ impl PatchStore {
 
     /// Restore one backup entry to the game root (copy-tmp + rename + hash check).
     pub fn restore_file(&self, entry: &BackupFileEntry) -> Result<()> {
-        let src = self
-            .backup_files_dir()
-            .join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let rel = safe_stored_rel(&entry.path)?;
+        let src = self.backup_files_dir().join(&rel);
         if !src.is_file() {
             return Err(LocustError::PatchBackupIncomplete(format!(
                 "backup file missing: {}",
@@ -267,9 +268,7 @@ impl PatchStore {
                 entry.path, entry.sha256, hash
             )));
         }
-        let dest = self
-            .game_root
-            .join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let dest = self.game_root.join(&rel);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }

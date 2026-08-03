@@ -8,6 +8,7 @@ use crate::error::{LocustError, Result};
 
 use super::manifest::{BackupBaseline, JournalState};
 use super::store::{PatchStatus, PatchStore};
+use super::zipsec::safe_stored_rel;
 
 #[derive(Debug, Clone, Default)]
 pub struct RollbackOptions {
@@ -80,7 +81,8 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                 if manifest_paths.contains(&a.path) {
                     continue; // R1 veto
                 }
-                let target = game_root.join(a.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let rel = safe_stored_rel(&a.path)?;
+                let target = game_root.join(&rel);
                 if target.is_file() {
                     let h = sha256_hex(&fs::read(&target)?);
                     if h != a.patched_sha256 {
@@ -94,7 +96,8 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
             }
 
             for p in &delete_set {
-                let target = game_root.join(p.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let rel = safe_stored_rel(p)?;
+                let target = game_root.join(&rel);
                 if target.is_file() {
                     fs::remove_file(&target)?;
                 }
@@ -162,7 +165,8 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                 if manifest_paths.contains(&a.path) {
                     continue;
                 }
-                let target = game_root.join(a.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let rel = safe_stored_rel(&a.path)?;
+                let target = game_root.join(&rel);
                 if !target.is_file() {
                     continue;
                 }
@@ -191,7 +195,8 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
             // (receipt path has no journal usually; optional)
 
             for p in &delete_set {
-                let target = game_root.join(p.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let rel = safe_stored_rel(p)?;
+                let target = game_root.join(&rel);
                 if target.is_file() {
                     fs::remove_file(&target)?;
                 }
@@ -205,7 +210,10 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
 
             // Remove created dirs if empty.
             for d in receipt.created_dirs.iter().rev() {
-                let p = game_root.join(d.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let Ok(rel) = safe_stored_rel(d) else {
+                    continue;
+                };
+                let p = game_root.join(&rel);
                 if p.is_dir() {
                     let _ = fs::remove_dir(&p); // only if empty
                 }

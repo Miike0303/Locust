@@ -67,6 +67,12 @@ where
     let report = verify(game_root, zip_path)?;
     enforce_verify_gates(&report, &opts, &store)?;
 
+    // R2: only a strict-tier Clean verify may authorize discarding a
+    // manifest-less backup/ (design rev 4). Status alone is wrong — presence
+    // of backup/ makes status Unknown even when the game content is Clean.
+    let r2_allow_discard = matches!(report.outcome, VerificationOutcome::Clean)
+        && matches!(report.tier, Some(VerificationTier::Strict));
+
     // R3 routing when a receipt is present.
     if let Some(prior) = store.read_receipt()? {
         if let Some(ref m) = report.manifest {
@@ -91,7 +97,15 @@ where
                             delete_modified_added: true,
                         },
                     )?;
-                    return apply_fresh(game_root, zip_path, &opts, &mut on_progress, None);
+                    // After a full rollback the game is pristine → allow R2 discard.
+                    return apply_fresh(
+                        game_root,
+                        zip_path,
+                        &opts,
+                        &mut on_progress,
+                        None,
+                        true,
+                    );
                 }
                 return apply_fresh(
                     game_root,
@@ -99,6 +113,7 @@ where
                     &opts,
                     &mut on_progress,
                     Some(prior),
+                    r2_allow_discard,
                 );
             }
             if prior.patch_id != m.patch_id || prior.patch_version != m.patch_version {
@@ -130,12 +145,26 @@ where
                             .into(),
                     ));
                 }
-                return apply_fresh(game_root, zip_path, &opts, &mut on_progress, None);
+                return apply_fresh(
+                    game_root,
+                    zip_path,
+                    &opts,
+                    &mut on_progress,
+                    None,
+                    true,
+                );
             }
         }
     }
 
-    apply_fresh(game_root, zip_path, &opts, &mut on_progress, None)
+    apply_fresh(
+        game_root,
+        zip_path,
+        &opts,
+        &mut on_progress,
+        None,
+        r2_allow_discard,
+    )
 }
 
 /// Rollback that must fully succeed before a subsequent apply. A soft abort
@@ -228,6 +257,7 @@ fn apply_fresh<F>(
     opts: &ApplyOptions,
     on_progress: &mut F,
     prior_receipt: Option<Receipt>,
+    r2_allow_discard: bool,
 ) -> Result<ApplyReport>
 where
     F: FnMut(PatchProgress),
@@ -456,7 +486,7 @@ where
 
     // Step 3: ensure .locust/ and handle existing backup (R2).
     store.ensure_locust_dir()?;
-    prepare_backup_slot(&store, tier, opts)?;
+    prepare_backup_slot(&store, tier, r2_allow_discard)?;
 
     // Step 4: backup every not-already-backed-up replaced file.
     let mut backup_entries = if let Some(existing) = store.read_backup_manifest()? {
@@ -581,10 +611,15 @@ where
 }
 
 /// RULE R2: decide whether an existing backup/ may be discarded or is incomplete.
+///
+/// `r2_allow_discard` is true only when verify reported Clean at the **strict**
+/// tier (content hashes). Structural/legacy and Unknown never authorize discard.
+/// Do not use `store.status() == NotPatched` alone: a leftover `backup/` without
+/// receipt makes status Unknown while the game itself may still be Clean.
 fn prepare_backup_slot(
     store: &PatchStore,
     tier: VerificationTier,
-    _opts: &ApplyOptions,
+    r2_allow_discard: bool,
 ) -> Result<()> {
     let backup_dir = store.backup_dir();
     if !backup_dir.exists() {
@@ -606,9 +641,7 @@ fn prepare_backup_slot(
                 .into(),
         ));
     }
-    // R2: discard only when strict-tier Clean. We are about to apply; "Clean"
-    // is implied only for non-forced structural/legacy we already gated — but
-    // structural/legacy MUST never authorize discard.
+    // R2: structural/legacy never authorize discard (even if somehow Clean).
     if tier != VerificationTier::Strict {
         return Err(LocustError::PatchBackupIncomplete(
             "manifest-less backup/ cannot be discarded under structural or legacy verification \
@@ -616,23 +649,14 @@ fn prepare_backup_slot(
                 .into(),
         ));
     }
-    // Strict tier + no receipt + no journal → safe to discard and rebuild.
-    // Status may still be Unknown if files look patched — apply only reaches
-    // here with force in that case; design still allows discard only for
-    // verify-Clean. Check game content via store status is insufficient;
-    // caller already forced Unknown. For force+Unknown, R2 says: if
-    // manifest-less backup exists, R2 fires and NOTHING is discarded when
-    // verify is not strict Clean. Unknown ≠ Clean → hard error.
-    match store.status()? {
-        PatchStatus::NotPatched => {
-            fs::remove_dir_all(&backup_dir)?;
-            fs::create_dir_all(store.backup_files_dir())?;
-            Ok(())
-        }
-        _ => Err(LocustError::PatchBackupIncomplete(
-            "manifest-less backup/ present and game is not verify-Clean at strict tier — \
-             refusing to discard (R2). Manual recovery required."
-                .into(),
-        )),
+    if r2_allow_discard {
+        fs::remove_dir_all(&backup_dir)?;
+        fs::create_dir_all(store.backup_files_dir())?;
+        return Ok(());
     }
+    Err(LocustError::PatchBackupIncomplete(
+        "manifest-less backup/ present and game is not verify-Clean at strict tier — \
+         refusing to discard (R2). Manual recovery required."
+            .into(),
+    ))
 }

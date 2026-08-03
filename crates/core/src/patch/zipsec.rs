@@ -109,6 +109,14 @@ pub fn case_fold_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
+/// Validate a stored relative path (receipt / backup manifest / journal)
+/// before joining under the game root. Same rules as zip entries — a
+/// tampered `.locust/` marker must not escape the game tree.
+pub fn safe_stored_rel(rel: &str) -> Result<PathBuf> {
+    let normalized = normalize_entry_name(rel);
+    safe_entry_path(&normalized, rel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
