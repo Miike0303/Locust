@@ -14,6 +14,7 @@ import TranslationModal from "../components/TranslationModal";
 import InjectModal from "../components/InjectModal";
 import PatchModal from "../components/PatchModal";
 import ExportModal from "../components/ExportModal";
+import SearchReplaceModal from "../components/SearchReplaceModal";
 
 export default function Editor() {
   const { filter, selectedEntryId, setSelected } = useEditorStore();
@@ -23,6 +24,7 @@ export default function Editor() {
   const [showInjectModal, setShowInjectModal] = useState(false);
   const [showPatchModal, setShowPatchModal] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
+  const [showReplaceModal, setShowReplaceModal] = useState(false);
   const [validating, setValidating] = useState(false);
 
   const { data: stringsData, refetch } = useQuery({
@@ -91,8 +93,10 @@ export default function Editor() {
   useHotkey("applyPatch", () => setShowPatchModal(true));
   useHotkey("validate", () => { void handleValidate(); });
   useHotkey("exportFile", () => setShowExportModal(true));
+  useHotkey("searchReplace", () => setShowReplaceModal(true));
   useHotkey("closePanel", () => {
-    if (showExportModal) setShowExportModal(false);
+    if (showReplaceModal) setShowReplaceModal(false);
+    else if (showExportModal) setShowExportModal(false);
     else if (showPatchModal) setShowPatchModal(false);
     else if (showInjectModal) setShowInjectModal(false);
     else if (showTranslateModal) setShowTranslateModal(false);
@@ -206,6 +210,12 @@ export default function Editor() {
         open={showExportModal}
         onClose={() => setShowExportModal(false)}
         onImported={handleRefetch}
+      />
+
+      <SearchReplaceModal
+        open={showReplaceModal}
+        onClose={() => setShowReplaceModal(false)}
+        onDone={handleRefetch}
       />
     </div>
   );
