@@ -364,18 +364,24 @@ fn verify_strict(
     for f in &manifest.files {
         let target = game_root.join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR));
         let original = f.original_sha256.as_deref().unwrap_or("");
+        // Identity patch: translation equals source → original hash == patched hash.
+        // A pristine game matching that hash is Clean, not AlreadyApplied/Unknown.
+        let identity_patch = !original.is_empty() && original == f.patched_sha256;
         if target.is_file() {
             let hash = sha256_hex(&fs::read(&target)?);
             if hash == f.patched_sha256 {
-                any_already = true;
-                // Treat as already-applied for this path; still plan as replaced/added
-                // based on original presence for apply planning.
+                if identity_patch || hash == original {
+                    any_clean = true;
+                } else {
+                    any_already = true;
+                }
+                // Plan as replaced/added based on original presence.
                 if original.is_empty() {
                     added.push(f.path.clone());
                 } else {
                     replaced.push(f.path.clone());
                 }
-            } else if hash == original {
+            } else if !original.is_empty() && hash == original {
                 any_clean = true;
                 replaced.push(f.path.clone());
             } else if original.is_empty() {
@@ -419,30 +425,14 @@ fn verify_strict(
                 .collect(),
         )
     } else if any_already && !any_clean {
-        VerificationOutcome::AlreadyApplied
-    } else if any_clean || (!replaced.is_empty() || !added.is_empty()) {
-        // Unknown: looks patched but no receipt (all already hashes) is handled
-        // only when we have no clean originals and no receipt — here Clean when
-        // every path is original or legitimately absent-added.
-        if any_already && any_clean {
-            // Mixed — report as mismatch-ish Unknown.
-            VerificationOutcome::Unknown
-        } else {
-            VerificationOutcome::Clean
-        }
-    } else {
-        VerificationOutcome::Clean
-    };
-
-    // Special case: all patched hashes, no receipt → Unknown (binding default).
-    let outcome = if matches!(outcome, VerificationOutcome::AlreadyApplied)
-        && /* no receipt path already returned above */ true
-    {
-        // Caller already handled receipt AlreadyApplied. Without receipt this
-        // branch means files look patched → Unknown, never silent reapply.
+        // All files look patched, none still match a distinct original.
+        // Without a receipt (handled above) this is Unknown, never silent reapply.
+        VerificationOutcome::Unknown
+    } else if any_already && any_clean {
+        // Mixed pristine + patched content without a receipt.
         VerificationOutcome::Unknown
     } else {
-        outcome
+        VerificationOutcome::Clean
     };
 
     // Re-evaluate: if every existing file matches patched and none match

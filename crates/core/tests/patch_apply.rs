@@ -466,3 +466,29 @@ fn restore_rejects_path_escape_in_backup_manifest() {
     let _ = fs::remove_dir_all(&game);
 }
 
+#[test]
+fn identity_patch_on_pristine_game_is_clean_not_unknown() {
+    // When translation == source, original_sha256 == patched_sha256. A pristine
+    // game matching that hash must verify Clean so apply can proceed (Unity
+    // equal-length inject case), not Unknown.
+    let game = tmp_game("identity_clean");
+    write_file(&game, "data/a.json", b"SAME_BYTES");
+    let zip = game.join("p.zip");
+    build_patch_zip(
+        &zip,
+        &[("data/a.json", b"SAME_BYTES", Some(b"SAME_BYTES"))],
+        "1.0.0",
+        "id-id",
+    );
+    let r = verify(&game, &zip).unwrap();
+    assert_eq!(
+        r.outcome,
+        VerificationOutcome::Clean,
+        "identity patch on pristine must be Clean, got {:?}",
+        r.outcome
+    );
+    let report = apply(&game, &zip, ApplyOptions::default(), |_| {}).unwrap();
+    assert_eq!(report.replaced, 1);
+    let _ = fs::remove_dir_all(&game);
+}
+
