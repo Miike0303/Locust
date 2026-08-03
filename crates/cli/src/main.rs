@@ -357,6 +357,15 @@ fn mutates_original_tree(format_id: &str) -> bool {
     writes_to_entry_tree(format_id) || format_id == "renpy"
 }
 
+/// Central backup root for inject / direct-inject. `LOCUST_BACKUP_ROOT` isolates
+/// tests and lets operators put backups on a larger volume; default matches the
+/// historical `temp_dir()/locust_bak` path named in recovery messages.
+fn locust_backup_root() -> PathBuf {
+    std::env::var_os("LOCUST_BACKUP_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("locust_bak"))
+}
+
 /// The restore step shared by every remedy issued from a state where the
 /// ORIGINAL game tree was provably already mutated. Advice without it is a
 /// closed loop: the re-run finds no original text, writes nothing, and
@@ -1479,7 +1488,8 @@ async fn cmd_inject(
     let format_id = plugin.id().to_string();
 
     // Use short temp path for backups to avoid Windows MAX_PATH issues
-    let backup_root = std::env::temp_dir().join("locust_bak");
+    // (overridable with LOCUST_BACKUP_ROOT — same helper as --direct).
+    let backup_root = locust_backup_root();
     std::fs::create_dir_all(&backup_root).ok();
     let backup_mgr = Arc::new(BackupManager::new(backup_root));
 
@@ -1597,6 +1607,52 @@ async fn cmd_inject_direct(
         plugin.name()
     );
 
+    // Task #14: every remedy funnels users here, but direct used to take NO
+    // backup while mutating entry-tree engines (and Ren'Py loose scripts) in
+    // place. Recovery advice that starts at "the backup listed above" was
+    // hollow for the one mode the tool recommends. Same default root as
+    // Replace/Add inject (`temp_dir()/locust_bak`, overridable with
+    // LOCUST_BACKUP_ROOT); failure is fatal for the same reason
+    // MultiLangInjector refuses to inject without a backup.
+    let backup_note = if mutates_original_tree(plugin.id()) {
+        let backup_root = locust_backup_root();
+        std::fs::create_dir_all(&backup_root).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot create backup directory {}: {e} — direct inject is refused \
+                 without a backup for engines that write into the original game tree \
+                 ({})",
+                backup_root.display(),
+                plugin.id()
+            )
+        })?;
+        let mgr = BackupManager::new(backup_root.clone());
+        if let Ok(deleted) = mgr.delete_old_backups(3) {
+            if deleted > 0 {
+                println!("Cleaned {deleted} old backup(s)");
+            }
+        }
+        println!("Creating backup (engine mutates the original game tree)...");
+        let entry = mgr.create_backup(&game_path).map_err(|e| {
+            anyhow::anyhow!(
+                "{e} — direct inject is refused without a backup: this engine \
+                 ({}) writes into the ORIGINAL tree, and every recovery path \
+                 starts at this backup (root: {}). Free disk space or fix the \
+                 backup directory, then re-run.",
+                plugin.id(),
+                backup_root.display()
+            )
+        })?;
+        println!(
+            "Backup: {} ({} files, {})",
+            entry.path.display(),
+            entry.file_count,
+            entry.id
+        );
+        Some(entry)
+    } else {
+        None
+    };
+
     let report = plugin.inject(&game_path, &translated)?;
 
     // Persist the paths this injection actually wrote — under EVERY requested
@@ -1632,6 +1688,9 @@ async fn cmd_inject_direct(
     table.add_row(vec!["Files modified", &report.files_modified.to_string()]);
     table.add_row(vec!["Strings written", &report.strings_written.to_string()]);
     table.add_row(vec!["Strings skipped", &report.strings_skipped.to_string()]);
+    if let Some(ref b) = backup_note {
+        table.add_row(vec!["Backup", &b.path.display().to_string()]);
+    }
     if !report.warnings.is_empty() {
         table.add_row(vec!["Warnings", &report.warnings.len().to_string()]);
     }
@@ -1833,6 +1892,10 @@ async fn cmd_server(port: u16) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Process-global env var — serialize tests that set LOCUST_BACKUP_ROOT.
+    static BACKUP_ROOT_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_cli_parses() {
@@ -2513,6 +2576,7 @@ mod tests {
         // requested language (recording only the first orphaned `patch -l
         // <other>` — today's F1 bug).
         let base = patch_test_tempdir();
+        let bak = base.join("bak");
         let game_dir = base.join("renpygame");
         let game_sub = game_dir.join("game");
         fs::create_dir_all(&game_sub).unwrap();
@@ -2524,13 +2588,18 @@ mod tests {
         save_translated(&db, "script.rpy#2", "Hello, world!", &script, "Hola, mundo!");
         drop(db);
 
-        cmd_inject_direct(
-            game_dir.clone(),
-            db_path.clone(),
-            vec!["es".to_string(), "fr".to_string()],
-        )
-        .await
-        .unwrap();
+        {
+            let _guard = BACKUP_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
+            cmd_inject_direct(
+                game_dir.clone(),
+                db_path.clone(),
+                vec!["es".to_string(), "fr".to_string()],
+            )
+            .await
+            .unwrap();
+            std::env::remove_var("LOCUST_BACKUP_ROOT");
+        }
 
         let db = Database::open(&db_path).unwrap();
         for lang in ["es", "fr"] {
@@ -2554,8 +2623,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_inject_direct_backs_up_before_mutating_renpy_tree() {
+        // Task #14: --direct is the universally recommended recovery path, but
+        // for engines that write the original tree it used to take no backup.
+        let base = patch_test_tempdir();
+        let bak = base.join("bak");
+        let game_dir = base.join("renpygame");
+        let game_sub = game_dir.join("game");
+        fs::create_dir_all(&game_sub).unwrap();
+        let script = game_sub.join("script.rpy");
+        fs::write(&script, "label start:\n    \"Hello, world!\"\n").unwrap();
+        let original = fs::read(&script).unwrap();
+
+        let db_path = base.join("project.locust.db");
+        let db = Database::open(&db_path).unwrap();
+        save_translated(&db, "script.rpy#2", "Hello, world!", &script, "Hola, mundo!");
+        drop(db);
+
+        {
+            let _guard = BACKUP_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
+            cmd_inject_direct(game_dir.clone(), db_path, vec!["es".to_string()])
+                .await
+                .unwrap();
+            std::env::remove_var("LOCUST_BACKUP_ROOT");
+        }
+
+        // Injection mutated the loose script.
+        assert_ne!(fs::read(&script).unwrap(), original);
+
+        // Isolated backup root holds the pre-inject bytes.
+        let bak_dirs: Vec<_> = fs::read_dir(&bak)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(
+            bak_dirs.len(),
+            1,
+            "direct inject on a mutating engine must create exactly one backup under {}",
+            bak.display()
+        );
+        let backed = bak_dirs[0].join("game").join("script.rpy");
+        assert!(
+            backed.is_file(),
+            "backup must contain the original game/script.rpy"
+        );
+        assert_eq!(
+            fs::read(&backed).unwrap(),
+            original,
+            "backup must hold pre-inject bytes"
+        );
+    }
+
+    #[tokio::test]
     async fn test_inject_direct_without_lang_records_the_unspecified_key() {
         let base = patch_test_tempdir();
+        let bak = base.join("bak");
         let game_dir = base.join("renpygame");
         let game_sub = game_dir.join("game");
         fs::create_dir_all(&game_sub).unwrap();
@@ -2567,9 +2692,14 @@ mod tests {
         save_translated(&db, "script.rpy#2", "Hello, world!", &script, "Hola, mundo!");
         drop(db);
 
-        cmd_inject_direct(game_dir, db_path.clone(), Vec::new())
-            .await
-            .unwrap();
+        {
+            let _guard = BACKUP_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
+            cmd_inject_direct(game_dir, db_path.clone(), Vec::new())
+                .await
+                .unwrap();
+            std::env::remove_var("LOCUST_BACKUP_ROOT");
+        }
 
         let db = Database::open(&db_path).unwrap();
         assert!(

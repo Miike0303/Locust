@@ -629,6 +629,14 @@ async fn inject(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InjectRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Same guard as CLI: empty languages used to return 200 with zero work and
+    // zero recording — a silent no-op that becomes an untranslatable patch later.
+    if req.languages.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "inject requires at least one language in `languages` (e.g. [\"es\"])",
+        ));
+    }
     let injector = MultiLangInjector::new(
         state.format_registry.clone(),
         state.db.clone(),
