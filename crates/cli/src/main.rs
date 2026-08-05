@@ -95,6 +95,22 @@ enum Commands {
     },
     /// Validate translations
     Validate { project: PathBuf },
+    /// Find and replace text inside translations in a project DB
+    Replace {
+        project: PathBuf,
+        /// Text to find in translations
+        #[arg(long)]
+        find: String,
+        /// Replacement text (may be empty)
+        #[arg(long, default_value = "")]
+        replace: String,
+        /// Case-sensitive matching (default: case-insensitive)
+        #[arg(long)]
+        case_sensitive: bool,
+        /// Preview only — do not write the database
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show translation stats: tokens, time, and cost per run
     Stats { project: PathBuf },
     /// Pivot: seed a new project whose SOURCE is another project's translations,
@@ -277,6 +293,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Validate { project } => cmd_validate(project)?,
+        Commands::Replace {
+            project,
+            find,
+            replace,
+            case_sensitive,
+            dry_run,
+        } => cmd_replace(project, find, replace, case_sensitive, dry_run).await?,
         Commands::Stats { project } => cmd_stats(project)?,
         Commands::Pivot { source, output } => cmd_pivot(source, output)?,
         Commands::Patch {
@@ -1743,6 +1766,152 @@ fn cmd_validate(project: PathBuf) -> anyhow::Result<()> {
     std::process::exit(1);
 }
 
+/// Byte length of a `haystack` prefix that case-folds to `find_folded`, or `None`.
+///
+/// Walks whole characters only. Compares `char::to_lowercase()` sequences so
+/// length-changing folds (e.g. ẞ→ß) stay aligned with the original string.
+fn case_insensitive_prefix_len(haystack: &str, find_folded: &[char]) -> Option<usize> {
+    let mut fi = 0;
+    let mut bytes = 0;
+    for ch in haystack.chars() {
+        let folded: Vec<char> = ch.to_lowercase().collect();
+        if fi + folded.len() > find_folded.len() {
+            return None;
+        }
+        if find_folded[fi..fi + folded.len()] != folded[..] {
+            return None;
+        }
+        fi += folded.len();
+        bytes += ch.len_utf8();
+        if fi == find_folded.len() {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// Replace all occurrences of `find` in `text`. Returns (new_text, occurrence_count).
+fn replace_in_translation(
+    text: &str,
+    find: &str,
+    replace: &str,
+    case_sensitive: bool,
+) -> (String, usize) {
+    if find.is_empty() {
+        return (text.to_string(), 0);
+    }
+    if case_sensitive {
+        let parts: Vec<&str> = text.split(find).collect();
+        let n = parts.len().saturating_sub(1);
+        if n == 0 {
+            return (text.to_string(), 0);
+        }
+        return (parts.join(replace), n);
+    }
+    // Case-insensitive: walk original chars; match by case-folded sequences.
+    let find_folded: Vec<char> = find.chars().flat_map(|c| c.to_lowercase()).collect();
+    let mut out = String::with_capacity(text.len());
+    let mut n = 0usize;
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(matched_bytes) = case_insensitive_prefix_len(rest, &find_folded) {
+            out.push_str(replace);
+            rest = &rest[matched_bytes..];
+            n += 1;
+        } else {
+            let mut chars = rest.chars();
+            let ch = chars.next().expect("rest non-empty");
+            out.push(ch);
+            rest = chars.as_str();
+        }
+    }
+    (out, n)
+}
+
+async fn cmd_replace(
+    project: PathBuf,
+    find: String,
+    replace: String,
+    case_sensitive: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if find.is_empty() {
+        anyhow::bail!("--find must not be empty");
+    }
+    let db = Database::open(&project)?;
+    // SQLite LIKE is case-insensitive only for ASCII. With non-ASCII find in
+    // case-insensitive mode, skip the SQL prefilter and match in Rust.
+    const ENTRY_LIMIT: usize = 100_000;
+    let use_sql_search = case_sensitive || find.is_ascii();
+    let entries = db.get_entries(&EntryFilter {
+        search: if use_sql_search {
+            Some(find.clone())
+        } else {
+            None
+        },
+        limit: Some(ENTRY_LIMIT),
+        ..Default::default()
+    })?;
+    if entries.len() == ENTRY_LIMIT {
+        eprintln!(
+            "warning: result set hit the {ENTRY_LIMIT}-entry cap; results may be truncated. \
+             Use a narrower --find."
+        );
+    }
+
+    let mut updates: Vec<(String, String)> = Vec::new();
+    let mut occurrences = 0usize;
+    for e in &entries {
+        let Some(ref t) = e.translation else {
+            continue;
+        };
+        let (next, n) = replace_in_translation(t, &find, &replace, case_sensitive);
+        if n == 0 || next == *t {
+            continue;
+        }
+        occurrences += n;
+        updates.push((e.id.clone(), next));
+    }
+
+    if updates.is_empty() {
+        println!("No matching translations for {find:?}.");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            "Dry run: would update {} string(s), {} occurrence(s).",
+            updates.len(),
+            occurrences
+        );
+        for (id, next) in updates.iter().take(10) {
+            println!("  {id} → {}", truncate_preview(next, 80));
+        }
+        if updates.len() > 10 {
+            println!("  … and {} more", updates.len() - 10);
+        }
+        return Ok(());
+    }
+
+    let applied = db
+        .save_translations_batch(updates, "cli-replace")
+        .await?;
+    println!(
+        "Updated {applied} string(s), {occurrences} occurrence(s) in {}.",
+        project.display()
+    );
+    Ok(())
+}
+
+fn truncate_preview(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 fn cmd_providers(config: &AppConfig) -> anyhow::Result<()> {
     let reg = locust_providers::default_registry(config);
     let providers = reg.list();
@@ -1925,6 +2094,66 @@ mod tests {
         // Verify the CLI struct parses without panicking
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn replace_in_translation_case_sensitive_basic() {
+        let (out, n) = replace_in_translation("foo bar foo", "foo", "X", true);
+        assert_eq!(out, "X bar X");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn replace_in_translation_case_sensitive_no_match() {
+        let (out, n) = replace_in_translation("Foo bar", "foo", "X", true);
+        assert_eq!(out, "Foo bar");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn replace_in_translation_case_sensitive_multiple() {
+        let (out, n) = replace_in_translation("aaa", "a", "b", true);
+        assert_eq!(out, "bbb");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn replace_in_translation_case_insensitive_ascii_mixed() {
+        let (out, n) = replace_in_translation("Foo FOO foo", "foo", "x", false);
+        assert_eq!(out, "x x x");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn replace_in_translation_case_insensitive_unicode_length_change() {
+        // ẞ lowercases to ß (different UTF-8 byte length) — must not panic.
+        let (out, n) = replace_in_translation("STRAẞE fine", "straße", "road", false);
+        assert_eq!(out, "road fine");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn replace_in_translation_case_insensitive_non_ascii_accent() {
+        let (out, n) = replace_in_translation("Árbol y Á", "á", "a", false);
+        assert_eq!(out, "arbol y a");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn replace_in_translation_empty_find() {
+        let (out, n) = replace_in_translation("hello", "", "x", false);
+        assert_eq!(out, "hello");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn replace_in_translation_shorter_and_longer_replacement() {
+        let (short, n1) = replace_in_translation("xxfoo yyfoo", "foo", "z", true);
+        assert_eq!(short, "xxz yyz");
+        assert_eq!(n1, 2);
+        let (long, n2) = replace_in_translation("a-b", "b", "BBB", true);
+        assert_eq!(long, "a-BBB");
+        assert_eq!(n2, 1);
     }
 
     #[test]
