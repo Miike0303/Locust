@@ -113,6 +113,7 @@ impl TranslationManager {
             .await;
 
         let mut completed = 0usize;
+        let mut oversize_count = 0usize;
         let mut total_cost = 0.0f64;
         let mut total_tokens = 0u64;
         let mut total_input_tokens = 0u64;
@@ -161,9 +162,12 @@ impl TranslationManager {
             opts.max_concurrent.max(1)
         };
 
+        /// Per-entry binary inject budget: (slot encoding name, max encoded bytes).
+        type SlotBudget = (String, usize);
         type BatchOutcome = (
             Vec<TranslationRequest>,
             std::collections::HashMap<String, Vec<Placeholder>>,
+            std::collections::HashMap<String, SlotBudget>,
             Result<Vec<TranslationResult>>,
         );
         let mut in_flight: tokio::task::JoinSet<BatchOutcome> = tokio::task::JoinSet::new();
@@ -201,15 +205,38 @@ impl TranslationManager {
                 // doesn't translate variable names like [player_name] or Ren'Py tags {i}{/i}
                 let mut placeholders_by_id: std::collections::HashMap<String, Vec<Placeholder>> =
                     std::collections::HashMap::new();
+                let mut budgets_by_id: std::collections::HashMap<String, SlotBudget> =
+                    std::collections::HashMap::new();
                 let requests: Vec<TranslationRequest> = chunk
                     .iter()
                     .map(|entry| {
-                        let context = match (&entry.context, &opts.game_context) {
+                        let mut context = match (&entry.context, &opts.game_context) {
                             (Some(ec), Some(gc)) => Some(format!("{} | {}", gc, ec)),
                             (Some(ec), None) => Some(ec.clone()),
                             (None, Some(gc)) => Some(gc.clone()),
                             (None, None) => None,
                         };
+                        // Binary-slot engines (Unity/Unreal/Wolf): hint the model to stay
+                        // within the inject byte budget for this string.
+                        if let Some(slot) = entry
+                            .metadata
+                            .get("binary_slot")
+                            .and_then(|v| v.as_str())
+                        {
+                            if let Some(budget) =
+                                crate::validation::encoded_byte_len(slot, &entry.source)
+                            {
+                                budgets_by_id
+                                    .insert(entry.id.clone(), (slot.to_string(), budget));
+                                let hint = format!(
+                                    "LENGTH LIMIT: the translation MUST fit in {budget} bytes when encoded as {slot}; abbreviate if needed."
+                                );
+                                context = Some(match context {
+                                    Some(c) => format!("{c} | {hint}"),
+                                    None => hint,
+                                });
+                            }
+                        }
                         let (sanitized, phs) = PlaceholderProcessor::extract(&entry.source);
                         placeholders_by_id.insert(entry.id.clone(), phs);
                         TranslationRequest {
@@ -219,15 +246,15 @@ impl TranslationManager {
                             target_lang: opts.target_lang.clone(),
                             context,
                             glossary_hint: glossary_hint.clone(),
-                    }
-                })
-                .collect();
+                        }
+                    })
+                    .collect();
 
                 // 5d. Dispatch provider call to the in-flight window
                 let provider = self.provider.clone();
                 in_flight.spawn(async move {
                     let result = provider.translate(&requests).await;
-                    (requests, placeholders_by_id, result)
+                    (requests, placeholders_by_id, budgets_by_id, result)
                 });
             }
 
@@ -235,7 +262,7 @@ impl TranslationManager {
             let Some(joined) = in_flight.join_next().await else {
                 break;
             };
-            let (requests, placeholders_by_id, batch_result) = match joined {
+            let (requests, placeholders_by_id, budgets_by_id, batch_result) = match joined {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     tracing::error!("Translation batch task panicked: {}", e);
@@ -263,6 +290,24 @@ impl TranslationManager {
                                         }
                                         result.translation = t;
                                     }
+                                }
+                            }
+                        }
+                        // Flag oversize after restore; still save — validate/inject preflight
+                        // are the enforcement points for binary slots.
+                        if let Some((slot, budget)) = budgets_by_id.get(&result.entry_id) {
+                            if let Some(actual) =
+                                crate::validation::encoded_byte_len(slot, &result.translation)
+                            {
+                                if actual > *budget {
+                                    tracing::warn!(
+                                        entry_id = %result.entry_id,
+                                        actual,
+                                        budget,
+                                        slot = %slot,
+                                        "translation exceeds binary slot budget"
+                                    );
+                                    oversize_count += 1;
                                 }
                             }
                         }
@@ -346,6 +391,13 @@ impl TranslationManager {
         if cancelled {
             let _ = tx.send(ProgressEvent::Paused).await;
             return Ok(());
+        }
+
+        // ProgressEvent / return type live outside this file; surface oversize via log only.
+        if oversize_count > 0 {
+            tracing::warn!(
+                "{oversize_count} translations exceed their binary slot; run locust validate"
+            );
         }
 
         // 6. Send Completed and record the run in the project ledger
@@ -961,5 +1013,256 @@ mod tests {
 
         let hints = provider_ref.glossary_hints.lock().unwrap();
         assert!(hints[0].as_ref().unwrap().contains("HP → Health Points"));
+    }
+
+    /// Captures request context keyed by entry id (for binary-slot budget tests).
+    struct ContextById {
+        by_id: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    }
+
+    #[async_trait]
+    impl TranslationProvider for ContextById {
+        fn id(&self) -> &str {
+            "ctx-by-id"
+        }
+        fn name(&self) -> &str {
+            "Context By Id"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            let mut guard = self.by_id.lock().unwrap();
+            for r in requests {
+                guard.insert(r.entry_id.clone(), r.context.clone());
+            }
+            Ok(requests
+                .iter()
+                .map(|r| TranslationResult {
+                    entry_id: r.entry_id.clone(),
+                    translation: "ok".to_string(),
+                    detected_source_lang: None,
+                    provider: "ctx-by-id".to_string(),
+                    tokens_used: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_usd: None,
+                })
+                .collect())
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_binary_slot_utf8_adds_length_limit_to_context() {
+        let (db, glossary) = setup();
+
+        let mut with_slot =
+            StringEntry::new("with_slot", "Hello", PathBuf::from("resources.assets"));
+        with_slot.metadata.insert(
+            "binary_slot".to_string(),
+            serde_json::Value::String("utf8".to_string()),
+        );
+        let without = StringEntry::new("no_slot", "World", PathBuf::from("script.txt"));
+        db.save_entries(&[with_slot.clone(), without.clone()])
+            .unwrap();
+
+        let provider = Arc::new(ContextById {
+            by_id: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let capture = provider.clone();
+        let manager = TranslationManager::new(provider, db, glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let cancel = CancellationToken::new();
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+
+        manager
+            .translate_entries(
+                vec![with_slot, without],
+                opts,
+                tx,
+                "job-slot-ctx".into(),
+                cancel,
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        let map = capture.by_id.lock().unwrap();
+        let slotted = map
+            .get("with_slot")
+            .and_then(|c| c.as_ref())
+            .expect("slotted entry must have context");
+        assert!(
+            slotted.contains("LENGTH LIMIT"),
+            "binary_slot entry must get a LENGTH LIMIT hint: {slotted}"
+        );
+        assert!(
+            slotted.contains("5 bytes"),
+            "utf8 budget for \"Hello\" is 5: {slotted}"
+        );
+        assert!(
+            slotted.contains("encoded as utf8"),
+            "slot name must appear: {slotted}"
+        );
+
+        let plain = map.get("no_slot").cloned().flatten();
+        assert!(
+            plain
+                .as_ref()
+                .map(|c| !c.contains("LENGTH LIMIT"))
+                .unwrap_or(true),
+            "entry without binary_slot must not get LENGTH LIMIT: {plain:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_binary_slot_utf16le_budget_uses_utf16_bytes() {
+        let (db, glossary) = setup();
+        // Three CJK chars: UTF-8 is 9 bytes; UTF-16LE is 3 code units * 2 = 6.
+        let source = "テスト";
+        assert_eq!(source.len(), 9);
+        assert_eq!(source.encode_utf16().count() * 2, 6);
+
+        let mut entry = StringEntry::new("u16", source, PathBuf::from("game.pak"));
+        entry.metadata.insert(
+            "binary_slot".to_string(),
+            serde_json::Value::String("utf16le".to_string()),
+        );
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+
+        let provider = Arc::new(ContextById {
+            by_id: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let capture = provider.clone();
+        let manager = TranslationManager::new(provider, db, glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        manager
+            .translate_entries(vec![entry], opts, tx, "job-u16".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        let map = capture.by_id.lock().unwrap();
+        let ctx = map
+            .get("u16")
+            .and_then(|c| c.as_ref())
+            .expect("utf16le entry must have LENGTH LIMIT context");
+        assert!(
+            ctx.contains("6 bytes"),
+            "utf16le budget must be code units * 2, not utf8 len: {ctx}"
+        );
+        assert!(
+            !ctx.contains("9 bytes"),
+            "must not use utf8 length for utf16le slot: {ctx}"
+        );
+        assert!(ctx.contains("encoded as utf16le"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn test_binary_slot_oversize_translation_still_saved() {
+        let (db, glossary) = setup();
+        let source = "Hi";
+        let mut entry = StringEntry::new("oversized", source, PathBuf::from("x.assets"));
+        entry.metadata.insert(
+            "binary_slot".to_string(),
+            serde_json::Value::String("utf8".to_string()),
+        );
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+
+        struct OversizeProvider;
+        #[async_trait]
+        impl TranslationProvider for OversizeProvider {
+            fn id(&self) -> &str {
+                "oversize"
+            }
+            fn name(&self) -> &str {
+                "Oversize"
+            }
+            fn is_free(&self) -> bool {
+                true
+            }
+            fn requires_api_key(&self) -> bool {
+                false
+            }
+            async fn translate(
+                &self,
+                requests: &[TranslationRequest],
+            ) -> Result<Vec<TranslationResult>> {
+                Ok(requests
+                    .iter()
+                    .map(|r| TranslationResult {
+                        entry_id: r.entry_id.clone(),
+                        // Far longer than any short source utf8 budget.
+                        translation: "XXXXXXXXXXXXXXXXXXXXXXXX".to_string(),
+                        detected_source_lang: None,
+                        provider: "oversize".to_string(),
+                        tokens_used: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cost_usd: None,
+                    })
+                    .collect())
+            }
+            async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+                None
+            }
+            async fn health_check(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let manager = TranslationManager::new(Arc::new(OversizeProvider), db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        manager
+            .translate_entries(vec![entry], opts, tx, "job-over".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "oversized")
+            .expect("entry must exist");
+        assert_eq!(
+            saved.translation.as_deref(),
+            Some("XXXXXXXXXXXXXXXXXXXXXXXX"),
+            "oversize translations must still be saved (validate/inject preflight enforce later)"
+        );
+        let budget = crate::validation::encoded_byte_len("utf8", source).unwrap();
+        let actual =
+            crate::validation::encoded_byte_len("utf8", saved.translation.as_ref().unwrap())
+                .unwrap();
+        assert!(actual > budget, "fixture must actually be oversize");
     }
 }
