@@ -163,11 +163,11 @@ impl FormatRegistry {
             .collect();
 
         // Display-only stubs for engines that still lack a formats plugin.
-        // QSP + KiriKiri/KAG are real plugins in `locust-formats` (Experimental).
+        // QSP + KiriKiri/KAG + YU-RIS are real plugins in `locust-formats` (Experimental).
         out.push(PluginInfo {
             id: "light-novel".to_string(),
             name: "Light Novel Engines".to_string(),
-            description: "Remaining JP novel engines (NScripter, Yuris, TyranoBuilder); KiriKiri is a separate plugin".to_string(),
+            description: "Remaining JP novel engines (NScripter, TyranoBuilder); KiriKiri and YU-RIS are separate plugins".to_string(),
             extensions: vec![".tjs".to_string(), ".nsa".to_string(), ".sar".to_string()],
             supported_modes: Vec::new(),
             stability: FormatStability::ComingSoon,

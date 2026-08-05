@@ -6,7 +6,7 @@ Universal open-source game translation tool built in Rust.
 
 Cargo workspace with 6 crates:
 - `crates/core` — error types, models, database (SQLite), extraction traits, translation engine, config, encoding, placeholders, validation, backup, glossary, font validation, export (PO/XLIFF), WASM plugins
-- `crates/formats` — game format plugins: RPG Maker MV/MZ, VX Ace, Ren'Py, Wolf RPG
+- `crates/formats` — game format plugins: RPG Maker MV/MZ, VX Ace, Ren'Py, Wolf RPG, QSP, KiriKiri, YU-RIS
 - `crates/providers` — translation providers: Mock, Argos, DeepL, OpenAI, Claude, Ollama + retry/rate limiting
 - `crates/server` — Axum HTTP server with 25+ REST endpoints, WebSocket for progress
 - `crates/cli` — clap CLI with extract/translate/inject/validate/export/import/server commands
@@ -40,8 +40,9 @@ locust providers                    # List translation providers
 
 ## Pending Work
 
-- Japanese light novel engines still ComingSoon (NScripter / Yuris / TyranoBuilder)
+- Japanese light novel engines still ComingSoon (NScripter / TyranoBuilder)
 - KiriKiri/KAG is Experimental (loose .ks only; synthetic fixtures; no XP3 / mode-2 yet)
+- YU-RIS is Experimental (loose YSTB .ybn only; synthetic fixtures; no YPF unpack yet)
 - QSP is Experimental (synthetic fixtures only; no real game tested yet)
 - Length-aware *real* ES for binary engines (validate flags oversize; mock is dual-slot safe)
 - Commercial Wolf RPG title E2E; Unreal full multi-GB base pak (patch `_P.pak` proven)
