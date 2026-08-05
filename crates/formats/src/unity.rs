@@ -736,6 +736,23 @@ script Chapter_1_script chapter 1 {
     }
 
     #[test]
+    fn test_extract_assets_binary_slot_metadata() {
+        let dir = tempdir();
+        create_unity_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        assert!(!entries.is_empty(), "fixture must yield .assets strings");
+        for entry in &entries {
+            assert_eq!(
+                entry.metadata.get("binary_slot"),
+                Some(&serde_json::Value::String("utf8".into())),
+                "entry {} missing binary_slot for validate/inject preflight",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
     fn test_extract_vn_scripts() {
         let dir = tempdir();
         create_vn_script_fixture(&dir);
