@@ -40,7 +40,8 @@ locust providers                    # List translation providers
 
 ## Pending Work
 
-- QSP and Japanese light novel engines (still ComingSoon stubs)
+- Japanese light novel engines (still ComingSoon stubs)
+- QSP is Experimental (synthetic fixtures only; no real game tested yet)
 - Length-aware *real* ES for binary engines (validate flags oversize; mock is dual-slot safe)
 - Commercial Wolf RPG title E2E; Unreal full multi-GB base pak (patch `_P.pak` proven)
 - Deeper Unity/Unreal parsers beyond heuristics

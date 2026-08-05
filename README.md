@@ -46,10 +46,10 @@ Stability matches `locust formats` / the desktop Welcome screen
 | **Unreal Engine**         | `.pak`           | UTF-16LE heuristic; length ≤ source |
 | **Wolf RPG Editor**       | `.wolf`          | Shift-JIS binary; length ≤ source |
 | **VNTextPatch JSON**      | `.json`          | VN intermediate (KiriKiri/YU-RIS/… via VNTextPatch); Phase-2 patch apply proven on fixture |
+| **QSP**                   | `.qsp`, `.gam`   | QuestSoft Player; synthetic fixture only |
 
 ### Coming soon
 
-- **QSP** — Russian-style text adventures (`.qsp`, `.gam`)
 - **Japanese light novel engines** — KiriKiri, NScripter, Yuris, TyranoBuilder
 
 Not seeing your engine? [Open an issue](https://github.com/Miike0303/Locust/issues).
@@ -176,7 +176,7 @@ MIT. See [LICENSE](LICENSE).
 Pull requests welcome. See [CLAUDE.md](CLAUDE.md) for the project architecture overview and [RELEASE.md](RELEASE.md) for the release process.
 
 Priority areas:
-- QSP and Japanese light-novel engines (KiriKiri / NScripter / …)
+- Japanese light-novel engines (KiriKiri / NScripter / …)
 - Length-aware real-ES for binary engines (Unity / Unreal / Wolf)
 - Deeper Unreal/Unity parsers beyond heuristic scans
 - Real commercial Wolf RPG end-to-end proof

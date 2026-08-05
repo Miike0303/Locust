@@ -162,16 +162,8 @@ impl FormatRegistry {
             })
             .collect();
 
-        // Add display-only "coming soon" formats that don't have plugins yet.
-        // These show up in the UI so users know they're planned.
-        out.push(PluginInfo {
-            id: "qsp".to_string(),
-            name: "QSP (QuestSoft Player)".to_string(),
-            description: "Russian-style text adventure engine (.qsp, .gam)".to_string(),
-            extensions: vec![".qsp".to_string(), ".gam".to_string()],
-            supported_modes: Vec::new(),
-            stability: FormatStability::ComingSoon,
-        });
+        // Display-only stubs for engines that still lack a formats plugin.
+        // QSP is registered for real in `locust-formats` (Experimental).
         out.push(PluginInfo {
             id: "light-novel".to_string(),
             name: "Light Novel Engines".to_string(),
@@ -810,11 +802,12 @@ mod tests {
     fn test_registry_list() {
         let reg = make_registry();
         let list = reg.list();
-        // One registered plugin plus the display-only "coming soon" formats
-        assert_eq!(list.len(), 3);
+        // One registered plugin plus display-only coming-soon stubs (light-novel).
+        // QSP is a real formats crate plugin, not a core stub.
+        assert_eq!(list.len(), 2);
         assert_eq!(list[0].id, "mock");
-        assert!(list.iter().any(|p| p.id == "qsp"));
         assert!(list.iter().any(|p| p.id == "light-novel"));
+        assert!(list.iter().all(|p| p.id != "qsp"));
     }
 
     #[test]

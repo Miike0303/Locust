@@ -7,6 +7,7 @@ pub mod unreal;
 pub mod unity;
 pub mod html_game;
 pub mod vntextpatch;
+pub mod qsp;
 
 use locust_core::extraction::FormatRegistry;
 
@@ -21,6 +22,7 @@ pub fn default_registry() -> FormatRegistry {
     r.register(Box::new(unity::UnityPlugin::new()));
     // html-game must be AFTER sugarcube (more specific wins first)
     r.register(Box::new(html_game::HtmlGamePlugin::new()));
+    r.register(Box::new(qsp::QspPlugin::new()));
     // vntextpatch last: only claims folders of {"message":...} JSON, so it
     // never shadows a real game format detected above.
     r.register(Box::new(vntextpatch::VnTextPatchPlugin::new()));
