@@ -162,16 +162,9 @@ impl FormatRegistry {
             })
             .collect();
 
-        // Display-only stubs for engines that still lack a formats plugin.
-        // QSP + KiriKiri/KAG + YU-RIS + NScripter are real plugins in `locust-formats` (Experimental).
-        out.push(PluginInfo {
-            id: "light-novel".to_string(),
-            name: "Light Novel Engines".to_string(),
-            description: "Remaining JP novel engines (TyranoBuilder); NScripter, KiriKiri, and YU-RIS are separate plugins".to_string(),
-            extensions: vec![".tjs".to_string()],
-            supported_modes: Vec::new(),
-            stability: FormatStability::ComingSoon,
-        });
+        // No display-only light-novel stub: TyranoBuilder, NScripter, KiriKiri,
+        // and YU-RIS are real plugins in `locust-formats` (Experimental). Leftover
+        // work is archive/engine-adjacent (YPF, XP3, asar, NSA, …) on those plugins.
 
         // Usable engines first: stable → experimental → coming soon, then id.
         out.sort_by(|a, b| {
@@ -802,11 +795,11 @@ mod tests {
     fn test_registry_list() {
         let reg = make_registry();
         let list = reg.list();
-        // One registered plugin plus display-only coming-soon stubs (light-novel).
+        // Registered plugins only — light-novel ComingSoon stub removed (Tyrano is real).
         // QSP is a real formats crate plugin, not a core stub.
-        assert_eq!(list.len(), 2);
+        assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "mock");
-        assert!(list.iter().any(|p| p.id == "light-novel"));
+        assert!(list.iter().all(|p| p.id != "light-novel"));
         assert!(list.iter().all(|p| p.id != "qsp"));
     }
 

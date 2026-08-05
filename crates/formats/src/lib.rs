@@ -8,6 +8,8 @@ pub mod unity;
 pub mod html_game;
 pub mod vntextpatch;
 pub mod qsp;
+// tyrano before kirikiri: both may see loose .ks; Tyrano claims data/scenario/ + tyrano/ trees.
+pub mod tyrano;
 pub mod kirikiri;
 pub mod yuris;
 pub mod nscripter;
@@ -26,6 +28,8 @@ pub fn default_registry() -> FormatRegistry {
     // html-game must be AFTER sugarcube (more specific wins first)
     r.register(Box::new(html_game::HtmlGamePlugin::new()));
     r.register(Box::new(qsp::QspPlugin::new()));
+    // tyrano before kirikiri so TyranoBuilder dirs are not claimed as KiriKiri.
+    r.register(Box::new(tyrano::TyranoPlugin::new()));
     r.register(Box::new(kirikiri::KirikiriPlugin::new()));
     r.register(Box::new(yuris::YurisPlugin::new()));
     r.register(Box::new(nscripter::NScripterPlugin::new()));
