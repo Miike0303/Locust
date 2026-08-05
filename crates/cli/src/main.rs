@@ -2055,13 +2055,12 @@ async fn cmd_import(
         "xliff" => {
             let units = export::import_xliff(&content)?;
             for unit in &units {
-                if !unit.target.is_empty() {
-                    if db
+                if !unit.target.is_empty()
+                    && db
                         .save_translation(&unit.id, &unit.target, "import")
                         .await?
-                    {
-                        imported += 1;
-                    }
+                {
+                    imported += 1;
                 }
             }
         }
@@ -2084,10 +2083,9 @@ async fn cmd_server(port: u16) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
 
     /// Process-global env var — serialize tests that set LOCUST_BACKUP_ROOT.
-    static BACKUP_ROOT_LOCK: Mutex<()> = Mutex::new(());
+    static BACKUP_ROOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn test_cli_parses() {
@@ -2445,7 +2443,7 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, &[script.clone()]).unwrap();
+        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script)).unwrap();
         db.record_injection(None, &game_dir, &[script]).unwrap();
         drop(db);
 
@@ -2757,7 +2755,7 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, &[script.clone()]).unwrap();
+        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script)).unwrap();
         drop(db);
 
         fs::write(&script, "label start:\n    \"Overwritten\"\n").unwrap();
@@ -2795,7 +2793,7 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, &[script.clone()]).unwrap();
+        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script)).unwrap();
         drop(db);
 
         fs::remove_file(&script).unwrap();
@@ -2841,7 +2839,7 @@ mod tests {
         drop(db);
 
         {
-            let _guard = BACKUP_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = BACKUP_ROOT_LOCK.lock().await;
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
             cmd_inject_direct(
                 game_dir.clone(),
@@ -2893,7 +2891,7 @@ mod tests {
         drop(db);
 
         {
-            let _guard = BACKUP_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = BACKUP_ROOT_LOCK.lock().await;
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
             cmd_inject_direct(game_dir.clone(), db_path, vec!["es".to_string()])
                 .await
@@ -2945,7 +2943,7 @@ mod tests {
         drop(db);
 
         {
-            let _guard = BACKUP_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = BACKUP_ROOT_LOCK.lock().await;
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
             cmd_inject_direct(game_dir, db_path.clone(), Vec::new())
                 .await
@@ -2973,7 +2971,7 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, &[script.clone()]).unwrap();
+        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script)).unwrap();
         drop(db);
         fs::remove_file(&script).unwrap();
 

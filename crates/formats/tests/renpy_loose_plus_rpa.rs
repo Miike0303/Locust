@@ -173,10 +173,10 @@ fn test_loose_rpy_translation_survives_inject_alongside_rpa() {
     // which is the precondition for the alleged bug.
     let has_rpa_entry = entries
         .iter()
-        .any(|e| e.file_path.extension().map_or(false, |ext| ext == "rpa"));
+        .any(|e| e.file_path.extension().is_some_and(|ext| ext == "rpa"));
     let has_rpy_entry = entries
         .iter()
-        .any(|e| e.file_path.extension().map_or(false, |ext| ext == "rpy"));
+        .any(|e| e.file_path.extension().is_some_and(|ext| ext == "rpy"));
     println!("mixed entries present: has_rpa_entry={has_rpa_entry} has_rpy_entry={has_rpy_entry}");
     assert!(has_rpa_entry && has_rpy_entry, "precondition failed: entries are not mixed rpa+rpy");
 

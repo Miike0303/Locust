@@ -188,7 +188,7 @@ impl FormatPlugin for WolfRpgPlugin {
 
     fn detect(&self, path: &Path) -> bool {
         if path.is_file() {
-            return path.extension().map_or(false, |ext| ext == "wolf");
+            return path.extension().is_some_and(|ext| ext == "wolf");
         }
         if path.is_dir() {
             if let Some(data_dir) = Self::find_data_dir(path) {
@@ -197,7 +197,7 @@ impl FormatPlugin for WolfRpgPlugin {
                         entries
                             .filter_map(|e| e.ok())
                             .any(|e| {
-                                e.path().extension().map_or(false, |ext| ext == "wolf")
+                                e.path().extension().is_some_and(|ext| ext == "wolf")
                             })
                     })
                     .unwrap_or(false);
@@ -228,7 +228,7 @@ impl FormatPlugin for WolfRpgPlugin {
         for entry in std::fs::read_dir(&data_dir)? {
             let entry = entry?;
             let fpath = entry.path();
-            if fpath.extension().map_or(false, |e| e == "wolf") {
+            if fpath.extension().is_some_and(|e| e == "wolf") {
                 let bytes = std::fs::read(&fpath)?;
                 let fname = fpath
                     .file_name()

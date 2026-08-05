@@ -218,8 +218,7 @@ impl TranslationProvider for OpenAiProvider {
             .map(|c| c.message.content.as_str())
             .unwrap_or("[]");
 
-        let translations = parse_json_array(content)
-            .map_err(|e| LocustError::ProviderError(e))?;
+        let translations = parse_json_array(content).map_err(LocustError::ProviderError)?;
 
         // A count mismatch would silently shift every translation onto the
         // wrong entry via zip; discard the whole batch instead.

@@ -20,7 +20,7 @@ impl UnrealPlugin {
 
     fn find_pak_files(path: &Path) -> Vec<PathBuf> {
         let mut paks = Vec::new();
-        if path.is_file() && path.extension().map_or(false, |e| e == "pak") {
+        if path.is_file() && path.extension().is_some_and(|e| e == "pak") {
             paks.push(path.to_path_buf());
             return paks;
         }
@@ -31,7 +31,7 @@ impl UnrealPlugin {
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                if entry.path().extension().map_or(false, |e| e == "pak") {
+                if entry.path().extension().is_some_and(|e| e == "pak") {
                     paks.push(entry.path().to_path_buf());
                 }
             }
@@ -49,13 +49,13 @@ impl UnrealPlugin {
             .read_dir()
             .ok()
             .and_then(|mut d| d.find(|e| {
-                e.as_ref().ok().map_or(false, |e| {
+                e.as_ref().ok().is_some_and(|e| {
                     e.path().is_dir()
                         && e.path().join("Content").is_dir()
                 })
             }))
             .is_some();
-        let has_content_paks = Self::find_pak_files(path).len() > 0;
+        let has_content_paks = !Self::find_pak_files(path).is_empty();
 
         has_engine || game_name || has_content_paks
     }
@@ -124,7 +124,7 @@ fn find_utf16le_strings(bytes: &[u8]) -> Vec<(usize, String)> {
         let lo = bytes[i];
         let hi = bytes[i + 1];
 
-        if hi == 0 && lo >= 0x20 && lo <= 0x7E {
+        if hi == 0 && (0x20..=0x7E).contains(&lo) {
             // Potential UTF-16LE ASCII start
             let start = i;
             let mut chars = Vec::new();
@@ -133,7 +133,7 @@ fn find_utf16le_strings(bytes: &[u8]) -> Vec<(usize, String)> {
                 let lo = bytes[i];
                 let hi = bytes[i + 1];
 
-                if hi == 0 && lo >= 0x20 && lo <= 0x7E {
+                if hi == 0 && (0x20..=0x7E).contains(&lo) {
                     chars.push(lo as char);
                     i += 2;
                 } else if hi == 0 && lo == 0 {
@@ -240,7 +240,7 @@ impl FormatPlugin for UnrealPlugin {
 
     fn detect(&self, path: &Path) -> bool {
         if path.is_file() {
-            return path.extension().map_or(false, |e| e == "pak");
+            return path.extension().is_some_and(|e| e == "pak");
         }
         Self::has_unreal_structure(path)
     }

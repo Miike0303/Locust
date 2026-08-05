@@ -138,7 +138,7 @@ impl Validator {
     pub fn validate_all(entries: &[StringEntry]) -> Vec<ValidationIssue> {
         entries
             .iter()
-            .flat_map(|e| Self::validate_entry(e))
+            .flat_map(Self::validate_entry)
             .collect()
     }
 

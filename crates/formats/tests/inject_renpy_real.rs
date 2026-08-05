@@ -18,7 +18,7 @@ fn test_inject_renpy_rpa_replace() {
         return;
     }
 
-    let db = locust_core::database::Database::open(&db_path).expect("Failed to open DB");
+    let db = locust_core::database::Database::open(db_path).expect("Failed to open DB");
     let entries = db.get_entries(&locust_core::database::EntryFilter::default()).expect("Failed to get entries");
     println!("Loaded {} entries from DB", entries.len());
 

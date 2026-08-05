@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::Arc;
 
 use serde::Deserialize;
 use tempfile::TempDir;
@@ -64,11 +63,15 @@ struct ProjectOpenResponse {
 #[derive(Deserialize)]
 struct StringsResponse {
     entries: Vec<serde_json::Value>,
+    // Present in API JSON; tests assert coverage via entries.len() / pending.
+    #[allow(dead_code)]
     total: usize,
 }
 
 #[derive(Deserialize)]
 struct StatsResponse {
+    // Present in API JSON; tests assert via pending/translated counts.
+    #[allow(dead_code)]
     total: usize,
     pending: usize,
     translated: usize,
@@ -424,7 +427,7 @@ async fn test_renpy_add_mode_flow() {
     let rpy_files: Vec<_> = std::fs::read_dir(&tl_es)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rpy"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rpy"))
         .collect();
     assert!(!rpy_files.is_empty(), "should have .rpy files in tl/es/");
     let content = std::fs::read_to_string(rpy_files[0].path()).unwrap();
@@ -619,7 +622,6 @@ async fn test_backup_restore() {
 
     // Corrupt a file
     let actors = tmpdir.path().join("data").join("Actors.json");
-    let original_content = std::fs::read_to_string(&actors).unwrap();
     std::fs::write(&actors, "CORRUPTED").unwrap();
     assert_eq!(std::fs::read_to_string(&actors).unwrap(), "CORRUPTED");
 

@@ -80,7 +80,7 @@ impl UnityPlugin {
             .filter_map(|e| e.ok())
         {
             let fpath = entry.path();
-            if !fpath.extension().map_or(false, |e| e == "txt") {
+            if fpath.extension().is_none_or(|e| e != "txt") {
                 continue;
             }
 
@@ -270,13 +270,13 @@ impl UnityPlugin {
 
     fn find_assets_files(path: &Path) -> Vec<PathBuf> {
         let mut assets = Vec::new();
-        if path.is_file() && path.extension().map_or(false, |e| e == "assets") {
+        if path.is_file() && path.extension().is_some_and(|e| e == "assets") {
             assets.push(path.to_path_buf());
             return assets;
         }
         let data_dir = if path.is_dir() {
             if let Some(d) = Self::find_data_dir(path) { d }
-            else if path.file_name().map_or(false, |n| n.to_string_lossy().ends_with("_Data")) {
+            else if path.file_name().is_some_and(|n| n.to_string_lossy().ends_with("_Data")) {
                 path.to_path_buf()
             } else { return assets; }
         } else { return assets; };
@@ -288,7 +288,7 @@ impl UnityPlugin {
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
-            if p.extension().map_or(false, |e| e == "assets") {
+            if p.extension().is_some_and(|e| e == "assets") {
                 if let Ok(meta) = std::fs::metadata(p) {
                     if meta.len() > 100 {
                         assets.push(p.to_path_buf());
@@ -312,7 +312,7 @@ impl UnityPlugin {
         let mut i = 0;
         while i + 4 < len {
             let str_len = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
-            if str_len >= 5 && str_len <= 2000 && i + 4 + str_len <= len {
+            if (5..=2000).contains(&str_len) && i + 4 + str_len <= len {
                 if let Ok(text) = std::str::from_utf8(&bytes[i + 4..i + 4 + str_len]) {
                     if is_unity_translatable(text) && seen.insert(text.to_string()) {
                         let id = format!("{}#offset_{}#{}", filename, i, entries.len());
@@ -482,7 +482,7 @@ impl FormatPlugin for UnityPlugin {
 
     fn detect(&self, path: &Path) -> bool {
         if path.is_file() {
-            return path.extension().map_or(false, |e| e == "assets");
+            return path.extension().is_some_and(|e| e == "assets");
         }
         Self::has_unity_structure(path)
     }
@@ -521,7 +521,7 @@ impl FormatPlugin for UnityPlugin {
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
         // Check if entries come from text scripts (file_path ends in .txt)
         let from_text = entries.iter().any(|e| {
-            e.file_path.extension().map_or(false, |ext| ext == "txt")
+            e.file_path.extension().is_some_and(|ext| ext == "txt")
         });
 
         if from_text {

@@ -129,7 +129,7 @@ impl<'a> MarshalReader<'a> {
             }
             return Ok(val);
         }
-        if c >= -4 && c < 0 {
+        if (-4..0).contains(&c) {
             let n = (-c) as usize;
             let mut val = -1i64;
             for i in 0..n {
@@ -325,7 +325,7 @@ impl MarshalWriter {
                 4
             };
             self.buf.push((-n_i8(n)) as u8);
-            self.buf.extend_from_slice(&bytes[..n as usize]);
+            self.buf.extend_from_slice(&bytes[..n]);
         }
     }
 
@@ -711,10 +711,8 @@ impl RpgMakerVxaPlugin {
                     for &(field, _) in fields {
                         let id = format!("{}#{}#{}", filename, idx, field);
                         if let Some(&translation) = lookup.get(id.as_str()) {
-                            if let Some(val) = ivars.get_mut(field) {
-                                if let MarshalValue::Str(s) = val {
-                                    *s = translation.to_string();
-                                }
+                            if let Some(MarshalValue::Str(s)) = ivars.get_mut(field) {
+                                *s = translation.to_string();
                             }
                         }
                     }
@@ -970,9 +968,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                         entries
                             .filter_map(|e| e.ok())
                             .any(|e| {
-                                e.path()
-                                    .extension()
-                                    .map_or(false, |ext| is_marshal_ext(ext))
+                                e.path().extension().is_some_and(is_marshal_ext)
                             })
                     })
                     .unwrap_or(false);
@@ -980,7 +976,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
             return false;
         }
         if path.is_file() {
-            return path.extension().map_or(false, |ext| is_marshal_ext(ext));
+            return path.extension().is_some_and(is_marshal_ext);
         }
         false
     }
@@ -1014,7 +1010,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
         for entry in std::fs::read_dir(&data_dir)? {
             let entry = entry?;
             let fpath = entry.path();
-            if fpath.extension().map_or(false, |e| is_marshal_ext(e)) {
+            if fpath.extension().is_some_and(is_marshal_ext) {
                 let bytes = std::fs::read(&fpath)?;
                 match MarshalValue::parse(&bytes) {
                     Ok(root) => {

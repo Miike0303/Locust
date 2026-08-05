@@ -14,9 +14,7 @@ pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) 
     lines.push(String::new());
     lines.push("msgid \"\"".to_string());
     lines.push("msgstr \"\"".to_string());
-    lines.push(format!(
-        "\"Content-Type: text/plain; charset=UTF-8\\n\""
-    ));
+    lines.push("\"Content-Type: text/plain; charset=UTF-8\\n\"".to_string());
     lines.push("\"Content-Transfer-Encoding: 8bit\\n\"".to_string());
     lines.push(format!("\"Language: {}\\n\"", target_lang));
     lines.push(String::new());
@@ -66,11 +64,10 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
             continue;
         }
 
-        if trimmed.starts_with("#: ") {
+        if let Some(reference) = trimmed.strip_prefix("#: ") {
             // Legacy Locust exports used `#: path#id`. Prefer msgctxt when present;
             // only fill id from the reference if we do not already have one.
             if current_id.is_none() {
-                let reference = &trimmed[3..];
                 // First `#` separates path from id so multi-# ids stay intact.
                 if let Some(hash_pos) = reference.find('#') {
                     current_id = Some(reference[hash_pos + 1..].to_string());
@@ -83,22 +80,22 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
             continue;
         }
 
-        if trimmed.starts_with("msgctxt ") {
-            let val = extract_po_string(&trimmed[8..]);
+        if let Some(rest) = trimmed.strip_prefix("msgctxt ") {
+            let val = extract_po_string(rest);
             current_id = Some(unescape_po(&val));
             reading = ReadingState::None;
             continue;
         }
 
-        if trimmed.starts_with("msgid ") {
-            let val = extract_po_string(&trimmed[6..]);
+        if let Some(rest) = trimmed.strip_prefix("msgid ") {
+            let val = extract_po_string(rest);
             current_msgid = Some(unescape_po(&val));
             reading = ReadingState::Msgid;
             continue;
         }
 
-        if trimmed.starts_with("msgstr ") {
-            let val = extract_po_string(&trimmed[7..]);
+        if let Some(rest) = trimmed.strip_prefix("msgstr ") {
+            let val = extract_po_string(rest);
             current_msgstr = Some(unescape_po(&val));
             reading = ReadingState::Msgstr;
             continue;

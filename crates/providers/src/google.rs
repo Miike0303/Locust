@@ -185,9 +185,6 @@ impl GoogleTranslateProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use httpmock::prelude::*;
-
     fn make_google_response(translated: &str) -> serde_json::Value {
         serde_json::json!([
             [[translated, "source", null, null, 1.0]],
@@ -198,19 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_google_translate_single() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET).path("/translate_a/single");
-            then.status(200)
-                .json_body(make_google_response("Hola mundo"));
-        });
-
-        // Create provider that talks to our mock
-        let provider = GoogleTranslateProvider {
-            client: reqwest::Client::new(),
-        };
-
-        // We can't easily redirect the URL in the provider, so test the parsing logic directly
+        // Parse the Google translate_a response shape (provider URL is hard-coded).
         let response_json = make_google_response("Hola mundo");
         let segments = response_json.get(0).unwrap().as_array().unwrap();
         let mut translated = String::new();

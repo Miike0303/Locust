@@ -41,7 +41,7 @@ impl RenPyPlugin {
         std::fs::read_dir(dir)
             .map(|entries| {
                 entries.filter_map(|e| e.ok()).any(|e| {
-                    e.path().extension().map_or(false, |ext| ext == "rpy")
+                    e.path().extension().is_some_and(|ext| ext == "rpy")
                 })
             })
             .unwrap_or(false)
@@ -259,7 +259,7 @@ impl RenPyPlugin {
         // Find unique RPA files referenced by entries
         let mut rpa_files: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for entry in entries {
-            if entry.file_path.extension().map_or(false, |ext| ext == "rpa") {
+            if entry.file_path.extension().is_some_and(|ext| ext == "rpa") {
                 rpa_files.insert(entry.file_path.clone());
             }
         }
@@ -324,7 +324,7 @@ impl RenPyPlugin {
             .filter_map(|e| e.ok())
         {
             let fpath = dir_entry.path();
-            if !fpath.extension().map_or(false, |e| e == "rpy") {
+            if fpath.extension().is_none_or(|e| e != "rpy") {
                 continue;
             }
             // Skip tl/ directory
@@ -437,7 +437,7 @@ impl RenPyPlugin {
         std::fs::read_dir(dir)
             .map(|entries| {
                 entries.filter_map(|e| e.ok()).any(|e| {
-                    e.path().extension().map_or(false, |ext| ext == "rpa")
+                    e.path().extension().is_some_and(|ext| ext == "rpa")
                 })
             })
             .unwrap_or(false)
@@ -573,16 +573,16 @@ impl RenPyPlugin {
             // When opened, skip all content until closed.
             if define_bracket_depth == 0 && trimmed.starts_with("define ") {
                 // Count opening vs closing brackets on this line
-                let opens = trimmed.matches(|c| c == '{' || c == '[' || c == '(').count() as i32;
-                let closes = trimmed.matches(|c| c == '}' || c == ']' || c == ')').count() as i32;
+                let opens = trimmed.matches(['{', '[', '(']).count() as i32;
+                let closes = trimmed.matches(['}', ']', ')']).count() as i32;
                 if opens > closes {
                     define_bracket_depth = opens - closes;
                     // Still process this line (the `define x = {` might have extract logic)
                     // But don't skip — the first line is the define itself
                 }
             } else if define_bracket_depth > 0 {
-                let opens = trimmed.matches(|c| c == '{' || c == '[' || c == '(').count() as i32;
-                let closes = trimmed.matches(|c| c == '}' || c == ']' || c == ')').count() as i32;
+                let opens = trimmed.matches(['{', '[', '(']).count() as i32;
+                let closes = trimmed.matches(['}', ']', ')']).count() as i32;
                 define_bracket_depth += opens - closes;
                 if define_bracket_depth < 0 {
                     define_bracket_depth = 0;
@@ -712,8 +712,8 @@ impl RenPyPlugin {
             }
 
             // centered "text" — always translatable
-            if trimmed.starts_with("centered ") {
-                let rest = trimmed["centered ".len()..].trim();
+            if let Some(rest) = trimmed.strip_prefix("centered ") {
+                let rest = rest.trim();
                 if let Some((text, _)) = extract_quoted_string(rest) {
                     if !text.is_empty() && !is_file_reference(text) {
                         let id = format!("{}#{}", filename, line_num);
@@ -917,6 +917,7 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
 ///   - `character "dialogue text"` (say statement)
 ///   - `"narrator text"` (narrator say)
 ///   - `"menu choice":` (menu choice)
+///
 /// Returns false for everything else (code, screens, defines, labels, etc.)
 fn is_dialogue_line(trimmed: &str) -> bool {
     if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1001,9 +1002,8 @@ fn is_renpy_keyword(word: &str) -> bool {
 /// Turns `"word"` into `\"word\"` but leaves already-escaped `\"` alone.
 fn escape_inner_quotes(s: &str) -> String {
     let mut result = String::with_capacity(s.len() + 8);
-    let mut chars = s.chars().peekable();
     let mut prev_was_backslash = false;
-    while let Some(ch) = chars.next() {
+    for ch in s.chars() {
         if ch == '"' {
             if prev_was_backslash {
                 // Already escaped, just push the quote
@@ -1838,7 +1838,7 @@ impl FormatPlugin for RenPyPlugin {
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
         if path.is_file() {
-            if path.extension().map_or(false, |e| e == "rpa") {
+            if path.extension().is_some_and(|e| e == "rpa") {
                 return self.extract_rpa_archive(path);
             }
             return Self::extract_file(path);
@@ -1861,7 +1861,7 @@ impl FormatPlugin for RenPyPlugin {
             .filter_map(|e| e.ok())
         {
             let fpath = entry.path();
-            if fpath.extension().map_or(false, |e| e == "rpy") {
+            if fpath.extension().is_some_and(|e| e == "rpy") {
                 // Skip tl/ directory and renpy/ engine dir
                 if let Ok(rel) = fpath.strip_prefix(&game_dir) {
                     if rel.starts_with("tl") {
@@ -1894,16 +1894,16 @@ impl FormatPlugin for RenPyPlugin {
         let before_rpa = all.len();
         for entry in std::fs::read_dir(&game_dir)?.filter_map(|e| e.ok()) {
             let fpath = entry.path();
-            if fpath.extension().map_or(false, |e| e == "rpa") {
-                if fpath.file_name().map_or(false, |n| {
+            if fpath.extension().is_some_and(|e| e == "rpa")
+                && fpath.file_name().is_some_and(|n| {
                     let name = n.to_string_lossy();
                     name.contains("script") || name == "archive.rpa"
-                }) {
-                    match self.extract_rpa_archive(&fpath) {
-                        Ok(entries) => all.extend(entries),
-                        Err(e) => {
-                            tracing::warn!("Failed to extract RPA {}: {}", fpath.display(), e);
-                        }
+                })
+            {
+                match self.extract_rpa_archive(&fpath) {
+                    Ok(entries) => all.extend(entries),
+                    Err(e) => {
+                        tracing::warn!("Failed to extract RPA {}: {}", fpath.display(), e);
                     }
                 }
             }
@@ -1913,8 +1913,8 @@ impl FormatPlugin for RenPyPlugin {
         if all.len() == before_rpa {
             for entry in std::fs::read_dir(&game_dir)?.filter_map(|e| e.ok()) {
                 let fpath = entry.path();
-                if fpath.extension().map_or(false, |e| e == "rpa") {
-                    if fpath.file_name().map_or(false, |n| {
+                if fpath.extension().is_some_and(|e| e == "rpa") {
+                    if fpath.file_name().is_some_and(|n| {
                         let name = n.to_string_lossy();
                         name.contains("script") || name == "archive.rpa"
                     }) {
@@ -1964,7 +1964,7 @@ impl FormatPlugin for RenPyPlugin {
         // of silently dropping whichever group didn't win the batch-wide check.
         let (rpa_entries, loose_entries): (Vec<StringEntry>, Vec<StringEntry>) = entries
             .into_iter()
-            .partition(|e| e.file_path.extension().map_or(false, |ext| ext == "rpa"));
+            .partition(|e| e.file_path.extension().is_some_and(|ext| ext == "rpa"));
 
         let mut warnings: Vec<String> = Vec::new();
         let mut strings_skipped = 0usize;
@@ -2207,7 +2207,7 @@ impl FormatPlugin for RenPyPlugin {
                 let line_num = entry
                     .id
                     .split('#')
-                    .last()
+                    .next_back()
                     .unwrap_or("0")
                     .parse::<usize>()
                     .unwrap_or(0);

@@ -206,7 +206,7 @@ impl PlaceholderProcessor {
                     // Basic validation: must look like a tag
                     if tag.len() >= 3
                         && (tag.starts_with("</")
-                            || tag.chars().nth(1).map_or(false, |c| c.is_ascii_alphabetic()))
+                            || tag.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic()))
                     {
                         matches.push(PatternMatch {
                             start: i,

@@ -125,7 +125,7 @@ impl TranslationProvider for ClaudeProvider {
             .unwrap_or("[]");
 
         let translations =
-            parse_json_array(content).map_err(|e| LocustError::ProviderError(e))?;
+            parse_json_array(content).map_err(LocustError::ProviderError)?;
 
         // A count mismatch would silently shift every translation onto the
         // wrong entry via zip; discard the whole batch instead.

@@ -32,9 +32,12 @@ fn write_file(root: &Path, rel: &str, contents: &[u8]) {
     fs::write(p, contents).unwrap();
 }
 
+/// Relative path, patched bytes, optional original bytes (for original_sha256).
+type PatchZipFile<'a> = (&'a str, &'a [u8], Option<&'a [u8]>);
+
 fn build_patch_zip(
     path: &Path,
-    files: &[(&str, &[u8], Option<&[u8]>)], // rel, patched bytes, optional original bytes
+    files: &[PatchZipFile<'_>],
     version: &str,
     patch_id: &str,
 ) {

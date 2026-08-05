@@ -414,10 +414,8 @@ where
             .map(|m| m.baseline)
             .unwrap_or(BackupBaseline::Pristine)
     } else if tier == VerificationTier::Strict
-        && matches!(store.status()?, PatchStatus::NotPatched)
+        && (matches!(store.status()?, PatchStatus::NotPatched) || !opts.force)
     {
-        BackupBaseline::Pristine
-    } else if tier == VerificationTier::Strict && !opts.force {
         BackupBaseline::Pristine
     } else if tier == VerificationTier::Strict && opts.force {
         // Force on a tree that is not a clean NotPatched game (Unknown, etc.).
@@ -537,17 +535,15 @@ where
 
     // Step 6: write files.
     let total = plan.replaced.len() + plan.added.len();
-    let mut current = 0usize;
     let write_paths: Vec<String> = plan
         .replaced
         .iter()
         .map(|r| r.path.clone())
         .chain(plan.added.iter().map(|a| a.path.clone()))
         .collect();
-    for path in write_paths {
-        current += 1;
+    for (current, path) in write_paths.into_iter().enumerate() {
         on_progress(PatchProgress {
-            current,
+            current: current + 1,
             total,
             path: path.clone(),
             phase: "write",

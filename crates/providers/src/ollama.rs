@@ -130,8 +130,8 @@ impl TranslationProvider for OllamaProvider {
             LocustError::ProviderError(format!("Ollama malformed response: {}", e))
         })?;
 
-        let translations = parse_json_array(&ollama_resp.message.content)
-            .map_err(|e| LocustError::ProviderError(e))?;
+        let translations =
+            parse_json_array(&ollama_resp.message.content).map_err(LocustError::ProviderError)?;
 
         // A count mismatch would silently shift every translation onto the
         // wrong entry via zip; discard the whole batch instead.

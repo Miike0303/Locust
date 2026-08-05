@@ -210,9 +210,11 @@ mod tests {
     fn test_save_and_load_roundtrip() {
         let tmp = tempdir();
         let path = tmp.join("config.json");
-        let mut cfg = AppConfig::default();
-        cfg.default_source_lang = "ko".to_string();
-        cfg.default_batch_size = 20;
+        let cfg = AppConfig {
+            default_source_lang: "ko".to_string(),
+            default_batch_size: 20,
+            ..Default::default()
+        };
         cfg.save(&path).unwrap();
         let loaded = AppConfig::load(&path).unwrap();
         assert_eq!(loaded.default_source_lang, "ko");

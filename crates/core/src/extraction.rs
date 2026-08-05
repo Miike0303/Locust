@@ -620,7 +620,7 @@ fn copy_dir_for_inject(src: &Path, dst: &Path) -> Result<()> {
         }
         true
     }) {
-        let entry = entry.map_err(|e| LocustError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let entry = entry.map_err(|e| LocustError::IoError(std::io::Error::other(e)))?;
         let rel = entry.path().strip_prefix(src).map_err(|e| {
             LocustError::InjectionError(e.to_string())
         })?;

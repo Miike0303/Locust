@@ -134,7 +134,7 @@ fn is_system_passage(name: &str, tags: &str) -> bool {
 
 fn is_html(path: &Path) -> bool {
     path.extension()
-        .map_or(false, |e| e == "html" || e == "htm")
+        .is_some_and(|e| e == "html" || e == "htm")
 }
 
 fn extract_attr(tag: &str, name: &str) -> Option<String> {

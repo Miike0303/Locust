@@ -1768,7 +1768,7 @@ mod tests {
         assert!(lang_file.exists());
         let content = fs::read_to_string(&lang_file).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(json.as_object().unwrap().len() > 0);
+        assert!(!json.as_object().unwrap().is_empty());
     }
 
     #[test]

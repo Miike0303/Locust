@@ -34,16 +34,14 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
     let store = PatchStore::new(game_root);
 
     match store.status()? {
-        PatchStatus::NotPatched => {
-            return Ok(RollbackReport {
-                restored: 0,
-                deleted: 0,
-                baseline: None,
-                messages: vec!["not patched — nothing to do".into()],
-                aborted_edited: vec![],
-                torn_deleted: vec![],
-            });
-        }
+        PatchStatus::NotPatched => Ok(RollbackReport {
+            restored: 0,
+            deleted: 0,
+            baseline: None,
+            messages: vec!["not patched — nothing to do".into()],
+            aborted_edited: vec![],
+            torn_deleted: vec![],
+        }),
         PatchStatus::Unknown => {
             // S6a: valid backup, no receipt → restore-only with force/confirm.
             if let Some(bm) = store.read_backup_manifest()? {
@@ -56,9 +54,9 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                 }
                 return restore_manifest_only(&store, &bm, vec![], true);
             }
-            return Err(LocustError::PatchBackupIncomplete(
+            Err(LocustError::PatchBackupIncomplete(
                 "no backup found — factory pristine is unrecoverable".into(),
-            ));
+            ))
         }
         PatchStatus::Interrupted(journal) => {
             // Journal-driven path.
@@ -115,14 +113,14 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
             let baseline = bm.baseline;
             store.remove_all()?;
 
-            return Ok(RollbackReport {
+            Ok(RollbackReport {
                 restored,
                 deleted: delete_set.len(),
                 baseline: Some(baseline),
                 messages: vec!["interrupted apply rolled back to backup baseline".into()],
                 aborted_edited: vec![],
                 torn_deleted: torn,
-            });
+            })
         }
         PatchStatus::Patched(receipt) => {
             let Some(bm) = store.read_backup_manifest()? else {

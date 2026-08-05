@@ -621,7 +621,7 @@ async fn handle_translate_ws(
     let Some(mut rx) = rx else {
         let _ = socket
             .send(Message::Text(
-                serde_json::json!({"type": "failed", "error": "job not found"}).to_string().into(),
+                serde_json::json!({"type": "failed", "error": "job not found"}).to_string(),
             ))
             .await;
         let _ = socket.close().await;
@@ -633,7 +633,7 @@ async fn handle_translate_ws(
             Ok(event) => {
                 let is_terminal = matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
                 let json = serde_json::to_string(&event).unwrap_or_default();
-                if socket.send(Message::Text(json.into())).await.is_err() {
+                if socket.send(Message::Text(json)).await.is_err() {
                     break;
                 }
                 if is_terminal {
@@ -1023,7 +1023,7 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     if let Some(providers) = val.get_mut("providers").and_then(|v| v.as_object_mut()) {
         for (_id, pc) in providers.iter_mut() {
             if let Some(obj) = pc.as_object_mut() {
-                if obj.get("api_key").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty()) {
+                if obj.get("api_key").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
                     obj.insert("api_key".to_string(), serde_json::Value::String("***".to_string()));
                 }
             }
