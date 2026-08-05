@@ -10,6 +10,7 @@ pub mod vntextpatch;
 pub mod qsp;
 pub mod kirikiri;
 pub mod yuris;
+pub mod nscripter;
 
 use locust_core::extraction::FormatRegistry;
 
@@ -27,6 +28,7 @@ pub fn default_registry() -> FormatRegistry {
     r.register(Box::new(qsp::QspPlugin::new()));
     r.register(Box::new(kirikiri::KirikiriPlugin::new()));
     r.register(Box::new(yuris::YurisPlugin::new()));
+    r.register(Box::new(nscripter::NScripterPlugin::new()));
     // vntextpatch last: only claims folders of {"message":...} JSON, so it
     // never shadows a real game format detected above.
     r.register(Box::new(vntextpatch::VnTextPatchPlugin::new()));

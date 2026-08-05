@@ -40,7 +40,8 @@ locust providers                    # List translation providers
 
 ## Pending Work
 
-- Japanese light novel engines still ComingSoon (NScripter / TyranoBuilder)
+- TyranoBuilder still ComingSoon
+- NScripter is Experimental (`0.txt` / `00.txt` / `nscript.dat` only; synthetic fixtures; no NSA / nscr_sec / nscript.___)
 - KiriKiri/KAG is Experimental (loose .ks only; synthetic fixtures; no XP3 / mode-2 yet)
 - YU-RIS is Experimental (loose YSTB .ybn only; synthetic fixtures; no YPF unpack yet)
 - QSP is Experimental (synthetic fixtures only; no real game tested yet)
