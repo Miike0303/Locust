@@ -6,7 +6,10 @@
 //!   (`ScriptHandler::readScript`, `ScriptHandler::readScriptSub`)
 //!   Priority: `0.txt` → `00.txt` → `nscr_sec.dat` → `nscript.___` → `nscript.dat`
 //!   (also `pscript.dat` UTF-8 path exists in ONScripter — out of scope here).
-//!   `encrypt_mode == 1` (`nscript.dat`): every byte `ch ^= 0x84`.
+//!   - `encrypt_mode == 1` (`nscript.dat`): every byte `ch ^= 0x84`.
+//!   - `encrypt_mode == 2` (`nscr_sec.dat`): rotating XOR
+//!     `ch ^= magic[i % 5]` with `magic = {0x79, 0x57, 0x0D, 0x80, 0x04}`;
+//!     counter resets at file start (self-inverse).
 //! - Token classes (`readToken`): high-bit first char (`ch & 0x80`) and backtick
 //!   `` ` `` start dialogue; ASCII-letter lines are commands; `*` labels; `;` comments.
 //!
@@ -15,9 +18,9 @@
 //! non-ASCII (SJIS lead ≥ 0x80 after decode) or a backtick. Inline wait markers
 //! (`@`, `\`, `/` at EOL) and furigana stay inside the extracted string.
 //!
-//! Out of scope: `nscr_sec.dat` (mode-2 5-byte magic XOR), `nscript.___` (mode-3
-//! key table from EXE), multi-file `1.txt`…`99.txt` concat, `pscript.dat` UTF-8,
-//! `arc.nsa` / `.sar` archive unpack, real commercial game fixtures.
+//! Out of scope: `nscript.___` (mode-3 key table from EXE / `--key-exe`), multi-file
+//! `1.txt`…`99.txt` concat, `pscript.dat` UTF-8, `arc.nsa` / `.sar` archive unpack,
+//! real commercial game fixtures.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,11 +32,14 @@ use locust_core::models::{OutputMode, StringEntry};
 /// ONScripter `nscript.dat` / encrypt_mode 1 XOR constant (`readScriptSub`).
 const NSCRIPT_DAT_XOR: u8 = 0x84;
 
-/// Supported script containers, highest priority first (engine order subset).
-const SUPPORTED_CONTAINERS: &[&str] = &["0.txt", "00.txt", "nscript.dat"];
+/// ONScripter `nscr_sec.dat` / encrypt_mode 2 rotating XOR key (`readScriptSub`).
+const NSCR_SEC_MAGIC: [u8; 5] = [0x79, 0x57, 0x0D, 0x80, 0x04];
+
+/// Supported script containers, highest priority first (engine `readScript` order).
+const SUPPORTED_CONTAINERS: &[&str] = &["0.txt", "00.txt", "nscr_sec.dat", "nscript.dat"];
 
 /// Present in engine priority but not implemented in this cut.
-const UNSUPPORTED_CONTAINERS: &[&str] = &["nscr_sec.dat", "nscript.___"];
+const UNSUPPORTED_CONTAINERS: &[&str] = &["nscript.___"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContainerKind {
@@ -41,6 +47,8 @@ enum ContainerKind {
     Plain,
     /// Byte-wise XOR 0x84 then Shift-JIS (`nscript.dat`).
     Xor84,
+    /// Rotating 5-byte XOR then Shift-JIS (`nscr_sec.dat`).
+    XorRot5,
 }
 
 impl ContainerKind {
@@ -48,6 +56,7 @@ impl ContainerKind {
         match name {
             "0.txt" | "00.txt" => Some(Self::Plain),
             "nscript.dat" => Some(Self::Xor84),
+            "nscr_sec.dat" => Some(Self::XorRot5),
             _ => None,
         }
     }
@@ -118,14 +127,18 @@ impl NScripterPlugin {
             .any(|e| e.path().is_file() && Self::is_nsa(&e.path()))
     }
 
-    fn has_unsupported_only_containers(root: &Path) -> bool {
+    /// True when the container the ENGINE would load is one we don't support.
+    /// `nscript.___` outranks `nscript.dat` in readScript order, so its mere
+    /// presence must not be masked by a lower-priority `nscript.dat`.
+    fn engine_picks_unsupported(root: &Path) -> bool {
         let has_unsupported = UNSUPPORTED_CONTAINERS
             .iter()
             .any(|n| Self::file_in_root(root, n).is_some());
-        let has_supported = SUPPORTED_CONTAINERS
+        // Only containers that outrank nscript.___ in engine order suppress it.
+        let higher_supported = ["0.txt", "00.txt", "nscr_sec.dat"]
             .iter()
             .any(|n| Self::file_in_root(root, n).is_some());
-        has_unsupported && !has_supported
+        has_unsupported && !higher_supported
     }
 
     /// Pick the highest-priority supported container (engine order).
@@ -214,13 +227,25 @@ fn xor_bytes(data: &[u8], key: u8) -> Vec<u8> {
     data.iter().map(|b| b ^ key).collect()
 }
 
+/// ONScripter encrypt_mode 2: `ch ^= magic[i % 5]` (self-inverse).
+fn xor_rot5_bytes(data: &[u8]) -> Vec<u8> {
+    data.iter()
+        .enumerate()
+        .map(|(i, b)| b ^ NSCR_SEC_MAGIC[i % 5])
+        .collect()
+}
+
 fn decode_container(bytes: &[u8], kind: ContainerKind, file_label: &str) -> Result<(String, bool)> {
-    let xored;
+    let decoded_owned;
     let plain: &[u8] = match kind {
         ContainerKind::Plain => bytes,
         ContainerKind::Xor84 => {
-            xored = xor_bytes(bytes, NSCRIPT_DAT_XOR);
-            &xored
+            decoded_owned = xor_bytes(bytes, NSCRIPT_DAT_XOR);
+            &decoded_owned
+        }
+        ContainerKind::XorRot5 => {
+            decoded_owned = xor_rot5_bytes(bytes);
+            &decoded_owned
         }
     };
     let (cow, _, had_errors) = encoding_rs::SHIFT_JIS.decode(plain);
@@ -254,6 +279,7 @@ fn encode_container(text: &str, kind: ContainerKind, crlf: bool, file_label: &st
     Ok(match kind {
         ContainerKind::Plain => sjis,
         ContainerKind::Xor84 => xor_bytes(&sjis, NSCRIPT_DAT_XOR),
+        ContainerKind::XorRot5 => xor_rot5_bytes(&sjis),
     })
 }
 
@@ -293,7 +319,7 @@ impl FormatPlugin for NScripterPlugin {
     }
 
     fn description(&self) -> &str {
-        "NScripter scripts (0.txt / 00.txt Shift-JIS; nscript.dat XOR 0x84) — synthetic fixtures"
+        "NScripter scripts (0.txt / 00.txt; nscr_sec.dat rot5 XOR; nscript.dat XOR 0x84) — synthetic"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -316,24 +342,29 @@ impl FormatPlugin for NScripterPlugin {
         let root = Self::root_dir(path);
         let label = path.display().to_string();
 
+        // Engine priority: nscript.___ outranks nscript.dat. If the engine would
+        // load the unsupported container, extracting nscript.dat would translate
+        // a file the game never reads — error loudly instead.
+        if Self::engine_picks_unsupported(&root) {
+            return Err(parse_err(
+                &label,
+                "engine would load nscript.___ (unsupported mode-3 key table); \
+                 this Experimental cut supports 0.txt, 00.txt, nscr_sec.dat, and nscript.dat \
+                 (nscript.___ needs --key-exe / key table)",
+            ));
+        }
         let Some(selected) = Self::select_container(path) else {
-            if Self::has_unsupported_only_containers(&root) {
-                return Err(parse_err(
-                    &label,
-                    "unsupported NScripter container only (nscr_sec.dat / nscript.___); \
-                     this Experimental cut supports 0.txt, 00.txt, and nscript.dat",
-                ));
-            }
             if Self::has_nsa(&root) {
                 return Err(parse_err(
                     &label,
                     "arc.nsa / .nsa archive present but no supported script container \
-                     (0.txt / 00.txt / nscript.dat); archive unpack is out of scope",
+                     (0.txt / 00.txt / nscr_sec.dat / nscript.dat); archive unpack is out of scope",
                 ));
             }
             return Err(parse_err(
                 &label,
-                "no NScripter script container found (expected 0.txt, 00.txt, or nscript.dat)",
+                "no NScripter script container found \
+                 (expected 0.txt, 00.txt, nscr_sec.dat, or nscript.dat)",
             ));
         };
 
@@ -534,6 +565,12 @@ click"
         fs::write(dir.join("nscript.dat"), xored).unwrap();
     }
 
+    fn write_nscr_sec(dir: &Path, text: &str) {
+        let plain = encode_sjis_fixture(text);
+        let xored = xor_rot5_bytes(&plain);
+        fs::write(dir.join("nscr_sec.dat"), xored).unwrap();
+    }
+
     #[test]
     fn test_xor84_self_inverse() {
         let data = b"hello nscript";
@@ -543,6 +580,20 @@ click"
         assert_eq!(twice.as_slice(), data.as_slice());
         // Spot-check constant matches ONScripter ScriptHandler.cpp readScriptSub.
         assert_eq!(NSCRIPT_DAT_XOR, 0x84);
+    }
+
+    #[test]
+    fn test_xor_rot5_self_inverse_and_magic() {
+        assert_eq!(NSCR_SEC_MAGIC, [0x79, 0x57, 0x0D, 0x80, 0x04]);
+        let data = b"hello nscr_sec rotating key!!";
+        let once = xor_rot5_bytes(data);
+        assert_ne!(once.as_slice(), data.as_slice());
+        // First five bytes use distinct key bytes.
+        assert_eq!(once[0], data[0] ^ 0x79);
+        assert_eq!(once[1], data[1] ^ 0x57);
+        assert_eq!(once[5], data[5] ^ 0x79);
+        let twice = xor_rot5_bytes(&once);
+        assert_eq!(twice.as_slice(), data.as_slice());
     }
 
     #[test]
@@ -687,6 +738,60 @@ click"
         assert!(!String::from_utf8_lossy(&bytes).contains("Hola"));
     }
 
+    #[test]
+    fn test_extract_nscr_sec() {
+        let dir = tempdir();
+        write_nscr_sec(&dir, sample_script());
+        let entries = NScripterPlugin::new().extract(&dir).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source.contains("こんにちは")),
+            "rot5-decoded extract failed: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(entries.iter().all(|e| e.id.starts_with("nscr_sec.dat#")));
+    }
+
+    #[test]
+    fn test_inject_roundtrip_nscr_sec() {
+        let dir = tempdir();
+        write_nscr_sec(&dir, sample_script());
+        roundtrip_translate(&dir, "`Hola, mundo!`");
+        let bytes = fs::read(dir.join("nscr_sec.dat")).unwrap();
+        let plain = xor_rot5_bytes(&bytes);
+        let (text, _, _) = encoding_rs::SHIFT_JIS.decode(&plain);
+        assert!(text.contains("Hola, mundo"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("Hola"));
+    }
+
+    #[test]
+    fn test_priority_prefers_0_txt_over_nscr_sec() {
+        let dir = tempdir();
+        write_0_txt(&dir, "`from zero`\r\n");
+        write_nscr_sec(&dir, "`from sec`\r\n");
+        let entries = NScripterPlugin::new().extract(&dir).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source.contains("from zero")),
+            "expected 0.txt win: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(entries.iter().all(|e| !e.source.contains("from sec")));
+        assert!(entries.iter().all(|e| e.id.starts_with("0.txt#")));
+    }
+
+    #[test]
+    fn test_priority_prefers_nscr_sec_over_nscript_dat() {
+        let dir = tempdir();
+        write_nscr_sec(&dir, "`from sec`\r\n");
+        write_nscript_dat(&dir, "`from dat`\r\n");
+        let entries = NScripterPlugin::new().extract(&dir).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source.contains("from sec")),
+            "expected nscr_sec.dat before nscript.dat: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(entries.iter().all(|e| !e.source.contains("from dat")));
+    }
+
     fn roundtrip_translate(dir: &Path, new_en: &str) {
         let plugin = NScripterPlugin::new();
         let mut entries = plugin.extract(dir).unwrap();
@@ -711,17 +816,6 @@ click"
     }
 
     #[test]
-    fn test_unsupported_only_nscr_sec_errors_loudly() {
-        let dir = tempdir();
-        fs::write(dir.join("nscr_sec.dat"), b"\0\0\0").unwrap();
-        let err = NScripterPlugin::new().extract(&dir).unwrap_err().to_string();
-        assert!(
-            err.contains("nscr_sec") || err.contains("unsupported"),
-            "expected unsupported container message, got: {err}"
-        );
-    }
-
-    #[test]
     fn test_unsupported_only_nscript_underscore_errors_loudly() {
         let dir = tempdir();
         fs::write(dir.join("nscript.___"), b"\0\0\0").unwrap();
@@ -730,6 +824,24 @@ click"
             err.contains("nscript.___") || err.contains("unsupported"),
             "expected unsupported container message, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_nscript_underscore_outranks_nscript_dat_errors_loudly() {
+        // Engine readScript order: nscript.___ (mode 3) beats nscript.dat (mode 1).
+        // Extracting nscript.dat here would translate a file the game never loads.
+        let dir = tempdir();
+        fs::write(dir.join("nscript.___"), b"\0\0\0").unwrap();
+        write_nscript_dat(&dir, "`ignored by engine\n");
+        let err = NScripterPlugin::new().extract(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("nscript.___"),
+            "expected engine-priority unsupported error, got: {err}"
+        );
+        // A higher-priority supported container suppresses the error again.
+        fs::write(dir.join("0.txt"), encode_sjis_fixture("`hello line\n")).unwrap();
+        let entries = NScripterPlugin::new().extract(&dir).unwrap();
+        assert!(!entries.is_empty());
     }
 
     #[test]
