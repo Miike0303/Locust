@@ -369,6 +369,174 @@ fn r1_deletion_set_never_includes_backup_manifest_paths() {
 #[allow(dead_code)]
 fn _touch_backup_type(_: &BackupManifest) {}
 
+// ── Streaming / multi-GB budget tests ───────────────────────────────────────
+
+/// Patch the first local-header **uncompressed** size field (offset 22) and
+/// the matching central-directory field, leaving compressed size intact.
+/// For Stored entries that makes `entry.size()` (declared) smaller than the
+/// bytes the reader can still yield — streaming must abort as a zip bomb.
+fn understate_uncompressed_sizes(zip_path: &Path, new_declared: u32) {
+    let mut bytes = fs::read(zip_path).unwrap();
+    // Local file header signature PK\x03\x04
+    let local_sig = [0x50u8, 0x4b, 0x03, 0x04];
+    let central_sig = [0x50u8, 0x4b, 0x01, 0x02];
+    let mut patched = 0usize;
+    for i in 0..bytes.len().saturating_sub(26) {
+        if bytes[i..i + 4] == local_sig {
+            // uncompressed size at +22
+            bytes[i + 22..i + 26].copy_from_slice(&new_declared.to_le_bytes());
+            patched += 1;
+        }
+        if bytes[i..i + 4] == central_sig {
+            // central: uncompressed at +24
+            bytes[i + 24..i + 28].copy_from_slice(&new_declared.to_le_bytes());
+            patched += 1;
+        }
+    }
+    assert!(patched >= 2, "expected local+central headers to patch, got {patched}");
+    fs::write(zip_path, bytes).unwrap();
+}
+
+#[test]
+fn streaming_apply_multi_entry_byte_identical() {
+    // A few MB across multiple files — streaming path must not depend on size.
+    let game = tmp_game("stream_multi");
+    let chunk_a: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
+    let chunk_b: Vec<u8> = (0..750_000u32).map(|i| (i % 241) as u8).collect();
+    let orig_a: Vec<u8> = vec![0x11; chunk_a.len()];
+    let orig_b: Vec<u8> = vec![0x22; chunk_b.len()];
+    write_file(&game, "data/big_a.bin", &orig_a);
+    write_file(&game, "data/big_b.bin", &orig_b);
+
+    let zip = game.join("p.zip");
+    build_patch_zip(
+        &zip,
+        &[
+            ("data/big_a.bin", &chunk_a, Some(orig_a.as_slice())),
+            ("data/big_b.bin", &chunk_b, Some(orig_b.as_slice())),
+            ("data/small.txt", b"hello-stream", None),
+        ],
+        "1.0.0",
+        "stream-id",
+    );
+
+    let report = apply(&game, &zip, ApplyOptions::default(), |_| {}).unwrap();
+    assert_eq!(report.replaced, 2);
+    assert_eq!(report.added, 1);
+    assert_eq!(fs::read(game.join("data").join("big_a.bin")).unwrap(), chunk_a);
+    assert_eq!(fs::read(game.join("data").join("big_b.bin")).unwrap(), chunk_b);
+    assert_eq!(
+        fs::read(game.join("data").join("small.txt")).unwrap(),
+        b"hello-stream"
+    );
+    // Staging dir must not linger after success.
+    let locust = game.join(".locust");
+    if locust.is_dir() {
+        for e in fs::read_dir(&locust).unwrap() {
+            let name = e.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with("staging-"),
+                "leftover staging dir: {name}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&game);
+}
+
+#[test]
+fn actual_exceeds_declared_aborts_nothing_replaced() {
+    let game = tmp_game("bomb_declared");
+    write_file(&game, "data/a.json", b"ORIGINAL_KEEP");
+    let zip = game.join("bomb.zip");
+    // Build a normal stored zip with a real content file + manifest, then
+    // understate uncompressed sizes so streaming hits actual > declared.
+    let payload = vec![0x5Au8; 64 * 1024]; // 64 KiB
+    build_patch_zip(
+        &zip,
+        &[("data/a.json", &payload, Some(b"ORIGINAL_KEEP"))],
+        "1.0.0",
+        "bomb-id",
+    );
+    understate_uncompressed_sizes(&zip, 1024); // declare 1 KiB, payload 64 KiB
+
+    let v = verify(&game, &zip);
+    assert!(
+        v.is_err(),
+        "verify must abort when stream exceeds declared size, got {v:?}"
+    );
+    let err = v.unwrap_err().to_string();
+    assert!(
+        err.contains("declared") || err.contains("bomb") || err.contains("expanded"),
+        "loud abort message, got: {err}"
+    );
+
+    // Game file untouched (verify is read-only; apply would also refuse).
+    assert_eq!(
+        fs::read(game.join("data").join("a.json")).unwrap(),
+        b"ORIGINAL_KEEP"
+    );
+    assert!(!game.join(".locust").join("receipt.json").exists());
+
+    let apply_err = apply(&game, &zip, ApplyOptions::default(), |_| {});
+    // apply runs verify first — same failure, nothing written.
+    assert!(apply_err.is_err());
+    assert_eq!(
+        fs::read(game.join("data").join("a.json")).unwrap(),
+        b"ORIGINAL_KEEP"
+    );
+    let _ = fs::remove_dir_all(&game);
+}
+
+#[test]
+fn declared_over_total_ceiling_rejected_before_stream() {
+    // Unit-level ceiling is in zipsec; here we assert the public helper used
+    // by verify/apply rejects a declared size above an explicit ceiling.
+    use locust_core::patch::zipsec::check_entry_budget_with;
+    let ceiling = 1024u64;
+    let err = check_entry_budget_with("huge.bin", ceiling + 1, 0, ceiling).unwrap_err();
+    let s = err.to_string();
+    assert!(
+        s.contains("limit") || s.contains("expand") || s.contains("declares"),
+        "{s}"
+    );
+    // Sum of declared sizes also trips the ceiling.
+    let t = check_entry_budget_with("a", 600, 0, ceiling).unwrap();
+    assert!(check_entry_budget_with("b", 600, t, ceiling).is_err());
+}
+
+#[test]
+fn dry_run_does_not_leave_locust_dir_on_clean_game() {
+    let game = tmp_game("dry_run_clean");
+    write_file(&game, "data/a.json", b"ORIG");
+    let zip = game.join("p.zip");
+    build_patch_zip(
+        &zip,
+        &[("data/a.json", b"NEW", Some(b"ORIG"))],
+        "1.0.0",
+        "dry-id",
+    );
+    let report = apply(
+        &game,
+        &zip,
+        ApplyOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert!(report.dry_run);
+    assert_eq!(
+        fs::read(game.join("data").join("a.json")).unwrap(),
+        b"ORIG"
+    );
+    assert!(
+        !game.join(".locust").exists(),
+        "dry-run must not leave .locust/ on a previously clean game"
+    );
+    let _ = fs::remove_dir_all(&game);
+}
+
 
 #[test]
 fn upgrade_aborts_when_rollback_soft_fails_on_edited_added_file() {

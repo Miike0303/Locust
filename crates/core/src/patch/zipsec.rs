@@ -117,32 +117,85 @@ pub fn safe_stored_rel(rel: &str) -> Result<PathBuf> {
     safe_entry_path(&normalized, rel)
 }
 
-/// Cap a single uncompressed zip entry (bytes). Above this we refuse to
-/// buffer the entry in memory (zip-bomb / multi-GB patch DoS — review W4).
+// ── Uncompressed size budgets (zip-bomb / DoS) ─────────────────────────────
+//
+// **History (W4, pre-streaming):** entries were fully buffered in RAM, so we
+// capped each entry at 64 MiB and the whole zip at 512 MiB
+// (`MAX_ZIP_ENTRY_BYTES` / old `MAX_ZIP_TOTAL_BYTES`). A real multi‑GB Unreal
+// pak patch is a single entry far above those caps, so the memory model had
+// to go.
+//
+// **Now (streaming):** entry bytes go to disk (apply) or are discarded after
+// hashing (verify). Peak RAM is a small fixed chunk, not file size. Budgets:
+//
+// 1. **Declared total ceiling** — sum of local-header uncompressed sizes
+//    must stay ≤ [`max_zip_total_bytes`] (default 32 GiB). Checked *before*
+//    streaming each entry. Override with env `LOCUST_PATCH_MAX_UNCOMPRESSED`.
+// 2. **Actual ≤ declared** — while streaming, if the inflater produces more
+//    bytes than the header declared, abort immediately (classic zip bomb).
+//
+// There is **no** per-entry hard cap anymore; a single 8 GiB entry is valid
+// when it fits under the total ceiling.
+//
+// The old 64 MiB constant is kept only as a documented historical value so
+// greps of review notes still resolve.
+
+/// Historical per-entry RAM cap (no longer enforced — see module docs above).
 pub const MAX_ZIP_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Cap total uncompressed content read from one patch zip.
-pub const MAX_ZIP_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// Default total uncompressed expansion ceiling for one patch zip (32 GiB).
+///
+/// Not a memory limit: streaming stages to disk. This bounds disk fill and
+/// CPU time for a malicious or accidental mega-archive.
+pub const MAX_ZIP_TOTAL_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
-/// Refuse entries whose declared uncompressed size is absurd before reading.
+/// Env var for [`max_zip_total_bytes`] (decimal byte count).
+pub const MAX_UNCOMPRESSED_ENV: &str = "LOCUST_PATCH_MAX_UNCOMPRESSED";
+
+/// Configured total uncompressed ceiling (env override or [`MAX_ZIP_TOTAL_BYTES`]).
+pub fn max_zip_total_bytes() -> u64 {
+    if let Ok(raw) = std::env::var(MAX_UNCOMPRESSED_ENV) {
+        if let Ok(n) = raw.trim().parse::<u64>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    MAX_ZIP_TOTAL_BYTES
+}
+
+/// Charge an entry's **declared** uncompressed size against the running total.
+///
+/// Does not read entry bytes. Per-entry size is not limited (streaming);
+/// only the zip-wide ceiling applies. Actual expansion vs declared is
+/// enforced by [`super::stream::stream_and_hash`].
 pub fn check_entry_budget(
     entry_name: &str,
     uncompressed_size: u64,
     total_so_far: u64,
 ) -> Result<u64> {
-    if uncompressed_size > MAX_ZIP_ENTRY_BYTES {
+    check_entry_budget_with(entry_name, uncompressed_size, total_so_far, max_zip_total_bytes())
+}
+
+/// Same as [`check_entry_budget`] with an explicit total ceiling (tests).
+pub fn check_entry_budget_with(
+    entry_name: &str,
+    uncompressed_size: u64,
+    total_so_far: u64,
+    max_total: u64,
+) -> Result<u64> {
+    if uncompressed_size > max_total {
         return Err(LocustError::PatchError(format!(
-            "zip entry \"{entry_name}\" is {uncompressed_size} bytes uncompressed \
-             (limit {} per entry) — refusing to load into memory",
-            MAX_ZIP_ENTRY_BYTES
+            "zip entry \"{entry_name}\" declares {uncompressed_size} bytes uncompressed \
+             (limit {max_total} for the whole patch) — refusing to extract \
+             (set {MAX_UNCOMPRESSED_ENV} to raise the ceiling)"
         )));
     }
     let next = total_so_far.saturating_add(uncompressed_size);
-    if next > MAX_ZIP_TOTAL_BYTES {
+    if next > max_total {
         return Err(LocustError::PatchError(format!(
-            "patch zip would expand to at least {next} bytes (limit {}) — \
-             refusing to load into memory",
-            MAX_ZIP_TOTAL_BYTES
+            "patch zip would expand to at least {next} bytes (limit {max_total}) — \
+             refusing to extract (set {MAX_UNCOMPRESSED_ENV} to raise the ceiling)"
         )));
     }
     Ok(next)
@@ -153,33 +206,32 @@ mod budget_tests {
     use super::*;
 
     #[test]
-    fn rejects_oversized_entry() {
-        let err = check_entry_budget("huge.bin", MAX_ZIP_ENTRY_BYTES + 1, 0).unwrap_err();
-        assert!(err.to_string().contains("per entry"));
+    fn accepts_entry_larger_than_historical_64mib() {
+        // Streaming removed the 64 MiB per-entry RAM cap.
+        let n = check_entry_budget_with("pak", MAX_ZIP_ENTRY_BYTES * 2, 0, MAX_ZIP_TOTAL_BYTES)
+            .unwrap();
+        assert_eq!(n, MAX_ZIP_ENTRY_BYTES * 2);
     }
 
     #[test]
-    fn rejects_total_over_budget() {
-        // Use max-per-entry chunks until the total budget trips.
-        let chunk = MAX_ZIP_ENTRY_BYTES;
-        let mut total = 0u64;
-        let mut last_err = None;
-        for i in 0..20 {
-            match check_entry_budget(&format!("e{i}"), chunk, total) {
-                Ok(n) => total = n,
-                Err(e) => {
-                    last_err = Some(e);
-                    break;
-                }
-            }
-        }
-        assert!(last_err.is_some(), "must eventually hit total budget");
-        assert!(last_err.unwrap().to_string().contains("limit"));
+    fn rejects_declared_over_total_ceiling() {
+        let ceiling = 1024u64;
+        let err = check_entry_budget_with("huge.bin", ceiling + 1, 0, ceiling).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("limit") || s.contains("expand") || s.contains("declares"), "{s}");
+    }
+
+    #[test]
+    fn rejects_sum_over_total_ceiling() {
+        let ceiling = 1000u64;
+        let t = check_entry_budget_with("a", 600, 0, ceiling).unwrap();
+        let err = check_entry_budget_with("b", 600, t, ceiling).unwrap_err();
+        assert!(err.to_string().contains("limit") || err.to_string().contains("expand"));
     }
 
     #[test]
     fn accepts_small() {
-        assert_eq!(check_entry_budget("a", 100, 0).unwrap(), 100);
+        assert_eq!(check_entry_budget_with("a", 100, 0, 512).unwrap(), 100);
     }
 }
 

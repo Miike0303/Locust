@@ -1,7 +1,6 @@
 //! Journaled patch apply transaction.
 
 use std::fs::{self, File};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -16,10 +15,17 @@ use super::manifest::{
 };
 use super::rollback::{rollback, RollbackOptions};
 use super::store::{PatchStatus, PatchStore};
+use super::stream::{charge_declared, stream_and_hash, stream_to_file, StagingDir};
 use super::verify::{
     classify_files, verify, VerificationOutcome, VerificationReport,
 };
-use super::zipsec::{check_entry_budget, normalize_entry_name, safe_entry_path};
+use super::zipsec::{normalize_entry_name, safe_entry_path};
+
+/// Staged zip content (on disk under `.locust/staging-*/`, same volume as game).
+struct StagedContent {
+    path: PathBuf,
+    sha256: String,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
@@ -263,15 +269,25 @@ where
     F: FnMut(PatchProgress),
 {
     let store = PatchStore::new(game_root);
+    // If we only ever created staging and then abort/dry-run, drop this last so
+    // an empty `.locust/` does not flip status to Unknown.
+    let _empty_locust_guard = EmptyLocustGuard(game_root.to_path_buf());
+    // Staging lives under game_root/.locust/ so rename-to-dest stays same-volume.
+    // Cleaned on drop (error, dry-run, or after successful renames).
+    let staging = StagingDir::create(game_root)?;
     let file = File::open(zip_path)?;
     let mut archive = ZipArchive::new(file)
         .map_err(|e| LocustError::PatchError(format!("open zip: {e}")))?;
 
-    // Load zip bytes by relative path (same budget as verify — W4).
-    let mut zip_files: std::collections::HashMap<String, Vec<u8>> =
+    // Stream each content entry to a staging file; hash while streaming.
+    // Manifest is small and kept in RAM (same meta cap idea as verify).
+    let mut zip_files: std::collections::HashMap<String, StagedContent> =
         std::collections::HashMap::new();
     let mut manifest: Option<PatchManifest> = None;
     let mut total_bytes = 0u64;
+    let mut stage_idx = 0u32;
+    const MAX_META_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
+
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -281,27 +297,48 @@ where
         }
         let original = entry.name().to_string();
         let normalized = normalize_entry_name(&original);
-        total_bytes = check_entry_budget(&original, entry.size(), total_bytes)?;
-        let mut data = Vec::new();
-        entry
-            .read_to_end(&mut data)
-            .map_err(|e| LocustError::PatchError(format!("read {original}: {e}")))?;
-        if (data.len() as u64) > entry.size() {
-            let prior = total_bytes.saturating_sub(entry.size());
-            total_bytes = check_entry_budget(&original, data.len() as u64, prior)?;
-        }
+        let declared = entry.size();
+        total_bytes = charge_declared(&original, declared, total_bytes)?;
+
         if normalized == PatchManifest::FILENAME {
+            if declared > MAX_META_BUFFER_BYTES {
+                return Err(LocustError::PatchError(format!(
+                    "zip meta entry \"{original}\" declares {declared} bytes \
+                     (limit {MAX_META_BUFFER_BYTES}) — refusing to buffer"
+                )));
+            }
+            let mut data = Vec::new();
+            stream_and_hash(
+                &mut entry,
+                declared.min(MAX_META_BUFFER_BYTES),
+                &original,
+                Some(&mut data),
+            )?;
             manifest = Some(serde_json::from_slice(&data).map_err(|e| {
                 LocustError::PatchError(format!("manifest parse: {e}"))
             })?);
             continue;
         }
         if normalized.eq_ignore_ascii_case("readme.txt") {
+            // Discard while still enforcing actual ≤ declared.
+            let mut sink = std::io::sink();
+            stream_and_hash(&mut entry, declared, &original, Some(&mut sink))?;
             continue;
         }
         let rel = safe_entry_path(&normalized, &original)?;
-        zip_files.insert(rel.to_string_lossy().replace('\\', "/"), data);
+        let key = rel.to_string_lossy().replace('\\', "/");
+        let staged_path = staging.child(&format!("e{stage_idx:05}"));
+        stage_idx += 1;
+        let streamed = stream_to_file(&mut entry, declared, &original, &staged_path)?;
+        zip_files.insert(
+            key,
+            StagedContent {
+                path: staged_path,
+                sha256: streamed.sha256_hex,
+            },
+        );
     }
+    let _ = total_bytes;
 
     // Build plan.
     let (mut replaced, mut added, mut user_edits) = if let Some(ref m) = manifest {
@@ -310,9 +347,9 @@ where
         // Legacy: every existing path replaced, absent = added.
         let mut replaced = Vec::new();
         let mut added = Vec::new();
-        for (path, data) in &zip_files {
+        for (path, staged) in &zip_files {
             let target = game_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            let patched = sha256_hex(data);
+            let patched = staged.sha256.clone();
             if target.is_file() {
                 let orig = sha256_hex(&fs::read(&target)?);
                 replaced.push(ReceiptReplaced {
@@ -475,6 +512,7 @@ where
     };
 
     if opts.dry_run {
+        // StagingDir + EmptyLocustGuard drops clean staging / empty .locust.
         return Ok(ApplyReport {
             patch_id,
             patch_version,
@@ -489,6 +527,7 @@ where
     }
 
     // Step 3: ensure .locust/ and handle existing backup (R2).
+    // Staging already created the parent .locust/; ensure hides + layout.
     store.ensure_locust_dir()?;
     prepare_backup_slot(&store, tier, r2_allow_discard)?;
 
@@ -548,25 +587,30 @@ where
             path: path.clone(),
             phase: "write",
         });
-        let data = zip_files.get(&path).ok_or_else(|| {
+        let staged = zip_files.get(&path).ok_or_else(|| {
             LocustError::PatchError(format!("zip missing path {path}"))
         })?;
         let dest = game_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        // Sibling temp name that cannot collide with a real extension.
+        // Move staged file to a sibling *.locust-tmp next to dest (same volume),
+        // then PatchStore::replace_file (W3: .locust-old aside on Windows).
         let tmp = {
             let mut t = dest.as_os_str().to_owned();
             t.push(".locust-tmp");
             PathBuf::from(t)
         };
-        fs::write(&tmp, data)?;
-        {
-            // Windows: sync_all needs a writable handle (see store::backup_file).
-            let f = fs::OpenOptions::new().read(true).write(true).open(&tmp)?;
-            f.sync_all()?;
+        if tmp.exists() {
+            let _ = fs::remove_file(&tmp);
         }
+        fs::rename(&staged.path, &tmp).map_err(|e| {
+            LocustError::PatchError(format!(
+                "stage → tmp {} → {}: {e}",
+                staged.path.display(),
+                tmp.display()
+            ))
+        })?;
         if dest.is_file() {
             let meta = fs::metadata(&dest)?;
             if meta.permissions().readonly() {
@@ -610,6 +654,29 @@ where
         user_edits_overwritten: user_edits,
         messages: vec![],
     })
+}
+
+/// Remove `.locust/` when it exists but is empty (dry-run / failed-staging residue).
+fn remove_empty_locust_dir(game_root: &Path) {
+    let locust = game_root.join(super::store::LOCUST_DIR);
+    if !locust.is_dir() {
+        return;
+    }
+    let empty = fs::read_dir(&locust)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(false);
+    if empty {
+        let _ = fs::remove_dir(&locust);
+    }
+}
+
+/// Drops after [`StagingDir`] so an empty `.locust/` can be removed.
+struct EmptyLocustGuard(PathBuf);
+
+impl Drop for EmptyLocustGuard {
+    fn drop(&mut self) {
+        remove_empty_locust_dir(&self.0);
+    }
 }
 
 /// RULE R2: decide whether an existing backup/ may be discarded or is incomplete.

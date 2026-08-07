@@ -18,6 +18,7 @@ pub mod manifest;
 pub mod pack;
 pub mod rollback;
 pub mod store;
+pub mod stream;
 pub mod verify;
 pub mod zipsec;
 

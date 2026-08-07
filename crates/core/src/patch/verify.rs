@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -13,9 +12,8 @@ use crate::error::{LocustError, Result};
 
 use super::manifest::{PatchFileEntry, PatchManifest, Receipt, VerificationTier};
 use super::store::{PatchStatus, PatchStore};
-use super::zipsec::{
-    case_fold_key, check_entry_budget, normalize_entry_name, safe_entry_path,
-};
+use super::stream::{charge_declared, stream_and_hash, stream_hash_only};
+use super::zipsec::{case_fold_key, normalize_entry_name, safe_entry_path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationOutcome {
@@ -103,10 +101,16 @@ struct ZipEntryMeta {
     normalized: String,
     /// Safe relative path under game root, if this is a content file.
     rel: Option<PathBuf>,
-    /// Raw bytes (small manifests; file content hashed for verify).
-    data: Vec<u8>,
+    /// SHA-256 of entry payload (streamed; not kept in RAM for content files).
+    content_sha256: String,
+    /// Small meta payloads only (manifest / readme). Empty for content files.
+    meta_data: Vec<u8>,
     is_dir: bool,
 }
+
+/// Meta entries (manifest, readme) stay in RAM but still stream through the
+/// same bomb checks. Cap so a malicious "manifest" cannot fill memory.
+const MAX_META_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
 
 fn scan_zip_entries(archive: &mut ZipArchive<File>) -> Result<Vec<ZipEntryMeta>> {
     let mut out = Vec::new();
@@ -129,15 +133,16 @@ fn scan_zip_entries(archive: &mut ZipArchive<File>) -> Result<Vec<ZipEntryMeta>>
                 original,
                 normalized,
                 rel: None,
-                data: vec![],
+                content_sha256: String::new(),
+                meta_data: vec![],
                 is_dir: true,
             });
             continue;
         }
         // Skip the manifest file from the content plan later.
-        let rel = if normalized == PatchManifest::FILENAME
-            || normalized.eq_ignore_ascii_case("readme.txt")
-        {
+        let is_meta = normalized == PatchManifest::FILENAME
+            || normalized.eq_ignore_ascii_case("readme.txt");
+        let rel = if is_meta {
             None
         } else {
             Some(safe_entry_path(&normalized, &original)?)
@@ -152,28 +157,46 @@ fn scan_zip_entries(archive: &mut ZipArchive<File>) -> Result<Vec<ZipEntryMeta>>
             }
         }
 
-        // Declared uncompressed size — refuse zip-bombs before buffering (W4).
-        total_bytes = check_entry_budget(&original, entry.size(), total_bytes)?;
+        let declared = entry.size();
+        // Declared size against zip-wide ceiling before any streaming.
+        total_bytes = charge_declared(&original, declared, total_bytes)?;
 
-        let mut data = Vec::new();
-        entry
-            .read_to_end(&mut data)
-            .map_err(|e| LocustError::PatchError(format!("read {original}: {e}")))?;
-        // Actual bytes can differ from the header; re-check and charge actual.
-        if (data.len() as u64) > entry.size() {
-            // Header understated size — re-budget with actual length from prior total.
-            let prior = total_bytes.saturating_sub(entry.size());
-            total_bytes = check_entry_budget(&original, data.len() as u64, prior)?;
-        }
+        let (content_sha256, meta_data) = if is_meta {
+            if declared > MAX_META_BUFFER_BYTES {
+                return Err(LocustError::PatchError(format!(
+                    "zip meta entry \"{original}\" declares {declared} bytes \
+                     (limit {MAX_META_BUFFER_BYTES}) — refusing to buffer"
+                )));
+            }
+            let mut buf = Vec::new();
+            let streamed = stream_and_hash(
+                &mut entry,
+                declared.min(MAX_META_BUFFER_BYTES),
+                &original,
+                Some(&mut buf),
+            )?;
+            if streamed.actual_len > MAX_META_BUFFER_BYTES {
+                return Err(LocustError::PatchError(format!(
+                    "zip meta entry \"{original}\" exceeded meta buffer limit"
+                )));
+            }
+            (streamed.sha256_hex, buf)
+        } else {
+            // Content: hash while streaming; discard bytes (multi‑GB safe).
+            let streamed = stream_hash_only(&mut entry, declared, &original)?;
+            (streamed.sha256_hex, vec![])
+        };
 
         out.push(ZipEntryMeta {
             original,
             normalized,
             rel,
-            data,
+            content_sha256,
+            meta_data,
             is_dir: false,
         });
     }
+    let _ = total_bytes;
     Ok(out)
 }
 
@@ -184,7 +207,7 @@ fn load_manifest_from_entries(entries: &[ZipEntryMeta]) -> Result<Option<PatchMa
     else {
         return Ok(None);
     };
-    let parsed: PatchManifest = serde_json::from_slice(&m.data).map_err(|e| {
+    let parsed: PatchManifest = serde_json::from_slice(&m.meta_data).map_err(|e| {
         LocustError::PatchError(format!("corrupt locust-patch.json: {e}"))
     })?;
     Ok(Some(parsed))
@@ -240,8 +263,8 @@ fn verify_with_manifest(
                 f.path
             )));
         };
-        let hash = sha256_hex(&ze.data);
-        if hash != f.patched_sha256 {
+        let hash = &ze.content_sha256;
+        if hash != &f.patched_sha256 {
             return Err(LocustError::PatchError(format!(
                 "zip content hash mismatch for {}: manifest says {}, zip has {}",
                 f.path, f.patched_sha256, hash
