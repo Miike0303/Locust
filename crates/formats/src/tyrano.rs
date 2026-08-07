@@ -8,7 +8,8 @@
 //!   `@tag …` full-line commands, else character-scan for inline `[tag]` + player text.
 //! - Game layout (TyranoBuilder shipping tree; not re-fetched here):
 //!   `data/scenario/*.ks` UTF-8 scenario scripts; engine assets under `tyrano/`.
-//!   Desktop wraps may use `app.asar` / `data.exe` — archives out of scope.
+//!   Desktop Electron packs use `app.asar` (see [`crate::tyrano_asar`]); inject rebuilds
+//!   the asar in place with a `.locust-old` safety rename.
 //!
 //! # First-cut extraction (over-extraction OK)
 //! - Player text = non-empty lines that are not comments/labels/`@`/pure-`[tag]` lines.
@@ -18,7 +19,7 @@
 //!   `:` is preserved on inject).
 //! - Encoding: UTF-8 only; preserve BOM if the source file had one.
 //!
-//! Out of scope: `app.asar` / `data.exe` / other archives, `Config.tjs` string tables,
+//! Out of scope: NW.js `data.exe` / `package.nw`, `Config.tjs` string tables,
 //! `[iscript]` JS / `[html]` bodies as structured ASTs (line heuristic may over-extract),
 //! real commercial game fixtures.
 
@@ -28,6 +29,9 @@ use std::path::{Path, PathBuf};
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
+use tracing::warn;
+
+use crate::tyrano_asar::{self, AsarArchive};
 
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
@@ -87,8 +91,38 @@ impl TyranoPlugin {
         out
     }
 
+    /// `app.asar` at game root or under `resources/`.
+    fn find_app_asars(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if root.is_file() {
+            if is_app_asar(root) {
+                out.push(root.to_path_buf());
+            }
+            return out;
+        }
+        if !root.is_dir() {
+            return out;
+        }
+        for candidate in [
+            root.join("app.asar"),
+            root.join("resources").join("app.asar"),
+        ] {
+            if candidate.is_file() {
+                out.push(candidate);
+            }
+        }
+        out
+    }
+
+    fn has_app_asar(root: &Path) -> bool {
+        !Self::find_app_asars(root).is_empty()
+    }
+
     fn detect_path(path: &Path) -> bool {
         if path.is_file() {
+            if is_app_asar(path) {
+                return true;
+            }
             // Single .ks only if it lives under …/data/scenario/
             if !Self::is_ks(path) {
                 return false;
@@ -118,8 +152,30 @@ impl TyranoPlugin {
         if !Self::find_scenario_ks(path).is_empty() {
             return true;
         }
-        Self::looks_like_tyrano(path)
+        if Self::looks_like_tyrano(path) {
+            return true;
+        }
+        // Electron pack: app.asar with scenario paths (and optional tyrano marker).
+        if Self::has_app_asar(path) {
+            for p in Self::find_app_asars(path) {
+                if AsarArchive::peek_header_mentions_scenario(&p) {
+                    return true;
+                }
+            }
+            // Asar present + no header peek: still claim if tyrano/ exists beside it
+            // (common desktop layout: resources/app.asar + resources/app.asar.unpacked/tyrano).
+            return path.join("tyrano").is_dir()
+                || path.join("resources").join("app.asar.unpacked").join("tyrano").is_dir();
+        }
+        false
     }
+}
+
+fn is_app_asar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.eq_ignore_ascii_case("app.asar"))
+        .unwrap_or(false)
 }
 
 impl Default for TyranoPlugin {
@@ -342,6 +398,141 @@ fn rebuild_speaker_line(original: &str, new_name: &str) -> String {
     }
 }
 
+/// Extract string entries from one UTF-8 scenario payload.
+fn entries_from_ks_bytes(
+    bytes: &[u8],
+    rel: &str,
+    file_path: PathBuf,
+) -> Result<Vec<StringEntry>> {
+    let decoded = decode_ks_utf8(bytes, rel)?;
+    let kinds = classify_lines(&decoded.text);
+    let mut all = Vec::new();
+    for (idx, line) in decoded.text.split('\n').enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line_no = idx + 1;
+        let kind = kinds.get(idx).copied().unwrap_or(LineKind::Skip);
+        match kind {
+            LineKind::Skip => {}
+            LineKind::Text => {
+                let id = format!("{rel}#{line_no}");
+                let mut entry = StringEntry::new(id, line, file_path.clone());
+                entry.tags = vec!["dialogue".into()];
+                all.push(entry);
+            }
+            LineKind::Speaker => {
+                if let Some(name) = speaker_display_name(line) {
+                    let id = format!("{rel}#{line_no}");
+                    let mut entry = StringEntry::new(id, name, file_path.clone());
+                    entry.tags = vec!["speaker".into()];
+                    entry.context = Some(line.to_string());
+                    all.push(entry);
+                }
+            }
+        }
+    }
+    Ok(all)
+}
+
+/// Apply translations to a scenario file; returns new bytes if changed.
+fn apply_ks_translations(
+    bytes: &[u8],
+    label: &str,
+    file_entries: &[&StringEntry],
+) -> Result<Option<(Vec<u8>, usize, usize)>> {
+    let mut decoded = decode_ks_utf8(bytes, label)?;
+    let mut by_line: HashMap<usize, &StringEntry> = HashMap::new();
+    for e in file_entries {
+        if e.translation.is_some() {
+            if let Some(n) = e.id.rsplit('#').next().and_then(|s| s.parse().ok()) {
+                by_line.insert(n, e);
+            }
+        }
+    }
+    let kinds = classify_lines(&decoded.text);
+    let mut out_lines = Vec::new();
+    let mut changed = false;
+    let mut file_written = 0usize;
+    let mut file_skipped = 0usize;
+
+    for (idx, line) in decoded.text.split('\n').enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line_no = idx + 1;
+        let kind = kinds.get(idx).copied().unwrap_or(LineKind::Skip);
+        if let Some(entry) = by_line.get(&line_no) {
+            if let Some(t) = entry.translation.as_deref() {
+                match kind {
+                    LineKind::Text if t != line => {
+                        out_lines.push(t.to_string());
+                        changed = true;
+                        file_written += 1;
+                        continue;
+                    }
+                    LineKind::Speaker => {
+                        if let Some(old_name) = speaker_display_name(line) {
+                            if t != old_name {
+                                out_lines.push(rebuild_speaker_line(line, t));
+                                changed = true;
+                                file_written += 1;
+                                continue;
+                            }
+                        }
+                        file_skipped += 1;
+                    }
+                    _ => {
+                        file_skipped += 1;
+                    }
+                }
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+    if !changed {
+        return Ok(None);
+    }
+    decoded.text = out_lines.join("\n");
+    Ok(Some((encode_ks_utf8(&decoded), file_written, file_skipped)))
+}
+
+/// Split `resources/app.asar/data/scenario/a.ks` → (`resources/app.asar`, `data/scenario/a.ks`).
+fn split_asar_virtual_path(path: &Path) -> Option<(String, String)> {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let lower = s.to_ascii_lowercase();
+    let needle = "app.asar/";
+    let idx = lower.find(needle)?;
+    let archive = s[..idx + "app.asar".len()].to_string();
+    let inner = s[idx + needle.len()..].to_string();
+    if inner.is_empty() {
+        return None;
+    }
+    Some((archive, inner))
+}
+
+/// Replace `path` with `new_bytes` after moving the original to `path` + `.locust-old`.
+fn replace_file_with_backup(path: &Path, new_bytes: &[u8]) -> Result<()> {
+    let backup = {
+        let mut s = path.to_string_lossy().into_owned();
+        s.push_str(".locust-old");
+        PathBuf::from(s)
+    };
+    if backup.exists() {
+        std::fs::remove_file(&backup).ok();
+    }
+    std::fs::rename(path, &backup).map_err(|e| {
+        parse_err(
+            &path.display().to_string(),
+            format!("cannot move aside for backup: {e}"),
+        )
+    })?;
+    if let Err(e) = std::fs::write(path, new_bytes) {
+        let _ = std::fs::rename(&backup, path);
+        return Err(parse_err(
+            &path.display().to_string(),
+            format!("write failed after backup (restored): {e}"),
+        ));
+    }
+    Ok(())
+}
+
 // ─── Plugin ────────────────────────────────────────────────────────────────
 
 impl FormatPlugin for TyranoPlugin {
@@ -354,7 +545,7 @@ impl FormatPlugin for TyranoPlugin {
     }
 
     fn description(&self) -> &str {
-        "TyranoBuilder scenario .ks under data/scenario/ (UTF-8); synthetic fixtures; no asar"
+        "TyranoBuilder data/scenario *.ks loose + app.asar unpack/repack (UTF-8); no data.exe"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -362,7 +553,7 @@ impl FormatPlugin for TyranoPlugin {
     }
 
     fn supported_extensions(&self) -> &[&str] {
-        &[".ks"]
+        &[".ks", ".asar"]
     }
 
     fn supported_modes(&self) -> Vec<OutputMode> {
@@ -382,23 +573,25 @@ impl FormatPlugin for TyranoPlugin {
         } else {
             Self::find_scenario_ks(&root)
         };
+        let asars = Self::find_app_asars(&root);
 
-        if ks_files.is_empty() {
+        if ks_files.is_empty() && asars.is_empty() {
             if Self::looks_like_tyrano(&root) {
                 return Err(parse_err(
                     &label,
                     "TyranoBuilder layout detected (tyrano/ and/or data/scenario/) but no loose \
-                     scenario .ks files found; desktop packs (app.asar / data.exe) are out of \
-                     scope — unpack scenarios to data/scenario/*.ks first",
+                     scenario .ks and no app.asar; NW.js data.exe packs are out of scope — unpack \
+                     scenarios to data/scenario/*.ks first",
                 ));
             }
             return Err(parse_err(
                 &label,
-                "no TyranoBuilder scenario .ks files found (expected data/scenario/*.ks)",
+                "no TyranoBuilder scenario .ks files found (expected data/scenario/*.ks or app.asar)",
             ));
         }
 
         let mut all = Vec::new();
+
         for fpath in &ks_files {
             let bytes = std::fs::read(fpath)?;
             let rel = fpath
@@ -406,34 +599,82 @@ impl FormatPlugin for TyranoPlugin {
                 .unwrap_or(fpath.as_path())
                 .to_string_lossy()
                 .replace('\\', "/");
-            let decoded = decode_ks_utf8(&bytes, &rel)?;
-            let kinds = classify_lines(&decoded.text);
-            for (idx, line) in decoded.text.split('\n').enumerate() {
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                let line_no = idx + 1;
-                let kind = kinds.get(idx).copied().unwrap_or(LineKind::Skip);
-                match kind {
-                    LineKind::Skip => {}
-                    LineKind::Text => {
-                        // Leading `_` is a Tyrano "keep spaces" marker; keep it in the
-                        // string so inject can rewrite the line as-is.
-                        let id = format!("{rel}#{line_no}");
-                        let mut entry = StringEntry::new(id, line, fpath.clone());
-                        entry.tags = vec!["dialogue".into()];
-                        all.push(entry);
+            all.extend(entries_from_ks_bytes(&bytes, &rel, fpath.clone())?);
+        }
+
+        let mut asar_errors = 0usize;
+        let mut last_asar_err = String::new();
+        let mut ks_seen = 0usize;
+        let mut ks_skipped = 0usize;
+
+        for asar_path in &asars {
+            let asar_rel = asar_path
+                .strip_prefix(&root)
+                .unwrap_or(asar_path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            let archive = match AsarArchive::open(asar_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    asar_errors += 1;
+                    last_asar_err = e.to_string();
+                    warn!(archive = %asar_rel, error = %e, "failed to open app.asar");
+                    continue;
+                }
+            };
+            for entry in archive.scenario_ks_entries() {
+                ks_seen += 1;
+                let payload = match archive.read_entry(entry) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            archive = %asar_rel,
+                            entry = %entry.path,
+                            error = %e,
+                            "asar .ks read failed; skipped"
+                        );
+                        ks_skipped += 1;
+                        continue;
                     }
-                    LineKind::Speaker => {
-                        if let Some(name) = speaker_display_name(line) {
-                            let id = format!("{rel}#{line_no}");
-                            let mut entry = StringEntry::new(id, name, fpath.clone());
-                            entry.tags = vec!["speaker".into()];
-                            entry.context = Some(line.to_string());
-                            all.push(entry);
-                        }
+                };
+                let rel = format!("{asar_rel}/{}", entry.path.replace('\\', "/"));
+                let virtual_path = PathBuf::from(&rel);
+                match entries_from_ks_bytes(&payload, &rel, virtual_path) {
+                    Ok(entries) => all.extend(entries),
+                    Err(e) => {
+                        warn!(
+                            archive = %asar_rel,
+                            entry = %entry.path,
+                            error = %e,
+                            "asar .ks is not valid UTF-8 text; skipped"
+                        );
+                        ks_skipped += 1;
                     }
                 }
             }
         }
+
+        if all.is_empty() && ks_files.is_empty() {
+            if asar_errors > 0 && ks_seen == 0 {
+                return Err(parse_err(
+                    &label,
+                    format!("failed to parse app.asar: {last_asar_err}"),
+                ));
+            }
+            if ks_seen == 0 {
+                return Err(parse_err(
+                    &label,
+                    "no data/scenario/*.ks found in app.asar",
+                ));
+            }
+            if ks_skipped > 0 {
+                warn!(
+                    skipped = ks_skipped,
+                    "all asar scenario .ks entries were skipped"
+                );
+            }
+        }
+
         Ok(all)
     }
 
@@ -451,12 +692,26 @@ impl FormatPlugin for TyranoPlugin {
 
         let search_root = Self::root_dir(path);
 
-        for (file_path, file_entries) in &by_file {
+        let mut asar_groups: HashMap<String, Vec<(String, Vec<&StringEntry>)>> = HashMap::new();
+        let mut loose: Vec<(PathBuf, Vec<&StringEntry>)> = Vec::new();
+
+        for (file_path, file_entries) in by_file {
+            if let Some((archive, inner)) = split_asar_virtual_path(&file_path) {
+                asar_groups
+                    .entry(archive)
+                    .or_default()
+                    .push((inner, file_entries));
+            } else {
+                loose.push((file_path, file_entries));
+            }
+        }
+
+        // Loose .ks
+        for (file_path, file_entries) in loose {
             let actual = if file_path.exists() {
                 file_path.clone()
             } else {
-                // Resolve relative data/scenario/… against game root.
-                let as_rel = search_root.join(file_path);
+                let as_rel = search_root.join(&file_path);
                 if as_rel.exists() {
                     as_rel
                 } else {
@@ -468,7 +723,6 @@ impl FormatPlugin for TyranoPlugin {
                 strings_skipped += file_entries.len();
                 continue;
             }
-
             let bytes = match std::fs::read(&actual) {
                 Ok(b) => b,
                 Err(e) => {
@@ -478,77 +732,147 @@ impl FormatPlugin for TyranoPlugin {
                 }
             };
             let label = actual.display().to_string();
-            let mut decoded = match decode_ks_utf8(&bytes, &label) {
-                Ok(d) => d,
-                Err(e) => {
-                    warnings.push(format!("cannot decode {}: {e}", actual.display()));
+            match apply_ks_translations(&bytes, &label, &file_entries) {
+                Ok(Some((encoded, written, skipped))) => {
+                    std::fs::write(&actual, &encoded)?;
+                    files_modified += 1;
+                    files_written.push(actual);
+                    strings_written += written;
+                    strings_skipped += skipped;
+                }
+                Ok(None) => {
                     strings_skipped += file_entries.len();
+                }
+                Err(e) => {
+                    warnings.push(format!("cannot re-encode {label}: {e}"));
+                    strings_skipped += file_entries.len();
+                }
+            }
+        }
+
+        // app.asar groups
+        for (archive_rel, inners) in asar_groups {
+            let arch_path = {
+                let p = search_root.join(&archive_rel);
+                if p.exists() {
+                    p
+                } else {
+                    search_root.join(Path::new(&archive_rel).file_name().unwrap_or_default())
+                }
+            };
+            if !arch_path.exists() {
+                warnings.push(format!("missing archive {archive_rel}"));
+                for (_, fe) in &inners {
+                    strings_skipped += fe.len();
+                }
+                continue;
+            }
+
+            let archive = match AsarArchive::open(&arch_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    warnings.push(format!("cannot open {archive_rel}: {e}"));
+                    for (_, fe) in &inners {
+                        strings_skipped += fe.len();
+                    }
                     continue;
                 }
             };
 
-            let mut by_line: HashMap<usize, &StringEntry> = HashMap::new();
-            for e in file_entries {
-                if e.translation.is_some() {
-                    if let Some(n) = e.id.rsplit('#').next().and_then(|s| s.parse().ok()) {
-                        by_line.insert(n, e);
+            let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
+            let mut unpacked_writes: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
+            let mut arch_written = 0usize;
+
+            for (inner, file_entries) in inners {
+                let entry = match archive
+                    .entries
+                    .iter()
+                    .find(|e| e.path.replace('\\', "/") == inner.replace('\\', "/"))
+                {
+                    Some(e) => e,
+                    None => {
+                        warnings.push(format!("entry {inner} not in {archive_rel}"));
+                        strings_skipped += file_entries.len();
+                        continue;
                     }
-                }
-            }
-
-            let kinds = classify_lines(&decoded.text);
-            let mut out_lines = Vec::new();
-            let mut changed = false;
-            let mut file_written = 0usize;
-            let mut file_skipped = 0usize;
-
-            for (idx, line) in decoded.text.split('\n').enumerate() {
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                let line_no = idx + 1;
-                let kind = kinds.get(idx).copied().unwrap_or(LineKind::Skip);
-
-                if let Some(entry) = by_line.get(&line_no) {
-                    if let Some(t) = entry.translation.as_deref() {
-                        match kind {
-                            LineKind::Text if t != line => {
-                                out_lines.push(t.to_string());
-                                changed = true;
-                                file_written += 1;
-                                continue;
-                            }
-                            LineKind::Speaker => {
-                                if let Some(old_name) = speaker_display_name(line) {
-                                    if t != old_name {
-                                        out_lines.push(rebuild_speaker_line(line, t));
-                                        changed = true;
-                                        file_written += 1;
-                                        continue;
-                                    }
-                                }
-                                file_skipped += 1;
-                            }
-                            _ => {
-                                file_skipped += 1;
-                            }
+                };
+                let bytes = match archive.read_entry(entry) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warnings.push(format!("read {archive_rel}/{inner}: {e}"));
+                        strings_skipped += file_entries.len();
+                        continue;
+                    }
+                };
+                let label = format!("{archive_rel}/{inner}");
+                match apply_ks_translations(&bytes, &label, &file_entries) {
+                    Ok(Some((encoded, written, skipped))) => {
+                        arch_written += written;
+                        strings_skipped += skipped;
+                        let key = inner.replace('\\', "/");
+                        if entry.unpacked {
+                            let disk = archive
+                                .unpacked_dir()
+                                .join(inner.replace('/', std::path::MAIN_SEPARATOR_STR));
+                            // Also update size in asar header via replacements map path
+                            replacements.insert(key.clone(), encoded.clone());
+                            unpacked_writes.push((key, disk, encoded));
+                        } else {
+                            replacements.insert(key, encoded);
                         }
                     }
+                    Ok(None) => {
+                        strings_skipped += file_entries.len();
+                    }
+                    Err(e) => {
+                        warnings.push(format!("cannot translate {label}: {e}"));
+                        strings_skipped += file_entries.len();
+                    }
                 }
-                // Preserve non-text (and unchanged) lines exactly as decoded.
-                out_lines.push(line.to_string());
             }
 
-            if !changed {
-                strings_skipped += file_entries.len();
-                continue;
+            // Unpacked files: write with per-file backup (or create if missing)
+            for (_key, disk, data) in &unpacked_writes {
+                if let Some(parent) = disk.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if disk.exists() {
+                    match replace_file_with_backup(disk, data) {
+                        Ok(()) => {
+                            files_modified += 1;
+                            files_written.push(disk.clone());
+                        }
+                        Err(e) => {
+                            warnings.push(format!("safe-replace {}: {e}", disk.display()));
+                        }
+                    }
+                } else if let Err(e2) = std::fs::write(disk, data) {
+                    warnings.push(format!("write unpacked {}: {e2}", disk.display()));
+                } else {
+                    files_modified += 1;
+                    files_written.push(disk.clone());
+                }
             }
 
-            decoded.text = out_lines.join("\n");
-            let encoded = encode_ks_utf8(&decoded);
-            std::fs::write(&actual, &encoded)?;
-            files_modified += 1;
-            files_written.push(actual);
-            strings_written += file_written;
-            strings_skipped += file_skipped;
+            if !replacements.is_empty() {
+                match tyrano_asar::rebuild_asar(&archive, &replacements) {
+                    Ok(new_arch) => match replace_file_with_backup(&arch_path, &new_arch) {
+                        Ok(()) => {
+                            files_modified += 1;
+                            files_written.push(arch_path.clone());
+                            strings_written += arch_written;
+                        }
+                        Err(e) => {
+                            warnings.push(format!("safe-replace {archive_rel}: {e}"));
+                            strings_skipped += arch_written;
+                        }
+                    },
+                    Err(e) => {
+                        warnings.push(format!("rebuild {archive_rel}: {e}"));
+                        strings_skipped += arch_written;
+                    }
+                }
+            }
         }
 
         Ok(InjectionReport {
@@ -867,9 +1191,62 @@ block comment body\r\n\
             err.contains("asar")
                 || err.contains("loose")
                 || err.contains("no loose")
-                || err.contains("out of scope"),
+                || err.contains("out of scope")
+                || err.contains("data.exe")
+                || err.contains("no TyranoBuilder"),
             "expected loud archive/missing-scenario message, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_asar_e2e_extract_inject_with_locust_old() {
+        let dir = tempdir();
+        let resources = dir.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        // Optional tyrano marker for detect fallback
+        fs::create_dir_all(resources.join("app.asar.unpacked").join("tyrano")).unwrap();
+
+        let asar_bytes = crate::tyrano_asar::write_asar(&[(
+            "data/scenario/scene1.ks".into(),
+            sample_scenario().as_bytes().to_vec(),
+        )])
+        .unwrap();
+        let asar_path = resources.join("app.asar");
+        fs::write(&asar_path, &asar_bytes).unwrap();
+
+        let plugin = TyranoPlugin::new();
+        assert!(plugin.detect(&dir));
+        let mut entries = plugin.extract(&dir).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source.contains("This is narration")),
+            "missing dialogue: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(
+            entries.iter().any(|e| e.id.starts_with("resources/app.asar/data/scenario/scene1.ks#")),
+            "ids: {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        for e in &mut entries {
+            if e.source.contains("This is narration") {
+                e.translation = Some("Esta es narracion.".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(report.files_modified >= 1, "{report:?}");
+
+        let backup = PathBuf::from(format!("{}.locust-old", asar_path.display()));
+        assert!(backup.is_file(), "expected .locust-old at {backup:?}");
+        assert!(asar_path.is_file());
+
+        let again = plugin.extract(&dir).unwrap();
+        assert!(
+            again.iter().any(|e| e.source.contains("narracion")),
+            "re-extract missing translation: {:?}",
+            again.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(again.iter().any(|e| e.source.contains("こんにちは")));
     }
 
     #[test]

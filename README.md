@@ -47,7 +47,7 @@ Stability matches `locust formats` / the desktop Welcome screen
 | **Wolf RPG Editor**       | `.wolf`          | Shift-JIS binary; length ≤ source |
 | **VNTextPatch JSON**      | `.json`          | VN intermediate (KiriKiri/YU-RIS/… via VNTextPatch); Phase-2 patch apply proven on fixture |
 | **QSP**                   | `.qsp`, `.gam`   | QuestSoft Player; synthetic fixture only |
-| **TyranoBuilder**         | `.ks`            | `data/scenario/*.ks` UTF-8; synthetic fixtures; no asar |
+| **TyranoBuilder**         | `.ks`, `.asar`   | `data/scenario` loose + `app.asar` unpack/repack; UTF-8; no data.exe |
 | **KiriKiri / KAG**        | `.ks`, `.xp3`    | Loose scripts + unencrypted XP3 read / `patch.xp3` write; no cxdec |
 | **YU-RIS**                | `.ybn`, `.ypf`   | Loose YSTB + YPF unpack/repack (common versions); synthetic + real-game YSTB |
 | **NScripter / ONScripter**| `0.txt`, `nscript.dat` | Shift-JIS; `nscript.dat` XOR 0x84; synthetic fixtures; no NSA |
@@ -176,7 +176,7 @@ MIT. See [LICENSE](LICENSE).
 Pull requests welcome. See [CLAUDE.md](CLAUDE.md) for the project architecture overview and [RELEASE.md](RELEASE.md) for the release process.
 
 Priority areas:
-- TyranoBuilder asar/data.exe unpack; NScripter NSA / nscr_sec / nscript.___; KiriKiri cxdec/Hxv4 + mode-2; YU-RIS exotic YPF schemes
+- TyranoBuilder data.exe/package.nw; NScripter NSA / nscr_sec / nscript.___; KiriKiri cxdec/Hxv4 + mode-2; YU-RIS exotic YPF schemes
 - Length-aware real-ES for binary engines (Unity / Unreal / Wolf)
 - Deeper Unreal/Unity parsers beyond heuristic scans
 - Real commercial Wolf RPG end-to-end proof
