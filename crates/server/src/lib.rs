@@ -21,7 +21,7 @@ use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
 use locust_core::font_validation::{FontCoverageReport, FontValidator};
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
-use locust_core::translation::{ProviderRegistry, TranslationManager, TranslationOptions};
+use locust_core::translation::{run_fallback_chain, ProviderRegistry, TranslationOptions};
 use locust_core::validation::Validator;
 
 type ApiError = (StatusCode, String);
@@ -516,6 +516,9 @@ async fn get_stats(
 #[derive(Deserialize)]
 struct TranslateStartRequest {
     provider_id: String,
+    /// Optional ordered fallbacks after the primary (same chain rules as CLI `--fallback`).
+    #[serde(default)]
+    fallback_provider_ids: Option<Vec<String>>,
     options: TranslationOptions,
 }
 
@@ -529,31 +532,48 @@ async fn translate_start(
     Json(req): Json<TranslateStartRequest>,
 ) -> Result<Json<TranslateStartResponse>, ApiError> {
     let reg = state.provider_registry.read().await;
-    let provider = reg
-        .get(&req.provider_id)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "provider not found"))?;
+    if reg.get(&req.provider_id).is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "provider not found"));
+    }
+
+    // Primary first, then unique fallbacks (skip duplicates of primary).
+    let mut chain = vec![req.provider_id.clone()];
+    if let Some(fallbacks) = &req.fallback_provider_ids {
+        for id in fallbacks {
+            if !chain.iter().any(|c| c == id) {
+                chain.push(id.clone());
+            }
+        }
+    }
+
+    let mut resolve_map: std::collections::HashMap<
+        String,
+        Arc<dyn locust_core::translation::TranslationProvider>,
+    > = std::collections::HashMap::new();
+    for id in &chain {
+        if let Some(p) = reg.get(id) {
+            resolve_map.insert(id.clone(), p);
+        }
+    }
+    drop(reg);
 
     let job_id = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1000);
     let (broadcast_tx, _) = broadcast::channel::<ProgressEvent>(1000);
     let broadcast_tx_clone = broadcast_tx.clone();
 
-    let entries = state
-        .db
-        .get_entries(&EntryFilter::default())
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    let manager = TranslationManager::new(provider, state.db.clone(), state.glossary.clone());
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel.clone();
     let job_id_clone = job_id.clone();
 
-    // Bridge mpsc → broadcast so WebSocket clients can subscribe
+    // Bridge mpsc → broadcast so WebSocket clients can subscribe.
+    // ProviderSwitched is non-terminal; only Completed / Failed end the stream.
     let jobs = state.active_jobs.clone();
     let cleanup_job_id = job_id.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            let is_terminal = matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
+            let is_terminal =
+                matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
             let _ = broadcast_tx_clone.send(event);
             if is_terminal {
                 break;
@@ -565,15 +585,31 @@ async fn translate_start(
     });
 
     // Insert job BEFORE spawning so WebSocket can find it immediately
-    state.active_jobs.insert(job_id.clone(), JobState {
-        abort_handle: tokio::spawn(async {}).abort_handle(), // placeholder
-        progress_tx: broadcast_tx,
-    });
+    state.active_jobs.insert(
+        job_id.clone(),
+        JobState {
+            abort_handle: tokio::spawn(async {}).abort_handle(), // placeholder
+            progress_tx: broadcast_tx,
+        },
+    );
 
+    let db = state.db.clone();
+    let glossary = state.glossary.clone();
+    let resolve_map = Arc::new(resolve_map);
     let handle = tokio::spawn(async move {
-        let _ = manager
-            .translate_entries(entries, req.options, tx, job_id_clone, cancel_clone)
-            .await;
+        let map = resolve_map;
+        let resolve = |id: &str| map.get(id).cloned();
+        let _ = run_fallback_chain(
+            &chain,
+            &resolve,
+            db,
+            glossary,
+            req.options,
+            tx,
+            job_id_clone,
+            cancel_clone,
+        )
+        .await;
     });
 
     // Update with real abort handle
@@ -1318,6 +1354,62 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body.get("job_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_translate_start_accepts_fallback_provider_ids() {
+        let (url, _h, state) = setup_with_state().await;
+        let entry = StringEntry::new("t1", "Hello", PathBuf::from("f.json"));
+        state.db.save_entries(&[entry]).unwrap();
+
+        // Optional field present — same status as without it (primary must exist).
+        let resp = client()
+            .post(format!("{}/api/translate/start", url))
+            .json(&serde_json::json!({
+                "provider_id": "mock",
+                "fallback_provider_ids": ["mock"],
+                "options": TranslationOptions::default()
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body.get("job_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_translate_start_without_fallback_field_unchanged() {
+        let (url, _h, state) = setup_with_state().await;
+        let entry = StringEntry::new("t2", "World", PathBuf::from("f.json"));
+        state.db.save_entries(&[entry]).unwrap();
+
+        // Omitting fallback_provider_ids must still deserialize and run.
+        let resp = client()
+            .post(format!("{}/api/translate/start", url))
+            .json(&serde_json::json!({
+                "provider_id": "mock",
+                "options": {
+                    "source_lang": "en",
+                    "target_lang": "es",
+                    "batch_size": 40,
+                    "max_concurrent": 1,
+                    "cost_limit_usd": null,
+                    "game_context": null,
+                    "use_glossary": false,
+                    "use_memory": false,
+                    "skip_approved": true
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "missing fallback_provider_ids must not break start: {}",
+            resp.text().await.unwrap_or_default()
+        );
     }
 
     #[tokio::test]

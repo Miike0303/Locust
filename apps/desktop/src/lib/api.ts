@@ -122,6 +122,8 @@ export interface AppConfig {
 
 export interface TranslationStartParams {
   provider_id: string;
+  /** Ordered fallbacks after the primary (optional; same chain rules as CLI --fallback). */
+  fallback_provider_ids?: string[];
   options: {
     source_lang: string; target_lang: string; batch_size: number;
     max_concurrent: number; cost_limit_usd: number | null;
@@ -183,6 +185,12 @@ export interface ProgressEventBatchCompleted { type: "batch_completed"; complete
 export interface ProgressEventStringTranslated { type: "string_translated"; entry_id: string; translation: string }
 export interface ProgressEventCompleted { type: "completed"; total_translated: number; total_cost: number; duration_secs: number }
 export interface ProgressEventFailed { type: "failed"; entry_id: string | null; error: string }
+export interface ProgressEventProviderSwitched {
+  type: "provider_switched";
+  provider_id: string;
+  provider_name: string;
+  remaining_pending: number;
+}
 
 // ─── API functions (Tauri IPC with HTTP fallback) ─────────────────────────
 

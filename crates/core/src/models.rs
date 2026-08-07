@@ -200,6 +200,12 @@ pub enum ProgressEvent {
         entry_id: Option<String>,
         error: String,
     },
+    /// Emitted when a multi-provider fallback chain advances to the next provider.
+    ProviderSwitched {
+        provider_id: String,
+        provider_name: String,
+        remaining_pending: usize,
+    },
 }
 
 #[cfg(test)]
@@ -326,6 +332,26 @@ mod tests {
             ProgressEvent::Failed { entry_id, error } => {
                 assert_eq!(entry_id, Some("e1".to_string()));
                 assert_eq!(error, "timeout");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let switched = ProgressEvent::ProviderSwitched {
+            provider_id: "lmstudio".into(),
+            provider_name: "LM Studio".into(),
+            remaining_pending: 12,
+        };
+        let json = serde_json::to_string(&switched).unwrap();
+        assert!(json.contains("provider_switched"), "{json}");
+        let back: ProgressEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            ProgressEvent::ProviderSwitched {
+                provider_id,
+                remaining_pending,
+                ..
+            } => {
+                assert_eq!(provider_id, "lmstudio");
+                assert_eq!(remaining_pending, 12);
             }
             _ => panic!("wrong variant"),
         }

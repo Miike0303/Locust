@@ -119,6 +119,21 @@ impl TranslationManager {
         job_id: String,
         cancel: CancellationToken,
     ) -> Result<()> {
+        self.translate_entries_inner(entries, opts, tx, job_id, cancel, true)
+            .await
+    }
+
+    /// Like [`translate_entries`] but controls Started/Completed lifecycle events.
+    /// Used by multi-provider chains so only the outer job emits terminal events.
+    pub async fn translate_entries_inner(
+        &self,
+        entries: Vec<StringEntry>,
+        opts: TranslationOptions,
+        tx: mpsc::Sender<ProgressEvent>,
+        job_id: String,
+        cancel: CancellationToken,
+        emit_lifecycle: bool,
+    ) -> Result<()> {
         let start = Instant::now();
 
         // 1. Filter translatable entries
@@ -132,12 +147,14 @@ impl TranslationManager {
         let total = translatable.len();
 
         // 2. Send Started
-        let _ = tx
-            .send(ProgressEvent::Started {
-                total,
-                job_id: job_id.clone(),
-            })
-            .await;
+        if emit_lifecycle {
+            let _ = tx
+                .send(ProgressEvent::Started {
+                    total,
+                    job_id: job_id.clone(),
+                })
+                .await;
+        }
 
         let mut completed = 0usize;
         // Binary-slot entries still over budget after one length-aware retry.
@@ -497,7 +514,9 @@ impl TranslationManager {
         }
 
         if cancelled {
-            let _ = tx.send(ProgressEvent::Paused).await;
+            if emit_lifecycle {
+                let _ = tx.send(ProgressEvent::Paused).await;
+            }
             return Ok(());
         }
 
@@ -520,13 +539,15 @@ impl TranslationManager {
 
         // 6. Send Completed and record the run in the project ledger
         let duration = start.elapsed().as_secs_f64();
-        let _ = tx
-            .send(ProgressEvent::Completed {
-                total_translated: completed,
-                total_cost,
-                duration_secs: duration,
-            })
-            .await;
+        if emit_lifecycle {
+            let _ = tx
+                .send(ProgressEvent::Completed {
+                    total_translated: completed,
+                    total_cost,
+                    duration_secs: duration,
+                })
+                .await;
+        }
 
         if completed > 0 {
             let run = crate::database::TranslationRun {
@@ -548,6 +569,131 @@ impl TranslationManager {
 
         Ok(())
     }
+}
+
+// ─── Provider fallback chain (shared by CLI + HTTP server) ─────────────────
+
+/// Pending (and otherwise translatable) entries, fresh from the DB.
+/// Restricting to pending keeps fallbacks from overwriting earlier providers.
+pub fn load_pending_entries(db: &Database) -> Result<Vec<StringEntry>> {
+    Ok(db
+        .get_entries(&crate::database::EntryFilter::default())?
+        .into_iter()
+        .filter(|e| e.status == StringStatus::Pending)
+        .collect())
+}
+
+/// Run primary then fallbacks: each provider gets one full pass over remaining
+/// pending entries. A provider is abandoned for the next when its pass finishes
+/// with work still pending (or if the provider id is missing). Emits a single
+/// [`ProgressEvent::Started`] / [`ProgressEvent::Completed`] for the whole job
+/// and [`ProgressEvent::ProviderSwitched`] when advancing.
+// ponytail: 8 args, two call sites (CLI + server); a params struct would be pure ceremony.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_fallback_chain(
+    chain: &[String],
+    resolve: &(dyn Fn(&str) -> Option<Arc<dyn TranslationProvider>> + Send + Sync),
+    db: Arc<Database>,
+    glossary: Arc<Glossary>,
+    opts: TranslationOptions,
+    tx: mpsc::Sender<ProgressEvent>,
+    job_id: String,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let start = Instant::now();
+    let initial = load_pending_entries(&db)?;
+    let initial_total = initial.len();
+
+    let _ = tx
+        .send(ProgressEvent::Started {
+            total: initial_total,
+            job_id: job_id.clone(),
+        })
+        .await;
+
+    if initial_total == 0 {
+        let _ = tx
+            .send(ProgressEvent::Completed {
+                total_translated: 0,
+                total_cost: 0.0,
+                duration_secs: start.elapsed().as_secs_f64(),
+            })
+            .await;
+        return Ok(());
+    }
+
+    let mut cumulative_completed = 0usize;
+
+    for (i, id) in chain.iter().enumerate() {
+        if cancel.is_cancelled() {
+            let _ = tx.send(ProgressEvent::Paused).await;
+            return Ok(());
+        }
+
+        let pending = load_pending_entries(&db)?;
+        if pending.is_empty() {
+            break;
+        }
+        let before = pending.len();
+
+        let Some(provider) = resolve(id) else {
+            tracing::warn!(provider = %id, "provider not found in registry, skipping");
+            continue;
+        };
+
+        if i > 0 {
+            let _ = tx
+                .send(ProgressEvent::ProviderSwitched {
+                    provider_id: id.clone(),
+                    provider_name: provider.name().to_string(),
+                    remaining_pending: before,
+                })
+                .await;
+        }
+
+        let manager = TranslationManager::new(provider, db.clone(), glossary.clone());
+        // Intermediate pass: no lifecycle events (we own Started/Completed).
+        if let Err(e) = manager
+            .translate_entries_inner(
+                pending,
+                opts.clone(),
+                tx.clone(),
+                job_id.clone(),
+                cancel.clone(),
+                false,
+            )
+            .await
+        {
+            tracing::warn!(provider = %id, error = %e, "provider pass failed; trying next in chain");
+        }
+
+        let after = load_pending_entries(&db)?.len();
+        cumulative_completed += before.saturating_sub(after);
+
+        if after == 0 {
+            break;
+        }
+        if after >= before {
+            tracing::warn!(
+                provider = %id,
+                remaining = after,
+                "provider made no progress on pending count"
+            );
+        }
+    }
+
+    let remaining = load_pending_entries(&db)?.len();
+    let total_translated = initial_total.saturating_sub(remaining).max(cumulative_completed);
+
+    let _ = tx
+        .send(ProgressEvent::Completed {
+            total_translated,
+            total_cost: 0.0, // per-pass cost is on BatchCompleted; chain total not aggregated
+            duration_secs: start.elapsed().as_secs_f64(),
+        })
+        .await;
+
+    Ok(())
 }
 
 pub struct ProviderRegistry {
@@ -1580,5 +1726,205 @@ mod tests {
             .find(|e| e.id == "slot-fit")
             .unwrap();
         assert_eq!(saved.translation.as_deref(), Some("Hola!"));
+    }
+
+    // ── Fallback chain ────────────────────────────────────────────────────
+
+    /// Translates at most `max` strings total across all translate() calls, then
+    /// returns empty results for the rest (leaves them pending).
+    struct LimitProvider {
+        id: String,
+        name: String,
+        max: usize,
+        done: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    impl LimitProvider {
+        fn new(id: &str, name: &str, max: usize) -> Self {
+            Self {
+                id: id.into(),
+                name: name.into(),
+                max,
+                done: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranslationProvider for LimitProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut out = Vec::new();
+            for r in requests {
+                let n = self.done.fetch_add(1, Ordering::SeqCst);
+                if n < self.max {
+                    out.push(TranslationResult {
+                        entry_id: r.entry_id.clone(),
+                        translation: format!("[{}] {}", self.id, r.source),
+                        detected_source_lang: None,
+                        provider: self.id.clone(),
+                        tokens_used: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cost_usd: Some(0.001),
+                    });
+                }
+            }
+            Ok(out)
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_chain_primary_partial_fallback_completes() {
+        let (db, glossary) = setup();
+        let entries = vec![
+            StringEntry::new("a", "Alpha", PathBuf::from("f.json")),
+            StringEntry::new("b", "Bravo", PathBuf::from("f.json")),
+            StringEntry::new("c", "Charlie", PathBuf::from("f.json")),
+        ];
+        db.save_entries(&entries).unwrap();
+
+        let primary = Arc::new(LimitProvider::new("primary", "Primary", 1));
+        let fallback = Arc::new(LimitProvider::new("fallback", "Fallback", 100));
+        let p_calls = Arc::clone(&primary);
+        let f_calls = Arc::clone(&fallback);
+
+        let mut map: std::collections::HashMap<String, Arc<dyn TranslationProvider>> = std::collections::HashMap::new();
+        map.insert(
+            "primary".into(),
+            Arc::clone(&primary) as Arc<dyn TranslationProvider>,
+        );
+        map.insert(
+            "fallback".into(),
+            Arc::clone(&fallback) as Arc<dyn TranslationProvider>,
+        );
+        let map = Arc::new(map);
+
+        let (tx, mut rx) = mpsc::channel(256);
+        let chain = vec!["primary".into(), "fallback".into()];
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            skip_approved: true,
+            ..Default::default()
+        };
+
+        let map2 = map.clone();
+        let db2 = db.clone();
+        let job = tokio::spawn(async move {
+            let resolve = |id: &str| map2.get(id).cloned();
+            run_fallback_chain(
+                &chain,
+                &resolve,
+                db2,
+                glossary,
+                opts,
+                tx,
+                "job-chain".into(),
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        let mut switched = 0usize;
+        let mut completed_evt = false;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                ProgressEvent::ProviderSwitched {
+                    provider_id,
+                    remaining_pending,
+                    ..
+                } => {
+                    assert_eq!(provider_id, "fallback");
+                    assert!(remaining_pending >= 1);
+                    switched += 1;
+                }
+                ProgressEvent::Completed { total_translated, .. } => {
+                    assert_eq!(total_translated, 3);
+                    completed_evt = true;
+                }
+                _ => {}
+            }
+        }
+        job.await.unwrap().unwrap();
+        assert_eq!(switched, 1, "expected one ProviderSwitched");
+        assert!(completed_evt);
+        assert!(p_calls.calls.load(Ordering::SeqCst) >= 1);
+        assert!(f_calls.calls.load(Ordering::SeqCst) >= 1);
+
+        let left = load_pending_entries(&db).unwrap().len();
+        assert_eq!(left, 0, "all strings should be translated");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_chain_single_provider_no_switch() {
+        let (db, glossary) = setup();
+        let entries = vec![
+            StringEntry::new("x", "One", PathBuf::from("f.json")),
+            StringEntry::new("y", "Two", PathBuf::from("f.json")),
+        ];
+        db.save_entries(&entries).unwrap();
+
+        let only = Arc::new(LimitProvider::new("only", "Only", 100));
+        let mut map: std::collections::HashMap<String, Arc<dyn TranslationProvider>> = std::collections::HashMap::new();
+        map.insert("only".into(), only as Arc<dyn TranslationProvider>);
+        let map = Arc::new(map);
+
+        let (tx, mut rx) = mpsc::channel(256);
+        let chain = vec!["only".into()];
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        let map2 = map.clone();
+        let db2 = db.clone();
+        let job = tokio::spawn(async move {
+            let resolve = |id: &str| map2.get(id).cloned();
+            run_fallback_chain(
+                &chain,
+                &resolve,
+                db2,
+                glossary,
+                opts,
+                tx,
+                "job-solo".into(),
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        let mut switched = 0usize;
+        while let Some(ev) = rx.recv().await {
+            if matches!(ev, ProgressEvent::ProviderSwitched { .. }) {
+                switched += 1;
+            }
+        }
+        job.await.unwrap().unwrap();
+        assert_eq!(switched, 0, "no fallback → no ProviderSwitched");
+        assert_eq!(load_pending_entries(&db).unwrap().len(), 0);
     }
 }

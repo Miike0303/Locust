@@ -39,6 +39,7 @@ const LANGUAGES: { code: string; name: string }[] = [
 ];
 
 const LANG_STORAGE_KEY = "locust.translation.langs";
+const FALLBACK_STORAGE_KEY = "locust.translation.fallbacks";
 
 export default function TranslationModal({ open, onClose, totalPending, onComplete }: TranslationModalProps) {
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders, enabled: open });
@@ -49,8 +50,18 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
   const saved = (() => {
     try { return JSON.parse(localStorage.getItem(LANG_STORAGE_KEY) || "{}"); } catch { return {}; }
   })();
+  const savedFallbacks: string[] = (() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(FALLBACK_STORAGE_KEY) || "[]");
+      return Array.isArray(v) ? v.filter((x: unknown) => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  })();
   const [sourceLang, setSourceLang] = useState<string>(saved.source ?? "auto");
   const [targetLang, setTargetLang] = useState<string>(saved.target ?? "es");
+  const [fallbackIds, setFallbackIds] = useState<string[]>(savedFallbacks);
+  const [fallbackPick, setFallbackPick] = useState("");
   const [batchSize, setBatchSize] = useState(40);
   const [maxConcurrent, setMaxConcurrent] = useState(1);
   const [costLimit, setCostLimit] = useState("");
@@ -64,6 +75,7 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
   const [total, setTotal] = useState(0);
   const [costSoFar, setCostSoFar] = useState(0);
   const [lastTranslated, setLastTranslated] = useState("");
+  const [activeProviderLabel, setActiveProviderLabel] = useState("");
   const [done, setDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -76,16 +88,32 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
       setDone(false);
       setError(null);
       setLastTranslated("");
+      setActiveProviderLabel("");
     }
   }, [open]);
 
+  const addFallback = () => {
+    if (!fallbackPick || fallbackPick === providerId || fallbackIds.includes(fallbackPick)) return;
+    setFallbackIds((prev) => [...prev, fallbackPick]);
+    setFallbackPick("");
+  };
+
+  const removeFallback = (id: string) => {
+    setFallbackIds((prev) => prev.filter((x) => x !== id));
+  };
+
   const handleStart = async () => {
     // Persist language selection for next time
-    try { localStorage.setItem(LANG_STORAGE_KEY, JSON.stringify({ source: sourceLang, target: targetLang })); } catch {}
-    addLog("info", `Starting translation with provider: ${providerId}, source: ${sourceLang}, target: ${targetLang}, batch: ${batchSize}`, undefined, "translation");
+    try {
+      localStorage.setItem(LANG_STORAGE_KEY, JSON.stringify({ source: sourceLang, target: targetLang }));
+      localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(fallbackIds));
+    } catch {}
+    const chainLabel = [providerId, ...fallbackIds].join(" → ");
+    addLog("info", `Starting translation with chain: ${chainLabel}, source: ${sourceLang}, target: ${targetLang}, batch: ${batchSize}`, undefined, "translation");
     try {
       const params = {
         provider_id: providerId,
+        ...(fallbackIds.length > 0 ? { fallback_provider_ids: fallbackIds } : {}),
         options: {
           source_lang: sourceLang,
           target_lang: targetLang,
@@ -105,7 +133,8 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
       setJob(result.job_id);
       setTranslating(true);
       setStep("progress");
-      addLog("info", `Translation started (${providerId}), subscribing to WebSocket...`, undefined, "translation");
+      setActiveProviderLabel(providers?.find((p) => p.id === providerId)?.name ?? providerId);
+      addLog("info", `Translation started (${chainLabel}), subscribing to WebSocket...`, undefined, "translation");
 
       const projectName = useProjectStore.getState().project?.name ?? "Project";
 
@@ -132,6 +161,16 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
           });
         },
         onStringTranslated: (e) => setLastTranslated(e.translation),
+        onProviderSwitched: (e) => {
+          setActiveProviderLabel(e.provider_name);
+          addLog(
+            "info",
+            `Switched to provider ${e.provider_name} (${e.remaining_pending} still pending)`,
+            undefined,
+            "translation"
+          );
+          addToast("info", `Switched to ${e.provider_name}`);
+        },
         onCompleted: (e) => {
           setDone(true);
           setTranslating(false);
@@ -175,10 +214,68 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
           <div className="space-y-4">
             <div>
               <label className="text-sm font-medium">Provider</label>
-              <select value={providerId} onChange={(e) => setProviderId(e.target.value)}
+              <select value={providerId} onChange={(e) => {
+                  setProviderId(e.target.value);
+                  setFallbackIds((prev) => prev.filter((id) => id !== e.target.value));
+                }}
                 className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm">
                 {providers?.map((p) => <option key={p.id} value={p.id}>{p.name} {p.is_free ? "(free)" : ""}</option>)}
               </select>
+            </div>
+            <div>
+              <label className="text-sm font-medium">Fallback providers (optional)</label>
+              <p className="text-xs text-gray-500 mt-0.5 mb-1">
+                Tried in order if the primary stops making progress on pending strings.
+              </p>
+              <div className="flex gap-2">
+                <select
+                  value={fallbackPick}
+                  onChange={(e) => setFallbackPick(e.target.value)}
+                  className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+                >
+                  <option value="">Add fallback…</option>
+                  {providers
+                    ?.filter((p) => p.id !== providerId && !fallbackIds.includes(p.id))
+                    .map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name} {p.is_free ? "(free)" : ""}
+                      </option>
+                    ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={addFallback}
+                  disabled={!fallbackPick}
+                  className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium disabled:opacity-50"
+                >
+                  Add
+                </button>
+              </div>
+              {fallbackIds.length > 0 && (
+                <ol className="mt-2 space-y-1">
+                  {fallbackIds.map((id, i) => {
+                    const name = providers?.find((p) => p.id === id)?.name ?? id;
+                    return (
+                      <li
+                        key={id}
+                        className="flex items-center justify-between text-sm px-2 py-1 bg-gray-50 dark:bg-gray-800/60 rounded"
+                      >
+                        <span>
+                          <span className="text-gray-400 mr-2">{i + 1}.</span>
+                          {name}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => removeFallback(id)}
+                          className="text-red-500 hover:text-red-700 text-xs font-medium"
+                        >
+                          Remove
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
@@ -245,6 +342,11 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
               {done ? "Complete!" : `${completed} / ${total}`}
               {costSoFar > 0 && ` · $${costSoFar.toFixed(4)}`}
             </div>
+            {activeProviderLabel && !done && (
+              <div className="text-xs text-center text-emerald-700 dark:text-emerald-400">
+                Using provider: {activeProviderLabel}
+              </div>
+            )}
             {lastTranslated && !done && (
               <div className="text-xs text-gray-500 truncate">Last: {lastTranslated}</div>
             )}

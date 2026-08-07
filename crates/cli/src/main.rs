@@ -12,7 +12,7 @@ use locust_core::database::{Database, EntryFilter};
 use locust_core::export;
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
-use locust_core::translation::{TranslationManager, TranslationOptions};
+use locust_core::translation::{load_pending_entries, run_fallback_chain, TranslationOptions};
 use locust_core::validation::{count_binary_slot_oversize, Validator};
 
 /// Surface binary inject oversize (Unity/Unreal/Wolf) before the engine silently
@@ -1338,95 +1338,40 @@ async fn cmd_translate(
         ..Default::default()
     };
 
-    let pending_count = || -> anyhow::Result<usize> {
-        Ok(db
-            .get_entries(&EntryFilter::default())?
-            .iter()
-            .filter(|e| e.status == StringStatus::Pending)
-            .count())
-    };
-
-    // Try the primary provider, then each fallback in order. A provider is
-    // abandoned once it stops reducing the pending count (out of credits,
-    // rate-limited, refusing every batch); the next one picks up the rest.
+    // Primary then fallbacks — shared chain in locust_core (same as HTTP server).
     let chain: Vec<String> = std::iter::once(provider_id).chain(fallback).collect();
-
-    for (i, id) in chain.iter().enumerate() {
-        let remaining = pending_count()?;
-        if remaining == 0 {
-            break;
-        }
-        let provider = match provider_reg.get(id) {
-            Some(p) => p,
-            None => {
-                eprintln!("provider '{}' not found, skipping", id);
-                continue;
+    let mut resolve_map: std::collections::HashMap<
+        String,
+        Arc<dyn locust_core::translation::TranslationProvider>,
+    > = std::collections::HashMap::new();
+    for id in &chain {
+        match provider_reg.get(id) {
+            Some(p) => {
+                resolve_map.insert(id.clone(), p);
             }
-        };
-        if i > 0 {
-            println!("\nFalling back to provider: {}", provider.name());
-        }
-        let before = remaining;
-        run_provider_pass(provider, db.clone(), glossary.clone(), opts.clone()).await?;
-        let after = pending_count()?;
-        if after == 0 {
-            break;
-        }
-        if after >= before {
-            eprintln!(
-                "Provider '{}' made no progress ({} still pending).",
-                id, after
-            );
+            None => eprintln!("provider '{id}' not found, will skip"),
         }
     }
+    let resolve_map = Arc::new(resolve_map);
 
-    let left = pending_count()?;
-    if left > 0 {
-        println!(
-            "\n{} strings still pending. Re-run to continue, or add --fallback <provider>.",
-            left
-        );
-    } else {
-        println!("\nAll strings translated.");
-    }
-    Ok(())
-}
-
-/// Run one provider over the project's pending strings until it finishes or
-/// stops making progress. Reads pending fresh so repeated calls resume.
-async fn run_provider_pass(
-    provider: Arc<dyn locust_core::translation::TranslationProvider>,
-    db: Arc<Database>,
-    glossary: Arc<Glossary>,
-    opts: TranslationOptions,
-) -> anyhow::Result<()> {
-    // Only translate PENDING entries. Fetching all statuses would let a
-    // fallback provider re-translate (and possibly overwrite/re-bill) strings
-    // an earlier provider already finished, and would clobber human-reviewed
-    // work. Restricting to pending also makes re-runs a clean resume.
-    let entries: Vec<_> = db
-        .get_entries(&EntryFilter::default())?
-        .into_iter()
-        .filter(|e| e.status == StringStatus::Pending)
-        .collect();
-    let pending = entries.len();
-    if pending == 0 {
+    let initial_pending = load_pending_entries(&db)?.len();
+    if initial_pending == 0 {
+        println!("No pending strings.");
         return Ok(());
     }
-
     println!(
-        "Provider: {}, {} → {}, {} pending strings",
-        provider.name(),
+        "Translation chain: {} · {} → {} · {} pending",
+        chain.join(" → "),
         opts.source_lang,
         opts.target_lang,
-        pending
+        initial_pending
     );
 
-    let manager = TranslationManager::new(provider, db.clone(), glossary);
-    let (tx, mut rx) = mpsc::channel(1000);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1000);
     let cancel = tokio_util::sync::CancellationToken::new();
+    let job_id = uuid::Uuid::new_v4().to_string();
 
-    let bar = ProgressBar::new(pending as u64);
+    let bar = ProgressBar::new(initial_pending as u64);
     bar.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
@@ -1434,34 +1379,67 @@ async fn run_provider_pass(
             .progress_chars("█▓░"),
     );
 
-    let job_id = uuid::Uuid::new_v4().to_string();
+    let map_job = resolve_map.clone();
+    let db_job = db.clone();
+    let glossary_job = glossary.clone();
+    let opts_job = opts.clone();
+    let chain_job = chain.clone();
     let handle = tokio::spawn(async move {
-        manager
-            .translate_entries(entries, opts, tx, job_id, cancel)
-            .await
+        let resolve = |id: &str| map_job.get(id).cloned();
+        run_fallback_chain(
+            &chain_job,
+            &resolve,
+            db_job,
+            glossary_job,
+            opts_job,
+            tx,
+            job_id,
+            cancel,
+        )
+        .await
     });
 
-    let start = std::time::Instant::now();
     let mut total_cost = 0.0;
     let mut total_translated = 0;
     let mut errors = 0u64;
+    let start = std::time::Instant::now();
 
     while let Some(event) = rx.recv().await {
         match event {
-            ProgressEvent::BatchCompleted { completed, cost_so_far, .. } => {
+            ProgressEvent::Started { total, .. } => {
+                bar.set_length(total as u64);
+            }
+            ProgressEvent::BatchCompleted {
+                completed,
+                cost_so_far,
+                ..
+            } => {
                 bar.set_position(completed as u64);
                 bar.set_message(format!("${:.4}", cost_so_far));
                 total_cost = cost_so_far;
                 total_translated = completed;
             }
-            ProgressEvent::Completed { total_translated: tt, total_cost: tc, .. } => {
+            ProgressEvent::ProviderSwitched {
+                provider_name,
+                remaining_pending,
+                ..
+            } => {
+                bar.println(format!(
+                    "Falling back to provider: {provider_name} ({remaining_pending} still pending)"
+                ));
+            }
+            ProgressEvent::Completed {
+                total_translated: tt,
+                total_cost: tc,
+                ..
+            } => {
                 total_translated = tt;
                 total_cost = tc;
             }
             ProgressEvent::Failed { error, .. } => {
                 errors += 1;
                 if errors <= 3 {
-                    bar.println(format!("Error: {}", error));
+                    bar.println(format!("Error: {error}"));
                 }
             }
             _ => {}
@@ -1480,6 +1458,14 @@ async fn run_provider_pass(
     table.add_row(vec!["Batch errors", &errors.to_string()]);
     println!("{table}");
 
+    let left = load_pending_entries(&db)?.len();
+    if left > 0 {
+        println!(
+            "\n{left} strings still pending. Re-run to continue, or add --fallback <provider>."
+        );
+    } else {
+        println!("\nAll strings translated.");
+    }
     Ok(())
 }
 

@@ -5,6 +5,7 @@ import type {
   ProgressEventStringTranslated,
   ProgressEventCompleted,
   ProgressEventFailed,
+  ProgressEventProviderSwitched,
 } from "./api";
 
 interface JobHandlers {
@@ -14,6 +15,7 @@ interface JobHandlers {
   onCompleted?: (e: ProgressEventCompleted) => void;
   onFailed?: (e: ProgressEventFailed) => void;
   onPaused?: () => void;
+  onProviderSwitched?: (e: ProgressEventProviderSwitched) => void;
 }
 
 interface WaitOptions {
@@ -57,6 +59,9 @@ export function subscribeToJob(jobId: string, handlers: JobHandlers): () => void
             break;
           case "paused":
             handlers.onPaused?.();
+            break;
+          case "provider_switched":
+            handlers.onProviderSwitched?.(data);
             break;
         }
       } catch (err) {
