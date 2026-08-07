@@ -3198,6 +3198,7 @@ dependencies = [
 name = "locust-formats"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "encoding_rs",
  "locust-core",

@@ -1,3 +1,4 @@
+pub mod binary_search;
 pub mod rpgmaker_mv;
 pub mod rpgmaker_vxa;
 pub mod renpy;

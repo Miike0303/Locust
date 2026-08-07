@@ -546,6 +546,14 @@ impl FormatPlugin for UnityPlugin {
             let mut bytes = std::fs::read(file_path)?;
             let mut modified = false;
 
+            // Collect eligible (needle, replacement payload) once, then one AC pass.
+            // Needle = u32 LE length prefix + UTF-8 source (same as before).
+            struct Work {
+                needle: Vec<u8>,
+                trans_bytes: Vec<u8>,
+                orig_payload_len: usize,
+            }
+            let mut work: Vec<Work> = Vec::new();
             for entry in file_entries {
                 let translation = match &entry.translation {
                     Some(t) => t,
@@ -576,12 +584,22 @@ impl FormatPlugin for UnityPlugin {
                 let mut needle = Vec::with_capacity(4 + orig_bytes.len());
                 needle.extend_from_slice(&orig_len_bytes);
                 needle.extend_from_slice(orig_bytes);
+                work.push(Work {
+                    needle,
+                    trans_bytes: trans_bytes.to_vec(),
+                    orig_payload_len: orig_bytes.len(),
+                });
+            }
 
-                if let Some(pos) = find_bytes_in(&bytes, &needle) {
-                    let new_len = trans_bytes.len() as u32;
+            let patterns: Vec<&[u8]> = work.iter().map(|w| w.needle.as_slice()).collect();
+            let mut cursor = crate::binary_search::MatchCursor::from_patterns(&bytes, &patterns);
+
+            for (i, w) in work.iter().enumerate() {
+                if let Some(pos) = cursor.next_valid(i, &bytes, &w.needle) {
+                    let new_len = w.trans_bytes.len() as u32;
                     bytes[pos..pos + 4].copy_from_slice(&new_len.to_le_bytes());
-                    bytes[pos + 4..pos + 4 + trans_bytes.len()].copy_from_slice(trans_bytes);
-                    for b in &mut bytes[pos + 4 + trans_bytes.len()..pos + 4 + orig_bytes.len()] {
+                    bytes[pos + 4..pos + 4 + w.trans_bytes.len()].copy_from_slice(&w.trans_bytes);
+                    for b in &mut bytes[pos + 4 + w.trans_bytes.len()..pos + 4 + w.orig_payload_len] {
                         *b = 0;
                     }
                     strings_written += 1;
@@ -608,31 +626,6 @@ impl FormatPlugin for UnityPlugin {
 
         Ok(InjectionReport { files_modified, strings_written, strings_skipped, warnings, files_written })
     }
-}
-
-/// Locate `needle` in `haystack`. Prefer scanning for the first byte before
-/// full compares — Unity .assets are multi‑MB and naive windows() over every
-/// offset was the dominant cost of inject (BOXMAN: minutes for 1.6k strings).
-fn find_bytes_in(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    let first = needle[0];
-    let nlen = needle.len();
-    let mut i = 0;
-    let end = haystack.len() - nlen + 1;
-    while i < end {
-        // Skip runs that cannot match.
-        if haystack[i] != first {
-            i += 1;
-            continue;
-        }
-        if &haystack[i..i + nlen] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 #[cfg(test)]
@@ -828,6 +821,79 @@ script Chapter_1_script chapter 1 {
 
         let report = plugin.inject(&dir, &entries).unwrap();
         assert!(report.strings_written >= 1);
+    }
+
+    /// Synthetic multi-pattern inject: (a) needle twice, (c) identity skip,
+    /// (d) oversize skip. Entries are planted manually so extract heuristics
+    /// do not filter the fixture.
+    #[test]
+    fn test_inject_assets_multi_pattern_semantics() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+
+        let s_dup = b"DupStr!!"; // 8 bytes, appears twice
+        let s_id = b"SameSame"; // identity
+        let s_long = b"SlotTxt!"; // oversize translation target
+        let s_ok = b"OkText!!"; // normal same-length
+
+        let mut data: Vec<u8> = vec![0; 16];
+        for s in [
+            s_dup.as_slice(),
+            s_id.as_slice(),
+            s_dup.as_slice(),
+            s_long.as_slice(),
+            s_ok.as_slice(),
+        ] {
+            data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            data.extend_from_slice(s);
+            data.push(0);
+        }
+        let assets = data_dir.join("sharedassets0.assets");
+        fs::write(&assets, &data).unwrap();
+
+        let mk = |id: &str, source: &str, translation: Option<&str>| {
+            let mut e = StringEntry::new(id, source, assets.clone());
+            e.translation = translation.map(|s| s.to_string());
+            e
+        };
+        let inject_list = vec![
+            mk("dup1", "DupStr!!", Some("DupOk!!!")), // 8 → 8
+            mk("id", "SameSame", Some("SameSame")),   // identity → skip
+            mk("dup2", "DupStr!!", Some("DupOk!!!")), // second occurrence
+            mk("over", "SlotTxt!", Some("WAYTOOLONG")), // oversize → skip
+            mk("ok", "OkText!!", Some("OkTxt!!!")),   // 8 → 8
+        ];
+
+        let plugin = UnityPlugin::new();
+        let report = plugin.inject(&dir, &inject_list).unwrap();
+        assert_eq!(
+            report.strings_written, 3,
+            "two dups + ok; got written={} skipped={} warnings={:?}",
+            report.strings_written,
+            report.strings_skipped,
+            report.warnings
+        );
+        assert_eq!(report.strings_skipped, 2, "identity + oversize");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("longer") || w.contains("skipped because")),
+            "oversize should warn: {:?}",
+            report.warnings
+        );
+
+        let out = fs::read(&assets).unwrap();
+        assert_eq!(
+            out.windows(8).filter(|w| *w == b"DupOk!!!").count(),
+            2,
+            "both DupStr slots rewritten"
+        );
+        assert!(out.windows(8).any(|w| w == b"OkTxt!!!"));
+        assert!(out.windows(8).any(|w| w == b"SameSame"), "identity unchanged");
+        assert!(out.windows(8).any(|w| w == b"SlotTxt!"), "oversize target unchanged");
     }
 
     #[test]

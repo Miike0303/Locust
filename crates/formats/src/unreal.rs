@@ -297,6 +297,13 @@ impl FormatPlugin for UnrealPlugin {
             let mut bytes = std::fs::read(file_path)?;
             let mut modified = false;
 
+            // Collect eligible UTF-16LE needles once, then one AC pass over the file.
+            struct Work<'a> {
+                entry: &'a StringEntry,
+                needle: Vec<u8>,
+                trans: Vec<u8>,
+            }
+            let mut work: Vec<Work<'_>> = Vec::new();
             for entry in file_entries {
                 let translation = match &entry.translation {
                     Some(t) => t,
@@ -336,19 +343,30 @@ impl FormatPlugin for UnrealPlugin {
                     continue;
                 }
 
-                if let Some(pos) = find_bytes_in(&bytes, &orig_utf16) {
-                    bytes[pos..pos + trans_utf16.len()].copy_from_slice(&trans_utf16);
-                    for b in &mut bytes[pos + trans_utf16.len()..pos + orig_utf16.len()] {
+                work.push(Work {
+                    entry,
+                    needle: orig_utf16,
+                    trans: trans_utf16,
+                });
+            }
+
+            let patterns: Vec<&[u8]> = work.iter().map(|w| w.needle.as_slice()).collect();
+            let mut cursor = crate::binary_search::MatchCursor::from_patterns(&bytes, &patterns);
+
+            for (i, w) in work.iter().enumerate() {
+                if let Some(pos) = cursor.next_valid(i, &bytes, &w.needle) {
+                    bytes[pos..pos + w.trans.len()].copy_from_slice(&w.trans);
+                    for b in &mut bytes[pos + w.trans.len()..pos + w.needle.len()] {
                         *b = 0;
                     }
                     strings_written += 1;
                     modified = true;
-                    if trans_utf16.len() < orig_utf16.len() {
+                    if w.trans.len() < w.needle.len() {
                         if pad_noted < 5 {
                             warnings.push(format!(
                                 "padded {} null bytes for '{}'",
-                                orig_utf16.len() - trans_utf16.len(),
-                                entry.id
+                                w.needle.len() - w.trans.len(),
+                                w.entry.id
                             ));
                         }
                         pad_noted += 1;
@@ -381,30 +399,6 @@ impl FormatPlugin for UnrealPlugin {
             files_written,
         })
     }
-}
-
-/// Locate `needle` in `haystack`. Prefer scanning for the first byte before
-/// full compares — Unreal .pak files can be multi‑GB; naive windows() over every
-/// offset dominates inject cost the same way it did for Unity .assets.
-fn find_bytes_in(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    let first = needle[0];
-    let nlen = needle.len();
-    let mut i = 0;
-    let end = haystack.len() - nlen + 1;
-    while i < end {
-        if haystack[i] != first {
-            i += 1;
-            continue;
-        }
-        if &haystack[i..i + nlen] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 #[cfg(test)]
@@ -527,5 +521,63 @@ mod tests {
         assert_eq!(report.files_modified, 0);
         assert_eq!(report.strings_written, 0);
         assert!(report.strings_skipped >= 1);
+    }
+
+    /// Multi-pattern Unreal inject: duplicate UTF-16LE needle, identity, oversize.
+    /// Entries planted manually (no extract filter dependency).
+    #[test]
+    fn test_inject_multi_pattern_semantics() {
+        let dir = tempdir();
+        let game_dir = dir.join("TestGame").join("Content").join("Paks");
+        fs::create_dir_all(&game_dir).unwrap();
+
+        fn utf16(s: &str) -> Vec<u8> {
+            s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
+        }
+
+        let mut data: Vec<u8> = vec![0; 32];
+        for s in ["AlphaStr", "AlphaStr", "BetaStr!"] {
+            data.extend_from_slice(&utf16(s));
+            data.extend_from_slice(&[0, 0]);
+            data.extend_from_slice(&[0xFF; 8]);
+        }
+        let pak = game_dir.join("Multi.pak");
+        fs::write(&pak, &data).unwrap();
+
+        let mk = |id: &str, source: &str, translation: Option<&str>| {
+            let mut e = StringEntry::new(id, source, pak.clone());
+            e.translation = translation.map(|s| s.to_string());
+            e
+        };
+        // AlphaStr = 8 chars; AlfaStr! = 8 chars (equal UTF-16LE byte length).
+        let inject = vec![
+            mk("a1", "AlphaStr", Some("AlfaStr!")),
+            mk("a2", "AlphaStr", Some("AlfaStr!")),
+            mk("id", "BetaStr!", Some("BetaStr!")), // identity
+            mk("over", "BetaStr!", Some("This translation is far too long")), // oversize
+        ];
+
+        let plugin = UnrealPlugin::new();
+        let report = plugin.inject(&dir, &inject).unwrap();
+        assert_eq!(
+            report.strings_written, 2,
+            "both AlphaStr occurrences: written={} skipped={} {:?}",
+            report.strings_written,
+            report.strings_skipped,
+            report.warnings
+        );
+        assert_eq!(report.strings_skipped, 2, "identity + oversize");
+
+        let out = fs::read(&pak).unwrap();
+        let alfa = utf16("AlfaStr!");
+        assert_eq!(
+            out.windows(alfa.len()).filter(|w| *w == alfa.as_slice()).count(),
+            2
+        );
+        let beta = utf16("BetaStr!");
+        assert!(
+            out.windows(beta.len()).any(|w| w == beta.as_slice()),
+            "identity BetaStr! must remain"
+        );
     }
 }
