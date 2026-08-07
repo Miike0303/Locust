@@ -133,13 +133,27 @@ export interface TranslationStartParams {
 }
 
 export interface InjectParams {
-  project_path: string; format_id: string; mode: OutputMode;
-  languages: string[]; output_dir?: string;
+  project_path: string;
+  format_id: string;
+  /** Replace/Add; ignored when `direct` is true. */
+  mode?: OutputMode;
+  languages: string[];
+  output_dir?: string;
+  /** In-place inject + injection recording for Patch → Pack (CLI `--direct`). */
+  direct?: boolean;
 }
 
 export interface MultiLangReport {
-  mode: OutputMode; languages_processed: string[];
-  languages_failed: [string, string][]; backup_id: string;
+  mode: OutputMode | "direct" | string;
+  languages_processed: string[];
+  languages_failed: [string, string][];
+  backup_id: string;
+  /** Absolute backup path when direct inject created one. */
+  backup_path?: string | null;
+  files_modified?: number;
+  strings_written?: number;
+  strings_skipped?: number;
+  warnings?: string[];
   reports: Record<string, any>;
 }
 

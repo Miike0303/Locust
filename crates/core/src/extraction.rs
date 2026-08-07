@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use walkdir::WalkDir;
 
 use crate::backup::BackupManager;
-use crate::database::Database;
+use crate::database::{Database, EntryFilter};
 use crate::error::{LocustError, Result};
 use crate::models::{OutputMode, ProgressEvent, StringEntry};
 
@@ -98,7 +98,7 @@ pub trait FormatPlugin: Send + Sync {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InjectionReport {
     pub files_modified: usize,
     pub strings_written: usize,
@@ -116,6 +116,144 @@ pub struct InjectionReport {
     /// they simply record nothing.
     #[serde(default)]
     pub files_written: Vec<PathBuf>,
+}
+
+/// Engines whose inject writes into the **original** game tree (entry-tree
+/// scanners + Ren'Py loose scripts). Direct inject must back these up first.
+pub fn mutates_original_tree(format_id: &str) -> bool {
+    matches!(format_id, "unity" | "unreal" | "wolf-rpg" | "renpy")
+}
+
+/// Result of [`inject_direct`] — shape compatible with MultiLangReport UI fields
+/// plus backup path for the desktop/CLI tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectInjectReport {
+    /// Always `"direct"`.
+    pub mode: String,
+    pub languages_processed: Vec<String>,
+    pub languages_failed: Vec<(String, String)>,
+    pub backup_id: String,
+    /// Absolute path of the pre-inject backup when one was created.
+    pub backup_path: Option<String>,
+    pub files_modified: usize,
+    pub strings_written: usize,
+    pub strings_skipped: usize,
+    pub warnings: Vec<String>,
+    pub files_written: Vec<PathBuf>,
+    /// Same injection stats under each language key (one inject pass).
+    pub reports: HashMap<String, InjectionReport>,
+    /// Per-key recording outcome — callers MUST surface the zero-write cases.
+    pub outcomes: Vec<(String, RecordOutcome)>,
+}
+
+// Used only in the outside-root containment error: for direct mode that means
+// the project db references files from a DIFFERENT copy of the game, so the
+// unblocking advice is to inject against that copy — not to restore backups.
+const DIRECT_RECORD_REMEDY: &str =
+    "The project database references files outside this directory — it was likely \
+     extracted from a DIFFERENT copy of the game (the one containing the file(s) \
+     above). Run inject --direct against that game copy instead, with the same \
+     -P project and language(s).";
+
+/// Inject translated strings **into the game tree in place**, create a backup
+/// when the engine mutates originals, and record the injection for
+/// `locust patch` packing. Shared by CLI `--direct`, HTTP, and the desktop app.
+pub fn inject_direct(
+    registry: &FormatRegistry,
+    db: &Database,
+    backup_manager: &BackupManager,
+    game_path: &Path,
+    format_id: &str,
+    languages: &[String],
+) -> Result<DirectInjectReport> {
+    let plugin = registry.get(format_id).ok_or_else(|| {
+        LocustError::UnsupportedFormat(format!("format not found: {format_id}"))
+    })?;
+
+    let entries = db.get_entries(&EntryFilter::default())?;
+    let translated: Vec<_> = entries
+        .into_iter()
+        .filter(|e| e.translation.is_some())
+        .collect();
+
+    let _ = backup_manager.delete_old_backups(3);
+
+    let (backup_id, backup_path) = if mutates_original_tree(format_id) {
+        let entry = backup_manager.create_backup(game_path).map_err(|e| {
+            LocustError::BackupError(format!(
+                "{e} — direct inject is refused without a backup: this engine \
+                 ({format_id}) writes into the ORIGINAL tree, and every recovery \
+                 path starts at this backup. Free disk space or fix the backup \
+                 directory, then re-run."
+            ))
+        })?;
+        (
+            entry.id.clone(),
+            Some(entry.path.display().to_string()),
+        )
+    } else {
+        ("none".to_string(), None)
+    };
+
+    let report = plugin.inject(game_path, &translated)?;
+
+    let backup_opt = if backup_id == "none" {
+        None
+    } else {
+        Some(backup_id.as_str())
+    };
+
+    // Collect per-key outcomes: zero-write keeps/nothing-recorded MUST reach
+    // the caller so no UI can swallow them silently (stale-recording hazard).
+    let mut outcomes: Vec<(String, RecordOutcome)> = Vec::new();
+    if languages.is_empty() {
+        let o = record_injection_for_lang(
+            db,
+            None,
+            game_path,
+            &report.files_written,
+            DIRECT_RECORD_REMEDY,
+            backup_opt,
+        )?;
+        outcomes.push(("(unspecified)".into(), o));
+    } else {
+        for lang in languages {
+            let o = record_injection_for_lang(
+                db,
+                Some(lang),
+                game_path,
+                &report.files_written,
+                DIRECT_RECORD_REMEDY,
+                backup_opt,
+            )?;
+            outcomes.push((lang.clone(), o));
+        }
+    }
+
+    let lang_keys: Vec<String> = if languages.is_empty() {
+        vec!["(unspecified)".into()]
+    } else {
+        languages.to_vec()
+    };
+    let mut reports = HashMap::new();
+    for lang in &lang_keys {
+        reports.insert(lang.clone(), report.clone());
+    }
+
+    Ok(DirectInjectReport {
+        mode: "direct".into(),
+        languages_processed: lang_keys,
+        languages_failed: vec![],
+        backup_id,
+        backup_path,
+        files_modified: report.files_modified,
+        strings_written: report.strings_written,
+        strings_skipped: report.strings_skipped,
+        warnings: report.warnings.clone(),
+        files_written: report.files_written.clone(),
+        reports,
+        outcomes,
+    })
 }
 
 pub struct FormatRegistry {
@@ -471,7 +609,7 @@ async fn emit_binary_slot_preflight(
 }
 
 /// What [`record_injection_for_lang`] did for one language key.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecordOutcome {
     /// The written files were containment-checked and persisted.
     Recorded { files: usize },

@@ -717,9 +717,15 @@ async fn handle_translate_ws(
 struct InjectRequest {
     project_path: String,
     format_id: String,
-    mode: OutputMode,
+    /// Ignored when `direct` is true.
+    #[serde(default)]
+    mode: Option<OutputMode>,
     languages: Vec<String>,
     output_dir: Option<String>,
+    /// When true, inject into the game tree in place and record for pack
+    /// (CLI `--direct`). Default false preserves Replace/Add MultiLangInjector.
+    #[serde(default)]
+    direct: bool,
 }
 
 /// Unblocking advice attached to a containment failure when recording an
@@ -746,6 +752,31 @@ async fn inject(
             "inject requires at least one language in `languages` (e.g. [\"es\"])",
         ));
     }
+
+    if req.direct {
+        let game_path = PathBuf::from(&req.project_path);
+        let format_id = req.format_id.clone();
+        let languages = req.languages.clone();
+        let registry = state.format_registry.clone();
+        let db = state.db.clone();
+        let backup = state.backup_manager.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            locust_core::extraction::inject_direct(
+                &registry,
+                &db,
+                &backup,
+                &game_path,
+                &format_id,
+                &languages,
+            )
+        })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        return Ok(Json(serde_json::to_value(report).unwrap_or_default()));
+    }
+
+    let mode = req.mode.unwrap_or(OutputMode::Replace);
     let injector = MultiLangInjector::new(
         state.format_registry.clone(),
         state.db.clone(),
@@ -759,7 +790,7 @@ async fn inject(
         .inject(
             &PathBuf::from(&req.project_path),
             &req.format_id,
-            req.mode,
+            mode,
             req.languages,
             req.output_dir.map(PathBuf::from),
             tx,

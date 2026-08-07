@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { X, FolderOpen, FileCheck, AlertCircle } from "lucide-react";
-import { inject, validate, type OutputMode } from "../lib/api";
+import { X, FolderOpen, FileCheck, AlertCircle, Package } from "lucide-react";
+import { inject, validate, type OutputMode, type MultiLangReport } from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -27,21 +27,29 @@ const LANGUAGES: { code: string; name: string }[] = [
 
 const INJECT_LANG_KEY = "locust.inject.langs";
 
+type InjectUiMode = OutputMode | "direct";
+
 interface InjectModalProps {
   open: boolean;
   onClose: () => void;
+  /** Optional: open Patch modal on the Pack tab after a successful direct inject. */
+  onOpenPack?: () => void;
 }
 
-export default function InjectModal({ open, onClose }: InjectModalProps) {
+export default function InjectModal({ open, onClose, onOpenPack }: InjectModalProps) {
   const { project } = useProjectStore();
-  const [mode, setMode] = useState<OutputMode>("add");
+  const [mode, setMode] = useState<InjectUiMode>("add");
   const savedLangs = (() => {
-    try { return JSON.parse(localStorage.getItem(INJECT_LANG_KEY) || "null") as string[] | null; } catch { return null; }
+    try {
+      return JSON.parse(localStorage.getItem(INJECT_LANG_KEY) || "null") as string[] | null;
+    } catch {
+      return null;
+    }
   })();
   const [selectedLangs, setSelectedLangs] = useState<string[]>(savedLangs ?? ["es"]);
   const [outputDir, setOutputDir] = useState("");
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<any>(null);
+  const [result, setResult] = useState<MultiLangReport | null>(null);
 
   const toggleLang = (code: string) => {
     setSelectedLangs((prev) =>
@@ -65,7 +73,11 @@ export default function InjectModal({ open, onClose }: InjectModalProps) {
     }
   };
 
-  const canInject = selectedLangs.length > 0 && (mode === "add" || (mode === "replace" && outputDir.trim() !== ""));
+  const canInject =
+    selectedLangs.length > 0 &&
+    (mode === "direct" ||
+      mode === "add" ||
+      (mode === "replace" && outputDir.trim() !== ""));
 
   const handleInject = async () => {
     if (mode === "replace" && !outputDir.trim()) {
@@ -76,14 +88,15 @@ export default function InjectModal({ open, onClose }: InjectModalProps) {
       addToast("error", "Select at least one language");
       return;
     }
-    // Persist language selection
-    try { localStorage.setItem(INJECT_LANG_KEY, JSON.stringify(selectedLangs)); } catch {}
+    try {
+      localStorage.setItem(INJECT_LANG_KEY, JSON.stringify(selectedLangs));
+    } catch {
+      /* ignore */
+    }
 
     setLoading(true);
     setResult(null);
     try {
-      // Same signal as CLI inject preflight: catch binary-slot oversize before
-      // Unity/Unreal/Wolf silently skip those strings.
       try {
         const pre = await validate();
         const binary = pre.validation.by_kind?.ExceedsBinarySlot ?? 0;
@@ -101,67 +114,120 @@ export default function InjectModal({ open, onClose }: InjectModalProps) {
           );
         }
       } catch {
-        // Validate optional — inject may still proceed if validation endpoint fails.
+        /* validate optional */
       }
 
+      const isDirect = mode === "direct";
       const report = await inject({
         project_path: project.path,
         format_id: project.format_id,
-        mode,
+        mode: isDirect ? undefined : mode,
         languages: selectedLangs,
-        output_dir: outputDir.trim() || undefined,
+        output_dir: isDirect ? undefined : outputDir.trim() || undefined,
+        direct: isDirect,
       });
       setResult(report);
 
-      const destInfo = mode === "replace"
-        ? `Output: ${outputDir}`
-        : `Added translation folders in ${project.path}`;
+      const destInfo = isDirect
+        ? `Direct inject into ${project.path}` +
+          (report.backup_path ? `\nBackup: ${report.backup_path}` : "")
+        : mode === "replace"
+          ? `Output: ${outputDir}`
+          : `Added translation folders in ${project.path}`;
 
       addLog(
         "info",
-        `Inject complete: ${report.languages_processed.join(", ")} (${mode} mode)`,
-        `${destInfo}\n${report.languages_failed.length > 0
-          ? `Failed: ${report.languages_failed.map(([l, e]: [string, string]) => `${l}: ${e}`).join(", ")}`
-          : "All languages succeeded"}`,
+        `Inject complete: ${report.languages_processed.join(", ")} (${report.mode} mode)`,
+        `${destInfo}\n${
+          report.languages_failed?.length
+            ? `Failed: ${report.languages_failed.map(([l, e]) => `${l}: ${e}`).join(", ")}`
+            : "All languages succeeded"
+        }`,
         "inject"
       );
-      addToast("success", `Injected ${report.languages_processed.length} language(s)`);
-    } catch (err: any) {
-      addLog("error", "Inject failed", err.message, "inject");
-      addToast("error", `Inject failed: ${err.message}`);
+      addToast(
+        "success",
+        isDirect
+          ? `Direct inject: ${report.strings_written ?? 0} string(s) written`
+          : `Injected ${report.languages_processed.length} language(s)`
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog("error", "Inject failed", msg, "inject");
+      addToast("error", `Inject failed: ${msg}`);
     } finally {
       setLoading(false);
     }
   };
 
   const gameName = project.path.split(/[\\/]/).filter(Boolean).pop() ?? project.name;
+  const isDirectResult = result?.mode === "direct";
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6">
+      <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
         <div className="flex justify-between items-center mb-4">
           <h2 className="text-lg font-bold">Inject Translations</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={20} /></button>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+            <X size={20} />
+          </button>
         </div>
 
         {!result ? (
           <div className="space-y-4">
             <div>
               <label className="text-sm font-medium">Mode</label>
-              <select value={mode} onChange={(e) => setMode(e.target.value as OutputMode)}
-                className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm">
-                <option value="replace">Replace — copy game to output folder with translations</option>
-                <option value="add">Add — create translation folders inside original game</option>
+              <select
+                value={mode}
+                onChange={(e) => setMode(e.target.value as InjectUiMode)}
+                className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+              >
+                <option value="replace">
+                  Replace — copy game to output folder with translations
+                </option>
+                <option value="add">
+                  Add — create translation folders inside original game
+                </option>
+                <option value="direct">
+                  Direct — write into the game and record for patch packing
+                </option>
               </select>
               <p className="text-xs text-gray-500 mt-1">
-                {mode === "replace"
-                  ? `Creates a translated copy at: [output]/${gameName}-[lang]/`
-                  : "Adds a tl/[lang]/ folder inside the original game directory"}
+                {mode === "replace" &&
+                  `Creates a translated copy at: [output]/${gameName}-[lang]/`}
+                {mode === "add" &&
+                  "Adds a tl/[lang]/ folder inside the original game directory"}
+                {mode === "direct" &&
+                  "Writes translations into the game folder (same as CLI --direct). Required before Patch → Pack."}
               </p>
             </div>
 
+            {mode === "direct" && (
+              <div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded text-sm text-amber-900 dark:text-amber-100 space-y-1">
+                <p className="font-medium flex items-center gap-1.5">
+                  <AlertCircle size={16} /> Direct mode mutates original game files
+                </p>
+                <ul className="list-disc pl-5 text-xs space-y-0.5">
+                  <li>An automatic backup is created when the engine writes in place.</li>
+                  <li>
+                    Selected language(s) name the injection recording (same as CLI{" "}
+                    <code className="px-0.5 bg-amber-100/80 dark:bg-amber-900/50 rounded">-l</code>
+                    ).
+                  </li>
+                  <li>
+                    After success you can pack a patch zip from the recording (Patch → Pack).
+                  </li>
+                </ul>
+              </div>
+            )}
+
             <div>
-              <label className="text-sm font-medium">Languages</label>
+              <label className="text-sm font-medium">
+                Languages
+                {mode === "direct" && (
+                  <span className="font-normal text-gray-500"> (recording key)</span>
+                )}
+              </label>
               <div className="mt-1 grid grid-cols-3 gap-2 p-2 border rounded dark:border-gray-600 max-h-40 overflow-y-auto">
                 {LANGUAGES.map((l) => (
                   <label key={l.code} className="flex items-center gap-1 text-sm cursor-pointer">
@@ -176,6 +242,11 @@ export default function InjectModal({ open, onClose }: InjectModalProps) {
               </div>
               <p className="text-xs text-gray-500 mt-1">
                 Selected: {selectedLangs.length === 0 ? "none" : selectedLangs.join(", ")}
+                {mode === "direct" && selectedLangs.length > 1 && (
+                  <span className="block mt-0.5">
+                    Each language gets its own recording (same as CLI -l for each).
+                  </span>
+                )}
               </p>
             </div>
 
@@ -215,7 +286,9 @@ export default function InjectModal({ open, onClose }: InjectModalProps) {
 
             <div className="pt-2 flex items-center gap-3 text-xs text-gray-500">
               <FileCheck size={14} />
-              <span>Source: <strong>{project.name}</strong> ({project.format_id})</span>
+              <span>
+                Source: <strong>{project.name}</strong> ({project.format_id})
+              </span>
             </div>
 
             <button
@@ -223,44 +296,91 @@ export default function InjectModal({ open, onClose }: InjectModalProps) {
               disabled={loading || !canInject}
               className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
             >
-              {loading ? "Injecting..." : "Inject Translations"}
+              {loading
+                ? "Injecting..."
+                : mode === "direct"
+                  ? "Direct inject & record"
+                  : "Inject Translations"}
             </button>
           </div>
         ) : (
           <div className="space-y-4">
             <div className="p-3 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 rounded text-sm">
-              <p className="font-medium text-emerald-700 dark:text-emerald-300">Injection complete</p>
+              <p className="font-medium text-emerald-700 dark:text-emerald-300">
+                Injection complete
+              </p>
               <p className="text-emerald-600 dark:text-emerald-400 mt-1">
                 Languages: {result.languages_processed.join(", ")}
               </p>
               <p className="text-emerald-600 dark:text-emerald-400">Mode: {result.mode}</p>
-              {mode === "replace" && outputDir && (
-                <p className="text-emerald-600 dark:text-emerald-400">
-                  Output: {outputDir}/
-                </p>
+              {isDirectResult && (
+                <>
+                  <p className="text-emerald-600 dark:text-emerald-400">
+                    Strings written: {result.strings_written ?? 0}, files modified:{" "}
+                    {result.files_modified ?? 0}, skipped: {result.strings_skipped ?? 0}
+                  </p>
+                  {result.backup_path && (
+                    <p className="text-xs text-emerald-700 dark:text-emerald-300 mt-1 break-all">
+                      Backup: {result.backup_path}
+                    </p>
+                  )}
+                </>
+              )}
+              {!isDirectResult && mode === "replace" && outputDir && (
+                <p className="text-emerald-600 dark:text-emerald-400">Output: {outputDir}/</p>
               )}
               {result.reports && Object.keys(result.reports).length > 0 && (
                 <div className="mt-2 space-y-1">
-                  {Object.entries(result.reports).map(([lang, report]: [string, any]) => (
+                  {Object.entries(result.reports).map(([lang, report]) => (
                     <p key={lang} className="text-xs text-emerald-500">
-                      {lang}: {report.strings_written ?? 0} strings written, {report.files_modified ?? 0} files modified
+                      {lang}: {(report as { strings_written?: number }).strings_written ?? 0}{" "}
+                      strings written,{" "}
+                      {(report as { files_modified?: number }).files_modified ?? 0} files modified
                     </p>
                   ))}
                 </div>
               )}
             </div>
 
+            {isDirectResult && (
+              <div className="p-3 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 rounded text-sm text-sky-900 dark:text-sky-100">
+                <p className="font-medium flex items-center gap-1.5">
+                  <Package size={16} /> Recording saved
+                </p>
+                <p className="text-xs mt-1">
+                  You can now pack a patch zip from this recording (Patch modal → Pack tab). Point
+                  the game folder at this project path for direct inject.
+                </p>
+                {onOpenPack && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onOpenPack();
+                    }}
+                    className="mt-2 text-xs font-medium text-sky-700 dark:text-sky-300 hover:underline"
+                  >
+                    Open Patch → Pack
+                  </button>
+                )}
+              </div>
+            )}
+
             {result.languages_failed?.length > 0 && (
               <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 rounded text-sm">
                 <p className="font-medium text-red-700">Failed languages:</p>
-                {result.languages_failed.map(([lang, err]: [string, string]) => (
-                  <p key={lang} className="text-red-600 text-xs mt-1">{lang}: {err}</p>
+                {result.languages_failed.map(([lang, err]) => (
+                  <p key={lang} className="text-red-600 text-xs mt-1">
+                    {lang}: {err}
+                  </p>
                 ))}
               </div>
             )}
 
-            <button onClick={onClose}
-              className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium">
+            <button
+              onClick={onClose}
+              className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
+            >
               Close
             </button>
           </div>

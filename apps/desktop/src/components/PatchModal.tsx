@@ -26,10 +26,17 @@ interface PatchModalProps {
   onClose: () => void;
   /** Optional default game path (e.g. current project folder). */
   defaultGamePath?: string;
+  /** Open on Apply or Pack (e.g. after direct inject). */
+  initialTab?: Tab;
 }
 
-export default function PatchModal({ open, onClose, defaultGamePath }: PatchModalProps) {
-  const [tab, setTab] = useState<Tab>("apply");
+export default function PatchModal({
+  open,
+  onClose,
+  defaultGamePath,
+  initialTab = "apply",
+}: PatchModalProps) {
+  const [tab, setTab] = useState<Tab>(initialTab);
   const [gamePath, setGamePath] = useState(defaultGamePath ?? "");
   const [zipPath, setZipPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
@@ -48,6 +55,7 @@ export default function PatchModal({ open, onClose, defaultGamePath }: PatchModa
   useEffect(() => {
     if (!open) return;
     if (defaultGamePath) setGamePath(defaultGamePath);
+    setTab(initialTab);
     setError(null);
     // Prefill pack language from config target lang
     getConfig()
@@ -59,7 +67,7 @@ export default function PatchModal({ open, onClose, defaultGamePath }: PatchModa
       .catch(() => {
         /* config optional for apply tab */
       });
-  }, [open, defaultGamePath]);
+  }, [open, defaultGamePath, initialTab]);
 
   if (!open) return null;
 

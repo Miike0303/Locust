@@ -484,9 +484,14 @@ pub async fn import_translations(
 pub struct InjectParams {
     pub project_path: String,
     pub format_id: String,
-    pub mode: OutputMode,
+    /// Ignored when `direct` is true.
+    #[serde(default)]
+    pub mode: Option<OutputMode>,
     pub languages: Vec<String>,
     pub output_dir: Option<String>,
+    /// CLI `--direct`: in-place inject + recording for patch pack.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 /// Unblocking advice attached to a containment failure when recording an
@@ -514,6 +519,31 @@ pub async fn run_inject(
         );
     }
     let s = &state.0;
+
+    if params.direct {
+        let game_path = PathBuf::from(&params.project_path);
+        let format_id = params.format_id.clone();
+        let languages = params.languages.clone();
+        let registry = s.format_registry.clone();
+        let db = s.db.clone();
+        let backup = s.backup_manager.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            locust_core::extraction::inject_direct(
+                &registry,
+                &db,
+                &backup,
+                &game_path,
+                &format_id,
+                &languages,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        return serde_json::to_value(report).map_err(|e| e.to_string());
+    }
+
+    let mode = params.mode.unwrap_or(OutputMode::Replace);
     let injector = locust_core::extraction::MultiLangInjector::new(
         s.format_registry.clone(),
         s.db.clone(),
@@ -527,7 +557,7 @@ pub async fn run_inject(
         .inject(
             &PathBuf::from(&params.project_path),
             &params.format_id,
-            params.mode,
+            mode,
             params.languages,
             params.output_dir.map(PathBuf::from),
             tx,

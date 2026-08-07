@@ -361,6 +361,89 @@ async fn test_inject_records_the_injection_for_patch() {
     );
 }
 
+// ─── Direct inject records for patch packing ────────────────────────────────
+
+#[tokio::test]
+async fn test_inject_direct_records_on_game_root() {
+    // `direct: true` must write into the game tree and record under that root
+    // (not a per-lang copy), matching CLI --direct — so Patch → Pack can use it.
+    let tmpdir = TempDir::new().unwrap();
+    create_rpgmaker_mv_fixture(tmpdir.path());
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("project.locust.db");
+
+    let state = locust_server::create_test_state_with_db(&db_path);
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+
+    let _open: ProjectOpenResponse = client()
+        .post(format!("{}/api/project/open", base_url))
+        .json(&serde_json::json!({"path": tmpdir.path().to_string_lossy()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client()
+        .post(format!("{}/api/translate/start", base_url))
+        .json(&serde_json::json!({
+            "provider_id": "mock",
+            "options": {
+                "source_lang": "en", "target_lang": "es",
+                "batch_size": 100, "max_concurrent": 1,
+                "cost_limit_usd": null, "game_context": null,
+                "use_glossary": false, "use_memory": false, "skip_approved": true
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let resp = client()
+        .post(format!("{}/api/inject", base_url))
+        .json(&serde_json::json!({
+            "project_path": tmpdir.path().to_string_lossy(),
+            "format_id": "rpgmaker-mv",
+            "languages": ["es"],
+            "direct": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "direct inject: {body}");
+
+    let v: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("json: {body}"));
+    assert_eq!(v["mode"], "direct");
+    assert!(
+        v["languages_processed"]
+            .as_array()
+            .map(|a| a.iter().any(|x| x == "es"))
+            .unwrap_or(false),
+        "expected es processed: {body}"
+    );
+    // RPG Maker MV replace-style plugin still reports via inject; strings may be written.
+    assert!(v.get("backup_id").is_some(), "backup_id present: {body}");
+
+    let db = locust_core::database::Database::open(&db_path).unwrap();
+    let rec = db
+        .get_injection(Some("es"))
+        .unwrap()
+        .expect("direct inject must record for language es");
+    assert!(
+        locust_core::database::paths_identical(&rec.root, tmpdir.path()),
+        "direct recording root must be the game path: got {}, want {}",
+        rec.root.display(),
+        tmpdir.path().display()
+    );
+    // Non-direct default path unchanged: without direct, recording is under *-lang copy
+    // (covered by test_inject_records_the_injection_for_patch).
+}
+
 // ─── Pack patch zip via HTTP ────────────────────────────────────────────────
 
 #[tokio::test]

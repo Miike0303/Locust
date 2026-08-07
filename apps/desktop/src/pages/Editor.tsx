@@ -24,6 +24,7 @@ export default function Editor() {
   const [showTranslateModal, setShowTranslateModal] = useState(false);
   const [showInjectModal, setShowInjectModal] = useState(false);
   const [showPatchModal, setShowPatchModal] = useState(false);
+  const [patchInitialTab, setPatchInitialTab] = useState<"apply" | "pack">("apply");
   const [showExportModal, setShowExportModal] = useState(false);
   const [showReplaceModal, setShowReplaceModal] = useState(false);
   const [showValidationModal, setShowValidationModal] = useState(false);
@@ -200,13 +201,21 @@ export default function Editor() {
       <InjectModal
         open={showInjectModal}
         onClose={() => setShowInjectModal(false)}
+        onOpenPack={() => {
+          setPatchInitialTab("pack");
+          setShowPatchModal(true);
+        }}
       />
 
-      {/* Patch apply / rollback */}
+      {/* Patch apply / rollback / pack */}
       <PatchModal
         open={showPatchModal}
-        onClose={() => setShowPatchModal(false)}
+        onClose={() => {
+          setShowPatchModal(false);
+          setPatchInitialTab("apply");
+        }}
         defaultGamePath={project?.path}
+        initialTab={patchInitialTab}
       />
 
       {/* PO / XLIFF export + import */}

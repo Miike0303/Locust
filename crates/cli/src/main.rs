@@ -366,7 +366,7 @@ fn writes_to_entry_tree(format_id: &str) -> bool {
 /// `maybe_mutated_note` are the two renderers of that step; any new error
 /// branch that advises a re-run must go through one of them.
 fn mutates_original_tree(format_id: &str) -> bool {
-    writes_to_entry_tree(format_id) || format_id == "renpy"
+    locust_core::extraction::mutates_original_tree(format_id)
 }
 
 /// Central backup root for inject / direct-inject. `LOCUST_BACKUP_ROOT` isolates
@@ -445,24 +445,6 @@ fn replace_containment_remedy(
     } else {
         format!("Run: locust inject \"{g}\" -P \"{p}\" --direct -l {lang}")
     }
-}
-
-/// Remedy for a direct-mode containment failure: the entries point outside
-/// the tree inject was handed, which means the project was extracted from a
-/// different copy of the game.
-fn direct_containment_remedy(project: &std::path::Path, languages: &[String]) -> String {
-    let p = project.display();
-    let lang_flag = if languages.is_empty() {
-        String::new()
-    } else {
-        format!(" -l {}", languages.join(" "))
-    };
-    format!(
-        "The project database references files outside this directory — it was likely \
-         extracted from a DIFFERENT copy of the game (the one containing the file(s) \
-         above). Run inject against that copy instead: locust inject \
-         \"<that game folder>\" -P \"{p}\" --direct{lang_flag}"
-    )
 }
 
 /// Remedy for a per-language Add-mode failure on an engine without Add
@@ -1282,93 +1264,48 @@ async fn cmd_inject_direct(
         .detect(&game_path)
         .ok_or_else(|| anyhow::anyhow!("format not detected for: {}", game_path.display()))?;
 
+    let format_id = plugin.id().to_string();
     let entries = db.get_entries(&EntryFilter::default())?;
-    let translated: Vec<_> = entries
-        .into_iter()
-        .filter(|e| e.translation.is_some())
-        .collect();
-
+    let translated_count = entries.iter().filter(|e| e.translation.is_some()).count();
     println!(
         "Direct inject: {} translated strings into {} ({})",
-        translated.len(),
+        translated_count,
         game_path.display(),
         plugin.name()
     );
-    warn_binary_slot_oversize(&translated);
+    warn_binary_slot_oversize(&entries);
 
-    // Task #14: every remedy funnels users here, but direct used to take NO
-    // backup while mutating entry-tree engines (and Ren'Py loose scripts) in
-    // place. Recovery advice that starts at "the backup listed above" was
-    // hollow for the one mode the tool recommends. Same default root as
-    // Replace/Add inject (`temp_dir()/locust_bak`, overridable with
-    // LOCUST_BACKUP_ROOT); failure is fatal for the same reason
-    // MultiLangInjector refuses to inject without a backup.
-    let backup_note = if mutates_original_tree(plugin.id()) {
-        let backup_root = locust_backup_root();
-        std::fs::create_dir_all(&backup_root).map_err(|e| {
-            anyhow::anyhow!(
-                "cannot create backup directory {}: {e} — direct inject is refused \
-                 without a backup for engines that write into the original game tree \
-                 ({})",
-                backup_root.display(),
-                plugin.id()
-            )
-        })?;
-        let mgr = BackupManager::new(backup_root.clone());
-        if let Ok(deleted) = mgr.delete_old_backups(3) {
-            if deleted > 0 {
-                println!("Cleaned {deleted} old backup(s)");
-            }
-        }
+    // Shared core path (HTTP + desktop): backup when the engine mutates
+    // originals, inject in place, record for `locust patch`.
+    let backup_root = locust_backup_root();
+    std::fs::create_dir_all(&backup_root).ok();
+    let mgr = BackupManager::new(backup_root);
+    if locust_core::extraction::mutates_original_tree(&format_id) {
         println!("Creating backup (engine mutates the original game tree)...");
-        let entry = mgr.create_backup(&game_path).map_err(|e| {
-            anyhow::anyhow!(
-                "{e} — direct inject is refused without a backup: this engine \
-                 ({}) writes into the ORIGINAL tree, and every recovery path \
-                 starts at this backup (root: {}). Free disk space or fix the \
-                 backup directory, then re-run.",
-                plugin.id(),
-                backup_root.display()
-            )
-        })?;
-        println!(
-            "Backup: {} ({} files, {})",
-            entry.path.display(),
-            entry.file_count,
-            entry.id
-        );
-        Some(entry)
-    } else {
-        None
-    };
+    }
+    let report = locust_core::extraction::inject_direct(
+        &registry,
+        &db,
+        &mgr,
+        &game_path,
+        &format_id,
+        &languages,
+    )?;
 
-    let report = plugin.inject(&game_path, &translated)?;
-
-    // Persist the paths this injection actually wrote — under EVERY requested
-    // language key (recording only the first one silently orphaned `patch -l
-    // <other>`), or under the reserved language-unspecified key when no -l
-    // was given (matched by `patch` without -l). `locust patch` packs from
-    // this recording, because for archive-based engines the written files
-    // never become database entries (Ren'Py extraction skips `zzz_locust*`
-    // and rewrites entry paths to the .rpa).
-    use locust_core::extraction::record_injection_for_lang;
-    let format_id = plugin.id().to_string();
-    let remedy = direct_containment_remedy(&project, &languages);
-    if languages.is_empty() {
-        let outcome =
-            record_injection_for_lang(&db, None, &game_path, &report.files_written, &remedy, None)?;
-        print_record_outcome("(unspecified)", &outcome, &report, &format_id);
-    } else {
-        for lang in &languages {
-            let outcome = record_injection_for_lang(
-                &db,
-                Some(lang),
-                &game_path,
-                &report.files_written,
-                &remedy,
-                None,
-            )?;
-            print_record_outcome(lang, &outcome, &report, &format_id);
+    // Contractual zero-write reporting (same messages as multilang inject):
+    // silent keeps / silent nothing-recorded are the stale-recording hazard.
+    for (lang, outcome) in &report.outcomes {
+        if let Some(rep) = report.reports.get(lang) {
+            print_record_outcome(lang, outcome, rep, &format_id);
+        }
+        if matches!(
+            outcome,
+            locust_core::extraction::RecordOutcome::Recorded { .. }
+        ) {
+            println!(
+                "Recorded {} file(s) for {lang} (pack root = game folder).",
+                report.files_written.len()
+            );
         }
     }
 
@@ -1377,8 +1314,8 @@ async fn cmd_inject_direct(
     table.add_row(vec!["Files modified", &report.files_modified.to_string()]);
     table.add_row(vec!["Strings written", &report.strings_written.to_string()]);
     table.add_row(vec!["Strings skipped", &report.strings_skipped.to_string()]);
-    if let Some(ref b) = backup_note {
-        table.add_row(vec!["Backup", &b.path.display().to_string()]);
+    if let Some(ref path) = report.backup_path {
+        table.add_row(vec!["Backup", path]);
     }
     if !report.warnings.is_empty() {
         table.add_row(vec!["Warnings", &report.warnings.len().to_string()]);
