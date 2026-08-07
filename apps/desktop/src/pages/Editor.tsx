@@ -1,7 +1,7 @@
 import { useState, useCallback } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Languages, Shield, Download, FileCheck, Package, Loader2 } from "lucide-react";
-import { getStrings, getStats, getString, validate } from "../lib/api";
+import { getStrings, getStats, getString, validate, type ValidationResponse } from "../lib/api";
 import { useEditorStore } from "../stores/editorStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useHotkey } from "../lib/hotkeys";
@@ -15,6 +15,7 @@ import InjectModal from "../components/InjectModal";
 import PatchModal from "../components/PatchModal";
 import ExportModal from "../components/ExportModal";
 import SearchReplaceModal from "../components/SearchReplaceModal";
+import ValidationResultsModal from "../components/ValidationResultsModal";
 
 export default function Editor() {
   const { filter, selectedEntryId, setSelected } = useEditorStore();
@@ -25,6 +26,8 @@ export default function Editor() {
   const [showPatchModal, setShowPatchModal] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
   const [showReplaceModal, setShowReplaceModal] = useState(false);
+  const [showValidationModal, setShowValidationModal] = useState(false);
+  const [validationResult, setValidationResult] = useState<ValidationResponse | null>(null);
   const [validating, setValidating] = useState(false);
 
   const { data: stringsData, refetch } = useQuery({
@@ -58,25 +61,25 @@ export default function Editor() {
     setValidating(true);
     try {
       const res = await validate();
+      // Normalize older servers without issues[]
+      if (!res.validation.issues) {
+        res.validation.issues = [];
+      }
+      if (!res.fonts) {
+        res.fonts = [];
+      }
+      setValidationResult(res);
+      setShowValidationModal(true);
+
       const v = res.validation;
       const kinds = Object.entries(v.by_kind || {})
         .map(([k, n]) => `${k}: ${n}`)
         .join(", ");
-      const binary = v.by_kind?.ExceedsBinarySlot ?? 0;
       if (v.issues_found === 0) {
-        addToast("success", `Validation clean (${v.total_checked} checked)`);
         addLog("info", `Validate: no issues in ${v.total_checked} strings`, undefined, "validate");
       } else {
         const msg = `${v.issues_found} issue(s) in ${v.entries_with_issues} entries${kinds ? ` (${kinds})` : ""}`;
-        addToast(binary > 0 ? "warning" : "error", msg, 8000);
-        addLog(
-          "warning",
-          `Validate: ${msg}`,
-          binary > 0
-            ? "ExceedsBinarySlot: shorten UTF-8/UTF-16LE/SJIS translations before inject"
-            : undefined,
-          "validate"
-        );
+        addLog("warning", `Validate: ${msg}`, undefined, "validate");
       }
     } catch (e) {
       const err = e instanceof Error ? e.message : String(e);
@@ -95,7 +98,8 @@ export default function Editor() {
   useHotkey("exportFile", () => setShowExportModal(true));
   useHotkey("searchReplace", () => setShowReplaceModal(true));
   useHotkey("closePanel", () => {
-    if (showReplaceModal) setShowReplaceModal(false);
+    if (showValidationModal) setShowValidationModal(false);
+    else if (showReplaceModal) setShowReplaceModal(false);
     else if (showExportModal) setShowExportModal(false);
     else if (showPatchModal) setShowPatchModal(false);
     else if (showInjectModal) setShowInjectModal(false);
@@ -216,6 +220,16 @@ export default function Editor() {
         open={showReplaceModal}
         onClose={() => setShowReplaceModal(false)}
         onDone={handleRefetch}
+      />
+
+      <ValidationResultsModal
+        open={showValidationModal}
+        result={validationResult}
+        onClose={() => setShowValidationModal(false)}
+        onSelectEntry={(entryId) => {
+          setShowValidationModal(false);
+          setSelected(entryId);
+        }}
       />
     </div>
   );

@@ -152,6 +152,9 @@ pub struct ValidationIssue {
     pub entry_id: String,
     pub kind: ValidationKind,
     pub message: String,
+    /// Optional source snippet for UI (not persisted in validation table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

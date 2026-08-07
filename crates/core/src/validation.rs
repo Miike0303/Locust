@@ -53,6 +53,7 @@ impl Validator {
                 entry_id: entry.id.clone(),
                 kind: ValidationKind::EmptyTranslation,
                 message: "translation is empty".to_string(),
+                source: None,
             });
         }
 
@@ -62,6 +63,7 @@ impl Validator {
                 entry_id: entry.id.clone(),
                 kind: ValidationKind::IdenticalToSource,
                 message: "translation is identical to source".to_string(),
+                source: None,
             });
         }
 
@@ -76,6 +78,7 @@ impl Validator {
                         "translation exceeds char limit: {} > {}",
                         actual, limit
                     ),
+                    source: None,
                 });
             }
         }
@@ -100,6 +103,7 @@ impl Validator {
                     entry_id: entry.id.clone(),
                     kind,
                     message: format!("placeholder mismatch: {}", m.placeholder),
+                    source: None,
                 });
             }
         }
@@ -126,6 +130,7 @@ impl Validator {
                             message: format!(
                                 "translation exceeds binary inject slot ({enc}): {tr_len} > {src_len} bytes"
                             ),
+                            source: None,
                         });
                     }
                 }
@@ -146,9 +151,20 @@ impl Validator {
         entries: &[StringEntry],
         db: &Database,
     ) -> Result<ValidationReport> {
-        let issues = Self::validate_all(entries);
+        let mut issues = Self::validate_all(entries);
 
         db.save_validation_issues(&issues).await?;
+
+        // Attach source snippets for UI (not stored in the validation table).
+        let source_by_id: HashMap<&str, &str> = entries
+            .iter()
+            .map(|e| (e.id.as_str(), e.source.as_str()))
+            .collect();
+        for issue in &mut issues {
+            if let Some(src) = source_by_id.get(issue.entry_id.as_str()) {
+                issue.source = Some(truncate_snippet(src, 100));
+            }
+        }
 
         let mut entries_with_issues = std::collections::HashSet::new();
         let mut by_kind: HashMap<String, usize> = HashMap::new();
@@ -170,7 +186,19 @@ impl Validator {
             issues_found: issues.len(),
             entries_with_issues: entries_with_issues.len(),
             by_kind,
+            issues,
         })
+    }
+}
+
+fn truncate_snippet(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -180,6 +208,8 @@ pub struct ValidationReport {
     pub issues_found: usize,
     pub entries_with_issues: usize,
     pub by_kind: HashMap<String, usize>,
+    /// Per-entry issues with optional source snippets for the desktop UI.
+    pub issues: Vec<ValidationIssue>,
 }
 
 #[cfg(test)]

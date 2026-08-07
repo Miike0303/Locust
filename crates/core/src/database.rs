@@ -991,6 +991,7 @@ impl Database {
                 entry_id: row.get(0)?,
                 kind,
                 message: row.get(2)?,
+                source: None,
             })
         })?;
         let mut issues = Vec::new();
@@ -1831,11 +1832,13 @@ mod tests {
                 entry_id: "e1".to_string(),
                 kind: ValidationKind::EmptyTranslation,
                 message: "empty".to_string(),
+                source: None,
             },
             ValidationIssue {
                 entry_id: "e2".to_string(),
                 kind: ValidationKind::IdenticalToSource,
                 message: "identical".to_string(),
+                source: None,
             },
         ];
         rt.block_on(async {

@@ -143,17 +143,57 @@ export interface MultiLangReport {
   reports: Record<string, any>;
 }
 
+/** Mirrors serde for core::models::ValidationKind (externally tagged). */
+export type ValidationKind =
+  | { MissingPlaceholder: { placeholder: string } }
+  | { ExtraPlaceholder: { placeholder: string } }
+  | { ExceedsCharLimit: { limit: number; actual: number } }
+  | { ExceedsBinarySlot: { encoding: string; limit: number; actual: number } }
+  | "EmptyTranslation"
+  | "IdenticalToSource";
+
+export interface ValidationIssue {
+  entry_id: string;
+  kind: ValidationKind;
+  message: string;
+  /** Optional source snippet (UI); not always present. */
+  source?: string | null;
+}
+
 export interface ValidationReport {
   total_checked: number;
   issues_found: number;
   entries_with_issues: number;
   /** Counts by kind name, e.g. ExceedsBinarySlot, MissingPlaceholder */
   by_kind: Record<string, number>;
+  issues: ValidationIssue[];
+}
+
+/** Mirrors core::font_validation::FontCoverageReport */
+export interface FontCoverageReport {
+  font_path: string;
+  font_name: string | null;
+  total_unique_chars: number;
+  /** JSON chars as single-codepoint strings */
+  missing_chars: string[];
+  missing_count: number;
+  coverage_percent: number;
+  has_full_coverage: boolean;
 }
 
 export interface ValidationResponse {
   validation: ValidationReport;
-  fonts: unknown[];
+  fonts: FontCoverageReport[];
+}
+
+/** Human label for a ValidationKind discriminant. */
+export function validationKindLabel(kind: ValidationKind): string {
+  if (typeof kind === "string") return kind;
+  if ("MissingPlaceholder" in kind) return "MissingPlaceholder";
+  if ("ExtraPlaceholder" in kind) return "ExtraPlaceholder";
+  if ("ExceedsCharLimit" in kind) return "ExceedsCharLimit";
+  if ("ExceedsBinarySlot" in kind) return "ExceedsBinarySlot";
+  return "Unknown";
 }
 
 /** UTF-8 / UTF-16LE byte length of text for inject-slot UI.
