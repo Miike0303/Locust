@@ -15,13 +15,24 @@ extract text ──► Locust DB ──► translate JA→EN ──► pivot ─
    (per engine)   (sqlite)     (grok-sub)         (new DB)   (grok-sub)          (per engine) (locust patch) (locust apply)
 ```
 
-### Locust patch apply (shared by all engines)
+### Locust patch pack / apply (shared by all engines)
 
-After inject has **recorded** what it wrote, package and apply without hand-unzipping:
+`locust patch` packs **only from an injection recording** — not from “whatever is on
+disk”. That recording is created when you inject:
+
+```bash
+# Preferred for packing: in-place inject that records the game root
+locust inject "<game>" -P project.locust.db --direct -l es
+
+# Or Replace/Add (recording root is the per-language copy / Add tree)
+locust inject "<game>" -P project.locust.db -l es -o <output_dir>
+```
+
+Then package and apply without hand-unzipping:
 
 ```bash
 # Prefer a pristine tree for original hashes (strict verify on apply)
-locust patch "<injected_or_recorded_game>" -P project.locust.db -l es -o game-es-patch.zip --pristine "<pristine_game>"
+locust patch "<recorded_root>" -P project.locust.db -l es -o game-es-patch.zip --pristine "<pristine_game>"
 
 # Apply onto a clean copy of the game (never the only original without backup)
 locust apply "<clean_game_copy>" game-es-patch.zip
@@ -30,28 +41,53 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
 ```
 
 - Backups and receipts live in `<game>/.locust/` (hidden on Windows).
-- Server: `POST /api/patch/{verify,apply,rollback,status}` (binds **127.0.0.1** by default).
-- Desktop: Editor → **Patch** (Ctrl+Shift+P).
-- **Unity**: translations must be **≤ source UTF-8 byte length** or inject skips them (no hard fail).
-- **Wolf**: translations must be **≤ source Shift-JIS byte length** or inject skips them (no hard fail).
-- **Unreal**: translations must be **≤ source UTF-16LE byte length** or inject skips them (no hard fail).
-  The `mock` provider is length-safe for **both UTF-8 and UTF-16LE** slots (ASCII
-  tags no longer blow Unreal's UTF-16 budget on short CJK); SJIS usually follows.
-  Extract tags entries with `metadata.binary_slot` (`utf8` / `utf16le` / `sjis`);
-  `locust validate <db>` reports `ExceedsBinarySlot` before inject.
+- Server: `POST /api/patch/{verify,apply,rollback,status,pack}` (binds **127.0.0.1** by default).
+- Desktop: Editor → **Inject** (Direct mode records for packing) → **Patch** (Ctrl+Shift+P)
+  → **Pack** tab (same core pack as the CLI). Apply/Verify/Rollback stay on the Apply tab.
+- Patch zips are **ZIP64-capable** (multi‑GB entries). **Verify/apply stream** entry bytes
+  (hash/stage to disk); default uncompressed ceiling **32 GiB**
+  (`LOCUST_PATCH_MAX_UNCOMPRESSED` to raise). Actual expansion past a zip header’s
+  declared size aborts (zip-bomb guard).
+- **Binary slot engines** (Unity UTF-8, Unreal UTF-16LE heuristic, Wolf Shift-JIS):
+  inject **skips** oversize translations (no hard fail). Extract tags
+  `metadata.binary_slot` (`utf8` / `utf16le` / `sjis`); `locust validate <db>` reports
+  `ExceedsBinarySlot` before inject. The translation engine does **one length-aware
+  retry** when a provider returns an oversize binary-slot string. Provider **fallback
+  chains**: CLI `--fallback a,b,c` and desktop translate dialog (same core
+  `run_fallback_chain`).
+- The `mock` provider is length-safe for UTF-8 and UTF-16LE slots (good for inject tests).
 
-**Phase-2 apply proven (copies only, mock or equal-length where needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube, HTML generic (non-SugarCube fixture), Unity (BOXMAN), Unreal (Last Hope `_P.pak` subset — full 8GB base pak not copied), Wolf RPG (synthetic `Data/*.wolf` fixture — no commercial title on disk yet), VNTextPatch JSON (synthetic fixture + **Ochiru EN** real subset `S004b/S004d/help_title` from `ochiru_p_vntp` — re-run VNTextPatch to pack into the original engine).
-
-`locust inject` / `inject --direct` preflight: warns if any translation exceeds a tagged binary inject slot (see `locust validate`).
+**Phase-2 apply / real-game notes (copies or patch paks, mock or equal-length where
+needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube, HTML generic, Unity (BOXMAN +
+structural TextAsset path), Unreal (Last Hope — **8.4 GB base pak** path proven for
+pack/apply tooling; locres inject writes sibling `*_LOCUST_P.pak`), Wolf RPG
+(synthetic `Data/*.wolf` — no commercial title on disk yet), VNTextPatch JSON
+(synthetic + Ochiru EN subset via external VNTextPatch pack). Experimental engines
+(KiriKiri/YU-RIS/Tyrano/NScripter/QSP) have synthetic Locust fixtures; commercial
+E2E varies — see per-engine sections.
 
 - **Locust DB**: each string has `id`, `source`, `translation`, `status`, `file_path`.
   For VNTextPatch-format games the `id` is `<jsonname>.json#<index>#message`, which
   maps back to the source file + line for reinjection.
 - **Translate**: `locust translate <db> -p grok-sub -s ja -t en --concurrency N --batch-size B --context "..."`.
-  Only `status=Pending` rows are sent, so re-running resumes cleanly.
+  Optional `--fallback provider2,provider3`. Only `status=Pending` rows are sent, so
+  re-running resumes cleanly.
 - **Pivot** (bridge language): `locust pivot <ja_db> -o <en2es_db>` copies each EN
   translation as the SOURCE of a new DB → translate `-s en -t es`. Then `-s en -t fr`, etc.
 - **Neutral LatAm Spanish** is applied automatically by the provider prompt for `es*`.
+
+### Desktop app (practical)
+
+The Tauri app talks to the same core/server as the CLI. For a full in-app loop:
+
+1. Open project → translate (optional fallback chain in the translate dialog).
+2. **Validate** (Ctrl+Shift+V) → results panel with jump-to-entry; binary-slot oversize
+   listed as `ExceedsBinarySlot`.
+3. **Inject** → **Direct** for packable recordings (automatic backup when the engine
+   mutates the original tree); Replace/Add for copies.
+4. **Patch → Pack** (zip) then Apply on a clean install; or use CLI apply.
+5. **Settings → Glossary** for preferred terms; **Settings → History** for past runs
+   (cost / tokens / duration — same ledger as `locust stats`).
 
 ### Translation gotchas (all engines)
 - **Count mismatch** (`sent 20 got 19`): grok merges adjacent short lines and the
@@ -59,7 +95,7 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
   **Fix: shrink batch size** on stall (20→12→6→3→2). Small batches don't merge.
   See `tonight_finish.sh` / `taimanin_translate.sh` `tr_until_done()`.
 - **Cost/usage**: grok-sub is a subscription ($0/token). Runs are logged in the DB
-  `translation_runs` table — `locust stats <db>` shows strings/tokens(in/out)/time.
+  `translation_runs` table — `locust stats <db>` or Desktop **Settings → History**.
 - Save the whole run in ONE sqlite transaction (Locust does) or 30k strings take minutes.
 
 ---
@@ -77,11 +113,23 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
 - Scripts/data in `.rvdata2` (Ruby Marshal). Locust reads/writes Marshal.
 - Detect encryption wrapper `{uid,bid,data}`; `is_encrypted()` in the plugin.
 
-### KiriKiri (KAG, `.ks` text scripts) — MEDIUM  ✅ done: Ochiru
-- Scripts are `.ks` text (cp932/Shift-JIS, or UTF-16LE with FF FE BOM), stored in `data.xp3`.
+### KiriKiri (KAG, `.ks` text scripts) — MEDIUM  ✅ Locust Experimental + Ochiru external
+- Scripts are `.ks` text (UTF-16LE / UTF-8 / Shift-JIS; **FE FE** cipher header modes
+  **0 / 1 / 2** — mode 2 is zlib-compressed UTF-16LE). Often stored in `data.xp3`.
 - The game auto-loads `patch.xp3`, `patch2.xp3`, … as **overlays** over `data.xp3`
-  (higher number wins), UNENCRYPTED. **A translation patch never re-encrypts anything.**
-- **Pipeline (Ochiru worked end-to-end):**
+  (higher number wins). **Unencrypted** patch XP3 is enough for many titles.
+- **Locust-native (synthetic + real-game loose/.xp3 where unencrypted):**
+  ```bash
+  locust extract "<game_or_loose_ks_tree>" -o project.locust.db
+  locust translate project.locust.db -p … -s ja -t es
+  locust inject "<game>" -P project.locust.db --direct -l es   # writes patch.xp3 when packing XP3
+  # Or inject into loose .ks and pack with locust patch / external xp3 tools
+  ```
+  - **Unencrypted XP3**: read full archive; inject can emit **`patch.xp3`** (engine
+    auto-loads it — no need to rewrite `data.xp3`).
+  - **FE FE 0/1/2** on loose `.ks` (mode-2 zlib verified against KirikiriDescrambler).
+  - **Not supported:** cxdec / encrypted content, Motto-style Hxv4 custom indexes.
+- **External pipeline (Ochiru worked end-to-end — still valid for encrypted bases):**
   1. Extract `data.xp3` preserving internal paths: `garbro_extract_paths.ps1 <xp3> <out> [scheme]`.
   2. Extract dialogue: `kag_extract_recursive.py <game_dir> <vntp_dir> <positions.json>`
      — decodes (BOM utf-16 / cp932), `splitlines()`, keeps lines with Japanese after
@@ -121,17 +169,92 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
   once (index, CxDec, decompression) — then FreeMote decompiles the dumped `.scn`.**
   FreeMote needs .NET 4.8. data.xp3 (1.5GB) may also hold scripts but wasn't cracked.
 
-### YU-RIS (`.ybn` in `.ypf`) — MEDIUM  ✅ done: Injuu
+### YU-RIS (`.ybn` in `.ypf`) — MEDIUM  ✅ Locust Experimental + Injuu external
 - DLLs `YSOHC/YSPNG/YSSNP/YSTCH/YSWBP/YSZLB`, archives `pac/*.ypf`, config `yscfg.dat`.
-- **VNTextPatch** (arcusmaximus) extracts/injects YU-RIS text; **`YPF.exe`** packs/unpacks YPF.
-- Injuu shipped a ready orchestrator `ysbin-patch.ps1` (`unpack` / `pack`):
+- **Locust-native:**
+  ```bash
+  locust extract "<game>" -o project.locust.db   # loose YSTB .ybn and/or YPF
+  locust translate project.locust.db -p … -s ja -t es
+  locust inject "<game>" -P project.locust.db --direct -l es
+  ```
+  - **Loose YSTB `.ybn`**: XOR key = first attr descriptor offset dword (attr+8); real-game
+    validated (e.g. Injuu).
+  - **YPF unpack/repack**: common versions including **0x1E4**; inject rebuilds the archive
+    with a **`.locust-old`** rename backup (restore on write failure).
+  - Exotic YPF encryption schemes still out of scope.
+- **External (Injuu shipped orchestrator `ysbin-patch.ps1`):**
   - unpack: `YPF.exe -e ysbin.ypf` → `VNTextPatch extractlocal ysbin output` (→ `output/*.json`)
   - pack:   `VNTextPatch insertlocal ysbin output res` → merge → `YPF.exe -c ysbin -v 500`
-- To translate: write ES into (a copy of) `output/*.json`, then run `pack`. It backs up
-  `ysbin.ypf` → `.bak`. **Run with pwsh 7** (`C:\Program Files\PowerShell\7\pwsh.exe`) —
-  the script has a parse error under Windows PowerShell 5.1.
-- Locust DB id `<name>.json#<i>#message` maps directly to `output/<name>.json[i]["message"]`
-  (VNTextPatch local JSON). See `inject_injuu_json.py`.
+  - Backs up `ysbin.ypf` → `.bak`. **Run with pwsh 7** (not Windows PowerShell 5.1).
+  - Locust DB id `<name>.json#<i>#message` maps to `output/<name>.json[i]["message"]`
+    (VNTextPatch local JSON). See `inject_injuu_json.py`.
+
+### TyranoBuilder / TyranoScript — MEDIUM  ✅ Locust Experimental
+- Scenario scripts: `data/scenario/*.ks` **UTF-8** (optional BOM preserved).
+- Desktop packs:
+  - **Electron**: `app.asar` (and `resources/app.asar`) — unpack scenario `.ks`, inject,
+    rebuild asar with **`.locust-old`** safety rename.
+  - **NW.js**: `package.nw` (plain ZIP) or **`data.exe` / game `.exe`** with ZIP **appended**
+    after the PE stub — Locust finds EOCD from the tail, preserves the exe prefix on rebuild.
+- ```bash
+  locust extract "<game>" -o project.locust.db
+  locust translate project.locust.db -p … -s ja -t es
+  locust inject "<game>" -P project.locust.db --direct -l es
+  ```
+- Registered **before** KiriKiri so Tyrano `data/scenario/*.ks` is not claimed as KAG.
+- Synthetic fixtures only for containers; no commercial Tyrano E2E claimed yet.
+
+### NScripter / ONScripter — MEDIUM  ✅ Locust Experimental
+- Engine read priority (ONScripter-compatible): **`0.txt` > `00.txt` > `nscr_sec.dat` >
+  `nscript.dat`**. Do **not** prefer a leftover `nscript.___` over real scripts.
+- Encodings: Shift-JIS dialogue lines (heuristic: lead byte ≥ 0x80 or backtick).
+- Containers:
+  - Plaintext `0.txt` / `00.txt`
+  - **`nscript.dat`**: whole-file XOR **0x84**
+  - **`nscr_sec.dat`**: ONScripter encrypt_mode 2 — rotating XOR magic
+    `{0x79,0x57,0x0D,0x80,0x04}` (self-inverse)
+- ```bash
+  locust extract "<game>" -o project.locust.db
+  locust translate … ; locust inject … --direct -l es
+  ```
+- Synthetic fixtures; no NSA archives / `nscript.___` support.
+
+### Unity — MEDIUM  ✅ Locust (heuristic + TextAsset slice 1)
+- **VN text scripts** under `*_Data/SCRIPTS~` (etc.) when present — preferred path.
+- **`.assets` / `level*` SerializedFile** (format versions **17–22**):
+  - Structural **TextAsset** (class 49): `m_Name` + `m_Script`; ids `textasset/<path_id>`.
+  - Inject: **same-or-shorter** in place (pad with spaces `0x20` to original field size);
+    longer → skip + length-aware retry / `ExceedsBinarySlot` validate path.
+  - Type trees / MonoBehaviour / full SerializedFile rewrite: **not** in slice 1 — parse
+    fail falls back to pure heuristic scan.
+- **Heuristic** length-prefixed UTF-8 still runs on the same files (skips TextAsset
+  byte ranges to avoid double extraction). Inject remains ≤ source UTF-8 bytes.
+- ```bash
+  locust extract "<game>" -o project.locust.db
+  locust validate project.locust.db          # binary slots
+  locust translate … ; locust inject … --direct -l es
+  locust patch … ; locust apply …
+  ```
+
+### Unreal Engine — MEDIUM–HARD  ✅ Locust Experimental + Last Hope path
+- **Structural `.locres`** (Localization culture files):
+  - Extract from **loose** `Content/Localization/.../*.locres` and **embedded** blobs
+    inside `.pak` (per-culture ids so cultures do not collide).
+  - Inject loose locres: rewrite file in place (variable length OK).
+  - Inject **embedded** locres: does **not** rewrite the multi‑GB base pak — builds a
+    sibling **`<base_stem>_LOCUST_P.pak`** (uncompressed patch pak). UE mounts `*_P.pak`
+    over the base by name ordering. Base file stays intact.
+- **Heuristic UTF-16LE** still scans paks for other strings; inject uses in-place slots
+  (≤ source UTF-16LE) via **direct** inject / AC multi-pattern search.
+- Pack/apply tooling proven on **~8.4 GB** base pak paths; patch zips ZIP64 + streaming
+  verify/apply (see §0).
+- ```bash
+  locust extract "<game>" -o project.locust.db
+  locust translate … ; locust inject "<game>" -P project.locust.db --direct -l es
+  # Expect …_LOCUST_P.pak next to the base pak when locres was embedded
+  locust patch "<recorded_root>" -P project.locust.db -l es -o patch.zip
+  locust apply "<clean_install>" patch.zip
+  ```
 
 ---
 
