@@ -65,6 +65,33 @@ impl Default for TranslationOptions {
     }
 }
 
+/// Restore placeholder tokens in a provider result (best-effort on failure).
+fn restore_placeholders_in_result(
+    result: &mut TranslationResult,
+    placeholders_by_id: &std::collections::HashMap<String, Vec<Placeholder>>,
+) {
+    let Some(phs) = placeholders_by_id.get(&result.entry_id) else {
+        return;
+    };
+    if phs.is_empty() {
+        return;
+    }
+    match PlaceholderProcessor::restore(&result.translation, phs) {
+        Ok(restored) => result.translation = restored,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to restore placeholders for {}: {}. Falling back to original with any missing tokens replaced.",
+                result.entry_id, e
+            );
+            let mut t = result.translation.clone();
+            for ph in phs {
+                t = t.replace(&ph.token, &ph.original);
+            }
+            result.translation = t;
+        }
+    }
+}
+
 pub struct TranslationManager {
     provider: Arc<dyn TranslationProvider>,
     db: Arc<Database>,
@@ -113,7 +140,10 @@ impl TranslationManager {
             .await;
 
         let mut completed = 0usize;
-        let mut oversize_count = 0usize;
+        // Binary-slot entries still over budget after one length-aware retry.
+        let mut oversize_after_retry = 0usize;
+        // Binary-slot entries that fit only after the length-aware retry.
+        let mut retried_ok = 0usize;
         let mut total_cost = 0.0f64;
         let mut total_tokens = 0u64;
         let mut total_input_tokens = 0u64;
@@ -274,44 +304,122 @@ impl TranslationManager {
                 Ok(mut results) => {
                     // Restore placeholders in translations before saving
                     for result in &mut results {
-                        if let Some(phs) = placeholders_by_id.get(&result.entry_id) {
-                            if !phs.is_empty() {
-                                match PlaceholderProcessor::restore(&result.translation, phs) {
-                                    Ok(restored) => result.translation = restored,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to restore placeholders for {}: {}. Falling back to original with any missing tokens replaced.",
-                                            result.entry_id, e
-                                        );
-                                        // Best-effort restore: replace each token even if some missing
-                                        let mut t = result.translation.clone();
-                                        for ph in phs {
-                                            t = t.replace(&ph.token, &ph.original);
-                                        }
-                                        result.translation = t;
-                                    }
-                                }
-                            }
+                        restore_placeholders_in_result(result, &placeholders_by_id);
+                    }
+
+                    // Length-aware retry: one extra provider attempt per oversize binary-slot.
+                    for result in &mut results {
+                        let Some((slot, budget)) = budgets_by_id.get(&result.entry_id) else {
+                            continue;
+                        };
+                        let Some(first_len) =
+                            crate::validation::encoded_byte_len(slot, &result.translation)
+                        else {
+                            continue;
+                        };
+                        if first_len <= *budget {
+                            continue;
                         }
-                        // Flag oversize after restore; still save — validate/inject preflight
-                        // are the enforcement points for binary slots.
-                        if let Some((slot, budget)) = budgets_by_id.get(&result.entry_id) {
-                            if let Some(actual) =
-                                crate::validation::encoded_byte_len(slot, &result.translation)
-                            {
-                                if actual > *budget {
-                                    tracing::warn!(
+
+                        let Some(orig_req) =
+                            requests.iter().find(|r| r.entry_id == result.entry_id)
+                        else {
+                            continue;
+                        };
+                        let correction = format!(
+                            "PREVIOUS ATTEMPT WAS {first_len} BYTES — HARD LIMIT {budget} BYTES ({slot}). \
+                             Shorten aggressively: drop articles, use abbreviations, keep meaning."
+                        );
+                        let mut retry_req = orig_req.clone();
+                        retry_req.context = Some(match &orig_req.context {
+                            Some(c) => format!("{c} | {correction}"),
+                            None => correction,
+                        });
+
+                        match self.provider.translate(std::slice::from_ref(&retry_req)).await {
+                            Ok(mut retry_batch) => {
+                                let mut retry_result = match retry_batch
+                                    .iter()
+                                    .position(|r| r.entry_id == result.entry_id)
+                                {
+                                    Some(i) => retry_batch.swap_remove(i),
+                                    None => match retry_batch.pop() {
+                                        Some(r) => r,
+                                        None => {
+                                            tracing::warn!(
+                                                entry_id = %result.entry_id,
+                                                "length retry returned no result; keeping first attempt"
+                                            );
+                                            oversize_after_retry += 1;
+                                            continue;
+                                        }
+                                    },
+                                };
+                                restore_placeholders_in_result(
+                                    &mut retry_result,
+                                    &placeholders_by_id,
+                                );
+                                let second_len = crate::validation::encoded_byte_len(
+                                    slot,
+                                    &retry_result.translation,
+                                )
+                                .unwrap_or(usize::MAX);
+
+                                if second_len <= *budget {
+                                    result.translation = retry_result.translation;
+                                    if let Some(c) = retry_result.cost_usd {
+                                        result.cost_usd =
+                                            Some(result.cost_usd.unwrap_or(0.0) + c);
+                                    }
+                                    if let Some(t) = retry_result.tokens_used {
+                                        result.tokens_used =
+                                            Some(result.tokens_used.unwrap_or(0) + t);
+                                    }
+                                    retried_ok += 1;
+                                    tracing::info!(
                                         entry_id = %result.entry_id,
-                                        actual,
+                                        first_len,
+                                        second_len,
                                         budget,
                                         slot = %slot,
-                                        "translation exceeds binary slot budget"
+                                        "binary-slot translation fits after length-aware retry"
                                     );
-                                    oversize_count += 1;
+                                } else {
+                                    // Still oversize: keep the shorter attempt.
+                                    if second_len < first_len {
+                                        result.translation = retry_result.translation;
+                                    }
+                                    let kept = crate::validation::encoded_byte_len(
+                                        slot,
+                                        &result.translation,
+                                    )
+                                    .unwrap_or(first_len.min(second_len));
+                                    tracing::warn!(
+                                        entry_id = %result.entry_id,
+                                        first_len,
+                                        second_len,
+                                        kept,
+                                        budget,
+                                        slot = %slot,
+                                        "translation still exceeds binary slot after length-aware retry"
+                                    );
+                                    oversize_after_retry += 1;
                                 }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    entry_id = %result.entry_id,
+                                    error = %e,
+                                    first_len,
+                                    budget,
+                                    slot = %slot,
+                                    "length-aware retry failed; keeping first oversize attempt"
+                                );
+                                oversize_after_retry += 1;
                             }
                         }
                     }
+
                     // 5e. Process results
                     for result in &results {
                         let _ = self
@@ -393,11 +501,21 @@ impl TranslationManager {
             return Ok(());
         }
 
-        // ProgressEvent / return type live outside this file; surface oversize via log only.
-        if oversize_count > 0 {
-            tracing::warn!(
-                "{oversize_count} translations exceed their binary slot; run locust validate"
-            );
+        // ProgressEvent / return type live outside this file; surface counters via log.
+        if oversize_after_retry > 0 || retried_ok > 0 {
+            if oversize_after_retry > 0 {
+                tracing::warn!(
+                    oversize_after_retry,
+                    retried_ok,
+                    "{oversize_after_retry} translations still exceed binary slot after length retry \
+                     ({retried_ok} fixed on retry); run locust validate"
+                );
+            } else {
+                tracing::info!(
+                    retried_ok,
+                    "{retried_ok} binary-slot translations fit after length-aware retry"
+                );
+            }
         }
 
         // 6. Send Completed and record the run in the project ledger
@@ -1181,60 +1299,101 @@ mod tests {
         assert!(ctx.contains("encoded as utf16le"), "{ctx}");
     }
 
-    #[tokio::test]
-    async fn test_binary_slot_oversize_translation_still_saved() {
-        let (db, glossary) = setup();
-        let source = "Hi";
-        let mut entry = StringEntry::new("oversized", source, PathBuf::from("x.assets"));
-        entry.metadata.insert(
+    /// Scripted provider: first translate() returns `first`, second returns `second`.
+    /// Counts how many times `translate` is invoked (not request count).
+    struct ScriptedLengthProvider {
+        calls: AtomicUsize,
+        first: String,
+        second: String,
+        /// Captured contexts per call for assertions.
+        contexts: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl ScriptedLengthProvider {
+        fn new(first: &str, second: &str) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                first: first.to_string(),
+                second: second.to_string(),
+                contexts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranslationProvider for ScriptedLengthProvider {
+        fn id(&self) -> &str {
+            "scripted-length"
+        }
+        fn name(&self) -> &str {
+            "Scripted Length"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = if n == 0 {
+                self.first.clone()
+            } else {
+                self.second.clone()
+            };
+            {
+                let mut ctxs = self.contexts.lock().unwrap();
+                for r in requests {
+                    ctxs.push(r.context.clone());
+                }
+            }
+            Ok(requests
+                .iter()
+                .map(|r| TranslationResult {
+                    entry_id: r.entry_id.clone(),
+                    translation: text.clone(),
+                    detected_source_lang: None,
+                    provider: "scripted-length".to_string(),
+                    tokens_used: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_usd: None,
+                })
+                .collect())
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn binary_utf8_entry(id: &str, source: &str) -> StringEntry {
+        let mut e = StringEntry::new(id, source, PathBuf::from("x.assets"));
+        e.metadata.insert(
             "binary_slot".to_string(),
             serde_json::Value::String("utf8".to_string()),
         );
+        e
+    }
+
+    #[tokio::test]
+    async fn test_binary_slot_retry_ok_stores_fitting_second_attempt() {
+        let (db, glossary) = setup();
+        // budget = 5 for "Hello"
+        let entry = binary_utf8_entry("slot-retry-ok", "Hello");
         db.save_entries(std::slice::from_ref(&entry)).unwrap();
 
-        struct OversizeProvider;
-        #[async_trait]
-        impl TranslationProvider for OversizeProvider {
-            fn id(&self) -> &str {
-                "oversize"
-            }
-            fn name(&self) -> &str {
-                "Oversize"
-            }
-            fn is_free(&self) -> bool {
-                true
-            }
-            fn requires_api_key(&self) -> bool {
-                false
-            }
-            async fn translate(
-                &self,
-                requests: &[TranslationRequest],
-            ) -> Result<Vec<TranslationResult>> {
-                Ok(requests
-                    .iter()
-                    .map(|r| TranslationResult {
-                        entry_id: r.entry_id.clone(),
-                        // Far longer than any short source utf8 budget.
-                        translation: "XXXXXXXXXXXXXXXXXXXXXXXX".to_string(),
-                        detected_source_lang: None,
-                        provider: "oversize".to_string(),
-                        tokens_used: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                        cost_usd: None,
-                    })
-                    .collect())
-            }
-            async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
-                None
-            }
-            async fn health_check(&self) -> Result<()> {
-                Ok(())
-            }
-        }
-
-        let manager = TranslationManager::new(Arc::new(OversizeProvider), db.clone(), glossary);
+        let provider = Arc::new(ScriptedLengthProvider::new(
+            "XXXXXXXXXXXXXXXX", // 16 > 5
+            "Hola!",            // 5 == 5 fits
+        ));
+        let capture = provider.clone();
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
         let (tx, mut rx) = mpsc::channel(100);
         let opts = TranslationOptions {
             use_memory: false,
@@ -1242,27 +1401,184 @@ mod tests {
             ..Default::default()
         };
         manager
-            .translate_entries(vec![entry], opts, tx, "job-over".into(), CancellationToken::new())
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-retry-ok".into(),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         rx.close();
         while rx.recv().await.is_some() {}
 
+        assert_eq!(
+            capture.calls.load(Ordering::SeqCst),
+            2,
+            "oversize first answer must trigger exactly one retry"
+        );
         let saved = db
             .get_entries(&crate::database::EntryFilter::default())
             .unwrap()
             .into_iter()
-            .find(|e| e.id == "oversized")
-            .expect("entry must exist");
+            .find(|e| e.id == "slot-retry-ok")
+            .unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("Hola!"));
+        let ctxs = capture.contexts.lock().unwrap();
+        assert_eq!(ctxs.len(), 2);
+        assert!(
+            ctxs[0].as_ref().is_some_and(|c| c.contains("LENGTH LIMIT")),
+            "first call must include budget hint: {:?}",
+            ctxs[0]
+        );
+        assert!(
+            ctxs[1]
+                .as_ref()
+                .is_some_and(|c| c.contains("PREVIOUS ATTEMPT WAS") && c.contains("HARD LIMIT")),
+            "retry must include correction: {:?}",
+            ctxs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_binary_slot_retry_still_oversize_keeps_shorter() {
+        let (db, glossary) = setup();
+        let entry = binary_utf8_entry("slot-still-over", "Hi"); // budget 2
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+
+        let provider = Arc::new(ScriptedLengthProvider::new(
+            "XXXXXXXXXXXXXXXX", // 16
+            "YYYYYYYY",         // 8 shorter but still over
+        ));
+        let capture = provider.clone();
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        manager
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-still-over".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(capture.calls.load(Ordering::SeqCst), 2);
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "slot-still-over")
+            .unwrap();
         assert_eq!(
             saved.translation.as_deref(),
-            Some("XXXXXXXXXXXXXXXXXXXXXXXX"),
-            "oversize translations must still be saved (validate/inject preflight enforce later)"
+            Some("YYYYYYYY"),
+            "must store the shorter of the two oversize attempts"
         );
-        let budget = crate::validation::encoded_byte_len("utf8", source).unwrap();
+        let budget = crate::validation::encoded_byte_len("utf8", "Hi").unwrap();
         let actual =
             crate::validation::encoded_byte_len("utf8", saved.translation.as_ref().unwrap())
                 .unwrap();
-        assert!(actual > budget, "fixture must actually be oversize");
+        assert!(actual > budget);
+    }
+
+    #[tokio::test]
+    async fn test_no_binary_slot_provider_called_once() {
+        let (db, glossary) = setup();
+        let entry = StringEntry::new("plain", "Hello", PathBuf::from("script.txt"));
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+
+        // First would be "oversize" length for a slot, but no slot → no retry.
+        let provider = Arc::new(ScriptedLengthProvider::new(
+            "XXXXXXXXXXXXXXXX",
+            "should-not-be-used",
+        ));
+        let capture = provider.clone();
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        manager
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-no-slot".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(
+            capture.calls.load(Ordering::SeqCst),
+            1,
+            "entry without binary_slot must not retry"
+        );
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "plain")
+            .unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("XXXXXXXXXXXXXXXX"));
+    }
+
+    #[tokio::test]
+    async fn test_fitting_first_answer_no_retry() {
+        let (db, glossary) = setup();
+        let entry = binary_utf8_entry("slot-fit", "Hello"); // budget 5
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+
+        let provider = Arc::new(ScriptedLengthProvider::new(
+            "Hola!", // 5 bytes, fits
+            "UNUSED",
+        ));
+        let capture = provider.clone();
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        manager
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-fit".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(
+            capture.calls.load(Ordering::SeqCst),
+            1,
+            "fitting first answer must not retry"
+        );
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "slot-fit")
+            .unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("Hola!"));
     }
 }
