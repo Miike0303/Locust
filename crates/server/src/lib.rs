@@ -49,6 +49,8 @@ pub struct AppState {
     pub format_registry: Arc<FormatRegistry>,
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
     pub db: Arc<Database>,
+    /// On-disk path of `db` — used to render runnable CLI commands in errors.
+    pub db_path: PathBuf,
     pub glossary: Arc<Glossary>,
     pub config: Arc<RwLock<AppConfig>>,
     pub backup_manager: Arc<BackupManager>,
@@ -95,6 +97,7 @@ pub fn create_app_state() -> Arc<AppState> {
         format_registry: Arc::new(format_registry),
         provider_registry: Arc::new(RwLock::new(provider_registry)),
         db,
+        db_path,
         glossary,
         config: Arc::new(RwLock::new(config)),
         backup_manager: Arc::new(BackupManager::new(backup_root)),
@@ -106,7 +109,10 @@ pub fn create_app_state() -> Arc<AppState> {
 }
 
 pub fn create_test_state() -> Arc<AppState> {
-    create_test_state_inner(Arc::new(Database::open_in_memory().unwrap()))
+    create_test_state_inner(
+        Arc::new(Database::open_in_memory().unwrap()),
+        PathBuf::from(":memory:"),
+    )
 }
 
 /// Test state whose project database lives at `db_path` — for integration
@@ -114,10 +120,13 @@ pub fn create_test_state() -> Arc<AppState> {
 /// recording `locust patch` packs from) by reopening the same file after a
 /// request completes.
 pub fn create_test_state_with_db(db_path: &std::path::Path) -> Arc<AppState> {
-    create_test_state_inner(Arc::new(Database::open(db_path).unwrap()))
+    create_test_state_inner(
+        Arc::new(Database::open(db_path).unwrap()),
+        db_path.to_path_buf(),
+    )
 }
 
-fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
+fn create_test_state_inner(db: Arc<Database>, db_path: PathBuf) -> Arc<AppState> {
     let glossary = Arc::new(Glossary::new(db.clone()));
     let backup_root = std::env::temp_dir().join(format!("locust_srv_{}", uuid::Uuid::new_v4()));
     let format_registry = locust_formats::default_registry();
@@ -128,6 +137,7 @@ fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
         format_registry: Arc::new(format_registry),
         provider_registry: Arc::new(RwLock::new(provider_registry)),
         db,
+        db_path,
         glossary,
         config: Arc::new(RwLock::new(config)),
         backup_manager: Arc::new(BackupManager::new(backup_root.clone())),
@@ -162,6 +172,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/patch/apply", post(patch_apply))
         .route("/api/patch/rollback", post(patch_rollback))
         .route("/api/patch/status", post(patch_status))
+        .route("/api/patch/pack", post(patch_pack))
         .route("/api/validate", post(validate))
         .route("/api/glossary", get(get_glossary).post(add_glossary))
         .route("/api/glossary/:term", delete(delete_glossary))
@@ -769,6 +780,23 @@ struct PatchPathsRequest {
     dry_run: bool,
 }
 
+#[derive(Deserialize)]
+struct PatchPackRequest {
+    game_path: String,
+    /// Destination patch zip path.
+    output_path: String,
+    /// Optional language keys; empty = auto when exactly one recording exists.
+    /// More than one language is refused (one zip = one recording).
+    #[serde(default)]
+    languages: Vec<String>,
+    /// When true, require pristine hashes (`.locust/backup` or fail).
+    #[serde(default)]
+    pristine: bool,
+    /// Optional path to a pristine game tree for original hashes (overrides backup).
+    #[serde(default)]
+    pristine_path: Option<String>,
+}
+
 fn map_patch_err(e: locust_core::error::LocustError) -> ApiError {
     use locust_core::error::LocustError::*;
     let status = match &e {
@@ -776,10 +804,58 @@ fn map_patch_err(e: locust_core::error::LocustError) -> ApiError {
         | PatchLegacyUnconfirmed(_) | PatchVerificationFailed(_) | PatchBackupIncomplete(_) => {
             StatusCode::CONFLICT
         }
-        PatchUnsafeEntry(_) | GameDirNotWritable(_) => StatusCode::BAD_REQUEST,
+        PatchUnsafeEntry(_) | GameDirNotWritable(_) | PatchError(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     err(status, e)
+}
+
+async fn patch_pack(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PatchPackRequest>,
+) -> Result<Json<locust_core::patch::PackReport>, ApiError> {
+    if req.game_path.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "game_path required"));
+    }
+    if req.output_path.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "output_path required"));
+    }
+    if req.languages.len() > 1 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "pack accepts at most one language (one zip = one injection recording)",
+        ));
+    }
+    let lang = req.languages.into_iter().next();
+    let game_path = PathBuf::from(&req.game_path);
+    let output = PathBuf::from(&req.output_path);
+    let pristine = req.pristine_path.map(PathBuf::from);
+    let require_pristine = req.pristine;
+    let engine = locust_formats::default_registry()
+        .detect(&game_path)
+        .map(|p| p.id().to_string());
+
+    let db = state.db.clone();
+    let db_path_for_errors = state.db_path.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        locust_core::patch::pack_injection_recording(
+            &db,
+            locust_core::patch::PackOptions {
+                game_path,
+                lang,
+                output,
+                pristine,
+                engine,
+                project: db_path_for_errors,
+                require_pristine,
+            },
+        )
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(map_patch_err)?;
+
+    Ok(Json(report))
 }
 
 async fn patch_verify(

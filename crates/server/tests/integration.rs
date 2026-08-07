@@ -361,6 +361,150 @@ async fn test_inject_records_the_injection_for_patch() {
     );
 }
 
+// ─── Pack patch zip via HTTP ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_patch_pack_from_injection_recording() {
+    // End-to-end: open → translate → inject (records files) → POST /api/patch/pack
+    // packs a zip from that recording. game_path must be the recorded root
+    // (per-language copy when inject uses output_dir).
+    let tmpdir = TempDir::new().unwrap();
+    create_rpgmaker_mv_fixture(tmpdir.path());
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("project.locust.db");
+
+    let state = locust_server::create_test_state_with_db(&db_path);
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+
+    let _open: ProjectOpenResponse = client()
+        .post(format!("{}/api/project/open", base_url))
+        .json(&serde_json::json!({"path": tmpdir.path().to_string_lossy()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client()
+        .post(format!("{}/api/translate/start", base_url))
+        .json(&serde_json::json!({
+            "provider_id": "mock",
+            "options": {
+                "source_lang": "en", "target_lang": "es",
+                "batch_size": 100, "max_concurrent": 1,
+                "cost_limit_usd": null, "game_context": null,
+                "use_glossary": false, "use_memory": false, "skip_approved": true
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let output_dir = TempDir::new().unwrap();
+    let inject_resp = client()
+        .post(format!("{}/api/inject", base_url))
+        .json(&serde_json::json!({
+            "project_path": tmpdir.path().to_string_lossy(),
+            "format_id": "rpgmaker-mv",
+            "mode": "replace",
+            "languages": ["es"],
+            "output_dir": output_dir.path().to_string_lossy()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inject_resp.status(), 200, "inject must succeed before pack");
+
+    let game_name = tmpdir.path().file_name().unwrap().to_string_lossy().to_string();
+    let recorded_root = output_dir.path().join(format!("{}-es", game_name));
+    let pack_out = TempDir::new().unwrap();
+    let zip_path = pack_out.path().join("locust-test-patch.zip");
+
+    let pack_resp = client()
+        .post(format!("{}/api/patch/pack", base_url))
+        .json(&serde_json::json!({
+            "game_path": recorded_root.to_string_lossy(),
+            "output_path": zip_path.to_string_lossy(),
+            "languages": ["es"],
+            "pristine": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = pack_resp.status();
+    let body = pack_resp.text().await.unwrap();
+    assert_eq!(status, 200, "pack response: {}", body);
+
+    #[derive(Deserialize)]
+    struct PackBody {
+        files_packed: usize,
+        patch_id: String,
+        patch_version: String,
+        tier: String,
+        engine: String,
+        language: String,
+        size_bytes: u64,
+        output_path: String,
+    }
+    let report: PackBody =
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("pack JSON: {}", body));
+    assert!(report.files_packed > 0, "expected packed files: {:?}", body);
+    assert!(!report.patch_id.is_empty());
+    assert!(!report.patch_version.is_empty());
+    assert_eq!(report.tier, "structural");
+    assert_eq!(report.language, "es");
+    assert!(report.size_bytes > 0);
+    assert!(zip_path.is_file(), "zip must exist at {}", report.output_path);
+    // Engine comes from format detect on the recorded tree (rpgmaker-mv).
+    assert!(
+        report.engine.contains("rpgmaker") || report.engine == "unknown",
+        "engine: {}",
+        report.engine
+    );
+
+    // Empty game_path → 400 with a body
+    let bad = client()
+        .post(format!("{}/api/patch/pack", base_url))
+        .json(&serde_json::json!({
+            "game_path": "",
+            "output_path": zip_path.to_string_lossy(),
+            "languages": ["es"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let bad_body = bad.text().await.unwrap();
+    assert!(
+        !bad_body.is_empty() && bad_body.to_lowercase().contains("game_path"),
+        "expected game_path error body, got: {}",
+        bad_body
+    );
+
+    // pristine without backup → 400 PatchError
+    let strict_zip = pack_out.path().join("strict.zip");
+    let strict = client()
+        .post(format!("{}/api/patch/pack", base_url))
+        .json(&serde_json::json!({
+            "game_path": recorded_root.to_string_lossy(),
+            "output_path": strict_zip.to_string_lossy(),
+            "languages": ["es"],
+            "pristine": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(strict.status(), 400, "pristine without backup must fail");
+    let strict_body = strict.text().await.unwrap();
+    assert!(
+        strict_body.to_lowercase().contains("pristine"),
+        "expected pristine error, got: {}",
+        strict_body
+    );
+}
+
 // ─── Ren'Py Add mode flow ──────────────────────────────────────────────────
 
 #[tokio::test]

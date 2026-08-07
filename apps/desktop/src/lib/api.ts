@@ -495,6 +495,34 @@ export const patchRollback = (params: PatchPathsParams): Promise<PatchRollbackRe
 export const patchStatus = (params: Pick<PatchPathsParams, "game_path">): Promise<PatchStatusResult> =>
   request("/patch/status", { method: "POST", body: JSON.stringify(params) });
 
+export interface PatchPackParams {
+  game_path: string;
+  output_path: string;
+  /** At most one language; empty = auto when a single recording exists. */
+  languages?: string[];
+  /** Require pristine hashes (.locust/backup or pristine_path). */
+  pristine?: boolean;
+  pristine_path?: string;
+}
+
+export interface PatchPackResult {
+  output_path: string;
+  recording_lang: string | null;
+  recorded_root: string;
+  files_packed: number;
+  translated_strings: number;
+  size_bytes: number;
+  patch_id: string;
+  patch_version: string;
+  engine: string;
+  language: string;
+  tier: string;
+  messages: string[];
+}
+
+export const patchPack = (params: PatchPackParams): Promise<PatchPackResult> =>
+  request("/patch/pack", { method: "POST", body: JSON.stringify(params) });
+
 // ─── Translation Memory ──────────────────────────────────────────────────
 
 export interface MemoryEntry {

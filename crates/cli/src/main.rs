@@ -11,7 +11,7 @@ use locust_core::config::AppConfig;
 use locust_core::database::{Database, EntryFilter};
 use locust_core::export;
 use locust_core::glossary::Glossary;
-use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
+use locust_core::models::{OutputMode, ProgressEvent, StringEntry};
 use locust_core::translation::{load_pending_entries, run_fallback_chain, TranslationOptions};
 use locust_core::validation::{count_binary_slot_oversize, Validator};
 
@@ -341,31 +341,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Removes a half-written temp file on any exit path, so a failed run never litters
-/// the directory holding the user's published patch. `disarm` hands ownership of the
-/// file over once it has become the real destination.
-struct TempFileGuard {
-    path: Option<PathBuf>,
-}
-
-impl TempFileGuard {
-    fn new(path: &std::path::Path) -> Self {
-        Self { path: Some(path.to_path_buf()) }
-    }
-
-    fn disarm(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.path.take() {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
 /// Engines whose `inject` writes into the tree the ENTRIES name instead of the
 /// tree it is handed, verified plugin by plugin: Unity and Unreal ignore the
 /// path argument entirely; Wolf RPG prefers `entry.file_path` whenever the
@@ -577,385 +552,72 @@ fn cmd_patch(
     astro: Option<PathBuf>,
     pristine: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    use locust_core::database::{paths_identical, sha256_hex};
-    use locust_core::patch::manifest::{PatchFileEntry, PatchManifest};
-    use locust_core::patch::PatchStore;
-    use std::io::Write as _;
+    use locust_core::patch::{pack_injection_recording, PackOptions};
 
     let db = Database::open(&project)?;
-
-    // Friendly pre-check: a project with no translations has nothing to
-    // record or pack yet, and "inject first" would be misdirection.
-    let entries = db.get_entries(&EntryFilter::default())?;
-    // Reviewed and Approved count as translated here: the desktop Review
-    // page advances strings to `approved`, and telling a fully approved
-    // project to "run `locust translate` first" would re-translate finished
-    // work.
-    let translated = entries
-        .iter()
-        .filter(|e| {
-            e.translation.as_deref().is_some_and(|t| !t.trim().is_empty())
-                && matches!(
-                    e.status,
-                    StringStatus::Translated | StringStatus::Reviewed | StringStatus::Approved
-                )
-        })
-        .count();
-    if translated == 0 {
-        anyhow::bail!(
-            "no translated, reviewed, or approved strings in \"{}\" — there is \
-             nothing to pack yet. Run `locust translate` first.",
-            project.display()
-        );
-    }
-
-    let lang_flag = lang
-        .as_deref()
-        .map(|l| format!(" -l {l}"))
-        .unwrap_or_default();
-
-    // `locust patch` packs EXCLUSIVELY from the recording injection persisted:
-    // the root it wrote into, the rels it wrote there, and the hash of every
-    // written file. There is deliberately NO fallback to an entry-derived
-    // list — entries name where text was READ, not what injection wrote, and
-    // packing them is how patches silently shipped original, untranslated
-    // files while claiming to carry translated text only.
-    let keys = db.list_recorded_langs()?;
-    if keys.is_empty() {
-        anyhow::bail!(
-            "no injection has been recorded in \"{}\". `locust patch` packs exactly \
-             the files a recorded injection wrote — never a list guessed from the \
-             database. Run `locust inject \"{}\" -P \"{}\" --direct{}` first, then \
-             re-run patch.{}",
-            project.display(),
-            game_path.display(),
-            project.display(),
-            lang_flag,
-            maybe_mutated_note(&game_path)
-        );
-    }
-
-    let key_label =
-        |k: &Option<String>| -> String { k.clone().unwrap_or_else(|| "(unspecified)".to_string()) };
-
-    let recording = match lang.as_deref() {
-        Some(l) => match db.get_injection(Some(l))? {
-            Some(rec) => rec,
-            None => {
-                // A key mismatch is a loud error listing the recorded keys,
-                // never a silent fallback. Alternatives are offered only when
-                // they provably work from this exact state (their recorded
-                // root must be the tree patch was pointed at).
-                let mut alternatives = String::new();
-                for k in &keys {
-                    let Some(rec) = db.get_injection(k.as_deref())? else {
-                        continue;
-                    };
-                    if !paths_identical(&game_path, &rec.root) {
-                        continue;
-                    }
-                    match k {
-                        Some(kk) => alternatives
-                            .push_str(&format!(", or re-run patch with -l {kk}")),
-                        None if keys.len() == 1 => {
-                            alternatives.push_str(", or re-run patch without -l")
-                        }
-                        None => {}
-                    }
-                }
-                let listed = keys
-                    .iter()
-                    .map(|k| format!("\"{}\"", key_label(k)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                anyhow::bail!(
-                    "no injection recorded for language \"{l}\"; recorded: [{listed}]. \
-                     Run `locust inject \"{}\" -P \"{}\" --direct -l {l}` to record \
-                     it{alternatives}.{}",
-                    game_path.display(),
-                    project.display(),
-                    maybe_mutated_note(&game_path)
-                );
-            }
-        },
-        None => {
-            if keys.len() == 1 {
-                db.get_injection(keys[0].as_deref())?
-                    .expect("a listed key must resolve to its recording")
-            } else {
-                // Several recordings exist: packing their union produced
-                // mixed-language zips and cross-copy collisions, and silently
-                // picking one — including the language-unspecified key when
-                // it coexists with named ones — would be a guess. Ambiguity
-                // must be the user's explicit choice.
-                let mut listed = String::new();
-                let mut example: Option<String> = None;
-                let mut fallback_example: Option<String> = None;
-                for k in &keys {
-                    let Some(rec) = db.get_injection(k.as_deref())? else {
-                        continue;
-                    };
-                    listed.push_str(&format!(
-                        "\n  {} → {}",
-                        key_label(k),
-                        rec.root.display()
-                    ));
-                    if let Some(kk) = k {
-                        if example.is_none() && paths_identical(&game_path, &rec.root) {
-                            example = Some(format!(
-                                "locust patch \"{}\" -P \"{}\" -l {kk}",
-                                game_path.display(),
-                                project.display()
-                            ));
-                        }
-                        if fallback_example.is_none() {
-                            fallback_example = Some(format!(
-                                "locust patch \"{}\" -P \"{}\" -l {kk}",
-                                rec.root.display(),
-                                project.display()
-                            ));
-                        }
-                    }
-                }
-                let example = example.or(fallback_example).unwrap_or_default();
-                // "Pass -l" alone cannot reach the language-unspecified
-                // recording — no -l value names the NULL key — so listing it
-                // without a way to select it would advertise a dead entry.
-                let unspecified_note = match keys.iter().find(|k| k.is_none()) {
-                    Some(_) => {
-                        let root = db
-                            .get_injection(None)?
-                            .map(|rec| rec.root.display().to_string())
-                            .unwrap_or_else(|| game_path.display().to_string());
-                        format!(
-                            "\nNo -l value can name the \"(unspecified)\" recording; \
-                             to pack it, re-record it under a named language first: \
-                             locust inject \"{root}\" -P \"{}\" --direct -l <lang>, \
-                             then re-run patch with that -l.",
-                            project.display()
-                        )
-                    }
-                    None => String::new(),
-                };
-                anyhow::bail!(
-                    "multiple injection recordings exist in \"{}\", so `patch` without \
-                     -l is ambiguous and refused:{listed}\nPass -l <lang> to choose \
-                     one. Example: {example}{unspecified_note}",
-                    project.display()
-                );
-            }
-        }
-    };
-
-    // Bytes are read from the RECORDED root. The game path on the command
-    // line must name that same tree: reading the recorded rels out of any
-    // other tree is exactly how a patch shipped the original files while the
-    // translated copy sat elsewhere.
-    if !paths_identical(&game_path, &recording.root) {
-        anyhow::bail!(
-            "the recorded injection for {} wrote into \"{}\", not \"{}\". Packing from \
-             a different tree would ship files injection never wrote, so this is \
-             refused. Re-run: locust patch \"{}\" -P \"{}\"{}",
-            key_label(&recording.lang),
-            recording.root.display(),
-            game_path.display(),
-            recording.root.display(),
-            project.display(),
-            lang_flag
-        );
-    }
-
     let out = output.unwrap_or_else(|| {
         let base = game_path.file_name().unwrap_or_default().to_string_lossy();
-        let suffix = lang.as_deref().map(|l| format!("-{}", l)).unwrap_or_default();
-        PathBuf::from(format!("{}{}-patch.zip", base, suffix))
+        let suffix = lang.as_deref().map(|l| format!("-{l}")).unwrap_or_default();
+        PathBuf::from(format!("{base}{suffix}-patch.zip"))
     });
+    let engine = detect_engine_label(&game_path);
 
-    // Never touch whatever already sits at `out` until the new archive is
-    // complete: a user re-running after moving files must not lose their last
-    // published patch to a run that then fails. Build in a temp file in the
-    // same directory and rename over the destination only on success.
-    let tmp = out.with_file_name(format!(
-        "{}.tmp-{}",
-        out.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    let zip_file = std::fs::File::create(&tmp)?;
-    // Every fallible step between here and the rename propagates with `?`, and each
-    // one would otherwise leave a stray .tmp-<pid> beside the user's published patch.
-    // A drop guard covers all of them, including early returns added later.
-    let mut tmp_guard = TempFileGuard::new(&tmp);
-    let mut zip = zip::ZipWriter::new(zip_file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-
-    // Resolve pristine source for original_sha256 (strict-tier apply).
-    let pristine_root: Option<PathBuf> = if let Some(p) = pristine {
-        if !p.is_dir() {
-            anyhow::bail!("--pristine path is not a directory: {}", p.display());
-        }
-        Some(p)
-    } else {
-        let store = PatchStore::new(&game_path);
-        if store.backup_manifest_valid() {
-            Some(store.backup_files_dir())
-        } else {
-            None
-        }
-    };
-    if pristine_root.is_none() {
-        println!(
-            "note: packing without original hashes (no --pristine, no .locust/backup). \
-             Apply will use structural verification."
-        );
-    }
-
-    let mut added = 0usize;
-    let mut missing: Vec<PathBuf> = Vec::new();
-    let mut changed: Vec<String> = Vec::new();
-    let mut manifest_files: Vec<PatchFileEntry> = Vec::new();
-    for f in &recording.files {
-        let rel = std::path::Path::new(&f.rel);
-        // Zip-slip defense in depth: record time cannot emit anything but
-        // plain relative components, but `patch` trusts DB TEXT it did not
-        // derive (a shared .locust.db is a plausible input) and this archive
-        // is redistributed to end users. Only `Normal` components may pass:
-        // a RootDir/Prefix rel is ABSOLUTE, and `root.join(absolute)`
-        // REPLACES the root — the patch would read a file outside the game
-        // tree and ship it, hash-verified from the same row.
-        if rel
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            anyhow::bail!(
-                "recorded path \"{}\" escapes the game root — refusing to pack it",
-                f.rel
+    let report = pack_injection_recording(
+        &db,
+        PackOptions {
+            game_path: game_path.clone(),
+            lang: lang.clone(),
+            output: out,
+            pristine,
+            engine: Some(engine),
+            project: project.clone(),
+            require_pristine: false,
+        },
+    )
+    .map_err(|e| {
+        // Preserve CLI remedies that mention inject paths when useful.
+        let mut msg = e.to_string();
+        if msg.contains("no injection has been recorded") {
+            msg = format!(
+                "{msg}{}",
+                maybe_mutated_note(&game_path)
             );
         }
-        // Re-join through components so the path renders with native
-        // separators (rels are stored with `/`; a mixed-separator path in an
-        // error message reads like a corrupted path).
-        let src = recording.root.join(rel.components().collect::<PathBuf>());
-        let bytes = match std::fs::read(&src) {
-            Ok(b) => b,
-            Err(_) => {
-                missing.push(src);
-                continue;
-            }
-        };
-        // Verify BEFORE packing, on the same bytes the zip receives: a packed
-        // file is provably the file injection reported writing.
-        if bytes.len() as u64 != f.size || sha256_hex(&bytes) != f.hash {
-            changed.push(f.rel.clone());
-            continue;
-        }
-        let original_sha256 = pristine_root.as_ref().and_then(|root| {
-            let src = root.join(rel.components().collect::<PathBuf>());
-            std::fs::read(&src).ok().map(|b| sha256_hex(&b))
-        });
-        manifest_files.push(PatchFileEntry {
-            path: f.rel.clone(),
-            patched_sha256: f.hash.clone(),
-            size: f.size,
-            original_sha256,
-        });
-        zip.start_file(f.rel.clone(), opts)?;
-        zip.write_all(&bytes)?;
-        added += 1;
+        anyhow::anyhow!(msg)
+    })?;
+
+    for m in &report.messages {
+        println!("note: {m}");
     }
-
-    // A recording names every file the patch promised to carry; a missing or
-    // altered one is a hard error, never a silent skip under a README that
-    // claims "translated text only".
-    if !missing.is_empty() || !changed.is_empty() {
-        drop(zip); // release the temp file handle so the guard can remove it
-        let mut detail = String::new();
-        if !changed.is_empty() {
-            detail.push_str("\n  changed on disk since injection recorded them:");
-            for rel in changed.iter().take(5) {
-                detail.push_str(&format!("\n    {rel}"));
-            }
-            if changed.len() > 5 {
-                detail.push_str(&format!("\n    ... and {} more", changed.len() - 5));
-            }
-        }
-        if !missing.is_empty() {
-            detail.push_str("\n  missing from disk:");
-            for p in missing.iter().take(5) {
-                detail.push_str(&format!("\n    {}", p.display()));
-            }
-            if missing.len() > 5 {
-                detail.push_str(&format!("\n    ... and {} more", missing.len() - 5));
-            }
-        }
-        anyhow::bail!(
-            "{} of {} recorded file(s) no longer match what injection wrote:{detail}\n\
-             The patch would not ship the files injection wrote, so it is refused. If \
-             the game files were replaced or restored since injection, re-run `locust \
-             inject \"{}\" -P \"{}\" --direct{}` to re-inject and refresh the \
-             recording, then re-run patch.",
-            missing.len() + changed.len(),
-            recording.files.len(),
-            game_path.display(),
-            project.display(),
-            lang_flag
-        );
-    }
-
-    // Emit locust-patch.json so `locust apply` can verify and journal.
-    let engine = detect_engine_label(&game_path);
-    let patch_manifest = PatchManifest {
-        schema_version: PatchManifest::SCHEMA_VERSION,
-        patch_id: uuid::Uuid::new_v4().to_string(),
-        game_name: game_path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "game".into()),
-        engine,
-        language: lang
-            .clone()
-            .or(recording.lang.clone())
-            .unwrap_or_else(|| "unknown".into()),
-        patch_version: "1.0.0".into(),
-        generator_version: env!("CARGO_PKG_VERSION").into(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        files: manifest_files,
-    };
-    zip.start_file(PatchManifest::FILENAME, opts)?;
-    zip.write_all(serde_json::to_string_pretty(&patch_manifest)?.as_bytes())?;
-
-    let readme = "rule95 / Locust translation patch\n\n\
-        Preferred apply:  locust apply <game> <this.zip>\n\
-        Manual apply:     extract over your game folder, replacing files.\n\
-        Back up your game folder first (locust apply does this for you).\n\n\
-        This patch contains translated text only. Get the game itself from the\n\
-        original creator.\n";
-    zip.start_file("README.txt", opts)?;
-    zip.write_all(readme.as_bytes())?;
-    zip.finish()?;
-
-    // The archive is complete and durable in `tmp`; only now replace the
-    // destination. `std::fs::rename` replaces an existing file on both
-    // Windows (MOVEFILE_REPLACE_EXISTING) and Unix.
-    if let Err(e) = std::fs::rename(&tmp, &out) {
-        return Err(e.into()); // the guard removes the temp
-    }
-    tmp_guard.disarm(); // the temp is now the destination
 
     if let Some(astro_path) = astro {
         write_astro_stub(&astro_path, &game_path, lang.as_deref())?;
         println!("Astro stub written to {}", astro_path.display());
     }
 
-    let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
-    table.add_row(vec!["Patch file", &out.display().to_string()]);
-    table.add_row(vec!["Recording", &key_label(&recording.lang)]);
-    table.add_row(vec!["Recorded root", &recording.root.display().to_string()]);
-    table.add_row(vec!["Files packed", &added.to_string()]);
-    table.add_row(vec!["Translated strings", &translated.to_string()]);
-    table.add_row(vec!["Size", &format!("{:.1} KB", size as f64 / 1024.0)]);
+    table.add_row(vec!["Patch file", &report.output_path]);
+    table.add_row(vec![
+        "Recording",
+        &report
+            .recording_lang
+            .clone()
+            .unwrap_or_else(|| "(unspecified)".into()),
+    ]);
+    table.add_row(vec!["Recorded root", &report.recorded_root]);
+    table.add_row(vec!["Files packed", &report.files_packed.to_string()]);
+    table.add_row(vec![
+        "Translated strings",
+        &report.translated_strings.to_string(),
+    ]);
+    table.add_row(vec![
+        "Size",
+        &format!("{:.1} KB", report.size_bytes as f64 / 1024.0),
+    ]);
+    table.add_row(vec!["Patch id", &report.patch_id]);
+    table.add_row(vec!["Version", &report.patch_version]);
+    table.add_row(vec!["Tier", &report.tier]);
     println!("{table}");
 
     Ok(())
@@ -2068,6 +1730,7 @@ async fn cmd_server(port: u16) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use locust_core::models::StringStatus;
     use std::fs;
 
     /// Process-global env var — serialize tests that set LOCUST_BACKUP_ROOT.
@@ -2140,36 +1803,6 @@ mod tests {
         assert_eq!(n2, 1);
     }
 
-    #[test]
-    fn test_temp_file_guard_removes_on_drop_and_survives_disarm() {
-        let dir = patch_test_tempdir();
-        fs::create_dir_all(&dir).unwrap();
-
-        // Dropped while armed: the half-written temp must not be left behind. This is
-        // what covers every `?` between creating the temp archive and renaming it, a
-        // set of exits too numerous to guard one at a time.
-        let armed = dir.join("armed.tmp-1");
-        fs::write(&armed, b"partial").unwrap();
-        {
-            let _g = TempFileGuard::new(&armed);
-        }
-        assert!(
-            !armed.exists(),
-            "an armed guard must remove the temp file when dropped"
-        );
-
-        // Disarmed: the file has become the real destination and must survive.
-        let kept = dir.join("kept.tmp-1");
-        fs::write(&kept, b"complete").unwrap();
-        {
-            let mut g = TempFileGuard::new(&kept);
-            g.disarm();
-        }
-        assert!(
-            kept.exists(),
-            "a disarmed guard must leave the file alone — it is the destination now"
-        );
-    }
 
     // ─── cmd_patch packaging tests: `patch` packs EXCLUSIVELY from the
     // recording injection persisted (root + rel + hash per language key);

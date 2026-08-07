@@ -15,6 +15,7 @@
 
 pub mod apply;
 pub mod manifest;
+pub mod pack;
 pub mod rollback;
 pub mod store;
 pub mod verify;
@@ -22,6 +23,7 @@ pub mod zipsec;
 
 pub use apply::{apply, ApplyOptions, ApplyReport, PatchProgress};
 pub use manifest::{BackupBaseline, BackupManifest, PatchFileEntry, PatchManifest, Receipt};
+pub use pack::{pack_injection_recording, PackOptions, PackReport};
 pub use rollback::{rollback, RollbackOptions, RollbackReport};
 pub use store::{PatchStatus, PatchStore};
 pub use verify::{verify, FileMismatch, VerificationOutcome, VerificationReport};
