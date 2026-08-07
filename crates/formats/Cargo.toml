@@ -19,6 +19,8 @@ miniz_oxide = "0.8"
 md-5 = "0.10"
 # Locked at 1.1.4 via Cargo.lock (already pulled by regex); direct dep for multi-pattern inject.
 aho-corasick = "1.1.4"
+# Same line as locust-core (workspace lock has 2.4.x); NW.js package.nw / data.exe.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

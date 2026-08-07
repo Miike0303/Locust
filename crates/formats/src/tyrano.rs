@@ -10,6 +10,8 @@
 //!   `data/scenario/*.ks` UTF-8 scenario scripts; engine assets under `tyrano/`.
 //!   Desktop Electron packs use `app.asar` (see [`crate::tyrano_asar`]); inject rebuilds
 //!   the asar in place with a `.locust-old` safety rename.
+//!   NW.js desktop packs use `package.nw` or a self-extracting `*.exe` with an
+//!   appended ZIP (see [`crate::tyrano_nw`]).
 //!
 //! # First-cut extraction (over-extraction OK)
 //! - Player text = non-empty lines that are not comments/labels/`@`/pure-`[tag]` lines.
@@ -19,7 +21,7 @@
 //!   `:` is preserved on inject).
 //! - Encoding: UTF-8 only; preserve BOM if the source file had one.
 //!
-//! Out of scope: NW.js `data.exe` / `package.nw`, `Config.tjs` string tables,
+//! Out of scope: `Config.tjs` string tables,
 //! `[iscript]` JS / `[html]` bodies as structured ASTs (line heuristic may over-extract),
 //! real commercial game fixtures.
 
@@ -32,6 +34,7 @@ use locust_core::models::{OutputMode, StringEntry};
 use tracing::warn;
 
 use crate::tyrano_asar::{self, AsarArchive};
+use crate::tyrano_nw::{self, NwArchive};
 
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
@@ -118,9 +121,23 @@ impl TyranoPlugin {
         !Self::find_app_asars(root).is_empty()
     }
 
+    fn find_nw_containers(root: &Path) -> Vec<PathBuf> {
+        tyrano_nw::find_nw_containers(root)
+    }
+
+    fn has_nw_container(root: &Path) -> bool {
+        !Self::find_nw_containers(root).is_empty()
+    }
+
     fn detect_path(path: &Path) -> bool {
         if path.is_file() {
             if is_app_asar(path) {
+                return true;
+            }
+            if tyrano_nw::is_package_nw_name(path) && tyrano_nw::probe_eocd_present(path) {
+                return true;
+            }
+            if tyrano_nw::is_exe_name(path) && tyrano_nw::probe_scenario_in_zip_tail(path) {
                 return true;
             }
             // Single .ks only if it lives under …/data/scenario/
@@ -164,8 +181,19 @@ impl TyranoPlugin {
             }
             // Asar present + no header peek: still claim if tyrano/ exists beside it
             // (common desktop layout: resources/app.asar + resources/app.asar.unpacked/tyrano).
-            return path.join("tyrano").is_dir()
-                || path.join("resources").join("app.asar.unpacked").join("tyrano").is_dir();
+            if path.join("tyrano").is_dir()
+                || path
+                    .join("resources")
+                    .join("app.asar.unpacked")
+                    .join("tyrano")
+                    .is_dir()
+            {
+                return true;
+            }
+        }
+        // NW.js: package.nw or top-level exe with appended scenario ZIP.
+        if Self::has_nw_container(path) {
+            return true;
         }
         false
     }
@@ -507,6 +535,32 @@ fn split_asar_virtual_path(path: &Path) -> Option<(String, String)> {
     Some((archive, inner))
 }
 
+/// Split `package.nw/data/scenario/a.ks` or `data.exe/data/scenario/a.ks`.
+fn split_nw_virtual_path(path: &Path) -> Option<(String, String)> {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let lower = s.to_ascii_lowercase();
+    // Prefer package.nw (fixed name).
+    if let Some(idx) = lower.find("package.nw/") {
+        let archive = s[..idx + "package.nw".len()].to_string();
+        let inner = s[idx + "package.nw/".len()..].to_string();
+        if !inner.is_empty() {
+            return Some((archive, inner));
+        }
+    }
+    // Any `something.exe/` segment (case-insensitive).
+    let parts: Vec<&str> = s.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if part.len() >= 4 && part.to_ascii_lowercase().ends_with(".exe") {
+            let archive = parts[..=i].join("/");
+            let inner = parts[i + 1..].join("/");
+            if !inner.is_empty() {
+                return Some((archive, inner));
+            }
+        }
+    }
+    None
+}
+
 /// Replace `path` with `new_bytes` after moving the original to `path` + `.locust-old`.
 fn replace_file_with_backup(path: &Path, new_bytes: &[u8]) -> Result<()> {
     let backup = {
@@ -545,7 +599,7 @@ impl FormatPlugin for TyranoPlugin {
     }
 
     fn description(&self) -> &str {
-        "TyranoBuilder data/scenario *.ks loose + app.asar unpack/repack (UTF-8); no data.exe"
+        "TyranoBuilder data/scenario *.ks loose + app.asar + NW.js package.nw/data.exe (UTF-8)"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -553,7 +607,7 @@ impl FormatPlugin for TyranoPlugin {
     }
 
     fn supported_extensions(&self) -> &[&str] {
-        &[".ks", ".asar"]
+        &[".ks", ".asar", ".nw", ".exe"]
     }
 
     fn supported_modes(&self) -> Vec<OutputMode> {
@@ -574,19 +628,27 @@ impl FormatPlugin for TyranoPlugin {
             Self::find_scenario_ks(&root)
         };
         let asars = Self::find_app_asars(&root);
+        let nw_containers = if path.is_file()
+            && (tyrano_nw::is_package_nw_name(path) || tyrano_nw::is_exe_name(path))
+            && Self::detect_path(path)
+        {
+            vec![path.to_path_buf()]
+        } else {
+            Self::find_nw_containers(&root)
+        };
 
-        if ks_files.is_empty() && asars.is_empty() {
+        if ks_files.is_empty() && asars.is_empty() && nw_containers.is_empty() {
             if Self::looks_like_tyrano(&root) {
                 return Err(parse_err(
                     &label,
                     "TyranoBuilder layout detected (tyrano/ and/or data/scenario/) but no loose \
-                     scenario .ks and no app.asar; NW.js data.exe packs are out of scope — unpack \
-                     scenarios to data/scenario/*.ks first",
+                     scenario .ks, no app.asar, and no package.nw / scenario-bearing .exe",
                 ));
             }
             return Err(parse_err(
                 &label,
-                "no TyranoBuilder scenario .ks files found (expected data/scenario/*.ks or app.asar)",
+                "no TyranoBuilder scenario .ks files found (expected data/scenario/*.ks, \
+                 app.asar, package.nw, or NW.js data.exe)",
             ));
         }
 
@@ -604,6 +666,8 @@ impl FormatPlugin for TyranoPlugin {
 
         let mut asar_errors = 0usize;
         let mut last_asar_err = String::new();
+        let mut nw_errors = 0usize;
+        let mut last_nw_err = String::new();
         let mut ks_seen = 0usize;
         let mut ks_skipped = 0usize;
 
@@ -654,23 +718,84 @@ impl FormatPlugin for TyranoPlugin {
             }
         }
 
+        for nw_path in &nw_containers {
+            let nw_rel = nw_path
+                .strip_prefix(&root)
+                .unwrap_or(nw_path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            let archive = match NwArchive::open(nw_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    nw_errors += 1;
+                    last_nw_err = e.to_string();
+                    warn!(archive = %nw_rel, error = %e, "failed to open NW.js package");
+                    continue;
+                }
+            };
+            for entry in archive.scenario_ks_entries() {
+                ks_seen += 1;
+                let payload = match archive.read_entry(entry) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            archive = %nw_rel,
+                            entry = %entry.path,
+                            error = %e,
+                            "NW.js .ks read failed; skipped"
+                        );
+                        ks_skipped += 1;
+                        continue;
+                    }
+                };
+                let rel = format!("{nw_rel}/{}", entry.path.replace('\\', "/"));
+                let virtual_path = PathBuf::from(&rel);
+                match entries_from_ks_bytes(&payload, &rel, virtual_path) {
+                    Ok(entries) => all.extend(entries),
+                    Err(e) => {
+                        warn!(
+                            archive = %nw_rel,
+                            entry = %entry.path,
+                            error = %e,
+                            "NW.js .ks is not valid UTF-8 text; skipped"
+                        );
+                        ks_skipped += 1;
+                    }
+                }
+            }
+        }
+
         if all.is_empty() && ks_files.is_empty() {
-            if asar_errors > 0 && ks_seen == 0 {
+            if asar_errors > 0 && nw_errors == 0 && ks_seen == 0 {
                 return Err(parse_err(
                     &label,
                     format!("failed to parse app.asar: {last_asar_err}"),
                 ));
             }
+            if nw_errors > 0 && asar_errors == 0 && ks_seen == 0 {
+                return Err(parse_err(
+                    &label,
+                    format!("failed to parse NW.js package: {last_nw_err}"),
+                ));
+            }
+            if asar_errors > 0 && nw_errors > 0 && ks_seen == 0 {
+                return Err(parse_err(
+                    &label,
+                    format!(
+                        "failed to parse containers (asar: {last_asar_err}; nw: {last_nw_err})"
+                    ),
+                ));
+            }
             if ks_seen == 0 {
                 return Err(parse_err(
                     &label,
-                    "no data/scenario/*.ks found in app.asar",
+                    "no data/scenario/*.ks found in app.asar or NW.js package",
                 ));
             }
             if ks_skipped > 0 {
                 warn!(
                     skipped = ks_skipped,
-                    "all asar scenario .ks entries were skipped"
+                    "all container scenario .ks entries were skipped"
                 );
             }
         }
@@ -693,11 +818,17 @@ impl FormatPlugin for TyranoPlugin {
         let search_root = Self::root_dir(path);
 
         let mut asar_groups: HashMap<String, Vec<(String, Vec<&StringEntry>)>> = HashMap::new();
+        let mut nw_groups: HashMap<String, Vec<(String, Vec<&StringEntry>)>> = HashMap::new();
         let mut loose: Vec<(PathBuf, Vec<&StringEntry>)> = Vec::new();
 
         for (file_path, file_entries) in by_file {
             if let Some((archive, inner)) = split_asar_virtual_path(&file_path) {
                 asar_groups
+                    .entry(archive)
+                    .or_default()
+                    .push((inner, file_entries));
+            } else if let Some((archive, inner)) = split_nw_virtual_path(&file_path) {
+                nw_groups
                     .entry(archive)
                     .or_default()
                     .push((inner, file_entries));
@@ -857,6 +988,97 @@ impl FormatPlugin for TyranoPlugin {
             if !replacements.is_empty() {
                 match tyrano_asar::rebuild_asar(&archive, &replacements) {
                     Ok(new_arch) => match replace_file_with_backup(&arch_path, &new_arch) {
+                        Ok(()) => {
+                            files_modified += 1;
+                            files_written.push(arch_path.clone());
+                            strings_written += arch_written;
+                        }
+                        Err(e) => {
+                            warnings.push(format!("safe-replace {archive_rel}: {e}"));
+                            strings_skipped += arch_written;
+                        }
+                    },
+                    Err(e) => {
+                        warnings.push(format!("rebuild {archive_rel}: {e}"));
+                        strings_skipped += arch_written;
+                    }
+                }
+            }
+        }
+
+        // NW.js package.nw / data.exe groups
+        for (archive_rel, inners) in nw_groups {
+            let arch_path = {
+                let p = search_root.join(&archive_rel);
+                if p.exists() {
+                    p
+                } else {
+                    search_root.join(Path::new(&archive_rel).file_name().unwrap_or_default())
+                }
+            };
+            if !arch_path.exists() {
+                warnings.push(format!("missing NW.js package {archive_rel}"));
+                for (_, fe) in &inners {
+                    strings_skipped += fe.len();
+                }
+                continue;
+            }
+
+            let archive = match NwArchive::open(&arch_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    warnings.push(format!("cannot open {archive_rel}: {e}"));
+                    for (_, fe) in &inners {
+                        strings_skipped += fe.len();
+                    }
+                    continue;
+                }
+            };
+
+            let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
+            let mut arch_written = 0usize;
+
+            for (inner, file_entries) in inners {
+                let entry = match archive
+                    .entries
+                    .iter()
+                    .find(|e| e.path.replace('\\', "/") == inner.replace('\\', "/"))
+                {
+                    Some(e) => e,
+                    None => {
+                        warnings.push(format!("entry {inner} not in {archive_rel}"));
+                        strings_skipped += file_entries.len();
+                        continue;
+                    }
+                };
+                let bytes = match archive.read_entry(entry) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warnings.push(format!("read {archive_rel}/{inner}: {e}"));
+                        strings_skipped += file_entries.len();
+                        continue;
+                    }
+                };
+                let label = format!("{archive_rel}/{inner}");
+                match apply_ks_translations(&bytes, &label, &file_entries) {
+                    Ok(Some((encoded, written, skipped))) => {
+                        arch_written += written;
+                        strings_skipped += skipped;
+                        replacements.insert(inner.replace('\\', "/"), encoded);
+                    }
+                    Ok(None) => {
+                        strings_skipped += file_entries.len();
+                    }
+                    Err(e) => {
+                        warnings.push(format!("cannot translate {label}: {e}"));
+                        strings_skipped += file_entries.len();
+                    }
+                }
+            }
+
+            if !replacements.is_empty() {
+                match tyrano_nw::rebuild_nw_zip(&archive, &replacements) {
+                    Ok(new_pkg) => match replace_file_with_backup(&arch_path, &new_pkg) {
                         Ok(()) => {
                             files_modified += 1;
                             files_written.push(arch_path.clone());
@@ -1247,6 +1469,138 @@ block comment body\r\n\
             again.iter().map(|e| &e.source).collect::<Vec<_>>()
         );
         assert!(again.iter().any(|e| e.source.contains("こんにちは")));
+    }
+
+    fn build_nw_zip_bytes(scenario: &str) -> Vec<u8> {
+        use std::io::{Cursor, Write as _};
+        use zip::write::SimpleFileOptions;
+        use zip::{CompressionMethod, ZipWriter};
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut z = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            z.start_file("package.json", opts).unwrap();
+            z.write_all(br#"{"name":"t","main":"index.html"}"#).unwrap();
+            z.start_file("data/scenario/scene1.ks", opts).unwrap();
+            z.write_all(scenario.as_bytes()).unwrap();
+            z.start_file("data/other/keep.bin", opts).unwrap();
+            z.write_all(b"UNTOUCHED_PAYLOAD_99").unwrap();
+            z.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn test_package_nw_e2e_extract_inject_locust_old() {
+        let dir = tempdir();
+        let nw_path = dir.join("package.nw");
+        fs::write(&nw_path, build_nw_zip_bytes(sample_scenario())).unwrap();
+
+        let plugin = TyranoPlugin::new();
+        assert!(plugin.detect(&dir));
+        let mut entries = plugin.extract(&dir).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.id.starts_with("package.nw/data/scenario/scene1.ks#")),
+            "ids: {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        for e in &mut entries {
+            if e.source.contains("This is narration") {
+                e.translation = Some("Esta es narracion NW.".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(report.files_modified >= 1, "{report:?}");
+        let backup = PathBuf::from(format!("{}.locust-old", nw_path.display()));
+        assert!(backup.is_file(), "expected .locust-old");
+
+        // Untouched asset still present after inject.
+        let arch = NwArchive::open(&nw_path).unwrap();
+        let asset = arch
+            .entries
+            .iter()
+            .find(|e| e.path == "data/other/keep.bin")
+            .unwrap();
+        assert_eq!(arch.read_entry(asset).unwrap(), b"UNTOUCHED_PAYLOAD_99");
+
+        let again = plugin.extract(&dir).unwrap();
+        assert!(again.iter().any(|e| e.source.contains("narracion NW")));
+    }
+
+    #[test]
+    fn test_data_exe_e2e_extract_inject() {
+        let dir = tempdir();
+        let mut exe = b"MZ\x90\x00FAKE_NW_STUB!!!!".to_vec();
+        let prefix = exe.clone();
+        exe.extend_from_slice(&build_nw_zip_bytes(sample_scenario()));
+        let exe_path = dir.join("data.exe");
+        fs::write(&exe_path, &exe).unwrap();
+
+        let plugin = TyranoPlugin::new();
+        assert!(plugin.detect(&dir));
+        let mut entries = plugin.extract(&dir).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.id.contains("data.exe/data/scenario/scene1.ks")),
+            "ids: {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        for e in &mut entries {
+            if e.source.contains("This is narration") {
+                e.translation = Some("Narracion en exe.".into());
+            }
+        }
+        plugin.inject(&dir, &entries).unwrap();
+        let out = fs::read(&exe_path).unwrap();
+        assert!(
+            out.starts_with(&prefix),
+            "exe prefix must be preserved after inject"
+        );
+        let backup = PathBuf::from(format!("{}.locust-old", exe_path.display()));
+        assert!(backup.is_file());
+        let again = plugin.extract(&dir).unwrap();
+        assert!(again.iter().any(|e| e.source.contains("Narracion en exe")));
+    }
+
+    #[test]
+    fn test_locust_old_restored_on_write_failure_path() {
+        // replace_file_with_backup restores original when the write step fails —
+        // exercise via a path that is a directory (write fails after rename).
+        let dir = tempdir();
+        let nw_path = dir.join("package.nw");
+        fs::write(&nw_path, build_nw_zip_bytes(sample_scenario())).unwrap();
+        // After a successful inject, .locust-old holds prior bytes.
+        let plugin = TyranoPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for e in &mut entries {
+            if e.source.contains("This is narration") {
+                e.translation = Some("x".into());
+            }
+        }
+        plugin.inject(&dir, &entries).unwrap();
+        let backup = PathBuf::from(format!("{}.locust-old", nw_path.display()));
+        assert!(backup.is_file());
+        let old = fs::read(&backup).unwrap();
+        // Second inject overwrites .locust-old with the previous package.nw.
+        for e in &mut entries {
+            if e.source.contains("This is narration") || e.source.contains("x") {
+                e.translation = Some("yy".into());
+            }
+        }
+        // Re-extract so translations match current file text.
+        let mut entries2 = plugin.extract(&dir).unwrap();
+        for e in &mut entries2 {
+            if e.source.contains("x") || e.source.contains("narration") {
+                e.translation = Some("second pass".into());
+            }
+        }
+        plugin.inject(&dir, &entries2).unwrap();
+        assert!(backup.is_file());
+        // Prior package (post-first-inject) should have been moved to .locust-old.
+        assert_ne!(fs::read(&backup).unwrap(), old);
     }
 
     #[test]

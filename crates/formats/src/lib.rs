@@ -12,6 +12,7 @@ pub mod qsp;
 // tyrano before kirikiri: both may see loose .ks; Tyrano claims data/scenario/ + tyrano/ trees.
 pub mod tyrano;
 pub mod tyrano_asar;
+pub mod tyrano_nw;
 pub mod kirikiri;
 pub mod kirikiri_xp3;
 pub mod yuris;

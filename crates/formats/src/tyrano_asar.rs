@@ -19,8 +19,8 @@
 //! `"integrity"` (Electron only enforces it when packaged with fuses).
 //!
 //! # Out of scope
-//! NW.js `package.nw` / `data.exe`, compressed asar variants, fuse-gated integrity
-//! recompute.
+//! Compressed asar variants, fuse-gated integrity recompute.
+//! (NW.js `package.nw` / `data.exe` live in [`crate::tyrano_nw`].)
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
