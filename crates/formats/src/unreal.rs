@@ -122,6 +122,10 @@ impl UnrealPlugin {
                     // locres is not supported — see inject warnings). Mark source.
                     let mut loc_entries = locres_to_entries(&file, file_path);
                     for e in &mut loc_entries {
+                        // A pak carries one locres blob PER CULTURE with identical
+                        // namespace/key sets — the blob offset keeps ids unique so
+                        // cultures don't silently overwrite each other in the DB.
+                        e.id = format!("locres@{off}/{}", e.id);
                         e.metadata.insert(
                             "locres_embedded".to_string(),
                             serde_json::Value::Bool(true),
