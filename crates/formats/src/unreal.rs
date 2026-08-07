@@ -6,6 +6,10 @@ use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 use crate::unreal_locres::{self, LocresFile};
+use crate::unreal_pak::{
+    self, payload_offset, read_footer, read_index, record_containing_offset, write_pak,
+    writable_version, PakWriteFile, DEFAULT_MOUNT_POINT,
+};
 
 /// Plugin for Unreal Engine games.
 /// Scans .pak files and loose localization files for translatable strings.
@@ -118,8 +122,7 @@ impl UnrealPlugin {
                     for (_ns, _key, value, _) in file.iter_entries() {
                         locres_values.insert(value.to_string());
                     }
-                    // file_path stays the pak (inject of embedded variable-length
-                    // locres is not supported — see inject warnings). Mark source.
+                    // file_path stays the pak; inject builds a sibling *_LOCUST_P.pak.
                     let mut loc_entries = locres_to_entries(&file, file_path);
                     for e in &mut loc_entries {
                         // A pak carries one locres blob PER CULTURE with identical
@@ -201,6 +204,175 @@ fn is_locres_entry(entry: &StringEntry) -> bool {
         .and_then(|v| v.as_str())
         == Some("locres")
         || is_locres_path(&entry.file_path)
+}
+
+fn find_record_for_locres_offset(
+    index: &unreal_pak::PakIndex,
+    off: u64,
+) -> Option<&unreal_pak::PakRecord> {
+    if let Some(r) = record_containing_offset(index, off) {
+        return Some(r);
+    }
+    let ver = index.footer.version;
+    index.records.iter().find(|r| {
+        let po = payload_offset(r, ver);
+        off >= po && off < po.saturating_add(r.size.max(1))
+    })
+}
+
+/// Group embedded locres entries by `locres_offset`, apply translations, write
+/// one `<base>_LOCUST_P.pak` beside the source pak.
+///
+/// Returns `(strings_written, strings_skipped, optional_patch_path)`.
+fn inject_embedded_locres_patch_pak(
+    pak_path: &Path,
+    entries: &[&StringEntry],
+    warnings: &mut Vec<String>,
+) -> Result<(usize, usize, Option<PathBuf>)> {
+    let label = pak_path.display().to_string();
+    let pak_bytes = std::fs::read(pak_path)?;
+    let footer = read_footer(&pak_bytes, &label).map_err(|e| LocustError::ParseError {
+        file: label.clone(),
+        message: e.message,
+    })?;
+    let write_ver = writable_version(footer.version).map_err(|e| LocustError::ParseError {
+        file: label.clone(),
+        message: e.message,
+    })?;
+
+    // Classic index for path lookup; if unavailable (v9+ path-hash), fall back
+    // to synthetic paths from offsets so we still produce a usable patch pak.
+    let index = read_index(&pak_bytes, &label).ok();
+    let mount = index
+        .as_ref()
+        .map(|i| i.mount_point.clone())
+        .unwrap_or_else(|| DEFAULT_MOUNT_POINT.to_string());
+
+    // offset → list of entries
+    let mut by_off: HashMap<u64, Vec<&StringEntry>> = HashMap::new();
+    let mut skipped = 0usize;
+    for e in entries {
+        let Some(off) = e
+            .metadata
+            .get("locres_offset")
+            .and_then(|v| v.as_u64())
+            .or_else(|| e.metadata.get("locres_offset").and_then(|v| v.as_i64()).map(|i| i as u64))
+        else {
+            warnings.push(format!("entry '{}' missing locres_offset", e.id));
+            skipped += 1;
+            continue;
+        };
+        by_off.entry(off).or_default().push(*e);
+    }
+
+    let mut pak_files: Vec<PakWriteFile> = Vec::new();
+    let mut written = 0usize;
+
+    for (off, group) in by_off {
+        if off as usize >= pak_bytes.len() {
+            warnings.push(format!("locres_offset {off} past EOF of {label}"));
+            skipped += group.len();
+            continue;
+        }
+        let mut loc = match LocresFile::parse(&pak_bytes[off as usize..], &format!("{label}+@{off}"))
+        {
+            Ok(l) => l,
+            Err(e) => {
+                warnings.push(format!("parse locres @{off}: {e}"));
+                skipped += group.len();
+                continue;
+            }
+        };
+
+        let mut map = HashMap::new();
+        let mut pending = 0usize;
+        for e in &group {
+            let Some(t) = e.translation.as_ref() else {
+                skipped += 1;
+                continue;
+            };
+            if t == &e.source {
+                skipped += 1;
+                continue;
+            }
+            // Strip "locres@<off>/" prefix from id for key lookup.
+            let key_id = e
+                .id
+                .strip_prefix(&format!("locres@{off}/"))
+                .unwrap_or(e.id.as_str());
+            map.insert(key_id.to_string(), t.clone());
+            pending += 1;
+        }
+        if map.is_empty() {
+            continue;
+        }
+        let n = loc.apply_translations(&map);
+        if n == 0 {
+            skipped += pending;
+            warnings.push(format!(
+                "locres @{off}: no keys matched for {pending} translation(s)"
+            ));
+            continue;
+        }
+        if pending > n {
+            skipped += pending - n;
+        }
+        written += n;
+
+        let payload = loc.serialize().map_err(|e| LocustError::ParseError {
+            file: label.clone(),
+            message: format!("serialize locres @{off}: {e}"),
+        })?;
+
+        // Resolve inner path from pak index when possible.
+        let inner_name = if let Some(ref idx) = index {
+            find_record_for_locres_offset(idx, off)
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| {
+                    format!("TestGame/Content/Localization/locres_{off}.locres")
+                })
+        } else {
+            format!("TestGame/Content/Localization/locres_{off}.locres")
+        };
+
+        pak_files.push(PakWriteFile {
+            name: inner_name,
+            data: payload,
+        });
+    }
+
+    if pak_files.is_empty() {
+        return Ok((written, skipped, None));
+    }
+
+    let patch_bytes = write_pak(&mount, write_ver, &pak_files, &label).map_err(|e| {
+        LocustError::ParseError {
+            file: label.clone(),
+            message: e.message,
+        }
+    })?;
+
+    let out_path = unreal_pak::patch_pak_path(pak_path);
+    if out_path.exists() {
+        // Safety rename if replacing different content.
+        let existing = std::fs::read(&out_path).unwrap_or_default();
+        if existing != patch_bytes {
+            let backup = {
+                let mut s = out_path.to_string_lossy().into_owned();
+                s.push_str(".locust-old");
+                PathBuf::from(s)
+            };
+            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::rename(&out_path, &backup);
+        }
+    }
+    std::fs::write(&out_path, &patch_bytes)?;
+    warnings.push(format!(
+        "wrote localization patch pak {} (version {write_ver}, {} file(s))",
+        out_path.display(),
+        pak_files.len()
+    ));
+    Ok((written, skipped, Some(out_path)))
 }
 
 fn locres_to_entries(file: &LocresFile, file_path: &Path) -> Vec<StringEntry> {
@@ -354,7 +526,7 @@ impl FormatPlugin for UnrealPlugin {
     }
 
     fn description(&self) -> &str {
-        "Unreal Engine (.pak heuristic UTF-16LE + structural .locres read/write)"
+        "Unreal Engine (.pak heuristic UTF-16LE + structural .locres; patch *_LOCUST_P.pak)"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -525,18 +697,39 @@ impl FormatPlugin for UnrealPlugin {
             }
 
             if any_locres && !is_locres_path(file_path) {
-                // Embedded locres inside a pak — variable-length rewrite not supported.
-                for e in file_entries {
-                    if is_locres_entry(e)
-                        && e.metadata.get("locres_embedded") == Some(&serde_json::Value::Bool(true))
-                        {
+                // Embedded locres → rebuild into sibling *_LOCUST_P.pak (UE mounts
+                // patch paks over the base; no base rewrite).
+                let embedded: Vec<&StringEntry> = file_entries
+                    .iter()
+                    .copied()
+                    .filter(|e| {
+                        is_locres_entry(e)
+                            && e.metadata.get("locres_embedded")
+                                == Some(&serde_json::Value::Bool(true))
+                    })
+                    .collect();
+                if !embedded.is_empty() {
+                    match inject_embedded_locres_patch_pak(
+                        file_path,
+                        &embedded,
+                        &mut warnings,
+                    ) {
+                        Ok((written, skipped, patch_path)) => {
+                            strings_written += written;
+                            strings_skipped += skipped;
+                            if let Some(p) = patch_path {
+                                files_modified += 1;
+                                files_written.push(p);
+                            }
+                        }
+                        Err(e) => {
                             warnings.push(format!(
-                                "skipping embedded locres entry '{}' in {} — export/replace a loose .locres to rewrite",
-                                e.id,
+                                "embedded locres patch pak for {}: {e}",
                                 file_path.display()
                             ));
-                            strings_skipped += 1;
+                            strings_skipped += embedded.len();
                         }
+                    }
                 }
                 // Fall through for any non-locres entries sharing the same file_path.
                 if all_locres {
@@ -1027,6 +1220,104 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("locres")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_embedded_locres_inject_writes_locust_p_pak() {
+        use crate::unreal_locres::{
+            str_crc32_ue, LocresFile, LocresNamespace, LocresString, LocresVersion,
+        };
+        use crate::unreal_pak::{read_index, write_pak, PakWriteFile, DEFAULT_MOUNT_POINT};
+
+        let dir = tempdir();
+        let paks = dir.join("TestGame").join("Content").join("Paks");
+        fs::create_dir_all(&paks).unwrap();
+
+        let loc = LocresFile {
+            version: LocresVersion::Compact,
+            namespaces: vec![LocresNamespace {
+                name: "Dialog".into(),
+                name_hash: 0,
+                strings: vec![LocresString {
+                    key: "Greeting".into(),
+                    value: "Hello traveler".into(),
+                    source_string_hash: str_crc32_ue("Hello traveler"),
+                    key_hash: 0,
+                }],
+            }],
+        };
+        let loc_bytes = loc.serialize().unwrap();
+        let inner = "TestGame/Content/Localization/Game/es/Game.locres";
+        let base_bytes = write_pak(
+            DEFAULT_MOUNT_POINT,
+            8,
+            &[PakWriteFile {
+                name: inner.into(),
+                data: loc_bytes,
+            }],
+            "base.pak",
+        )
+        .unwrap();
+        let base_path = paks.join("Game.pak");
+        fs::write(&base_path, &base_bytes).unwrap();
+
+        let plugin = UnrealPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        let loc_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                e.metadata.get("locres_embedded") == Some(&serde_json::Value::Bool(true))
+            })
+            .cloned()
+            .collect();
+        assert!(
+            !loc_entries.is_empty(),
+            "expected embedded locres entries, got {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        for e in &mut entries {
+            if e.source == "Hello traveler" {
+                e.translation = Some("Hola viajero desde patch pak".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(
+            report.strings_written >= 1,
+            "written={} warnings={:?}",
+            report.strings_written,
+            report.warnings
+        );
+        assert!(
+            report
+                .files_written
+                .iter()
+                .any(|p| p.to_string_lossy().contains("_LOCUST_P.pak")),
+            "files_written={:?}",
+            report.files_written
+        );
+
+        let patch_path = paks.join("Game_LOCUST_P.pak");
+        assert!(patch_path.is_file(), "missing {}", patch_path.display());
+        let patch = fs::read(&patch_path).unwrap();
+        let idx = read_index(&patch, "patch").unwrap();
+        assert_eq!(idx.records.len(), 1);
+        assert!(idx.records[0].name.contains("Game.locres"));
+
+        // Decode locres from patch payload
+        let rec = &idx.records[0];
+        let poff = crate::unreal_pak::payload_offset(rec, idx.footer.version) as usize;
+        let payload = &patch[poff..poff + rec.size as usize];
+        let parsed = LocresFile::parse(payload, "patch-locres").unwrap();
+        assert!(
+            parsed
+                .iter_entries()
+                .any(|(_, _, v, _)| v.contains("Hola viajero")),
+            "patch locres missing translation"
+        );
+        // Base pak unchanged
+        assert_eq!(fs::read(&base_path).unwrap(), base_bytes);
         let _ = fs::remove_dir_all(&dir);
     }
 }

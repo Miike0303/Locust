@@ -3206,6 +3206,7 @@ dependencies = [
  "miniz_oxide",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
