@@ -28,8 +28,12 @@ pub struct EntryFilter {
 /// tokens/time/cost ledger.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TranslationRun {
+    /// Auto-increment primary key (0 when constructing a run to insert).
+    #[serde(default)]
+    pub id: i64,
     pub started_at: String,
     pub duration_secs: f64,
+    /// Provider id, or a chain summary when multiple were used (e.g. `"a→b"`).
     pub provider: String,
     pub source_lang: String,
     pub target_lang: String,
@@ -807,25 +811,28 @@ impl Database {
         Ok(langs)
     }
 
+    /// All ledger rows, oldest first (CLI `stats` chronological table).
+    /// Callers that want newest-first (HTTP UI) reverse the slice.
     pub fn get_translation_runs(&self) -> Result<Vec<TranslationRun>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT started_at, duration_secs, provider, source_lang, target_lang,
+            "SELECT id, started_at, duration_secs, provider, source_lang, target_lang,
                     strings_translated, tokens_used, input_tokens, output_tokens, cost_usd
-             FROM translation_runs ORDER BY started_at ASC",
+             FROM translation_runs ORDER BY started_at ASC, id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(TranslationRun {
-                started_at: row.get(0)?,
-                duration_secs: row.get(1)?,
-                provider: row.get(2)?,
-                source_lang: row.get(3)?,
-                target_lang: row.get(4)?,
-                strings_translated: row.get::<_, i64>(5)? as usize,
-                tokens_used: row.get::<_, i64>(6)? as u64,
-                input_tokens: row.get::<_, i64>(7)? as u64,
-                output_tokens: row.get::<_, i64>(8)? as u64,
-                cost_usd: row.get(9)?,
+                id: row.get(0)?,
+                started_at: row.get(1)?,
+                duration_secs: row.get(2)?,
+                provider: row.get(3)?,
+                source_lang: row.get(4)?,
+                target_lang: row.get(5)?,
+                strings_translated: row.get::<_, i64>(6)? as usize,
+                tokens_used: row.get::<_, i64>(7)? as u64,
+                input_tokens: row.get::<_, i64>(8)? as u64,
+                output_tokens: row.get::<_, i64>(9)? as u64,
+                cost_usd: row.get(10)?,
             })
         })?;
         let mut runs = Vec::new();
@@ -1893,6 +1900,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         rt.block_on(async {
             db.record_translation_run(&TranslationRun {
+                id: 0,
                 started_at: "2026-01-01T00:00:00Z".into(),
                 duration_secs: 1.0,
                 provider: "mock".into(),
@@ -1907,6 +1915,7 @@ mod tests {
             .await
             .unwrap();
             db.record_translation_run(&TranslationRun {
+                id: 0,
                 started_at: "2026-01-02T00:00:00Z".into(),
                 duration_secs: 1.0,
                 provider: "mock".into(),

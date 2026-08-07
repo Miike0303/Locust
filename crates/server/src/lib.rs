@@ -15,7 +15,9 @@ use tower_http::cors::CorsLayer;
 
 use locust_core::backup::{BackupEntry, BackupManager};
 use locust_core::config::AppConfig;
-use locust_core::database::{Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, ProjectStats};
+use locust_core::database::{
+    Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, ProjectStats, TranslationRun,
+};
 use locust_core::export;
 use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
 use locust_core::font_validation::{FontCoverageReport, FontValidator};
@@ -164,6 +166,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/strings/batch", post(batch_patch_strings))
         .route("/api/strings/:id", get(get_string).patch(patch_string))
         .route("/api/stats", get(get_stats))
+        .route("/api/runs", get(list_translation_runs))
         .route("/api/translate/start", post(translate_start))
         .route("/api/translate/cancel/:job_id", post(translate_cancel))
         .route("/api/translate/ws/:job_id", get(translate_ws))
@@ -522,6 +525,18 @@ async fn get_stats(
         .get_stats()
         .map(Json)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Translation run ledger (same rows as CLI `locust stats`), newest first.
+async fn list_translation_runs(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<TranslationRun>>, ApiError> {
+    let mut runs = state
+        .db
+        .get_translation_runs()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    runs.reverse();
+    Ok(Json(runs))
 }
 
 #[derive(Deserialize)]
@@ -1410,6 +1425,83 @@ mod tests {
         assert!(body.get("total").is_some());
         assert!(body.get("pending").is_some());
         assert!(body.get("translated").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_translation_runs_seeded() {
+        use locust_core::database::TranslationRun;
+
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .record_translation_run(&TranslationRun {
+                id: 0,
+                started_at: "2026-03-15T12:34:56Z".into(),
+                duration_secs: 42.5,
+                provider: "mock→deepl".into(),
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                strings_translated: 12,
+                tokens_used: 100,
+                input_tokens: 60,
+                output_tokens: 40,
+                cost_usd: 0.0012,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .record_translation_run(&TranslationRun {
+                id: 0,
+                started_at: "2026-03-16T08:00:00Z".into(),
+                duration_secs: 10.0,
+                provider: "mock".into(),
+                source_lang: "en".into(),
+                target_lang: "fr".into(),
+                strings_translated: 3,
+                tokens_used: 20,
+                input_tokens: 10,
+                output_tokens: 10,
+                cost_usd: 0.0001,
+            })
+            .await
+            .unwrap();
+
+        let resp = client()
+            .get(format!("{}/api/runs", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+        assert_eq!(body.len(), 2, "{body:?}");
+        // Newest first
+        assert_eq!(body[0]["started_at"], "2026-03-16T08:00:00Z");
+        assert_eq!(body[0]["provider"], "mock");
+        assert_eq!(body[0]["target_lang"], "fr");
+        assert_eq!(body[1]["provider"], "mock→deepl");
+        assert_eq!(body[1]["strings_translated"], 12);
+        assert_eq!(body[1]["input_tokens"], 60);
+        assert_eq!(body[1]["output_tokens"], 40);
+        assert!((body[1]["cost_usd"].as_f64().unwrap() - 0.0012).abs() < 1e-9);
+        assert!((body[1]["duration_secs"].as_f64().unwrap() - 42.5).abs() < 1e-9);
+        assert!(body[0]["id"].as_i64().unwrap() >= 1);
+        // All ledger columns present
+        for key in [
+            "id",
+            "started_at",
+            "duration_secs",
+            "provider",
+            "source_lang",
+            "target_lang",
+            "strings_translated",
+            "tokens_used",
+            "input_tokens",
+            "output_tokens",
+            "cost_usd",
+        ] {
+            assert!(body[0].get(key).is_some(), "missing {key}");
+        }
     }
 
     #[tokio::test]

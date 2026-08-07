@@ -6,10 +6,18 @@ import {
   getProviders, checkProviderHealth, getConfig, updateConfig,
   getBackups, restoreBackup, deleteBackup,
   getGlossary, addGlossaryEntry, deleteGlossaryEntry,
+  getTranslationRuns,
 } from "../lib/api";
-import type { GlossaryEntry } from "../lib/api";
+import type { GlossaryEntry, TranslationRun } from "../lib/api";
 
-const SECTIONS = ["Providers", "Translation Defaults", "Appearance", "Glossary", "Data"] as const;
+const SECTIONS = [
+  "Providers",
+  "Translation Defaults",
+  "Appearance",
+  "Glossary",
+  "History",
+  "Data",
+] as const;
 type Section = (typeof SECTIONS)[number];
 
 export default function Settings() {
@@ -38,8 +46,165 @@ export default function Settings() {
         {section === "Translation Defaults" && <DefaultsSection />}
         {section === "Appearance" && <AppearanceSection />}
         {section === "Glossary" && <GlossarySection />}
+        {section === "History" && <HistorySection />}
         {section === "Data" && <DataSection />}
       </div>
+    </div>
+  );
+}
+
+function formatRunDate(iso: string): string {
+  if (!iso) return "—";
+  // Prefer local short form; fall back to first 16 chars of ISO.
+  const d = new Date(iso);
+  if (!Number.isNaN(d.getTime())) {
+    return d.toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+  return iso.length >= 16 ? iso.slice(0, 16) : iso;
+}
+
+function formatDuration(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+function HistorySection() {
+  const { data: runs, isLoading, isError, error, refetch } = useQuery({
+    queryKey: ["translation-runs"],
+    queryFn: getTranslationRuns,
+  });
+
+  const totals = useMemo(() => {
+    const list = runs ?? [];
+    return list.reduce(
+      (acc, r) => {
+        acc.strings += r.strings_translated;
+        acc.tokens += r.tokens_used;
+        acc.input += r.input_tokens;
+        acc.output += r.output_tokens;
+        acc.cost += r.cost_usd;
+        acc.secs += r.duration_secs;
+        return acc;
+      },
+      { strings: 0, tokens: 0, input: 0, output: 0, cost: 0, secs: 0 }
+    );
+  }, [runs]);
+
+  return (
+    <div className="space-y-4 max-w-5xl">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-xl font-bold">Translation history</h2>
+          <p className="text-sm text-gray-500 mt-1">
+            Past runs for this project (provider, cost, tokens, duration). Same ledger as{" "}
+            <code className="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">locust stats</code>.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => refetch()}
+          className="text-sm text-emerald-700 hover:underline dark:text-emerald-400"
+        >
+          Refresh
+        </button>
+      </div>
+
+      {isLoading && (
+        <div className="flex items-center gap-2 text-sm text-gray-500">
+          <Loader size={16} className="animate-spin" /> Loading runs…
+        </div>
+      )}
+
+      {isError && (
+        <div className="text-sm text-red-600 dark:text-red-400">
+          Failed to load runs: {(error as Error)?.message ?? "unknown error"}
+        </div>
+      )}
+
+      {!isLoading && !isError && (runs?.length ?? 0) === 0 && (
+        <div className="border border-dashed border-gray-300 dark:border-gray-600 rounded-lg p-8 text-center text-sm text-gray-500">
+          No translation runs recorded yet. Run a translation from the Editor to populate this
+          history.
+        </div>
+      )}
+
+      {!isLoading && !isError && (runs?.length ?? 0) > 0 && (
+        <div className="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 dark:bg-gray-800/80 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                <th className="px-3 py-2">Date</th>
+                <th className="px-3 py-2">Provider</th>
+                <th className="px-3 py-2">Langs</th>
+                <th className="px-3 py-2 text-right">Strings</th>
+                <th className="px-3 py-2 text-right">Tokens</th>
+                <th className="px-3 py-2 text-right">In</th>
+                <th className="px-3 py-2 text-right">Out</th>
+                <th className="px-3 py-2 text-right">Cost (USD)</th>
+                <th className="px-3 py-2 text-right">Duration</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+              {runs!.map((r: TranslationRun) => (
+                <tr key={r.id} className="hover:bg-gray-50/80 dark:hover:bg-gray-800/40">
+                  <td className="px-3 py-2 whitespace-nowrap text-gray-700 dark:text-gray-300">
+                    {formatRunDate(r.started_at)}
+                  </td>
+                  <td className="px-3 py-2 font-mono text-xs" title={r.provider}>
+                    {r.provider}
+                  </td>
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    {r.source_lang}→{r.target_lang}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">{r.strings_translated}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{r.tokens_used}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                    {r.input_tokens}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                    {r.output_tokens}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    {r.cost_usd.toFixed(4)}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums whitespace-nowrap">
+                    {formatDuration(r.duration_secs)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr className="bg-gray-50 dark:bg-gray-800/80 font-semibold text-gray-800 dark:text-gray-200 border-t border-gray-200 dark:border-gray-700">
+                <td className="px-3 py-2" colSpan={3}>
+                  Total ({runs!.length} run{runs!.length === 1 ? "" : "s"})
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums">{totals.strings}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{totals.tokens}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                  {totals.input}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                  {totals.output}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {totals.cost.toFixed(4)}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums whitespace-nowrap">
+                  {formatDuration(totals.secs)}
+                </td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

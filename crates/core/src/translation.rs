@@ -551,6 +551,7 @@ impl TranslationManager {
 
         if completed > 0 {
             let run = crate::database::TranslationRun {
+                id: 0,
                 started_at,
                 duration_secs: duration,
                 provider: self.provider.id().to_string(),

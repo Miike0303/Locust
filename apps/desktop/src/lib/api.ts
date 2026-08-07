@@ -409,6 +409,28 @@ export async function importTranslations(
   };
 }
 
+// ─── Translation run history ─────────────────────────────────────────────
+
+/** Mirrors core::database::TranslationRun (all ledger columns). */
+export interface TranslationRun {
+  id: number;
+  started_at: string;
+  duration_secs: number;
+  /** Single provider or chain like "mock→deepl". */
+  provider: string;
+  source_lang: string;
+  target_lang: string;
+  strings_translated: number;
+  tokens_used: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+}
+
+/** Newest-first list of translation runs for the open project. */
+export const getTranslationRuns = (): Promise<TranslationRun[]> =>
+  request("/runs");
+
 export const getConfig = (): Promise<AppConfig> =>
   IS_TAURI ? invoke("get_config") : request("/config");
 
