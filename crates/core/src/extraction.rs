@@ -164,7 +164,7 @@ impl FormatRegistry {
 
         // No display-only light-novel stub: TyranoBuilder, NScripter, KiriKiri,
         // and YU-RIS are real plugins in `locust-formats` (Experimental). Leftover
-        // work is archive/engine-adjacent (YPF, XP3, asar, NSA, …) on those plugins.
+        // work is archive/engine-adjacent leftovers (cxdec, exotic YPF schemes, asar, NSA, …).
 
         // Usable engines first: stable → experimental → coming soon, then id.
         out.sort_by(|a, b| {

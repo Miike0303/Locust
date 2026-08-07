@@ -13,6 +13,7 @@ pub mod tyrano;
 pub mod kirikiri;
 pub mod kirikiri_xp3;
 pub mod yuris;
+pub mod yuris_ypf;
 pub mod nscripter;
 
 use locust_core::extraction::FormatRegistry;

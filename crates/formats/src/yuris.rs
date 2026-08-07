@@ -26,8 +26,11 @@
 //! plaintext 0, so the encrypted u32 at `attr_section_start+8` *is* the key
 //! (VNTextPatch; verified on Injuu Kangoku RE yst00000–04 / yst00042 → B4 62 6A D8).
 //!
-//! Out of scope: YPF archive unpack, ysc.ybn command-name table (WORD/_/GOSUB
-//! filtering uses structural heuristics instead — over-extraction OK).
+//! YPF containers: see [`crate::yuris_ypf`] (GARbro ArcYPF layout; inject rebuilds
+//! the archive in place with a `.locust-old` safety rename).
+//!
+//! Out of scope: ysc.ybn command-name table (WORD/_/GOSUB filtering uses structural
+//! heuristics instead — over-extraction OK); exotic per-title YPF swap schemes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +38,9 @@ use std::path::{Path, PathBuf};
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
+use tracing::warn;
+
+use crate::yuris_ypf::{self, YpfArchive};
 
 const YSTB_MAGIC: &[u8; 4] = b"YSTB";
 const HEADER_SIZE: usize = 0x20;
@@ -90,35 +96,52 @@ impl YurisPlugin {
         out
     }
 
-    fn has_ypf(root: &Path) -> bool {
+    /// Top-level `*.ypf` plus `ysbin/*.ypf` (common YU-RIS layout).
+    fn find_ypf_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
         if root.is_file() {
-            return Self::is_ypf(root);
+            if Self::is_ypf(root) {
+                out.push(root.to_path_buf());
+            }
+            return out;
         }
         if !root.is_dir() {
-            return false;
+            return out;
         }
-        walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .any(|e| e.path().is_file() && Self::is_ypf(e.path()))
+        let mut push_ypf = |dir: &Path| {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_file() && Self::is_ypf(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+        };
+        push_ypf(root);
+        let ysbin = root.join("ysbin");
+        if ysbin.is_dir() {
+            push_ypf(&ysbin);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn has_ypf(root: &Path) -> bool {
+        !Self::find_ypf_files(root).is_empty()
     }
 
     fn has_ybn_or_ypf(root: &Path) -> bool {
-        if root.is_file() {
-            return Self::is_ybn(root) || Self::is_ypf(root);
+        !Self::find_ybn_files(root).is_empty() || Self::has_ypf(root)
+    }
+
+    fn root_dir(path: &Path) -> PathBuf {
+        if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
         }
-        if !root.is_dir() {
-            return false;
-        }
-        walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .any(|e| {
-                let p = e.path();
-                p.is_file() && (Self::is_ybn(p) || Self::is_ypf(p))
-            })
     }
 }
 
@@ -648,6 +671,88 @@ fn inject_into_ystb(ystb: &DecryptedYstb, translations: &HashMap<usize, &str>) -
     Ok(out)
 }
 
+/// Extract string entries from one YSTB payload. `rel` is the id prefix;
+/// `file_path` is stored for inject routing (loose path or `archive.ypf/inner`).
+fn entries_from_ystb_bytes(
+    bytes: &[u8],
+    rel: &str,
+    file_path: PathBuf,
+) -> Result<Vec<StringEntry>> {
+    let Some(ystb) = load_ystb(bytes, rel)? else {
+        return Ok(Vec::new());
+    };
+    let mut all = Vec::with_capacity(ystb.strings.len());
+    for s in &ystb.strings {
+        let id = format!("{rel}#arg{}", s.arg_index);
+        let mut entry = StringEntry::new(id, &s.text, file_path.clone());
+        entry.tags = vec!["dialogue".into()];
+        entry.context = Some(format!("attr_type={}", s.attr_type));
+        all.push(entry);
+    }
+    Ok(all)
+}
+
+fn translations_from_entries<'a>(
+    file_entries: &[&'a StringEntry],
+) -> (HashMap<usize, &'a str>, usize) {
+    let mut translations = HashMap::new();
+    let mut skipped = 0usize;
+    for e in file_entries {
+        let Some(t) = e.translation.as_deref() else {
+            skipped += 1;
+            continue;
+        };
+        if let Some(pos) = e.id.rfind("#arg") {
+            if let Ok(idx) = e.id[pos + 4..].parse::<usize>() {
+                translations.insert(idx, t);
+                continue;
+            }
+        }
+        skipped += 1;
+    }
+    (translations, skipped)
+}
+
+/// Split `ysbin/test.ypf/yst00000.ybn` → (`ysbin/test.ypf` relative path, `yst00000.ybn`).
+fn split_ypf_virtual_path(path: &Path) -> Option<(String, String)> {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let lower = s.to_ascii_lowercase();
+    let idx = lower.find(".ypf/")?;
+    let archive = s[..=idx + 3].to_string();
+    let inner = s[idx + 5..].to_string();
+    if inner.is_empty() {
+        return None;
+    }
+    Some((archive, inner))
+}
+
+/// Replace `path` with `new_bytes` after moving the original to `path` + `.locust-old`.
+/// Restores the backup if the write fails.
+fn replace_file_with_backup(path: &Path, new_bytes: &[u8]) -> Result<()> {
+    let backup = {
+        let mut s = path.to_string_lossy().into_owned();
+        s.push_str(".locust-old");
+        PathBuf::from(s)
+    };
+    if backup.exists() {
+        std::fs::remove_file(&backup).ok();
+    }
+    std::fs::rename(path, &backup).map_err(|e| {
+        parse_err(
+            &path.display().to_string(),
+            format!("cannot move aside for backup: {e}"),
+        )
+    })?;
+    if let Err(e) = std::fs::write(path, new_bytes) {
+        let _ = std::fs::rename(&backup, path);
+        return Err(parse_err(
+            &path.display().to_string(),
+            format!("write failed after backup (restored): {e}"),
+        ));
+    }
+    Ok(())
+}
+
 // ─── FormatPlugin ──────────────────────────────────────────────────────────
 
 impl FormatPlugin for YurisPlugin {
@@ -660,7 +765,7 @@ impl FormatPlugin for YurisPlugin {
     }
 
     fn description(&self) -> &str {
-        "YU-RIS loose YSTB .ybn scripts (XOR; Shift-JIS); YPF archives not yet"
+        "YU-RIS YSTB .ybn (XOR; Shift-JIS) + YPF unpack/repack (common versions)"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -680,27 +785,19 @@ impl FormatPlugin for YurisPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        let root = Self::root_dir(path);
         let ybn_files = Self::find_ybn_files(path);
-        if ybn_files.is_empty() {
-            if Self::has_ypf(path) {
-                return Err(parse_err(
-                    &path.display().to_string(),
-                    "no loose .ybn scripts; ypf archives not yet supported",
-                ));
-            }
+        let ypf_files = Self::find_ypf_files(path);
+
+        if ybn_files.is_empty() && ypf_files.is_empty() {
             return Err(parse_err(
                 &path.display().to_string(),
-                "no .ybn script files found",
+                "no .ybn script files or .ypf archives found",
             ));
         }
 
-        let root = if path.is_dir() {
-            path.to_path_buf()
-        } else {
-            path.parent().unwrap_or(path).to_path_buf()
-        };
-
         let mut all = Vec::new();
+
         for fpath in &ybn_files {
             let bytes = std::fs::read(fpath)?;
             let rel = fpath
@@ -708,19 +805,85 @@ impl FormatPlugin for YurisPlugin {
                 .unwrap_or(fpath.as_path())
                 .to_string_lossy()
                 .replace('\\', "/");
-            let Some(ystb) = load_ystb(&bytes, &rel)? else {
-                // Non-YSTB (YSTD stub etc.): skip, no error.
-                continue;
+            // Loose files stay loud: a corrupt YSTB is an Err naming the file
+            // (audited contract; warn+skip is only for entries inside a YPF).
+            all.extend(entries_from_ystb_bytes(&bytes, &rel, fpath.clone())?);
+        }
+
+        let mut ypf_parse_errors = 0usize;
+        let mut last_ypf_err = String::new();
+        let mut ybn_seen = 0usize;
+        let mut ybn_skipped = 0usize;
+
+        for arch_path in &ypf_files {
+            let arch_rel = arch_path
+                .strip_prefix(&root)
+                .unwrap_or(arch_path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            let archive = match YpfArchive::open(arch_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    ypf_parse_errors += 1;
+                    last_ypf_err = e.to_string();
+                    warn!(archive = %arch_rel, error = %e, "failed to open YPF");
+                    continue;
+                }
             };
-            for s in &ystb.strings {
-                let id = format!("{rel}#arg{}", s.arg_index);
-                let mut entry = StringEntry::new(id, &s.text, fpath.clone());
-                entry.tags = vec!["dialogue".into()];
-                entry.context = Some(format!("attr_type={}", s.attr_type));
-                // Variable-length rebuild — no binary_slot.
-                all.push(entry);
+
+            for entry in archive.ybn_entries() {
+                ybn_seen += 1;
+                let payload = match archive.read_entry(entry) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            archive = %arch_rel,
+                            entry = %entry.name,
+                            error = %e,
+                            "YPF .ybn read failed; skipped"
+                        );
+                        ybn_skipped += 1;
+                        continue;
+                    }
+                };
+                let rel = format!("{arch_rel}/{}", entry.name.replace('\\', "/"));
+                let virtual_path = PathBuf::from(&rel);
+                match entries_from_ystb_bytes(&payload, &rel, virtual_path) {
+                    Ok(entries) => all.extend(entries),
+                    Err(e) => {
+                        warn!(
+                            archive = %arch_rel,
+                            entry = %entry.name,
+                            error = %e,
+                            "YPF .ybn YSTB parse failed; skipped"
+                        );
+                        ybn_skipped += 1;
+                    }
+                }
             }
         }
+
+        if all.is_empty() && ybn_files.is_empty() {
+            if ypf_parse_errors > 0 && ybn_seen == 0 {
+                return Err(parse_err(
+                    &path.display().to_string(),
+                    format!("failed to parse YPF archive(s): {last_ypf_err}"),
+                ));
+            }
+            if ybn_seen == 0 {
+                return Err(parse_err(
+                    &path.display().to_string(),
+                    "no .ybn scripts found in YPF archives",
+                ));
+            }
+            if ybn_skipped > 0 {
+                warn!(
+                    skipped = ybn_skipped,
+                    "all YPF .ybn entries were skipped (parse/read failures)"
+                );
+            }
+        }
+
         Ok(all)
     }
 
@@ -736,17 +899,34 @@ impl FormatPlugin for YurisPlugin {
             by_file.entry(e.file_path.clone()).or_default().push(e);
         }
 
-        let search_root = if path.is_dir() {
-            path.to_path_buf()
-        } else {
-            path.parent().unwrap_or(path).to_path_buf()
-        };
+        let search_root = Self::root_dir(path);
 
-        for (file_path, file_entries) in &by_file {
+        // Group YPF virtual paths by archive relative path
+        let mut ypf_groups: HashMap<String, Vec<(String, Vec<&StringEntry>)>> = HashMap::new();
+        let mut loose: Vec<(PathBuf, Vec<&StringEntry>)> = Vec::new();
+
+        for (file_path, file_entries) in by_file {
+            if let Some((archive, inner)) = split_ypf_virtual_path(&file_path) {
+                ypf_groups
+                    .entry(archive)
+                    .or_default()
+                    .push((inner, file_entries));
+            } else {
+                loose.push((file_path, file_entries));
+            }
+        }
+
+        // Loose .ybn
+        for (file_path, file_entries) in loose {
             let actual = if file_path.exists() {
                 file_path.clone()
             } else {
-                search_root.join(file_path.file_name().unwrap_or_default())
+                let as_rel = search_root.join(&file_path);
+                if as_rel.exists() {
+                    as_rel
+                } else {
+                    search_root.join(file_path.file_name().unwrap_or_default())
+                }
             };
             if !actual.exists() {
                 warnings.push(format!("missing script {}", file_path.display()));
@@ -777,19 +957,8 @@ impl FormatPlugin for YurisPlugin {
                 }
             };
 
-            let mut translations: HashMap<usize, &str> = HashMap::new();
-            for e in file_entries {
-                let Some(t) = e.translation.as_deref() else {
-                    strings_skipped += 1;
-                    continue;
-                };
-                // id ends with #argN
-                if let Some(pos) = e.id.rfind("#arg") {
-                    if let Ok(idx) = e.id[pos + 4..].parse::<usize>() {
-                        translations.insert(idx, t);
-                    }
-                }
-            }
+            let (translations, skipped) = translations_from_entries(&file_entries);
+            strings_skipped += skipped;
             if translations.is_empty() {
                 continue;
             }
@@ -806,6 +975,114 @@ impl FormatPlugin for YurisPlugin {
             files_modified += 1;
             files_written.push(actual);
             strings_written += translations.len();
+        }
+
+        // YPF archives — rebuild each affected archive in place with .locust-old backup
+        for (archive_rel, inners) in ypf_groups {
+            let arch_path = {
+                let p = search_root.join(&archive_rel);
+                if p.exists() {
+                    p
+                } else {
+                    // basename only
+                    search_root.join(Path::new(&archive_rel).file_name().unwrap_or_default())
+                }
+            };
+            if !arch_path.exists() {
+                warnings.push(format!("missing archive {archive_rel}"));
+                for (_, fe) in &inners {
+                    strings_skipped += fe.len();
+                }
+                continue;
+            }
+
+            let archive = match YpfArchive::open(&arch_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    warnings.push(format!("cannot open {archive_rel}: {e}"));
+                    for (_, fe) in &inners {
+                        strings_skipped += fe.len();
+                    }
+                    continue;
+                }
+            };
+
+            let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
+            let mut arch_written = 0usize;
+
+            for (inner, file_entries) in inners {
+                let entry = match archive
+                    .entries
+                    .iter()
+                    .find(|e| e.name.replace('\\', "/") == inner.replace('\\', "/"))
+                {
+                    Some(e) => e,
+                    None => {
+                        warnings.push(format!("entry {inner} not in {archive_rel}"));
+                        strings_skipped += file_entries.len();
+                        continue;
+                    }
+                };
+                let bytes = match archive.read_entry(entry) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warnings.push(format!("read {archive_rel}/{inner}: {e}"));
+                        strings_skipped += file_entries.len();
+                        continue;
+                    }
+                };
+                let label = format!("{archive_rel}/{inner}");
+                let ystb = match load_ystb(&bytes, &label) {
+                    Ok(Some(y)) => y,
+                    Ok(None) => {
+                        warnings.push(format!("skip non-YSTB {label}"));
+                        strings_skipped += file_entries.len();
+                        continue;
+                    }
+                    Err(e) => {
+                        warnings.push(format!("cannot parse {label}: {e}"));
+                        strings_skipped += file_entries.len();
+                        continue;
+                    }
+                };
+                let (translations, skipped) = translations_from_entries(&file_entries);
+                strings_skipped += skipped;
+                if translations.is_empty() {
+                    continue;
+                }
+                match inject_into_ystb(&ystb, &translations) {
+                    Ok(new_bytes) => {
+                        replacements.insert(inner.replace('\\', "/"), new_bytes);
+                        arch_written += translations.len();
+                    }
+                    Err(e) => {
+                        warnings.push(format!("inject {label}: {e}"));
+                        strings_skipped += file_entries.len();
+                    }
+                }
+            }
+
+            if replacements.is_empty() {
+                continue;
+            }
+
+            match yuris_ypf::rebuild_ypf(&archive, &replacements) {
+                Ok(new_arch) => match replace_file_with_backup(&arch_path, &new_arch) {
+                    Ok(()) => {
+                        files_modified += 1;
+                        files_written.push(arch_path.clone());
+                        strings_written += arch_written;
+                    }
+                    Err(e) => {
+                        warnings.push(format!("safe-replace {archive_rel}: {e}"));
+                        strings_skipped += arch_written;
+                    }
+                },
+                Err(e) => {
+                    warnings.push(format!("rebuild {archive_rel}: {e}"));
+                    strings_skipped += arch_written;
+                }
+            }
         }
 
         Ok(InjectionReport {
@@ -1080,15 +1357,78 @@ mod tests {
     }
 
     #[test]
-    fn test_ypf_only_extract_reports_loudly() {
+    fn test_ypf_malformed_extract_errors_naming_file() {
         let dir = tempdir();
         fs::write(dir.join("ysbin.ypf"), b"YPF\0fake").unwrap();
         let plugin = YurisPlugin::new();
         let err = plugin.extract(&dir).unwrap_err().to_string();
         assert!(
-            err.contains("ypf") && err.contains("not yet supported"),
-            "expected ypf skip message, got: {err}"
+            err.contains("YPF")
+                || err.contains("ypf")
+                || err.contains("magic")
+                || err.contains("parse")
+                || err.contains("small"),
+            "expected YPF parse error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_ypf_e2e_extract_inject_with_locust_old() {
+        let dir = tempdir();
+        let ysbin = dir.join("ysbin");
+        fs::create_dir_all(&ysbin).unwrap();
+
+        let ystb = build_ystb_with_inst_pad(
+            TRUE_KEY_B4626AD8,
+            &["Hello, world!", "Second line"],
+            &[],
+            0,
+            0,
+        );
+        let ypf_bytes = crate::yuris_ypf::write_ypf(
+            0x1E4,
+            0xFF,
+            &[("yst00000.ybn".into(), ystb, true)],
+        )
+        .unwrap();
+        let ypf_path = ysbin.join("test.ypf");
+        fs::write(&ypf_path, &ypf_bytes).unwrap();
+
+        let plugin = YurisPlugin::new();
+        assert!(plugin.detect(&dir));
+        let mut entries = plugin.extract(&dir).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source.contains("Hello")),
+            "missing strings: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.id.contains("ysbin/test.ypf/") && e.id.contains("yst00000.ybn#arg")),
+            "ids: {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        for e in &mut entries {
+            if e.source.contains("Hello") {
+                e.translation = Some("Hola, mundo!".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(report.files_modified >= 1, "{report:?}");
+
+        let backup = PathBuf::from(format!("{}.locust-old", ypf_path.display()));
+        assert!(backup.is_file(), "expected .locust-old backup at {backup:?}");
+        assert!(ypf_path.is_file(), "rebuilt ypf must exist");
+
+        let again = plugin.extract(&dir).unwrap();
+        assert!(
+            again.iter().any(|e| e.source.contains("Hola")),
+            "re-extract missing translation: {:?}",
+            again.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(again.iter().any(|e| e.source.contains("Second line")));
     }
 
     #[test]

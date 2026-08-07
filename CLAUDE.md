@@ -43,7 +43,7 @@ locust providers                    # List translation providers
 - TyranoBuilder is Experimental (`data/scenario/*.ks` UTF-8 only; synthetic fixtures; no asar / data.exe)
 - NScripter is Experimental (`0.txt` / `00.txt` / `nscript.dat` only; synthetic fixtures; no NSA / nscr_sec / nscript.___)
 - KiriKiri/KAG is Experimental (loose .ks + unencrypted XP3 read / patch.xp3 write; synthetic fixtures; no cxdec / mode-2 yet)
-- YU-RIS is Experimental (loose YSTB .ybn only; synthetic fixtures; no YPF unpack yet)
+- YU-RIS is Experimental (loose YSTB .ybn + YPF unpack/repack common versions; synthetic fixtures + real-game YSTB validated)
 - QSP is Experimental (synthetic fixtures only; no real game tested yet)
 - Length-aware *real* ES for binary engines (validate flags oversize; mock is dual-slot safe)
 - Commercial Wolf RPG title E2E; Unreal full multi-GB base pak (patch `_P.pak` proven)

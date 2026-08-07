@@ -49,7 +49,7 @@ Stability matches `locust formats` / the desktop Welcome screen
 | **QSP**                   | `.qsp`, `.gam`   | QuestSoft Player; synthetic fixture only |
 | **TyranoBuilder**         | `.ks`            | `data/scenario/*.ks` UTF-8; synthetic fixtures; no asar |
 | **KiriKiri / KAG**        | `.ks`, `.xp3`    | Loose scripts + unencrypted XP3 read / `patch.xp3` write; no cxdec |
-| **YU-RIS**                | `.ybn`           | Loose YSTB (XOR + Shift-JIS); YPF not yet; synthetic fixtures |
+| **YU-RIS**                | `.ybn`, `.ypf`   | Loose YSTB + YPF unpack/repack (common versions); synthetic + real-game YSTB |
 | **NScripter / ONScripter**| `0.txt`, `nscript.dat` | Shift-JIS; `nscript.dat` XOR 0x84; synthetic fixtures; no NSA |
 
 Not seeing your engine? [Open an issue](https://github.com/Miike0303/Locust/issues).
@@ -176,7 +176,7 @@ MIT. See [LICENSE](LICENSE).
 Pull requests welcome. See [CLAUDE.md](CLAUDE.md) for the project architecture overview and [RELEASE.md](RELEASE.md) for the release process.
 
 Priority areas:
-- TyranoBuilder asar/data.exe unpack; NScripter NSA / nscr_sec / nscript.___; KiriKiri cxdec/Hxv4 + mode-2; YU-RIS YPF
+- TyranoBuilder asar/data.exe unpack; NScripter NSA / nscr_sec / nscript.___; KiriKiri cxdec/Hxv4 + mode-2; YU-RIS exotic YPF schemes
 - Length-aware real-ES for binary engines (Unity / Unreal / Wolf)
 - Deeper Unreal/Unity parsers beyond heuristic scans
 - Real commercial Wolf RPG end-to-end proof
