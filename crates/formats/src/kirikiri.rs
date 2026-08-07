@@ -6,7 +6,7 @@
 //!   https://github.com/arcusmaximus/KirikiriTools/blob/master/KirikiriDescrambler/Descrambler.cs
 //!   https://github.com/arcusmaximus/KirikiriTools/blob/master/KirikiriDescrambler/Scrambler.cs
 //!   (mode 0: per-UTF-16LE-unit XOR; mode 1: odd/even bit swap — self-inverse;
-//!   mode 2: zlib-compressed UTF-16LE payload after length fields).
+//!   mode 2: zlib-compressed UTF-16LE after size fields — see below).
 //! - Header signature documentation:
 //!   https://github.com/arcusmaximus/KirikiriTools#kirikiridescrambler
 //! - Engine family / KAG script conventions (`;` comments, `*` labels, `@` commands,
@@ -20,10 +20,13 @@
 //! - **Mode 0 encode:** reverse of decode: skip same control units; else
 //!   `low ^= 1; high ^= (low & 0xFE)` (Scrambler order — uses post-xor low).
 //! - **Mode 1:** `c = ((c & 0xAAAA) >> 1) | ((c & 0x5555) << 1)` (self-inverse).
-//! - **Mode 2:** detect header only; report unsupported (zlib path; miniz available
-//!   but first-cut intentionally rejects compressed scripts).
+//! - **Mode 2** (Descrambler `Decompress` / Scrambler `Compress`): after `FE FE 02 FF FE`,
+//!   `u64` compressed_size LE, `u64` uncompressed_size LE, then a zlib stream of that
+//!   compressed size. Inflated payload is raw UTF-16LE code units (no extra BOM inside
+//!   the stream — the cipher header already carries `FF FE`). Write-back re-emits the
+//!   same layout with correct sizes.
 //!
-//! Out of scope: CxDec / Hxv4 encrypted XP3, `.tjs`/compiled `.scn`, mode-2 write-back,
+//! Out of scope: CxDec / Hxv4 encrypted XP3, `.tjs`/compiled `.scn`,
 //! rewriting base `.xp3` archives (patch.xp3 only).
 
 use std::collections::HashMap;
@@ -45,12 +48,13 @@ enum KsEncoding {
 }
 
 /// Optional FE FE cipher wrapper around a UTF-16LE payload.
-/// Mode 2 (zlib) is rejected at decode and never stored here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CipherMode {
     None,
     Mode0,
     Mode1,
+    /// Zlib-compressed UTF-16LE after two u64 size fields.
+    Mode2,
 }
 
 #[derive(Clone, Debug)]
@@ -247,11 +251,77 @@ fn decode_ks_bytes(bytes: &[u8], file_label: &str) -> Result<DecodedKs> {
                 });
             }
             2 => {
-                // Mode 2 is zlib-compressed UTF-16LE; first cut rejects it loudly.
-                return Err(parse_err(
-                    file_label,
-                    "compressed .ks (mode 2) not yet supported",
-                ));
+                // Layout (arcusmaximus KirikiriDescrambler Decompress / Scrambler Compress):
+                // u64 compressed_size, u64 uncompressed_size, then zlib blob.
+                if body.len() < 16 {
+                    return Err(parse_err(
+                        file_label,
+                        "mode-2 cipher body too small for size fields",
+                    ));
+                }
+                let compressed_size = u64::from_le_bytes(body[0..8].try_into().unwrap()) as usize;
+                let uncompressed_size =
+                    u64::from_le_bytes(body[8..16].try_into().unwrap()) as usize;
+                let zlib_start = 16usize;
+                let zlib_end = zlib_start
+                    .checked_add(compressed_size)
+                    .filter(|e| *e <= body.len())
+                    .ok_or_else(|| {
+                        parse_err(
+                            file_label,
+                            &format!(
+                                "mode-2 compressed size {compressed_size} exceeds remaining body"
+                            ),
+                        )
+                    })?;
+                let zlib = &body[zlib_start..zlib_end];
+                let plain = miniz_oxide::inflate::decompress_to_vec_zlib(zlib).map_err(|e| {
+                    parse_err(
+                        file_label,
+                        &format!("mode-2 zlib inflate failed: {e:?}"),
+                    )
+                })?;
+                if uncompressed_size != 0 && plain.len() != uncompressed_size {
+                    // Prefer exact match (Descrambler allocates uncompressed_size).
+                    if plain.len() < uncompressed_size {
+                        return Err(parse_err(
+                            file_label,
+                            &format!(
+                                "mode-2 inflated size {} < declared uncompressed {uncompressed_size}",
+                                plain.len()
+                            ),
+                        ));
+                    }
+                    // Extra trailing bytes: take declared length if even.
+                    if !uncompressed_size.is_multiple_of(2) {
+                        return Err(parse_err(
+                            file_label,
+                            "mode-2 uncompressed size is odd (not UTF-16LE)",
+                        ));
+                    }
+                }
+                let utf16 = if uncompressed_size != 0
+                    && plain.len() >= uncompressed_size
+                    && uncompressed_size.is_multiple_of(2)
+                {
+                    &plain[..uncompressed_size]
+                } else {
+                    if !plain.len().is_multiple_of(2) {
+                        return Err(parse_err(
+                            file_label,
+                            "mode-2 inflated payload has odd length",
+                        ));
+                    }
+                    &plain[..]
+                };
+                let text = str_from_utf16le_bytes(utf16);
+                let crlf = text.contains("\r\n");
+                return Ok(DecodedKs {
+                    text,
+                    encoding: KsEncoding::Utf16Le,
+                    cipher: CipherMode::Mode2,
+                    crlf,
+                });
             }
             _ => {
                 return Err(parse_err(
@@ -331,6 +401,17 @@ fn encode_ks_bytes(decoded: &DecodedKs) -> Result<Vec<u8>> {
             mode1_swap_units(&mut body);
             let mut out = vec![0xFE, 0xFE, 0x01, 0xFF, 0xFE];
             out.extend_from_slice(&body);
+            Ok(out)
+        }
+        CipherMode::Mode2 => {
+            // Scrambler.Compress: raw UTF-16LE (no BOM), zlib, then patch compressed size.
+            let utf16 = utf16le_bytes_from_str(&text);
+            let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&utf16, 6);
+            let mut out = Vec::with_capacity(5 + 16 + compressed.len());
+            out.extend_from_slice(&[0xFE, 0xFE, 0x02, 0xFF, 0xFE]);
+            out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+            out.extend_from_slice(&(utf16.len() as u64).to_le_bytes());
+            out.extend_from_slice(&compressed);
             Ok(out)
         }
         CipherMode::None => match decoded.encoding {
@@ -503,7 +584,7 @@ impl FormatPlugin for KirikiriPlugin {
     }
 
     fn description(&self) -> &str {
-        "KiriKiri KAG loose .ks + unencrypted XP3 (UTF-16/UTF-8/SJIS; FE FE 0/1; patch.xp3 inject)"
+        "KiriKiri KAG loose .ks + unencrypted XP3 (UTF-16/UTF-8/SJIS; FE FE 0/1/2; patch.xp3 inject)"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -827,9 +908,15 @@ This is narration.\r\n\
         fs::write(path, out).unwrap();
     }
 
-    fn write_mode2_stub(path: &Path) {
-        // Header only — enough to hit the unsupported path.
-        fs::write(path, [0xFE, 0xFE, 0x02, 0xFF, 0xFE, 0x00, 0x00]).unwrap();
+    /// Build a valid mode-2 FE FE file (zlib UTF-16LE, Scrambler layout).
+    fn write_mode2_ks(path: &Path, text: &str) {
+        let utf16 = utf16le_bytes_from_str(text);
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&utf16, 6);
+        let mut out = vec![0xFE, 0xFE, 0x02, 0xFF, 0xFE];
+        out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(utf16.len() as u64).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        fs::write(path, out).unwrap();
     }
 
     #[test]
@@ -930,6 +1017,23 @@ This is narration.\r\n\
         assert_eq!(&bytes[0..5], &[0xFE, 0xFE, 0x01, 0xFF, 0xFE]);
     }
 
+    #[test]
+    fn test_inject_roundtrip_mode2() {
+        let dir = tempdir();
+        write_mode2_ks(&dir.join("scenario.ks"), sample_script());
+        roundtrip_translate(&dir, "Hola, mundo!");
+        let bytes = fs::read(dir.join("scenario.ks")).unwrap();
+        assert_eq!(&bytes[0..5], &[0xFE, 0xFE, 0x02, 0xFF, 0xFE]);
+        // Size fields present and zlib still inflates
+        assert!(bytes.len() >= 5 + 16);
+        let comp_size = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+        let uncomp_size = u64::from_le_bytes(bytes[13..21].try_into().unwrap()) as usize;
+        assert_eq!(bytes.len(), 5 + 16 + comp_size);
+        let plain =
+            miniz_oxide::inflate::decompress_to_vec_zlib(&bytes[21..21 + comp_size]).unwrap();
+        assert_eq!(plain.len(), uncomp_size);
+    }
+
     fn roundtrip_translate(dir: &Path, new_text_fragment: &str) {
         let plugin = KirikiriPlugin::new();
         let mut entries = plugin.extract(dir).unwrap();
@@ -952,13 +1056,47 @@ This is narration.\r\n\
     }
 
     #[test]
-    fn test_mode2_reports_unsupported() {
+    fn test_mode2_extract_dialogue() {
         let dir = tempdir();
-        write_mode2_stub(&dir.join("compressed.ks"));
+        write_mode2_ks(&dir.join("scenario.ks"), sample_script());
+        let plugin = KirikiriPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert!(
+            sources.iter().any(|s| s.contains("Hello, world")),
+            "mode-2 missing dialogue: {sources:?}"
+        );
+        assert!(
+            sources.contains(&"This is narration."),
+            "mode-2 missing narration: {sources:?}"
+        );
+        assert!(
+            sources.iter().all(|s| !s.starts_with(';')
+                && !s.starts_with('*')
+                && !s.starts_with('@')),
+            "mode-2 non-text leaked: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn test_mode2_bad_zlib_errors_naming_file() {
+        let dir = tempdir();
+        let path = dir.join("bad.ks");
+        // Valid header + sizes claiming a short zlib blob of garbage
+        let mut bytes = vec![0xFE, 0xFE, 0x02, 0xFF, 0xFE];
+        let garbage = [0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        bytes.extend_from_slice(&(garbage.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&100u64.to_le_bytes()); // claimed uncompressed
+        bytes.extend_from_slice(&garbage);
+        fs::write(&path, &bytes).unwrap();
         let err = KirikiriPlugin::new().extract(&dir).unwrap_err().to_string();
         assert!(
-            err.contains("mode 2") || err.contains("compressed"),
-            "expected mode-2 message, got: {err}"
+            err.contains("mode-2") || err.contains("zlib") || err.contains("inflate"),
+            "expected mode-2 zlib error, got: {err}"
+        );
+        assert!(
+            err.contains("bad.ks") || err.contains("ks"),
+            "error should name the file, got: {err}"
         );
     }
 
