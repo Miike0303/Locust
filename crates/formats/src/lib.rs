@@ -5,6 +5,7 @@ pub mod renpy;
 pub mod wolf_rpg;
 pub mod sugarcube;
 pub mod unreal;
+pub mod unreal_locres;
 pub mod unity;
 pub mod html_game;
 pub mod vntextpatch;

@@ -43,7 +43,7 @@ Stability matches `locust formats` / the desktop Welcome screen
 | **SugarCube / Twine**     | `.html`, `.htm`  | Interactive fiction |
 | **HTML (generic)**        | `.html`, `.htm`  | Non-SugarCube HTML adventures |
 | **Unity**                 | `.assets`        | Binary length-limited inject (UTF-8 ≤ source) |
-| **Unreal Engine**         | `.pak`           | UTF-16LE heuristic; length ≤ source |
+| **Unreal Engine**         | `.pak`, `.locres` | UTF-16LE heuristic + structural `.locres` (variable-length) |
 | **Wolf RPG Editor**       | `.wolf`          | Shift-JIS binary; length ≤ source |
 | **VNTextPatch JSON**      | `.json`          | VN intermediate (KiriKiri/YU-RIS/… via VNTextPatch); Phase-2 patch apply proven on fixture |
 | **QSP**                   | `.qsp`, `.gam`   | QuestSoft Player; synthetic fixture only |
@@ -178,7 +178,7 @@ Pull requests welcome. See [CLAUDE.md](CLAUDE.md) for the project architecture o
 Priority areas:
 - NScripter NSA / nscript.___; KiriKiri cxdec/Hxv4; YU-RIS exotic YPF schemes
 - Length-aware real-ES for binary engines (Unity / Unreal / Wolf)
-- Deeper Unreal/Unity parsers beyond heuristic scans
+- Deeper Unity parsers beyond heuristic scans; Unreal full pak index
 - Real commercial Wolf RPG end-to-end proof
 
 ---
