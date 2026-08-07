@@ -34,7 +34,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     addLog("error", `API ${res.status}: ${path}`, text, "api");
     throw new Error(`${res.status}: ${text}`);
   }
-  return res.json();
+  // 204 / empty body (DELETE, some POSTs) — do not call res.json()
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 async function requestText(path: string): Promise<string> {
@@ -369,7 +373,11 @@ export const getBackups = (): Promise<BackupEntry[]> =>
   IS_TAURI ? invoke("get_backups") : request("/backups");
 
 export const restoreBackup = (id: string) =>
-  request<void>(`/backups/${id}/restore`, { method: "POST" });
+  request<void>(`/backups/${encodeURIComponent(id)}/restore`, { method: "POST" });
+
+/** Delete a backup by id (HTTP DELETE — uses baseUrl for Tauri port). */
+export const deleteBackup = (id: string): Promise<void> =>
+  request<void>(`/backups/${encodeURIComponent(id)}`, { method: "DELETE" });
 
 // ─── Patch apply / rollback (HTTP — server embeds the core engine) ────────
 
