@@ -46,5 +46,6 @@ locust providers                    # List translation providers
 - YU-RIS is Experimental (loose YSTB .ybn + YPF unpack/repack common versions; synthetic fixtures + real-game YSTB validated)
 - QSP is Experimental (synthetic fixtures only; no real game tested yet)
 - Length-aware binary slots: engine retries once on oversize + counters; real-provider ES E2E still pending (mock is dual-slot safe)
-- Commercial Wolf RPG title E2E; Unreal full multi-GB base pak (patch `_P.pak` proven)
+- Commercial Wolf RPG title E2E (no Wolf game on disk yet)
+- Streaming verify/apply for multi-GB patch zips (pack is ZIP64-ready and proven on an 8.4GB base pak; apply still buffers under the 64MiB/entry zipsec budget)
 - Deeper Unity/Unreal parsers beyond heuristics

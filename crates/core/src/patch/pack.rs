@@ -324,7 +324,9 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
             size: f.size,
             original_sha256,
         });
-        zip.start_file(f.rel.clone(), zip_opts)
+        // ZIP64 for entries at/over 4 GiB (multi-GB Unreal base paks).
+        let entry_opts = zip_opts.large_file(bytes.len() as u64 >= 0xFFFF_FFFF);
+        zip.start_file(f.rel.clone(), entry_opts)
             .map_err(|e| pack_err(format!("zip start_file {}: {e}", f.rel)))?;
         zip.write_all(&bytes)?;
         added += 1;
