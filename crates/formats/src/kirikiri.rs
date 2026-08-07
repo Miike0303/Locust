@@ -1,4 +1,4 @@
-//! KiriKiri / KAG loose `.ks` script plugin — Experimental (synthetic fixtures).
+//! KiriKiri / KAG script plugin — Experimental (synthetic fixtures).
 //!
 //! # Spec sources (transforms verified — do not invent)
 //! - Scrambled text-stream header `FE FE <mode> FF FE` and per-mode body transforms
@@ -11,6 +11,8 @@
 //!   https://github.com/arcusmaximus/KirikiriTools#kirikiridescrambler
 //! - Engine family / KAG script conventions (`;` comments, `*` labels, `@` commands,
 //!   `[tag]` markup): KiriKiri2 / KAG lineage — https://github.com/krkrz/krkr2
+//! - Unencrypted XP3 containers: see [`crate::kirikiri_xp3`] (arcusmaximus Xp3Pack layout;
+//!   inject writes `patch.xp3` — engines load it next to the exe and override base entries).
 //!
 //! # Mode transforms (UTF-16LE code units, little-endian byte pairs)
 //! - **Mode 0 decode:** for each unit, if high==0 && low<0x20 leave as-is; else
@@ -21,8 +23,8 @@
 //! - **Mode 2:** detect header only; report unsupported (zlib path; miniz available
 //!   but first-cut intentionally rejects compressed scripts).
 //!
-//! Out of scope: XP3 archive extraction, `.tjs`/compiled `.scn`, mode-2 write-back,
-//! engine-private encryption beyond the public FE FE stream.
+//! Out of scope: CxDec / Hxv4 encrypted XP3, `.tjs`/compiled `.scn`, mode-2 write-back,
+//! rewriting base `.xp3` archives (patch.xp3 only).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +32,9 @@ use std::path::{Path, PathBuf};
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
+use tracing::warn;
+
+use crate::kirikiri_xp3::{self, Xp3Archive};
 
 /// How the on-disk bytes encode the decoded Unicode text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,18 +107,41 @@ impl KirikiriPlugin {
         out
     }
 
-    fn has_xp3(root: &Path) -> bool {
+    /// Top-level `.xp3` files in a game directory (or the path itself if it is one).
+    fn find_top_level_xp3(root: &Path) -> Vec<PathBuf> {
         if root.is_file() {
-            return Self::is_xp3(root);
+            return if Self::is_xp3(root) {
+                vec![root.to_path_buf()]
+            } else {
+                Vec::new()
+            };
         }
         if !root.is_dir() {
-            return false;
+            return Vec::new();
         }
-        walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .any(|e| e.path().is_file() && Self::is_xp3(e.path()))
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() && Self::is_xp3(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn has_xp3(root: &Path) -> bool {
+        !Self::find_top_level_xp3(root).is_empty()
+    }
+
+    fn root_dir(path: &Path) -> PathBuf {
+        if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        }
     }
 }
 
@@ -386,6 +414,83 @@ fn is_player_text_line(line: &str) -> bool {
     !is_non_text_line(line)
 }
 
+/// Extract dialogue lines from decoded `.ks` text. `rel` is the id/source path
+/// prefix (loose relative path or `archive.xp3/inner.ks`). `file_path` is stored
+/// on each entry for inject routing.
+fn extract_lines_from_text(
+    text: &str,
+    rel: &str,
+    file_path: PathBuf,
+) -> Vec<StringEntry> {
+    let mut all = Vec::new();
+    for (idx, line) in text.split('\n').enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line_no = idx + 1;
+        if !is_player_text_line(line) {
+            continue;
+        }
+        let id = format!("{rel}#{line_no}");
+        let mut entry = StringEntry::new(id, line, file_path.clone());
+        entry.tags = vec!["dialogue".into()];
+        all.push(entry);
+    }
+    all
+}
+
+/// Apply line translations to a decoded script; returns encoded bytes if changed.
+fn apply_translations(
+    bytes: &[u8],
+    label: &str,
+    file_entries: &[&StringEntry],
+) -> Result<Option<(Vec<u8>, usize)>> {
+    let mut decoded = decode_ks_bytes(bytes, label)?;
+    let mut by_line: HashMap<usize, &str> = HashMap::new();
+    for e in file_entries {
+        if let Some(t) = e.translation.as_deref() {
+            if let Some(n) = e.id.rsplit('#').next().and_then(|s| s.parse().ok()) {
+                by_line.insert(n, t);
+            }
+        }
+    }
+
+    let mut out_lines = Vec::new();
+    let mut changed = false;
+    let mut written = 0usize;
+    for (idx, line) in decoded.text.split('\n').enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line_no = idx + 1;
+        if let Some(t) = by_line.get(&line_no) {
+            if is_player_text_line(line) && *t != line {
+                out_lines.push((*t).to_string());
+                changed = true;
+                written += 1;
+                continue;
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    decoded.text = out_lines.join("\n");
+    let encoded = encode_ks_bytes(&decoded)?;
+    Ok(Some((encoded, written)))
+}
+
+/// Split `data.xp3/scenario/foo.ks` into (`data.xp3`, `scenario/foo.ks`).
+fn split_xp3_virtual_path(path: &Path) -> Option<(String, String)> {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let lower = s.to_ascii_lowercase();
+    let idx = lower.find(".xp3/")?;
+    let archive = s[..=idx + 3].to_string(); // includes ".xp3"
+    let inner = s[idx + 5..].to_string();
+    if inner.is_empty() {
+        return None;
+    }
+    Some((archive, inner))
+}
+
 // ─── Plugin ────────────────────────────────────────────────────────────────
 
 impl FormatPlugin for KirikiriPlugin {
@@ -398,7 +503,7 @@ impl FormatPlugin for KirikiriPlugin {
     }
 
     fn description(&self) -> &str {
-        "KiriKiri KAG loose .ks scripts (UTF-16LE / UTF-8 / Shift-JIS; FE FE mode 0/1)"
+        "KiriKiri KAG loose .ks + unencrypted XP3 (UTF-16/UTF-8/SJIS; FE FE 0/1; patch.xp3 inject)"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -406,7 +511,7 @@ impl FormatPlugin for KirikiriPlugin {
     }
 
     fn supported_extensions(&self) -> &[&str] {
-        &[".ks"]
+        &[".ks", ".xp3"]
     }
 
     fn supported_modes(&self) -> Vec<OutputMode> {
@@ -418,27 +523,20 @@ impl FormatPlugin for KirikiriPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        let root = Self::root_dir(path);
         let ks_files = Self::find_ks_files(path);
-        if ks_files.is_empty() {
-            if Self::has_xp3(path) {
-                return Err(parse_err(
-                    &path.display().to_string(),
-                    "no loose .ks scripts; xp3 archives not yet supported",
-                ));
-            }
+        let xp3_files = Self::find_top_level_xp3(path);
+
+        if ks_files.is_empty() && xp3_files.is_empty() {
             return Err(parse_err(
                 &path.display().to_string(),
-                "no .ks script files found",
+                "no .ks script files or .xp3 archives found",
             ));
         }
 
-        let root = if path.is_dir() {
-            path.to_path_buf()
-        } else {
-            path.parent().unwrap_or(path).to_path_buf()
-        };
-
         let mut all = Vec::new();
+
+        // Loose .ks
         for fpath in &ks_files {
             let bytes = std::fs::read(fpath)?;
             let rel = fpath
@@ -447,18 +545,95 @@ impl FormatPlugin for KirikiriPlugin {
                 .to_string_lossy()
                 .replace('\\', "/");
             let decoded = decode_ks_bytes(&bytes, &rel)?;
-            for (idx, line) in decoded.text.split('\n').enumerate() {
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                let line_no = idx + 1;
-                if !is_player_text_line(line) {
+            all.extend(extract_lines_from_text(
+                &decoded.text,
+                &rel,
+                fpath.clone(),
+            ));
+        }
+
+        // XP3 archives
+        let mut xp3_parse_errors = 0usize;
+        let mut last_xp3_err = String::new();
+        let mut xp3_ks_seen = 0usize;
+        let mut xp3_skipped = 0usize;
+
+        for arch_path in &xp3_files {
+            let arch_name = arch_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("archive.xp3");
+            let archive = match Xp3Archive::open(arch_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    xp3_parse_errors += 1;
+                    last_xp3_err = e.to_string();
+                    warn!(archive = %arch_path.display(), error = %e, "failed to open XP3");
                     continue;
                 }
-                let id = format!("{rel}#{line_no}");
-                let mut entry = StringEntry::new(id, line, fpath.clone());
-                entry.tags = vec!["dialogue".into()];
-                all.push(entry);
+            };
+
+            for entry in archive.ks_entries() {
+                xp3_ks_seen += 1;
+                let payload = match archive.read_entry(entry) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            archive = %arch_name,
+                            entry = %entry.name,
+                            error = %e,
+                            "failed to read XP3 .ks entry; skipped"
+                        );
+                        xp3_skipped += 1;
+                        continue;
+                    }
+                };
+                let rel = format!("{arch_name}/{}", entry.name.replace('\\', "/"));
+                let virtual_path = PathBuf::from(&rel);
+                match decode_ks_bytes(&payload, &rel) {
+                    Ok(decoded) => {
+                        all.extend(extract_lines_from_text(
+                            &decoded.text,
+                            &rel,
+                            virtual_path,
+                        ));
+                    }
+                    Err(e) => {
+                        // Likely cxdec-encrypted or non-text — skip, do not fail the whole extract.
+                        warn!(
+                            archive = %arch_name,
+                            entry = %entry.name,
+                            error = %e,
+                            "XP3 .ks payload did not decode as text (cxdec/encrypted?); skipped"
+                        );
+                        xp3_skipped += 1;
+                    }
+                }
             }
         }
+
+        if all.is_empty() && ks_files.is_empty() {
+            // Only XP3 path and nothing usable
+            if xp3_parse_errors > 0 && xp3_ks_seen == 0 {
+                return Err(parse_err(
+                    &path.display().to_string(),
+                    &format!("failed to parse XP3 archive(s): {last_xp3_err}"),
+                ));
+            }
+            if xp3_ks_seen == 0 {
+                return Err(parse_err(
+                    &path.display().to_string(),
+                    "no .ks scripts found in top-level XP3 archives",
+                ));
+            }
+            if xp3_skipped > 0 {
+                warn!(
+                    skipped = xp3_skipped,
+                    "all XP3 .ks entries were skipped (decode/read failures)"
+                );
+            }
+        }
+
         Ok(all)
     }
 
@@ -474,17 +649,81 @@ impl FormatPlugin for KirikiriPlugin {
             by_file.entry(e.file_path.clone()).or_default().push(e);
         }
 
-        let search_root = if path.is_dir() {
-            path.to_path_buf()
-        } else {
-            path.parent().unwrap_or(path).to_path_buf()
-        };
+        let search_root = Self::root_dir(path);
+
+        // Collect modified XP3 payloads for a single patch.xp3
+        let mut patch_files: Vec<(String, Vec<u8>)> = Vec::new();
+        // Cache opened base archives: archive file name → archive
+        let mut archive_cache: HashMap<String, Xp3Archive> = HashMap::new();
 
         for (file_path, file_entries) in &by_file {
+            if let Some((archive_name, inner)) = split_xp3_virtual_path(file_path) {
+                if !archive_cache.contains_key(&archive_name) {
+                    let arch_path = search_root.join(&archive_name);
+                    match Xp3Archive::open(&arch_path) {
+                        Ok(a) => {
+                            archive_cache.insert(archive_name.clone(), a);
+                        }
+                        Err(e) => {
+                            warnings.push(format!(
+                                "cannot open base archive {archive_name} for inject: {e}"
+                            ));
+                            strings_skipped += file_entries.len();
+                            continue;
+                        }
+                    }
+                }
+                let arch = archive_cache.get(&archive_name).unwrap();
+
+                let entry = match arch.entries.iter().find(|e| {
+                    e.name.replace('\\', "/") == inner.replace('\\', "/")
+                }) {
+                    Some(e) => e.clone(),
+                    None => {
+                        warnings.push(format!(
+                            "entry {inner} not found in {archive_name}"
+                        ));
+                        strings_skipped += file_entries.len();
+                        continue;
+                    }
+                };
+
+                let bytes = match arch.read_entry(&entry) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warnings.push(format!("read {archive_name}/{inner}: {e}"));
+                        strings_skipped += file_entries.len();
+                        continue;
+                    }
+                };
+                let label = format!("{archive_name}/{inner}");
+                match apply_translations(&bytes, &label, file_entries) {
+                    Ok(Some((encoded, written))) => {
+                        patch_files.push((inner.replace('\\', "/"), encoded));
+                        strings_written += written;
+                        files_modified += 1;
+                    }
+                    Ok(None) => {
+                        strings_skipped += file_entries.len();
+                    }
+                    Err(e) => {
+                        warnings.push(format!("cannot translate {label}: {e}"));
+                        strings_skipped += file_entries.len();
+                    }
+                }
+                continue;
+            }
+
+            // Loose file path
             let actual = if file_path.exists() {
                 file_path.clone()
             } else {
-                search_root.join(file_path.file_name().unwrap_or_default())
+                let as_rel = search_root.join(file_path);
+                if as_rel.exists() {
+                    as_rel
+                } else {
+                    search_root.join(file_path.file_name().unwrap_or_default())
+                }
             };
             if !actual.exists() {
                 warnings.push(format!("missing script {}", file_path.display()));
@@ -492,61 +731,49 @@ impl FormatPlugin for KirikiriPlugin {
                 continue;
             }
 
-            let bytes = std::fs::read(&actual)?;
-            let label = actual.display().to_string();
-            let mut decoded = match decode_ks_bytes(&bytes, &label) {
-                Ok(d) => d,
-                Err(e) => {
-                    warnings.push(format!("cannot decode {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
-                    continue;
-                }
-            };
-
-            // Map line number (1-based) → translation via id suffix `#N`
-            let mut by_line: HashMap<usize, &str> = HashMap::new();
-            for e in file_entries {
-                if let Some(t) = e.translation.as_deref() {
-                    if let Some(n) = e.id.rsplit('#').next().and_then(|s| s.parse().ok()) {
-                        by_line.insert(n, t);
-                    }
-                }
-            }
-
-            let mut out_lines = Vec::new();
-            let mut changed = false;
-            for (idx, line) in decoded.text.split('\n').enumerate() {
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                let line_no = idx + 1;
-                if let Some(t) = by_line.get(&line_no) {
-                    if is_player_text_line(line) && *t != line {
-                        out_lines.push((*t).to_string());
-                        changed = true;
-                        strings_written += 1;
-                        continue;
-                    }
-                }
-                out_lines.push(line.to_string());
-            }
-
-            if !changed {
-                strings_skipped += file_entries.len();
-                continue;
-            }
-
-            let joined = out_lines.join("\n");
-            decoded.text = joined;
-            let encoded = match encode_ks_bytes(&decoded) {
+            let bytes = match std::fs::read(&actual) {
                 Ok(b) => b,
                 Err(e) => {
-                    warnings.push(format!("cannot re-encode {}: {e}", actual.display()));
+                    warnings.push(format!("read {}: {e}", actual.display()));
                     strings_skipped += file_entries.len();
                     continue;
                 }
             };
-            std::fs::write(&actual, &encoded)?;
-            files_modified += 1;
-            files_written.push(actual);
+            let label = actual.display().to_string();
+            match apply_translations(&bytes, &label, file_entries) {
+                Ok(Some((encoded, written))) => {
+                    std::fs::write(&actual, &encoded)?;
+                    files_modified += 1;
+                    files_written.push(actual);
+                    strings_written += written;
+                }
+                Ok(None) => {
+                    strings_skipped += file_entries.len();
+                }
+                Err(e) => {
+                    warnings.push(format!("cannot re-encode {label}: {e}"));
+                    strings_skipped += file_entries.len();
+                }
+            }
+        }
+
+        if !patch_files.is_empty() {
+            // Merge by inner name (last write wins)
+            let mut merged: HashMap<String, Vec<u8>> = HashMap::new();
+            for (name, data) in patch_files {
+                merged.insert(name, data);
+            }
+            let list: Vec<(String, Vec<u8>)> = merged.into_iter().collect();
+            match kirikiri_xp3::write_xp3(&list) {
+                Ok(bytes) => {
+                    let patch_path = search_root.join("patch.xp3");
+                    std::fs::write(&patch_path, &bytes)?;
+                    files_written.push(patch_path);
+                }
+                Err(e) => {
+                    warnings.push(format!("failed to build patch.xp3: {e}"));
+                }
+            }
         }
 
         Ok(InjectionReport {
@@ -736,14 +963,88 @@ This is narration.\r\n\
     }
 
     #[test]
-    fn test_xp3_only_extract_reports_loudly() {
+    fn test_xp3_malformed_extract_errors_naming_file() {
         let dir = tempdir();
         fs::write(dir.join("data.xp3"), b"XP3\r\n").unwrap();
         let err = KirikiriPlugin::new().extract(&dir).unwrap_err().to_string();
         assert!(
-            err.contains("xp3") && err.contains("not yet supported"),
-            "expected xp3 skip message, got: {err}"
+            err.contains("xp3") || err.contains("XP3") || err.contains("magic") || err.contains("parse"),
+            "expected XP3 parse error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_xp3_e2e_extract_and_patch_inject() {
+        let dir = tempdir();
+        // Build UTF-16LE .ks payload and pack into data.xp3
+        let mut ks = vec![0xFF, 0xFE];
+        ks.extend_from_slice(&utf16le_bytes_from_str(sample_script()));
+        let arch = crate::kirikiri_xp3::write_xp3(&[("scenario/first.ks".into(), ks)]).unwrap();
+        fs::write(dir.join("data.xp3"), &arch).unwrap();
+
+        let plugin = KirikiriPlugin::new();
+        assert!(plugin.detect(&dir));
+        let mut entries = plugin.extract(&dir).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source.contains("Hello, world")),
+            "missing dialogue from XP3: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(
+            entries.iter().any(|e| e.id.starts_with("data.xp3/scenario/first.ks#")),
+            "ids: {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        for e in &mut entries {
+            if e.source.contains("Hello, world") {
+                e.translation = Some("[name] Hola, mundo!".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(report.files_modified >= 1, "{report:?}");
+        let patch = dir.join("patch.xp3");
+        assert!(patch.is_file(), "expected patch.xp3, written: {:?}", report.files_written);
+
+        // Re-read patch and confirm translation payload
+        let patch_arch = Xp3Archive::open(&patch).unwrap();
+        let e = patch_arch
+            .ks_entries()
+            .next()
+            .expect("patch should contain .ks");
+        let payload = patch_arch.read_entry(e).unwrap();
+        let decoded = decode_ks_bytes(&payload, "patch").unwrap();
+        assert!(
+            decoded.text.contains("Hola, mundo"),
+            "patch missing translation: {}",
+            decoded.text
+        );
+    }
+
+    #[test]
+    fn test_xp3_garbage_ks_skipped_not_crash() {
+        let dir = tempdir();
+        // Mode-2 cipher header: existing decoder rejects (not plausible text / unsupported).
+        let garbage = vec![0xFE, 0xFE, 0x02, 0xFF, 0xFE, 0x00, 0x00];
+        let arch =
+            crate::kirikiri_xp3::write_xp3(&[("foo.ks".into(), garbage)]).unwrap();
+        fs::write(dir.join("data.xp3"), arch).unwrap();
+        let plugin = KirikiriPlugin::new();
+        // Must not panic; skip with warn → empty Ok or soft error
+        let result = plugin.extract(&dir);
+        match result {
+            Ok(entries) => {
+                assert!(
+                    entries.is_empty(),
+                    "undecodable .ks should not yield dialogue: {:?}",
+                    entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+                );
+            }
+            Err(e) => {
+                let s = e.to_string();
+                assert!(!s.contains("panic"), "{s}");
+            }
+        }
     }
 
     #[test]
