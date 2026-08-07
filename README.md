@@ -42,7 +42,7 @@ Stability matches `locust formats` / the desktop Welcome screen
 | ------------------------- | ---------------- | ----- |
 | **SugarCube / Twine**     | `.html`, `.htm`  | Interactive fiction |
 | **HTML (generic)**        | `.html`, `.htm`  | Non-SugarCube HTML adventures |
-| **Unity**                 | `.assets`        | Binary length-limited inject (UTF-8 ≤ source) |
+| **Unity**                 | `.assets`, `level*` | TextAsset structural + heuristic UTF-8 slots (≤ source) |
 | **Unreal Engine**         | `.pak`, `.locres` | UTF-16LE heuristic + structural `.locres`; inject → `*_LOCUST_P.pak` |
 | **Wolf RPG Editor**       | `.wolf`          | Shift-JIS binary; length ≤ source |
 | **VNTextPatch JSON**      | `.json`          | VN intermediate (KiriKiri/YU-RIS/… via VNTextPatch); Phase-2 patch apply proven on fixture |

@@ -5,10 +5,15 @@ use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
+use crate::unity_serialized::{
+    is_binary_looking_script, rewrite_text_asset_script_inplace, SerializedFile,
+};
+
 /// Plugin for Unity Engine games.
-/// Supports two modes:
+/// Supports:
 /// 1. Text-based VN scripts (SCRIPTS~/ directory with .txt dialogue files)
-/// 2. Binary .assets files with length-prefixed UTF-8 strings (heuristic)
+/// 2. Structural TextAsset extraction from SerializedFile `.assets` / `level*`
+/// 3. Heuristic length-prefixed UTF-8 scan of the same files (skips TextAsset ranges)
 pub struct UnityPlugin;
 
 impl UnityPlugin {
@@ -270,16 +275,26 @@ impl UnityPlugin {
 
     fn find_assets_files(path: &Path) -> Vec<PathBuf> {
         let mut assets = Vec::new();
-        if path.is_file() && path.extension().is_some_and(|e| e == "assets") {
-            assets.push(path.to_path_buf());
+        if path.is_file() {
+            if is_unity_serialized_candidate(path) {
+                assets.push(path.to_path_buf());
+            }
             return assets;
         }
         let data_dir = if path.is_dir() {
-            if let Some(d) = Self::find_data_dir(path) { d }
-            else if path.file_name().is_some_and(|n| n.to_string_lossy().ends_with("_Data")) {
+            if let Some(d) = Self::find_data_dir(path) {
+                d
+            } else if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with("_Data"))
+            {
                 path.to_path_buf()
-            } else { return assets; }
-        } else { return assets; };
+            } else {
+                return assets;
+            }
+        } else {
+            return assets;
+        };
 
         for entry in walkdir::WalkDir::new(&data_dir)
             .max_depth(2)
@@ -288,40 +303,125 @@ impl UnityPlugin {
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
-            if p.extension().is_some_and(|e| e == "assets") {
-                if let Ok(meta) = std::fs::metadata(p) {
-                    if meta.len() > 100 {
-                        assets.push(p.to_path_buf());
-                    }
-                }
+            if p.is_file() && is_unity_serialized_candidate(p) {
+                assets.push(p.to_path_buf());
             }
         }
         assets
     }
 
+    /// Structural TextAsset + heuristic scan (skipping TextAsset ranges).
     fn extract_strings_from_assets(
         bytes: &[u8],
         filename: &str,
         file_path: &Path,
     ) -> Vec<StringEntry> {
         let mut entries = Vec::new();
+        let mut skip_ranges: Vec<(usize, usize)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let len = bytes.len();
-        if len < 8 { return entries; }
 
+        match SerializedFile::parse(bytes.to_vec(), file_path) {
+            Ok(sf) => {
+                skip_ranges = sf.text_asset_byte_ranges();
+                for obj in sf.text_asset_objects() {
+                    match sf.read_text_asset(obj.path_id) {
+                        Ok(ta) => {
+                            if is_binary_looking_script(&ta.script) {
+                                continue;
+                            }
+                            if ta.script.trim().is_empty() {
+                                continue;
+                            }
+                            if !seen.insert(ta.script.clone()) {
+                                continue;
+                            }
+                            let id = format!("textasset/{}", ta.path_id);
+                            let mut entry =
+                                StringEntry::new(id, ta.script.clone(), file_path.to_path_buf());
+                            entry.tags = vec!["textasset".to_string()];
+                            entry.context = if ta.name.is_empty() {
+                                None
+                            } else {
+                                Some(format!("m_Name={}", ta.name))
+                            };
+                            entry.metadata.insert(
+                                "extraction_method".to_string(),
+                                serde_json::Value::String("textasset".to_string()),
+                            );
+                            entry.metadata.insert(
+                                "path_id".to_string(),
+                                serde_json::json!(ta.path_id),
+                            );
+                            entry.metadata.insert(
+                                "name".to_string(),
+                                serde_json::Value::String(ta.name),
+                            );
+                            entry.metadata.insert(
+                                "textasset_script_offset".to_string(),
+                                serde_json::json!(ta.script_len_offset),
+                            );
+                            entry.metadata.insert(
+                                "textasset_script_byte_len".to_string(),
+                                serde_json::json!(ta.script_byte_len),
+                            );
+                            // Length budget for oversize skip + length-aware retry.
+                            entry.metadata.insert(
+                                "binary_slot".to_string(),
+                                serde_json::Value::String("utf8".to_string()),
+                            );
+                            entries.push(entry);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                file = %filename,
+                                path_id = obj.path_id,
+                                error = %e,
+                                "TextAsset read failed; skipped"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    file = %filename,
+                    error = %e,
+                    "SerializedFile parse failed; using pure heuristic"
+                );
+            }
+        }
+
+        // Heuristic length-prefixed UTF-8 scan, skipping TextAsset object ranges.
+        let len = bytes.len();
+        if len < 8 {
+            return entries;
+        }
         let mut i = 0;
         while i + 4 < len {
-            let str_len = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+            if range_contains(&skip_ranges, i) {
+                i += 1;
+                continue;
+            }
+            let str_len =
+                u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
             if (5..=2000).contains(&str_len) && i + 4 + str_len <= len {
+                // Skip if this string lies inside a TextAsset object span.
+                if range_overlaps(&skip_ranges, i, i + 4 + str_len) {
+                    i += 1;
+                    continue;
+                }
                 if let Ok(text) = std::str::from_utf8(&bytes[i + 4..i + 4 + str_len]) {
                     if is_unity_translatable(text) && seen.insert(text.to_string()) {
                         let id = format!("{}#offset_{}#{}", filename, i, entries.len());
                         let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
                         entry.tags = vec!["unknown".to_string()];
-                        // .assets inject is length-prefixed UTF-8; validate before inject.
                         entry.metadata.insert(
                             "binary_slot".to_string(),
                             serde_json::Value::String("utf8".to_string()),
+                        );
+                        entry.metadata.insert(
+                            "extraction_method".to_string(),
+                            serde_json::Value::String("heuristic".to_string()),
                         );
                         entries.push(entry);
                     }
@@ -334,6 +434,36 @@ impl UnityPlugin {
         }
         entries
     }
+}
+
+fn is_unity_serialized_candidate(path: &Path) -> bool {
+    if path.extension().is_some_and(|e| e == "assets") {
+        return true;
+    }
+    // Built player "level0", "level1", … often have no extension.
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            let lower = n.to_ascii_lowercase();
+            lower.starts_with("level") && !lower.contains('.')
+        })
+        .unwrap_or(false)
+}
+
+fn range_contains(ranges: &[(usize, usize)], pos: usize) -> bool {
+    ranges.iter().any(|&(s, e)| pos >= s && pos < e)
+}
+
+fn range_overlaps(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    ranges.iter().any(|&(s, e)| start < e && end > s)
+}
+
+fn is_textasset_entry(entry: &StringEntry) -> bool {
+    entry
+        .metadata
+        .get("extraction_method")
+        .and_then(|v| v.as_str())
+        == Some("textasset")
 }
 
 /// Extract a quoted string from a line like `button 0 "Label" +link jump 5`
@@ -464,7 +594,7 @@ impl FormatPlugin for UnityPlugin {
     }
 
     fn description(&self) -> &str {
-        "Unity Engine games (text scripts or .assets heuristic extraction)"
+        "Unity Engine (VN scripts + TextAsset structural + .assets heuristic)"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -542,32 +672,98 @@ impl FormatPlugin for UnityPlugin {
         }
 
         for (file_path, file_entries) in &by_file {
-            if !file_path.exists() { continue; }
+            if !file_path.exists() {
+                continue;
+            }
             let mut bytes = std::fs::read(file_path)?;
             let mut modified = false;
+            let label = file_path.display().to_string();
 
-            // Collect eligible (needle, replacement payload) once, then one AC pass.
-            // Needle = u32 LE length prefix + UTF-8 source (same as before).
+            // ── Structural TextAsset inject (same-or-shorter, space-pad) ─────
+            for entry in file_entries.iter().filter(|e| is_textasset_entry(e)) {
+                let translation = match &entry.translation {
+                    Some(t) => t,
+                    None => {
+                        strings_skipped += 1;
+                        continue;
+                    }
+                };
+                if translation == &entry.source {
+                    strings_skipped += 1;
+                    continue;
+                }
+                let Some(script_off) = entry
+                    .metadata
+                    .get("textasset_script_offset")
+                    .and_then(|v| v.as_u64())
+                    .map(|u| u as usize)
+                else {
+                    warnings.push(format!(
+                        "TextAsset entry '{}' missing textasset_script_offset",
+                        entry.id
+                    ));
+                    strings_skipped += 1;
+                    continue;
+                };
+                let orig_len = entry
+                    .metadata
+                    .get("textasset_script_byte_len")
+                    .and_then(|v| v.as_u64())
+                    .map(|u| u as usize)
+                    .unwrap_or(entry.source.len());
+                if translation.len() > orig_len {
+                    if length_skipped < 5 {
+                        warnings.push(format!(
+                            "translation for '{}' longer than original TextAsset script ({} > {} bytes), skipping",
+                            entry.id,
+                            translation.len(),
+                            orig_len
+                        ));
+                    }
+                    length_skipped += 1;
+                    strings_skipped += 1;
+                    continue;
+                }
+                match rewrite_text_asset_script_inplace(
+                    &mut bytes,
+                    script_off,
+                    orig_len,
+                    translation,
+                    &label,
+                ) {
+                    Ok(()) => {
+                        strings_written += 1;
+                        modified = true;
+                    }
+                    Err(e) => {
+                        warnings.push(format!("TextAsset rewrite {}: {e}", entry.id));
+                        strings_skipped += 1;
+                    }
+                }
+            }
+
+            // ── Heuristic length-prefixed inject (non-TextAsset entries) ───
             struct Work {
                 needle: Vec<u8>,
                 trans_bytes: Vec<u8>,
                 orig_payload_len: usize,
             }
             let mut work: Vec<Work> = Vec::new();
-            for entry in file_entries {
+            for entry in file_entries.iter().filter(|e| !is_textasset_entry(e)) {
                 let translation = match &entry.translation {
                     Some(t) => t,
-                    None => { strings_skipped += 1; continue; }
+                    None => {
+                        strings_skipped += 1;
+                        continue;
+                    }
                 };
                 let orig_bytes = entry.source.as_bytes();
                 let trans_bytes = translation.as_bytes();
-                // Identity: nothing to rewrite; skip the multi-MB scan.
                 if trans_bytes == orig_bytes {
                     strings_skipped += 1;
                     continue;
                 }
                 if trans_bytes.len() > orig_bytes.len() {
-                    // Cap per-entry noise: first few examples + one summary at end.
                     if length_skipped < 5 {
                         warnings.push(format!(
                             "translation for '{}' longer than original ({} > {} bytes), skipping",
@@ -591,21 +787,27 @@ impl FormatPlugin for UnityPlugin {
                 });
             }
 
-            let patterns: Vec<&[u8]> = work.iter().map(|w| w.needle.as_slice()).collect();
-            let mut cursor = crate::binary_search::MatchCursor::from_patterns(&bytes, &patterns);
+            if !work.is_empty() {
+                let patterns: Vec<&[u8]> = work.iter().map(|w| w.needle.as_slice()).collect();
+                let mut cursor =
+                    crate::binary_search::MatchCursor::from_patterns(&bytes, &patterns);
 
-            for (i, w) in work.iter().enumerate() {
-                if let Some(pos) = cursor.next_valid(i, &bytes, &w.needle) {
-                    let new_len = w.trans_bytes.len() as u32;
-                    bytes[pos..pos + 4].copy_from_slice(&new_len.to_le_bytes());
-                    bytes[pos + 4..pos + 4 + w.trans_bytes.len()].copy_from_slice(&w.trans_bytes);
-                    for b in &mut bytes[pos + 4 + w.trans_bytes.len()..pos + 4 + w.orig_payload_len] {
-                        *b = 0;
+                for (i, w) in work.iter().enumerate() {
+                    if let Some(pos) = cursor.next_valid(i, &bytes, &w.needle) {
+                        let new_len = w.trans_bytes.len() as u32;
+                        bytes[pos..pos + 4].copy_from_slice(&new_len.to_le_bytes());
+                        bytes[pos + 4..pos + 4 + w.trans_bytes.len()]
+                            .copy_from_slice(&w.trans_bytes);
+                        for b in
+                            &mut bytes[pos + 4 + w.trans_bytes.len()..pos + 4 + w.orig_payload_len]
+                        {
+                            *b = 0;
+                        }
+                        strings_written += 1;
+                        modified = true;
+                    } else {
+                        strings_skipped += 1;
                     }
-                    strings_written += 1;
-                    modified = true;
-                } else {
-                    strings_skipped += 1;
                 }
             }
 
@@ -904,5 +1106,128 @@ script Chapter_1_script chapter 1 {
         assert!(!is_unity_translatable("SOME_CONSTANT_NAME"));
         assert!(!is_unity_translatable("Assets/Textures/player.png"));
         assert!(!is_unity_translatable("UnityEngine.CoreModule"));
+    }
+
+    fn create_textasset_assets_fixture(dir: &Path) -> PathBuf {
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        let bytes = crate::unity_serialized::write_v17_fixture(
+            "Dialog",
+            "Hello traveler, welcome!", // 25 chars — room to shorten
+        );
+        let path = data_dir.join("sharedassets0.assets");
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_textasset_extract_structural() {
+        let dir = tempdir();
+        create_textasset_assets_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let ta: Vec<_> = entries
+            .iter()
+            .filter(|e| e.tags.iter().any(|t| t == "textasset"))
+            .collect();
+        assert!(
+            !ta.is_empty(),
+            "expected TextAsset entries, got {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        assert!(ta.iter().any(|e| e.id.starts_with("textasset/")));
+        assert!(ta.iter().any(|e| e.source.contains("Hello traveler")));
+        assert_eq!(
+            ta[0]
+                .metadata
+                .get("extraction_method")
+                .and_then(|v| v.as_str()),
+            Some("textasset")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_textasset_inject_same_and_shorter() {
+        let dir = tempdir();
+        let assets = create_textasset_assets_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for e in &mut entries {
+            if e.tags.iter().any(|t| t == "textasset") && e.source.contains("Hello traveler") {
+                // shorter — pad with spaces in place
+                e.translation = Some("Hola viajero!".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(
+            report.strings_written >= 1,
+            "written={} skipped={} {:?}",
+            report.strings_written,
+            report.strings_skipped,
+            report.warnings
+        );
+        let again = plugin.extract(&dir).unwrap();
+        assert!(
+            again.iter().any(|e| e.source.starts_with("Hola viajero!")),
+            "re-extract: {:?}",
+            again.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        // Object table / file still parseable
+        let sf = SerializedFile::parse_path(&assets).unwrap();
+        assert_eq!(sf.objects.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_textasset_inject_oversize_skips() {
+        let dir = tempdir();
+        create_textasset_assets_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for e in &mut entries {
+            if e.tags.iter().any(|t| t == "textasset") {
+                e.translation = Some(
+                    "This translation is intentionally far longer than the original TextAsset script"
+                        .into(),
+                );
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert!(report.strings_skipped >= 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("longer") || w.contains("skipped because")),
+            "{:?}",
+            report.warnings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_garbage_assets_falls_back_to_heuristic() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        // Not a SerializedFile — pure heuristic payload
+        let mut data = vec![0u8; 32];
+        let s = b"Press any key to continue";
+        data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        data.extend_from_slice(s);
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        fs::write(data_dir.join("resources.assets"), &data).unwrap();
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source.contains("Press any key")),
+            "heuristic fallback should still find strings: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

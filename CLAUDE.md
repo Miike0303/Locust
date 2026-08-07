@@ -48,4 +48,4 @@ locust providers                    # List translation providers
 - Length-aware binary slots: engine retries once on oversize + counters; real-provider ES E2E still pending (mock is dual-slot safe)
 - Commercial Wolf RPG title E2E (no Wolf game on disk yet)
 - Streaming verify/apply for multi-GB patch zips (pack is ZIP64-ready and proven on an 8.4GB base pak; apply still buffers under the 64MiB/entry zipsec budget)
-- Deeper Unity parsers beyond heuristics; Unreal multi-GB base pak E2E; pak writer is uncompressed patch-only (v3/7/8)
+- Unity SerializedFile slice 1 done (TextAsset); still no typetree/MonoBehaviour/full rewrite; Unreal multi-GB base pak E2E

@@ -8,6 +8,7 @@ pub mod unreal;
 pub mod unreal_locres;
 pub mod unreal_pak;
 pub mod unity;
+pub mod unity_serialized;
 pub mod html_game;
 pub mod vntextpatch;
 pub mod qsp;
