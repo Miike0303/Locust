@@ -92,6 +92,49 @@ fn restore_placeholders_in_result(
     }
 }
 
+/// Tight UI slots (short source labels) need a harsher first-pass budget hint.
+/// Threshold is in **encoded bytes** of the source string.
+const TIGHT_BINARY_SLOT_BYTES: usize = 12;
+
+/// First-pass context hint for binary-slot inject budgets.
+fn binary_slot_length_hint(slot: &str, budget: usize) -> String {
+    if budget <= TIGHT_BINARY_SLOT_BYTES {
+        format!(
+            "LENGTH LIMIT: HARD MAX {budget} bytes ({slot}). \
+             Prefer one short word or heavy abbreviation; spaces and accents count as bytes."
+        )
+    } else {
+        format!(
+            "LENGTH LIMIT: the translation MUST fit in {budget} bytes when encoded as {slot}; \
+             abbreviate if needed."
+        )
+    }
+}
+
+/// Length-aware retry correction: include the failed text and exact excess so the
+/// model can edit instead of retranslating from scratch.
+fn binary_slot_retry_correction(
+    slot: &str,
+    budget: usize,
+    first_len: usize,
+    previous: &str,
+) -> String {
+    let excess = first_len.saturating_sub(budget);
+    // Cap quoted previous text so a runaway provider answer does not blow context.
+    let prev_display = if previous.chars().count() > 80 {
+        let truncated: String = previous.chars().take(80).collect();
+        format!("{truncated}…")
+    } else {
+        previous.to_string()
+    };
+    format!(
+        "PREVIOUS ATTEMPT WAS {first_len} BYTES — HARD LIMIT {budget} BYTES ({slot}). \
+         Previous text: «{prev_display}». Remove at least {excess} byte(s). \
+         Shorten aggressively: drop articles/vowels/spaces, use abbreviations; \
+         return ONLY the shortened translation."
+    )
+}
+
 pub struct TranslationManager {
     provider: Arc<dyn TranslationProvider>,
     db: Arc<Database>,
@@ -275,9 +318,7 @@ impl TranslationManager {
                             {
                                 budgets_by_id
                                     .insert(entry.id.clone(), (slot.to_string(), budget));
-                                let hint = format!(
-                                    "LENGTH LIMIT: the translation MUST fit in {budget} bytes when encoded as {slot}; abbreviate if needed."
-                                );
+                                let hint = binary_slot_length_hint(slot, budget);
                                 context = Some(match context {
                                     Some(c) => format!("{c} | {hint}"),
                                     None => hint,
@@ -343,9 +384,11 @@ impl TranslationManager {
                         else {
                             continue;
                         };
-                        let correction = format!(
-                            "PREVIOUS ATTEMPT WAS {first_len} BYTES — HARD LIMIT {budget} BYTES ({slot}). \
-                             Shorten aggressively: drop articles, use abbreviations, keep meaning."
+                        let correction = binary_slot_retry_correction(
+                            slot,
+                            *budget,
+                            first_len,
+                            &result.translation,
                         );
                         let mut retry_req = orig_req.clone();
                         retry_req.context = Some(match &orig_req.context {
@@ -1378,13 +1421,14 @@ mod tests {
             slotted.contains("LENGTH LIMIT"),
             "binary_slot entry must get a LENGTH LIMIT hint: {slotted}"
         );
+        // "Hello" is 5 bytes → tight UI path (HARD MAX), not the longer-line phrasing.
         assert!(
-            slotted.contains("5 bytes"),
-            "utf8 budget for \"Hello\" is 5: {slotted}"
+            slotted.contains("HARD MAX 5 bytes") && slotted.contains("utf8"),
+            "tight utf8 budget for \"Hello\" is 5: {slotted}"
         );
         assert!(
-            slotted.contains("encoded as utf8"),
-            "slot name must appear: {slotted}"
+            !slotted.contains("encoded as utf8"),
+            "tight path should not use the longer-line phrasing: {slotted}"
         );
 
         let plain = map.get("no_slot").cloned().flatten();
@@ -1436,14 +1480,33 @@ mod tests {
             .and_then(|c| c.as_ref())
             .expect("utf16le entry must have LENGTH LIMIT context");
         assert!(
-            ctx.contains("6 bytes"),
+            ctx.contains("HARD MAX 6 bytes") && ctx.contains("utf16le"),
             "utf16le budget must be code units * 2, not utf8 len: {ctx}"
         );
         assert!(
             !ctx.contains("9 bytes"),
             "must not use utf8 length for utf16le slot: {ctx}"
         );
-        assert!(ctx.contains("encoded as utf16le"), "{ctx}");
+    }
+
+    #[test]
+    fn test_binary_slot_length_hint_tight_vs_loose() {
+        let tight = binary_slot_length_hint("utf8", 8);
+        assert!(tight.contains("HARD MAX 8 bytes (utf8)"), "{tight}");
+        let loose = binary_slot_length_hint("utf8", 40);
+        assert!(
+            loose.contains("40 bytes when encoded as utf8"),
+            "{loose}"
+        );
+        assert!(!loose.contains("HARD MAX"), "{loose}");
+    }
+
+    #[test]
+    fn test_binary_slot_retry_correction_quotes_previous() {
+        let c = binary_slot_retry_correction("utf8", 7, 8, "Opciones");
+        assert!(c.contains("Previous text: «Opciones»"), "{c}");
+        assert!(c.contains("Remove at least 1 byte"), "{c}");
+        assert!(c.contains("HARD LIMIT 7 BYTES (utf8)"), "{c}");
     }
 
     /// Scripted provider: first translate() returns `first`, second returns `second`.
@@ -1579,12 +1642,18 @@ mod tests {
             "first call must include budget hint: {:?}",
             ctxs[0]
         );
+        let retry_ctx = ctxs[1].as_ref().expect("retry context");
         assert!(
-            ctxs[1]
-                .as_ref()
-                .is_some_and(|c| c.contains("PREVIOUS ATTEMPT WAS") && c.contains("HARD LIMIT")),
-            "retry must include correction: {:?}",
-            ctxs[1]
+            retry_ctx.contains("PREVIOUS ATTEMPT WAS") && retry_ctx.contains("HARD LIMIT"),
+            "retry must include correction: {retry_ctx}"
+        );
+        assert!(
+            retry_ctx.contains("Previous text: «XXXXXXXXXXXXXXXX»"),
+            "retry must quote the failed attempt so the model can edit: {retry_ctx}"
+        );
+        assert!(
+            retry_ctx.contains("Remove at least 11 byte"),
+            "retry must state exact excess (16-5=11): {retry_ctx}"
         );
     }
 
