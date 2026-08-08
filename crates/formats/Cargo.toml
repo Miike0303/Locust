@@ -23,6 +23,8 @@ aho-corasick = "1.1.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Already in Cargo.lock (0.10.6); pak index SHA-1.
 sha1 = "0.10"
+# POR_DatabaseEncoder / Iavra deploy: data/*.jsono is LZString base64 (UTF-16 payload).
+lz-str = "0.2.1"
 
 [dev-dependencies]
 tempfile = "3"

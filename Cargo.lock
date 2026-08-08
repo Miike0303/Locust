@@ -3202,6 +3202,7 @@ dependencies = [
  "anyhow",
  "encoding_rs",
  "locust-core",
+ "lz-str",
  "md-5",
  "miniz_oxide",
  "serde",
@@ -3262,6 +3263,12 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 dependencies = [
  "value-bag",
 ]
+
+[[package]]
+name = "lz-str"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39f3d72d77227090eed75ea331285a53726e78374a1f357ff5757702c23c70cc"
 
 [[package]]
 name = "mac"

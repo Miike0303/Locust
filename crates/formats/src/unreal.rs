@@ -28,7 +28,9 @@ impl UnrealPlugin {
     fn find_pak_files(path: &Path) -> Vec<PathBuf> {
         let mut paks = Vec::new();
         if path.is_file() && path.extension().is_some_and(|e| e == "pak") {
-            paks.push(path.to_path_buf());
+            if Self::looks_like_unreal_pak(path) {
+                paks.push(path.to_path_buf());
+            }
             return paks;
         }
         if path.is_dir() {
@@ -38,12 +40,50 @@ impl UnrealPlugin {
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                if entry.path().extension().is_some_and(|e| e == "pak") {
-                    paks.push(entry.path().to_path_buf());
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "pak") && Self::looks_like_unreal_pak(p) {
+                    paks.push(p.to_path_buf());
                 }
             }
         }
         paks
+    }
+
+    /// True when a `.pak` has Unreal footer magic near EOF.
+    /// Filters Chromium/NW.js packs (`resources.pak`, `nw_*.pak`, `locales/*.pak`)
+    /// that otherwise made NW.js RPG Maker deploys misdetect as Unreal.
+    fn looks_like_unreal_pak(path: &Path) -> bool {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            let lower = name.to_ascii_lowercase();
+            if lower == "resources.pak"
+                || lower.starts_with("nw_")
+                || lower.starts_with("chrome_")
+                || lower == "icudtl.dat"
+            {
+                return false;
+            }
+            // Chromium locale packs live under locales/
+            if path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|p| p.eq_ignore_ascii_case("locales"))
+            {
+                return false;
+            }
+        }
+        let Ok(data) = std::fs::read(path) else {
+            return false;
+        };
+        if data.len() < 32 {
+            return false;
+        }
+        let magic = unreal_pak::PAK_MAGIC.to_le_bytes();
+        let window = data.len().min(1024 * 1024);
+        let start = data.len() - window;
+        data[start..]
+            .windows(4)
+            .any(|w| w == magic)
     }
 
     fn has_unreal_structure(path: &Path) -> bool {
@@ -62,6 +102,7 @@ impl UnrealPlugin {
                 })
             }))
             .is_some();
+        // Only count paks that pass Unreal magic / name filters — not NW.js chrome paks.
         let has_content_paks = !Self::find_pak_files(path).is_empty();
 
         has_engine || game_name || has_content_paks
@@ -895,6 +936,27 @@ mod tests {
         let dir = tempdir();
         let plugin = UnrealPlugin::new();
         assert!(!plugin.detect(&dir));
+    }
+
+    #[test]
+    fn test_detect_ignores_nwjs_chromium_paks() {
+        // RPG Maker MZ NW.js deploys ship Chromium packs (resources.pak, nw_*.pak,
+        // locales/*.pak) that must not classify as Unreal Engine.
+        let dir = tempdir();
+        fs::write(dir.join("resources.pak"), b"not-an-unreal-pak").unwrap();
+        fs::write(dir.join("nw_100_percent.pak"), b"also-not-unreal").unwrap();
+        fs::create_dir_all(dir.join("locales")).unwrap();
+        fs::write(dir.join("locales").join("en-US.pak"), b"locale-pack").unwrap();
+        // Fake game shell like RM MZ
+        fs::create_dir_all(dir.join("js")).unwrap();
+        fs::write(dir.join("js").join("rmmz_core.js"), b"// mz").unwrap();
+        fs::create_dir_all(dir.join("data")).unwrap();
+
+        let plugin = UnrealPlugin::new();
+        assert!(
+            !plugin.detect(&dir),
+            "NW.js/Chromium .pak files must not trigger Unreal detect"
+        );
     }
 
     #[test]

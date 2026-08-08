@@ -47,5 +47,7 @@ locust providers                    # List translation providers
 - QSP is Experimental (synthetic fixtures only; no real game tested yet)
 - Length-aware binary slots: engine retries once on oversize + counters; real-provider ES E2E still pending (mock is dual-slot safe)
 - Commercial Wolf RPG title E2E (no Wolf game on disk yet)
-- Streaming verify/apply for multi-GB patch zips (pack is ZIP64-ready and proven on an 8.4GB base pak; apply still buffers under the 64MiB/entry zipsec budget)
-- Unity SerializedFile slice 1 done (TextAsset); still no typetree/MonoBehaviour/full rewrite; Unreal multi-GB base pak E2E
+- Streaming verify/apply multi-GB: shipped (pack ZIP64 + stream apply); keep eye on edge cases
+- Unity SerializedFile slice 1 done (TextAsset); still no typetree/MonoBehaviour/full rewrite
+- Unreal multi-GB base pak E2E: done (Last Hope); optional more titles
+- RM MZ POR `.jsono` + Iavra multi-pack extract: done (prefer `en`); inject re-encode to `.jsono` + VisuMZ/Map language-option tooling still open

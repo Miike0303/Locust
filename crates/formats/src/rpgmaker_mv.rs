@@ -162,9 +162,91 @@ impl RpgMakerMvPlugin {
     }
 
     fn has_rpgmaker_json(dir: &Path) -> bool {
+        // Plain deploy (editor / unencrypted)
         dir.join("Actors.json").exists()
             || dir.join("System.json").exists()
             || dir.join("Map001.json").exists()
+            // POR_DatabaseEncoder deploy: same stems with .jsono (LZString base64)
+            || dir.join("Actors.jsono").exists()
+            || dir.join("System.jsono").exists()
+            || dir.join("Map001.jsono").exists()
+            // Any MapNNN.jsono is enough (some titles renumber maps)
+            || Self::dir_has_map_data(dir)
+            // Iavra multi-pack: data/lang_*_*.json{,o}
+            || Self::dir_has_iavra_lang_pack(dir)
+    }
+
+    fn dir_has_map_data(dir: &Path) -> bool {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        rd.filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name();
+                let Some(s) = name.to_str() else {
+                    return false;
+                };
+                Self::is_map_data_name(s)
+            })
+    }
+
+    fn dir_has_iavra_lang_pack(dir: &Path) -> bool {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        rd.filter_map(|e| e.ok()).any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|s| Self::is_iavra_lang_pack_name(s))
+        })
+    }
+
+    fn is_map_data_name(name: &str) -> bool {
+        let stem = Self::strip_data_ext(name);
+        let stem_lower = stem.to_ascii_lowercase();
+        stem_lower.starts_with("map")
+            && stem_lower.len() > 3
+            && stem_lower[3..].chars().all(|c| c.is_ascii_digit())
+            && (name.ends_with(".json") || name.ends_with(".jsono"))
+    }
+
+    /// `lang_{pack}_{lang}.json` / `.jsono` (Iavra multi-file path template).
+    fn is_iavra_lang_pack_name(name: &str) -> bool {
+        let stem = Self::strip_data_ext(name);
+        if !(name.ends_with(".json") || name.ends_with(".jsono")) {
+            return false;
+        }
+        // lang_g_en, lang_h_jp, lang_terms_zh, ...
+        let Some(rest) = stem.strip_prefix("lang_") else {
+            return false;
+        };
+        rest.contains('_')
+    }
+
+    fn strip_data_ext(name: &str) -> &str {
+        name.strip_suffix(".jsono")
+            .or_else(|| name.strip_suffix(".json"))
+            .unwrap_or(name)
+    }
+
+    /// POR / Iavra deploy: `.jsono` is LZString.compressToBase64 of UTF-16 code units.
+    fn decode_data_file_text(file_path: &Path, raw: &str) -> Result<String> {
+        let is_jsono = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsono"));
+        if !is_jsono {
+            return Ok(raw.to_string());
+        }
+        let trimmed = raw.trim();
+        let units = lz_str::decompress_from_base64(trimmed).ok_or_else(|| {
+            LocustError::ParseError {
+                file: file_path.display().to_string(),
+                message: "failed to decompress .jsono (LZString base64 / POR_DatabaseEncoder)"
+                    .to_string(),
+            }
+        })?;
+        Ok(String::from_utf16_lossy(&units))
     }
 
     /// True when the game's data files are wrapped by a protection plugin:
@@ -172,19 +254,26 @@ impl RpgMakerMvPlugin {
     /// real object. Cheap check: parse System.json and look for the `data`
     /// string wrapper plus the absence of any normal top-level field.
     fn is_encrypted(data_dir: &Path) -> bool {
-        let Ok(text) = std::fs::read_to_string(data_dir.join("System.json")) else {
-            return false;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return false;
-        };
-        let Some(obj) = json.as_object() else {
-            return false;
-        };
-        obj.get("data").is_some_and(|d| d.is_string())
-            && obj.contains_key("uid")
-            && !obj.contains_key("gameTitle")
-            && !obj.contains_key("terms")
+        for name in ["System.json", "System.jsono"] {
+            let path = data_dir.join(name);
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(text) = Self::decode_data_file_text(&path, &raw) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let Some(obj) = json.as_object() else {
+                continue;
+            };
+            return obj.get("data").is_some_and(|d| d.is_string())
+                && obj.contains_key("uid")
+                && !obj.contains_key("gameTitle")
+                && !obj.contains_key("terms");
+        }
+        false
     }
 
     fn detect_version(game_root: &Path) -> MvMzVersion {
@@ -207,7 +296,10 @@ impl RpgMakerMvPlugin {
     }
 
     fn is_known_data_file(name: &str) -> bool {
-        let stem = name.strip_suffix(".json").unwrap_or(name);
+        if !(name.ends_with(".json") || name.ends_with(".jsono")) {
+            return false;
+        }
+        let stem = Self::strip_data_ext(name);
         let stem_lower = stem.to_lowercase();
         for af in ARRAY_FILES {
             if stem_lower == af.to_lowercase() {
@@ -217,20 +309,24 @@ impl RpgMakerMvPlugin {
         if stem_lower == "system" || stem_lower == "commonevents" {
             return true;
         }
-        if stem_lower.starts_with("map") && stem_lower[3..].chars().all(|c| c.is_ascii_digit()) {
+        if stem_lower.starts_with("map")
+            && stem_lower.len() > 3
+            && stem_lower[3..].chars().all(|c| c.is_ascii_digit())
+        {
             return true;
         }
         false
     }
 
     fn extract_file(file_path: &Path) -> Result<Vec<StringEntry>> {
-        let (content, _enc) = EncodingDetector::read_file_auto(file_path)?;
+        let (raw, _enc) = EncodingDetector::read_file_auto(file_path)?;
+        let content = Self::decode_data_file_text(file_path, &raw)?;
         let filename = file_path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let stem = filename.strip_suffix(".json").unwrap_or(&filename);
+        let stem = Self::strip_data_ext(&filename);
         let stem_lower = stem.to_lowercase();
 
         let json: serde_json::Value = serde_json::from_str(&content)?;
@@ -1147,6 +1243,138 @@ impl RpgMakerMvPlugin {
 
         list.splice(cmd_idx..cmd_idx + run_len, new_cmds);
     }
+
+    /// Parse `lang_{pack}_{lang}` stem → (pack, lang).
+    fn parse_iavra_pack_stem(stem: &str) -> Option<(&str, &str)> {
+        let rest = stem.strip_prefix("lang_")?;
+        let (pack, lang) = rest.rsplit_once('_')?;
+        if pack.is_empty() || lang.is_empty() {
+            return None;
+        }
+        Some((pack, lang))
+    }
+
+    /// Prefer `en`, then `jp`/`ja`, then any other lang code present on disk.
+    fn pick_iavra_source_lang(available: &[String]) -> Option<String> {
+        if available.is_empty() {
+            return None;
+        }
+        for pref in ["en", "jp", "ja", "zh"] {
+            if available.iter().any(|l| l == pref) {
+                return Some(pref.to_string());
+            }
+        }
+        let mut sorted = available.to_vec();
+        sorted.sort();
+        sorted.into_iter().next()
+    }
+
+    fn list_iavra_packs(data_dir: &Path) -> Result<Vec<(String, String, PathBuf)>> {
+        // (pack, lang, path)
+        let mut out = Vec::new();
+        for dir_entry in std::fs::read_dir(data_dir)? {
+            let dir_entry = dir_entry?;
+            let path = dir_entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !Self::is_iavra_lang_pack_name(name) {
+                continue;
+            }
+            let stem = Self::strip_data_ext(name);
+            let Some((pack, lang)) = Self::parse_iavra_pack_stem(stem) else {
+                continue;
+            };
+            out.push((pack.to_string(), lang.to_string(), path));
+        }
+        out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        Ok(out)
+    }
+
+    fn extract_iavra_pack_file(file_path: &Path) -> Result<Vec<StringEntry>> {
+        let (raw, _enc) = EncodingDetector::read_file_auto(file_path)?;
+        let content = Self::decode_data_file_text(file_path, &raw)?;
+        let filename = file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let stem = Self::strip_data_ext(&filename);
+        let (pack, lang) = Self::parse_iavra_pack_stem(stem).ok_or_else(|| {
+            LocustError::ParseError {
+                file: file_path.display().to_string(),
+                message: format!("not an Iavra lang pack name: {filename}"),
+            }
+        })?;
+
+        let json: serde_json::Value = serde_json::from_str(&content)?;
+        let obj = json.as_object().ok_or_else(|| LocustError::ParseError {
+            file: file_path.display().to_string(),
+            message: "Iavra lang pack root must be a JSON object".to_string(),
+        })?;
+
+        let mut entries = Vec::new();
+        for (key, val) in obj {
+            let Some(text) = val.as_str() else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let id = format!("{filename}#{key}");
+            let mut entry = StringEntry::new(id, text.to_string(), file_path.to_path_buf());
+            entry = entry.with_tags(vec![
+                "iavra".to_string(),
+                format!("pack:{pack}"),
+                format!("lang:{lang}"),
+            ]);
+            entry.context = Some(format!("iavra/{pack}/{lang}/{key}"));
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// Extract all Iavra multi-packs for the preferred source language.
+    fn extract_iavra_packs(data_dir: &Path) -> Result<Vec<StringEntry>> {
+        let packs = Self::list_iavra_packs(data_dir)?;
+        if packs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let langs: Vec<String> = {
+            let mut u = packs
+                .iter()
+                .map(|(_, lang, _)| lang.clone())
+                .collect::<Vec<_>>();
+            u.sort();
+            u.dedup();
+            u
+        };
+        let Some(source_lang) = Self::pick_iavra_source_lang(&langs) else {
+            return Ok(Vec::new());
+        };
+
+        let mut all = Vec::new();
+        for (pack, lang, path) in packs {
+            if lang != source_lang {
+                continue;
+            }
+            match Self::extract_iavra_pack_file(&path) {
+                Ok(entries) => {
+                    tracing::info!(
+                        "Iavra pack {} ({}): {} strings",
+                        pack,
+                        lang,
+                        entries.len()
+                    );
+                    all.extend(entries);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed Iavra pack {}: {}", path.display(), e);
+                }
+            }
+        }
+        Ok(all)
+    }
 }
 
 /// Visible length of a message line, skipping RPG Maker control codes such
@@ -1261,7 +1489,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
     }
 
     fn supported_extensions(&self) -> &[&str] {
-        &[".json"]
+        &[".json", ".jsono"]
     }
 
     fn supported_modes(&self) -> Vec<OutputMode> {
@@ -1270,17 +1498,26 @@ impl FormatPlugin for RpgMakerMvPlugin {
 
     fn detect(&self, path: &Path) -> bool {
         if path.is_dir() {
+            // Strong MZ/MV signals even when only POR .jsono + Iavra packs exist
+            // (NW.js deploy has Chromium .pak files that must not steal detect).
+            let has_rm_js = path.join("js").join("rmmz_core.js").exists()
+                || path.join("js").join("rpg_core.js").exists()
+                || path.join("www").join("js").join("rpg_core.js").exists();
             if let Some(data_dir) = Self::find_data_dir(path) {
-                let has_actors = data_dir.join("Actors.json").exists();
-                let has_system = data_dir.join("System.json").exists();
-                let has_map = data_dir.join("Map001.json").exists();
-                return has_actors || has_system || has_map;
+                if Self::has_rpgmaker_json(&data_dir) {
+                    return true;
+                }
+                if has_rm_js && (data_dir.exists()) {
+                    // data/ present with engine JS — still RM even if empty markers
+                    return Self::dir_has_iavra_lang_pack(&data_dir)
+                        || Self::dir_has_map_data(&data_dir);
+                }
             }
             return false;
         }
         if path.is_file() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                return Self::is_known_data_file(name);
+                return Self::is_known_data_file(name) || Self::is_iavra_lang_pack_name(name);
             }
         }
         false
@@ -1288,6 +1525,13 @@ impl FormatPlugin for RpgMakerMvPlugin {
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
         if path.is_file() {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if Self::is_iavra_lang_pack_name(name) {
+                return Self::extract_iavra_pack_file(path);
+            }
             return Self::extract_file(path);
         }
 
@@ -1311,6 +1555,16 @@ impl FormatPlugin for RpgMakerMvPlugin {
         }
 
         let mut all_entries = Vec::new();
+
+        // Iavra multi-pack first: these hold the real player-facing strings when
+        // maps only store {{keys}}. Prefer source lang `en`, else first available.
+        match Self::extract_iavra_packs(&data_dir) {
+            Ok(entries) => all_entries.extend(entries),
+            Err(e) => {
+                tracing::warn!("Iavra pack extract skipped: {}", e);
+            }
+        }
+
         for dir_entry in std::fs::read_dir(&data_dir)? {
             let dir_entry = dir_entry?;
             let file_path = dir_entry.path();
@@ -1807,5 +2061,119 @@ mod tests {
             .find(|e| e.id == "System.json#terms#messages#actorDamage");
         assert!(damage.is_some());
         assert_eq!(damage.unwrap().source, "%1 took %2 damage!");
+    }
+
+    fn write_jsono(path: &Path, json: &str) {
+        let compressed = lz_str::compress_to_base64(json);
+        fs::write(path, compressed).unwrap();
+    }
+
+    #[test]
+    fn test_detect_por_jsono_only_deploy() {
+        let dir = std::env::temp_dir().join(format!("locust_por_{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(dir.join("js")).unwrap();
+        fs::write(dir.join("js").join("rmmz_core.js"), "// mz").unwrap();
+        write_jsono(
+            &data.join("System.jsono"),
+            r#"{"gameTitle":"POR Game","terms":{"commands":["Fight"]}}"#,
+        );
+        write_jsono(&data.join("Map001.jsono"), r#"{"displayName":"Town","events":[]}"#);
+
+        let plugin = RpgMakerMvPlugin::new();
+        assert!(plugin.detect(&dir), "should detect POR-only MZ deploy");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_system_jsono() {
+        let dir = std::env::temp_dir().join(format!("locust_por_ex_{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        write_jsono(
+            &data.join("System.jsono"),
+            r#"{"gameTitle":"LZ Title","terms":{"basic":["Level"],"commands":["Fight","Escape"],"params":[],"messages":{}}}"#,
+        );
+
+        let plugin = RpgMakerMvPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let title = entries
+            .iter()
+            .find(|e| e.id == "System.jsono#gameTitle")
+            .expect("gameTitle from jsono");
+        assert_eq!(title.source, "LZ Title");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_iavra_packs_prefer_en() {
+        let dir = std::env::temp_dir().join(format!("locust_iavra_{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(dir.join("js")).unwrap();
+        fs::write(dir.join("js").join("rmmz_core.js"), "// mz").unwrap();
+        // Minimal system so known-data walk is happy
+        write_jsono(
+            &data.join("System.jsono"),
+            r#"{"gameTitle":"Iavra Title","terms":{"basic":[],"commands":[],"params":[],"messages":{}}}"#,
+        );
+        write_jsono(
+            &data.join("lang_g_jp.jsono"),
+            r#"{"yes":"はい","no":"いいえ"}"#,
+        );
+        write_jsono(
+            &data.join("lang_g_en.jsono"),
+            r#"{"yes":"Yes","no":"No","title":"United Front"}"#,
+        );
+        write_jsono(
+            &data.join("lang_h_en.jsono"),
+            r#"{"Map001_0":"Hello hero.","Map001_1":"{cm1}"}"#,
+        );
+
+        let plugin = RpgMakerMvPlugin::new();
+        assert!(plugin.detect(&dir));
+        let entries = plugin.extract(&dir).unwrap();
+
+        let yes = entries
+            .iter()
+            .find(|e| e.id == "lang_g_en.jsono#yes")
+            .expect("en pack preferred");
+        assert_eq!(yes.source, "Yes");
+        assert!(yes.tags.iter().any(|t| t == "iavra"));
+
+        // jp pack must NOT be extracted when en exists
+        assert!(
+            entries.iter().all(|e| !e.id.contains("lang_g_jp")),
+            "should not extract non-source lang packs"
+        );
+
+        let dialogue = entries
+            .iter()
+            .find(|e| e.id == "lang_h_en.jsono#Map001_0")
+            .expect("h pack");
+        assert_eq!(dialogue.source, "Hello hero.");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pick_iavra_source_lang_order() {
+        assert_eq!(
+            RpgMakerMvPlugin::pick_iavra_source_lang(&["zh".into(), "jp".into(), "en".into()]),
+            Some("en".into())
+        );
+        assert_eq!(
+            RpgMakerMvPlugin::pick_iavra_source_lang(&["zh".into(), "jp".into()]),
+            Some("jp".into())
+        );
+        assert_eq!(
+            RpgMakerMvPlugin::pick_iavra_source_lang(&["zh".into(), "ko".into()]),
+            Some("zh".into()) // zh is in the preference list before free-form sort
+        );
+        assert_eq!(
+            RpgMakerMvPlugin::pick_iavra_source_lang(&["ko".into(), "de".into()]),
+            Some("de".into()) // neither preferred → alphabetical first
+        );
     }
 }
