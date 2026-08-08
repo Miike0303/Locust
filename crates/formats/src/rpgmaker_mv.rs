@@ -767,6 +767,17 @@ impl RpgMakerMvPlugin {
 
         let parts: Vec<&str> = suffix.split('#').collect();
 
+        // Iavra multi-pack flat object: "yes", "Map003_0", "skill1", …
+        if parts.len() == 1 && Self::is_iavra_lang_pack_name(filename) {
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert(
+                    parts[0].to_string(),
+                    serde_json::Value::String(translation.to_string()),
+                );
+            }
+            return;
+        }
+
         // Array file: "1#name" (but NOT CommonEvent commands like "201#cmd_97")
         if parts.len() == 2 && !parts[1].starts_with("cmd_") {
             if let Ok(idx) = parts[0].parse::<usize>() {
@@ -1614,8 +1625,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
                 continue;
             }
 
-            let (content, _enc) = EncodingDetector::read_file_auto(&file_path)?;
-            let mut json: serde_json::Value = serde_json::from_str(&content)?;
+            let mut json = Self::read_data_json(&file_path)?;
 
             // Message-block splices change command counts, so apply from the
             // bottom of each event list up: earlier indices stay valid.
@@ -1631,8 +1641,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
                 }
             }
 
-            let output = serde_json::to_string_pretty(&json)?;
-            std::fs::write(&file_path, output)?;
+            Self::write_data_file(&file_path, &json)?;
             files_modified += 1;
             files_written.push(file_path.clone());
         }
@@ -1653,6 +1662,22 @@ impl FormatPlugin for RpgMakerMvPlugin {
         entries: &[StringEntry],
     ) -> Result<InjectionReport> {
         let game_root = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+        let data_dir = Self::find_data_dir(game_root)
+            .unwrap_or_else(|| game_root.join("data"));
+
+        // Multi-pack Iavra: write data/lang_{pack}_{lang}.jsono (not Languages/{lang}.json)
+        let has_iavra = entries.iter().any(|e| {
+            e.file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(Self::is_iavra_lang_pack_name)
+                || e.tags.iter().any(|t| t == "iavra")
+        }) || Self::dir_has_iavra_lang_pack(&data_dir);
+
+        if has_iavra {
+            return Self::inject_add_iavra_packs(game_root, &data_dir, lang, entries);
+        }
+
         let version = Self::detect_version(game_root);
         let mut strings_written = 0;
         let mut strings_skipped = 0;
@@ -1709,6 +1734,141 @@ impl FormatPlugin for RpgMakerMvPlugin {
 
         Ok(InjectionReport {
             files_modified: 1,
+            strings_written,
+            strings_skipped,
+            warnings: Vec::new(),
+            files_written,
+        })
+    }
+}
+
+impl RpgMakerMvPlugin {
+    /// Write JSON (pretty for .json, LZString base64 for .jsono).
+    fn write_data_file(file_path: &Path, json: &serde_json::Value) -> Result<()> {
+        let is_jsono = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsono"));
+        let text = if is_jsono {
+            serde_json::to_string(json)?
+        } else {
+            serde_json::to_string_pretty(json)?
+        };
+        if is_jsono {
+            let encoded = lz_str::compress_to_base64(&text);
+            std::fs::write(file_path, encoded)?;
+        } else {
+            std::fs::write(file_path, text)?;
+        }
+        Ok(())
+    }
+
+    fn read_data_json(file_path: &Path) -> Result<serde_json::Value> {
+        let (raw, _enc) = EncodingDetector::read_file_auto(file_path)?;
+        let content = Self::decode_data_file_text(file_path, &raw)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    /// Remap `lang_{pack}_{srcLang}.jsono` → `lang_{pack}_{targetLang}.jsono`.
+    fn iavra_target_filename(source_filename: &str, target_lang: &str) -> Option<String> {
+        if !Self::is_iavra_lang_pack_name(source_filename) {
+            return None;
+        }
+        let stem = Self::strip_data_ext(source_filename);
+        let (pack, _src) = Self::parse_iavra_pack_stem(stem)?;
+        let ext = if source_filename.ends_with(".jsono") {
+            "jsono"
+        } else {
+            "json"
+        };
+        Some(format!("lang_{pack}_{target_lang}.{ext}"))
+    }
+
+    /// Write/merge Iavra multi-packs for `target_lang` from extracted source-pack entries.
+    fn inject_add_iavra_packs(
+        _game_root: &Path,
+        data_dir: &Path,
+        target_lang: &str,
+        entries: &[StringEntry],
+    ) -> Result<InjectionReport> {
+        let mut by_pack: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut pack_source_file: HashMap<String, String> = HashMap::new();
+        let mut strings_written = 0usize;
+        let mut strings_skipped = 0usize;
+
+        for entry in entries {
+            let filename = entry
+                .file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if !Self::is_iavra_lang_pack_name(filename) {
+                strings_skipped += 1;
+                continue;
+            }
+            let stem = Self::strip_data_ext(filename);
+            let Some((pack, _src_lang)) = Self::parse_iavra_pack_stem(stem) else {
+                strings_skipped += 1;
+                continue;
+            };
+            pack_source_file
+                .entry(pack.to_string())
+                .or_insert_with(|| filename.to_string());
+
+            let key = entry
+                .id
+                .strip_prefix(&format!("{filename}#"))
+                .unwrap_or(entry.id.as_str());
+            if let Some(ref translation) = entry.translation {
+                by_pack
+                    .entry(pack.to_string())
+                    .or_default()
+                    .insert(key.to_string(), translation.clone());
+                strings_written += 1;
+            } else {
+                strings_skipped += 1;
+            }
+        }
+
+        let mut files_written = Vec::new();
+        let mut files_modified = 0usize;
+
+        for (pack, translations) in by_pack {
+            let src_name = pack_source_file
+                .get(&pack)
+                .cloned()
+                .unwrap_or_else(|| format!("lang_{pack}_en.jsono"));
+            let Some(target_name) = Self::iavra_target_filename(&src_name, target_lang) else {
+                continue;
+            };
+            let target_path = data_dir.join(&target_name);
+            let src_path = data_dir.join(&src_name);
+
+            let mut obj: serde_json::Map<String, serde_json::Value> = if target_path.exists() {
+                Self::read_data_json(&target_path)?
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            } else if src_path.exists() {
+                Self::read_data_json(&src_path)?
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                serde_json::Map::new()
+            };
+
+            for (k, v) in translations {
+                obj.insert(k, serde_json::Value::String(v));
+            }
+
+            Self::write_data_file(&target_path, &serde_json::Value::Object(obj))?;
+            files_modified += 1;
+            files_written.push(target_path);
+        }
+
+        Ok(InjectionReport {
+            files_modified,
             strings_written,
             strings_skipped,
             warnings: Vec::new(),
@@ -2175,5 +2335,82 @@ mod tests {
             RpgMakerMvPlugin::pick_iavra_source_lang(&["ko".into(), "de".into()]),
             Some("de".into()) // neither preferred → alphabetical first
         );
+    }
+
+    #[test]
+    fn test_inject_add_iavra_writes_target_jsono() {
+        let dir = std::env::temp_dir().join(format!("locust_iavra_inj_{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(dir.join("js")).unwrap();
+        fs::write(dir.join("js").join("rmmz_core.js"), "// mz").unwrap();
+        write_jsono(
+            &data.join("System.jsono"),
+            r#"{"gameTitle":"T","terms":{"basic":[],"commands":[],"params":[],"messages":{}}}"#,
+        );
+        write_jsono(
+            &data.join("lang_g_en.jsono"),
+            r#"{"yes":"Yes","no":"No","title":"Front"}"#,
+        );
+        write_jsono(
+            &data.join("lang_h_en.jsono"),
+            r#"{"Map001_0":"Hello","Map001_1":"World"}"#,
+        );
+
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for e in &mut entries {
+            if e.id.starts_with("lang_") {
+                e.translation = Some(format!("[es] {}", e.source));
+            }
+        }
+
+        let report = plugin.inject_add(&dir, "es", &entries).unwrap();
+        assert!(report.files_modified >= 2, "got {:?}", report.files_written);
+        assert!(data.join("lang_g_es.jsono").exists());
+        assert!(data.join("lang_h_es.jsono").exists());
+        // Source EN packs untouched
+        let en = RpgMakerMvPlugin::read_data_json(&data.join("lang_g_en.jsono")).unwrap();
+        assert_eq!(en["yes"], "Yes");
+
+        let es = RpgMakerMvPlugin::read_data_json(&data.join("lang_g_es.jsono")).unwrap();
+        assert_eq!(es["yes"], "[es] Yes");
+        assert_eq!(es["title"], "[es] Front");
+
+        let es_h = RpgMakerMvPlugin::read_data_json(&data.join("lang_h_es.jsono")).unwrap();
+        assert_eq!(es_h["Map001_0"], "[es] Hello");
+
+        // Round-trip still LZString
+        let raw = fs::read_to_string(data.join("lang_g_es.jsono")).unwrap();
+        assert!(!raw.trim_start().starts_with('{'), "should stay encoded jsono");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_inject_replace_jsono_in_place() {
+        let dir = std::env::temp_dir().join(format!("locust_por_inj_{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        write_jsono(
+            &data.join("System.jsono"),
+            r#"{"gameTitle":"Old","terms":{"basic":[],"commands":[],"params":[],"messages":{}}}"#,
+        );
+
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for e in &mut entries {
+            if e.id == "System.jsono#gameTitle" {
+                e.translation = Some("Nuevo Título".into());
+            }
+        }
+        plugin.inject(&dir, &entries).unwrap();
+
+        let json = RpgMakerMvPlugin::read_data_json(&data.join("System.jsono")).unwrap();
+        assert_eq!(json["gameTitle"], "Nuevo Título");
+        let raw = fs::read_to_string(data.join("System.jsono")).unwrap();
+        assert!(!raw.trim_start().starts_with('{'));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
