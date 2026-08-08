@@ -58,10 +58,17 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
   chains**: CLI `--fallback a,b,c` and desktop translate dialog (same core
   `run_fallback_chain`).
 - The `mock` provider is length-safe for UTF-8 and UTF-16LE slots (good for inject tests).
+- **Real-provider length-aware ES E2E (2026-08-08):** Unity heuristic fixture (6 short
+  UI strings, `binary_slot=utf8`) translated with **`grok-sub` en→es**. Retry path
+  fired on 3 oversize slots; **0 fixed on retry** because Spanish UI labels still
+  exceed very tight budgets by 1 byte after abbreviation (e.g. Options 7 → Opciones 8).
+  Fitting strings inject cleanly; `locust validate` reports `ExceedsBinarySlot` for
+  the rest. Takeaway: length-aware retry helps longer lines; single-word UI slots
+  often need manual edit or pad-friendly sources.
 
 **Phase-2 apply / real-game notes (copies or patch paks, mock or equal-length where
 needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube, HTML generic, Unity (BOXMAN +
-structural TextAsset path), Unreal (Last Hope — **8.4 GB base pak** path proven for
+structural TextAsset path + grok-sub ES binary-slot fixture), Unreal (Last Hope — **8.4 GB base pak** path proven for
 pack/apply tooling; locres inject writes sibling `*_LOCUST_P.pak`), Wolf RPG
 (synthetic `Data/*.wolf` — no commercial title on disk yet), VNTextPatch JSON
 (synthetic + Ochiru EN subset via external VNTextPatch pack). Experimental engines
