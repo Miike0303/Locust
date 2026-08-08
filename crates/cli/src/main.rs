@@ -182,6 +182,18 @@ enum Commands {
     Providers,
     /// List supported game formats
     Formats,
+    /// Register an extra UI language on an RPG Maker MV/MZ multi-lang game
+    /// (Iavra Languages + VisuMZ Options + boot Map choices). Creates `*.bak-locust` backups.
+    RegisterLang {
+        /// Deployed game root (folder with js/ and data/)
+        game_path: PathBuf,
+        /// Language code written into packs/options (e.g. es)
+        #[arg(short, long)]
+        lang: String,
+        /// Menu label (e.g. Español)
+        #[arg(long, default_value = "Español")]
+        label: String,
+    },
     /// Manage glossary terms
     Glossary {
         #[command(subcommand)]
@@ -322,6 +334,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Auth { provider } => cmd_auth(provider).await?,
         Commands::Providers => cmd_providers(&config)?,
         Commands::Formats => cmd_formats()?,
+        Commands::RegisterLang {
+            game_path,
+            lang,
+            label,
+        } => cmd_register_lang(game_path, lang, label)?,
         Commands::Glossary { action } => cmd_glossary(action)?,
         Commands::Export {
             project,
@@ -1541,6 +1558,32 @@ fn cmd_formats() -> anyhow::Result<()> {
     }
     println!("{table}");
 
+    Ok(())
+}
+
+fn cmd_register_lang(game_path: PathBuf, lang: String, label: String) -> anyhow::Result<()> {
+    let report = locust_formats::rpgmaker_lang::register_language(&game_path, &lang, &label)?;
+    println!(
+        "register-lang {} → {} ({})",
+        game_path.display(),
+        lang,
+        label
+    );
+    println!(
+        "  plugins.js: {} (iavra={}, visumz={})",
+        report.plugins_js, report.iavra_languages, report.visumz_options
+    );
+    println!("  maps patched: {}", report.maps_patched.len());
+    for p in &report.maps_patched {
+        println!("    {}", p.display());
+    }
+    println!("  backups: {}", report.backups.len());
+    for n in &report.notes {
+        println!("  note: {n}");
+    }
+    if !report.plugins_js && report.maps_patched.is_empty() {
+        println!("  (idempotent / no further changes needed)");
+    }
     Ok(())
 }
 

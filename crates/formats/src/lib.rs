@@ -1,5 +1,6 @@
 pub mod binary_search;
 pub mod rpgmaker_mv;
+pub mod rpgmaker_lang;
 pub mod rpgmaker_vxa;
 pub mod renpy;
 pub mod wolf_rpg;

@@ -51,5 +51,5 @@ locust providers                    # List translation providers
 - Unity SerializedFile slice 1 done (TextAsset); still no typetree/MonoBehaviour/full rewrite
 - Unreal multi-GB base pak E2E: done (Last Hope); optional more titles
 - RM MZ POR `.jsono` + Iavra multi-pack extract: done (prefer `en`); inject Replace re-encodes `.jsono`; inject Add writes `lang_*_{lang}.jsono` packs
-- VisuMZ OptionsCore / Map choice language-option automation still open (manual patch for Elf-Goblin worked)
+- RM MZ UI language registration: `locust register-lang <game> -l es --label Español` (Iavra + VisuMZ langs arrays + Map boot choices; `*.bak-locust`)
 - Apply patch from URL (download+apply) still open

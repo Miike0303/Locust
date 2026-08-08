@@ -139,7 +139,7 @@ impl RpgMakerMvPlugin {
         Self
     }
 
-    fn find_data_dir(path: &Path) -> Option<PathBuf> {
+    pub(crate) fn find_data_dir(path: &Path) -> Option<PathBuf> {
         if path.is_dir() {
             // Check www/data first (MV typically uses www/data/)
             let www = path.join("www").join("data");
