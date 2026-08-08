@@ -36,6 +36,8 @@ locust patch "<recorded_root>" -P project.locust.db -l es -o game-es-patch.zip -
 
 # Apply onto a clean copy of the game (never the only original without backup)
 locust apply "<clean_game_copy>" game-es-patch.zip
+# Or download then apply in one step (http/https only):
+locust apply "<clean_game_copy>" --url "https://example.com/game-es-patch.zip"
 locust patch-status "<clean_game_copy>"
 locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
 ```

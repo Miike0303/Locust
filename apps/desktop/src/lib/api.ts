@@ -468,6 +468,8 @@ export const deleteBackup = (id: string): Promise<void> =>
 export interface PatchPathsParams {
   game_path: string;
   zip_path?: string;
+  /** http(s) URL of a patch zip — server downloads then applies/verifies. */
+  zip_url?: string;
   force?: boolean;
   confirm_legacy?: boolean;
   dry_run?: boolean;

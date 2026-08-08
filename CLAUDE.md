@@ -52,4 +52,4 @@ locust providers                    # List translation providers
 - Unreal multi-GB base pak E2E: done (Last Hope); optional more titles
 - RM MZ POR `.jsono` + Iavra multi-pack extract: done (prefer `en`); inject Replace re-encodes `.jsono`; inject Add writes `lang_*_{lang}.jsono` packs
 - RM MZ UI language registration: `locust register-lang <game> -l es --label Español` (Iavra + VisuMZ langs arrays + Map boot choices; `*.bak-locust`)
-- Apply patch from URL (download+apply) still open
+- Apply patch from URL: `locust apply <game> --url https://…/patch.zip` + desktop/server `zip_url`

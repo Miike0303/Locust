@@ -39,6 +39,7 @@ export default function PatchModal({
   const [tab, setTab] = useState<Tab>(initialTab);
   const [gamePath, setGamePath] = useState(defaultGamePath ?? "");
   const [zipPath, setZipPath] = useState("");
+  const [zipUrl, setZipUrl] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [languages, setLanguages] = useState("");
   const [pristine, setPristine] = useState(false);
@@ -126,9 +127,19 @@ export default function PatchModal({
     }
   };
 
+  const patchSource = (): { zip_path?: string; zip_url?: string } | null => {
+    const path = zipPath.trim();
+    const url = zipUrl.trim();
+    if (path && url) return null;
+    if (path) return { zip_path: path };
+    if (url) return { zip_url: url };
+    return null;
+  };
+
   const handleVerify = async () => {
-    if (!gamePath.trim() || !zipPath.trim()) {
-      addToast("error", "Select both game folder and patch zip");
+    const src = patchSource();
+    if (!gamePath.trim() || !src) {
+      addToast("error", "Select game folder and either a local zip or a zip URL");
       return;
     }
     setLoading(true);
@@ -138,7 +149,7 @@ export default function PatchModal({
     try {
       const report = await patchVerify({
         game_path: gamePath.trim(),
-        zip_path: zipPath.trim(),
+        ...src,
       });
       setVerify(report);
       await refreshStatus();
@@ -154,8 +165,9 @@ export default function PatchModal({
   };
 
   const handleApply = async () => {
-    if (!gamePath.trim() || !zipPath.trim()) {
-      addToast("error", "Select both game folder and patch zip");
+    const src = patchSource();
+    if (!gamePath.trim() || !src) {
+      addToast("error", "Select game folder and either a local zip or a zip URL");
       return;
     }
     setLoading(true);
@@ -164,7 +176,7 @@ export default function PatchModal({
     try {
       const report = await patchApply({
         game_path: gamePath.trim(),
-        zip_path: zipPath.trim(),
+        ...src,
         force,
         confirm_legacy: confirmLegacy,
         dry_run: dryRun,
@@ -339,11 +351,14 @@ export default function PatchModal({
           {tab === "apply" && (
             <>
               <div>
-                <label className="text-sm font-medium">Patch zip</label>
+                <label className="text-sm font-medium">Patch zip (local)</label>
                 <div className="flex gap-2 mt-1">
                   <input
                     value={zipPath}
-                    onChange={(e) => setZipPath(e.target.value)}
+                    onChange={(e) => {
+                      setZipPath(e.target.value);
+                      if (e.target.value.trim()) setZipUrl("");
+                    }}
                     placeholder="locust-*-patch.zip..."
                     className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
                   />
@@ -355,6 +370,22 @@ export default function PatchModal({
                     <FileArchive size={16} />
                   </button>
                 </div>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium">Or patch zip URL</label>
+                <input
+                  value={zipUrl}
+                  onChange={(e) => {
+                    setZipUrl(e.target.value);
+                    if (e.target.value.trim()) setZipPath("");
+                  }}
+                  placeholder="https://…/game-es-patch.zip"
+                  className="w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Downloads over http(s), then verify/apply. Use either local path or URL.
+                </p>
               </div>
 
               <div className="flex flex-wrap gap-4 text-sm">

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -818,12 +818,102 @@ async fn inject(
 struct PatchPathsRequest {
     game_path: String,
     zip_path: Option<String>,
+    /// http(s) URL of a patch zip — downloaded to a temp file then applied/verified.
+    /// Mutually exclusive with `zip_path`. Loopback server only; still scheme-gated.
+    zip_url: Option<String>,
     #[serde(default)]
     force: bool,
     #[serde(default)]
     confirm_legacy: bool,
     #[serde(default)]
     dry_run: bool,
+}
+
+/// Resolve local zip path or download `zip_url` into a TempDir (caller must keep it alive).
+async fn resolve_patch_zip(
+    zip_path: Option<String>,
+    zip_url: Option<String>,
+) -> Result<(PathBuf, Option<tempfile::TempDir>), ApiError> {
+    match (zip_path, zip_url) {
+        (Some(p), None) => {
+            let path = PathBuf::from(p);
+            if !path.is_file() {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!("zip_path not found: {}", path.display()),
+                ));
+            }
+            Ok((path, None))
+        }
+        (None, Some(url)) => {
+            let dir = tempfile::TempDir::new()
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let dest = dir.path().join("locust-patch.zip");
+            download_patch_zip_async(&url, &dest).await?;
+            Ok((dest, Some(dir)))
+        }
+        (Some(_), Some(_)) => Err(err(
+            StatusCode::BAD_REQUEST,
+            "pass either zip_path or zip_url, not both",
+        )),
+        (None, None) => Err(err(
+            StatusCode::BAD_REQUEST,
+            "zip_path or zip_url required",
+        )),
+    }
+}
+
+async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError> {
+    const MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        err(StatusCode::BAD_REQUEST, format!("invalid zip_url: {e}"))
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("only http/https zip_url allowed (got {other})"),
+            ));
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30 * 60))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent(format!("locust-server/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let resp = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download HTTP error: {e}")))?;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_BYTES {
+            return Err(err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("remote zip too large: {len} bytes"),
+            ));
+        }
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download body: {e}")))?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "remote zip too large"));
+    }
+    if bytes.is_empty() {
+        return Err(err(StatusCode::BAD_GATEWAY, "download produced empty file"));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+    std::fs::write(dest, &bytes).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -907,12 +997,10 @@ async fn patch_pack(
 async fn patch_verify(
     Json(req): Json<PatchPathsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zip = req
-        .zip_path
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "zip_path required"))?;
+    let (zip, _guard) = resolve_patch_zip(req.zip_path, req.zip_url).await?;
     let report = locust_core::patch::verify(
         &PathBuf::from(&req.game_path),
-        &PathBuf::from(&zip),
+        &zip,
     )
     .map_err(map_patch_err)?;
     Ok(Json(serde_json::json!({
@@ -930,9 +1018,7 @@ async fn patch_verify(
 async fn patch_apply(
     Json(req): Json<PatchPathsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zip = req
-        .zip_path
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "zip_path required"))?;
+    let (zip, _guard) = resolve_patch_zip(req.zip_path, req.zip_url).await?;
     let opts = locust_core::patch::ApplyOptions {
         force: req.force,
         confirm_legacy: req.confirm_legacy,
@@ -940,7 +1026,6 @@ async fn patch_apply(
     };
     // Apply is disk-bound and journaled; run off the async runtime.
     let game = PathBuf::from(&req.game_path);
-    let zip = PathBuf::from(&zip);
     let report = tokio::task::spawn_blocking(move || {
         locust_core::patch::apply(&game, &zip, opts, |_| {})
     })

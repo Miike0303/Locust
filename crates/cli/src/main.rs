@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -149,8 +149,11 @@ enum Commands {
     Apply {
         /// Game root to patch
         game_path: PathBuf,
-        /// Patch zip produced by `locust patch` (or a legacy zip)
-        zip: PathBuf,
+        /// Local patch zip produced by `locust patch` (omit when using --url)
+        zip: Option<PathBuf>,
+        /// Download this patch zip URL (http/https) then apply
+        #[arg(long)]
+        url: Option<String>,
         /// Override verification blocks (mismatch, already-applied, unknown, downgrade)
         #[arg(long)]
         force: bool,
@@ -325,10 +328,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Apply {
             game_path,
             zip,
+            url,
             force,
             confirm_legacy,
             dry_run,
-        } => cmd_apply(game_path, zip, force, confirm_legacy, dry_run)?,
+        } => cmd_apply(game_path, zip, url, force, confirm_legacy, dry_run)?,
         Commands::PatchRollback { game_path, force } => cmd_patch_rollback(game_path, force)?,
         Commands::PatchStatus { game_path } => cmd_patch_status(game_path)?,
         Commands::Auth { provider } => cmd_auth(provider).await?,
@@ -681,7 +685,8 @@ fn detect_engine_label(game_path: &std::path::Path) -> String {
 
 fn cmd_apply(
     game_path: PathBuf,
-    zip: PathBuf,
+    zip: Option<PathBuf>,
+    url: Option<String>,
     force: bool,
     confirm_legacy: bool,
     dry_run: bool,
@@ -691,16 +696,39 @@ fn cmd_apply(
     if !game_path.is_dir() {
         anyhow::bail!("game path is not a directory: {}", game_path.display());
     }
-    if !zip.is_file() {
-        anyhow::bail!("patch zip not found: {}", zip.display());
-    }
+
+    // Keep download tempdir alive for the whole apply.
+    let mut _download_guard: Option<tempfile::TempDir> = None;
+    let zip_path = match (zip, url) {
+        (Some(p), None) => {
+            if !p.is_file() {
+                anyhow::bail!("patch zip not found: {}", p.display());
+            }
+            p
+        }
+        (None, Some(u)) => {
+            let dir = tempfile::tempdir()?;
+            let dest = dir.path().join("locust-patch.zip");
+            println!("downloading {u} …");
+            download_patch_zip(&u, &dest)?;
+            println!("saved {}", dest.display());
+            _download_guard = Some(dir);
+            dest
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("pass either a local zip path or --url, not both");
+        }
+        (None, None) => {
+            anyhow::bail!("patch zip path or --url is required");
+        }
+    };
 
     let opts = ApplyOptions {
         force,
         confirm_legacy,
         dry_run,
     };
-    let report = apply(&game_path, &zip, opts, |p| {
+    let report = apply(&game_path, &zip_path, opts, |p| {
         println!("[{}/{}] {} ({})", p.current, p.total, p.path, p.phase);
     })?;
 
@@ -725,6 +753,60 @@ fn cmd_apply(
         report.added,
         report.baseline
     );
+    Ok(())
+}
+
+/// Download a patch zip over http(s) with size and scheme guards.
+fn download_patch_zip(url: &str, dest: &Path) -> anyhow::Result<()> {
+    const MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB — same order as patch ceiling
+
+    let parsed = reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => anyhow::bail!("only http/https URLs are allowed (got {other})"),
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30 * 60))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent(format!("locust/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let mut resp = client.get(parsed).send()?.error_for_status()?;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_BYTES {
+            anyhow::bail!("remote zip too large: {len} bytes (max {MAX_BYTES})");
+        }
+    }
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(dest)?;
+    let mut written: u64 = 0;
+    let mut buf = [0u8; 1024 * 256];
+    loop {
+        let n = {
+            use std::io::Read;
+            resp.read(&mut buf)?
+        };
+        if n == 0 {
+            break;
+        }
+        written += n as u64;
+        if written > MAX_BYTES {
+            let _ = std::fs::remove_file(dest);
+            anyhow::bail!("download exceeded {MAX_BYTES} bytes — aborted");
+        }
+        use std::io::Write;
+        file.write_all(&buf[..n])?;
+    }
+    if written == 0 {
+        let _ = std::fs::remove_file(dest);
+        anyhow::bail!("download produced an empty file");
+    }
+    println!("downloaded {written} bytes");
     Ok(())
 }
 

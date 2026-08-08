@@ -25,6 +25,8 @@ uuid.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tempfile = "3"
 
 [dependencies.tokio-util]
 version = "0.7"
