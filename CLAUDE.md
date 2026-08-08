@@ -48,7 +48,7 @@ locust providers                    # List translation providers
 - Length-aware binary slots: engine retries once on oversize + counters; **real-provider ES E2E done** (2026-08-08): Unity heuristic fixture `tmp/unity-length-e2e` (6 utf8 binary_slot strings) via `locust translate -p grok-sub -s en -t es` — 526 tokens, ~2.4s; 3 fit first attempt (`Hola Mundo`, `Presiona una tecla`, `¿Seguro?`); 3 still over after length-aware retry on tight UI budgets (`New Game` 8→`Nuevo Jgo` 9, `Load Game` 9→`Cargar Jgo` 10, `Options` 7→`Opciones` 8); `locust validate` → 3× `ExceedsBinarySlot`; inject skips oversize / writes fitting. Mock dual-slot unit tests remain the regression gate
 - Commercial Wolf RPG title E2E (no Wolf game on disk yet)
 - Streaming verify/apply multi-GB: shipped (pack ZIP64 + stream apply); keep eye on edge cases
-- Unity SerializedFile slice 1 done (TextAsset); still no typetree/MonoBehaviour/full rewrite
+- Unity SerializedFile slice 2 done: type-tree blobs **skipped** (object table still reachable); MonoBehaviour (class 114) `m_Name` + sequential aligned-string fields extract/inject (pad in place, `binary_slot=utf8`); BOXMAN real-game: +834 mono entries (Naninovel `@` scripts etc.) alongside 10 TextAssets. Still no full type-tree field walk / object-table rewrite
 - Unreal multi-GB base pak E2E: done (Last Hope); optional more titles
 - RM MZ POR `.jsono` + Iavra multi-pack extract: done (prefer `en`); inject Replace re-encodes `.jsono`; inject Add writes `lang_*_{lang}.jsono` packs
 - RM MZ UI language registration: `locust register-lang <game> -l es --label Español` (Iavra + VisuMZ langs arrays + Map boot choices; `*.bak-locust`)

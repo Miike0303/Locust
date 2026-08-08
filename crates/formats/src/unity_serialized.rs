@@ -1,5 +1,10 @@
-//! Unity SerializedFile container — slice 1: header, type table (no type trees),
-//! object table, and TextAsset (class_id 49) `m_Name` / `m_Script` reads.
+//! Unity SerializedFile container — slices 1–2:
+//! - **Slice 1:** header, type table, object table, TextAsset (class_id 49)
+//!   `m_Name` / `m_Script` reads + in-place rewrite.
+//! - **Slice 2:** skip type-tree blobs (no field interpretation), MonoBehaviour
+//!   (class_id 114) base layout (`m_GameObject`, `m_Enabled`, `m_Script`,
+//!   `m_Name`) plus sequential aligned-string fields after the base for
+//!   extract/in-place rewrite. Full type-tree walks remain out of scope.
 //!
 //! # Format (AssetStudio / AssetsTools.NET conventions)
 //! Header fields through `data_offset` are **big-endian**. From version ≥ 9 the
@@ -8,23 +13,29 @@
 //! file_size / data_offset.
 //!
 //! Metadata (file endian): unity version c-string, target platform u32,
-//! enable_type_tree bool, type count, then per-type class_id and script hashes
-//! **without** type-tree blobs when `enable_type_tree` is false. Type trees are
-//! out of scope for slice 1 — files with type trees return a clear error so
-//! callers can fall back to heuristics.
+//! enable_type_tree bool, type count, then per-type class_id and script hashes.
+//! When `enable_type_tree` is set, type-tree **blobs are skipped** (node table +
+//! string buffer) so the object table is still reachable — field-level type
+//! trees are not interpreted.
 //!
 //! Object table (v≥16): count i32; each object 4-aligned: path_id i64,
 //! byte_start u32 (u64 when v≥22), byte_size u32, type_id i32 (index into types).
 //!
 //! TextAsset object body: aligned string `m_Name`, aligned string `m_Script`
 //! (u32 length + bytes + pad to 4).
+//!
+//! MonoBehaviour object body (release, v≥14 path IDs): PPtr `m_GameObject`,
+//! u8 `m_Enabled` + align4, PPtr `m_Script`, aligned string `m_Name`, then
+//! script-defined fields (slice 2 only walks further **aligned strings**).
 
 use std::path::Path;
 
 /// Unity class ID for TextAsset.
 pub const CLASS_ID_TEXT_ASSET: i32 = 49;
+/// Unity class ID for MonoBehaviour.
+pub const CLASS_ID_MONO_BEHAVIOUR: i32 = 114;
 
-/// SerializedFile format versions we fully support for slice 1.
+/// SerializedFile format versions we fully support for slices 1–2.
 pub const MIN_SUPPORTED_VERSION: u32 = 17;
 pub const MAX_SUPPORTED_VERSION: u32 = 22;
 
@@ -90,6 +101,21 @@ pub struct TextAssetData {
     pub script_len_offset: usize,
     /// Original `m_Script` string byte length (not including length prefix / align).
     pub script_byte_len: usize,
+}
+
+/// One string field extracted from a MonoBehaviour object.
+#[derive(Debug, Clone)]
+pub struct MonoStringData {
+    pub path_id: i64,
+    /// MonoBehaviour `m_Name` (may be empty).
+    pub mono_name: String,
+    /// 0 = `m_Name` itself; 1+ = sequential aligned strings after the base layout.
+    pub field_index: usize,
+    pub text: String,
+    /// Absolute file offset of the string length prefix (u32).
+    pub len_offset: usize,
+    /// Original string byte length (not including length prefix / align).
+    pub byte_len: usize,
 }
 
 #[derive(Debug)]
@@ -277,12 +303,6 @@ impl SerializedFile {
         let unity_version = r.cstring()?;
         let _target_platform = r.u32()?;
         let enable_type_tree = r.u8()? != 0;
-        if enable_type_tree {
-            return Err(err(
-                &label,
-                "SerializedFile has type trees enabled — not supported in TextAsset slice 1",
-            ));
-        }
 
         let type_count = r.i32()?;
         if !(0..=100_000).contains(&type_count) {
@@ -299,11 +319,14 @@ impl SerializedFile {
             // v >= 17
             let script_type_index = r.i16()?;
             // script_id[16] for MonoBehaviour / negative class
-            if class_id == 114 || class_id < 0 {
+            if class_id == CLASS_ID_MONO_BEHAVIOUR || class_id < 0 {
                 let _script_id = r.take(16)?;
             }
             let _old_type_hash = r.take(16)?;
-            // no type tree
+            // Slice 2: skip type-tree blobs without interpreting nodes.
+            if enable_type_tree {
+                skip_type_tree_blob(&mut r, version)?;
+            }
             types.push(SerializedType {
                 class_id,
                 is_stripped,
@@ -379,6 +402,12 @@ impl SerializedFile {
             .filter(|o| o.class_id == CLASS_ID_TEXT_ASSET)
     }
 
+    pub fn mono_behaviour_objects(&self) -> impl Iterator<Item = &ObjectInfo> {
+        self.objects
+            .iter()
+            .filter(|o| o.class_id == CLASS_ID_MONO_BEHAVIOUR)
+    }
+
     /// Read TextAsset `m_Name` + `m_Script` at `path_id`.
     pub fn read_text_asset(&self, path_id: i64) -> Result<TextAssetData, SerializedError> {
         let label = self.path.display().to_string();
@@ -407,17 +436,206 @@ impl SerializedFile {
         })
     }
 
-    /// Absolute byte ranges of all TextAsset objects (for heuristic skip).
+    /// Read MonoBehaviour `m_Name` + sequential aligned-string fields after the
+    /// fixed base layout. Stops at the first non-string-shaped field.
+    pub fn read_mono_strings(&self, path_id: i64) -> Result<Vec<MonoStringData>, SerializedError> {
+        let label = self.path.display().to_string();
+        let obj = self
+            .objects
+            .iter()
+            .find(|o| o.path_id == path_id && o.class_id == CLASS_ID_MONO_BEHAVIOUR)
+            .ok_or_else(|| {
+                err(
+                    &label,
+                    format!("no MonoBehaviour with path_id={path_id}"),
+                )
+            })?;
+
+        let start = obj.data_abs as usize;
+        let end = (start + obj.byte_size as usize).min(self.data.len());
+        let mut r = R {
+            data: &self.data[..end],
+            pos: start,
+            file: &label,
+            endian: self.header.endian,
+        };
+
+        // m_GameObject PPtr (FileID i32 + PathID i64 for v≥14 / our supported range)
+        let _go_file = r.i32()?;
+        let _go_path = r.i64()?;
+        // m_Enabled + align
+        let _enabled = r.u8()?;
+        r.align4();
+        // m_Script PPtr
+        let _script_file = r.i32()?;
+        let _script_path = r.i64()?;
+        // m_Name
+        let (mono_name, name_off, name_len) = r.aligned_string()?;
+
+        let mut out = Vec::new();
+        // m_Name: keep short natural labels; still drop binary / FFFD.
+        if mono_name_worth_extracting(&mono_name) {
+            out.push(MonoStringData {
+                path_id,
+                mono_name: mono_name.clone(),
+                field_index: 0,
+                text: mono_name.clone(),
+                len_offset: name_off,
+                byte_len: name_len,
+            });
+        }
+
+        // Sequential aligned strings for simple script layouts (no type tree).
+        let mut field_index = 1usize;
+        while r.pos + 4 <= end {
+            // Bound the length read so a non-string int does not walk off the object.
+            let len_peek = {
+                let b = match r.need(4) {
+                    Ok(()) => &r.data[r.pos..r.pos + 4],
+                    Err(_) => break,
+                };
+                match r.endian {
+                    Endian::Little => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                    Endian::Big => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+                }
+            };
+            let remaining = end - r.pos - 4;
+            if len_peek as usize > remaining || len_peek > 4 * 1024 * 1024 {
+                break;
+            }
+            match r.aligned_string() {
+                Ok((text, len_offset, byte_len)) => {
+                    if r.pos > end {
+                        // Overran — discard
+                        break;
+                    }
+                    if mono_script_field_worth_extracting(&text) {
+                        out.push(MonoStringData {
+                            path_id,
+                            mono_name: mono_name.clone(),
+                            field_index,
+                            text,
+                            len_offset,
+                            byte_len,
+                        });
+                    }
+                    // Always advance index for any string-shaped field we consumed.
+                    field_index += 1;
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Absolute byte ranges of TextAsset + MonoBehaviour objects (heuristic skip).
     pub fn text_asset_byte_ranges(&self) -> Vec<(usize, usize)> {
+        self.structural_object_byte_ranges()
+    }
+
+    /// Absolute byte ranges of objects handled structurally (TextAsset + MonoBehaviour).
+    pub fn structural_object_byte_ranges(&self) -> Vec<(usize, usize)> {
         self.objects
             .iter()
-            .filter(|o| o.class_id == CLASS_ID_TEXT_ASSET)
+            .filter(|o| {
+                o.class_id == CLASS_ID_TEXT_ASSET || o.class_id == CLASS_ID_MONO_BEHAVIOUR
+            })
             .map(|o| {
                 let s = o.data_abs as usize;
                 (s, s + o.byte_size as usize)
             })
             .collect()
     }
+}
+
+/// Skip a SerializedFile type-tree blob (AssetStudio `TypeTreeBlobRead`).
+/// Supported format versions are ≥17, which always use the blob layout.
+fn skip_type_tree_blob(r: &mut R<'_>, version: u32) -> Result<(), SerializedError> {
+    let node_count = r.i32()?;
+    let string_buffer_size = r.i32()?;
+    if !(0..=1_000_000).contains(&node_count) {
+        return Err(err(
+            r.file,
+            format!("implausible type-tree node count {node_count}"),
+        ));
+    }
+    if !(0..=50_000_000).contains(&string_buffer_size) {
+        return Err(err(
+            r.file,
+            format!("implausible type-tree string buffer size {string_buffer_size}"),
+        ));
+    }
+    // Each node: 24 bytes before format 19, 32 bytes with RefTypeHash at ≥19.
+    let node_size: usize = if version >= 19 { 32 } else { 24 };
+    let nodes_bytes = (node_count as usize).saturating_mul(node_size);
+    r.take(nodes_bytes)?;
+    r.take(string_buffer_size as usize)?;
+    Ok(())
+}
+
+fn mono_name_worth_extracting(s: &str) -> bool {
+    let t = s.trim();
+    if t.len() < 2 {
+        return false;
+    }
+    if t.contains('\u{FFFD}') || is_binary_looking_script(s) {
+        return false;
+    }
+    if t.chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+    {
+        return false;
+    }
+    t.chars().any(|c| c.is_alphabetic())
+}
+
+/// Script-field filter (field_index ≥ 1). Sequential walks mis-read ints as lengths
+/// on complex MonoBehaviours — be strict so BOXMAN-class noise stays out.
+fn mono_script_field_worth_extracting(s: &str) -> bool {
+    if !mono_name_worth_extracting(s) {
+        return false;
+    }
+    let t = s.trim();
+    // Pure numeric / version-like.
+    if t.chars()
+        .all(|c| c.is_ascii_digit() || c == '-' || c == '.' || c == '+')
+    {
+        return false;
+    }
+    // `_CONST` / `ALL_CAPS_SNAKE` engine tokens.
+    if t.starts_with('_') {
+        return false;
+    }
+    if t.len() >= 3
+        && t.chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+    {
+        return false;
+    }
+    // Single-token PascalCase / camelCase identifiers (SpritesDefault, Live2DSceneHolder).
+    // Keep multi-word / multi-line / script-ish text (`@showUI …`, `Portable Speaker`).
+    let has_word_break = t.chars().any(|c| c.is_whitespace() || c == '@');
+    if !has_word_break && looks_like_code_identifier(t) {
+        return false;
+    }
+    true
+}
+
+fn looks_like_code_identifier(t: &str) -> bool {
+    if t.is_empty() || !t.chars().next().unwrap().is_ascii_alphabetic() {
+        return false;
+    }
+    if !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    let chars: Vec<char> = t.chars().collect();
+    // PascalCase / camelCase / name2 style — not plain words like "Hola" / "Save".
+    let has_inner_upper = chars.len() >= 2 && chars[1..].iter().any(|c| c.is_ascii_uppercase());
+    let has_digit = chars.iter().any(|c| c.is_ascii_digit());
+    has_inner_upper || has_digit
 }
 
 /// True if `script` looks like binary (high non-text ratio).
@@ -481,7 +699,7 @@ pub fn rewrite_text_asset_script_inplace(
     Ok(())
 }
 
-// ─── Test / fixture writer (v17, little-endian, no type trees) ─────────────
+// ─── Test / fixture writer (v17, little-endian) ────────────────────────────
 
 /// Build a minimal v17 SerializedFile with one TextAsset and one dummy object.
 #[cfg(test)]
@@ -682,4 +900,206 @@ mod tests {
         let e = SerializedFile::parse(bytes, "oob.assets");
         assert!(e.is_err());
     }
+
+    #[test]
+    fn parse_v17_with_type_tree_blob_skipped() {
+        let bytes = write_v17_fixture_with_type_tree("HelloName", "Hello script body");
+        let sf = SerializedFile::parse(bytes, "tt.assets").unwrap();
+        assert_eq!(sf.objects.len(), 1);
+        let ta = sf.read_text_asset(1).unwrap();
+        assert_eq!(ta.name, "HelloName");
+        assert_eq!(ta.script, "Hello script body");
+    }
+
+    #[test]
+    fn parse_v17_mono_behaviour_strings() {
+        let bytes = write_v17_mono_fixture(
+            "DialogBox",
+            &["Welcome, traveler!", "See you later."],
+        );
+        let sf = SerializedFile::parse(bytes, "mono.assets").unwrap();
+        let monos: Vec<_> = sf.mono_behaviour_objects().collect();
+        assert_eq!(monos.len(), 1);
+        assert_eq!(monos[0].path_id, 10);
+        assert_eq!(monos[0].class_id, CLASS_ID_MONO_BEHAVIOUR);
+
+        let fields = sf.read_mono_strings(10).unwrap();
+        // m_Name + 2 script strings
+        assert_eq!(fields.len(), 3, "fields: {fields:?}");
+        assert_eq!(fields[0].field_index, 0);
+        assert_eq!(fields[0].text, "DialogBox");
+        assert_eq!(fields[1].text, "Welcome, traveler!");
+        assert_eq!(fields[2].text, "See you later.");
+        assert_eq!(fields[1].mono_name, "DialogBox");
+    }
+
+    #[test]
+    fn rewrite_mono_script_field_inplace() {
+        let bytes = write_v17_mono_fixture("Box", &["Hi world"]); // dialogue = 8 bytes
+        let sf = SerializedFile::parse(bytes.clone(), "m.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        assert!(
+            fields.iter().any(|f| f.text == "Hi world"),
+            "pre-rewrite fields: {fields:?}"
+        );
+        let dialogue = fields.iter().find(|f| f.text == "Hi world").unwrap();
+        let mut file = bytes;
+        rewrite_text_asset_script_inplace(
+            &mut file,
+            dialogue.len_offset,
+            dialogue.byte_len,
+            "Hola",
+            "m.assets",
+        )
+        .unwrap();
+        let again = SerializedFile::parse(file, "m.assets").unwrap();
+        let fields2 = again.read_mono_strings(10).unwrap();
+        let d2 = fields2
+            .iter()
+            .find(|f| f.text.starts_with("Hola"))
+            .expect(&format!("post-rewrite fields: {fields2:?}"));
+        assert_eq!(d2.byte_len, 8);
+    }
+
+    #[test]
+    fn structural_ranges_include_mono() {
+        let bytes = write_v17_mono_fixture("N", &["Hi there"]);
+        let sf = SerializedFile::parse(bytes, "m.assets").unwrap();
+        let ranges = sf.structural_object_byte_ranges();
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].1 > ranges[0].0);
+    }
+}
+
+/// v17 fixture: one TextAsset, enable_type_tree=1 with a minimal skippable blob.
+#[cfg(test)]
+pub fn write_v17_fixture_with_type_tree(text_name: &str, text_script: &str) -> Vec<u8> {
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+        let pad = align4(b.len()) - b.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+
+    let mut text_payload = Vec::new();
+    write_aligned_string(&mut text_payload, text_name);
+    write_aligned_string(&mut text_payload, text_script);
+
+    let mut meta = Vec::new();
+    meta.extend_from_slice(b"2019.4.0f1\0");
+    meta.extend_from_slice(&1u32.to_le_bytes());
+    meta.push(1); // enable_type_tree = true
+
+    meta.extend_from_slice(&1i32.to_le_bytes()); // 1 type
+    meta.extend_from_slice(&CLASS_ID_TEXT_ASSET.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&(-1i16).to_le_bytes());
+    meta.extend_from_slice(&[0u8; 16]); // old_type_hash
+    // type tree blob: 1 node (24 bytes for v17), empty string buffer
+    meta.extend_from_slice(&1i32.to_le_bytes()); // node count
+    meta.extend_from_slice(&0i32.to_le_bytes()); // string buffer size
+    meta.extend_from_slice(&[0u8; 24]); // one node
+
+    meta.extend_from_slice(&1i32.to_le_bytes()); // 1 object
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    meta.extend_from_slice(&1i64.to_le_bytes());
+    meta.extend_from_slice(&0u32.to_le_bytes()); // byte_start
+    meta.extend_from_slice(&(text_payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes()); // type index
+
+    let header_len = 20usize;
+    let mut data_offset = header_len + meta.len();
+    data_offset = (data_offset + 15) & !15;
+    let file_size = data_offset + text_payload.len();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(file_size as u32).to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&meta);
+    while out.len() < data_offset {
+        out.push(0);
+    }
+    out.extend_from_slice(&text_payload);
+    out
+}
+
+/// v17 fixture: one MonoBehaviour with `m_Name` + sequential string fields.
+#[cfg(test)]
+pub fn write_v17_mono_fixture(mono_name: &str, script_strings: &[&str]) -> Vec<u8> {
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+        let pad = align4(b.len()) - b.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+    fn write_pptr(buf: &mut Vec<u8>, file_id: i32, path_id: i64) {
+        buf.extend_from_slice(&file_id.to_le_bytes());
+        buf.extend_from_slice(&path_id.to_le_bytes());
+    }
+
+    let mut payload = Vec::new();
+    write_pptr(&mut payload, 0, 0); // m_GameObject
+    payload.push(1); // m_Enabled
+    while payload.len() % 4 != 0 {
+        payload.push(0);
+    }
+    write_pptr(&mut payload, 0, 0); // m_Script
+    write_aligned_string(&mut payload, mono_name);
+    for s in script_strings {
+        write_aligned_string(&mut payload, s);
+    }
+
+    let mut meta = Vec::new();
+    meta.extend_from_slice(b"2019.4.0f1\0");
+    meta.extend_from_slice(&1u32.to_le_bytes());
+    meta.push(0); // no type tree
+
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    meta.extend_from_slice(&CLASS_ID_MONO_BEHAVIOUR.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&0i16.to_le_bytes()); // script_type_index
+    meta.extend_from_slice(&[0u8; 16]); // script_id (class 114)
+    meta.extend_from_slice(&[0u8; 16]); // old_type_hash
+
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    meta.extend_from_slice(&10i64.to_le_bytes()); // path_id
+    meta.extend_from_slice(&0u32.to_le_bytes());
+    meta.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes());
+
+    let header_len = 20usize;
+    let mut data_offset = header_len + meta.len();
+    data_offset = (data_offset + 15) & !15;
+    let file_size = data_offset + payload.len();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(file_size as u32).to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&meta);
+    while out.len() < data_offset {
+        out.push(0);
+    }
+    out.extend_from_slice(&payload);
+    out
 }

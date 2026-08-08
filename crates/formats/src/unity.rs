@@ -12,8 +12,9 @@ use crate::unity_serialized::{
 /// Plugin for Unity Engine games.
 /// Supports:
 /// 1. Text-based VN scripts (SCRIPTS~/ directory with .txt dialogue files)
-/// 2. Structural TextAsset extraction from SerializedFile `.assets` / `level*`
-/// 3. Heuristic length-prefixed UTF-8 scan of the same files (skips TextAsset ranges)
+/// 2. Structural TextAsset + MonoBehaviour extraction from SerializedFile
+///    `.assets` / `level*` (type-tree blobs skipped; no full type-tree walk)
+/// 3. Heuristic length-prefixed UTF-8 scan of the same files (skips structural ranges)
 pub struct UnityPlugin;
 
 impl UnityPlugin {
@@ -322,7 +323,7 @@ impl UnityPlugin {
 
         match SerializedFile::parse(bytes.to_vec(), file_path) {
             Ok(sf) => {
-                skip_ranges = sf.text_asset_byte_ranges();
+                skip_ranges = sf.structural_object_byte_ranges();
                 for obj in sf.text_asset_objects() {
                     match sf.read_text_asset(obj.path_id) {
                         Ok(ta) => {
@@ -377,6 +378,76 @@ impl UnityPlugin {
                                 path_id = obj.path_id,
                                 error = %e,
                                 "TextAsset read failed; skipped"
+                            );
+                        }
+                    }
+                }
+                // Slice 2: MonoBehaviour m_Name + sequential aligned-string fields.
+                for obj in sf.mono_behaviour_objects() {
+                    match sf.read_mono_strings(obj.path_id) {
+                        Ok(fields) => {
+                            for field in fields {
+                                if field.text.trim().is_empty() {
+                                    continue;
+                                }
+                                if !seen.insert(field.text.clone()) {
+                                    continue;
+                                }
+                                let id = format!(
+                                    "monobehaviour/{}/{}",
+                                    field.path_id, field.field_index
+                                );
+                                let mut entry = StringEntry::new(
+                                    id,
+                                    field.text.clone(),
+                                    file_path.to_path_buf(),
+                                );
+                                entry.tags = vec!["monobehaviour".to_string()];
+                                entry.context = if field.mono_name.is_empty() {
+                                    Some(format!("field={}", field.field_index))
+                                } else {
+                                    Some(format!(
+                                        "m_Name={} field={}",
+                                        field.mono_name, field.field_index
+                                    ))
+                                };
+                                entry.metadata.insert(
+                                    "extraction_method".to_string(),
+                                    serde_json::Value::String("monobehaviour".to_string()),
+                                );
+                                entry.metadata.insert(
+                                    "path_id".to_string(),
+                                    serde_json::json!(field.path_id),
+                                );
+                                entry.metadata.insert(
+                                    "field_index".to_string(),
+                                    serde_json::json!(field.field_index),
+                                );
+                                entry.metadata.insert(
+                                    "name".to_string(),
+                                    serde_json::Value::String(field.mono_name),
+                                );
+                                entry.metadata.insert(
+                                    "mono_string_offset".to_string(),
+                                    serde_json::json!(field.len_offset),
+                                );
+                                entry.metadata.insert(
+                                    "mono_string_byte_len".to_string(),
+                                    serde_json::json!(field.byte_len),
+                                );
+                                entry.metadata.insert(
+                                    "binary_slot".to_string(),
+                                    serde_json::Value::String("utf8".to_string()),
+                                );
+                                entries.push(entry);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                file = %filename,
+                                path_id = obj.path_id,
+                                error = %e,
+                                "MonoBehaviour read failed; skipped"
                             );
                         }
                     }
@@ -464,6 +535,18 @@ fn is_textasset_entry(entry: &StringEntry) -> bool {
         .get("extraction_method")
         .and_then(|v| v.as_str())
         == Some("textasset")
+}
+
+fn is_mono_entry(entry: &StringEntry) -> bool {
+    entry
+        .metadata
+        .get("extraction_method")
+        .and_then(|v| v.as_str())
+        == Some("monobehaviour")
+}
+
+fn is_structural_entry(entry: &StringEntry) -> bool {
+    is_textasset_entry(entry) || is_mono_entry(entry)
 }
 
 /// Extract a quoted string from a line like `button 0 "Label" +link jump 5`
@@ -679,8 +762,8 @@ impl FormatPlugin for UnityPlugin {
             let mut modified = false;
             let label = file_path.display().to_string();
 
-            // ── Structural TextAsset inject (same-or-shorter, space-pad) ─────
-            for entry in file_entries.iter().filter(|e| is_textasset_entry(e)) {
+            // ── Structural TextAsset / MonoBehaviour inject (pad in place) ──
+            for entry in file_entries.iter().filter(|e| is_structural_entry(e)) {
                 let translation = match &entry.translation {
                     Some(t) => t,
                     None => {
@@ -692,14 +775,27 @@ impl FormatPlugin for UnityPlugin {
                     strings_skipped += 1;
                     continue;
                 }
+                let (off_key, len_key, kind) = if is_textasset_entry(entry) {
+                    (
+                        "textasset_script_offset",
+                        "textasset_script_byte_len",
+                        "TextAsset",
+                    )
+                } else {
+                    (
+                        "mono_string_offset",
+                        "mono_string_byte_len",
+                        "MonoBehaviour",
+                    )
+                };
                 let Some(script_off) = entry
                     .metadata
-                    .get("textasset_script_offset")
+                    .get(off_key)
                     .and_then(|v| v.as_u64())
                     .map(|u| u as usize)
                 else {
                     warnings.push(format!(
-                        "TextAsset entry '{}' missing textasset_script_offset",
+                        "{kind} entry '{}' missing {off_key}",
                         entry.id
                     ));
                     strings_skipped += 1;
@@ -707,14 +803,14 @@ impl FormatPlugin for UnityPlugin {
                 };
                 let orig_len = entry
                     .metadata
-                    .get("textasset_script_byte_len")
+                    .get(len_key)
                     .and_then(|v| v.as_u64())
                     .map(|u| u as usize)
                     .unwrap_or(entry.source.len());
                 if translation.len() > orig_len {
                     if length_skipped < 5 {
                         warnings.push(format!(
-                            "translation for '{}' longer than original TextAsset script ({} > {} bytes), skipping",
+                            "translation for '{}' longer than original {kind} string ({} > {} bytes), skipping",
                             entry.id,
                             translation.len(),
                             orig_len
@@ -736,20 +832,20 @@ impl FormatPlugin for UnityPlugin {
                         modified = true;
                     }
                     Err(e) => {
-                        warnings.push(format!("TextAsset rewrite {}: {e}", entry.id));
+                        warnings.push(format!("{kind} rewrite {}: {e}", entry.id));
                         strings_skipped += 1;
                     }
                 }
             }
 
-            // ── Heuristic length-prefixed inject (non-TextAsset entries) ───
+            // ── Heuristic length-prefixed inject (non-structural entries) ──
             struct Work {
                 needle: Vec<u8>,
                 trans_bytes: Vec<u8>,
                 orig_payload_len: usize,
             }
             let mut work: Vec<Work> = Vec::new();
-            for entry in file_entries.iter().filter(|e| !is_textasset_entry(e)) {
+            for entry in file_entries.iter().filter(|e| !is_structural_entry(e)) {
                 let translation = match &entry.translation {
                     Some(t) => t,
                     None => {
@@ -1177,6 +1273,78 @@ script Chapter_1_script chapter 1 {
         // Object table / file still parseable
         let sf = SerializedFile::parse_path(&assets).unwrap();
         assert_eq!(sf.objects.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn create_mono_assets_fixture(dir: &Path) -> PathBuf {
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        let bytes = crate::unity_serialized::write_v17_mono_fixture(
+            "DialogBox",
+            &["Hello traveler, welcome!"],
+        );
+        let path = data_dir.join("sharedassets0.assets");
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_mono_extract_structural() {
+        let dir = tempdir();
+        create_mono_assets_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let mono: Vec<_> = entries
+            .iter()
+            .filter(|e| e.tags.iter().any(|t| t == "monobehaviour"))
+            .collect();
+        assert!(
+            mono.len() >= 2,
+            "expected m_Name + dialogue, got {:?}",
+            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+        );
+        assert!(mono.iter().any(|e| e.source == "DialogBox"));
+        assert!(mono.iter().any(|e| e.source.contains("Hello traveler")));
+        assert!(mono.iter().any(|e| e.id.starts_with("monobehaviour/")));
+        assert_eq!(
+            mono[0]
+                .metadata
+                .get("extraction_method")
+                .and_then(|v| v.as_str()),
+            Some("monobehaviour")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mono_inject_shorter() {
+        let dir = tempdir();
+        let assets = create_mono_assets_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for e in &mut entries {
+            if e.tags.iter().any(|t| t == "monobehaviour") && e.source.contains("Hello traveler") {
+                e.translation = Some("Hola!".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(
+            report.strings_written >= 1,
+            "written={} {:?}",
+            report.strings_written,
+            report.warnings
+        );
+        let again = plugin.extract(&dir).unwrap();
+        assert!(
+            again
+                .iter()
+                .any(|e| e.tags.iter().any(|t| t == "monobehaviour") && e.source.starts_with("Hola!")),
+            "re-extract: {:?}",
+            again.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        let sf = SerializedFile::parse_path(&assets).unwrap();
+        assert_eq!(sf.mono_behaviour_objects().count(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
