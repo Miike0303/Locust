@@ -45,7 +45,7 @@ locust providers                    # List translation providers
 - KiriKiri/KAG is Experimental (loose .ks + unencrypted XP3 + FE FE 0/1/2; patch.xp3 write; synthetic fixtures; no cxdec)
 - YU-RIS is Experimental (loose YSTB .ybn + YPF unpack/repack common versions; synthetic fixtures + real-game YSTB validated)
 - QSP is Experimental (synthetic fixtures only; no real game tested yet)
-- Length-aware binary slots: engine retries once on oversize + counters; real-provider ES E2E still pending (mock is dual-slot safe)
+- Length-aware binary slots: engine retries once on oversize + counters; **real-provider ES E2E done** (2026-08-08): Unity heuristic fixture `tmp/unity-length-e2e` (6 utf8 binary_slot strings) via `locust translate -p grok-sub -s en -t es` — 526 tokens, ~2.4s; 3 fit first attempt (`Hola Mundo`, `Presiona una tecla`, `¿Seguro?`); 3 still over after length-aware retry on tight UI budgets (`New Game` 8→`Nuevo Jgo` 9, `Load Game` 9→`Cargar Jgo` 10, `Options` 7→`Opciones` 8); `locust validate` → 3× `ExceedsBinarySlot`; inject skips oversize / writes fitting. Mock dual-slot unit tests remain the regression gate
 - Commercial Wolf RPG title E2E (no Wolf game on disk yet)
 - Streaming verify/apply multi-GB: shipped (pack ZIP64 + stream apply); keep eye on edge cases
 - Unity SerializedFile slice 1 done (TextAsset); still no typetree/MonoBehaviour/full rewrite
