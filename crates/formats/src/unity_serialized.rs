@@ -1,6 +1,7 @@
 //! Unity SerializedFile container — slices 1–2:
 //! - **Slice 1:** header, type table, object table, TextAsset (class_id 49)
-//!   `m_Name` / `m_Script` reads + in-place rewrite.
+//!   `m_Name` / `m_Script` reads + in-place rewrite (payload pad with `0x20`;
+//!   length-prefix u32 left byte-identical so BE assets stay valid).
 //! - **Slice 2:** skip type-tree blobs (no field interpretation), MonoBehaviour
 //!   (class_id 114) base layout (`m_GameObject`, `m_Enabled`, `m_Script`,
 //!   `m_Name`) plus sequential aligned-string fields after the base for
@@ -659,8 +660,14 @@ pub fn is_binary_looking_script(script: &str) -> bool {
     (non_text as f64) / (bytes.len() as f64) > 0.20
 }
 
-/// In-place rewrite of `m_Script` when `new_script` UTF-8 length ≤ original.
-/// Pads with `0x20` to keep the original string field size; object table unchanged.
+/// In-place rewrite of an aligned string payload when `new_script` UTF-8 length
+/// ≤ original. Pads with `0x20` to keep the original field size; object table
+/// unchanged.
+///
+/// The **length prefix u32 is left byte-identical** (not re-encoded). That keeps
+/// big-endian SerializedFiles valid — rewriting the prefix as little-endian
+/// would byte-swap the stored length on BE assets. LE games keep the same
+/// numeric length either way.
 pub fn rewrite_text_asset_script_inplace(
     file_bytes: &mut [u8],
     script_len_offset: usize,
@@ -686,12 +693,10 @@ pub fn rewrite_text_asset_script_inplace(
     if need > file_bytes.len() {
         return Err(err(file_label, "script field past EOF"));
     }
-    // Length prefix stays as **original** length so the field size (and align)
-    // is unchanged; pad shorter text with spaces (Unity reads the full buffer).
-    // User asked pad to original m_Script length with 0x20 — keep len = orig.
-    file_bytes[script_len_offset..script_len_offset + 4]
-        .copy_from_slice(&(orig_script_byte_len as u32).to_le_bytes());
-    let payload = &mut file_bytes[script_len_offset + 4..script_len_offset + 4 + orig_script_byte_len];
+    // Do not rewrite the length prefix — leave endianness and value as on disk.
+    // Field size stays fixed; pad shorter text with 0x20 (Unity reads the full buffer).
+    let payload =
+        &mut file_bytes[script_len_offset + 4..script_len_offset + 4 + orig_script_byte_len];
     payload[..new_bytes.len()].copy_from_slice(new_bytes);
     for b in &mut payload[new_bytes.len()..] {
         *b = b' ';
@@ -869,6 +874,55 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.message.contains("longer"));
+    }
+
+    /// Length prefix must stay byte-identical (big-endian assets break if we
+    /// re-encode the u32 as little-endian).
+    #[test]
+    fn rewrite_preserves_length_prefix_bytes_including_be() {
+        // Synthetic slot: BE u32 length=8 + 8 payload bytes.
+        let mut buf = vec![0u8; 12];
+        buf[0..4].copy_from_slice(&8u32.to_be_bytes());
+        buf[4..12].copy_from_slice(b"ABCDEFGH");
+        let prefix_before = buf[0..4].to_vec();
+        rewrite_text_asset_script_inplace(&mut buf, 0, 8, "Hi", "be.assets").unwrap();
+        assert_eq!(
+            &buf[0..4],
+            prefix_before.as_slice(),
+            "length prefix must not be rewritten"
+        );
+        assert_eq!(&buf[4..6], b"Hi");
+        assert_eq!(&buf[6..12], b"      "); // space pad
+    }
+
+    /// Multi-byte UTF-8 shorter rewrite pads with 0x20; length field unchanged.
+    #[test]
+    fn rewrite_utf8_multibyte_shorter_pads() {
+        // "¿Seguro?" = 9 bytes UTF-8; rewrite to "Sí" (3 bytes) + spaces.
+        let src = "¿Seguro?";
+        assert_eq!(src.len(), 9);
+        let bytes = write_v17_fixture("Q", src);
+        let sf = SerializedFile::parse(bytes.clone(), "u8.assets").unwrap();
+        let ta = sf.read_text_asset(1).unwrap();
+        let mut file = bytes;
+        let prefix = file[ta.script_len_offset..ta.script_len_offset + 4].to_vec();
+        rewrite_text_asset_script_inplace(
+            &mut file,
+            ta.script_len_offset,
+            ta.script_byte_len,
+            "Sí",
+            "u8.assets",
+        )
+        .unwrap();
+        assert_eq!(
+            &file[ta.script_len_offset..ta.script_len_offset + 4],
+            prefix.as_slice()
+        );
+        let again = SerializedFile::parse(file, "u8.assets").unwrap();
+        let ta2 = again.read_text_asset(1).unwrap();
+        assert!(ta2.script.starts_with("Sí"), "got {:?}", ta2.script);
+        assert_eq!(ta2.script.len(), 9);
+        assert!(ta2.script.ends_with(' '));
     }
 
     #[test]
