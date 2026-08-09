@@ -335,6 +335,15 @@ impl UnityPlugin {
                             if !is_textasset_script_worth_extracting(&ta.script) {
                                 continue;
                             }
+                            // Non-player assets by m_Name (TMP linebreak tables, SFX tech
+                            // packs, CharacterNames lists).
+                            if is_non_player_textasset_name(&ta.name) {
+                                continue;
+                            }
+                            // Markdown / internal delivery notes mis-stored as TextAsset.
+                            if looks_like_internal_tech_doc(&ta.script) {
+                                continue;
+                            }
                             // Naninovel / ICU locale name catalogs (`af: Afrikaans`, …) —
                             // not game UI; skip whole asset (BOXMAN ~233 rows).
                             if is_locale_catalog_script(&ta.script) {
@@ -928,7 +937,11 @@ fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
     if non_empty.len() == 1 {
         let line = non_empty[0];
         let (key, sep, value) = split_loc_kv(line)?;
-        if value.trim().is_empty() || !looks_like_loc_key(key) {
+        if value.trim().is_empty()
+            || !looks_like_loc_key(key)
+            || looks_like_bcp47_locale_id(key)
+            || looks_like_lorem_ipsum(value)
+        {
             return None;
         }
         return Some(vec![TextAssetLocLine {
@@ -954,6 +967,10 @@ fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
             if looks_like_bcp47_locale_id(key) {
                 continue;
             }
+            // Designer placeholder preview copy.
+            if looks_like_lorem_ipsum(value) {
+                continue;
+            }
             out.push(TextAssetLocLine {
                 key: Some(key.to_string()),
                 sep: sep.to_string(),
@@ -961,7 +978,11 @@ fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
                 line_count,
             });
         } else {
-            // Rare non-kv line in a loc doc — keep whole line for round-trip.
+            // Rare non-kv line in a loc doc — keep whole line for round-trip
+            // unless it's pure placeholder filler.
+            if looks_like_lorem_ipsum(line) {
+                continue;
+            }
             out.push(TextAssetLocLine {
                 key: None,
                 sep: String::new(),
@@ -1020,6 +1041,52 @@ fn looks_like_bcp47_locale_id(key: &str) -> bool {
         }
     }
     true
+}
+
+/// TextAsset `m_Name` that is never player-facing copy.
+fn is_non_player_textasset_name(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() {
+        return false;
+    }
+    let lower = n.to_ascii_lowercase();
+    // TMP / ICU linebreak character-class tables (BOXMAN path_id 830/831).
+    if lower.starts_with("linebreaking")
+        || lower.contains("line breaking")
+        || lower.ends_with("leading characters")
+        || lower.ends_with("following characters")
+    {
+        return true;
+    }
+    // Internal SFX / pipeline delivery notes.
+    if lower.contains("technical specifications") {
+        return true;
+    }
+    // Proper-name tables (Emily/Jake/…) — translate via glossary, not bulk extract.
+    if lower == "characternames" || lower.ends_with("character names") {
+        return true;
+    }
+    false
+}
+
+/// Markdown-ish internal tech / delivery notes stored as TextAsset.
+fn looks_like_internal_tech_doc(script: &str) -> bool {
+    let t = script.trim();
+    if t.len() < 40 {
+        return false;
+    }
+    let upper = t.to_ascii_uppercase();
+    if upper.contains("TECHNICAL SPECIFICATIONS") {
+        return true;
+    }
+    // `**Date:**` / `**Format**` style packages.
+    let bold_markers = t.matches("**").count();
+    if bold_markers >= 4
+        && (t.contains("**Date:**") || t.contains("**Format**") || t.contains("**Format:**"))
+    {
+        return true;
+    }
+    false
 }
 
 /// Entire ManagedText blob is a culture→display-name catalog (Naninovel `Locales`).
@@ -2738,6 +2805,72 @@ script Chapter_1_script chapter 1 {
             ta.is_empty(),
             "line-break charset TextAsset must not extract: {:?}",
             ta.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_textasset_skips_tech_docs_characternames_and_lorem_loc() {
+        assert!(is_non_player_textasset_name(
+            "LineBreaking Leading Characters"
+        ));
+        assert!(is_non_player_textasset_name(
+            "TECHNICAL SPECIFICATIONS — SFX DELIVERY"
+        ));
+        assert!(is_non_player_textasset_name("CharacterNames"));
+        assert!(!is_non_player_textasset_name("DefaultUI"));
+        assert!(!is_non_player_textasset_name("START"));
+
+        let tech = "\r\n\r\n**TECHNICAL SPECIFICATIONS — SFX PACKAGE**  \r\n**Date:** 2025-12-03\r\n\r\n**Format**\r\n\r\nWAV 48kHz";
+        assert!(looks_like_internal_tech_doc(tech));
+        assert!(!looks_like_internal_tech_doc(
+            "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS"
+        ));
+
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+
+        // CharacterNames asset → skip
+        let names = "Carter: Carter\r\nEmily: Emily\r\nJake: Jake\r\n";
+        let bytes = crate::unity_serialized::write_v17_fixture("CharacterNames", names);
+        fs::write(data_dir.join("sharedassets0.assets"), &bytes).unwrap();
+        let entries = UnityPlugin::new().extract(&dir).unwrap();
+        assert!(
+            !entries.iter().any(|e| e.source == "Emily" || e.source == "Carter"),
+            "CharacterNames must not extract: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+
+        // Tech doc by body content (generic m_Name)
+        let bytes = crate::unity_serialized::write_v17_fixture("Notes", tech);
+        fs::write(data_dir.join("sharedassets0.assets"), &bytes).unwrap();
+        let entries = UnityPlugin::new().extract(&dir).unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.source.contains("TECHNICAL SPECIFICATIONS")),
+            "tech doc must not extract: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+
+        // Lorem preview line dropped from ManagedText; real UI kept.
+        let ui = "\
+TitleMenu.START: NEW GAME\r\n\
+SettingsMenu.PreviewText: Lorem ipsum dolor sit amet, consectetur adipiscing elit\r\n\
+Confirmation.Yes: YES\r\n";
+        let bytes = crate::unity_serialized::write_v17_fixture("DefaultUI", ui);
+        fs::write(data_dir.join("sharedassets0.assets"), &bytes).unwrap();
+        let entries = UnityPlugin::new().extract(&dir).unwrap();
+        let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert!(
+            sources.iter().any(|s| *s == "NEW GAME"),
+            "keep UI: {sources:?}"
+        );
+        assert!(sources.iter().any(|s| *s == "YES"), "keep YES: {sources:?}");
+        assert!(
+            !sources.iter().any(|s| s.to_ascii_lowercase().contains("lorem")),
+            "drop lorem loc value: {sources:?}"
         );
     }
 
