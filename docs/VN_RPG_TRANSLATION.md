@@ -53,21 +53,16 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
 - **Binary slot engines** (Unity UTF-8, Unreal UTF-16LE heuristic, Wolf Shift-JIS):
   inject **skips** oversize translations (no hard fail). Extract tags
   `metadata.binary_slot` (`utf8` / `utf16le` / `sjis`); `locust validate <db>` reports
-  `ExceedsBinarySlot` before inject. The translation engine does **up to **two length-aware
+  `ExceedsBinarySlot` before inject. The translation engine does **up to two length-aware
   retries** when a provider returns an oversize binary-slot string. First-pass hints use
   **HARD MAX** wording for budgets ≤12 encoded bytes; the retry quotes the failed
   attempt and exact excess so the model can edit rather than retranslate. Provider
   **fallback chains**: CLI `--fallback a,b,c` and desktop translate dialog (same core
   `run_fallback_chain`).
 - The `mock` provider is length-safe for UTF-8 and UTF-16LE slots (good for inject tests).
-- **Real-provider length-aware ES E2E (2026-08-08):** Unity heuristic fixture (6 short
-  UI strings, `binary_slot=utf8`) translated with **`grok-sub` en→es**. Retry path
-  fired on 3 oversize slots; **0 fixed on retry** because Spanish UI labels still
-  exceed very tight budgets by 1 byte after abbreviation (e.g. Options 7 → Opciones 8).
-  Fitting strings inject cleanly; `locust validate` reports `ExceedsBinarySlot` for
-  the rest. Takeaway: length-aware retry helps longer lines; single-word UI slots
-  often need manual edit or pad-friendly sources. Prompt tighten (quote previous + HARD MAX for tight slots) re-measured same night:
-  with 2 retries + HARD MAX prompts: **0 oversize** on re-measure (`New Game`→`Nueva Pt`, `Load Game`→`Cargar J`, `Options`→`Opcns`).
+- **Real-provider length-aware ES E2E (grok-sub en→es, Unity fixture):** after HARD MAX
+  prompts + dual retries, **0 oversize** (`New Game`→`Nueva Pt`, `Load Game`→`Cargar J`,
+  `Options`→`Opcns`); `locust validate` clean. Inject still skips any remaining oversize.
 
 **Phase-2 apply / real-game notes (copies or patch paks, mock or equal-length where
 needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube, HTML generic, Unity (BOXMAN +
