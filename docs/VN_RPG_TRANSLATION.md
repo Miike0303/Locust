@@ -91,8 +91,11 @@ The Tauri app talks to the same core/server as the CLI. For a full in-app loop:
 2. **Validate** (Ctrl+Shift+V) → results panel with jump-to-entry; binary-slot oversize
    listed as `ExceedsBinarySlot`.
 3. **Inject** → **Direct** for packable recordings (automatic backup when the engine
-   mutates the original tree); Replace/Add for copies.
-4. **Patch → Pack** (zip) then Apply on a clean install; or use CLI apply.
+   mutates the original tree); Replace/Add for copies. For RPG Maker multi-lang
+   (Iavra/VisuMZ): **Register … in game UI** (same as CLI `register-lang`) from the
+   Inject modal.
+4. **Patch → Pack** (zip) then Apply on a clean install; or use CLI apply. Apply accepts
+   a local zip **or** an http(s) **URL** (desktop Patch modal + `locust apply --url`).
 5. **Settings → Glossary** for preferred terms; **Settings → History** for past runs
    (cost / tokens / duration — same ledger as `locust stats`).
 
@@ -226,16 +229,21 @@ The Tauri app talks to the same core/server as the CLI. For a full in-app loop:
   ```
 - Synthetic fixtures; no NSA archives / `nscript.___` support.
 
-### Unity — MEDIUM  ✅ Locust (heuristic + TextAsset slice 1)
+### Unity — MEDIUM  ✅ Locust (heuristic + SerializedFile slices 1–2)
 - **VN text scripts** under `*_Data/SCRIPTS~` (etc.) when present — preferred path.
-- **`.assets` / `level*` SerializedFile** (format versions **17–22**):
+- **SerializedFile** (format versions **17–22**) under `*_Data`:
+  - Files: `*.assets`, extensionless `globalgamemanagers` / `resources` / `level*`.
   - Structural **TextAsset** (class 49): `m_Name` + `m_Script`; ids `textasset/<path_id>`.
-  - Inject: **same-or-shorter** in place (pad with spaces `0x20` to original field size);
-    longer → skip + length-aware retry / `ExceedsBinarySlot` validate path.
-  - Type trees / MonoBehaviour / full SerializedFile rewrite: **not** in slice 1 — parse
-    fail falls back to pure heuristic scan.
-- **Heuristic** length-prefixed UTF-8 still runs on the same files (skips TextAsset
-  byte ranges to avoid double extraction). Inject remains ≤ source UTF-8 bytes.
+  - Structural **MonoBehaviour** (class **114 or negative** script-type ids): `m_Name` +
+    sequential aligned-string fields (skips up to 16 implausible 4-byte non-string words
+    between strings); ids `monobehaviour/<path_id>/<field_index>`.
+  - Type-tree **blobs skipped** (object table still reachable); full type-tree field walk /
+    object-table rewrite: **not** yet.
+  - Inject structural: **same-or-shorter** in place (pad `0x20`); length-prefix u32 left
+    **byte-identical** (endian-safe). Longer → skip + length-aware retry / `ExceedsBinarySlot`.
+  - Parse fail falls back to pure heuristic scan.
+- **Heuristic** length-prefixed UTF-8 on the same files (skips structural object ranges).
+  Supports LE/BE length prefixes (`metadata.length_endian`); inject ≤ source UTF-8 bytes.
 - ```bash
   locust extract "<game>" -o project.locust.db
   locust validate project.locust.db          # binary slots

@@ -499,7 +499,12 @@ impl SerializedFile {
         }
 
         // Sequential aligned strings for simple script layouts (no type tree).
+        // When a length prefix is implausible (typical int/float between strings),
+        // skip up to MAX_MONO_NON_STRING_SKIPS × 4-byte words and keep scanning —
+        // recovers `string, int, string` layouts without a full type-tree walk.
+        const MAX_MONO_NON_STRING_SKIPS: usize = 16;
         let mut field_index = 1usize;
+        let mut non_string_skips = 0usize;
         while r.pos + 4 <= end {
             // Bound the length read so a non-string int does not walk off the object.
             let len_peek = {
@@ -514,6 +519,12 @@ impl SerializedFile {
             };
             let remaining = end - r.pos - 4;
             if len_peek as usize > remaining || len_peek > 4 * 1024 * 1024 {
+                if non_string_skips < MAX_MONO_NON_STRING_SKIPS {
+                    // Skip one 4-byte word (int/float/enum) and try again.
+                    let _ = r.take(4);
+                    non_string_skips += 1;
+                    continue;
+                }
                 break;
             }
             match r.aligned_string() {
@@ -522,6 +533,7 @@ impl SerializedFile {
                         // Overran — discard
                         break;
                     }
+                    non_string_skips = 0;
                     if mono_script_field_worth_extracting(&text) {
                         out.push(MonoStringData {
                             path_id,
@@ -536,6 +548,11 @@ impl SerializedFile {
                     field_index += 1;
                 }
                 Err(_) => {
+                    if non_string_skips < MAX_MONO_NON_STRING_SKIPS {
+                        let _ = r.take(4);
+                        non_string_skips += 1;
+                        continue;
+                    }
                     break;
                 }
             }
@@ -1068,6 +1085,28 @@ mod tests {
         );
         assert_eq!(sf.structural_object_byte_ranges().len(), 1);
     }
+
+    /// `string, int (implausible length), string` — skip the int and keep both strings.
+    #[test]
+    fn parse_mono_skips_int_between_strings() {
+        let bytes = write_v17_mono_fixture_with_int_gap(
+            "Box",
+            "First line of dialogue",
+            0x7fff_ff00u32, // way larger than remaining → not a string length
+            "Second line after int",
+        );
+        let sf = SerializedFile::parse(bytes, "gap.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| *t == "First line of dialogue"),
+            "fields: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Second line after int"),
+            "must recover string after non-string int gap: {texts:?}"
+        );
+    }
 }
 
 /// v17 fixture: one TextAsset, enable_type_tree=1 with a minimal skippable blob.
@@ -1193,6 +1232,80 @@ pub fn write_v17_mono_fixture_with_class(
         meta.push(0);
     }
     meta.extend_from_slice(&10i64.to_le_bytes()); // path_id
+    meta.extend_from_slice(&0u32.to_le_bytes());
+    meta.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes());
+
+    let header_len = 20usize;
+    let mut data_offset = header_len + meta.len();
+    data_offset = (data_offset + 15) & !15;
+    let file_size = data_offset + payload.len();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(file_size as u32).to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&meta);
+    while out.len() < data_offset {
+        out.push(0);
+    }
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// MonoBehaviour payload: m_Name + string_a + raw u32 gap + string_b.
+#[cfg(test)]
+pub fn write_v17_mono_fixture_with_int_gap(
+    mono_name: &str,
+    first: &str,
+    gap_u32: u32,
+    second: &str,
+) -> Vec<u8> {
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+        let pad = align4(b.len()) - b.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+    fn write_pptr(buf: &mut Vec<u8>, file_id: i32, path_id: i64) {
+        buf.extend_from_slice(&file_id.to_le_bytes());
+        buf.extend_from_slice(&path_id.to_le_bytes());
+    }
+
+    let mut payload = Vec::new();
+    write_pptr(&mut payload, 0, 0);
+    payload.push(1);
+    while payload.len() % 4 != 0 {
+        payload.push(0);
+    }
+    write_pptr(&mut payload, 0, 0);
+    write_aligned_string(&mut payload, mono_name);
+    write_aligned_string(&mut payload, first);
+    payload.extend_from_slice(&gap_u32.to_le_bytes());
+    write_aligned_string(&mut payload, second);
+
+    let mut meta = Vec::new();
+    meta.extend_from_slice(b"2019.4.0f1\0");
+    meta.extend_from_slice(&1u32.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    meta.extend_from_slice(&CLASS_ID_MONO_BEHAVIOUR.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&0i16.to_le_bytes());
+    meta.extend_from_slice(&[0u8; 16]);
+    meta.extend_from_slice(&[0u8; 16]);
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    meta.extend_from_slice(&10i64.to_le_bytes());
     meta.extend_from_slice(&0u32.to_le_bytes());
     meta.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     meta.extend_from_slice(&0i32.to_le_bytes());
