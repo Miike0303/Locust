@@ -671,14 +671,21 @@ impl RpgMakerVxaPlugin {
     }
 
     fn apply_translations(root: &mut MarshalValue, filename: &str, entries: &[StringEntry]) {
-        let lookup: HashMap<&str, &str> = entries
+        // Providers flatten hand-wrapped fields (item/actor `description`), so
+        // restore the source line width before anything writes them back.
+        let rewrapped: Vec<(&str, String)> = entries
             .iter()
             .filter_map(|e| {
-                e.translation
-                    .as_deref()
-                    .map(|t| (e.id.as_str(), t))
+                e.translation.as_deref().map(|t| {
+                    (
+                        e.id.as_str(),
+                        crate::rpgmaker_mv::rewrap_to_source_width(&e.source, t),
+                    )
+                })
             })
             .collect();
+        let lookup: HashMap<&str, &str> =
+            rewrapped.iter().map(|(id, t)| (*id, t.as_str())).collect();
 
         if lookup.is_empty() {
             return;
@@ -1333,6 +1340,55 @@ mod tests {
         let entries2 = plugin.extract(&dir).unwrap();
         let hero = entries2.iter().find(|e| e.id == "Actors.rvdata2#1#@name").unwrap();
         assert_eq!(hero.source, "TranslatedHero");
+    }
+
+    #[test]
+    fn test_inject_rewraps_flattened_multiline_description() {
+        let dir = create_vxa_fixture();
+        let plugin = RpgMakerVxaPlugin::new();
+        const ID: &str = "Actors.rvdata2#1#@description";
+
+        // Give the fixture a hand-wrapped description to translate against.
+        // The source here is single-line, so this value is written verbatim.
+        let wrapped = "Un héroe de prueba\nde las montañas del norte.";
+        let mut entries = plugin.extract(&dir).unwrap();
+        for e in &mut entries {
+            if e.id == ID {
+                e.translation = Some(wrapped.to_string());
+            }
+        }
+        plugin.inject(&dir, &entries).unwrap();
+
+        // Now the source is multi-line and a provider hands back one flat line.
+        let flat = "Una heroina legendaria nacida en las montanas heladas del norte.";
+        let mut entries = plugin.extract(&dir).unwrap();
+        assert_eq!(
+            entries.iter().find(|e| e.id == ID).unwrap().source,
+            wrapped,
+            "setup: description should now be multi-line"
+        );
+        for e in &mut entries {
+            if e.id == ID {
+                e.translation = Some(flat.to_string());
+            }
+        }
+        plugin.inject(&dir, &entries).unwrap();
+
+        let out = plugin.extract(&dir).unwrap();
+        let written = &out.iter().find(|e| e.id == ID).unwrap().source;
+        let width = wrapped.lines().map(crate::rpgmaker_mv::visible_len).max().unwrap();
+        assert!(written.contains('\n'), "should be re-wrapped: {written:?}");
+        for line in written.lines() {
+            assert!(
+                crate::rpgmaker_mv::visible_len(line) <= width,
+                "line over budget: {line:?}"
+            );
+        }
+        assert_eq!(
+            written.split_whitespace().collect::<Vec<_>>(),
+            flat.split_whitespace().collect::<Vec<_>>(),
+            "re-wrapping must not change wording"
+        );
     }
 
     #[test]

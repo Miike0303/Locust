@@ -1427,6 +1427,25 @@ pub(crate) fn visible_len(s: &str) -> usize {
 
 /// Word-wrap to lines whose visible length fits `width`. A word longer than
 /// the width gets its own line rather than being split.
+/// Fields that carry the game's own hand-wrapped line breaks — Iavra pack
+/// values, item/actor `description` — get one flat line back from a provider,
+/// which overflows the window. Restore the source's line width when the
+/// translation exceeds it.
+///
+/// A single-line source is a name/label slot: it renders on one line, so an
+/// overlong translation needs shorter wording, never a line break.
+pub(crate) fn rewrap_to_source_width(source: &str, translation: &str) -> String {
+    if !source.contains('\n') {
+        return translation.to_string();
+    }
+    let width = source.lines().map(visible_len).max().unwrap_or(0);
+    if width == 0 || translation.lines().all(|l| visible_len(l) <= width) {
+        return translation.to_string();
+    }
+    let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
+    wrap_message(&flat, width).join("\n")
+}
+
 pub(crate) fn wrap_message(text: &str, width: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -1637,7 +1656,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
                     // Replace mode reaches Iavra packs and multi-line database
                     // `description` fields too, so restore line width here —
                     // `apply_message_block` re-flattens what it handles.
-                    let translation = Self::rewrap_to_source_width(&entry.source, translation);
+                    let translation = rewrap_to_source_width(&entry.source, translation);
                     Self::apply_translation(&mut json, filename, &entry.id, &translation);
                     strings_written += 1;
                 } else {
@@ -1789,25 +1808,6 @@ impl RpgMakerMvPlugin {
     }
 
     /// Write/merge Iavra multi-packs for `target_lang` from extracted source-pack entries.
-    /// Fields that carry the game's own hand-wrapped line breaks — Iavra pack
-    /// values, item/actor `description` — get one flat line back from a
-    /// provider, which overflows the window. Restore the source's line width
-    /// when the translation exceeds it.
-    ///
-    /// A single-line source is a name/label slot — it renders on one line, so
-    /// an overlong translation needs shorter wording, never a line break.
-    fn rewrap_to_source_width(source: &str, translation: &str) -> String {
-        if !source.contains('\n') {
-            return translation.to_string();
-        }
-        let width = source.lines().map(visible_len).max().unwrap_or(0);
-        if width == 0 || translation.lines().all(|l| visible_len(l) <= width) {
-            return translation.to_string();
-        }
-        let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
-        wrap_message(&flat, width).join("\n")
-    }
-
     fn inject_add_iavra_packs(
         _game_root: &Path,
         data_dir: &Path,
@@ -1845,7 +1845,7 @@ impl RpgMakerMvPlugin {
             if let Some(ref translation) = entry.translation {
                 by_pack.entry(pack.to_string()).or_default().insert(
                     key.to_string(),
-                    Self::rewrap_to_source_width(&entry.source, translation),
+                    rewrap_to_source_width(&entry.source, translation),
                 );
                 strings_written += 1;
             } else {
@@ -2093,7 +2093,7 @@ mod tests {
         // Provider flattened a hand-wrapped message: re-wrap to the source width.
         let src = "Hey, I heard your little brother\nand sister have no food to eat?";
         let flat = "Oye, escuché que tu hermanito y tu hermanita no tienen nada de comida, ¿verdad?";
-        let out = RpgMakerMvPlugin::rewrap_to_source_width(src, flat);
+        let out = rewrap_to_source_width(src, flat);
         let width = src.lines().map(visible_len).max().unwrap();
         assert!(out.contains('\n'), "should have been re-wrapped: {out:?}");
         for line in out.lines() {
@@ -2106,11 +2106,11 @@ mod tests {
         );
 
         // Single-line source is a name/label slot: never gains a break.
-        let name = RpgMakerMvPlugin::rewrap_to_source_width("Dragon Flail", "Mayal de dragón");
+        let name = rewrap_to_source_width("Dragon Flail", "Mayal de dragón");
         assert_eq!(name, "Mayal de dragón");
 
         // A translation that already fits is left exactly as the translator wrote it.
-        let kept = RpgMakerMvPlugin::rewrap_to_source_width(src, "Corto\ny cabe");
+        let kept = rewrap_to_source_width(src, "Corto\ny cabe");
         assert_eq!(kept, "Corto\ny cabe");
     }
 
