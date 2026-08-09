@@ -529,8 +529,111 @@ fn looks_player_visible(s: &str) -> bool {
             return false;
         }
     }
+    // Script commands / resource IDs (es.*, MAC.*, st01, HSE_056, BTN.PLATE…).
+    if is_yuris_engine_token(t) {
+        return false;
+    }
     t.chars()
         .any(|c| c.is_alphabetic() || is_cjk(c) || c == '「' || c == '『' || c == '（')
+}
+
+/// True for pure-ASCII YU-RIS engine / resource identifiers that are not dialogue.
+///
+/// Real games pack thousands of `es.*` ops, `MAC.*` macros, and asset codes
+/// (`st01`, `HSE_056`, `BTN.PLATE`) into attribute strings. Keep spaced dialogue,
+/// CJK, accented UI (`Sí`), and SFX with strong punctuation (`*Thud*`).
+fn is_yuris_engine_token(t: &str) -> bool {
+    if !t.is_ascii() {
+        return false;
+    }
+    if t.chars().any(|c| c.is_ascii_whitespace()) {
+        return false;
+    }
+    // Dialogue / SFX punctuation → not an engine token.
+    if t.chars().any(|c| {
+        matches!(
+            c,
+            '!' | '?'
+                | ','
+                | '"'
+                | '\''
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '~'
+                | '*'
+                | ';'
+                | ':'
+        )
+    }) {
+        return false;
+    }
+    if t.contains("...") {
+        return false;
+    }
+
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("es.") || lower.starts_with("mac.") {
+        return true;
+    }
+
+    let id_charset = t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+    if !id_charset {
+        // Hotkeys like SHIFT+V / CTRL+S.
+        if t.contains('+')
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '_' || c == '-')
+        {
+            return true;
+        }
+        return false;
+    }
+
+    // Digits → asset / state codes (st01, ysr000, HSE_056, cg160b_030).
+    if t.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+
+    // Dotted multi-segment commands (BTN.PLATE, SCENARIO_TITLE is underscore).
+    if t.contains('.') {
+        let parts: Vec<&str> = t.split('.').filter(|p| !p.is_empty()).collect();
+        if parts.len() >= 2
+            && parts.iter().all(|p| {
+                let alnum = p.chars().filter(|c| *c != '_').all(|c| c.is_ascii_alphanumeric());
+                alnum && !p.is_empty() && p.len() <= 28
+            })
+        {
+            return true;
+        }
+    }
+
+    // snake_case / SCREAMING_SNAKE resource labels.
+    if t.contains('_') && t.chars().filter(|c| *c != '_').all(|c| c.is_ascii_alphanumeric()) {
+        return true;
+    }
+
+    // Short lowercase resource colors / stubs (black, white, tran, trbn).
+    if t.len() <= 6
+        && t.chars().all(|c| c.is_ascii_alphabetic() && c.is_ascii_lowercase())
+    {
+        return true;
+    }
+
+    // ALL-CAPS codes and system labels (CLRX, BACKLOG, ESCMODE, AUTOSAVETIMING).
+    if t.len() >= 3
+        && t.chars()
+            .all(|c| c.is_ascii_alphabetic() && c.is_ascii_uppercase())
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Skip tool/output/backup directories that re-host the same yst*.ybn set.
@@ -1390,6 +1493,59 @@ mod tests {
         assert!(looks_player_visible("Hello, traveler"));
         assert!(looks_player_visible("「こんにちは」"));
         assert!(looks_player_visible("Sí"));
+    }
+
+    #[test]
+    fn test_looks_player_visible_rejects_engine_script_tokens() {
+        // YU-RIS script / resource identifiers (Injuu Kangoku RE noise).
+        for s in [
+            "es.SND",
+            "es.SP.WA.SET",
+            "ES.CONFIG.VOL.CHARA.EVO.SLIDER.VDEF",
+            "MAC.EV",
+            "MAC.BG",
+            "st01",
+            "ysr000",
+            "sys005",
+            "HSE_056",
+            "SE_114",
+            "EF01",
+            "CUT01",
+            "SP001",
+            "BTN.PLATE",
+            "SCENARIO_TITLE",
+            "LNO_CM",
+            "black",
+            "tran",
+            "BACKLOG",
+            "ESCMODE",
+            "SHIFT+V",
+            "tip/foo",
+        ] {
+            assert!(
+                !looks_player_visible(s),
+                "engine token should be rejected: {s}"
+            );
+        }
+        // Player-facing dialogue / UI must survive.
+        for s in [
+            "Hello, traveler",
+            "Y entonces...",
+            "Para siempre.",
+            "John「 Liz!」",
+            "Salir",
+            "Saltar",
+            "Texto",
+            "John",
+            "*Thud*",
+            "「こんにちは」",
+            "なし",
+        ] {
+            assert!(
+                looks_player_visible(s),
+                "player text should be kept: {s}"
+            );
+        }
     }
 
     #[test]
