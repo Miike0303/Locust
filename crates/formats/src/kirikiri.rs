@@ -707,6 +707,24 @@ fn normalize_script_key(rel_or_virtual: &str) -> String {
     s
 }
 
+/// True when decoded `.ks` text is plausibly KAG script rather than ciphertext.
+///
+/// cxdec-protected archives hold payloads that still survive UTF-16LE decoding
+/// but come out as control-character soup. They must not count as a source, or
+/// they outrank the plaintext copy of the same script and it is dropped.
+fn looks_like_readable_ks(text: &str) -> bool {
+    let mut ctrl = 0usize;
+    let mut total = 0usize;
+    for c in text.chars() {
+        total += 1;
+        if c == '\u{FFFD}' || (c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+            ctrl += 1;
+        }
+    }
+    // Real scripts carry essentially no C0 bytes beyond newlines and tabs.
+    total == 0 || ctrl * 20 <= total
+}
+
 /// Higher rank wins when the same script key appears in multiple places.
 /// Prefer higher-numbered `patchN.xp3`, then other XP3, then loose (not tool dumps).
 fn script_source_rank(rel_or_virtual: &str) -> i32 {
@@ -847,29 +865,22 @@ impl FormatPlugin for KirikiriPlugin {
             open_archives.insert(arch_path.clone(), archive);
         }
 
-        let mut all_rels: Vec<String> = loose_cands.iter().map(|(r, _)| r.clone()).collect();
-        all_rels.extend(xp3_cands.iter().map(|(r, _, _)| r.clone()));
-        let winners = select_best_script_rels(&all_rels);
-
-        let mut all = Vec::new();
+        // Decode BEFORE ranking: an encrypted archive can outrank a plaintext
+        // copy of the same script, and picking it would drop the only readable
+        // source. Rank only arbitrates between sources that actually decoded.
+        let mut readable: Vec<(String, PathBuf, String)> = Vec::new();
 
         for (rel, fpath) in &loose_cands {
-            if !winners.contains(rel) {
-                continue;
-            }
             let bytes = std::fs::read(fpath)?;
             let decoded = decode_ks_bytes(&bytes, rel)?;
-            all.extend(extract_lines_from_text(
-                &decoded.text,
-                rel,
-                fpath.clone(),
-            ));
+            if !looks_like_readable_ks(&decoded.text) {
+                warn!(script = %rel, "loose .ks decoded to non-script bytes; skipped");
+                continue;
+            }
+            readable.push((rel.clone(), fpath.clone(), decoded.text));
         }
 
         for (rel, arch_path, entry_name) in &xp3_cands {
-            if !winners.contains(rel) {
-                continue;
-            }
             let Some(archive) = open_archives.get(arch_path) else {
                 continue;
             };
@@ -899,12 +910,16 @@ impl FormatPlugin for KirikiriPlugin {
             };
             let virtual_path = PathBuf::from(rel);
             match decode_ks_bytes(&payload, rel) {
-                Ok(decoded) => {
-                    all.extend(extract_lines_from_text(
-                        &decoded.text,
-                        rel,
-                        virtual_path,
-                    ));
+                Ok(decoded) if looks_like_readable_ks(&decoded.text) => {
+                    readable.push((rel.clone(), virtual_path, decoded.text));
+                }
+                Ok(_) => {
+                    warn!(
+                        archive = %arch_name,
+                        entry = %entry_name,
+                        "XP3 .ks decoded to non-script bytes (cxdec/encrypted?); skipped"
+                    );
+                    xp3_skipped += 1;
                 }
                 Err(e) => {
                     warn!(
@@ -915,6 +930,16 @@ impl FormatPlugin for KirikiriPlugin {
                     );
                     xp3_skipped += 1;
                 }
+            }
+        }
+
+        let readable_rels: Vec<String> = readable.iter().map(|(r, _, _)| r.clone()).collect();
+        let winners = select_best_script_rels(&readable_rels);
+
+        let mut all = Vec::new();
+        for (rel, src_path, text) in &readable {
+            if winners.contains(rel) {
+                all.extend(extract_lines_from_text(text, rel, src_path.clone()));
             }
         }
 
@@ -1433,6 +1458,48 @@ This is narration.\r\n\
         assert!(!win.contains("data.xp3/scenario/a.ks"), "{win:?}");
         assert!(!win.contains("unencrypted/a.ks"), "{win:?}");
         assert!(win.contains("data.xp3/scenario/only_base.ks"), "{win:?}");
+    }
+
+    #[test]
+    fn test_looks_like_readable_ks_rejects_control_soup() {
+        assert!(looks_like_readable_ks("; comment\n*start\n[tag]\nHola\r\n\t"));
+        assert!(looks_like_readable_ks(""));
+        let soup: String = (0..300)
+            .map(|i| if i % 3 == 0 { '\u{3}' } else { 'j' })
+            .collect();
+        assert!(!looks_like_readable_ks(&soup));
+        assert!(!looks_like_readable_ks(&"\u{FFFD}".repeat(50)));
+    }
+
+    #[test]
+    fn test_extract_falls_back_when_higher_rank_source_is_ciphertext() {
+        // A cxdec archive outranks the plaintext dump but decodes to control
+        // soup. Ranking before decoding used to pick it and drop the only
+        // readable copy, leaving the game with almost nothing extracted.
+        let dir = tempdir();
+        let cipher: String = (0..400)
+            .map(|i| if i % 3 == 0 { '\u{3}' } else { 'j' })
+            .collect();
+        let mut ks_cipher = vec![0xFF, 0xFE];
+        ks_cipher.extend_from_slice(&utf16le_bytes_from_str(&cipher));
+        let data =
+            crate::kirikiri_xp3::write_xp3(&[("scenario/a.ks".into(), ks_cipher)]).unwrap();
+        fs::write(dir.join("data.xp3"), &data).unwrap();
+        let unenc = dir.join("unencrypted");
+        fs::create_dir_all(&unenc).unwrap();
+        write_utf16le_ks(&unenc.join("a.ks"), "; comment\n*start\nHello from UNENC\n");
+
+        let plugin = KirikiriPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert!(
+            sources.iter().any(|s| s.contains("Hello from UNENC")),
+            "readable dump must win over ciphertext: {sources:?}"
+        );
+        assert!(
+            !sources.iter().any(|s| s.contains('\u{3}')),
+            "ciphertext must not be extracted: {sources:?}"
+        );
     }
 
     #[test]
