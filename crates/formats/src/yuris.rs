@@ -1,4 +1,4 @@
-//! YU-RIS engine plugin — Experimental (synthetic fixtures).
+//! YU-RIS engine plugin — Experimental (synthetic fixtures + real-game E2E).
 //!
 //! # Spec sources (do not invent transforms)
 //! - Scenario layout + expression opcodes (Notes / scenario walk):
@@ -89,11 +89,16 @@ impl YurisPlugin {
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
+            // Skip tool/backup trees (Injuu ships VNTranslationTools + res/ copies).
+            if path_is_yuris_noise_dir(p) {
+                continue;
+            }
             if p.is_file() && Self::is_ybn(p) {
                 out.push(p.to_path_buf());
             }
         }
-        out
+        // Prefer one path per basename (pac/ > ysbin/ > anything else).
+        dedupe_ybn_by_basename(out)
     }
 
     /// Top-level `*.ypf` plus `ysbin/*.ypf` (common YU-RIS layout).
@@ -495,6 +500,15 @@ fn looks_player_visible(s: &str) -> bool {
     if t.chars().count() < 2 {
         return false;
     }
+    // Binary attribute crumbs (`V\x03`) and other control-bearing garbage.
+    if t.chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+    {
+        return false;
+    }
+    if t.contains('\u{FFFD}') {
+        return false;
+    }
     if t.chars()
         .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+')
     {
@@ -504,8 +518,82 @@ fn looks_player_visible(s: &str) -> bool {
     if (t.contains('/') || t.contains('\\')) && !t.contains(' ') && !t.chars().any(is_cjk) {
         return false;
     }
+    // Very short pure-ASCII identifiers (engine tokens), keep CJK/dialogue.
+    if t.chars().count() <= 3
+        && t.is_ascii()
+        && !t.chars().any(|c| c.is_ascii_whitespace())
+        && !t.chars().any(|c| c == '.' || c == '!' || c == '?')
+    {
+        // Allow short UI like "OK" / "Sí" handled above via non-ascii / punctuation.
+        if t.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
     t.chars()
         .any(|c| c.is_alphabetic() || is_cjk(c) || c == '「' || c == '『' || c == '（')
+}
+
+/// Skip tool/output/backup directories that re-host the same yst*.ybn set.
+fn path_is_yuris_noise_dir(p: &Path) -> bool {
+    for comp in p.components() {
+        let Some(s) = comp.as_os_str().to_str() else {
+            continue;
+        };
+        let lower = s.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "vntranslationtools"
+                | "__pycache__"
+                | "gameupdate"
+                | "output"
+                | "output.ja.bak"
+                | ".git"
+                | ".locust"
+        ) || lower.ends_with(".bak")
+            || lower.starts_with("output.")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Keep a single `.ybn` per file name, preferring game `pac/` over loose `res/`.
+fn dedupe_ybn_by_basename(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    use std::collections::BTreeMap;
+    fn rank(p: &Path) -> i32 {
+        let s = p.to_string_lossy().to_ascii_lowercase().replace('\\', "/");
+        if s.contains("/pac/") {
+            0
+        } else if s.contains("/ysbin/") {
+            1
+        } else if s.contains("/res/") {
+            3
+        } else {
+            2
+        }
+    }
+    let mut best: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for p in paths {
+        let key = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        match best.get(&key) {
+            None => {
+                best.insert(key, p);
+            }
+            Some(prev) if rank(&p) < rank(prev) => {
+                best.insert(key, p);
+            }
+            _ => {}
+        }
+    }
+    best.into_values().collect()
 }
 
 fn is_cjk(c: char) -> bool {
@@ -1291,6 +1379,61 @@ mod tests {
                 || err.contains("layout")
                 || err.contains("offset"),
             "error must describe bad key/layout, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_looks_player_visible_rejects_binary_crumbs() {
+        assert!(!looks_player_visible("V\u{0003}"));
+        assert!(!looks_player_visible("OK")); // short pure-ASCII token
+        assert!(!looks_player_visible("12"));
+        assert!(looks_player_visible("Hello, traveler"));
+        assert!(looks_player_visible("「こんにちは」"));
+        assert!(looks_player_visible("Sí"));
+    }
+
+    #[test]
+    fn test_ybn_discovery_skips_tool_trees_and_dedupes() {
+        let dir = tempdir();
+        let pac = dir.join("pac").join("ysbin").join("ysbin");
+        let tools = dir.join("VNTranslationTools").join("ysbin");
+        let res = dir.join("res");
+        fs::create_dir_all(&pac).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        fs::create_dir_all(&res).unwrap();
+        // Minimal valid-ish file name only — discovery does not parse.
+        fs::write(pac.join("yst00000.ybn"), b"YSTB").unwrap();
+        fs::write(tools.join("yst00000.ybn"), b"YSTB").unwrap();
+        fs::write(res.join("yst00000.ybn"), b"YSTB").unwrap();
+        fs::write(res.join("yst00001.ybn"), b"YSTB").unwrap();
+        let found = YurisPlugin::find_ybn_files(&dir);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names.iter().filter(|n| n.eq_ignore_ascii_case("yst00000.ybn")).count(),
+            1,
+            "dedupe basename: {found:?}"
+        );
+        assert!(
+            found.iter().any(|p| p.to_string_lossy().to_ascii_lowercase().contains("pac")),
+            "prefer pac/: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("vntranslationtools")),
+            "skip tools: {found:?}"
+        );
+        assert!(
+            found.iter().any(|p| p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("yst00001.ybn")),
+            "unique res file kept: {found:?}"
         );
     }
 
