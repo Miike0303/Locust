@@ -1,13 +1,18 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { X, FolderOpen, FileCheck, AlertCircle, Package } from "lucide-react";
 import {
   inject,
   registerLang,
   validate,
-  type OutputMode,
   type MultiLangReport,
   type RegisterLangReport,
 } from "../lib/api";
+import {
+  availableInjectModes,
+  coerceInjectMode,
+  defaultInjectMode,
+  type InjectUiMode,
+} from "../lib/injectModes";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -34,8 +39,6 @@ const LANGUAGES: { code: string; name: string }[] = [
 
 const INJECT_LANG_KEY = "locust.inject.langs";
 
-type InjectUiMode = OutputMode | "direct";
-
 interface InjectModalProps {
   open: boolean;
   onClose: () => void;
@@ -45,7 +48,17 @@ interface InjectModalProps {
 
 export default function InjectModal({ open, onClose, onOpenPack }: InjectModalProps) {
   const { project } = useProjectStore();
-  const [mode, setMode] = useState<InjectUiMode>("add");
+  const injectModes = useMemo(
+    () => availableInjectModes(project?.supported_modes),
+    [project?.supported_modes]
+  );
+  const [mode, setMode] = useState<InjectUiMode>(() =>
+    defaultInjectMode(undefined)
+  );
+  // When project/format modes change, drop illegal selections (e.g. Add on Unity).
+  useEffect(() => {
+    setMode((m) => coerceInjectMode(m, project?.supported_modes));
+  }, [project?.supported_modes, project?.format_id]);
   const savedLangs = (() => {
     try {
       return JSON.parse(localStorage.getItem(INJECT_LANG_KEY) || "null") as string[] | null;
@@ -285,15 +298,21 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                 onChange={(e) => setMode(e.target.value as InjectUiMode)}
                 className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
               >
-                <option value="replace">
-                  Replace — copy game to output folder with translations
-                </option>
-                <option value="add">
-                  Add — create translation folders inside original game
-                </option>
-                <option value="direct">
-                  Direct — write into the game and record for patch packing
-                </option>
+                {injectModes.includes("replace") && (
+                  <option value="replace">
+                    Replace — copy game to output folder with translations
+                  </option>
+                )}
+                {injectModes.includes("add") && (
+                  <option value="add">
+                    Add — create translation folders inside original game
+                  </option>
+                )}
+                {injectModes.includes("direct") && (
+                  <option value="direct">
+                    Direct — write into the game and record for patch packing
+                  </option>
+                )}
               </select>
               <p className="text-xs text-gray-500 mt-1">
                 {mode === "replace" &&
@@ -302,6 +321,11 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                   "Adds a tl/[lang]/ folder inside the original game directory"}
                 {mode === "direct" &&
                   "Writes translations into the game folder (same as CLI --direct). Required before Patch → Pack."}
+                {!injectModes.includes("add") && (
+                  <span className="block mt-0.5">
+                    This format only supports Replace/Direct (no Add language packs).
+                  </span>
+                )}
               </p>
             </div>
 

@@ -57,6 +57,7 @@ export default function Welcome() {
         path: result.project_path,
         format_id: result.format_id,
         name: result.project_name,
+        supported_modes: result.supported_modes,
       });
       addLog("info", `Opened: ${result.project_name} (${result.format_name}, ${result.total_strings} strings)`, undefined, "project");
       setPendingPath(null);

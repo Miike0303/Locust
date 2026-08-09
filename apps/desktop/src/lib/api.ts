@@ -67,6 +67,8 @@ export interface ProviderInfo {
 
 export interface ProjectInfo {
   path: string; format_id: string; name: string;
+  /** From project open; drives Inject modal mode list. */
+  supported_modes?: OutputMode[];
 }
 
 export interface ProjectOpenResponse {
