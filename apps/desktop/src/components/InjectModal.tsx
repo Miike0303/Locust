@@ -63,6 +63,14 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
   >([]);
   /** Optional UI label override (CLI `--label`). Used when a single lang is selected. */
   const [regLabelOverride, setRegLabelOverride] = useState("");
+  /** After inject, also run register-lang for RPG Maker multi-lang UI. */
+  const [autoRegisterAfterInject, setAutoRegisterAfterInject] = useState(() => {
+    try {
+      return localStorage.getItem("locust.inject.autoRegister") === "1";
+    } catch {
+      return false;
+    }
+  });
 
   const toggleLang = (code: string) => {
     setSelectedLangs((prev) =>
@@ -103,6 +111,71 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
     (mode === "direct" ||
       mode === "add" ||
       (mode === "replace" && outputDir.trim() !== ""));
+
+  const isRpgMaker =
+    project.format_id === "rpgmaker-mv" ||
+    project.format_id === "rpgmaker-mz" ||
+    project.format_id.startsWith("rpgmaker");
+
+  const runRegisterLang = async (quiet = false): Promise<boolean> => {
+    if (selectedLangs.length === 0) {
+      if (!quiet) addToast("error", "Select at least one language to register");
+      return false;
+    }
+    setRegLoading(true);
+    setRegReports([]);
+    const done: { lang: string; label: string; report: RegisterLangReport }[] = [];
+    try {
+      for (const code of selectedLangs) {
+        const label = labelForRegister(code);
+        const report = await registerLang({
+          game_path: project.path,
+          lang: code,
+          label,
+        });
+        done.push({ lang: code, label, report });
+        addLog(
+          "info",
+          `register-lang ${code} (${label})`,
+          `plugins_js=${report.plugins_js} iavra=${report.iavra_languages} visumz=${report.visumz_options} maps=${report.maps_patched?.length ?? 0}` +
+            (report.notes?.length ? `\n${report.notes.join("\n")}` : ""),
+          "inject"
+        );
+      }
+      setRegReports(done);
+      const anyChange = done.some(
+        (d) =>
+          d.report.plugins_js ||
+          d.report.iavra_languages ||
+          d.report.visumz_options ||
+          (d.report.maps_patched?.length ?? 0) > 0
+      );
+      if (anyChange) {
+        addToast(
+          "success",
+          `Registered ${done.length} language(s) in game UI (backups *.bak-locust)`
+        );
+      } else {
+        addToast(
+          "warning",
+          "No Iavra/VisuMZ language patterns or Map boot choices matched — game may not use multi-lang UI plugins",
+          8000
+        );
+      }
+      return anyChange;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog("error", "register-lang failed", msg, "inject");
+      addToast("error", `register-lang failed: ${msg}`);
+      return false;
+    } finally {
+      setRegLoading(false);
+    }
+  };
+
+  const handleRegisterLang = async () => {
+    await runRegisterLang(false);
+  };
 
   const handleInject = async () => {
     if (mode === "replace" && !outputDir.trim()) {
@@ -176,6 +249,11 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
           ? `Direct inject: ${report.strings_written ?? 0} string(s) written`
           : `Injected ${report.languages_processed.length} language(s)`
       );
+
+      // Optional: register selected lang(s) in RM multi-lang UI after inject.
+      if (autoRegisterAfterInject && isRpgMaker) {
+        await runRegisterLang(true);
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       addLog("error", "Inject failed", msg, "inject");
@@ -187,64 +265,6 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
 
   const gameName = project.path.split(/[\\/]/).filter(Boolean).pop() ?? project.name;
   const isDirectResult = result?.mode === "direct";
-  const isRpgMaker =
-    project.format_id === "rpgmaker-mv" ||
-    project.format_id === "rpgmaker-mz" ||
-    project.format_id.startsWith("rpgmaker");
-
-  const handleRegisterLang = async () => {
-    if (selectedLangs.length === 0) {
-      addToast("error", "Select at least one language to register");
-      return;
-    }
-    setRegLoading(true);
-    setRegReports([]);
-    const done: { lang: string; label: string; report: RegisterLangReport }[] = [];
-    try {
-      for (const code of selectedLangs) {
-        const label = labelForRegister(code);
-        const report = await registerLang({
-          game_path: project.path,
-          lang: code,
-          label,
-        });
-        done.push({ lang: code, label, report });
-        addLog(
-          "info",
-          `register-lang ${code} (${label})`,
-          `plugins_js=${report.plugins_js} iavra=${report.iavra_languages} visumz=${report.visumz_options} maps=${report.maps_patched?.length ?? 0}` +
-            (report.notes?.length ? `\n${report.notes.join("\n")}` : ""),
-          "inject"
-        );
-      }
-      setRegReports(done);
-      const anyChange = done.some(
-        (d) =>
-          d.report.plugins_js ||
-          d.report.iavra_languages ||
-          d.report.visumz_options ||
-          (d.report.maps_patched?.length ?? 0) > 0
-      );
-      if (anyChange) {
-        addToast(
-          "success",
-          `Registered ${done.length} language(s) in game UI (backups *.bak-locust)`
-        );
-      } else {
-        addToast(
-          "warning",
-          "No Iavra/VisuMZ language patterns or Map boot choices matched — game may not use multi-lang UI plugins",
-          8000
-        );
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addLog("error", "register-lang failed", msg, "inject");
-      addToast("error", `register-lang failed: ${msg}`);
-    } finally {
-      setRegLoading(false);
-    }
-  };
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -394,6 +414,22 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                   <code className="px-0.5 bg-gray-100 dark:bg-gray-800 rounded">register-lang</code>
                   ).
                 </p>
+                <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={autoRegisterAfterInject}
+                    onChange={(e) => {
+                      const on = e.target.checked;
+                      setAutoRegisterAfterInject(on);
+                      try {
+                        localStorage.setItem("locust.inject.autoRegister", on ? "1" : "0");
+                      } catch {
+                        /* ignore */
+                      }
+                    }}
+                  />
+                  After inject, also register language(s) in game UI
+                </label>
                 {selectedLangs.length === 1 && (
                   <div>
                     <label className="text-xs font-medium text-gray-600 dark:text-gray-400">

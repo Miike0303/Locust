@@ -14,6 +14,13 @@ import {
   type PatchStatusResult,
   type PatchVerifyResult,
 } from "../lib/api";
+import {
+  isHttpPatchUrl,
+  loadRememberedPatchSource,
+  patchSourceReady,
+  rememberPatchSource,
+  resolvePatchSource,
+} from "../lib/patchSource";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 
@@ -36,10 +43,17 @@ export default function PatchModal({
   defaultGamePath,
   initialTab = "apply",
 }: PatchModalProps) {
+  const remembered = (() => {
+    try {
+      return loadRememberedPatchSource();
+    } catch {
+      return { zipPath: "", zipUrl: "" };
+    }
+  })();
   const [tab, setTab] = useState<Tab>(initialTab);
   const [gamePath, setGamePath] = useState(defaultGamePath ?? "");
-  const [zipPath, setZipPath] = useState("");
-  const [zipUrl, setZipUrl] = useState("");
+  const [zipPath, setZipPath] = useState(remembered.zipPath);
+  const [zipUrl, setZipUrl] = useState(remembered.zipUrl);
   const [outputPath, setOutputPath] = useState("");
   const [languages, setLanguages] = useState("");
   const [pristine, setPristine] = useState(false);
@@ -69,6 +83,16 @@ export default function PatchModal({
         /* config optional for apply tab */
       });
   }, [open, defaultGamePath, initialTab]);
+
+  const resolvedSource = resolvePatchSource(zipPath, zipUrl);
+  const sourceOk = patchSourceReady(resolvedSource);
+  const canVerifyApply = Boolean(gamePath.trim()) && sourceOk;
+  const urlFieldError =
+    zipUrl.trim() && !isHttpPatchUrl(zipUrl)
+      ? "URL must start with http:// or https://"
+      : resolvedSource && "error" in resolvedSource
+        ? resolvedSource.error
+        : null;
 
   if (!open) return null;
 
@@ -133,38 +157,17 @@ export default function PatchModal({
     }
   };
 
-  const patchSource = ():
-    | { zip_path?: string; zip_url?: string }
-    | { error: string }
-    | null => {
-    const path = zipPath.trim();
-    const url = zipUrl.trim();
-    if (path && url) {
-      return { error: "Use either a local zip path or a URL, not both" };
-    }
-    if (path) return { zip_path: path };
-    if (url) {
-      const lower = url.toLowerCase();
-      if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
-        return { error: "Patch URL must start with http:// or https://" };
-      }
-      return { zip_url: url };
-    }
-    return null;
-  };
-
   const handleVerify = async () => {
-    const src = patchSource();
     if (!gamePath.trim()) {
       addToast("error", "Select a game folder");
       return;
     }
-    if (!src) {
+    if (!resolvedSource) {
       addToast("error", "Select a local zip or a patch zip URL");
       return;
     }
-    if ("error" in src) {
-      addToast("error", src.error);
+    if ("error" in resolvedSource) {
+      addToast("error", resolvedSource.error);
       return;
     }
     setLoading(true);
@@ -174,8 +177,9 @@ export default function PatchModal({
     try {
       const report = await patchVerify({
         game_path: gamePath.trim(),
-        ...src,
+        ...resolvedSource,
       });
+      rememberPatchSource(resolvedSource);
       setVerify(report);
       await refreshStatus();
       addLog("info", `Patch verify: ${report.outcome}`, report.messages?.join("\n") || "", "patch");
@@ -190,17 +194,16 @@ export default function PatchModal({
   };
 
   const handleApply = async () => {
-    const src = patchSource();
     if (!gamePath.trim()) {
       addToast("error", "Select a game folder");
       return;
     }
-    if (!src) {
+    if (!resolvedSource) {
       addToast("error", "Select a local zip or a patch zip URL");
       return;
     }
-    if ("error" in src) {
-      addToast("error", src.error);
+    if ("error" in resolvedSource) {
+      addToast("error", resolvedSource.error);
       return;
     }
     setLoading(true);
@@ -209,11 +212,12 @@ export default function PatchModal({
     try {
       const report = await patchApply({
         game_path: gamePath.trim(),
-        ...src,
+        ...resolvedSource,
         force,
         confirm_legacy: confirmLegacy,
         dry_run: dryRun,
       });
+      rememberPatchSource(resolvedSource);
       setApplyResult(report);
       await refreshStatus();
       addLog(
@@ -414,11 +418,32 @@ export default function PatchModal({
                     if (e.target.value.trim()) setZipPath("");
                   }}
                   placeholder="https://…/game-es-patch.zip"
-                  className="w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+                  className={`w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm ${
+                    urlFieldError
+                      ? "border-red-400 dark:border-red-600"
+                      : zipUrl.trim() && isHttpPatchUrl(zipUrl)
+                        ? "border-emerald-400 dark:border-emerald-700"
+                        : ""
+                  }`}
                 />
-                <p className="text-xs text-gray-500 mt-1">
-                  Downloads over http(s), then verify/apply. Use either local path or URL.
-                </p>
+                {urlFieldError ? (
+                  <p className="text-xs text-red-600 dark:text-red-400 mt-1">{urlFieldError}</p>
+                ) : (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Downloads over http(s), then verify/apply. Last successful source is remembered.
+                    Use either local path or URL.
+                  </p>
+                )}
+                {patchSourceReady(resolvedSource) && (
+                  <p className="text-xs text-emerald-700 dark:text-emerald-400 mt-0.5">
+                    Active source:{" "}
+                    {"zip_url" in resolvedSource
+                      ? `URL (${resolvedSource.zip_url.slice(0, 48)}${
+                          resolvedSource.zip_url.length > 48 ? "…" : ""
+                        })`
+                      : "local file"}
+                  </p>
+                )}
               </div>
 
               <div className="flex flex-wrap gap-4 text-sm">
@@ -443,14 +468,28 @@ export default function PatchModal({
               <div className="flex flex-wrap gap-2">
                 <button
                   onClick={handleVerify}
-                  disabled={loading}
+                  disabled={loading || !canVerifyApply}
+                  title={
+                    !gamePath.trim()
+                      ? "Select a game folder"
+                      : !sourceOk
+                        ? "Select a local zip or a valid http(s) URL"
+                        : undefined
+                  }
                   className="flex items-center gap-1.5 px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium disabled:opacity-50"
                 >
                   <ShieldCheck size={16} /> Verify
                 </button>
                 <button
                   onClick={handleApply}
-                  disabled={loading}
+                  disabled={loading || !canVerifyApply}
+                  title={
+                    !gamePath.trim()
+                      ? "Select a game folder"
+                      : !sourceOk
+                        ? "Select a local zip or a valid http(s) URL"
+                        : undefined
+                  }
                   className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium disabled:opacity-50"
                 >
                   <Package size={16} /> {dryRun ? "Plan apply" : "Apply"}
