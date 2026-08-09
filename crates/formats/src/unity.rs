@@ -822,8 +822,9 @@ struct TextAssetLocLine {
     line_count: usize,
 }
 
-/// Detect Naninovel ManagedText / locale docs: ≥2 non-empty lines and ≥70% look
-/// like `Key: Value` (or `Key=Value` without spaces in the key).
+/// Detect Naninovel ManagedText / locale docs:
+/// - multi-line: ≥2 non-empty lines and ≥70% `Key: Value` / `Key=Value`
+/// - single-line: one `Key: Value` with a dotted/identifier key (e.g. TitleMenu.START)
 fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
     let raw_lines: Vec<&str> = script.lines().collect();
     let non_empty: Vec<&str> = raw_lines
@@ -831,8 +832,22 @@ fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
         .copied()
         .filter(|l| !l.trim().is_empty())
         .collect();
-    if non_empty.len() < 2 {
+    if non_empty.is_empty() {
         return None;
+    }
+    // Single ManagedText asset that is just one key/value pair.
+    if non_empty.len() == 1 {
+        let line = non_empty[0];
+        let (key, sep, value) = split_loc_kv(line)?;
+        if value.trim().is_empty() || !looks_like_loc_key(key) {
+            return None;
+        }
+        return Some(vec![TextAssetLocLine {
+            key: Some(key.to_string()),
+            sep: sep.to_string(),
+            value: value.to_string(),
+            line_count: 1,
+        }]);
     }
     let kv_hits = non_empty.iter().filter(|l| split_loc_kv(l).is_some()).count();
     if kv_hits * 100 / non_empty.len() < 70 {
@@ -862,10 +877,23 @@ fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
             });
         }
     }
-    if out.len() < 2 {
+    if out.is_empty() {
         return None;
     }
     Some(out)
+}
+
+/// ManagedText-style keys: `TitleMenu.START`, `Confirmation.Yes`, `af-ZA`.
+fn looks_like_loc_key(key: &str) -> bool {
+    let key = key.trim();
+    if key.is_empty() || key.len() > 80 {
+        return false;
+    }
+    // Prefer dotted keys; also allow locale ids like `af-ZA`.
+    key.contains('.')
+        || key.contains('_')
+        || key.contains('-')
+        || (key.chars().all(|c| c.is_ascii_alphanumeric()) && key.len() >= 2)
 }
 
 /// `Key: Value` (prefer `: `), bare `:`, or `Key=Value` with no spaces in key.
@@ -2177,9 +2205,14 @@ script Chapter_1_script chapter 1 {
         assert_eq!(lines[0].key.as_deref(), Some("TitleMenu.START"));
         assert_eq!(lines[0].value, "NEW GAME");
         assert_eq!(lines[1].value, "CREDITS");
-        // Single line / non-kv prose: no split
+        // Single-line ManagedText with dotted key → one loc line (value only).
+        let one = parse_textasset_loc_lines("TitleMenu.START: NEW GAME").expect("single");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].value, "NEW GAME");
+        assert_eq!(one[0].key.as_deref(), Some("TitleMenu.START"));
+        // Prose / non-key single line: no split
         assert!(parse_textasset_loc_lines("Hello traveler, welcome!").is_none());
-        assert!(parse_textasset_loc_lines("OnlyOne: Line").is_none());
+        assert!(parse_textasset_loc_lines("Not a key: has spaces in key side").is_none());
     }
 
     #[test]

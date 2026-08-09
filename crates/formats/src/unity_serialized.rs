@@ -1052,19 +1052,49 @@ pub(crate) fn looks_like_code_identifier(t: &str) -> bool {
 
 /// Whether a TextAsset `m_Script` body is worth extracting as translateable text.
 /// Drops empty/binary payloads and line-break **character-class tables** (TMP/ICU
-/// style strings of brackets/punctuation with almost no letters — BOXMAN 830/831).
+/// style bags of punctuation / small kana with no Latin words — BOXMAN 830/831).
 pub fn is_textasset_script_worth_extracting(script: &str) -> bool {
     let t = script.trim();
     if t.is_empty() || is_binary_looking_script(script) {
+        return false;
+    }
+    if looks_like_linebreak_charset_table(t) {
         return false;
     }
     let total = t.chars().count();
     if total >= 20 {
         let letters = t.chars().filter(|c| c.is_alphabetic()).count();
         let ratio = letters as f64 / total as f64;
-        // Charset tables are nearly all punctuation/symbols.
+        // Pure punctuation/symbol tables (no CJK letters either).
         if ratio < 0.12 {
             return false;
+        }
+    }
+    true
+}
+
+/// TMP / ICU line-break character-class tables: almost no whitespace, no Latin
+/// word of length ≥3, dense symbols (and often small kana which *are* alphabetic).
+fn looks_like_linebreak_charset_table(t: &str) -> bool {
+    let total = t.chars().count();
+    if total < 20 || total > 400 {
+        return false;
+    }
+    let ws = t.chars().filter(|c| c.is_whitespace()).count();
+    // Real scripts have spaces/newlines between words; charset tables are one blob.
+    if ws > 3 {
+        return false;
+    }
+    // Any run of 3+ ASCII letters ⇒ likely prose / code / locale text.
+    let mut run = 0usize;
+    for c in t.chars() {
+        if c.is_ascii_alphabetic() {
+            run += 1;
+            if run >= 3 {
+                return false;
+            }
+        } else {
+            run = 0;
         }
     }
     true
@@ -1414,6 +1444,12 @@ mod tests {
     fn textasset_script_worth_extracting_rejects_charset_tables() {
         let charset = "([｛〔〈《「『【〘〖〝‘“｟«$—…‥〳〴〵\\［（{£¥\"々〇〉》」＄｠￥￦ #)]｝〕〉》」』】〙〗〟’”｠»";
         assert!(!is_textasset_script_worth_extracting(charset));
+        // CJK small-kana line-break class (letters, but no Latin words / spaces).
+        let kana_table = ")]｝〕〉》」』】〙〗〟’”｠»ヽゴミ袋ァィゥェォッャュョヮヵヶぁぃぅぇぉっゃゅょゎゕゖㇰㇱㇲㇳㇴㇵㇶㇷㇸㇹㇺㇻㇼㇽㇾㇿ々〻‐゠–〜?!‼⁇⁈⁉・、%,.:;。！？］）：；＝}¢°\"†‡℃〆％，．";
+        assert!(
+            !is_textasset_script_worth_extracting(kana_table),
+            "kana linebreak table must be rejected"
+        );
         assert!(!is_textasset_script_worth_extracting(""));
         assert!(!is_textasset_script_worth_extracting("   \n"));
         assert!(is_textasset_script_worth_extracting(
@@ -1421,6 +1457,9 @@ mod tests {
         ));
         assert!(is_textasset_script_worth_extracting(
             "ITEM_CATEGORY,ITEM_NAME\r\nElectronics,mp3 player"
+        ));
+        assert!(is_textasset_script_worth_extracting(
+            "TitleMenu.START: NEW GAME"
         ));
     }
 
