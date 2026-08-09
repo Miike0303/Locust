@@ -61,11 +61,25 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
   const [regReports, setRegReports] = useState<
     { lang: string; label: string; report: RegisterLangReport }[]
   >([]);
+  /** Optional UI label override (CLI `--label`). Used when a single lang is selected. */
+  const [regLabelOverride, setRegLabelOverride] = useState("");
 
   const toggleLang = (code: string) => {
     setSelectedLangs((prev) =>
       prev.includes(code) ? prev.filter((l) => l !== code) : [...prev, code]
     );
+  };
+
+  const defaultLabelFor = (code: string) =>
+    LANGUAGES.find((l) => l.code === code)?.name ?? code;
+
+  /** Resolve menu label for register-lang (override only when one language is selected). */
+  const labelForRegister = (code: string) => {
+    const override = regLabelOverride.trim();
+    if (override && selectedLangs.length === 1 && selectedLangs[0] === code) {
+      return override;
+    }
+    return defaultLabelFor(code);
   };
 
   if (!open || !project) return null;
@@ -188,7 +202,7 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
     const done: { lang: string; label: string; report: RegisterLangReport }[] = [];
     try {
       for (const code of selectedLangs) {
-        const label = LANGUAGES.find((l) => l.code === code)?.name ?? code;
+        const label = labelForRegister(code);
         const report = await registerLang({
           game_path: project.path,
           lang: code,
@@ -380,6 +394,25 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                   <code className="px-0.5 bg-gray-100 dark:bg-gray-800 rounded">register-lang</code>
                   ).
                 </p>
+                {selectedLangs.length === 1 && (
+                  <div>
+                    <label className="text-xs font-medium text-gray-600 dark:text-gray-400">
+                      Menu label (optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={regLabelOverride}
+                      onChange={(e) => setRegLabelOverride(e.target.value)}
+                      placeholder={defaultLabelFor(selectedLangs[0])}
+                      className="w-full mt-0.5 p-1.5 text-sm border rounded dark:bg-gray-800 dark:border-gray-600"
+                    />
+                    <p className="text-[11px] text-gray-500 mt-0.5">
+                      Shown in the game language picker — same as CLI{" "}
+                      <code className="px-0.5 bg-gray-100 dark:bg-gray-800 rounded">--label</code>
+                      . Leave empty for “{defaultLabelFor(selectedLangs[0])}”.
+                    </p>
+                  </div>
+                )}
                 <button
                   type="button"
                   onClick={handleRegisterLang}
@@ -490,6 +523,24 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                   </code>
                   ). Writes <code className="px-0.5">*.bak-locust</code> backups.
                 </p>
+                {selectedLangs.length === 1 && (
+                  <div>
+                    <label className="text-xs font-medium text-violet-900 dark:text-violet-100">
+                      Menu label (optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={regLabelOverride}
+                      onChange={(e) => setRegLabelOverride(e.target.value)}
+                      placeholder={defaultLabelFor(selectedLangs[0])}
+                      className="w-full mt-0.5 p-1.5 text-sm border border-violet-200 dark:border-violet-700 rounded dark:bg-gray-900"
+                    />
+                    <p className="text-[11px] text-violet-700 dark:text-violet-300 mt-0.5">
+                      CLI <code className="px-0.5">--label</code> equivalent. Empty → “
+                      {defaultLabelFor(selectedLangs[0])}”.
+                    </p>
+                  </div>
+                )}
                 <button
                   type="button"
                   onClick={handleRegisterLang}
