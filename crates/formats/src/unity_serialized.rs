@@ -867,6 +867,10 @@ fn is_mono_engine_noise(t: &str) -> bool {
     {
         return true;
     }
+    // Full/short .NET assembly-qualified type names.
+    if looks_like_assembly_qualified_type(t) {
+        return true;
+    }
     // Namespace / type tokens: `Naninovel.Commands`, `UnityEngine.DMAT`.
     // Preserves UI-ish `Q.SAVE` / `Q.LOAD` (short ALL-CAPS segments).
     if looks_like_dotted_type_name(t) {
@@ -948,6 +952,41 @@ fn looks_like_face_or_blend_param(t: &str) -> bool {
         })
 }
 
+/// .NET / Unity assembly-qualified type name.
+///
+/// Short form: `UnityEngine.Object, UnityEngine`
+/// Full form (BOXMAN Naninovel configs):  
+/// `Naninovel.Script, Elringus.Naninovel.Runtime, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null`
+pub(crate) fn looks_like_assembly_qualified_type(t: &str) -> bool {
+    let t = t.trim();
+    if t.len() < 8 || !t.contains(',') || !t.contains('.') {
+        return false;
+    }
+    // Canonical full AQN markers.
+    if t.contains("Version=")
+        && (t.contains("PublicKeyToken=") || t.contains("Culture="))
+    {
+        return true;
+    }
+    // Common short assembly suffixes after the type name.
+    if t.contains(", UnityEngine")
+        || t.contains(", UnityEditor")
+        || t.contains(", Assembly-CSharp")
+        || t.contains(", Elringus.")
+        || t.contains(", TMPro")
+        || t.contains(", Unity.")
+        || t.contains(", System.")
+        || t.contains(", mscorlib")
+    {
+        return true;
+    }
+    // Compact form with no spaces: `Foo.Bar,Baz.Qux`
+    if !t.contains(' ') && t.contains('.') && t.contains(',') {
+        return true;
+    }
+    false
+}
+
 /// `Foo.Bar` / `A.B.C` type or namespace tokens (no spaces).
 /// Returns false for short UI abbreviations like `Q.SAVE`.
 fn looks_like_dotted_type_name(t: &str) -> bool {
@@ -1005,11 +1044,8 @@ fn mono_script_field_worth_extracting(s: &str) -> bool {
     {
         return false;
     }
-    // Assembly-qualified type refs: `UnityEngine.Object, UnityEngine`.
-    if t.contains(", UnityEngine")
-        || t.contains(", Assembly-CSharp")
-        || (t.contains('.') && t.contains(',') && !t.contains(' '))
-    {
+    // Assembly-qualified type refs (short + full .NET AQN with Version=…).
+    if looks_like_assembly_qualified_type(t) {
         return false;
     }
     // Engine API / serialized method tokens (not player-facing).
@@ -1812,6 +1848,10 @@ mod tests {
             &[
                 "Portable Speaker",
                 "UnityEngine.Object, UnityEngine",
+                // Full .NET AQN as serialized in BOXMAN Naninovel configs:
+                "Naninovel.Script, Elringus.Naninovel.Runtime, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null",
+                "UnityEditor.DefaultAsset, UnityEditor, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null",
+                "TMPro.TMP_FontAsset, Unity.TextMeshPro, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null",
                 "set_text",
                 "Welcome home",
             ],
@@ -1830,6 +1870,14 @@ mod tests {
         assert!(
             !texts.iter().any(|t| t.contains("UnityEngine")),
             "drop assembly type: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Version=") || t.contains("PublicKeyToken=")),
+            "drop full AQN: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Naninovel.Script") || t.contains("TMP_FontAsset")),
+            "drop Naninovel/TMPro AQN: {texts:?}"
         );
         assert!(
             !texts.iter().any(|t| *t == "set_text"),

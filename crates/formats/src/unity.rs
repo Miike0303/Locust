@@ -6,8 +6,8 @@ use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 use crate::unity_serialized::{
-    is_binary_looking_script, is_textasset_script_worth_extracting, looks_like_code_identifier,
-    rewrite_text_asset_script_inplace, SerializedFile,
+    is_binary_looking_script, is_textasset_script_worth_extracting, looks_like_assembly_qualified_type,
+    looks_like_code_identifier, rewrite_text_asset_script_inplace, SerializedFile,
 };
 
 /// Plugin for Unity Engine games.
@@ -1327,6 +1327,10 @@ fn is_unity_translatable(text: &str) -> bool {
     if s.is_empty() || s.len() < 5 {
         return false;
     }
+    // Managed type refs flood heuristic scans of ScriptableObject blobs.
+    if looks_like_assembly_qualified_type(s) {
+        return false;
+    }
     let total = s.chars().count();
     let ascii_printable = s
         .chars()
@@ -2425,6 +2429,13 @@ script Chapter_1_script chapter 1 {
         assert!(!is_unity_translatable("SOME_CONSTANT_NAME"));
         assert!(!is_unity_translatable("Assets/Textures/player.png"));
         assert!(!is_unity_translatable("UnityEngine.CoreModule"));
+        // Full .NET AQN (spaces after commas — old filter missed these)
+        assert!(!is_unity_translatable(
+            "Naninovel.Script, Elringus.Naninovel.Runtime, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+        ));
+        assert!(!is_unity_translatable(
+            "UnityEditor.DefaultAsset, UnityEditor, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+        ));
         // MonoScript / type-name noise (BOXMAN heuristic flood)
         // Title-case single words like "Naninovel" stay filter-pass (same as "Hello");
         // MonoScript class 115 byte ranges are skipped instead.
