@@ -8,7 +8,7 @@ use locust_core::models::{OutputMode, StringEntry};
 use crate::unity_serialized::{
     is_binary_looking_script, is_textasset_script_worth_extracting, looks_like_assembly_qualified_type,
     looks_like_code_identifier, looks_like_lorem_ipsum, looks_like_naninovel_script,
-    rewrite_text_asset_script_inplace, SerializedFile,
+    looks_like_unity_asset_path, rewrite_text_asset_script_inplace, SerializedFile,
 };
 
 /// Plugin for Unity Engine games.
@@ -1547,6 +1547,10 @@ fn is_unity_translatable(text: &str) -> bool {
     if s.starts_with("naninovel/") || s.contains("/audio/") || s.contains("/bgm/") {
         return false;
     }
+    // Shared asset-root paths (Tilemap/, Shaders/, Day/1…, UI/btn…).
+    if looks_like_unity_asset_path(s) {
+        return false;
+    }
     // Shader #define soup: `BLENDMODES_MODE_MULTIPLY ETC1_EXTERNAL_ALPHA`
     if s.contains("BLENDMODES_") || s.contains("ETC1_EXTERNAL_ALPHA") {
         return false;
@@ -2770,12 +2774,18 @@ script Chapter_1_script chapter 1 {
         assert!(!is_unity_translatable("Pillar Sprite"));
         // Extra uGUI default
         assert!(!is_unity_translatable("Thumbnail"));
+        // Asset paths with spaces (mono + heuristic)
+        assert!(!is_unity_translatable("Naninovel/Audio/BGM/Erotic 01"));
+        assert!(!is_unity_translatable("Tilemap/Pillar Sprite_11"));
+        assert!(!is_unity_translatable("Day/1 Centered"));
         // Real UI / dialogue with slash must still pass when clearly sentence-like.
         assert!(is_unity_translatable("Press Start"));
         assert!(is_unity_translatable("Save game now"));
         assert!(is_unity_translatable("Delete")); // short UI verb
         assert!(is_unity_translatable("Progress")); // short UI label
         assert!(is_unity_translatable("Clothing")); // inventory category
+        assert!(is_unity_translatable("START / LOAD"));
+        assert!(is_unity_translatable("Fridge / Microwave"));
     }
 
     #[test]

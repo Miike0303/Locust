@@ -914,6 +914,11 @@ fn is_mono_engine_noise(t: &str) -> bool {
     if !t.contains(' ') && t.contains('/') {
         return true;
     }
+    // Asset hierarchy paths that include spaces (BOXMAN audio/tilemap/shader flood).
+    // Keeps real UI like `START / LOAD` and `Fridge / Microwave`.
+    if looks_like_unity_asset_path(t) {
+        return true;
+    }
     // Asset / guid-ish hex blobs mis-read as strings (BOXMAN ~70 rows).
     if looks_like_hex_token(t) {
         return true;
@@ -942,6 +947,47 @@ fn looks_like_hex_token(t: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit())
         // Require at least one a-f so pure decimal numbers can stay (rare UI).
         && t.chars().any(|c| matches!(c, 'a'..='f' | 'A'..='F'))
+}
+
+/// Unity project resource paths (often with spaces) that are not player copy.
+/// e.g. `Naninovel/Audio/BGM/…`, `Tilemap/Pillar Sprite_11`, `Shaders/TMP_SDF Overlay`.
+/// Does **not** match spaced UI phrases like `START / LOAD` or `Fridge / Microwave`.
+pub(crate) fn looks_like_unity_asset_path(t: &str) -> bool {
+    let t = t.trim();
+    if !t.contains('/') {
+        return false;
+    }
+    let lower = t.to_ascii_lowercase();
+    const PREFIXES: &[&str] = &[
+        "naninovel/",
+        "shaders/",
+        "shader graph/",
+        "tilemap/",
+        "sprites/",
+        "textures/",
+        "fonts & materials/",
+        "fonts/",
+        "style sheets/",
+        "sprite assets/",
+        "color gradient",
+        "profiles/",
+        "settings/",
+        "other/",
+        "ui/",
+    ];
+    if PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+    // Lighting / post profile crumbs: `Day/1 Centered`, `Night/2 Centered`.
+    if let Some(rest) = lower
+        .strip_prefix("day/")
+        .or_else(|| lower.strip_prefix("night/"))
+    {
+        if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Editor/scene section banners padded with dashes (BOXMAN gallery setup notes).
@@ -2121,6 +2167,61 @@ mod tests {
             );
         }
         for keep in ["Play", "Emily", "Q.SAVE", "Message speed:"] {
+            assert!(
+                texts.iter().any(|t| *t == keep),
+                "expected keep {keep}: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mono_script_filter_drops_asset_paths_with_spaces() {
+        assert!(looks_like_unity_asset_path(
+            "Naninovel/Audio/BGM/HSCENE_NTR/Erotic 01"
+        ));
+        assert!(looks_like_unity_asset_path("Tilemap/Pillar Sprite_11"));
+        assert!(looks_like_unity_asset_path("Shaders/TMP_SDF Overlay"));
+        assert!(looks_like_unity_asset_path("Day/1 Centered"));
+        assert!(looks_like_unity_asset_path("Night/2 Centered"));
+        assert!(looks_like_unity_asset_path("UI/btn arrow left"));
+        assert!(looks_like_unity_asset_path(
+            "Fonts & Materials/LiberationSans SDF - Outline"
+        ));
+        // Real UI with slash separators (not asset roots).
+        assert!(!looks_like_unity_asset_path("START / LOAD"));
+        assert!(!looks_like_unity_asset_path("Fridge / Microwave"));
+        assert!(!looks_like_unity_asset_path("LOADING / PLEASE WAIT..."));
+        assert!(!looks_like_unity_asset_path("MM / DD / YYYY"));
+        assert!(!looks_like_unity_asset_path("Play"));
+
+        let bytes = write_v17_mono_fixture(
+            "Audio",
+            &[
+                "Naninovel/Audio/BGM/results_ (1)",
+                "Tilemap/Demo Tilemap (Dungeon)",
+                "Sprites/Floor Sprite",
+                "Day/2 Standard",
+                "START / LOAD",
+                "Fridge / Microwave",
+                "Play",
+                "Emily",
+            ],
+        );
+        let sf = SerializedFile::parse(bytes, "paths.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        for drop in [
+            "Naninovel/Audio/BGM/results_ (1)",
+            "Tilemap/Demo Tilemap (Dungeon)",
+            "Sprites/Floor Sprite",
+            "Day/2 Standard",
+        ] {
+            assert!(
+                !texts.iter().any(|t| *t == drop),
+                "expected drop {drop}: {texts:?}"
+            );
+        }
+        for keep in ["START / LOAD", "Fridge / Microwave", "Play", "Emily"] {
             assert!(
                 texts.iter().any(|t| *t == keep),
                 "expected keep {keep}: {texts:?}"
