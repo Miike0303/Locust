@@ -5,8 +5,8 @@
 //! - **Slice 2:** skip type-tree blobs (no field interpretation), MonoBehaviour
 //!   (class_id 114 **or negative** script-type ids) base layout (`m_GameObject`,
 //!   `m_Enabled`, `m_Script`, `m_Name`) plus sequential aligned-string fields
-//!   after the base for extract/in-place rewrite. Full type-tree walks remain
-//!   out of scope.
+//!   after the base for extract/in-place rewrite; **TextMesh** (class_id 141)
+//!   `m_Text` after `m_GameObject` PPtr. Full type-tree walks remain out of scope.
 //!
 //! # Format (AssetStudio / AssetsTools.NET conventions)
 //! Header fields through `data_offset` are **big-endian**. From version ≥ 9 the
@@ -36,6 +36,8 @@ use std::path::Path;
 pub const CLASS_ID_TEXT_ASSET: i32 = 49;
 /// Unity class ID for MonoBehaviour.
 pub const CLASS_ID_MONO_BEHAVIOUR: i32 = 114;
+/// Unity class ID for legacy TextMesh (3D text component).
+pub const CLASS_ID_TEXT_MESH: i32 = 141;
 
 /// True when `class_id` is a MonoBehaviour type in the SerializedFile type table.
 ///
@@ -129,6 +131,17 @@ pub struct MonoStringData {
     pub len_offset: usize,
     /// Original string byte length (not including length prefix / align).
     pub byte_len: usize,
+}
+
+/// TextMesh `m_Text` field (class_id 141).
+#[derive(Debug, Clone)]
+pub struct TextMeshData {
+    pub path_id: i64,
+    pub text: String,
+    /// Absolute file offset of the `m_Text` length prefix (u32).
+    pub text_len_offset: usize,
+    /// Original `m_Text` string byte length (not including length prefix / align).
+    pub text_byte_len: usize,
 }
 
 #[derive(Debug)]
@@ -421,6 +434,12 @@ impl SerializedFile {
             .filter(|o| is_monobehaviour_class(o.class_id))
     }
 
+    pub fn text_mesh_objects(&self) -> impl Iterator<Item = &ObjectInfo> {
+        self.objects
+            .iter()
+            .filter(|o| o.class_id == CLASS_ID_TEXT_MESH)
+    }
+
     /// Read TextAsset `m_Name` + `m_Script` at `path_id`.
     pub fn read_text_asset(&self, path_id: i64) -> Result<TextAssetData, SerializedError> {
         let label = self.path.display().to_string();
@@ -561,17 +580,53 @@ impl SerializedFile {
         Ok(out)
     }
 
+    /// Read TextMesh `m_Text` at `path_id`.
+    ///
+    /// Layout (Component base + TextMesh fields): `PPtr m_GameObject`, then
+    /// aligned string `m_Text`. Remaining floats/ints/font/color are ignored.
+    pub fn read_text_mesh(&self, path_id: i64) -> Result<TextMeshData, SerializedError> {
+        let label = self.path.display().to_string();
+        let obj = self
+            .objects
+            .iter()
+            .find(|o| o.path_id == path_id && o.class_id == CLASS_ID_TEXT_MESH)
+            .ok_or_else(|| err(&label, format!("no TextMesh with path_id={path_id}")))?;
+
+        let start = obj.data_abs as usize;
+        let end = (start + obj.byte_size as usize).min(self.data.len());
+        let mut r = R {
+            data: &self.data[..end],
+            pos: start,
+            file: &label,
+            endian: self.header.endian,
+        };
+
+        // m_GameObject PPtr (FileID i32 + PathID i64)
+        let _go_file = r.i32()?;
+        let _go_path = r.i64()?;
+        let (text, text_len_offset, text_byte_len) = r.aligned_string()?;
+        Ok(TextMeshData {
+            path_id,
+            text,
+            text_len_offset,
+            text_byte_len,
+        })
+    }
+
     /// Absolute byte ranges of TextAsset + MonoBehaviour objects (heuristic skip).
     pub fn text_asset_byte_ranges(&self) -> Vec<(usize, usize)> {
         self.structural_object_byte_ranges()
     }
 
-    /// Absolute byte ranges of objects handled structurally (TextAsset + MonoBehaviour).
+    /// Absolute byte ranges of objects handled structurally
+    /// (TextAsset + MonoBehaviour + TextMesh).
     pub fn structural_object_byte_ranges(&self) -> Vec<(usize, usize)> {
         self.objects
             .iter()
             .filter(|o| {
-                o.class_id == CLASS_ID_TEXT_ASSET || is_monobehaviour_class(o.class_id)
+                o.class_id == CLASS_ID_TEXT_ASSET
+                    || is_monobehaviour_class(o.class_id)
+                    || o.class_id == CLASS_ID_TEXT_MESH
             })
             .map(|o| {
                 let s = o.data_abs as usize;
@@ -1148,6 +1203,108 @@ mod tests {
             "first string must remain: {fields2:?}"
         );
     }
+
+    #[test]
+    fn parse_v17_textmesh_m_text() {
+        let bytes = write_v17_textmesh_fixture("Hello, world!");
+        let sf = SerializedFile::parse(bytes, "tm.assets").unwrap();
+        let meshes: Vec<_> = sf.text_mesh_objects().collect();
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].path_id, 7);
+        assert_eq!(meshes[0].class_id, CLASS_ID_TEXT_MESH);
+
+        let tm = sf.read_text_mesh(7).unwrap();
+        assert_eq!(tm.text, "Hello, world!");
+        assert_eq!(tm.text_byte_len, "Hello, world!".len());
+        assert_eq!(sf.structural_object_byte_ranges().len(), 1);
+    }
+
+    #[test]
+    fn rewrite_textmesh_m_text_inplace() {
+        let bytes = write_v17_textmesh_fixture("Hello, world!"); // 13 bytes
+        let sf = SerializedFile::parse(bytes.clone(), "tm.assets").unwrap();
+        let tm = sf.read_text_mesh(7).unwrap();
+        let mut file = bytes;
+        rewrite_text_asset_script_inplace(
+            &mut file,
+            tm.text_len_offset,
+            tm.text_byte_len,
+            "Hola!",
+            "tm.assets",
+        )
+        .unwrap();
+        let again = SerializedFile::parse(file, "tm.assets").unwrap();
+        let tm2 = again.read_text_mesh(7).unwrap();
+        assert!(
+            tm2.text.starts_with("Hola!"),
+            "post-rewrite: {:?}",
+            tm2.text
+        );
+        assert_eq!(tm2.text_byte_len, 13);
+    }
+}
+
+/// v17 fixture: one TextMesh (class 141) with `m_Text` only (minimal tail).
+#[cfg(test)]
+pub fn write_v17_textmesh_fixture(m_text: &str) -> Vec<u8> {
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+        let pad = align4(b.len()) - b.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+    fn write_pptr(buf: &mut Vec<u8>, file_id: i32, path_id: i64) {
+        buf.extend_from_slice(&file_id.to_le_bytes());
+        buf.extend_from_slice(&path_id.to_le_bytes());
+    }
+
+    let mut payload = Vec::new();
+    write_pptr(&mut payload, 0, 1); // m_GameObject
+    write_aligned_string(&mut payload, m_text);
+    // Minimal remainder so byte_size covers a realistic object (floats after m_Text).
+    payload.extend_from_slice(&0f32.to_le_bytes()); // m_OffsetZ
+    payload.extend_from_slice(&1f32.to_le_bytes()); // m_CharacterSize
+
+    let mut meta = Vec::new();
+    meta.extend_from_slice(b"2019.4.0f1\0");
+    meta.extend_from_slice(&1u32.to_le_bytes());
+    meta.push(0); // no type tree
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    meta.extend_from_slice(&CLASS_ID_TEXT_MESH.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&(-1i16).to_le_bytes());
+    meta.extend_from_slice(&[0u8; 16]); // old_type_hash
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    meta.extend_from_slice(&7i64.to_le_bytes()); // path_id
+    meta.extend_from_slice(&0u32.to_le_bytes());
+    meta.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes());
+
+    let header_len = 20usize;
+    let mut data_offset = header_len + meta.len();
+    data_offset = (data_offset + 15) & !15;
+    let file_size = data_offset + payload.len();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(file_size as u32).to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&meta);
+    while out.len() < data_offset {
+        out.push(0);
+    }
+    out.extend_from_slice(&payload);
+    out
 }
 
 /// v17 fixture: one TextAsset, enable_type_tree=1 with a minimal skippable blob.
