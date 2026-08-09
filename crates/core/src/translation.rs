@@ -102,10 +102,18 @@ const TIGHT_BINARY_SLOT_BYTES: usize = 12;
 const MAX_BINARY_SLOT_LENGTH_RETRIES: usize = 2;
 
 /// First-pass context hint for binary-slot inject budgets.
-fn binary_slot_length_hint(slot: &str, budget: usize) -> String {
+/// When `source` is set and the budget is tight, quote the source so the model
+/// can edit length against the actual label (helps short UI slots).
+fn binary_slot_length_hint(slot: &str, budget: usize, source: &str) -> String {
+    let src_display = if source.chars().count() > 48 {
+        let t: String = source.chars().take(48).collect();
+        format!("{t}…")
+    } else {
+        source.to_string()
+    };
     if budget <= TIGHT_BINARY_SLOT_BYTES {
         format!(
-            "LENGTH LIMIT: HARD MAX {budget} bytes ({slot}). \
+            "LENGTH LIMIT: HARD MAX {budget} bytes ({slot}). Source: «{src_display}». \
              Prefer one short word or heavy abbreviation; spaces and accents count as bytes."
         )
     } else {
@@ -240,12 +248,50 @@ impl TranslationManager {
             remaining = translatable;
         }
 
-        // 4. Build glossary hint
-        let glossary_hint = if opts.use_glossary {
-            self.glossary.build_hint(&opts.source_lang, &opts.target_lang)
-        } else {
-            None
-        };
+        // 3b. Exact glossary hits (full-string): short-circuit provider — key for
+        // short UI binary slots where the user already fixed a fitting form.
+        if opts.use_glossary && !remaining.is_empty() {
+            let mut still = Vec::with_capacity(remaining.len());
+            for entry in remaining.drain(..) {
+                let Some(term) = self.glossary.lookup_exact(
+                    &entry.source,
+                    &opts.source_lang,
+                    &opts.target_lang,
+                ) else {
+                    still.push(entry);
+                    continue;
+                };
+                // Binary-slot: only apply when the glossary form fits the budget.
+                if let Some(slot) = entry
+                    .metadata
+                    .get("binary_slot")
+                    .and_then(|v| v.as_str())
+                {
+                    if let Some(budget) =
+                        crate::validation::encoded_byte_len(slot, &entry.source)
+                    {
+                        if crate::validation::encoded_byte_len(slot, &term)
+                            .map(|n| n > budget)
+                            .unwrap_or(true)
+                        {
+                            still.push(entry);
+                            continue;
+                        }
+                    }
+                }
+                self.db
+                    .save_translation(&entry.id, &term, "glossary")
+                    .await?;
+                let _ = tx
+                    .send(ProgressEvent::StringTranslated {
+                        entry_id: entry.id.clone(),
+                        translation: term,
+                    })
+                    .await;
+                completed += 1;
+            }
+            remaining = still;
+        }
 
         // 5. Process remaining in chunks — up to `max_concurrent` provider calls
         // in flight at once. Result handling (DB writes, progress, cost) stays on
@@ -323,7 +369,8 @@ impl TranslationManager {
                             {
                                 budgets_by_id
                                     .insert(entry.id.clone(), (slot.to_string(), budget));
-                                let hint = binary_slot_length_hint(slot, budget);
+                                let hint =
+                                    binary_slot_length_hint(slot, budget, &entry.source);
                                 context = Some(match context {
                                     Some(c) => format!("{c} | {hint}"),
                                     None => hint,
@@ -332,13 +379,24 @@ impl TranslationManager {
                         }
                         let (sanitized, phs) = PlaceholderProcessor::extract(&entry.source);
                         placeholders_by_id.insert(entry.id.clone(), phs);
+                        // Per-entry glossary: only terms present in this source
+                        // (keeps short UI slots free of bulk noise).
+                        let glossary_hint = if opts.use_glossary {
+                            self.glossary.build_hint_for_text(
+                                &opts.source_lang,
+                                &opts.target_lang,
+                                &entry.source,
+                            )
+                        } else {
+                            None
+                        };
                         TranslationRequest {
                             entry_id: entry.id.clone(),
                             source: sanitized,
                             source_lang: opts.source_lang.clone(),
                             target_lang: opts.target_lang.clone(),
                             context,
-                            glossary_hint: glossary_hint.clone(),
+                            glossary_hint,
                         }
                     })
                     .collect();
@@ -1265,6 +1323,8 @@ mod tests {
         .unwrap();
 
         let mut entries = make_entries(1);
+        // Source must contain the glossary term so filtered hints attach.
+        entries[0].source = "Current HP is low".to_string();
         entries[0].context = Some("battle screen".to_string());
         db.save_entries(&entries).unwrap();
 
@@ -1350,6 +1410,105 @@ mod tests {
 
         let hints = provider_ref.glossary_hints.lock().unwrap();
         assert!(hints[0].as_ref().unwrap().contains("HP → Health Points"));
+    }
+
+    #[tokio::test]
+    async fn test_glossary_exact_short_circuits_provider() {
+        let (db, glossary) = setup();
+        glossary
+            .add("Options", "Opcns", "en-es", None)
+            .unwrap();
+        let entry = StringEntry::new("ui-opt", "Options", PathBuf::from("ui.assets"));
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+
+        let provider = Arc::new(ScriptedLengthProvider::new(&["SHOULD_NOT_RUN"]));
+        let capture = provider.clone();
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: true,
+            source_lang: "en".into(),
+            target_lang: "es".into(),
+            ..Default::default()
+        };
+        manager
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-gloss-exact".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(
+            capture.calls.load(Ordering::SeqCst),
+            0,
+            "exact glossary must not call provider"
+        );
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "ui-opt")
+            .unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("Opcns"));
+        assert_eq!(saved.provider_used.as_deref(), Some("glossary"));
+    }
+
+    #[tokio::test]
+    async fn test_glossary_exact_oversize_binary_slot_falls_through() {
+        let (db, glossary) = setup();
+        // Budget for "Options" is 7; glossary form is 9 → must not short-circuit.
+        glossary
+            .add("Options", "Opciones", "en-es", None)
+            .unwrap();
+        let mut entry = StringEntry::new("ui-opt2", "Options", PathBuf::from("ui.assets"));
+        entry.metadata.insert(
+            "binary_slot".to_string(),
+            serde_json::Value::String("utf8".to_string()),
+        );
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+
+        let provider = Arc::new(ScriptedLengthProvider::new(&["Opcns"])); // 5 bytes, fits
+        let capture = provider.clone();
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: true,
+            source_lang: "en".into(),
+            target_lang: "es".into(),
+            ..Default::default()
+        };
+        manager
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-gloss-oversize".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+
+        assert!(
+            capture.calls.load(Ordering::SeqCst) >= 1,
+            "oversize glossary form must fall through to provider"
+        );
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "ui-opt2")
+            .unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("Opcns"));
     }
 
     /// Captures request context keyed by entry id (for binary-slot budget tests).
@@ -1456,6 +1615,10 @@ mod tests {
             "tight utf8 budget for \"Hello\" is 5: {slotted}"
         );
         assert!(
+            slotted.contains("Source: «Hello»"),
+            "tight hint must quote source: {slotted}"
+        );
+        assert!(
             !slotted.contains("encoded as utf8"),
             "tight path should not use the longer-line phrasing: {slotted}"
         );
@@ -1520,14 +1683,22 @@ mod tests {
 
     #[test]
     fn test_binary_slot_length_hint_tight_vs_loose() {
-        let tight = binary_slot_length_hint("utf8", 8);
+        let tight = binary_slot_length_hint("utf8", 8, "Options");
         assert!(tight.contains("HARD MAX 8 bytes (utf8)"), "{tight}");
-        let loose = binary_slot_length_hint("utf8", 40);
+        assert!(
+            tight.contains("Source: «Options»"),
+            "tight hint must quote source: {tight}"
+        );
+        let loose = binary_slot_length_hint("utf8", 40, "Longer dialogue line here");
         assert!(
             loose.contains("40 bytes when encoded as utf8"),
             "{loose}"
         );
         assert!(!loose.contains("HARD MAX"), "{loose}");
+        assert!(
+            !loose.contains("Source:"),
+            "loose budget keeps shorter phrasing: {loose}"
+        );
     }
 
     #[test]
