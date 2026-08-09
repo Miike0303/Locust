@@ -13,6 +13,10 @@ import {
   defaultInjectMode,
   type InjectUiMode,
 } from "../lib/injectModes";
+import {
+  loadRegLabelOverride,
+  rememberRegLabelOverride,
+} from "../lib/registerLangPrefs";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -75,7 +79,9 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
     { lang: string; label: string; report: RegisterLangReport }[]
   >([]);
   /** Optional UI label override (CLI `--label`). Used when a single lang is selected. */
-  const [regLabelOverride, setRegLabelOverride] = useState("");
+  const [regLabelOverride, setRegLabelOverride] = useState(() =>
+    loadRegLabelOverride()
+  );
   /** After inject, also run register-lang for RPG Maker multi-lang UI. */
   const [autoRegisterAfterInject, setAutoRegisterAfterInject] = useState(() => {
     try {
@@ -84,6 +90,11 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
       return false;
     }
   });
+
+  const setRegLabelAndRemember = (value: string) => {
+    setRegLabelOverride(value);
+    rememberRegLabelOverride(value);
+  };
 
   const toggleLang = (code: string) => {
     setSelectedLangs((prev) =>
@@ -462,14 +473,14 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                     <input
                       type="text"
                       value={regLabelOverride}
-                      onChange={(e) => setRegLabelOverride(e.target.value)}
+                      onChange={(e) => setRegLabelAndRemember(e.target.value)}
                       placeholder={defaultLabelFor(selectedLangs[0])}
                       className="w-full mt-0.5 p-1.5 text-sm border rounded dark:bg-gray-800 dark:border-gray-600"
                     />
                     <p className="text-[11px] text-gray-500 mt-0.5">
                       Shown in the game language picker — same as CLI{" "}
                       <code className="px-0.5 bg-gray-100 dark:bg-gray-800 rounded">--label</code>
-                      . Leave empty for “{defaultLabelFor(selectedLangs[0])}”.
+                      . Leave empty for “{defaultLabelFor(selectedLangs[0])}”. Remembered across sessions.
                     </p>
                   </div>
                 )}
@@ -591,7 +602,7 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                     <input
                       type="text"
                       value={regLabelOverride}
-                      onChange={(e) => setRegLabelOverride(e.target.value)}
+                      onChange={(e) => setRegLabelAndRemember(e.target.value)}
                       placeholder={defaultLabelFor(selectedLangs[0])}
                       className="w-full mt-0.5 p-1.5 text-sm border border-violet-200 dark:border-violet-700 rounded dark:bg-gray-900"
                     />
