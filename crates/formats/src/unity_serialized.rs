@@ -5,9 +5,11 @@
 //! - **Slice 2:** skip type-tree blobs (no field interpretation), MonoBehaviour
 //!   (class_id 114 **or negative** script-type ids) base layout (`m_GameObject`,
 //!   `m_Enabled`, `m_Script`, `m_Name`) plus sequential aligned-string fields
-//!   after the base for extract/in-place rewrite; **TextMesh** (class_id 141)
-//!   `m_Text` after `m_GameObject` PPtr; **GUIText** (class_id 132) `m_Text`
-//!   after Behaviour base + `m_PixelOffset`. Full type-tree walks remain out of scope.
+//!   after the base for extract/in-place rewrite (also recovers Unity `string[]` /
+//!   `List<string>` as i32 count + N aligned strings when count is small);
+//!   **TextMesh** (class_id 141) `m_Text` after `m_GameObject` PPtr; **GUIText**
+//!   (class_id 132) `m_Text` after Behaviour base + `m_PixelOffset`. Full
+//!   type-tree walks remain out of scope.
 //!
 //! # Format (AssetStudio / AssetsTools.NET conventions)
 //! Header fields through `data_offset` are **big-endian**. From version ≥ 9 the
@@ -533,7 +535,10 @@ impl SerializedFile {
         // When a length prefix is implausible (typical int/float between strings),
         // skip up to MAX_MONO_NON_STRING_SKIPS × 4-byte words and keep scanning —
         // recovers `string, int, string` layouts without a full type-tree walk.
+        // Small peeks (1..=64) try Unity `string[]` / `List<string>` first so an
+        // array count is not consumed as a short garbage string (which desyncs).
         const MAX_MONO_NON_STRING_SKIPS: usize = 16;
+        const MAX_MONO_STRING_ARRAY_LEN: u32 = 64;
         let mut field_index = 1usize;
         let mut non_string_skips = 0usize;
         while r.pos + 4 <= end {
@@ -558,6 +563,30 @@ impl SerializedFile {
                 }
                 break;
             }
+
+            // Prefer string-array when the u32 looks like a small element count.
+            if (1..=MAX_MONO_STRING_ARRAY_LEN).contains(&len_peek) {
+                if let Some(items) =
+                    try_read_mono_string_array(&mut r, end, len_peek as usize)
+                {
+                    non_string_skips = 0;
+                    for (text, len_offset, byte_len) in items {
+                        if mono_script_field_worth_extracting(&text) {
+                            out.push(MonoStringData {
+                                path_id,
+                                mono_name: mono_name.clone(),
+                                field_index,
+                                text,
+                                len_offset,
+                                byte_len,
+                            });
+                        }
+                        field_index += 1;
+                    }
+                    continue;
+                }
+            }
+
             match r.aligned_string() {
                 Ok((text, len_offset, byte_len)) => {
                     if r.pos > end {
@@ -686,6 +715,69 @@ impl SerializedFile {
             })
             .collect()
     }
+}
+
+/// Try reading Unity `string[]` / `List<string>`: i32/u32 count already at `r.pos`,
+/// then `count` aligned strings. On failure restores `r.pos` and returns `None`.
+///
+/// Accepts only when every element parses and at least one passes the script-field
+/// filter (avoids treating a real short string like `"Yes"` as array count 3).
+fn try_read_mono_string_array(
+    r: &mut R<'_>,
+    end: usize,
+    count: usize,
+) -> Option<Vec<(String, usize, usize)>> {
+    let start_pos = r.pos;
+    // Consume count u32.
+    if r.take(4).is_err() {
+        r.pos = start_pos;
+        return None;
+    }
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        if r.pos + 4 > end {
+            r.pos = start_pos;
+            return None;
+        }
+        let elem_len = {
+            let b = &r.data[r.pos..r.pos + 4];
+            match r.endian {
+                Endian::Little => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                Endian::Big => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            }
+        };
+        let rem = end.saturating_sub(r.pos + 4);
+        if elem_len as usize > rem || elem_len > 4 * 1024 * 1024 {
+            r.pos = start_pos;
+            return None;
+        }
+        match r.aligned_string() {
+            Ok((text, len_offset, byte_len)) => {
+                if r.pos > end {
+                    r.pos = start_pos;
+                    return None;
+                }
+                // Non-empty binary-looking elements reject the array hypothesis.
+                if !text.is_empty() && is_binary_looking_script(&text) {
+                    r.pos = start_pos;
+                    return None;
+                }
+                items.push((text, len_offset, byte_len));
+            }
+            Err(_) => {
+                r.pos = start_pos;
+                return None;
+            }
+        }
+    }
+    if !items
+        .iter()
+        .any(|(t, _, _)| mono_script_field_worth_extracting(t))
+    {
+        r.pos = start_pos;
+        return None;
+    }
+    Some(items)
 }
 
 /// Skip a SerializedFile type-tree blob (AssetStudio `TypeTreeBlobRead`).
@@ -1333,6 +1425,159 @@ mod tests {
         );
         assert_eq!(gt2.text_byte_len, 11);
     }
+
+    /// `List<string>` / `string[]`: i32 count + N aligned strings after m_Name.
+    #[test]
+    fn parse_mono_string_array_after_name() {
+        let bytes = write_v17_mono_fixture_with_string_array(
+            "MenuLabels",
+            &["New Game", "Load Game", "Options"],
+        );
+        let sf = SerializedFile::parse(bytes, "arr.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| *t == "New Game"),
+            "fields: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Load Game"),
+            "fields: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Options"),
+            "fields: {texts:?}"
+        );
+        // Count u32 must not appear as a garbage 3-byte "string".
+        assert!(
+            !texts.iter().any(|t| t.len() == 3 && t.as_bytes().iter().all(|b| *b < 0x20)),
+            "array count must not be consumed as a short string: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_mono_string_array_element_inplace() {
+        let bytes = write_v17_mono_fixture_with_string_array(
+            "MenuLabels",
+            &["New Game", "Load Game", "Options"],
+        );
+        let sf = SerializedFile::parse(bytes.clone(), "arr.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let load = fields
+            .iter()
+            .find(|f| f.text == "Load Game")
+            .expect("Load Game present");
+        let mut file = bytes;
+        rewrite_text_asset_script_inplace(
+            &mut file,
+            load.len_offset,
+            load.byte_len,
+            "Cargar",
+            "arr.assets",
+        )
+        .unwrap();
+        let again = SerializedFile::parse(file, "arr.assets").unwrap();
+        let fields2 = again.read_mono_strings(10).unwrap();
+        assert!(
+            fields2.iter().any(|f| f.text.starts_with("Cargar")),
+            "array element inject: {fields2:?}"
+        );
+        assert!(
+            fields2.iter().any(|f| f.text == "New Game"),
+            "sibling array element must remain: {fields2:?}"
+        );
+        assert!(
+            fields2.iter().any(|f| f.text == "Options"),
+            "sibling array element must remain: {fields2:?}"
+        );
+    }
+
+    /// Real short string (length 3) must not be misread as array count 3.
+    #[test]
+    fn parse_mono_short_string_not_array_count() {
+        let bytes = write_v17_mono_fixture("Box", &["Yes", "See you later."]);
+        let sf = SerializedFile::parse(bytes, "short.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| *t == "Yes"),
+            "short string must extract as itself: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "See you later."),
+            "following string must still extract: {texts:?}"
+        );
+    }
+}
+
+/// MonoBehaviour: m_Name + i32 count + N aligned strings (`string[]` / `List<string>`).
+#[cfg(test)]
+pub fn write_v17_mono_fixture_with_string_array(mono_name: &str, items: &[&str]) -> Vec<u8> {
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+        let pad = align4(b.len()) - b.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+    fn write_pptr(buf: &mut Vec<u8>, file_id: i32, path_id: i64) {
+        buf.extend_from_slice(&file_id.to_le_bytes());
+        buf.extend_from_slice(&path_id.to_le_bytes());
+    }
+
+    let mut payload = Vec::new();
+    write_pptr(&mut payload, 0, 0);
+    payload.push(1);
+    while payload.len() % 4 != 0 {
+        payload.push(0);
+    }
+    write_pptr(&mut payload, 0, 0);
+    write_aligned_string(&mut payload, mono_name);
+    payload.extend_from_slice(&(items.len() as i32).to_le_bytes());
+    for s in items {
+        write_aligned_string(&mut payload, s);
+    }
+
+    let mut meta = Vec::new();
+    meta.extend_from_slice(b"2019.4.0f1\0");
+    meta.extend_from_slice(&1u32.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    meta.extend_from_slice(&CLASS_ID_MONO_BEHAVIOUR.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&0i16.to_le_bytes());
+    meta.extend_from_slice(&[0u8; 16]);
+    meta.extend_from_slice(&[0u8; 16]);
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    meta.extend_from_slice(&10i64.to_le_bytes());
+    meta.extend_from_slice(&0u32.to_le_bytes());
+    meta.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes());
+
+    let header_len = 20usize;
+    let mut data_offset = header_len + meta.len();
+    data_offset = (data_offset + 15) & !15;
+    let file_size = data_offset + payload.len();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(file_size as u32).to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&meta);
+    while out.len() < data_offset {
+        out.push(0);
+    }
+    out.extend_from_slice(&payload);
+    out
 }
 
 /// v17 fixture: one TextMesh (class 141) with `m_Text` only (minimal tail).

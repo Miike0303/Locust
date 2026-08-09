@@ -236,7 +236,8 @@ The Tauri app talks to the same core/server as the CLI. For a full in-app loop:
   - Structural **TextAsset** (class 49): `m_Name` + `m_Script`; ids `textasset/<path_id>`.
   - Structural **MonoBehaviour** (class **114 or negative** script-type ids): `m_Name` +
     sequential aligned-string fields (skips up to 16 implausible 4-byte non-string words
-    between strings); ids `monobehaviour/<path_id>/<field_index>`.
+    between strings; recovers `string[]` / `List<string>` when a small i32 count is
+    followed by N aligned strings); ids `monobehaviour/<path_id>/<field_index>`.
   - Structural **TextMesh** (class **141**): `m_Text` after `m_GameObject` PPtr; ids
     `textmesh/<path_id>`.
   - Structural **GUIText** (class **132**): Behaviour base + `m_PixelOffset` then `m_Text`;
