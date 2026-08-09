@@ -94,10 +94,16 @@ export default function PatchModal({
         multiple: false,
         filters: [{ name: "Patch zip", extensions: ["zip"] }],
       });
-      if (typeof selected === "string") setZipPath(selected);
+      if (typeof selected === "string") {
+        setZipPath(selected);
+        setZipUrl(""); // mutual exclusion with URL field
+      }
     } else {
       const path = prompt("Patch zip path:");
-      if (path) setZipPath(path);
+      if (path) {
+        setZipPath(path);
+        setZipUrl("");
+      }
     }
   };
 

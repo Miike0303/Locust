@@ -231,7 +231,8 @@ The Tauri app talks to the same core/server as the CLI. For a full in-app loop:
 
 ### Unity — MEDIUM  ✅ Locust (heuristic + SerializedFile slices 1–2)
 - **VN text scripts** under `*_Data/SCRIPTS~` (etc.) when present — preferred path.
-- **SerializedFile** (format versions **17–22**) under `*_Data`:
+- **SerializedFile** (format versions **17–22**, including v22 LargeFilesSupport u64
+  sizes / object `byte_start`) under `*_Data`:
   - Files: `*.assets`, extensionless `globalgamemanagers` / `resources` / `level*`.
   - Structural **TextAsset** (class 49): `m_Name` + `m_Script`; ids `textasset/<path_id>`.
   - Structural **MonoBehaviour** (class **114 or negative** script-type ids): `m_Name` +

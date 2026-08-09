@@ -1065,6 +1065,45 @@ mod tests {
         assert!(ta.script_byte_len == "Hello script body".len());
     }
 
+    /// Format version 22 (LargeFilesSupport): extended header + u64 byte_start.
+    #[test]
+    fn parse_v22_text_asset_large_files_support() {
+        let bytes = write_v22_textasset_fixture("Dlg", "Hello from v22 assets");
+        let sf = SerializedFile::parse(bytes, "v22.assets").unwrap();
+        assert_eq!(sf.header.version, 22);
+        assert!(sf.header.data_offset >= 48, "extended header pushes metadata past 20");
+        let texts: Vec<_> = sf.text_asset_objects().collect();
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].path_id, 1);
+        let ta = sf.read_text_asset(1).unwrap();
+        assert_eq!(ta.name, "Dlg");
+        assert_eq!(ta.script, "Hello from v22 assets");
+    }
+
+    #[test]
+    fn rewrite_v22_text_asset_inplace() {
+        let bytes = write_v22_textasset_fixture("N", "ABCDEFGH");
+        let sf = SerializedFile::parse(bytes.clone(), "v22.assets").unwrap();
+        let ta = sf.read_text_asset(1).unwrap();
+        let mut file = bytes;
+        rewrite_text_asset_script_inplace(
+            &mut file,
+            ta.script_len_offset,
+            ta.script_byte_len,
+            "Hola",
+            "v22.assets",
+        )
+        .unwrap();
+        let again = SerializedFile::parse(file, "v22.assets").unwrap();
+        let ta2 = again.read_text_asset(1).unwrap();
+        assert!(
+            ta2.script.starts_with("Hola"),
+            "v22 inject: {:?}",
+            ta2.script
+        );
+        assert_eq!(again.header.version, 22);
+    }
+
     #[test]
     fn rewrite_shorter_pads_with_spaces() {
         let bytes = write_v17_fixture("N", "ABCDEFGH"); // 8 bytes
@@ -1789,6 +1828,73 @@ pub fn write_v17_guitext_fixture(m_text: &str) -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&payload);
+    out
+}
+
+/// v22 fixture: one TextAsset with LargeFilesSupport header (u64 sizes + byte_start).
+#[cfg(test)]
+pub fn write_v22_textasset_fixture(text_name: &str, text_script: &str) -> Vec<u8> {
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+        let pad = align4(b.len()) - b.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+
+    let mut text_payload = Vec::new();
+    write_aligned_string(&mut text_payload, text_name);
+    write_aligned_string(&mut text_payload, text_script);
+
+    let mut meta = Vec::new();
+    meta.extend_from_slice(b"2021.3.0f1\0");
+    meta.extend_from_slice(&1u32.to_le_bytes()); // target platform
+    meta.push(0); // no type tree
+    meta.extend_from_slice(&1i32.to_le_bytes()); // 1 type
+    meta.extend_from_slice(&CLASS_ID_TEXT_ASSET.to_le_bytes());
+    meta.push(0); // not stripped
+    meta.extend_from_slice(&(-1i16).to_le_bytes());
+    meta.extend_from_slice(&[0u8; 16]); // old_type_hash
+    meta.extend_from_slice(&1i32.to_le_bytes()); // 1 object
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    // Object: path_id i64, byte_start u64 (v22), byte_size u32, type_id i32
+    meta.extend_from_slice(&1i64.to_le_bytes());
+    meta.extend_from_slice(&0u64.to_le_bytes()); // byte_start
+    meta.extend_from_slice(&(text_payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes());
+
+    // Classic header (20) + extended (4+8+8+8=28) = 48 bytes before metadata.
+    let classic_header = 20usize;
+    let extended = 28usize;
+    let header_and_ext = classic_header + extended;
+    let mut data_offset = header_and_ext + meta.len();
+    data_offset = (data_offset + 15) & !15;
+    let file_size = (data_offset + text_payload.len()) as u64;
+    let metadata_size = meta.len() as u32;
+
+    let mut out = Vec::new();
+    // Classic BE header (placeholders; real sizes come from extended block).
+    out.extend_from_slice(&0u32.to_be_bytes()); // metadata_size stub
+    out.extend_from_slice(&0u32.to_be_bytes()); // file_size stub
+    out.extend_from_slice(&22u32.to_be_bytes()); // version
+    out.extend_from_slice(&0u32.to_be_bytes()); // data_offset stub
+    out.push(0); // little-endian metadata
+    out.extend_from_slice(&[0, 0, 0]);
+    // Extended LargeFilesSupport header (still big-endian).
+    out.extend_from_slice(&metadata_size.to_be_bytes());
+    out.extend_from_slice(&file_size.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u64).to_be_bytes());
+    out.extend_from_slice(&0u64.to_be_bytes()); // unknown
+    out.extend_from_slice(&meta);
+    while out.len() < data_offset {
+        out.push(0);
+    }
+    out.extend_from_slice(&text_payload);
     out
 }
 
