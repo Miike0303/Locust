@@ -67,6 +67,9 @@ fn unreal_extract_tags_utf16le_binary_slot() {
         data.extend_from_slice(&ch.to_le_bytes());
     }
     data.extend_from_slice(&[0, 0, 0, 0]);
+    // Footer magic — pak discovery requires it to reject Chromium/NW.js packs.
+    data.extend_from_slice(&locust_formats::unreal_pak::PAK_MAGIC.to_le_bytes());
+    data.extend_from_slice(&[0; 40]);
     fs::write(paks.join("TestGame.pak"), &data).unwrap();
 
     let plugin = UnrealPlugin::new();

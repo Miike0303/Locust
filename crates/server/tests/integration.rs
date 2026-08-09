@@ -203,6 +203,11 @@ async fn test_full_rpgmaker_mv_flow() {
     for e in &strings.entries {
         let t = e["translation"].as_str().unwrap_or("");
         let src = e["source"].as_str().unwrap_or("");
+        // Exact glossary hits short-circuit the provider and are free to grow;
+        // only the mock output is length-bound. See step 5.
+        if e["provider_used"].as_str() == Some("glossary") {
+            continue;
+        }
         // Mock is length-safe (≤ source bytes). Long strings keep the tag;
         // short ones may be a same-length reverse without the full marker.
         assert!(
@@ -261,10 +266,10 @@ async fn test_full_rpgmaker_mv_flow() {
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
     // characterIndex should be preserved
     assert_eq!(json[1]["characterIndex"], 0);
-    // name should be mock-transformed (length-safe; short strings reverse)
+    // "Hero" is an exact glossary hit (step 5), so it short-circuits the mock
+    // and reaches the injected file as the glossary value.
     let name = json[1]["name"].as_str().unwrap();
-    assert_ne!(name, "Hero", "name should be mock-transformed: {name}");
-    assert!(name.len() <= "Hero".len(), "mock must not grow short Unity/MV slots");
+    assert_eq!(name, "Héroe", "glossary hit should reach the injected file");
 
     // 12. Replace mode with output_dir must still take a backup. The original is NOT
     // reliably untouched: Unity, Unreal, Wolf RPG and Ren'Py loose scripts inject via

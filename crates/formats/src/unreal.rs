@@ -916,6 +916,10 @@ mod tests {
         }
         data.extend_from_slice(&[0, 0]);
         data.extend_from_slice(&[0; 32]); // trailing
+        // Footer magic — `looks_like_unreal_pak` requires it to tell real paks
+        // apart from Chromium/NW.js packs.
+        data.extend_from_slice(&unreal_pak::PAK_MAGIC.to_le_bytes());
+        data.extend_from_slice(&[0; 40]);
 
         let pak_path = game_dir.join("TestGame.pak");
         fs::write(&pak_path, &data).unwrap();
