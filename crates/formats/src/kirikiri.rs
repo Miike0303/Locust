@@ -467,10 +467,16 @@ fn is_non_text_line(line: &str) -> bool {
     if t.starts_with(';') || t.starts_with('*') || t.starts_with('@') {
         return true;
     }
-    if is_pure_ellipsis_line(t) {
+    // KAG line-continuation: pure command lines often end with `\`.
+    // Taimanin / many scripts: `[cm][SYSMENU]\`, `[endif]\`, `[NAME_W n="…"]\`.
+    let core = t.trim_end_matches(|c: char| c == '\\' || c.is_whitespace());
+    if core.is_empty() {
         return true;
     }
-    is_pure_tag_line(t)
+    if is_pure_ellipsis_line(core) {
+        return true;
+    }
+    is_pure_tag_line(core)
 }
 
 /// Pure pause/filler lines: `......`, fullwidth-space + dots, `…` runs.
@@ -491,6 +497,9 @@ fn is_pure_ellipsis_line(t: &str) -> bool {
 }
 
 /// Entire line is one or more `[...]` tags with no free text between them.
+///
+/// Uses bracket depth so attribute expressions with nested `[]` still count as
+/// one tag: `[eval exp="sf.x[tf.i]=1"]` (Taimanin / KAG).
 fn is_pure_tag_line(t: &str) -> bool {
     let mut rest = t;
     if !rest.starts_with('[') {
@@ -504,8 +513,26 @@ fn is_pure_tag_line(t: &str) -> bool {
         if !rest.starts_with('[') {
             return false;
         }
-        match rest.find(']') {
-            Some(i) => rest = &rest[i + 1..],
+        let mut depth = 0i32;
+        let mut end: Option<usize> = None;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(i) => {
+                // advance past `]` (1 byte ASCII)
+                rest = &rest[i + 1..];
+            }
             None => return false,
         }
     }
@@ -991,6 +1018,33 @@ This is narration.\r\n\
         assert!(is_player_text_line("Hello..."));
         assert!(is_player_text_line("\u{3000}Estoy enamorado―――"));
         assert!(is_player_text_line("【Haruki】"));
+    }
+
+    #[test]
+    fn test_kag_tag_lines_with_trailing_backslash_are_non_text() {
+        for s in [
+            r#"[cm][SYSMENU]\"#,
+            r#"[endif]\"#,
+            r#"[NAME_W n="Asagi"]\"#,
+            r#"[NAME_W n="アサギ"]\"#,
+            r#"[s]\"#,
+            r#"[eval exp="f.vol=sf.se_vol*10"]\"#,
+            // Nested [] inside attribute (first `]` is NOT the tag closer).
+            r#"[eval exp="sf.ch_voice_flg[tf.c_vo_num]=1"]\"#,
+            r#"[freeimage layer=base page=fore]\"#,
+            r#"[cm][SYSMENU]\ "#, // trailing space after \
+        ] {
+            assert!(
+                is_non_text_line(s),
+                "pure tag + line-cont should drop: {s:?}"
+            );
+        }
+        // Dialogue with a tag prefix or free text must stay.
+        assert!(is_player_text_line(r#"[name] Hello world\"#));
+        assert!(is_player_text_line("Hello\\"));
+        assert!(is_player_text_line("【Haruki】"));
+        // Tag + dialogue on same line (common): keep.
+        assert!(is_player_text_line(r#"「…………」[T_NEXT]\"#));
     }
 
     #[test]
