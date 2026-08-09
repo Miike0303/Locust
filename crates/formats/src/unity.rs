@@ -297,8 +297,11 @@ impl UnityPlugin {
             return assets;
         };
 
+        // Depth 3 reaches e.g. `*_Data/subdir/level0` and keeps walk cheap.
+        // (Addressable bundles under StreamingAssets/aa/… are not classic
+        // SerializedFiles and are filtered by `is_unity_serialized_candidate`.)
         for entry in walkdir::WalkDir::new(&data_dir)
-            .max_depth(2)
+            .max_depth(3)
             .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -1188,6 +1191,34 @@ script Chapter_1_script chapter 1 {
             entries
                 .iter()
                 .any(|e| e.source == "Extensionless managers dialogue"),
+            "got: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_find_assets_nested_depth3_level() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        let nested = data_dir.join("Scenes").join("Act1");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        let bytes =
+            crate::unity_serialized::write_v17_fixture("N", "Nested level dialogue here");
+        // Depth from *_Data: Scenes (1) / Act1 (2) / level0 (3)
+        fs::write(nested.join("level0"), &bytes).unwrap();
+
+        let found = UnityPlugin::find_assets_files(&dir);
+        assert!(
+            found.iter().any(|p| p.file_name().is_some_and(|n| n == "level0")),
+            "max_depth 3 must reach nested level0: {found:?}"
+        );
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.source == "Nested level dialogue here"),
             "got: {:?}",
             entries.iter().map(|e| &e.source).collect::<Vec<_>>()
         );

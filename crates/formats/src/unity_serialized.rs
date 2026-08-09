@@ -1107,6 +1107,47 @@ mod tests {
             "must recover string after non-string int gap: {texts:?}"
         );
     }
+
+    /// Offsets from gap-skipping extract must rewrite the post-gap string in place.
+    #[test]
+    fn rewrite_mono_string_after_int_gap() {
+        let bytes = write_v17_mono_fixture_with_int_gap(
+            "Box",
+            "First line of dialogue", // long enough to leave pad room
+            0x7fff_ff00u32,
+            "Second line after int",
+        );
+        let sf = SerializedFile::parse(bytes.clone(), "gap.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let second = fields
+            .iter()
+            .find(|f| f.text == "Second line after int")
+            .expect("second string present");
+        let mut file = bytes;
+        rewrite_text_asset_script_inplace(
+            &mut file,
+            second.len_offset,
+            second.byte_len,
+            "Hola linea dos", // shorter UTF-8
+            "gap.assets",
+        )
+        .unwrap();
+        let again = SerializedFile::parse(file, "gap.assets").unwrap();
+        let fields2 = again.read_mono_strings(10).unwrap();
+        assert!(
+            fields2
+                .iter()
+                .any(|f| f.text.starts_with("Hola linea dos")),
+            "post-gap inject must land on second string: {fields2:?}"
+        );
+        // Gap must not have destroyed the first string.
+        assert!(
+            fields2
+                .iter()
+                .any(|f| f.text == "First line of dialogue"),
+            "first string must remain: {fields2:?}"
+        );
+    }
 }
 
 /// v17 fixture: one TextAsset, enable_type_tree=1 with a minimal skippable blob.

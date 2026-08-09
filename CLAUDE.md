@@ -50,7 +50,7 @@ locust providers                    # List translation providers
 - Streaming verify/apply multi-GB: shipped (pack ZIP64 + stream apply); keep eye on edge cases
 - Unity SerializedFile slice 2: type-tree blobs **skipped**; TextAsset (49) + MonoBehaviour (**114 or negative** script-type class ids) sequential aligned strings extract/inject (pad in place, length-prefix byte-identical, `binary_slot=utf8`); mono walk skips up to 16 implausible 4-byte words between strings; BOXMAN: +834 mono + 10 TextAssets. Still no full type-tree field walk / object-table rewrite
 - Unity heuristic extract/inject: **big-endian length prefix** support (`metadata.length_endian=be|le`); prefers LE; rejects BE off-by-3 shadow of following LE lengths (NUL payload start guard)
-- Unity SerializedFile discovery: extensionless `globalgamemanagers` / `resources` / `level*` under `*_Data` (not only `*.assets`)
+- Unity SerializedFile discovery: extensionless `globalgamemanagers` / `resources` / `level*` under `*_Data` (not only `*.assets`); walk depth 3 for nested `Scenes/…/level*`
 - Unreal multi-GB base pak E2E: done (Last Hope); optional more titles
 - RM MZ POR `.jsono` + Iavra multi-pack extract: done (prefer `en`); inject Replace re-encodes `.jsono`; inject Add writes `lang_*_{lang}.jsono` packs
 - RM MZ UI language registration: `locust register-lang <game> -l es --label Español` (Iavra + VisuMZ langs arrays + Map boot choices; `*.bak-locust`); **desktop/server**: `POST /api/register-lang` + Tauri `register_lang` + Inject modal “Register … in game UI” for rpgmaker-* formats
