@@ -457,7 +457,8 @@ fn parse_err(file: &str, message: &str) -> LocustError {
 
 // ─── KAG line classification ───────────────────────────────────────────────
 
-/// True for `;comment`, `*label`, `@command`, empty, or pure `[tag]`-only lines.
+/// True for `;comment`, `*label`, `@command`, empty, pure `[tag]`-only lines,
+/// or pure ellipsis/dot filler (no letters).
 fn is_non_text_line(line: &str) -> bool {
     let t = line.trim();
     if t.is_empty() {
@@ -466,7 +467,27 @@ fn is_non_text_line(line: &str) -> bool {
     if t.starts_with(';') || t.starts_with('*') || t.starts_with('@') {
         return true;
     }
+    if is_pure_ellipsis_line(t) {
+        return true;
+    }
     is_pure_tag_line(t)
+}
+
+/// Pure pause/filler lines: `......`, fullwidth-space + dots, `…` runs.
+/// Ochiru Hitozuma (and many KAG scripts) pad timing with these — not dialogue.
+fn is_pure_ellipsis_line(t: &str) -> bool {
+    let mut n = 0usize;
+    for c in t.chars() {
+        if c.is_whitespace() || c == '\u{3000}' {
+            continue;
+        }
+        if matches!(c, '.' | '…' | '・' | '．') {
+            n += 1;
+            continue;
+        }
+        return false;
+    }
+    n >= 2
 }
 
 /// Entire line is one or more `[...]` tags with no free text between them.
@@ -958,6 +979,18 @@ This is narration.\r\n\
         let dir = tempdir();
         fs::write(dir.join("readme.txt"), b"nope").unwrap();
         assert!(!KirikiriPlugin::new().detect(&dir));
+    }
+
+    #[test]
+    fn test_pure_ellipsis_lines_are_non_text() {
+        assert!(is_non_text_line("......"));
+        assert!(is_non_text_line("\u{3000}.................."));
+        assert!(is_non_text_line("…………………………………………"));
+        assert!(is_non_text_line("  ...  "));
+        // Real dialogue with an ellipsis must stay extractable.
+        assert!(is_player_text_line("Hello..."));
+        assert!(is_player_text_line("\u{3000}Estoy enamorado―――"));
+        assert!(is_player_text_line("【Haruki】"));
     }
 
     #[test]
