@@ -458,13 +458,14 @@ fn parse_err(file: &str, message: &str) -> LocustError {
 // ─── KAG line classification ───────────────────────────────────────────────
 
 /// True for `;comment`, `*label`, `@command`, empty, pure `[tag]`-only lines,
-/// or pure ellipsis/dot filler (no letters).
+/// pure ellipsis/dot filler, TJS `//` comments, brace-only lines, or obvious
+/// TJS/KAG script statements (not player dialogue).
 fn is_non_text_line(line: &str) -> bool {
     let t = line.trim();
     if t.is_empty() {
         return true;
     }
-    if t.starts_with(';') || t.starts_with('*') || t.starts_with('@') {
+    if t.starts_with(';') || t.starts_with('*') || t.starts_with('@') || t.starts_with("//") {
         return true;
     }
     // KAG line-continuation: pure command lines often end with `\`.
@@ -473,10 +474,70 @@ fn is_non_text_line(line: &str) -> bool {
     if core.is_empty() {
         return true;
     }
+    // Strip trailing `// …` so `];  // init` classifies as punctuation noise.
+    let core = match core.find("//") {
+        Some(i) => core[..i].trim_end(),
+        None => core,
+    };
+    if core.is_empty() {
+        return true;
+    }
     if is_pure_ellipsis_line(core) {
         return true;
     }
-    is_pure_tag_line(core)
+    if is_pure_tag_line(core) {
+        return true;
+    }
+    if is_tjs_or_brace_noise(core) {
+        return true;
+    }
+    false
+}
+
+/// Brace-only lines and obvious TJS/KAG script statements (Taimanin macros).
+/// Keeps dialogue that merely *contains* braces or code-like fragments.
+fn is_tjs_or_brace_noise(t: &str) -> bool {
+    let compact: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+    if matches!(
+        compact.as_str(),
+        "{" | "}" | "};" | "];" | "else" | "else{" | "}else{" | "}else"
+    ) {
+        return true;
+    }
+    let low = t.trim_start();
+    if low.starts_with("for(")
+        || low.starts_with("for (")
+        || low.starts_with("while(")
+        || low.starts_with("while (")
+        || low.starts_with("function(")
+        || low.starts_with("function ")
+        || low.starts_with("var ")
+        || low.starts_with("const ")
+        || low.starts_with("let ")
+    {
+        return true;
+    }
+    // Bare control keywords used as whole lines in macro scripts.
+    if matches!(low, "else" | "return" | "break" | "continue") {
+        return true;
+    }
+    // Engine storage assignments: `tf.con_vol=[];`, `sf.masked[i]=0;`
+    // (no dialogue quotes / fullwidth brackets).
+    let has_dialogue_mark = t.chars().any(|c| {
+        matches!(c, '「' | '」' | '『' | '』' | '（' | '）')
+            || c == '"'
+            || c == '\''
+    });
+    if !has_dialogue_mark
+        && (low.starts_with("tf.")
+            || low.starts_with("sf.")
+            || low.starts_with("f.")
+            || low.starts_with("kag."))
+        && (t.contains('=') || t.ends_with(';'))
+    {
+        return true;
+    }
+    false
 }
 
 /// Pure pause/filler lines: `......`, fullwidth-space + dots, `…` runs.
@@ -1133,6 +1194,32 @@ This is narration.\r\n\
         assert!(is_player_text_line("Hello..."));
         assert!(is_player_text_line("\u{3000}Estoy enamorado―――"));
         assert!(is_player_text_line("【Haruki】"));
+    }
+
+    #[test]
+    fn test_tjs_brace_and_comment_lines_are_non_text() {
+        for s in [
+            "{",
+            "}",
+            "\t}",
+            "\t\t{",
+            "};",
+            "];",
+            "\t];  // 配列を初期化",
+            "//-----------------------------------------------------",
+            "else",
+            "\t\t\telse",
+            "for(var i=1;i<=10;i++){",
+            "for(var i = 0; i < (i_max+1); i++) {",
+            "tf.con_vol=[];",
+            "sf.masked[i] = 0;",
+        ] {
+            assert!(is_non_text_line(s), "TJS/brace noise should drop: {s:?}");
+        }
+        // Dialogue must stay.
+        assert!(is_player_text_line("Hello {player}"));
+        assert!(is_player_text_line("「Kuh......!」[T_NEXT]\\"));
+        assert!(is_player_text_line("\u{3000}And then......[T_NEXT]\\"));
     }
 
     #[test]
