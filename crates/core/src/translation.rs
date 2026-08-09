@@ -111,10 +111,17 @@ fn binary_slot_length_hint(slot: &str, budget: usize, source: &str) -> String {
     } else {
         source.to_string()
     };
+    let accent_note = if slot == "utf8" && source.is_ascii() && budget <= TIGHT_BINARY_SLOT_BYTES
+    {
+        " Prefer ASCII when needed: accented letters cost 2 UTF-8 bytes each (ó/ñ/ü)."
+    } else {
+        ""
+    };
     if budget <= TIGHT_BINARY_SLOT_BYTES {
         format!(
             "LENGTH LIMIT: HARD MAX {budget} bytes ({slot}). Source: «{src_display}». \
-             Prefer one short word or heavy abbreviation; spaces and accents count as bytes."
+             Prefer one short word or heavy abbreviation; spaces and accents count as bytes.\
+             {accent_note}"
         )
     } else {
         format!(
@@ -558,6 +565,34 @@ impl TranslationManager {
                             }
                         }
 
+                        if !fitted {
+                            // Deterministic last resort: accent-fold / despace / truncate.
+                            if let Some(fitted_text) = crate::validation::mechanical_fit_binary_slot(
+                                slot,
+                                *budget,
+                                &result.translation,
+                            ) {
+                                let new_len = crate::validation::encoded_byte_len(
+                                    slot,
+                                    &fitted_text,
+                                )
+                                .unwrap_or(usize::MAX);
+                                if new_len <= *budget {
+                                    tracing::info!(
+                                        entry_id = %result.entry_id,
+                                        prev_len = best_len,
+                                        new_len,
+                                        budget,
+                                        slot = %slot,
+                                        "binary-slot translation fits after mechanical shrink"
+                                    );
+                                    result.translation = fitted_text;
+                                    best_len = new_len;
+                                    fitted = true;
+                                    retried_ok += 1;
+                                }
+                            }
+                        }
                         if !fitted {
                             oversize_after_retry += 1;
                             tracing::warn!(
@@ -1622,6 +1657,10 @@ mod tests {
             "tight hint must quote source: {slotted}"
         );
         assert!(
+            slotted.contains("accented letters cost 2 UTF-8 bytes"),
+            "ASCII source tight slot should warn about accents: {slotted}"
+        );
+        assert!(
             !slotted.contains("encoded as utf8"),
             "tight path should not use the longer-line phrasing: {slotted}"
         );
@@ -1858,7 +1897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_binary_slot_retry_still_oversize_keeps_shorter() {
+    async fn test_binary_slot_retry_still_oversize_mechanical_fit() {
         let (db, glossary) = setup();
         let entry = binary_utf8_entry("slot-still-over", "Hi"); // budget 2
         db.save_entries(std::slice::from_ref(&entry)).unwrap();
@@ -1866,7 +1905,7 @@ mod tests {
         let provider = Arc::new(ScriptedLengthProvider::new(&[
             "XXXXXXXXXXXXXXXX", // 16
             "YYYYYYYY",         // 8 shorter but still over
-            "ZZZZ",             // 4 still over budget 2; shortest kept
+            "ZZZZ",             // 4 still over budget 2 → mechanical truncates to "ZZ"
         ]));
         let capture = provider.clone();
         let manager = TranslationManager::new(provider, db.clone(), glossary);
@@ -1902,14 +1941,61 @@ mod tests {
             .unwrap();
         assert_eq!(
             saved.translation.as_deref(),
-            Some("ZZZZ"),
-            "must store the shortest of the oversize attempts"
+            Some("ZZ"),
+            "mechanical fit must truncate shortest oversize attempt to budget"
         );
         let budget = crate::validation::encoded_byte_len("utf8", "Hi").unwrap();
         let actual =
             crate::validation::encoded_byte_len("utf8", saved.translation.as_ref().unwrap())
                 .unwrap();
-        assert!(actual > budget);
+        assert!(actual <= budget);
+    }
+
+    #[tokio::test]
+    async fn test_binary_slot_mechanical_fit_after_accented_oversize() {
+        let (db, glossary) = setup();
+        // budget 7; provider only returns accented 8-byte form.
+        let entry = binary_utf8_entry("slot-accent", "Options"); // 7 bytes
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let provider = Arc::new(ScriptedLengthProvider::new(&[
+            "Canción!", // 9 utf8
+            "Canción",  // 8
+            "Canción",  // 8 still over
+        ]));
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        manager
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-accent".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "slot-accent")
+            .unwrap();
+        let tr = saved.translation.as_deref().unwrap();
+        assert!(
+            crate::validation::encoded_byte_len("utf8", tr).unwrap() <= 7,
+            "mechanical accent fold should fit: {tr}"
+        );
+        assert!(
+            tr.starts_with("Canci"),
+            "should preserve stem after fold: {tr}"
+        );
     }
 
     #[tokio::test]

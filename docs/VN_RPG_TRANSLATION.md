@@ -55,8 +55,10 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
   `metadata.binary_slot` (`utf8` / `utf16le` / `sjis`); `locust validate <db>` reports
   `ExceedsBinarySlot` before inject. The translation engine does **up to two length-aware
   retries** when a provider returns an oversize binary-slot string. First-pass hints use
-  **HARD MAX** wording for budgets ≤12 encoded bytes; the retry quotes the failed
-  attempt and exact excess so the model can edit rather than retranslate. Provider
+  **HARD MAX** wording for budgets ≤12 encoded bytes (ASCII utf8 also notes accent
+  byte cost); the retry quotes the failed attempt and exact excess so the model can
+  edit rather than retranslate. If still oversize, a **mechanical fit** runs (Latin
+  accent-fold → remove spaces → encoding-aware truncate) before inject skip. Provider
   **fallback chains**: CLI `--fallback a,b,c` and desktop translate dialog (same core
   `run_fallback_chain`).
 - The `mock` provider is length-safe for UTF-8 and UTF-16LE slots (good for inject tests).

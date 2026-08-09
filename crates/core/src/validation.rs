@@ -42,6 +42,167 @@ pub fn count_binary_slot_oversize(entries: &[StringEntry]) -> usize {
     binary_slot_oversize_issues(entries).len()
 }
 
+/// Deterministic last-resort shrink after provider length-retries still oversize.
+/// Tries (in order of preference for content): already-fits, accent-fold, despace,
+/// then encoding-aware truncate. Returns `Some` only when the result fits `budget`
+/// and still has at least one alphanumeric character.
+///
+/// Aimed at tight UI labels (e.g. EN→ES `Opciones` on a 7-byte utf8 slot → fold
+/// accents / drop spaces / truncate) so inject skips fewer slots.
+pub fn mechanical_fit_binary_slot(encoding: &str, budget: usize, text: &str) -> Option<String> {
+    if budget == 0 || text.is_empty() {
+        return None;
+    }
+    if encoded_byte_len(encoding, text).map(|n| n <= budget).unwrap_or(false) {
+        return Some(text.to_string());
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        candidates.push(trimmed.to_string());
+    }
+    let folded = fold_latin_accents(trimmed);
+    if folded != trimmed && !folded.is_empty() {
+        candidates.push(folded.clone());
+    }
+    let despaced: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    if despaced != trimmed && !despaced.is_empty() {
+        candidates.push(despaced.clone());
+    }
+    let fold_despaced: String = folded.chars().filter(|c| !c.is_whitespace()).collect();
+    if fold_despaced != folded && !fold_despaced.is_empty() {
+        candidates.push(fold_despaced);
+    }
+
+    // Truncate each base candidate on encoding boundaries.
+    let base: Vec<String> = candidates.clone();
+    for c in base {
+        if let Some(t) = truncate_to_encoded_budget(encoding, budget, &c) {
+            if !candidates.iter().any(|x| x == &t) {
+                candidates.push(t);
+            }
+        }
+    }
+
+    // Prefer the longest fitting candidate (most preserved content).
+    let mut best: Option<(usize, String)> = None;
+    for c in candidates {
+        if !c.chars().any(|ch| ch.is_alphanumeric()) {
+            continue;
+        }
+        let Some(n) = encoded_byte_len(encoding, &c) else {
+            continue;
+        };
+        if n > budget {
+            continue;
+        }
+        match &best {
+            Some((bn, _)) if n <= *bn => {}
+            _ => best = Some((n, c)),
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// Map common Latin accented letters to ASCII (Spanish/French/German UI).
+fn fold_latin_accents(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let r = match c {
+            'á' | 'à' | 'ä' | 'â' | 'ã' | 'å' | 'ā' => 'a',
+            'Á' | 'À' | 'Ä' | 'Â' | 'Ã' | 'Å' | 'Ā' => 'A',
+            'é' | 'è' | 'ë' | 'ê' | 'ē' => 'e',
+            'É' | 'È' | 'Ë' | 'Ê' | 'Ē' => 'E',
+            'í' | 'ì' | 'ï' | 'î' | 'ī' => 'i',
+            'Í' | 'Ì' | 'Ï' | 'Î' | 'Ī' => 'I',
+            'ó' | 'ò' | 'ö' | 'ô' | 'õ' | 'ø' | 'ō' => 'o',
+            'Ó' | 'Ò' | 'Ö' | 'Ô' | 'Õ' | 'Ø' | 'Ō' => 'O',
+            'ú' | 'ù' | 'ü' | 'û' | 'ū' => 'u',
+            'Ú' | 'Ù' | 'Ü' | 'Û' | 'Ū' => 'U',
+            'ý' | 'ÿ' => 'y',
+            'Ý' => 'Y',
+            'ñ' => 'n',
+            'Ñ' => 'N',
+            'ç' => 'c',
+            'Ç' => 'C',
+            'ß' => {
+                out.push('s');
+                out.push('s');
+                continue;
+            }
+            other => other,
+        };
+        out.push(r);
+    }
+    out
+}
+
+/// Truncate `text` so encoded length ≤ `budget` (char-boundary for utf8;
+/// UTF-16 code-unit pairs for utf16le; byte-greedy re-encode check for sjis).
+fn truncate_to_encoded_budget(encoding: &str, budget: usize, text: &str) -> Option<String> {
+    if budget == 0 || text.is_empty() {
+        return None;
+    }
+    if encoded_byte_len(encoding, text).map(|n| n <= budget).unwrap_or(false) {
+        return Some(text.to_string());
+    }
+    match encoding {
+        "utf8" => {
+            let mut end = budget.min(text.len());
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == 0 {
+                return None;
+            }
+            let s = text[..end].to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        "utf16le" => {
+            // budget is in bytes; each code unit is 2 bytes.
+            let max_units = budget / 2;
+            if max_units == 0 {
+                return None;
+            }
+            let units: Vec<u16> = text.encode_utf16().take(max_units).collect();
+            // Drop trailing unpaired high surrogate.
+            let mut units = units;
+            if let Some(&last) = units.last() {
+                if (0xD800..=0xDBFF).contains(&last) {
+                    units.pop();
+                }
+            }
+            if units.is_empty() {
+                return None;
+            }
+            String::from_utf16(&units).ok()
+        }
+        "sjis" | "shift_jis" | "shift-jis" => {
+            // Walk chars; keep prefix while SJIS encoding fits.
+            let mut out = String::new();
+            for ch in text.chars() {
+                let mut trial = out.clone();
+                trial.push(ch);
+                match encoded_byte_len(encoding, &trial) {
+                    Some(n) if n <= budget => out = trial,
+                    _ => break,
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
 impl Validator {
     pub fn validate_entry(entry: &StringEntry) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
@@ -310,6 +471,39 @@ mod tests {
         assert_eq!(n, 6); // 3 CJK × 2 SJIS
         assert!(encoded_byte_len("utf16le", "テスト").unwrap() == 6);
         assert!(encoded_byte_len("utf8", "テスト").unwrap() == 9);
+    }
+
+    #[test]
+    fn test_mechanical_fit_folds_accents_for_utf8_ui_slot() {
+        // "Opciones" is 8 ASCII bytes; with accent "Opciónes" style:
+        // "Nueva" fits; "Canción" (8 utf8: C-a-n-c-i-ó(2)-n = 8) on budget 7 → "Cancion" (7).
+        let src = "Canción"; // C a n c i ó n = 1*5 + 2 + 1 = 8
+        assert_eq!(encoded_byte_len("utf8", src).unwrap(), 8);
+        let fit = mechanical_fit_binary_slot("utf8", 7, src).unwrap();
+        assert!(
+            encoded_byte_len("utf8", &fit).unwrap() <= 7,
+            "fit={fit:?}"
+        );
+        assert_eq!(fit, "Cancion");
+    }
+
+    #[test]
+    fn test_mechanical_fit_despaces_and_truncates() {
+        // "New Game" budget 7: despace "NewGame" is 7 — fits.
+        let fit = mechanical_fit_binary_slot("utf8", 7, "New Game").unwrap();
+        assert_eq!(fit, "NewGame");
+        // Truncate when still over.
+        let fit2 = mechanical_fit_binary_slot("utf8", 4, "Options").unwrap();
+        assert_eq!(fit2, "Opti");
+        assert!(encoded_byte_len("utf8", &fit2).unwrap() <= 4);
+    }
+
+    #[test]
+    fn test_mechanical_fit_utf16le_truncate() {
+        // 4 BMP chars = 8 bytes; budget 6 → 3 code units.
+        let fit = mechanical_fit_binary_slot("utf16le", 6, "ABCD").unwrap();
+        assert_eq!(fit, "ABC");
+        assert_eq!(encoded_byte_len("utf16le", &fit).unwrap(), 6);
     }
 
     #[test]
