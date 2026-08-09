@@ -44,14 +44,16 @@ pub fn count_binary_slot_oversize(entries: &[StringEntry]) -> usize {
 
 /// Deterministic last-resort shrink after provider length-retries still oversize.
 /// Tries (in order of preference for content): already-fits, accent-fold, despace,
-/// then encoding-aware truncate. Returns `Some` only when the result fits `budget`
-/// and still has at least one alphanumeric character.
+/// multi-word first/initials, vowel-compress, then encoding-aware truncate.
+/// Returns `Some` only when the result fits `budget` and still has at least one
+/// alphanumeric character.
 ///
 /// Aimed at tight UI labels (e.g. EN→ES `Opciones` on a 7-byte utf8 slot → fold
 /// accents / drop spaces / drop inner vowels / truncate) so inject skips fewer slots.
 ///
 /// Preference: longest **non-truncated** fit first (vowel-compress beats mid-word
-/// chop: `Opciones`→`Opcns` over `Opcione`); only then longest truncated fit.
+/// chop: `Opciones`→`Opcns` over `Opcione`; multi-word `Cargar Juego`@6 → `Cargar`);
+/// only then longest truncated fit.
 pub fn mechanical_fit_binary_slot(encoding: &str, budget: usize, text: &str) -> Option<String> {
     if budget == 0 || text.is_empty() {
         return None;
@@ -76,6 +78,14 @@ pub fn mechanical_fit_binary_slot(encoding: &str, budget: usize, text: &str) -> 
     let fold_despaced: String = folded.chars().filter(|c| !c.is_whitespace()).collect();
     push_unique(&mut soft, fold_despaced);
 
+    // Multi-word UI labels: first word, first+initials, pure initials.
+    // e.g. "Cargar Juego"@6 → "Cargar"; "Nueva Partida"@7 → "Nueva P".
+    for base in [trimmed, folded.as_str()] {
+        for cand in multiword_soft_candidates(base) {
+            push_unique(&mut soft, cand);
+        }
+    }
+
     // Inner-vowel drop on each soft base (Latin UI abbreviation style).
     let soft_bases: Vec<String> = soft.clone();
     for c in &soft_bases {
@@ -99,6 +109,48 @@ pub fn mechanical_fit_binary_slot(encoding: &str, budget: usize, text: &str) -> 
         }
     }
     pick_longest_fit(encoding, budget, &hard)
+}
+
+/// Soft shrink candidates for multi-word UI (`Cargar Juego`, `Nueva Partida`).
+/// Returns first word, `First I…` (rest initials, spaced), `FirstI…` (no space),
+/// and pure initials (`NP`).
+fn multiword_soft_candidates(s: &str) -> Vec<String> {
+    let words: Vec<&str> = s.split_whitespace().filter(|w| !w.is_empty()).collect();
+    if words.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    out.push(words[0].to_string());
+
+    let mut initials: Vec<char> = Vec::new();
+    for w in &words {
+        if let Some(c) = w.chars().find(|ch| ch.is_alphabetic()) {
+            initials.push(c);
+        }
+    }
+    if initials.len() >= 2 {
+        out.push(initials.iter().collect::<String>());
+    }
+
+    // First word + first letter of each subsequent word (spaced and joined).
+    if words.len() >= 2 {
+        let mut spaced = words[0].to_string();
+        let mut joined = words[0].to_string();
+        for w in &words[1..] {
+            if let Some(c) = w.chars().find(|ch| ch.is_alphabetic()) {
+                spaced.push(' ');
+                spaced.push(c);
+                joined.push(c);
+            }
+        }
+        if spaced != words[0] {
+            out.push(spaced);
+        }
+        if joined != words[0] {
+            out.push(joined);
+        }
+    }
+    out
 }
 
 /// Prefer the longest candidate that encodes within `budget` and keeps alnum.
@@ -564,6 +616,25 @@ mod tests {
             "fit2={fit2:?}"
         );
         assert_eq!(fit2, "Cncón");
+    }
+
+    #[test]
+    fn test_mechanical_fit_multiword_prefers_first_word_over_truncate() {
+        // ES "Cargar Juego" (12) on 6-byte slot: first word "Cargar" fits cleanly.
+        // Without multi-word soft candidates, despace+vowel/"CargarJuego" truncates mid-token.
+        assert_eq!(encoded_byte_len("utf8", "Cargar Juego").unwrap(), 12);
+        let fit = mechanical_fit_binary_slot("utf8", 6, "Cargar Juego").unwrap();
+        assert_eq!(fit, "Cargar");
+        assert!(encoded_byte_len("utf8", &fit).unwrap() <= 6);
+
+        // "Nueva Partida" (13) budget 7 → "Nueva P" (7) beats bare "Nueva" (5).
+        let fit2 = mechanical_fit_binary_slot("utf8", 7, "Nueva Partida").unwrap();
+        assert_eq!(fit2, "Nueva P");
+        assert!(encoded_byte_len("utf8", &fit2).unwrap() <= 7);
+
+        // Tiny budget: initials only.
+        let fit3 = mechanical_fit_binary_slot("utf8", 2, "Nueva Partida").unwrap();
+        assert_eq!(fit3, "NP");
     }
 
     #[test]
