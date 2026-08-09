@@ -6,7 +6,8 @@
 //!   (class_id 114 **or negative** script-type ids) base layout (`m_GameObject`,
 //!   `m_Enabled`, `m_Script`, `m_Name`) plus sequential aligned-string fields
 //!   after the base for extract/in-place rewrite; **TextMesh** (class_id 141)
-//!   `m_Text` after `m_GameObject` PPtr. Full type-tree walks remain out of scope.
+//!   `m_Text` after `m_GameObject` PPtr; **GUIText** (class_id 132) `m_Text`
+//!   after Behaviour base + `m_PixelOffset`. Full type-tree walks remain out of scope.
 //!
 //! # Format (AssetStudio / AssetsTools.NET conventions)
 //! Header fields through `data_offset` are **big-endian**. From version ≥ 9 the
@@ -38,6 +39,8 @@ pub const CLASS_ID_TEXT_ASSET: i32 = 49;
 pub const CLASS_ID_MONO_BEHAVIOUR: i32 = 114;
 /// Unity class ID for legacy TextMesh (3D text component).
 pub const CLASS_ID_TEXT_MESH: i32 = 141;
+/// Unity class ID for legacy GUIText (screen-space text component).
+pub const CLASS_ID_GUI_TEXT: i32 = 132;
 
 /// True when `class_id` is a MonoBehaviour type in the SerializedFile type table.
 ///
@@ -133,7 +136,7 @@ pub struct MonoStringData {
     pub byte_len: usize,
 }
 
-/// TextMesh `m_Text` field (class_id 141).
+/// TextMesh / GUIText `m_Text` field (class_id 141 / 132).
 #[derive(Debug, Clone)]
 pub struct TextMeshData {
     pub path_id: i64,
@@ -143,6 +146,9 @@ pub struct TextMeshData {
     /// Original `m_Text` string byte length (not including length prefix / align).
     pub text_byte_len: usize,
 }
+
+/// Alias: same shape as [`TextMeshData`] (aligned `m_Text` + absolute offsets).
+pub type GuiTextData = TextMeshData;
 
 #[derive(Debug)]
 pub struct SerializedFile {
@@ -440,6 +446,12 @@ impl SerializedFile {
             .filter(|o| o.class_id == CLASS_ID_TEXT_MESH)
     }
 
+    pub fn gui_text_objects(&self) -> impl Iterator<Item = &ObjectInfo> {
+        self.objects
+            .iter()
+            .filter(|o| o.class_id == CLASS_ID_GUI_TEXT)
+    }
+
     /// Read TextAsset `m_Name` + `m_Script` at `path_id`.
     pub fn read_text_asset(&self, path_id: i64) -> Result<TextAssetData, SerializedError> {
         let label = self.path.display().to_string();
@@ -613,13 +625,52 @@ impl SerializedFile {
         })
     }
 
+    /// Read GUIText `m_Text` at `path_id`.
+    ///
+    /// Layout (Behaviour base + GUIText): `PPtr m_GameObject`, `u8 m_Enabled` +
+    /// align4, `Vector2 m_PixelOffset` (2×f32), then aligned string `m_Text`.
+    pub fn read_gui_text(&self, path_id: i64) -> Result<GuiTextData, SerializedError> {
+        let label = self.path.display().to_string();
+        let obj = self
+            .objects
+            .iter()
+            .find(|o| o.path_id == path_id && o.class_id == CLASS_ID_GUI_TEXT)
+            .ok_or_else(|| err(&label, format!("no GUIText with path_id={path_id}")))?;
+
+        let start = obj.data_abs as usize;
+        let end = (start + obj.byte_size as usize).min(self.data.len());
+        let mut r = R {
+            data: &self.data[..end],
+            pos: start,
+            file: &label,
+            endian: self.header.endian,
+        };
+
+        // m_GameObject PPtr
+        let _go_file = r.i32()?;
+        let _go_path = r.i64()?;
+        // m_Enabled + align4 (Behaviour)
+        let _enabled = r.u8()?;
+        r.align4();
+        // m_PixelOffset Vector2 (2 × f32)
+        let _px = r.take(4)?;
+        let _py = r.take(4)?;
+        let (text, text_len_offset, text_byte_len) = r.aligned_string()?;
+        Ok(GuiTextData {
+            path_id,
+            text,
+            text_len_offset,
+            text_byte_len,
+        })
+    }
+
     /// Absolute byte ranges of TextAsset + MonoBehaviour objects (heuristic skip).
     pub fn text_asset_byte_ranges(&self) -> Vec<(usize, usize)> {
         self.structural_object_byte_ranges()
     }
 
     /// Absolute byte ranges of objects handled structurally
-    /// (TextAsset + MonoBehaviour + TextMesh).
+    /// (TextAsset + MonoBehaviour + TextMesh + GUIText).
     pub fn structural_object_byte_ranges(&self) -> Vec<(usize, usize)> {
         self.objects
             .iter()
@@ -627,6 +678,7 @@ impl SerializedFile {
                 o.class_id == CLASS_ID_TEXT_ASSET
                     || is_monobehaviour_class(o.class_id)
                     || o.class_id == CLASS_ID_TEXT_MESH
+                    || o.class_id == CLASS_ID_GUI_TEXT
             })
             .map(|o| {
                 let s = o.data_abs as usize;
@@ -1242,6 +1294,45 @@ mod tests {
         );
         assert_eq!(tm2.text_byte_len, 13);
     }
+
+    #[test]
+    fn parse_v17_guitext_m_text() {
+        let bytes = write_v17_guitext_fixture("Press Start");
+        let sf = SerializedFile::parse(bytes, "gt.assets").unwrap();
+        let guis: Vec<_> = sf.gui_text_objects().collect();
+        assert_eq!(guis.len(), 1);
+        assert_eq!(guis[0].path_id, 8);
+        assert_eq!(guis[0].class_id, CLASS_ID_GUI_TEXT);
+
+        let gt = sf.read_gui_text(8).unwrap();
+        assert_eq!(gt.text, "Press Start");
+        assert_eq!(gt.text_byte_len, "Press Start".len());
+        assert_eq!(sf.structural_object_byte_ranges().len(), 1);
+    }
+
+    #[test]
+    fn rewrite_guitext_m_text_inplace() {
+        let bytes = write_v17_guitext_fixture("Press Start"); // 11 bytes
+        let sf = SerializedFile::parse(bytes.clone(), "gt.assets").unwrap();
+        let gt = sf.read_gui_text(8).unwrap();
+        let mut file = bytes;
+        rewrite_text_asset_script_inplace(
+            &mut file,
+            gt.text_len_offset,
+            gt.text_byte_len,
+            "Pulsa",
+            "gt.assets",
+        )
+        .unwrap();
+        let again = SerializedFile::parse(file, "gt.assets").unwrap();
+        let gt2 = again.read_gui_text(8).unwrap();
+        assert!(
+            gt2.text.starts_with("Pulsa"),
+            "post-rewrite: {:?}",
+            gt2.text
+        );
+        assert_eq!(gt2.text_byte_len, 11);
+    }
 }
 
 /// v17 fixture: one TextMesh (class 141) with `m_Text` only (minimal tail).
@@ -1283,6 +1374,75 @@ pub fn write_v17_textmesh_fixture(m_text: &str) -> Vec<u8> {
         meta.push(0);
     }
     meta.extend_from_slice(&7i64.to_le_bytes()); // path_id
+    meta.extend_from_slice(&0u32.to_le_bytes());
+    meta.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes());
+
+    let header_len = 20usize;
+    let mut data_offset = header_len + meta.len();
+    data_offset = (data_offset + 15) & !15;
+    let file_size = data_offset + payload.len();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(file_size as u32).to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&meta);
+    while out.len() < data_offset {
+        out.push(0);
+    }
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// v17 fixture: one GUIText (class 132) with Behaviour base + m_PixelOffset + m_Text.
+#[cfg(test)]
+pub fn write_v17_guitext_fixture(m_text: &str) -> Vec<u8> {
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+        let pad = align4(b.len()) - b.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+    fn write_pptr(buf: &mut Vec<u8>, file_id: i32, path_id: i64) {
+        buf.extend_from_slice(&file_id.to_le_bytes());
+        buf.extend_from_slice(&path_id.to_le_bytes());
+    }
+
+    let mut payload = Vec::new();
+    write_pptr(&mut payload, 0, 1); // m_GameObject
+    payload.push(1); // m_Enabled
+    while payload.len() % 4 != 0 {
+        payload.push(0);
+    }
+    payload.extend_from_slice(&0f32.to_le_bytes()); // m_PixelOffset.x
+    payload.extend_from_slice(&0f32.to_le_bytes()); // m_PixelOffset.y
+    write_aligned_string(&mut payload, m_text);
+    // Minimal tail (anchor / alignment)
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.extend_from_slice(&0i32.to_le_bytes());
+
+    let mut meta = Vec::new();
+    meta.extend_from_slice(b"2019.4.0f1\0");
+    meta.extend_from_slice(&1u32.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    meta.extend_from_slice(&CLASS_ID_GUI_TEXT.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&(-1i16).to_le_bytes());
+    meta.extend_from_slice(&[0u8; 16]);
+    meta.extend_from_slice(&1i32.to_le_bytes());
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    meta.extend_from_slice(&8i64.to_le_bytes()); // path_id
     meta.extend_from_slice(&0u32.to_le_bytes());
     meta.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     meta.extend_from_slice(&0i32.to_le_bytes());

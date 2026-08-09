@@ -239,6 +239,8 @@ The Tauri app talks to the same core/server as the CLI. For a full in-app loop:
     between strings); ids `monobehaviour/<path_id>/<field_index>`.
   - Structural **TextMesh** (class **141**): `m_Text` after `m_GameObject` PPtr; ids
     `textmesh/<path_id>`.
+  - Structural **GUIText** (class **132**): Behaviour base + `m_PixelOffset` then `m_Text`;
+    ids `guitext/<path_id>`.
   - Type-tree **blobs skipped** (object table still reachable); full type-tree field walk /
     object-table rewrite: **not** yet.
   - Inject structural: **same-or-shorter** in place (pad `0x20`); length-prefix u32 left

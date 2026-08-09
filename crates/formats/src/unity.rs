@@ -12,8 +12,8 @@ use crate::unity_serialized::{
 /// Plugin for Unity Engine games.
 /// Supports:
 /// 1. Text-based VN scripts (SCRIPTS~/ directory with .txt dialogue files)
-/// 2. Structural TextAsset + MonoBehaviour + TextMesh extraction from SerializedFile
-///    `.assets` / `level*` (type-tree blobs skipped; no full type-tree walk)
+/// 2. Structural TextAsset + MonoBehaviour + TextMesh + GUIText extraction from
+///    SerializedFile `.assets` / `level*` (type-tree blobs skipped; no full type-tree walk)
 /// 3. Heuristic length-prefixed UTF-8 scan of the same files (skips structural ranges)
 pub struct UnityPlugin;
 
@@ -505,6 +505,56 @@ impl UnityPlugin {
                         }
                     }
                 }
+                // Slice 2: GUIText m_Text (legacy screen text, class 132).
+                for obj in sf.gui_text_objects() {
+                    match sf.read_gui_text(obj.path_id) {
+                        Ok(gt) => {
+                            if gt.text.trim().is_empty() {
+                                continue;
+                            }
+                            if is_binary_looking_script(&gt.text) {
+                                continue;
+                            }
+                            if !seen.insert(gt.text.clone()) {
+                                continue;
+                            }
+                            let id = format!("guitext/{}", gt.path_id);
+                            let mut entry =
+                                StringEntry::new(id, gt.text.clone(), file_path.to_path_buf());
+                            entry.tags = vec!["guitext".to_string()];
+                            entry.context = Some("m_Text".to_string());
+                            entry.metadata.insert(
+                                "extraction_method".to_string(),
+                                serde_json::Value::String("guitext".to_string()),
+                            );
+                            entry.metadata.insert(
+                                "path_id".to_string(),
+                                serde_json::json!(gt.path_id),
+                            );
+                            entry.metadata.insert(
+                                "guitext_text_offset".to_string(),
+                                serde_json::json!(gt.text_len_offset),
+                            );
+                            entry.metadata.insert(
+                                "guitext_text_byte_len".to_string(),
+                                serde_json::json!(gt.text_byte_len),
+                            );
+                            entry.metadata.insert(
+                                "binary_slot".to_string(),
+                                serde_json::Value::String("utf8".to_string()),
+                            );
+                            entries.push(entry);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                file = %filename,
+                                path_id = obj.path_id,
+                                error = %e,
+                                "GUIText read failed; skipped"
+                            );
+                        }
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -687,8 +737,19 @@ fn is_textmesh_entry(entry: &StringEntry) -> bool {
         == Some("textmesh")
 }
 
+fn is_guitext_entry(entry: &StringEntry) -> bool {
+    entry
+        .metadata
+        .get("extraction_method")
+        .and_then(|v| v.as_str())
+        == Some("guitext")
+}
+
 fn is_structural_entry(entry: &StringEntry) -> bool {
-    is_textasset_entry(entry) || is_mono_entry(entry) || is_textmesh_entry(entry)
+    is_textasset_entry(entry)
+        || is_mono_entry(entry)
+        || is_textmesh_entry(entry)
+        || is_guitext_entry(entry)
 }
 
 /// Extract a quoted string from a line like `button 0 "Label" +link jump 5`
@@ -819,7 +880,7 @@ impl FormatPlugin for UnityPlugin {
     }
 
     fn description(&self) -> &str {
-        "Unity Engine (VN scripts + TextAsset/MonoBehaviour/TextMesh structural + SerializedFile heuristic)"
+        "Unity Engine (VN scripts + TextAsset/MonoBehaviour/TextMesh/GUIText structural + SerializedFile heuristic)"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -904,7 +965,7 @@ impl FormatPlugin for UnityPlugin {
             let mut modified = false;
             let label = file_path.display().to_string();
 
-            // ── Structural TextAsset / MonoBehaviour / TextMesh inject (pad in place) ──
+            // ── Structural TextAsset / MonoBehaviour / TextMesh / GUIText inject ──
             for entry in file_entries.iter().filter(|e| is_structural_entry(e)) {
                 let translation = match &entry.translation {
                     Some(t) => t,
@@ -928,6 +989,12 @@ impl FormatPlugin for UnityPlugin {
                         "textmesh_text_offset",
                         "textmesh_text_byte_len",
                         "TextMesh",
+                    )
+                } else if is_guitext_entry(entry) {
+                    (
+                        "guitext_text_offset",
+                        "guitext_text_byte_len",
+                        "GUIText",
                     )
                 } else {
                     (
@@ -1784,6 +1851,75 @@ script Chapter_1_script chapter 1 {
         );
         let sf = SerializedFile::parse_path(&assets).unwrap();
         assert_eq!(sf.text_mesh_objects().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn create_guitext_assets_fixture(dir: &Path) -> PathBuf {
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        let bytes = crate::unity_serialized::write_v17_guitext_fixture("Press Start");
+        let path = data_dir.join("sharedassets0.assets");
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_guitext_extract_structural() {
+        let dir = tempdir();
+        create_guitext_assets_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let gt: Vec<_> = entries
+            .iter()
+            .filter(|e| e.tags.iter().any(|t| t == "guitext"))
+            .collect();
+        assert!(
+            !gt.is_empty(),
+            "expected GUIText entries, got {:?}",
+            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+        );
+        assert!(gt.iter().any(|e| e.id.starts_with("guitext/")));
+        assert!(gt.iter().any(|e| e.source == "Press Start"));
+        assert_eq!(
+            gt[0]
+                .metadata
+                .get("extraction_method")
+                .and_then(|v| v.as_str()),
+            Some("guitext")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_guitext_inject_shorter() {
+        let dir = tempdir();
+        let assets = create_guitext_assets_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for e in &mut entries {
+            if e.tags.iter().any(|t| t == "guitext") && e.source == "Press Start" {
+                e.translation = Some("Pulsa".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(
+            report.strings_written >= 1,
+            "written={} skipped={} {:?}",
+            report.strings_written,
+            report.strings_skipped,
+            report.warnings
+        );
+        let again = plugin.extract(&dir).unwrap();
+        assert!(
+            again
+                .iter()
+                .any(|e| e.tags.iter().any(|t| t == "guitext") && e.source.starts_with("Pulsa")),
+            "re-extract: {:?}",
+            again.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        let sf = SerializedFile::parse_path(&assets).unwrap();
+        assert_eq!(sf.gui_text_objects().count(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
