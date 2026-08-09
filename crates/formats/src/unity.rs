@@ -334,6 +334,94 @@ impl UnityPlugin {
                             if !is_textasset_script_worth_extracting(&ta.script) {
                                 continue;
                             }
+                            // Naninovel ManagedText / locale docs: split Key: Value lines
+                            // so each UI string is a translateable row (inject rebuilds blob).
+                            if let Some(lines) = parse_textasset_loc_lines(&ta.script) {
+                                let newline = if ta.script.contains("\r\n") {
+                                    "\r\n"
+                                } else {
+                                    "\n"
+                                };
+                                for (line_index, loc) in lines.into_iter().enumerate() {
+                                    let id = format!(
+                                        "textasset/{}/line/{}",
+                                        ta.path_id, line_index
+                                    );
+                                    let mut entry = StringEntry::new(
+                                        id,
+                                        loc.value.clone(),
+                                        file_path.to_path_buf(),
+                                    );
+                                    entry.tags = vec![
+                                        "textasset".to_string(),
+                                        "textasset_loc".to_string(),
+                                    ];
+                                    entry.context = Some(match (&ta.name, &loc.key) {
+                                        (n, Some(k)) if !n.is_empty() => {
+                                            format!("m_Name={n} key={k}")
+                                        }
+                                        (n, _) if !n.is_empty() => format!("m_Name={n}"),
+                                        (_, Some(k)) => format!("key={k}"),
+                                        _ => format!("line={line_index}"),
+                                    });
+                                    entry.metadata.insert(
+                                        "extraction_method".to_string(),
+                                        serde_json::Value::String(
+                                            "textasset_loc_line".to_string(),
+                                        ),
+                                    );
+                                    entry.metadata.insert(
+                                        "path_id".to_string(),
+                                        serde_json::json!(ta.path_id),
+                                    );
+                                    entry.metadata.insert(
+                                        "name".to_string(),
+                                        serde_json::Value::String(ta.name.clone()),
+                                    );
+                                    entry.metadata.insert(
+                                        "textasset_script_offset".to_string(),
+                                        serde_json::json!(ta.script_len_offset),
+                                    );
+                                    entry.metadata.insert(
+                                        "textasset_script_byte_len".to_string(),
+                                        serde_json::json!(ta.script_byte_len),
+                                    );
+                                    entry.metadata.insert(
+                                        "line_index".to_string(),
+                                        serde_json::json!(line_index),
+                                    );
+                                    entry.metadata.insert(
+                                        "line_count".to_string(),
+                                        serde_json::json!(loc.line_count),
+                                    );
+                                    entry.metadata.insert(
+                                        "newline".to_string(),
+                                        serde_json::Value::String(newline.to_string()),
+                                    );
+                                    if let Some(k) = &loc.key {
+                                        entry.metadata.insert(
+                                            "loc_key".to_string(),
+                                            serde_json::Value::String(k.clone()),
+                                        );
+                                        entry.metadata.insert(
+                                            "loc_sep".to_string(),
+                                            serde_json::Value::String(loc.sep.clone()),
+                                        );
+                                    }
+                                    // Per-value budget for length-aware translate; inject
+                                    // still pads the whole m_Script blob.
+                                    entry.metadata.insert(
+                                        "binary_slot".to_string(),
+                                        serde_json::Value::String("utf8".to_string()),
+                                    );
+                                    entry.metadata.insert(
+                                        "line_value_byte_len".to_string(),
+                                        serde_json::json!(loc.value.len()),
+                                    );
+                                    entries.push(entry);
+                                }
+                                continue;
+                            }
                             // Keep every structural instance (unique path_id / inject offset).
                             let id = format!("textasset/{}", ta.path_id);
                             let mut entry =
@@ -704,11 +792,141 @@ fn range_overlaps(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
 }
 
 fn is_textasset_entry(entry: &StringEntry) -> bool {
+    matches!(
+        entry
+            .metadata
+            .get("extraction_method")
+            .and_then(|v| v.as_str()),
+        Some("textasset") | Some("textasset_loc_line")
+    )
+}
+
+fn is_textasset_loc_line_entry(entry: &StringEntry) -> bool {
     entry
         .metadata
         .get("extraction_method")
         .and_then(|v| v.as_str())
-        == Some("textasset")
+        == Some("textasset_loc_line")
+}
+
+/// One non-empty line from a ManagedText-style localization document.
+#[derive(Debug, Clone)]
+struct TextAssetLocLine {
+    /// Localization key when the line is `Key: Value` / `Key=Value`; else `None`.
+    key: Option<String>,
+    /// Separator between key and value (`": "` / `":"` / `"="`), empty if whole line.
+    sep: String,
+    /// Translatable text (value or full line).
+    value: String,
+    /// Total non-empty line count in the document (for inject sanity).
+    line_count: usize,
+}
+
+/// Detect Naninovel ManagedText / locale docs: ≥2 non-empty lines and ≥70% look
+/// like `Key: Value` (or `Key=Value` without spaces in the key).
+fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
+    let raw_lines: Vec<&str> = script.lines().collect();
+    let non_empty: Vec<&str> = raw_lines
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if non_empty.len() < 2 {
+        return None;
+    }
+    let kv_hits = non_empty.iter().filter(|l| split_loc_kv(l).is_some()).count();
+    if kv_hits * 100 / non_empty.len() < 70 {
+        return None;
+    }
+    let line_count = non_empty.len();
+    let mut out = Vec::with_capacity(line_count);
+    for line in non_empty {
+        if let Some((key, sep, value)) = split_loc_kv(line) {
+            // Skip empty values and pure key-only noise.
+            if value.trim().is_empty() {
+                continue;
+            }
+            out.push(TextAssetLocLine {
+                key: Some(key.to_string()),
+                sep: sep.to_string(),
+                value: value.to_string(),
+                line_count,
+            });
+        } else {
+            // Rare non-kv line in a loc doc — keep whole line for round-trip.
+            out.push(TextAssetLocLine {
+                key: None,
+                sep: String::new(),
+                value: line.to_string(),
+                line_count,
+            });
+        }
+    }
+    if out.len() < 2 {
+        return None;
+    }
+    Some(out)
+}
+
+/// `Key: Value` (prefer `: `), bare `:`, or `Key=Value` with no spaces in key.
+fn split_loc_kv(line: &str) -> Option<(&str, &str, &str)> {
+    let line = line.trim_end_matches('\r');
+    if let Some((k, v)) = line.split_once(": ") {
+        let k = k.trim();
+        if !k.is_empty() && !k.contains('\t') {
+            return Some((k, ": ", v));
+        }
+    }
+    if let Some((k, v)) = line.split_once('=') {
+        let k = k.trim();
+        if !k.is_empty() && !k.contains(' ') && !k.contains('\t') {
+            return Some((k, "=", v));
+        }
+    }
+    if let Some((k, v)) = line.split_once(':') {
+        let k = k.trim();
+        // Avoid matching times / ratios; require key-like token (alnum / . / _).
+        if !k.is_empty()
+            && !k.contains(' ')
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        {
+            return Some((k, ":", v.trim_start()));
+        }
+    }
+    None
+}
+
+/// Rebuild a loc document from line entries (sorted by `line_index`).
+fn rebuild_textasset_loc_script(lines: &[&StringEntry]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    let mut ordered: Vec<&StringEntry> = lines.to_vec();
+    ordered.sort_by_key(|e| {
+        e.metadata
+            .get("line_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    });
+    let newline = ordered[0]
+        .metadata
+        .get("newline")
+        .and_then(|v| v.as_str())
+        .unwrap_or("\n");
+    let mut parts: Vec<String> = Vec::with_capacity(ordered.len());
+    for e in ordered {
+        let text = e.translation.as_deref().unwrap_or(e.source.as_str());
+        let line = match (
+            e.metadata.get("loc_key").and_then(|v| v.as_str()),
+            e.metadata.get("loc_sep").and_then(|v| v.as_str()),
+        ) {
+            (Some(k), Some(sep)) => format!("{k}{sep}{text}"),
+            _ => text.to_string(),
+        };
+        parts.push(line);
+    }
+    Some(parts.join(newline))
 }
 
 fn is_mono_entry(entry: &StringEntry) -> bool {
@@ -1056,8 +1274,105 @@ impl FormatPlugin for UnityPlugin {
             let mut modified = false;
             let label = file_path.display().to_string();
 
+            // ── TextAsset loc-line groups (rebuild whole m_Script once per path_id) ──
+            {
+                let mut loc_groups: HashMap<i64, Vec<&StringEntry>> = HashMap::new();
+                for entry in file_entries.iter().filter(|e| is_textasset_loc_line_entry(e)) {
+                    let Some(path_id) = entry
+                        .metadata
+                        .get("path_id")
+                        .and_then(|v| v.as_i64())
+                    else {
+                        warnings.push(format!(
+                            "TextAsset loc line '{}' missing path_id",
+                            entry.id
+                        ));
+                        strings_skipped += 1;
+                        continue;
+                    };
+                    loc_groups.entry(path_id).or_default().push(*entry);
+                }
+                for (_path_id, group) in loc_groups {
+                    let Some(head) = group.first() else { continue };
+                    let Some(script_off) = head
+                        .metadata
+                        .get("textasset_script_offset")
+                        .and_then(|v| v.as_u64())
+                        .map(|u| u as usize)
+                    else {
+                        warnings.push(format!(
+                            "TextAsset loc group missing textasset_script_offset ({})",
+                            head.id
+                        ));
+                        strings_skipped += group.len();
+                        continue;
+                    };
+                    let orig_len = head
+                        .metadata
+                        .get("textasset_script_byte_len")
+                        .and_then(|v| v.as_u64())
+                        .map(|u| u as usize)
+                        .unwrap_or(0);
+                    if orig_len == 0 {
+                        strings_skipped += group.len();
+                        continue;
+                    }
+                    let Some(mut rebuilt) = rebuild_textasset_loc_script(&group) else {
+                        strings_skipped += group.len();
+                        continue;
+                    };
+                    // Preserve original trailing newline style if present in budget.
+                    if rebuilt.len() > orig_len {
+                        if length_skipped < 5 {
+                            warnings.push(format!(
+                                "TextAsset loc rebuild longer than slot ({} > {} bytes) for '{}', skipping group",
+                                rebuilt.len(),
+                                orig_len,
+                                head.id
+                            ));
+                        }
+                        length_skipped += 1;
+                        strings_skipped += group.len();
+                        continue;
+                    }
+                    // Pad with spaces to keep m_Script byte length identical.
+                    while rebuilt.len() < orig_len {
+                        rebuilt.push(' ');
+                    }
+                    match rewrite_text_asset_script_inplace(
+                        &mut bytes,
+                        script_off,
+                        orig_len,
+                        &rebuilt,
+                        &label,
+                    ) {
+                        Ok(()) => {
+                            let changed = group
+                                .iter()
+                                .filter(|e| {
+                                    e.translation
+                                        .as_ref()
+                                        .map(|t| t != &e.source)
+                                        .unwrap_or(false)
+                                })
+                                .count();
+                            strings_written += changed.max(1);
+                            strings_skipped += group.len().saturating_sub(changed.max(1));
+                            modified = true;
+                        }
+                        Err(e) => {
+                            warnings.push(format!("TextAsset loc rewrite {}: {e}", head.id));
+                            strings_skipped += group.len();
+                        }
+                    }
+                }
+            }
+
             // ── Structural TextAsset / MonoBehaviour / TextMesh / GUIText inject ──
-            for entry in file_entries.iter().filter(|e| is_structural_entry(e)) {
+            for entry in file_entries
+                .iter()
+                .filter(|e| is_structural_entry(e) && !is_textasset_loc_line_entry(e))
+            {
                 let translation = match &entry.translation {
                     Some(t) => t,
                     None => {
@@ -1852,6 +2167,100 @@ script Chapter_1_script chapter 1 {
             Some("textasset")
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_textasset_loc_lines_key_value() {
+        let doc = "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS\r\nConfirmation.Yes: YES\r\n";
+        let lines = parse_textasset_loc_lines(doc).expect("loc doc");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].key.as_deref(), Some("TitleMenu.START"));
+        assert_eq!(lines[0].value, "NEW GAME");
+        assert_eq!(lines[1].value, "CREDITS");
+        // Single line / non-kv prose: no split
+        assert!(parse_textasset_loc_lines("Hello traveler, welcome!").is_none());
+        assert!(parse_textasset_loc_lines("OnlyOne: Line").is_none());
+    }
+
+    #[test]
+    fn test_textasset_loc_line_extract_and_inject() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        // Pad script so inject can expand short values within total budget.
+        let script = "\
+TitleMenu.START: NEW GAME\r\n\
+TitleMenu.CREDITS: CREDITS\r\n\
+Confirmation.Yes: YES\r\n\
+// spare padding for longer ES forms          ";
+        let bytes = crate::unity_serialized::write_v17_fixture("ManagedText", script);
+        let assets = data_dir.join("sharedassets0.assets");
+        fs::write(&assets, &bytes).unwrap();
+
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        let loc: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                e.metadata
+                    .get("extraction_method")
+                    .and_then(|v| v.as_str())
+                    == Some("textasset_loc_line")
+            })
+            .collect();
+        assert!(
+            loc.len() >= 3,
+            "expected loc lines, got {:?}",
+            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+        );
+        assert!(loc.iter().any(|e| e.source == "NEW GAME"));
+        assert!(loc.iter().any(|e| e.source == "CREDITS"));
+        assert!(loc.iter().any(|e| {
+            e.metadata
+                .get("loc_key")
+                .and_then(|v| v.as_str())
+                == Some("TitleMenu.START")
+        }));
+
+        for e in &mut entries {
+            if e.source == "NEW GAME" {
+                e.translation = Some("NUEVA".into());
+            }
+            if e.source == "YES" {
+                e.translation = Some("SI".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(
+            report.strings_written >= 1,
+            "written={} {:?}",
+            report.strings_written,
+            report.warnings
+        );
+        let again = plugin.extract(&dir).unwrap();
+        let values: Vec<&str> = again
+            .iter()
+            .filter(|e| {
+                e.metadata
+                    .get("extraction_method")
+                    .and_then(|v| v.as_str())
+                    == Some("textasset_loc_line")
+            })
+            .map(|e| e.source.as_str())
+            .collect();
+        assert!(
+            values.iter().any(|v| *v == "NUEVA"),
+            "re-extract values: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| *v == "SI"),
+            "re-extract values: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| *v == "CREDITS"),
+            "untouched line kept: {values:?}"
+        );
     }
 
     #[test]
