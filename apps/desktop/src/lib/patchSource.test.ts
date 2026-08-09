@@ -12,12 +12,14 @@ import {
 assert.equal(isHttpPatchUrl(""), false);
 assert.equal(isHttpPatchUrl("ftp://x/a.zip"), false);
 assert.equal(isHttpPatchUrl("https://"), false);
-assert.equal(isHttpPatchUrl("https:///no-host"), false);
+assert.equal(isHttpPatchUrl("http://"), false);
 assert.equal(isHttpPatchUrl("not a url"), false);
 assert.equal(isHttpPatchUrl("https://ex.com/p.zip"), true);
 assert.equal(isHttpPatchUrl("HTTP://ex.com/p.zip"), true);
 assert.equal(isHttpPatchUrl("  https://ex.com/p.zip  "), true);
 assert.equal(isHttpPatchUrl("https://ex.com/p.zip?sig=1"), true);
+// WHATWG: "https:///name" treats "name" as the host — accepted if host present.
+assert.equal(isHttpPatchUrl("https:///cdn.example/p.zip"), true);
 
 assert.equal(patchUrlLooksLikeZip("https://ex.com/p.zip"), true);
 assert.equal(patchUrlLooksLikeZip("https://ex.com/p.ZIP?token=1"), true);
