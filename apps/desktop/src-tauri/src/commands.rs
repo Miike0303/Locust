@@ -579,6 +579,35 @@ pub async fn run_inject(
     serde_json::to_value(report).map_err(|e| e.to_string())
 }
 
+#[derive(Deserialize)]
+pub struct RegisterLangParams {
+    pub game_path: String,
+    pub lang: String,
+    pub label: String,
+}
+
+/// Register a language in RM MZ multi-lang UI (Iavra / VisuMZ / Map choices).
+/// Same as CLI `locust register-lang`. Mutates game files; writes `*.bak-locust`.
+#[tauri::command]
+pub async fn register_lang(params: RegisterLangParams) -> Result<serde_json::Value, String> {
+    let game_path = PathBuf::from(params.game_path.trim());
+    if params.game_path.trim().is_empty() || !game_path.is_dir() {
+        return Err(format!(
+            "game_path must be an existing directory (got {:?})",
+            params.game_path
+        ));
+    }
+    let lang = params.lang;
+    let label = params.label;
+    let report = tokio::task::spawn_blocking(move || {
+        locust_formats::rpgmaker_lang::register_language(&game_path, &lang, &label)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    serde_json::to_value(report).map_err(|e| e.to_string())
+}
+
 // ─── Config ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]

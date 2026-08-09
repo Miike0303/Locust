@@ -1,6 +1,13 @@
 import { useState } from "react";
 import { X, FolderOpen, FileCheck, AlertCircle, Package } from "lucide-react";
-import { inject, validate, type OutputMode, type MultiLangReport } from "../lib/api";
+import {
+  inject,
+  registerLang,
+  validate,
+  type OutputMode,
+  type MultiLangReport,
+  type RegisterLangReport,
+} from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -50,6 +57,10 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
   const [outputDir, setOutputDir] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<MultiLangReport | null>(null);
+  const [regLoading, setRegLoading] = useState(false);
+  const [regReports, setRegReports] = useState<
+    { lang: string; label: string; report: RegisterLangReport }[]
+  >([]);
 
   const toggleLang = (code: string) => {
     setSelectedLangs((prev) =>
@@ -162,6 +173,49 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
 
   const gameName = project.path.split(/[\\/]/).filter(Boolean).pop() ?? project.name;
   const isDirectResult = result?.mode === "direct";
+  const isRpgMaker =
+    project.format_id === "rpgmaker-mv" ||
+    project.format_id === "rpgmaker-mz" ||
+    project.format_id.startsWith("rpgmaker");
+
+  const handleRegisterLang = async () => {
+    if (selectedLangs.length === 0) {
+      addToast("error", "Select at least one language to register");
+      return;
+    }
+    setRegLoading(true);
+    setRegReports([]);
+    const done: { lang: string; label: string; report: RegisterLangReport }[] = [];
+    try {
+      for (const code of selectedLangs) {
+        const label = LANGUAGES.find((l) => l.code === code)?.name ?? code;
+        const report = await registerLang({
+          game_path: project.path,
+          lang: code,
+          label,
+        });
+        done.push({ lang: code, label, report });
+        addLog(
+          "info",
+          `register-lang ${code} (${label})`,
+          `plugins_js=${report.plugins_js} iavra=${report.iavra_languages} visumz=${report.visumz_options} maps=${report.maps_patched?.length ?? 0}` +
+            (report.notes?.length ? `\n${report.notes.join("\n")}` : ""),
+          "inject"
+        );
+      }
+      setRegReports(done);
+      addToast(
+        "success",
+        `Registered ${done.length} language(s) in game UI (backups *.bak-locust)`
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog("error", "register-lang failed", msg, "inject");
+      addToast("error", `register-lang failed: ${msg}`);
+    } finally {
+      setRegLoading(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -302,6 +356,37 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                   ? "Direct inject & record"
                   : "Inject Translations"}
             </button>
+
+            {isRpgMaker && (
+              <div className="pt-1 border-t dark:border-gray-700 space-y-2">
+                <p className="text-xs text-gray-500">
+                  Multi-lang RM only: register selected language(s) in the in-game language menu
+                  without injecting strings (CLI{" "}
+                  <code className="px-0.5 bg-gray-100 dark:bg-gray-800 rounded">register-lang</code>
+                  ).
+                </p>
+                <button
+                  type="button"
+                  onClick={handleRegisterLang}
+                  disabled={regLoading || selectedLangs.length === 0}
+                  className="w-full py-1.5 text-sm border border-violet-300 dark:border-violet-700 text-violet-800 dark:text-violet-200 hover:bg-violet-50 dark:hover:bg-violet-950/40 disabled:opacity-50 rounded font-medium"
+                >
+                  {regLoading
+                    ? "Registering…"
+                    : `Register ${selectedLangs.join(", ") || "lang"} in game UI only`}
+                </button>
+                {regReports.length > 0 && (
+                  <div className="text-xs text-violet-700 dark:text-violet-300 space-y-0.5">
+                    {regReports.map(({ lang, label, report }) => (
+                      <p key={lang}>
+                        {lang} ({label}): plugins={report.plugins_js ? "yes" : "no"}, maps=
+                        {report.maps_patched?.length ?? 0}
+                      </p>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         ) : (
           <div className="space-y-4">
@@ -374,6 +459,47 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                     {lang}: {err}
                   </p>
                 ))}
+              </div>
+            )}
+
+            {isRpgMaker && (
+              <div className="p-3 bg-violet-50 dark:bg-violet-950/30 border border-violet-200 dark:border-violet-800 rounded text-sm space-y-2">
+                <p className="font-medium text-violet-900 dark:text-violet-100">
+                  Register language in game UI
+                </p>
+                <p className="text-xs text-violet-800 dark:text-violet-200">
+                  For multi-lang Iavra / VisuMZ titles: add selected language(s) to plugins.js and
+                  Map boot choices (same as{" "}
+                  <code className="px-0.5 bg-violet-100/80 dark:bg-violet-900/40 rounded">
+                    locust register-lang
+                  </code>
+                  ). Writes <code className="px-0.5">*.bak-locust</code> backups.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleRegisterLang}
+                  disabled={regLoading || selectedLangs.length === 0}
+                  className="w-full py-1.5 text-sm bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded font-medium"
+                >
+                  {regLoading
+                    ? "Registering…"
+                    : `Register ${selectedLangs.join(", ") || "lang"} in UI`}
+                </button>
+                {regReports.length > 0 && (
+                  <div className="text-xs text-violet-700 dark:text-violet-300 space-y-1">
+                    {regReports.map(({ lang, label, report }) => (
+                      <p key={lang}>
+                        {lang} ({label}): plugins=
+                        {report.plugins_js ? "yes" : "no"}, maps=
+                        {report.maps_patched?.length ?? 0}, backups=
+                        {report.backups?.length ?? 0}
+                        {report.notes?.length
+                          ? ` — ${report.notes.slice(0, 2).join("; ")}`
+                          : ""}
+                      </p>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 

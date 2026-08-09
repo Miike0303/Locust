@@ -171,6 +171,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/translate/cancel/:job_id", post(translate_cancel))
         .route("/api/translate/ws/:job_id", get(translate_ws))
         .route("/api/inject", post(inject))
+        .route("/api/register-lang", post(register_lang))
         .route("/api/patch/verify", post(patch_verify))
         .route("/api/patch/apply", post(patch_apply))
         .route("/api/patch/rollback", post(patch_rollback))
@@ -809,6 +810,52 @@ async fn inject(
     )
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+}
+
+// ─── Register language (RPG Maker multi-lang UI) ───────────────────────────
+
+#[derive(Deserialize)]
+struct RegisterLangRequest {
+    /// Game root (folder with `js/plugins.js` and/or `data/`).
+    game_path: String,
+    /// Language code (e.g. `es`).
+    lang: String,
+    /// Display label (e.g. `Español`).
+    label: String,
+}
+
+/// Patch Iavra/VisuMZ language lists + Map boot choices so a new lang is
+/// selectable in the game UI. Writes `*.bak-locust` siblings (same as CLI).
+async fn register_lang(
+    Json(req): Json<RegisterLangRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let game_path = PathBuf::from(req.game_path.trim());
+    if req.game_path.trim().is_empty() || !game_path.is_dir() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "game_path must be an existing directory (got {:?})",
+                req.game_path
+            ),
+        ));
+    }
+    let lang = req.lang;
+    let label = req.label;
+    let report = tokio::task::spawn_blocking(move || {
+        locust_formats::rpgmaker_lang::register_language(&game_path, &lang, &label)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(|e| {
+        // Invalid lang/label is a client error; other failures stay 500.
+        let msg = e.to_string();
+        if msg.contains("invalid language") || msg.contains("label must not be empty") {
+            err(StatusCode::BAD_REQUEST, msg)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, msg)
+        }
+    })?;
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 

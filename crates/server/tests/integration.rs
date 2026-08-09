@@ -877,3 +877,74 @@ async fn test_backup_restore() {
     assert_ne!(restored, "CORRUPTED");
     assert!(restored.contains("Hero"), "original content should be restored");
 }
+
+
+// ─── Register language (RM multi-lang UI) ───────────────────────────────────
+
+#[tokio::test]
+async fn test_register_lang_endpoint_patches_plugins() {
+    let tmpdir = TempDir::new().unwrap();
+    let root = tmpdir.path();
+    std::fs::create_dir_all(root.join("js")).unwrap();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::write(root.join("js").join("rmmz_core.js"), "// mz").unwrap();
+    std::fs::write(
+        root.join("js").join("plugins.js"),
+        r#"var $plugins = [{"name":"Iavra_MZ_Localization_byNeomaStudio","status":true,"parameters":{"Languages":"jp, en, zh","Language Labels":"en:English, jp:日本語, zh:中文"}}];
+const langs = ['jp', 'en', 'zh'];
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("data").join("System.json"),
+        r#"{"gameTitle":"T","terms":{"basic":[],"commands":[],"params":[],"messages":{}}}"#,
+    )
+    .unwrap();
+
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+
+    let resp = client()
+        .post(format!("{}/api/register-lang", base_url))
+        .json(&serde_json::json!({
+            "game_path": root.to_string_lossy(),
+            "lang": "es",
+            "label": "Español"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "body: {body}");
+    assert!(
+        body.get("plugins_js").and_then(|v| v.as_bool()).unwrap_or(false)
+            || body.get("iavra_languages").and_then(|v| v.as_bool()).unwrap_or(false),
+        "expected plugins patch: {body}"
+    );
+
+    let plugins = std::fs::read_to_string(root.join("js").join("plugins.js")).unwrap();
+    assert!(plugins.contains("es"), "{plugins}");
+    assert!(plugins.contains("Español") || plugins.contains("'es'"), "{plugins}");
+    assert!(root.join("js").join("plugins.js.bak-locust").is_file());
+}
+
+#[tokio::test]
+async fn test_register_lang_rejects_bad_lang() {
+    let tmpdir = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmpdir.path()).unwrap();
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let resp = client()
+        .post(format!("{}/api/register-lang", base_url))
+        .json(&serde_json::json!({
+            "game_path": tmpdir.path().to_string_lossy(),
+            "lang": "bad lang!",
+            "label": "X"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+

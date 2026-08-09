@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 
 use locust_core::error::{LocustError, Result};
 use locust_core::encoding::EncodingDetector;
+use serde::Serialize;
 
 use crate::rpgmaker_mv::RpgMakerMvPlugin;
 
 /// Report of what `register_language` changed on disk.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RegisterLanguageReport {
     pub plugins_js: bool,
     pub iavra_languages: bool,

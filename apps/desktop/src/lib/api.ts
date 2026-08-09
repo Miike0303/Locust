@@ -323,6 +323,27 @@ export const inject = (params: InjectParams): Promise<MultiLangReport> =>
     ? invoke("run_inject", { params })
     : request("/inject", { method: "POST", body: JSON.stringify(params) });
 
+/** Register a language in RM multi-lang UI (Iavra / VisuMZ / Map choices). */
+export interface RegisterLangParams {
+  game_path: string;
+  lang: string;
+  label: string;
+}
+
+export interface RegisterLangReport {
+  plugins_js: boolean;
+  iavra_languages: boolean;
+  visumz_options: boolean;
+  maps_patched: string[];
+  backups: string[];
+  notes: string[];
+}
+
+export const registerLang = (params: RegisterLangParams): Promise<RegisterLangReport> =>
+  IS_TAURI
+    ? invoke("register_lang", { params })
+    : request("/register-lang", { method: "POST", body: JSON.stringify(params) });
+
 export const validate = (): Promise<ValidationResponse> =>
   IS_TAURI
     ? invoke("run_validation")

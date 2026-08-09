@@ -53,5 +53,5 @@ locust providers                    # List translation providers
 - Unity TextAsset/mono rewrite edge: length-prefix u32 **left byte-identical** on inject (was always re-encoded LE — breaks big-endian SerializedFiles); payload still space-padded. Unit: BE synthetic + UTF-8 multi-byte pad
 - Unreal multi-GB base pak E2E: done (Last Hope); optional more titles
 - RM MZ POR `.jsono` + Iavra multi-pack extract: done (prefer `en`); inject Replace re-encodes `.jsono`; inject Add writes `lang_*_{lang}.jsono` packs
-- RM MZ UI language registration: `locust register-lang <game> -l es --label Español` (Iavra + VisuMZ langs arrays + Map boot choices; `*.bak-locust`)
+- RM MZ UI language registration: `locust register-lang <game> -l es --label Español` (Iavra + VisuMZ langs arrays + Map boot choices; `*.bak-locust`); **desktop/server**: `POST /api/register-lang` + Tauri `register_lang` + Inject modal “Register … in game UI” for rpgmaker-* formats
 - Apply patch from URL: `locust apply <game> --url https://…/patch.zip` + desktop/server `zip_url`

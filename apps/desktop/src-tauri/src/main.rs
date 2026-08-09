@@ -63,6 +63,7 @@ fn main() {
             commands::export_translations,
             commands::import_translations,
             commands::run_inject,
+            commands::register_lang,
             commands::get_config,
             commands::save_config,
             commands::get_backups,
