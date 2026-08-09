@@ -109,8 +109,25 @@ impl BackupManager {
         })
     }
 
+    /// Reject anything that is not a bare directory name.
+    ///
+    /// Ids reach here from untrusted input — `POST /api/backups/:id/restore`
+    /// and its delete sibling — and are joined onto the backup root, so a
+    /// traversal would let a caller restore from, or delete, any directory.
+    fn resolve_backup_dir(&self, backup_id: &str) -> Result<PathBuf> {
+        let mut components = Path::new(backup_id).components();
+        let single_plain_name = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+        if !single_plain_name {
+            return Err(LocustError::BackupError(format!(
+                "invalid backup id: {backup_id}"
+            )));
+        }
+        Ok(self.backup_root.join(backup_id))
+    }
+
     pub fn restore(&self, backup_id: &str, target_path: &Path) -> Result<()> {
-        let backup_dir = self.backup_root.join(backup_id);
+        let backup_dir = self.resolve_backup_dir(backup_id)?;
         if !backup_dir.exists() {
             return Err(LocustError::BackupError(format!(
                 "backup not found: {}",
@@ -181,7 +198,7 @@ impl BackupManager {
     }
 
     pub fn delete_backup(&self, backup_id: &str) -> Result<()> {
-        let backup_dir = self.backup_root.join(backup_id);
+        let backup_dir = self.resolve_backup_dir(backup_id)?;
         if backup_dir.exists() {
             std::fs::remove_dir_all(&backup_dir)?;
         }
@@ -259,6 +276,54 @@ mod tests {
         let list = mgr.list_backups().unwrap();
         assert_eq!(list.len(), 2);
         assert!(list[0].created_at >= list[1].created_at);
+    }
+
+    #[test]
+    fn test_backup_id_traversal_is_rejected() {
+        // Ids arrive from HTTP (`POST /api/backups/:id/restore` and delete),
+        // so a traversal must not reach outside the backup root — delete in
+        // particular would remove the directory tree it lands on.
+        let backup_root = tempdir();
+        let outsider = backup_root.parent().unwrap().join(format!(
+            "locust_outsider_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&outsider).unwrap();
+        fs::write(outsider.join("keep.txt"), "important").unwrap();
+
+        let mgr = BackupManager::new(backup_root);
+        let escape = format!("../{}", outsider.file_name().unwrap().to_string_lossy());
+        let restore_target = tempdir();
+
+        for bad in [
+            escape.as_str(),
+            "..",
+            ".",
+            "",
+            "sub/dir",
+            "sub\\dir",
+            "/etc",
+        ] {
+            assert!(
+                mgr.restore(bad, &restore_target).is_err(),
+                "restore accepted {bad:?}"
+            );
+            assert!(
+                mgr.delete_backup(bad).is_err(),
+                "delete accepted {bad:?}"
+            );
+        }
+
+        assert!(
+            outsider.join("keep.txt").exists(),
+            "traversal deleted a directory outside the backup root"
+        );
+
+        // A real id still works.
+        let game_dir = create_game_dir();
+        let entry = mgr.create_backup(&game_dir).unwrap();
+        mgr.restore(&entry.id, &restore_target).unwrap();
+        mgr.delete_backup(&entry.id).unwrap();
     }
 
     #[test]
