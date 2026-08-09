@@ -883,11 +883,69 @@ fn is_mono_engine_noise(t: &str) -> bool {
     if matches!(t, "Naninovel" | "Default") {
         return true;
     }
+    // Naninovel / script control-flow commands (never player-facing copy).
+    // Keep UI verbs: Play, Wait, Stop, Skip, Save, Load, Config, …
+    if matches!(t, "Gosub" | "Goto" | "Else") {
+        return true;
+    }
+    // Live2D / face blend-shape parameter labels (BOXMAN).
+    if looks_like_face_or_blend_param(t) {
+        return true;
+    }
+    // Pure template / variable tokens: `{g_saveslot}`.
+    if t.starts_with('{') && t.ends_with('}') && t.len() >= 3 && !t[1..t.len() - 1].contains(' ')
+    {
+        return true;
+    }
     // Mixer / resource path fragments without sentence whitespace: `Master/HFX`.
     if !t.contains(' ') && t.contains('/') {
         return true;
     }
     false
+}
+
+/// Live2D / facial rig parameter names: `EyeR Open`, `Eyeball Y`, `Mouth Form`,
+/// bare `Brows` / `Breath`. Not player-facing dialogue.
+fn looks_like_face_or_blend_param(t: &str) -> bool {
+    let t = t.trim();
+    if matches!(
+        t,
+        "Brows" | "Breath" | "Splat" | "Crop" | "Mouth" | "Jaw" | "Cheek"
+    ) {
+        return true;
+    }
+    let mut parts = t.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    // EyeL / EyeR / Eyeball / BrowL / BrowR / Mouth / Jaw + short axis/shape token.
+    let face_head = matches!(
+        first,
+        "EyeL"
+            | "EyeR"
+            | "Eyeball"
+            | "BrowL"
+            | "BrowR"
+            | "Brow"
+            | "Brows"
+            | "Mouth"
+            | "Jaw"
+            | "Cheek"
+    );
+    if !face_head {
+        return false;
+    }
+    // Single token already handled above for bare names; multi-token: ≤2 short tails.
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        return true;
+    }
+    rest.len() <= 2
+        && rest.iter().all(|p| {
+            p.len() <= 8
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
 }
 
 /// `Foo.Bar` / `A.B.C` type or namespace tokens (no spaces).
@@ -1768,6 +1826,70 @@ mod tests {
             texts.iter().any(|t| t.contains("replacement")),
             "keep dialogue: {texts:?}"
         );
+    }
+
+    #[test]
+    fn mono_script_filter_drops_script_cmds_and_face_params() {
+        let bytes = write_v17_mono_fixture(
+            "Actor",
+            &[
+                "Gosub",
+                "Goto",
+                "Else",
+                "EyeR Open",
+                "EyeL Open",
+                "Eyeball Y",
+                "Eyeball X",
+                "Mouth Form",
+                "Mouth Open",
+                "BrowL Y",
+                "Brows",
+                "Breath",
+                "{g_saveslot}",
+                "Play",
+                "Wait",
+                "Option A",
+                "Emily",
+                "Q.LOAD",
+                "Message speed:",
+            ],
+        );
+        let sf = SerializedFile::parse(bytes, "face.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        for drop in [
+            "Gosub",
+            "Goto",
+            "Else",
+            "EyeR Open",
+            "EyeL Open",
+            "Eyeball Y",
+            "Eyeball X",
+            "Mouth Form",
+            "Mouth Open",
+            "BrowL Y",
+            "Brows",
+            "Breath",
+            "{g_saveslot}",
+        ] {
+            assert!(
+                !texts.iter().any(|t| *t == drop),
+                "expected drop {drop}: {texts:?}"
+            );
+        }
+        for keep in [
+            "Play",
+            "Wait",
+            "Option A",
+            "Emily",
+            "Q.LOAD",
+            "Message speed:",
+        ] {
+            assert!(
+                texts.iter().any(|t| *t == keep),
+                "expected keep {keep}: {texts:?}"
+            );
+        }
     }
 
     /// `List<string>` / `string[]`: i32 count + N aligned strings after m_Name.

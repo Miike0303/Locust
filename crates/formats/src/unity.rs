@@ -859,6 +859,18 @@ fn is_unity_translatable(text: &str) -> bool {
     if s.contains("Shaders/") || s.starts_with("Hidden/") || s.starts_with("Legacy Shaders/") {
         return false;
     }
+    // Shader / UI material path leftovers: `UI/Default Font`, `UI/Lit/…`
+    if s.starts_with("UI/") {
+        return false;
+    }
+    // Animator layer default name (not player-facing).
+    if s == "Base Layer" {
+        return false;
+    }
+    // Shader #define soup: `BLENDMODES_MODE_MULTIPLY ETC1_EXTERNAL_ALPHA`
+    if s.contains("BLENDMODES_") || s.contains("ETC1_EXTERNAL_ALPHA") {
+        return false;
+    }
     if s.contains('\\') && s.contains('.') {
         return false;
     }
@@ -1721,6 +1733,11 @@ script Chapter_1_script chapter 1 {
         // Shader path leftovers outside Shader object ranges
         assert!(!is_unity_translatable("Legacy Shaders/Reflective/Diffuse"));
         assert!(!is_unity_translatable("Hidden/Internal-GUITexture"));
+        assert!(!is_unity_translatable("UI/Default Font"));
+        assert!(!is_unity_translatable("Base Layer"));
+        assert!(!is_unity_translatable(
+            "BLENDMODES_MODE_MULTIPLY ETC1_EXTERNAL_ALPHA"
+        ));
     }
 
     /// MonoScript bodies must not leak type names into heuristic extract.
