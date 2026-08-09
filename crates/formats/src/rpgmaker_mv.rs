@@ -197,7 +197,7 @@ impl RpgMakerMvPlugin {
         rd.filter_map(|e| e.ok()).any(|e| {
             e.file_name()
                 .to_str()
-                .is_some_and(|s| Self::is_iavra_lang_pack_name(s))
+                .is_some_and(Self::is_iavra_lang_pack_name)
         })
     }
 
