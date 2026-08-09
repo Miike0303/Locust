@@ -29,7 +29,7 @@
 //! Out of scope: CxDec / Hxv4 encrypted XP3, `.tjs`/compiled `.scn`,
 //! rewriting base `.xp3` archives (patch.xp3 only).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use locust_core::error::{LocustError, Result};
@@ -620,6 +620,85 @@ fn split_xp3_virtual_path(path: &Path) -> Option<(String, String)> {
     Some((archive, inner))
 }
 
+/// Normalize a script identity for multi-source dedupe (Taimanin / Ochiru-style trees).
+///
+/// - `data.xp3/scenario/newgame03.ks` → `newgame03.ks`
+/// - `patch2.xp3/newgame03.ks` → `newgame03.ks`
+/// - `unencrypted/newgame03.ks` → `newgame03.ks`
+/// - `data.xp3/scenario/select/movie.ks` → `select/movie.ks`
+fn normalize_script_key(rel_or_virtual: &str) -> String {
+    let mut s = rel_or_virtual.replace('\\', "/").to_ascii_lowercase();
+    if let Some(idx) = s.find(".xp3/") {
+        s = s[idx + 5..].to_string();
+    }
+    for prefix in [
+        "unencrypted/",
+        "vntranslationtools/",
+        "output/",
+        "scenario/",
+        "data/scenario/",
+        "data/",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.to_string();
+        }
+    }
+    s
+}
+
+/// Higher rank wins when the same script key appears in multiple places.
+/// Prefer higher-numbered `patchN.xp3`, then other XP3, then loose (not tool dumps).
+fn script_source_rank(rel_or_virtual: &str) -> i32 {
+    let s = rel_or_virtual.replace('\\', "/").to_ascii_lowercase();
+    if let Some(idx) = s.find(".xp3/") {
+        // `patch2.xp3/foo` → arch_file `patch2.xp3`
+        let arch_file = &s[..=idx + 3];
+        let stem = arch_file.trim_end_matches(".xp3");
+        if stem == "patch" || stem.starts_with("patch") {
+            let n = stem.trim_start_matches("patch");
+            let num: i32 = if n.is_empty() {
+                1
+            } else {
+                n.parse().unwrap_or(1)
+            };
+            return 1000 + num;
+        }
+        return 100;
+    }
+    // Loose tool dumps are lowest priority (often full copies of scenario/).
+    if s.contains("/unencrypted/")
+        || s.starts_with("unencrypted/")
+        || s.contains("vntranslationtools")
+        || s.contains("/output/")
+        || s.starts_with("output/")
+    {
+        return 1;
+    }
+    10
+}
+
+/// Winning relative/virtual paths after per-key rank selection.
+fn select_best_script_rels(candidates: &[String]) -> std::collections::HashSet<String> {
+    let mut best: BTreeMap<String, (i32, String)> = BTreeMap::new();
+    for rel in candidates {
+        let key = normalize_script_key(rel);
+        if key.is_empty() {
+            continue;
+        }
+        let rank = script_source_rank(rel);
+        match best.get(&key) {
+            None => {
+                best.insert(key, (rank, rel.clone()));
+            }
+            Some((prev_rank, _)) if rank > *prev_rank => {
+                best.insert(key, (rank, rel.clone()));
+            }
+            _ => {}
+        }
+    }
+    best.into_values().map(|(_, rel)| rel).collect()
+}
+
 // ─── Plugin ────────────────────────────────────────────────────────────────
 
 impl FormatPlugin for KirikiriPlugin {
@@ -663,35 +742,32 @@ impl FormatPlugin for KirikiriPlugin {
             ));
         }
 
-        let mut all = Vec::new();
-
-        // Loose .ks
+        // Collect candidate script identities first, then keep the best source per
+        // normalized key (patchN.xp3 > data.xp3 > loose; unencrypted tool dumps lose).
+        let mut loose_cands: Vec<(String, PathBuf)> = Vec::new();
         for fpath in &ks_files {
-            let bytes = std::fs::read(fpath)?;
             let rel = fpath
                 .strip_prefix(&root)
                 .unwrap_or(fpath.as_path())
                 .to_string_lossy()
                 .replace('\\', "/");
-            let decoded = decode_ks_bytes(&bytes, &rel)?;
-            all.extend(extract_lines_from_text(
-                &decoded.text,
-                &rel,
-                fpath.clone(),
-            ));
+            loose_cands.push((rel, fpath.clone()));
         }
 
-        // XP3 archives
         let mut xp3_parse_errors = 0usize;
         let mut last_xp3_err = String::new();
         let mut xp3_ks_seen = 0usize;
         let mut xp3_skipped = 0usize;
+        // (rel virtual path, archive path, entry name for read)
+        let mut xp3_cands: Vec<(String, PathBuf, String)> = Vec::new();
+        let mut open_archives: HashMap<PathBuf, Xp3Archive> = HashMap::new();
 
         for arch_path in &xp3_files {
             let arch_name = arch_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("archive.xp3");
+                .unwrap_or("archive.xp3")
+                .to_string();
             let archive = match Xp3Archive::open(arch_path) {
                 Ok(a) => a,
                 Err(e) => {
@@ -701,48 +777,87 @@ impl FormatPlugin for KirikiriPlugin {
                     continue;
                 }
             };
-
             for entry in archive.ks_entries() {
                 xp3_ks_seen += 1;
-                let payload = match archive.read_entry(entry) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(
-                            archive = %arch_name,
-                            entry = %entry.name,
-                            error = %e,
-                            "failed to read XP3 .ks entry; skipped"
-                        );
-                        xp3_skipped += 1;
-                        continue;
-                    }
-                };
-                let rel = format!("{arch_name}/{}", entry.name.replace('\\', "/"));
-                let virtual_path = PathBuf::from(&rel);
-                match decode_ks_bytes(&payload, &rel) {
-                    Ok(decoded) => {
-                        all.extend(extract_lines_from_text(
-                            &decoded.text,
-                            &rel,
-                            virtual_path,
-                        ));
-                    }
-                    Err(e) => {
-                        // Likely cxdec-encrypted or non-text — skip, do not fail the whole extract.
-                        warn!(
-                            archive = %arch_name,
-                            entry = %entry.name,
-                            error = %e,
-                            "XP3 .ks payload did not decode as text (cxdec/encrypted?); skipped"
-                        );
-                        xp3_skipped += 1;
-                    }
+                let inner = entry.name.replace('\\', "/");
+                let rel = format!("{arch_name}/{inner}");
+                xp3_cands.push((rel, arch_path.clone(), entry.name.clone()));
+            }
+            open_archives.insert(arch_path.clone(), archive);
+        }
+
+        let mut all_rels: Vec<String> = loose_cands.iter().map(|(r, _)| r.clone()).collect();
+        all_rels.extend(xp3_cands.iter().map(|(r, _, _)| r.clone()));
+        let winners = select_best_script_rels(&all_rels);
+
+        let mut all = Vec::new();
+
+        for (rel, fpath) in &loose_cands {
+            if !winners.contains(rel) {
+                continue;
+            }
+            let bytes = std::fs::read(fpath)?;
+            let decoded = decode_ks_bytes(&bytes, rel)?;
+            all.extend(extract_lines_from_text(
+                &decoded.text,
+                rel,
+                fpath.clone(),
+            ));
+        }
+
+        for (rel, arch_path, entry_name) in &xp3_cands {
+            if !winners.contains(rel) {
+                continue;
+            }
+            let Some(archive) = open_archives.get(arch_path) else {
+                continue;
+            };
+            let Some(entry) = archive
+                .entries
+                .iter()
+                .find(|e| e.name == *entry_name || e.name.replace('\\', "/") == entry_name.replace('\\', "/"))
+            else {
+                continue;
+            };
+            let arch_name = arch_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("archive.xp3");
+            let payload = match archive.read_entry(entry) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        archive = %arch_name,
+                        entry = %entry_name,
+                        error = %e,
+                        "failed to read XP3 .ks entry; skipped"
+                    );
+                    xp3_skipped += 1;
+                    continue;
+                }
+            };
+            let virtual_path = PathBuf::from(rel);
+            match decode_ks_bytes(&payload, rel) {
+                Ok(decoded) => {
+                    all.extend(extract_lines_from_text(
+                        &decoded.text,
+                        rel,
+                        virtual_path,
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        archive = %arch_name,
+                        entry = %entry_name,
+                        error = %e,
+                        "XP3 .ks payload did not decode as text (cxdec/encrypted?); skipped"
+                    );
+                    xp3_skipped += 1;
                 }
             }
         }
 
         if all.is_empty() && ks_files.is_empty() {
-            // Only XP3 path and nothing usable
             if xp3_parse_errors > 0 && xp3_ks_seen == 0 {
                 return Err(parse_err(
                     &path.display().to_string(),
@@ -1195,6 +1310,82 @@ This is narration.\r\n\
         assert!(
             err.contains("xp3") || err.contains("XP3") || err.contains("magic") || err.contains("parse"),
             "expected XP3 parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_script_key_rank_and_dedupe_helpers() {
+        assert_eq!(
+            normalize_script_key("data.xp3/scenario/newgame03.ks"),
+            "newgame03.ks"
+        );
+        assert_eq!(
+            normalize_script_key("patch2.xp3/newgame03.ks"),
+            "newgame03.ks"
+        );
+        assert_eq!(
+            normalize_script_key("unencrypted/newgame03.ks"),
+            "newgame03.ks"
+        );
+        assert_eq!(
+            normalize_script_key("data.xp3/scenario/select/movie.ks"),
+            "select/movie.ks"
+        );
+        assert!(script_source_rank("patch2.xp3/a.ks") > script_source_rank("patch.xp3/a.ks"));
+        assert!(script_source_rank("patch.xp3/a.ks") > script_source_rank("data.xp3/a.ks"));
+        assert!(script_source_rank("data.xp3/a.ks") > script_source_rank("unencrypted/a.ks"));
+
+        let cands = vec![
+            "data.xp3/scenario/a.ks".into(),
+            "patch2.xp3/a.ks".into(),
+            "unencrypted/a.ks".into(),
+            "data.xp3/scenario/only_base.ks".into(),
+        ];
+        let win = select_best_script_rels(&cands);
+        assert!(win.contains("patch2.xp3/a.ks"), "{win:?}");
+        assert!(!win.contains("data.xp3/scenario/a.ks"), "{win:?}");
+        assert!(!win.contains("unencrypted/a.ks"), "{win:?}");
+        assert!(win.contains("data.xp3/scenario/only_base.ks"), "{win:?}");
+    }
+
+    #[test]
+    fn test_extract_prefers_patch_over_data_and_unencrypted() {
+        let dir = tempdir();
+        let script = "; comment\n*start\nHello from DATA\n";
+        let script_patch = "; comment\n*start\nHello from PATCH2\n";
+        let mut ks_data = vec![0xFF, 0xFE];
+        ks_data.extend_from_slice(&utf16le_bytes_from_str(script));
+        let mut ks_patch = vec![0xFF, 0xFE];
+        ks_patch.extend_from_slice(&utf16le_bytes_from_str(script_patch));
+        let data = crate::kirikiri_xp3::write_xp3(&[("scenario/a.ks".into(), ks_data)]).unwrap();
+        let patch2 = crate::kirikiri_xp3::write_xp3(&[("a.ks".into(), ks_patch)]).unwrap();
+        fs::write(dir.join("data.xp3"), &data).unwrap();
+        fs::write(dir.join("patch2.xp3"), &patch2).unwrap();
+        let unenc = dir.join("unencrypted");
+        fs::create_dir_all(&unenc).unwrap();
+        write_utf16le_ks(&unenc.join("a.ks"), "; comment\n*start\nHello from UNENC\n");
+
+        let plugin = KirikiriPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert!(
+            sources.iter().any(|s| s.contains("Hello from PATCH2")),
+            "prefer patch2: {sources:?}"
+        );
+        assert!(
+            !sources.iter().any(|s| s.contains("Hello from DATA")),
+            "drop data copy: {sources:?}"
+        );
+        assert!(
+            !sources.iter().any(|s| s.contains("Hello from UNENC")),
+            "drop unencrypted copy: {sources:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.id.starts_with("patch2.xp3/") || e.file_path.to_string_lossy().contains("patch2")),
+            "ids/paths should be patch2: {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
     }
 
