@@ -853,7 +853,8 @@ fn mono_name_worth_extracting(s: &str) -> bool {
     if is_mono_engine_noise(t) {
         return false;
     }
-    t.chars().any(|c| c.is_alphabetic())
+    // Need ≥2 letters so crumbs like `v'` / `A!` don't slip through.
+    t.chars().filter(|c| c.is_alphabetic()).count() >= 2
 }
 
 /// High-precision engine metadata that floods MonoBehaviour walks (BOXMAN/Naninovel).
@@ -913,7 +914,30 @@ fn is_mono_engine_noise(t: &str) -> bool {
     if !t.contains(' ') && t.contains('/') {
         return true;
     }
+    // Asset / guid-ish hex blobs mis-read as strings (BOXMAN ~70 rows).
+    if looks_like_hex_token(t) {
+        return true;
+    }
+    // Unity component / pipeline tokens that are not player-facing copy.
+    // Keep real UI verbs (Play/Wait/Save) and labels (Master volume may be UI — allow).
+    if matches!(
+        t,
+        "Fader" | "Clip" | "Canvas" | "Sprites" | "trigger" | "Author Name"
+    ) {
+        return true;
+    }
     false
+}
+
+/// Pure hexadecimal id / guid fragment: `72010b7a`, `7d24045dcfc9abb4…`.
+fn looks_like_hex_token(t: &str) -> bool {
+    let t = t.trim();
+    // 6+ hex digits avoids short numerics; pure hex only (no spaces).
+    t.len() >= 6
+        && t.chars()
+            .all(|c| c.is_ascii_hexdigit())
+        // Require at least one a-f so pure decimal numbers can stay (rare UI).
+        && t.chars().any(|c| matches!(c, 'a'..='f' | 'A'..='F'))
 }
 
 /// Naninovel (and similar) scenario commands: every non-empty line is an `@cmd…`.
@@ -2017,6 +2041,55 @@ mod tests {
             assert!(
                 !texts.iter().any(|t| t.contains(drop_sub)),
                 "expected drop containing {drop_sub}: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mono_script_filter_drops_hex_ids_and_component_tokens() {
+        let bytes = write_v17_mono_fixture(
+            "Holder",
+            &[
+                "72010b7a",
+                "7d24045dcfc9abb4b809014e4a26b613",
+                "ecbbacfc",
+                "Fader",
+                "Clip",
+                "Canvas",
+                "Sprites",
+                "trigger",
+                "Author Name",
+                "v'",
+                "Play",
+                "Emily",
+                "Q.SAVE",
+                "Message speed:",
+            ],
+        );
+        let sf = SerializedFile::parse(bytes, "hex.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        for drop in [
+            "72010b7a",
+            "7d24045dcfc9abb4b809014e4a26b613",
+            "ecbbacfc",
+            "Fader",
+            "Clip",
+            "Canvas",
+            "Sprites",
+            "trigger",
+            "Author Name",
+            "v'",
+        ] {
+            assert!(
+                !texts.iter().any(|t| *t == drop),
+                "expected drop {drop}: {texts:?}"
+            );
+        }
+        for keep in ["Play", "Emily", "Q.SAVE", "Message speed:"] {
+            assert!(
+                texts.iter().any(|t| *t == keep),
+                "expected keep {keep}: {texts:?}"
             );
         }
     }
