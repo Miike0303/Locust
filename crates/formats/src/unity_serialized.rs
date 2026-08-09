@@ -850,7 +850,78 @@ fn mono_name_worth_extracting(s: &str) -> bool {
     {
         return false;
     }
+    if is_mono_engine_noise(t) {
+        return false;
+    }
     t.chars().any(|c| c.is_alphabetic())
+}
+
+/// High-precision engine metadata that floods MonoBehaviour walks (BOXMAN/Naninovel).
+/// Kept separate so real UI verbs (`Play`, `Save`) and short labels (`Q.SAVE`) survive.
+fn is_mono_engine_noise(t: &str) -> bool {
+    let t = t.trim();
+    // Managed assembly names.
+    if t == "Assembly-CSharp"
+        || t == "Assembly-CSharp-firstpass"
+        || t.starts_with("Assembly-CSharp")
+    {
+        return true;
+    }
+    // Namespace / type tokens: `Naninovel.Commands`, `UnityEngine.DMAT`.
+    // Preserves UI-ish `Q.SAVE` / `Q.LOAD` (short ALL-CAPS segments).
+    if looks_like_dotted_type_name(t) {
+        return true;
+    }
+    // Unity Selectable ColorBlock state labels (not player-facing copy).
+    if matches!(
+        t,
+        "Normal" | "Highlighted" | "Pressed" | "Selected" | "Disabled" | "Focused"
+    ) {
+        return true;
+    }
+    // Framework product token + ubiquitous serialized default label.
+    if matches!(t, "Naninovel" | "Default") {
+        return true;
+    }
+    // Mixer / resource path fragments without sentence whitespace: `Master/HFX`.
+    if !t.contains(' ') && t.contains('/') {
+        return true;
+    }
+    false
+}
+
+/// `Foo.Bar` / `A.B.C` type or namespace tokens (no spaces).
+/// Returns false for short UI abbreviations like `Q.SAVE`.
+fn looks_like_dotted_type_name(t: &str) -> bool {
+    if t.contains(' ') || !t.contains('.') {
+        return false;
+    }
+    if !t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+    {
+        return false;
+    }
+    let parts: Vec<&str> = t.split('.').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    if !parts
+        .iter()
+        .all(|p| p.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
+    {
+        return false;
+    }
+    // `Q.SAVE` / `Q.LOAD`: every segment is short UPPER/digit — keep as UI.
+    if parts.iter().all(|p| {
+        p.len() <= 4
+            && p.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    }) {
+        return false;
+    }
+    // At least one real identifier segment (avoids `A.B` toy tokens).
+    parts.iter().any(|p| p.len() >= 4)
 }
 
 /// Script-field filter (field_index ≥ 1). Sequential walks mis-read ints as lengths
@@ -886,7 +957,12 @@ fn mono_script_field_worth_extracting(s: &str) -> bool {
     // Engine API / serialized method tokens (not player-facing).
     if matches!(
         t,
-        "set_text" | "get_text" | "set_enabled" | "get_enabled" | "set_active" | "get_active"
+        "set_text"
+            | "get_text"
+            | "set_enabled"
+            | "get_enabled"
+            | "set_active"
+            | "get_active"
     ) {
         return false;
     }
@@ -1627,6 +1703,70 @@ mod tests {
         assert!(
             !texts.iter().any(|t| *t == "set_text"),
             "drop API token: {texts:?}"
+        );
+    }
+
+    /// BOXMAN-class flood: namespaces, Assembly-CSharp, Selectable color states,
+    /// engine product tokens — while keeping real UI (Q.SAVE, Play, Save).
+    #[test]
+    fn mono_script_filter_drops_namespace_assembly_uistate_noise() {
+        let bytes = write_v17_mono_fixture(
+            "Naninovel", // m_Name noise
+            &[
+                "Naninovel.Commands",
+                "Assembly-CSharp",
+                "Highlighted",
+                "Pressed",
+                "Normal",
+                "Disabled",
+                "UnityEngine.DMAT",
+                "ControlPanel.Config",
+                "Master/HFX",
+                "Q.SAVE",
+                "Play",
+                "Save game now",
+                "Could be a replacement part",
+            ],
+        );
+        let sf = SerializedFile::parse(bytes, "noise.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        // m_Name "Naninovel" must not extract
+        assert!(
+            !texts.iter().any(|t| *t == "Naninovel"),
+            "drop engine product m_Name: {texts:?}"
+        );
+        for drop in [
+            "Naninovel.Commands",
+            "Assembly-CSharp",
+            "Highlighted",
+            "Pressed",
+            "Normal",
+            "Disabled",
+            "UnityEngine.DMAT",
+            "ControlPanel.Config",
+            "Master/HFX",
+        ] {
+            assert!(
+                !texts.iter().any(|t| *t == drop),
+                "expected drop {drop}: {texts:?}"
+            );
+        }
+        assert!(
+            texts.iter().any(|t| *t == "Q.SAVE"),
+            "keep quick-save UI: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Play"),
+            "keep short UI verb: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Save game now"),
+            "keep sentence: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("replacement")),
+            "keep dialogue: {texts:?}"
         );
     }
 
