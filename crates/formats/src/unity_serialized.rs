@@ -1232,6 +1232,58 @@ mod tests {
         assert_eq!(ta.script, "Hello script body");
     }
 
+    /// Format ≥19 type-tree nodes are 32 bytes (RefTypeHash); wrong size desyncs object table.
+    #[test]
+    fn parse_v19_with_type_tree_32byte_nodes_skipped() {
+        let bytes = write_v19_fixture_with_type_tree("V19Name", "V19 script body here");
+        let sf = SerializedFile::parse(bytes, "tt19.assets").unwrap();
+        assert_eq!(sf.header.version, 19);
+        assert_eq!(sf.objects.len(), 1);
+        let ta = sf.read_text_asset(1).unwrap();
+        assert_eq!(ta.name, "V19Name");
+        assert_eq!(ta.script, "V19 script body here");
+    }
+
+    /// Big-endian metadata + object data (endian flag ≠ 0).
+    #[test]
+    fn parse_v17_big_endian_text_asset() {
+        let bytes = write_v17_be_textasset_fixture("BEName", "Big endian script");
+        let sf = SerializedFile::parse(bytes, "be.assets").unwrap();
+        assert_eq!(sf.header.endian, Endian::Big);
+        let ta = sf.read_text_asset(1).unwrap();
+        assert_eq!(ta.name, "BEName");
+        assert_eq!(ta.script, "Big endian script");
+    }
+
+    #[test]
+    fn rewrite_v17_big_endian_text_asset_preserves_prefix() {
+        let bytes = write_v17_be_textasset_fixture("N", "ABCDEFGH");
+        let sf = SerializedFile::parse(bytes.clone(), "be.assets").unwrap();
+        let ta = sf.read_text_asset(1).unwrap();
+        let mut file = bytes;
+        let prefix = file[ta.script_len_offset..ta.script_len_offset + 4].to_vec();
+        assert_eq!(
+            prefix,
+            8u32.to_be_bytes().to_vec(),
+            "BE length prefix expected"
+        );
+        rewrite_text_asset_script_inplace(
+            &mut file,
+            ta.script_len_offset,
+            ta.script_byte_len,
+            "Hi",
+            "be.assets",
+        )
+        .unwrap();
+        assert_eq!(
+            &file[ta.script_len_offset..ta.script_len_offset + 4],
+            prefix.as_slice()
+        );
+        let again = SerializedFile::parse(file, "be.assets").unwrap();
+        let ta2 = again.read_text_asset(1).unwrap();
+        assert!(ta2.script.starts_with("Hi"), "{:?}", ta2.script);
+    }
+
     #[test]
     fn parse_v17_mono_behaviour_strings() {
         let bytes = write_v17_mono_fixture(
@@ -1901,44 +1953,95 @@ pub fn write_v22_textasset_fixture(text_name: &str, text_script: &str) -> Vec<u8
 /// v17 fixture: one TextAsset, enable_type_tree=1 with a minimal skippable blob.
 #[cfg(test)]
 pub fn write_v17_fixture_with_type_tree(text_name: &str, text_script: &str) -> Vec<u8> {
+    write_typed_textasset_with_type_tree(17, 24, text_name, text_script, Endian::Little)
+}
+
+/// v19 fixture: type-tree nodes are 32 bytes (+ optional string buffer).
+#[cfg(test)]
+pub fn write_v19_fixture_with_type_tree(text_name: &str, text_script: &str) -> Vec<u8> {
+    write_typed_textasset_with_type_tree(19, 32, text_name, text_script, Endian::Little)
+}
+
+/// Big-endian v17 TextAsset (metadata + object payload use BE length prefixes).
+#[cfg(test)]
+pub fn write_v17_be_textasset_fixture(text_name: &str, text_script: &str) -> Vec<u8> {
+    write_typed_textasset_with_type_tree(17, 0, text_name, text_script, Endian::Big)
+}
+
+/// Shared TextAsset fixture writer.
+/// `type_tree_node_size` 0 = no type tree; else enable_type_tree with one node of that size.
+#[cfg(test)]
+fn write_typed_textasset_with_type_tree(
+    version: u32,
+    type_tree_node_size: usize,
+    text_name: &str,
+    text_script: &str,
+    data_endian: Endian,
+) -> Vec<u8> {
     fn align4(n: usize) -> usize {
         (n + 3) & !3
     }
-    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+    fn write_u32(buf: &mut Vec<u8>, v: u32, endian: Endian) {
+        match endian {
+            Endian::Little => buf.extend_from_slice(&v.to_le_bytes()),
+            Endian::Big => buf.extend_from_slice(&v.to_be_bytes()),
+        }
+    }
+    fn write_i32(buf: &mut Vec<u8>, v: i32, endian: Endian) {
+        write_u32(buf, v as u32, endian);
+    }
+    fn write_i64(buf: &mut Vec<u8>, v: i64, endian: Endian) {
+        match endian {
+            Endian::Little => buf.extend_from_slice(&v.to_le_bytes()),
+            Endian::Big => buf.extend_from_slice(&v.to_be_bytes()),
+        }
+    }
+    fn write_i16(buf: &mut Vec<u8>, v: i16, endian: Endian) {
+        match endian {
+            Endian::Little => buf.extend_from_slice(&v.to_le_bytes()),
+            Endian::Big => buf.extend_from_slice(&v.to_be_bytes()),
+        }
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str, endian: Endian) {
         let b = s.as_bytes();
-        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        write_u32(buf, b.len() as u32, endian);
         buf.extend_from_slice(b);
         let pad = align4(b.len()) - b.len();
         buf.extend(std::iter::repeat_n(0u8, pad));
     }
 
     let mut text_payload = Vec::new();
-    write_aligned_string(&mut text_payload, text_name);
-    write_aligned_string(&mut text_payload, text_script);
+    write_aligned_string(&mut text_payload, text_name, data_endian);
+    write_aligned_string(&mut text_payload, text_script, data_endian);
 
     let mut meta = Vec::new();
     meta.extend_from_slice(b"2019.4.0f1\0");
-    meta.extend_from_slice(&1u32.to_le_bytes());
-    meta.push(1); // enable_type_tree = true
+    write_u32(&mut meta, 1, data_endian); // target platform
+    let enable_tt = type_tree_node_size > 0;
+    meta.push(if enable_tt { 1 } else { 0 });
 
-    meta.extend_from_slice(&1i32.to_le_bytes()); // 1 type
-    meta.extend_from_slice(&CLASS_ID_TEXT_ASSET.to_le_bytes());
+    write_i32(&mut meta, 1, data_endian); // 1 type
+    write_i32(&mut meta, CLASS_ID_TEXT_ASSET, data_endian);
     meta.push(0);
-    meta.extend_from_slice(&(-1i16).to_le_bytes());
+    write_i16(&mut meta, -1, data_endian);
     meta.extend_from_slice(&[0u8; 16]); // old_type_hash
-    // type tree blob: 1 node (24 bytes for v17), empty string buffer
-    meta.extend_from_slice(&1i32.to_le_bytes()); // node count
-    meta.extend_from_slice(&0i32.to_le_bytes()); // string buffer size
-    meta.extend_from_slice(&[0u8; 24]); // one node
+    if enable_tt {
+        write_i32(&mut meta, 1, data_endian); // node count
+        // Non-empty string buffer exercises skip of both nodes and buffer.
+        let str_buf = b"m_Name\0m_Script\0";
+        write_i32(&mut meta, str_buf.len() as i32, data_endian);
+        meta.extend(std::iter::repeat_n(0u8, type_tree_node_size));
+        meta.extend_from_slice(str_buf);
+    }
 
-    meta.extend_from_slice(&1i32.to_le_bytes()); // 1 object
+    write_i32(&mut meta, 1, data_endian); // 1 object
     while meta.len() % 4 != 0 {
         meta.push(0);
     }
-    meta.extend_from_slice(&1i64.to_le_bytes());
-    meta.extend_from_slice(&0u32.to_le_bytes()); // byte_start
-    meta.extend_from_slice(&(text_payload.len() as u32).to_le_bytes());
-    meta.extend_from_slice(&0i32.to_le_bytes()); // type index
+    write_i64(&mut meta, 1, data_endian); // path_id
+    write_u32(&mut meta, 0, data_endian); // byte_start
+    write_u32(&mut meta, text_payload.len() as u32, data_endian);
+    write_i32(&mut meta, 0, data_endian); // type index
 
     let header_len = 20usize;
     let mut data_offset = header_len + meta.len();
@@ -1948,9 +2051,12 @@ pub fn write_v17_fixture_with_type_tree(text_name: &str, text_script: &str) -> V
     let mut out = Vec::new();
     out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
     out.extend_from_slice(&(file_size as u32).to_be_bytes());
-    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&version.to_be_bytes());
     out.extend_from_slice(&(data_offset as u32).to_be_bytes());
-    out.push(0);
+    out.push(match data_endian {
+        Endian::Little => 0,
+        Endian::Big => 1,
+    });
     out.extend_from_slice(&[0, 0, 0]);
     out.extend_from_slice(&meta);
     while out.len() < data_offset {
