@@ -18,6 +18,7 @@ import {
   isHttpPatchUrl,
   loadRememberedPatchSource,
   patchSourceReady,
+  patchUrlLooksLikeZip,
   rememberPatchSource,
   resolvePatchSource,
 } from "../lib/patchSource";
@@ -89,10 +90,18 @@ export default function PatchModal({
   const canVerifyApply = Boolean(gamePath.trim()) && sourceOk;
   const urlFieldError =
     zipUrl.trim() && !isHttpPatchUrl(zipUrl)
-      ? "URL must start with http:// or https://"
+      ? "Enter a full http:// or https:// URL with a host"
       : resolvedSource && "error" in resolvedSource
         ? resolvedSource.error
         : null;
+  // Soft hint only — signed CDN links may omit `.zip` in the path.
+  const urlZipHint =
+    !urlFieldError &&
+    zipUrl.trim() &&
+    isHttpPatchUrl(zipUrl) &&
+    !patchUrlLooksLikeZip(zipUrl)
+      ? "URL path does not end in .zip — downloads still work if the server returns a zip"
+      : null;
 
   if (!open) return null;
 
@@ -428,6 +437,8 @@ export default function PatchModal({
                 />
                 {urlFieldError ? (
                   <p className="text-xs text-red-600 dark:text-red-400 mt-1">{urlFieldError}</p>
+                ) : urlZipHint ? (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">{urlZipHint}</p>
                 ) : (
                   <p className="text-xs text-gray-500 mt-1">
                     Downloads over http(s), then verify/apply. Last successful source is remembered.

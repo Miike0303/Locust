@@ -7,16 +7,40 @@ export type PatchSourceOk = { zip_path: string } | { zip_url: string };
 
 export type PatchSourceResult = PatchSourceOk | { error: string } | null;
 
-/** True when `url` is a non-empty http(s) absolute URL (scheme only; no fetch). */
+/**
+ * True when `url` is a non-empty absolute http(s) URL with a host (no fetch).
+ * Rejects `https://` alone, `http:///path`, and non-http schemes.
+ */
 export function isHttpPatchUrl(url: string): boolean {
-  const t = url.trim().toLowerCase();
-  return t.startsWith("http://") || t.startsWith("https://");
+  const t = url.trim();
+  if (!t) return false;
+  try {
+    const u = new URL(t);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    // hostname required (blocks "https://" and "http:///foo")
+    return u.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Soft hint: path ends with `.zip` (query/hash ignored). Signed CDN links
+ * without `.zip` in the path still download fine — UI may only warn.
+ */
+export function patchUrlLooksLikeZip(url: string): boolean {
+  try {
+    const u = new URL(url.trim());
+    return u.pathname.toLowerCase().endsWith(".zip");
+  } catch {
+    return false;
+  }
 }
 
 /**
  * @returns `null` if neither path nor URL provided;
  *          `{ error }` on mutual exclusion or bad scheme;
- *          `{ zip_path }` or `{ zip_url }` when valid.
+ *          `{ zip_path }` or `{ zip_url }` when valid (trimmed).
  */
 export function resolvePatchSource(
   zipPath: string,
@@ -30,7 +54,9 @@ export function resolvePatchSource(
   if (path) return { zip_path: path };
   if (url) {
     if (!isHttpPatchUrl(url)) {
-      return { error: "Patch URL must start with http:// or https://" };
+      return {
+        error: "Patch URL must be a valid http:// or https:// address with a host",
+      };
     }
     return { zip_url: url };
   }
