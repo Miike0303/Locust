@@ -462,7 +462,11 @@ impl UnityPlugin {
             }
         }
 
-        // Heuristic length-prefixed UTF-8 scan, skipping TextAsset object ranges.
+        // Heuristic length-prefixed UTF-8 scan, skipping structural object ranges.
+        // Prefer little-endian length (PC Unity default); fall back to big-endian so
+        // BE blobs still yield injectible strings. BE candidates must not look like
+        // the classic off-by-3 shadow of a following LE length field (see
+        // `heuristic_string_at`).
         let len = bytes.len();
         if len < 8 {
             return entries;
@@ -473,38 +477,96 @@ impl UnityPlugin {
                 i += 1;
                 continue;
             }
-            let str_len =
-                u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
-            if (5..=2000).contains(&str_len) && i + 4 + str_len <= len {
-                // Skip if this string lies inside a TextAsset object span.
-                if range_overlaps(&skip_ranges, i, i + 4 + str_len) {
-                    i += 1;
-                    continue;
-                }
-                if let Ok(text) = std::str::from_utf8(&bytes[i + 4..i + 4 + str_len]) {
-                    if is_unity_translatable(text) && seen.insert(text.to_string()) {
-                        let id = format!("{}#offset_{}#{}", filename, i, entries.len());
-                        let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
-                        entry.tags = vec!["unknown".to_string()];
-                        entry.metadata.insert(
-                            "binary_slot".to_string(),
-                            serde_json::Value::String("utf8".to_string()),
-                        );
-                        entry.metadata.insert(
-                            "extraction_method".to_string(),
-                            serde_json::Value::String("heuristic".to_string()),
-                        );
-                        entries.push(entry);
-                    }
-                }
-                let aligned = (str_len + 3) & !3;
-                i += 4 + aligned;
-            } else {
+            let Some((str_len, endian)) = heuristic_string_at(bytes, i) else {
                 i += 1;
+                continue;
+            };
+            if range_overlaps(&skip_ranges, i, i + 4 + str_len) {
+                i += 1;
+                continue;
             }
+            if let Ok(text) = std::str::from_utf8(&bytes[i + 4..i + 4 + str_len]) {
+                if is_unity_translatable(text) && seen.insert(text.to_string()) {
+                    let id = format!("{}#offset_{}#{}", filename, i, entries.len());
+                    let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
+                    entry.tags = vec!["unknown".to_string()];
+                    entry.metadata.insert(
+                        "binary_slot".to_string(),
+                        serde_json::Value::String("utf8".to_string()),
+                    );
+                    entry.metadata.insert(
+                        "extraction_method".to_string(),
+                        serde_json::Value::String("heuristic".to_string()),
+                    );
+                    entry.metadata.insert(
+                        "length_endian".to_string(),
+                        serde_json::Value::String(endian.as_meta().to_string()),
+                    );
+                    entries.push(entry);
+                }
+            }
+            let aligned = (str_len + 3) & !3;
+            i += 4 + aligned;
         }
         entries
     }
+}
+
+/// Endianness of a Unity length-prefixed UTF-8 string field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LengthEndian {
+    Little,
+    Big,
+}
+
+impl LengthEndian {
+    fn as_meta(self) -> &'static str {
+        match self {
+            LengthEndian::Little => "le",
+            LengthEndian::Big => "be",
+        }
+    }
+
+    fn from_meta(s: &str) -> Option<Self> {
+        match s {
+            "le" | "little" => Some(LengthEndian::Little),
+            "be" | "big" => Some(LengthEndian::Big),
+            _ => None,
+        }
+    }
+
+    fn encode_u32(self, v: u32) -> [u8; 4] {
+        match self {
+            LengthEndian::Little => v.to_le_bytes(),
+            LengthEndian::Big => v.to_be_bytes(),
+        }
+    }
+}
+
+/// Probe `bytes[i..]` for a plausible length-prefixed UTF-8 string.
+/// Prefers little-endian (PC Unity). BE is accepted only when LE is out of range
+/// **and** the payload does not start with NUL — rejecting the off-by-3 shadow of
+/// a following LE length field (`00 00 00 NN` BE=N overlapping pad + LE length).
+fn heuristic_string_at(bytes: &[u8], i: usize) -> Option<(usize, LengthEndian)> {
+    if i + 4 > bytes.len() {
+        return None;
+    }
+    let le = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+    let be = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+    let le_ok = (5..=2000).contains(&le) && i + 4 + le <= bytes.len();
+    if le_ok {
+        return Some((le, LengthEndian::Little));
+    }
+    let be_ok = (5..=2000).contains(&be) && i + 4 + be <= bytes.len();
+    if be_ok {
+        // Reject payload that starts with NUL — false-positive BE shadows of LE
+        // lengths always pull leading zeros into the "string".
+        if bytes[i + 4] == 0 {
+            return None;
+        }
+        return Some((be, LengthEndian::Big));
+    }
+    None
 }
 
 fn is_unity_serialized_candidate(path: &Path) -> bool {
@@ -519,6 +581,16 @@ fn is_unity_serialized_candidate(path: &Path) -> bool {
             lower.starts_with("level") && !lower.contains('.')
         })
         .unwrap_or(false)
+}
+
+/// First occurrence of `needle` in `haystack`, or `None`.
+fn find_bytes_once(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
 }
 
 fn range_contains(ranges: &[(usize, usize)], pos: usize) -> bool {
@@ -841,6 +913,10 @@ impl FormatPlugin for UnityPlugin {
             // ── Heuristic length-prefixed inject (non-structural entries) ──
             struct Work {
                 needle: Vec<u8>,
+                /// Alternate endian needle when metadata did not pin endianness.
+                alt_needle: Option<Vec<u8>>,
+                endian: LengthEndian,
+                alt_endian: Option<LengthEndian>,
                 trans_bytes: Vec<u8>,
                 orig_payload_len: usize,
             }
@@ -872,12 +948,29 @@ impl FormatPlugin for UnityPlugin {
                     strings_skipped += 1;
                     continue;
                 }
-                let orig_len_bytes = (orig_bytes.len() as u32).to_le_bytes();
+                let pinned = entry
+                    .metadata
+                    .get("length_endian")
+                    .and_then(|v| v.as_str())
+                    .and_then(LengthEndian::from_meta);
+                let (endian, alt_endian) = match pinned {
+                    Some(e) => (e, None),
+                    None => (LengthEndian::Little, Some(LengthEndian::Big)),
+                };
                 let mut needle = Vec::with_capacity(4 + orig_bytes.len());
-                needle.extend_from_slice(&orig_len_bytes);
+                needle.extend_from_slice(&endian.encode_u32(orig_bytes.len() as u32));
                 needle.extend_from_slice(orig_bytes);
+                let alt_needle = alt_endian.map(|ae| {
+                    let mut n = Vec::with_capacity(4 + orig_bytes.len());
+                    n.extend_from_slice(&ae.encode_u32(orig_bytes.len() as u32));
+                    n.extend_from_slice(orig_bytes);
+                    n
+                });
                 work.push(Work {
                     needle,
+                    alt_needle,
+                    endian,
+                    alt_endian,
                     trans_bytes: trans_bytes.to_vec(),
                     orig_payload_len: orig_bytes.len(),
                 });
@@ -889,9 +982,18 @@ impl FormatPlugin for UnityPlugin {
                     crate::binary_search::MatchCursor::from_patterns(&bytes, &patterns);
 
                 for (i, w) in work.iter().enumerate() {
-                    if let Some(pos) = cursor.next_valid(i, &bytes, &w.needle) {
+                    let mut matched: Option<(usize, LengthEndian)> =
+                        cursor.next_valid(i, &bytes, &w.needle).map(|p| (p, w.endian));
+                    if matched.is_none() {
+                        if let (Some(alt), Some(ae)) = (&w.alt_needle, w.alt_endian) {
+                            if let Some(pos) = find_bytes_once(&bytes, alt) {
+                                matched = Some((pos, ae));
+                            }
+                        }
+                    }
+                    if let Some((pos, used_endian)) = matched {
                         let new_len = w.trans_bytes.len() as u32;
-                        bytes[pos..pos + 4].copy_from_slice(&new_len.to_le_bytes());
+                        bytes[pos..pos + 4].copy_from_slice(&used_endian.encode_u32(new_len));
                         bytes[pos + 4..pos + 4 + w.trans_bytes.len()]
                             .copy_from_slice(&w.trans_bytes);
                         for b in
@@ -1119,6 +1221,103 @@ script Chapter_1_script chapter 1 {
 
         let report = plugin.inject(&dir, &entries).unwrap();
         assert!(report.strings_written >= 1);
+    }
+
+    /// Big-endian length-prefixed strings must extract and inject without
+    /// assuming little-endian u32, and must not steal LE strings via off-by-3
+    /// BE shadows.
+    #[test]
+    fn test_heuristic_be_extract_and_inject() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+
+        // Pad so this is not a valid SerializedFile header → pure heuristic path.
+        // Leading non-zero pad prevents accidental LE length hits.
+        let s = b"Hello World"; // 11 bytes
+        let mut data: Vec<u8> = vec![0xFF; 64];
+        data.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        data.extend_from_slice(s);
+        data.extend_from_slice(&[0, 0, 0]);
+        let assets = data_dir.join("resources.assets");
+        fs::write(&assets, &data).unwrap();
+
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let hello = entries
+            .iter()
+            .find(|e| e.source == "Hello World")
+            .expect("BE length-prefixed Hello World must extract");
+        assert_eq!(
+            hello
+                .metadata
+                .get("length_endian")
+                .and_then(|v| v.as_str()),
+            Some("be"),
+            "must record big-endian length: {:?}",
+            hello.metadata
+        );
+
+        let mut inject_entries = entries;
+        for e in &mut inject_entries {
+            if e.source == "Hello World" {
+                e.translation = Some("Hola Mundo".to_string()); // 10 < 11
+            }
+        }
+        let report = plugin.inject(&dir, &inject_entries).unwrap();
+        assert!(
+            report.strings_written >= 1,
+            "BE inject written={} skipped={} warn={:?}",
+            report.strings_written,
+            report.strings_skipped,
+            report.warnings
+        );
+        let out = fs::read(&assets).unwrap();
+        let be_ten = 10u32.to_be_bytes();
+        assert!(
+            out.windows(4 + 10)
+                .any(|w| w[..4] == be_ten && &w[4..] == b"Hola Mundo"),
+            "expected BE len=10 + Hola Mundo"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_string_at_prefers_le() {
+        let s = b"Hello World";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        buf.extend_from_slice(s);
+        let (len, end) = heuristic_string_at(&buf, 0).unwrap();
+        assert_eq!(len, 11);
+        assert_eq!(end, LengthEndian::Little);
+    }
+
+    #[test]
+    fn test_heuristic_string_at_be_when_le_implausible() {
+        let s = b"Hello World";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        buf.extend_from_slice(s);
+        let (len, end) = heuristic_string_at(&buf, 0).unwrap();
+        assert_eq!(len, 11);
+        assert_eq!(end, LengthEndian::Big);
+    }
+
+    #[test]
+    fn test_heuristic_string_at_rejects_be_shadow_of_le() {
+        // 3 zeros + LE length 11 + "Hello World" — BE at offset 0 is 11 but payload
+        // starts with NUL → must reject so the real LE string is not skipped.
+        let s = b"Hello World";
+        let mut buf = vec![0u8; 3];
+        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        buf.extend_from_slice(s);
+        assert!(
+            heuristic_string_at(&buf, 0).is_none(),
+            "BE shadow of LE length must be rejected"
+        );
+        let (len, end) = heuristic_string_at(&buf, 3).unwrap();
+        assert_eq!((len, end), (11, LengthEndian::Little));
     }
 
     /// Synthetic multi-pattern inject: (a) needle twice, (c) identity skip,

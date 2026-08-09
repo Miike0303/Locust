@@ -49,6 +49,7 @@ locust providers                    # List translation providers
 - Commercial Wolf RPG title E2E (no Wolf game on disk yet)
 - Streaming verify/apply multi-GB: shipped (pack ZIP64 + stream apply); keep eye on edge cases
 - Unity SerializedFile slice 2: type-tree blobs **skipped**; TextAsset (49) + MonoBehaviour (**114 or negative** script-type class ids) sequential aligned strings extract/inject (pad in place, length-prefix byte-identical, `binary_slot=utf8`); BOXMAN: +834 mono + 10 TextAssets. Still no full type-tree field walk / object-table rewrite
+- Unity heuristic extract/inject: **big-endian length prefix** support (`metadata.length_endian=be|le`); prefers LE; rejects BE off-by-3 shadow of following LE lengths (NUL payload start guard)
 - Unreal multi-GB base pak E2E: done (Last Hope); optional more titles
 - RM MZ POR `.jsono` + Iavra multi-pack extract: done (prefer `en`); inject Replace re-encodes `.jsono`; inject Add writes `lang_*_{lang}.jsono` packs
 - RM MZ UI language registration: `locust register-lang <game> -l es --label Español` (Iavra + VisuMZ langs arrays + Map boot choices; `*.bak-locust`); **desktop/server**: `POST /api/register-lang` + Tauri `register_lang` + Inject modal “Register … in game UI” for rpgmaker-* formats
