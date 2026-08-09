@@ -334,6 +334,81 @@ impl UnityPlugin {
                             if !is_textasset_script_worth_extracting(&ta.script) {
                                 continue;
                             }
+                            // Simple CSV tables (header + data): text columns as cells.
+                            if let Some(csv) = parse_textasset_csv(&ta.script) {
+                                let newline = if ta.script.contains("\r\n") {
+                                    "\r\n"
+                                } else {
+                                    "\n"
+                                };
+                                for cell in csv.cells {
+                                    let id = format!(
+                                        "textasset/{}/csv/{}/{}",
+                                        ta.path_id, cell.row, cell.col
+                                    );
+                                    let mut entry = StringEntry::new(
+                                        id,
+                                        cell.value.clone(),
+                                        file_path.to_path_buf(),
+                                    );
+                                    entry.tags = vec![
+                                        "textasset".to_string(),
+                                        "textasset_csv".to_string(),
+                                    ];
+                                    entry.context = Some(if ta.name.is_empty() {
+                                        format!("csv col={} row={}", cell.header, cell.row)
+                                    } else {
+                                        format!(
+                                            "m_Name={} csv col={} row={}",
+                                            ta.name, cell.header, cell.row
+                                        )
+                                    });
+                                    entry.metadata.insert(
+                                        "extraction_method".to_string(),
+                                        serde_json::Value::String(
+                                            "textasset_csv_cell".to_string(),
+                                        ),
+                                    );
+                                    entry.metadata.insert(
+                                        "path_id".to_string(),
+                                        serde_json::json!(ta.path_id),
+                                    );
+                                    entry.metadata.insert(
+                                        "name".to_string(),
+                                        serde_json::Value::String(ta.name.clone()),
+                                    );
+                                    entry.metadata.insert(
+                                        "textasset_script_offset".to_string(),
+                                        serde_json::json!(ta.script_len_offset),
+                                    );
+                                    entry.metadata.insert(
+                                        "textasset_script_byte_len".to_string(),
+                                        serde_json::json!(ta.script_byte_len),
+                                    );
+                                    entry.metadata.insert(
+                                        "csv_row".to_string(),
+                                        serde_json::json!(cell.row),
+                                    );
+                                    entry.metadata.insert(
+                                        "csv_col".to_string(),
+                                        serde_json::json!(cell.col),
+                                    );
+                                    entry.metadata.insert(
+                                        "csv_header".to_string(),
+                                        serde_json::Value::String(cell.header),
+                                    );
+                                    entry.metadata.insert(
+                                        "newline".to_string(),
+                                        serde_json::Value::String(newline.to_string()),
+                                    );
+                                    entry.metadata.insert(
+                                        "binary_slot".to_string(),
+                                        serde_json::Value::String("utf8".to_string()),
+                                    );
+                                    entries.push(entry);
+                                }
+                                continue;
+                            }
                             // Naninovel ManagedText / locale docs: split Key: Value lines
                             // so each UI string is a translateable row (inject rebuilds blob).
                             if let Some(lines) = parse_textasset_loc_lines(&ta.script) {
@@ -797,7 +872,7 @@ fn is_textasset_entry(entry: &StringEntry) -> bool {
             .metadata
             .get("extraction_method")
             .and_then(|v| v.as_str()),
-        Some("textasset") | Some("textasset_loc_line")
+        Some("textasset") | Some("textasset_loc_line") | Some("textasset_csv_cell")
     )
 }
 
@@ -807,6 +882,14 @@ fn is_textasset_loc_line_entry(entry: &StringEntry) -> bool {
         .get("extraction_method")
         .and_then(|v| v.as_str())
         == Some("textasset_loc_line")
+}
+
+fn is_textasset_csv_cell_entry(entry: &StringEntry) -> bool {
+    entry
+        .metadata
+        .get("extraction_method")
+        .and_then(|v| v.as_str())
+        == Some("textasset_csv_cell")
 }
 
 /// One non-empty line from a ManagedText-style localization document.
@@ -923,6 +1006,175 @@ fn split_loc_kv(line: &str) -> Option<(&str, &str, &str)> {
         }
     }
     None
+}
+
+/// Simple unquoted CSV table for TextAsset split (BOXMAN item lists, etc.).
+#[derive(Debug)]
+struct TextAssetCsvCell {
+    /// 1-based data row index (header is row 0, not extracted).
+    row: usize,
+    col: usize,
+    header: String,
+    value: String,
+}
+
+#[derive(Debug)]
+struct TextAssetCsv {
+    cells: Vec<TextAssetCsvCell>,
+}
+
+fn is_csv_header_token(h: &str) -> bool {
+    let h = h.trim();
+    !h.is_empty()
+        && h.len() <= 64
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn is_pure_int_token(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '+')
+}
+
+/// Detect simple CSV: header of identifier columns, ≥2 data rows, no quotes,
+/// consistent column counts. Emits cells from non-numeric columns only.
+fn parse_textasset_csv(script: &str) -> Option<TextAssetCsv> {
+    let t = script.trim();
+    if t.is_empty() || t.contains('"') {
+        return None;
+    }
+    // Prefer ManagedText over CSV when both could match (unlikely).
+    if parse_textasset_loc_lines(script).is_some() {
+        return None;
+    }
+    let lines: Vec<&str> = t
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if lines.len() < 3 {
+        return None;
+    }
+    // Header must contain a comma.
+    if !lines[0].contains(',') {
+        return None;
+    }
+    let headers: Vec<&str> = lines[0].split(',').map(|s| s.trim()).collect();
+    if headers.len() < 2 || !headers.iter().all(|h| is_csv_header_token(h)) {
+        return None;
+    }
+    let ncols = headers.len();
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(lines.len() - 1);
+    for line in &lines[1..] {
+        // Require at least one comma on data rows too.
+        if !line.contains(',') {
+            return None;
+        }
+        let cells: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
+        if cells.len() != ncols {
+            return None;
+        }
+        rows.push(cells);
+    }
+    if rows.len() < 2 {
+        return None;
+    }
+    // Text columns: not ≥80% pure integers, and at least one alphabetic cell.
+    let mut text_cols: Vec<usize> = Vec::new();
+    for c in 0..ncols {
+        let numeric = rows.iter().filter(|r| is_pure_int_token(&r[c])).count();
+        if numeric * 100 / rows.len() >= 80 {
+            continue;
+        }
+        if rows
+            .iter()
+            .any(|r| r[c].chars().any(|ch| ch.is_alphabetic()))
+        {
+            text_cols.push(c);
+        }
+    }
+    if text_cols.is_empty() {
+        return None;
+    }
+    let mut cells = Vec::new();
+    for (ri, row) in rows.iter().enumerate() {
+        for &c in &text_cols {
+            let value = row[c].clone();
+            if value.is_empty() {
+                continue;
+            }
+            cells.push(TextAssetCsvCell {
+                row: ri + 1, // 1-based data row
+                col: c,
+                header: headers[c].to_string(),
+                value,
+            });
+        }
+    }
+    if cells.len() < 2 {
+        return None;
+    }
+    Some(TextAssetCsv { cells })
+}
+
+/// Apply CSV cell translations onto the original script (re-parse + rewrite).
+fn apply_csv_translations_to_script(
+    original: &str,
+    cells: &[&StringEntry],
+) -> Option<String> {
+    let newline = if original.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let lines: Vec<&str> = original
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let headers: Vec<&str> = lines[0].split(',').map(|s| s.trim()).collect();
+    let ncols = headers.len();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for line in &lines[1..] {
+        let row: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
+        if row.len() != ncols {
+            return None;
+        }
+        rows.push(row);
+    }
+    for e in cells {
+        let Some(row_i) = e.metadata.get("csv_row").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(col) = e.metadata.get("csv_col").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let row_i = row_i as usize;
+        let col = col as usize;
+        // csv_row is 1-based data index.
+        if row_i == 0 || row_i > rows.len() || col >= ncols {
+            continue;
+        }
+        let text = e.translation.as_deref().unwrap_or(e.source.as_str());
+        // Reject commas / newlines in translation (would break simple CSV).
+        if text.contains(',') || text.contains('\n') || text.contains('\r') {
+            continue;
+        }
+        rows[row_i - 1][col] = text.to_string();
+    }
+    let mut out = headers.join(",");
+    for row in rows {
+        out.push_str(newline);
+        out.push_str(&row.join(","));
+    }
+    // Preserve a trailing newline if the original had one after the last row.
+    if original.ends_with("\r\n") || original.ends_with('\n') {
+        out.push_str(newline);
+    }
+    Some(out)
 }
 
 /// Rebuild a loc document from line entries (sorted by `line_index`).
@@ -1302,6 +1554,103 @@ impl FormatPlugin for UnityPlugin {
             let mut modified = false;
             let label = file_path.display().to_string();
 
+            // ── TextAsset CSV cell groups (re-parse original blob, apply cells) ──
+            {
+                let mut csv_groups: HashMap<i64, Vec<&StringEntry>> = HashMap::new();
+                for entry in file_entries.iter().filter(|e| is_textasset_csv_cell_entry(e)) {
+                    let Some(path_id) = entry
+                        .metadata
+                        .get("path_id")
+                        .and_then(|v| v.as_i64())
+                    else {
+                        warnings.push(format!(
+                            "TextAsset csv cell '{}' missing path_id",
+                            entry.id
+                        ));
+                        strings_skipped += 1;
+                        continue;
+                    };
+                    csv_groups.entry(path_id).or_default().push(*entry);
+                }
+                for (_path_id, group) in csv_groups {
+                    let Some(head) = group.first() else { continue };
+                    let Some(script_off) = head
+                        .metadata
+                        .get("textasset_script_offset")
+                        .and_then(|v| v.as_u64())
+                        .map(|u| u as usize)
+                    else {
+                        strings_skipped += group.len();
+                        continue;
+                    };
+                    let orig_len = head
+                        .metadata
+                        .get("textasset_script_byte_len")
+                        .and_then(|v| v.as_u64())
+                        .map(|u| u as usize)
+                        .unwrap_or(0);
+                    if orig_len == 0 || script_off + 4 + orig_len > bytes.len() {
+                        strings_skipped += group.len();
+                        continue;
+                    }
+                    // Payload starts after the u32 length prefix.
+                    let payload =
+                        &bytes[script_off + 4..script_off + 4 + orig_len];
+                    let Ok(original) = std::str::from_utf8(payload) else {
+                        strings_skipped += group.len();
+                        continue;
+                    };
+                    let Some(mut rebuilt) =
+                        apply_csv_translations_to_script(original, &group)
+                    else {
+                        strings_skipped += group.len();
+                        continue;
+                    };
+                    if rebuilt.len() > orig_len {
+                        if length_skipped < 5 {
+                            warnings.push(format!(
+                                "TextAsset CSV rebuild longer than slot ({} > {}) for '{}', skipping",
+                                rebuilt.len(),
+                                orig_len,
+                                head.id
+                            ));
+                        }
+                        length_skipped += 1;
+                        strings_skipped += group.len();
+                        continue;
+                    }
+                    while rebuilt.len() < orig_len {
+                        rebuilt.push(' ');
+                    }
+                    match rewrite_text_asset_script_inplace(
+                        &mut bytes,
+                        script_off,
+                        orig_len,
+                        &rebuilt,
+                        &label,
+                    ) {
+                        Ok(()) => {
+                            let changed = group
+                                .iter()
+                                .filter(|e| {
+                                    e.translation
+                                        .as_ref()
+                                        .map(|t| t != &e.source)
+                                        .unwrap_or(false)
+                                })
+                                .count();
+                            strings_written += changed.max(1);
+                            strings_skipped += group.len().saturating_sub(changed.max(1));
+                            modified = true;
+                        }
+                        Err(e) => {
+                            warnings.push(format!("TextAsset CSV rewrite {}: {e}", head.id));
+                            strings_skipped += group.len();
+                        }
+                    }
+                }
+            }
+
             // ── TextAsset loc-line groups (rebuild whole m_Script once per path_id) ──
             {
                 let mut loc_groups: HashMap<i64, Vec<&StringEntry>> = HashMap::new();
@@ -1397,10 +1746,11 @@ impl FormatPlugin for UnityPlugin {
             }
 
             // ── Structural TextAsset / MonoBehaviour / TextMesh / GUIText inject ──
-            for entry in file_entries
-                .iter()
-                .filter(|e| is_structural_entry(e) && !is_textasset_loc_line_entry(e))
-            {
+            for entry in file_entries.iter().filter(|e| {
+                is_structural_entry(e)
+                    && !is_textasset_loc_line_entry(e)
+                    && !is_textasset_csv_cell_entry(e)
+            }) {
                 let translation = match &entry.translation {
                     Some(t) => t,
                     None => {
@@ -2195,6 +2545,101 @@ script Chapter_1_script chapter 1 {
             Some("textasset")
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_textasset_csv_text_columns() {
+        let csv = "\
+ITEM_CATEGORY,ITEM_NAME,ITEM_TEST_ID\r\n\
+Electronics,mp3 player,15\r\n\
+Electronics,towel,14\r\n\
+Electronics,video games,13\r\n";
+        let parsed = parse_textasset_csv(csv).expect("csv");
+        // CATEGORY + NAME are text; TEST_ID numeric skipped.
+        assert!(
+            parsed.cells.iter().any(|c| c.value == "mp3 player" && c.header == "ITEM_NAME"),
+            "{:?}",
+            parsed.cells
+        );
+        assert!(
+            parsed.cells.iter().any(|c| c.value == "Electronics"),
+            "{:?}",
+            parsed.cells
+        );
+        assert!(
+            !parsed.cells.iter().any(|c| c.value == "15"),
+            "numeric col must not extract: {:?}",
+            parsed.cells
+        );
+        assert!(parse_textasset_csv("Hello traveler, welcome!").is_none());
+        assert!(parse_textasset_csv("a,b\n1,2").is_none()); // only 1 data row
+    }
+
+    #[test]
+    fn test_textasset_csv_extract_and_inject() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        let mut script = String::from(
+            "ITEM_CATEGORY,ITEM_NAME,ITEM_TEST_ID\r\n\
+Electronics,mp3 player,15\r\n\
+Electronics,towel,14\r\n\
+Electronics,video games,13\r\n",
+        );
+        // Trailing spaces enlarge the m_Script budget for inject pad-in-place.
+        script.push_str(&" ".repeat(48));
+        let bytes = crate::unity_serialized::write_v17_fixture("Items", &script);
+        let assets = data_dir.join("sharedassets0.assets");
+        fs::write(&assets, &bytes).unwrap();
+
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        let cells: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                e.metadata
+                    .get("extraction_method")
+                    .and_then(|v| v.as_str())
+                    == Some("textasset_csv_cell")
+            })
+            .collect();
+        assert!(
+            cells.len() >= 4,
+            "expected csv cells, got {:?}",
+            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+        );
+        assert!(cells.iter().any(|e| e.source == "towel"));
+
+        for e in &mut entries {
+            if e.source == "towel" {
+                e.translation = Some("toalla".into());
+            }
+            if e.source == "mp3 player" {
+                e.translation = Some("mp3".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(
+            report.strings_written >= 1,
+            "written={} {:?}",
+            report.strings_written,
+            report.warnings
+        );
+        let again = plugin.extract(&dir).unwrap();
+        let values: Vec<&str> = again
+            .iter()
+            .filter(|e| {
+                e.metadata
+                    .get("extraction_method")
+                    .and_then(|v| v.as_str())
+                    == Some("textasset_csv_cell")
+            })
+            .map(|e| e.source.as_str())
+            .collect();
+        assert!(values.iter().any(|v| *v == "toalla"), "{values:?}");
+        assert!(values.iter().any(|v| *v == "mp3"), "{values:?}");
+        assert!(values.iter().any(|v| *v == "video games"), "{values:?}");
     }
 
     #[test]
