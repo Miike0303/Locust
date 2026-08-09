@@ -48,7 +48,10 @@ pub fn count_binary_slot_oversize(entries: &[StringEntry]) -> usize {
 /// and still has at least one alphanumeric character.
 ///
 /// Aimed at tight UI labels (e.g. EN→ES `Opciones` on a 7-byte utf8 slot → fold
-/// accents / drop spaces / truncate) so inject skips fewer slots.
+/// accents / drop spaces / drop inner vowels / truncate) so inject skips fewer slots.
+///
+/// Preference: longest **non-truncated** fit first (vowel-compress beats mid-word
+/// chop: `Opciones`→`Opcns` over `Opcione`); only then longest truncated fit.
 pub fn mechanical_fit_binary_slot(encoding: &str, budget: usize, text: &str) -> Option<String> {
     if budget == 0 || text.is_empty() {
         return None;
@@ -57,41 +60,55 @@ pub fn mechanical_fit_binary_slot(encoding: &str, budget: usize, text: &str) -> 
         return Some(text.to_string());
     }
 
-    let mut candidates: Vec<String> = Vec::new();
+    let mut soft: Vec<String> = Vec::new();
+    let push_unique = |v: &mut Vec<String>, s: String| {
+        if !s.is_empty() && !v.iter().any(|x| x == &s) {
+            v.push(s);
+        }
+    };
+
     let trimmed = text.trim();
-    if !trimmed.is_empty() {
-        candidates.push(trimmed.to_string());
-    }
+    push_unique(&mut soft, trimmed.to_string());
     let folded = fold_latin_accents(trimmed);
-    if folded != trimmed && !folded.is_empty() {
-        candidates.push(folded.clone());
-    }
+    push_unique(&mut soft, folded.clone());
     let despaced: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
-    if despaced != trimmed && !despaced.is_empty() {
-        candidates.push(despaced.clone());
-    }
+    push_unique(&mut soft, despaced);
     let fold_despaced: String = folded.chars().filter(|c| !c.is_whitespace()).collect();
-    if fold_despaced != folded && !fold_despaced.is_empty() {
-        candidates.push(fold_despaced);
+    push_unique(&mut soft, fold_despaced);
+
+    // Inner-vowel drop on each soft base (Latin UI abbreviation style).
+    let soft_bases: Vec<String> = soft.clone();
+    for c in &soft_bases {
+        push_unique(&mut soft, drop_inner_vowels(c));
+        let d: String = drop_inner_vowels(c)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        push_unique(&mut soft, d);
     }
 
-    // Truncate each base candidate on encoding boundaries.
-    let base: Vec<String> = candidates.clone();
-    for c in base {
-        if let Some(t) = truncate_to_encoded_budget(encoding, budget, &c) {
-            if !candidates.iter().any(|x| x == &t) {
-                candidates.push(t);
-            }
+    if let Some(best) = pick_longest_fit(encoding, budget, &soft) {
+        return Some(best);
+    }
+
+    // Last resort: truncate soft candidates on encoding boundaries.
+    let mut hard: Vec<String> = Vec::new();
+    for c in &soft {
+        if let Some(t) = truncate_to_encoded_budget(encoding, budget, c) {
+            push_unique(&mut hard, t);
         }
     }
+    pick_longest_fit(encoding, budget, &hard)
+}
 
-    // Prefer the longest fitting candidate (most preserved content).
+/// Prefer the longest candidate that encodes within `budget` and keeps alnum.
+fn pick_longest_fit(encoding: &str, budget: usize, candidates: &[String]) -> Option<String> {
     let mut best: Option<(usize, String)> = None;
     for c in candidates {
         if !c.chars().any(|ch| ch.is_alphanumeric()) {
             continue;
         }
-        let Some(n) = encoded_byte_len(encoding, &c) else {
+        let Some(n) = encoded_byte_len(encoding, c) else {
             continue;
         };
         if n > budget {
@@ -99,10 +116,39 @@ pub fn mechanical_fit_binary_slot(encoding: &str, budget: usize, text: &str) -> 
         }
         match &best {
             Some((bn, _)) if n <= *bn => {}
-            _ => best = Some((n, c)),
+            _ => best = Some((n, c.clone())),
         }
     }
     best.map(|(_, s)| s)
+}
+
+/// Keep the first letter of each word; drop subsequent Latin vowels (a e i o u).
+/// `Opciones` → `Opcns`, `Nueva Partida` → `Nv Prtd`.
+fn drop_inner_vowels(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            out.push(c);
+            at_word_start = true;
+            continue;
+        }
+        if !c.is_alphabetic() {
+            out.push(c);
+            // Digits / punctuation start a new "word" for the next letter.
+            at_word_start = true;
+            continue;
+        }
+        let is_vowel = matches!(
+            c.to_ascii_lowercase(),
+            'a' | 'e' | 'i' | 'o' | 'u'
+        );
+        if at_word_start || !is_vowel {
+            out.push(c);
+        }
+        at_word_start = false;
+    }
+    out
 }
 
 /// Map common Latin accented letters to ASCII (Spanish/French/German UI).
@@ -496,6 +542,28 @@ mod tests {
         let fit2 = mechanical_fit_binary_slot("utf8", 4, "Options").unwrap();
         assert_eq!(fit2, "Opti");
         assert!(encoded_byte_len("utf8", &fit2).unwrap() <= 4);
+    }
+
+    #[test]
+    fn test_mechanical_fit_prefers_vowel_compress_over_midword_truncate() {
+        // ES UI: "Opciones" (8) on 7-byte utf8 slot.
+        // Naive truncate → "Opcione"; inner-vowel drop → "Opcns" (matches real ES E2E style).
+        assert_eq!(encoded_byte_len("utf8", "Opciones").unwrap(), 8);
+        let fit = mechanical_fit_binary_slot("utf8", 7, "Opciones").unwrap();
+        assert!(
+            encoded_byte_len("utf8", &fit).unwrap() <= 7,
+            "fit={fit:?}"
+        );
+        assert_eq!(fit, "Opcns");
+        // Accented: drop_inner_vowels keeps non-ASCII vowels (ó) so "Canción"→"Cncón"
+        // (6 utf8 bytes) fits budget 6 without mid-word chop; preferred over shorter
+        // fold+compress "Cncn".
+        let fit2 = mechanical_fit_binary_slot("utf8", 6, "Canción").unwrap();
+        assert!(
+            encoded_byte_len("utf8", &fit2).unwrap() <= 6,
+            "fit2={fit2:?}"
+        );
+        assert_eq!(fit2, "Cncón");
     }
 
     #[test]
