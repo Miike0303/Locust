@@ -892,6 +892,14 @@ fn is_mono_engine_noise(t: &str) -> bool {
     if matches!(t, "Gosub" | "Goto" | "Else") {
         return true;
     }
+    // Naninovel scenario script blobs (`@hideUI …`, multi-line `@novel` blocks).
+    if looks_like_naninovel_script(t) {
+        return true;
+    }
+    // Designer placeholder copy.
+    if looks_like_lorem_ipsum(t) {
+        return true;
+    }
     // Live2D / face blend-shape parameter labels (BOXMAN).
     if looks_like_face_or_blend_param(t) {
         return true;
@@ -906,6 +914,32 @@ fn is_mono_engine_noise(t: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Naninovel (and similar) scenario commands: every non-empty line is an `@cmd…`.
+/// BOXMAN stores these as MonoBehaviour string fields next to real UI labels.
+pub(crate) fn looks_like_naninovel_script(t: &str) -> bool {
+    let t = t.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // Single-line or leading `@hideUI TutorialUI` / `@else` / `@moveMode state:"drive"`.
+    if t.starts_with('@') {
+        return true;
+    }
+    // Multi-line block where every non-empty line is a command.
+    let lines: Vec<&str> = t
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.len() >= 2 && lines.iter().all(|l| l.starts_with('@'))
+}
+
+/// Classic designer placeholder (BOXMAN ships Lorem blocks in UI prefabs).
+pub(crate) fn looks_like_lorem_ipsum(t: &str) -> bool {
+    let lower = t.to_ascii_lowercase();
+    lower.contains("lorem ipsum")
 }
 
 /// Live2D / facial rig parameter names: `EyeR Open`, `Eyeball Y`, `Mouth Form`,
@@ -1947,6 +1981,44 @@ mod tests {
             texts.iter().any(|t| t.contains("replacement")),
             "keep dialogue: {texts:?}"
         );
+    }
+
+    #[test]
+    fn mono_script_filter_drops_naninovel_scripts_and_lorem() {
+        let bytes = write_v17_mono_fixture(
+            "Holder",
+            &[
+                "Play",
+                "@novel\n@dotween name:\"ItemList\" dir:1\n@stop",
+                "@hideUI TutorialUI",
+                "@else",
+                "@moveMode state:\"drive\"",
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit",
+                "Emily",
+                "Save game",
+            ],
+        );
+        let sf = SerializedFile::parse(bytes, "nani.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| *t == "Play"),
+            "keep UI: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Emily"),
+            "keep name: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Save game"),
+            "keep sentence: {texts:?}"
+        );
+        for drop_sub in ["@novel", "@hideUI", "@else", "@moveMode", "Lorem ipsum"] {
+            assert!(
+                !texts.iter().any(|t| t.contains(drop_sub)),
+                "expected drop containing {drop_sub}: {texts:?}"
+            );
+        }
     }
 
     #[test]
