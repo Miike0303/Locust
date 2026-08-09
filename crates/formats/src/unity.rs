@@ -335,6 +335,11 @@ impl UnityPlugin {
                             if !is_textasset_script_worth_extracting(&ta.script) {
                                 continue;
                             }
+                            // Naninovel / ICU locale name catalogs (`af: Afrikaans`, …) —
+                            // not game UI; skip whole asset (BOXMAN ~233 rows).
+                            if is_locale_catalog_script(&ta.script) {
+                                continue;
+                            }
                             // Simple CSV tables (header + data): text columns as cells.
                             if let Some(csv) = parse_textasset_csv(&ta.script) {
                                 let newline = if ta.script.contains("\r\n") {
@@ -945,6 +950,10 @@ fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
             if value.trim().is_empty() {
                 continue;
             }
+            // Locale-id keys belong in culture catalogs, not translate queues.
+            if looks_like_bcp47_locale_id(key) {
+                continue;
+            }
             out.push(TextAssetLocLine {
                 key: Some(key.to_string()),
                 sep: sep.to_string(),
@@ -967,17 +976,74 @@ fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
     Some(out)
 }
 
-/// ManagedText-style keys: `TitleMenu.START`, `Confirmation.Yes`, `af-ZA`.
+/// ManagedText-style keys: `TitleMenu.START`, `Confirmation.Yes`, `SaveGame`.
 fn looks_like_loc_key(key: &str) -> bool {
     let key = key.trim();
     if key.is_empty() || key.len() > 80 {
         return false;
     }
-    // Prefer dotted keys; also allow locale ids like `af-ZA`.
+    // Prefer dotted / snake keys; bare alnum ≥2 (not BCP-47 locale ids alone —
+    // those are filtered at extract time via `looks_like_bcp47_locale_id`).
     key.contains('.')
         || key.contains('_')
         || key.contains('-')
         || (key.chars().all(|c| c.is_ascii_alphanumeric()) && key.len() >= 2)
+}
+
+/// BCP-47-ish culture id used as ManagedText key in locale name tables:
+/// `af`, `af-ZA`, `zh-Hans`, `es-419`.
+fn looks_like_bcp47_locale_id(key: &str) -> bool {
+    let key = key.trim();
+    if key.is_empty() || key.len() > 16 || key.contains('.') || key.contains('_') {
+        return false;
+    }
+    let parts: Vec<&str> = key.split('-').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return false;
+    }
+    let lang = parts[0];
+    if !(2..=3).contains(&lang.len()) || !lang.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    for p in &parts[1..] {
+        let ok = match p.len() {
+            // Region: US, ZA
+            2 => p.chars().all(|c| c.is_ascii_alphabetic()),
+            // UN M.49 region: 419
+            3 => p.chars().all(|c| c.is_ascii_digit()),
+            // Script: Hans, Hant, Latn
+            4 => p.chars().all(|c| c.is_ascii_alphabetic()),
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Entire ManagedText blob is a culture→display-name catalog (Naninovel `Locales`).
+fn is_locale_catalog_script(script: &str) -> bool {
+    let mut keys = 0usize;
+    let mut locale_keys = 0usize;
+    for line in script.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, _, value)) = split_loc_kv(line) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        keys += 1;
+        if looks_like_bcp47_locale_id(key) {
+            locale_keys += 1;
+        }
+    }
+    // Need a real catalog (≥8 cultures) that is overwhelmingly locale-keyed.
+    keys >= 8 && locale_keys * 100 / keys >= 80
 }
 
 /// `Key: Value` (prefer `: `), bare `:`, or `Key=Value` with no spaces in key.
@@ -2851,6 +2917,73 @@ Electronics,video games,13\r\n",
         // Prose / non-key single line: no split
         assert!(parse_textasset_loc_lines("Hello traveler, welcome!").is_none());
         assert!(parse_textasset_loc_lines("Not a key: has spaces in key side").is_none());
+    }
+
+    #[test]
+    fn test_locale_catalog_keys_and_docs_skipped() {
+        assert!(looks_like_bcp47_locale_id("af"));
+        assert!(looks_like_bcp47_locale_id("af-ZA"));
+        assert!(looks_like_bcp47_locale_id("zh-Hans"));
+        assert!(looks_like_bcp47_locale_id("es-419"));
+        assert!(looks_like_bcp47_locale_id("en-US"));
+        assert!(!looks_like_bcp47_locale_id("TitleMenu.START"));
+        assert!(!looks_like_bcp47_locale_id("Confirmation.Yes"));
+        assert!(!looks_like_bcp47_locale_id("Carter"));
+        assert!(!looks_like_bcp47_locale_id("START"));
+
+        let catalog = "\
+af: Afrikaans\r\n\
+af-ZA: Afrikaans (South Africa)\r\n\
+ar: Arabic\r\n\
+ar-AE: Arabic (U.A.E.)\r\n\
+en: English\r\n\
+en-US: English (United States)\r\n\
+es: Spanish\r\n\
+es-419: Spanish (Latin America)\r\n\
+zh-Hans: Chinese (Simplified)\r\n";
+        assert!(is_locale_catalog_script(catalog));
+        assert!(!is_locale_catalog_script(
+            "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS\r\n"
+        ));
+
+        // Locale keys dropped from mixed docs; game keys kept.
+        let mixed = "\
+af: Afrikaans\r\n\
+TitleMenu.START: NEW GAME\r\n\
+en-US: English (United States)\r\n\
+Confirmation.Yes: YES\r\n";
+        let lines = parse_textasset_loc_lines(mixed).expect("mixed");
+        assert!(
+            lines.iter().all(|l| {
+                l.key
+                    .as_deref()
+                    .map(|k| !looks_like_bcp47_locale_id(k))
+                    .unwrap_or(true)
+            }),
+            "locale keys must be filtered: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.value == "NEW GAME"));
+        assert!(lines.iter().any(|l| l.value == "YES"));
+        assert!(!lines.iter().any(|l| l.value.contains("Afrikaans")));
+
+        // Full extract skips Naninovel Locales catalog asset.
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        let bytes = crate::unity_serialized::write_v17_fixture("Locales", catalog);
+        fs::write(data_dir.join("sharedassets0.assets"), &bytes).unwrap();
+        let entries = UnityPlugin::new().extract(&dir).unwrap();
+        assert!(
+            !entries.iter().any(|e| e.source.contains("Afrikaans")),
+            "locale catalog must not extract: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(
+            !entries.iter().any(|e| e.source.contains("af:")),
+            "must not fall back to whole-blob extract: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
     }
 
     #[test]
