@@ -1050,6 +1050,26 @@ pub(crate) fn looks_like_code_identifier(t: &str) -> bool {
     has_inner_upper || has_digit
 }
 
+/// Whether a TextAsset `m_Script` body is worth extracting as translateable text.
+/// Drops empty/binary payloads and line-break **character-class tables** (TMP/ICU
+/// style strings of brackets/punctuation with almost no letters — BOXMAN 830/831).
+pub fn is_textasset_script_worth_extracting(script: &str) -> bool {
+    let t = script.trim();
+    if t.is_empty() || is_binary_looking_script(script) {
+        return false;
+    }
+    let total = t.chars().count();
+    if total >= 20 {
+        let letters = t.chars().filter(|c| c.is_alphabetic()).count();
+        let ratio = letters as f64 / total as f64;
+        // Charset tables are nearly all punctuation/symbols.
+        if ratio < 0.12 {
+            return false;
+        }
+    }
+    true
+}
+
 /// True if `script` looks like binary (high non-text ratio).
 pub fn is_binary_looking_script(script: &str) -> bool {
     if script.is_empty() {
@@ -1388,6 +1408,20 @@ mod tests {
         bytes[8..12].copy_from_slice(&9u32.to_be_bytes());
         let e = SerializedFile::parse(bytes, "old.assets").unwrap_err();
         assert!(e.message.contains("version 9"), "{}", e.message);
+    }
+
+    #[test]
+    fn textasset_script_worth_extracting_rejects_charset_tables() {
+        let charset = "([｛〔〈《「『【〘〖〝‘“｟«$—…‥〳〴〵\\［（{£¥\"々〇〉》」＄｠￥￦ #)]｝〕〉》」』】〙〗〟’”｠»";
+        assert!(!is_textasset_script_worth_extracting(charset));
+        assert!(!is_textasset_script_worth_extracting(""));
+        assert!(!is_textasset_script_worth_extracting("   \n"));
+        assert!(is_textasset_script_worth_extracting(
+            "Gallery.Scene1: Change of Heart\r\nTitleMenu.START: NEW GAME"
+        ));
+        assert!(is_textasset_script_worth_extracting(
+            "ITEM_CATEGORY,ITEM_NAME\r\nElectronics,mp3 player"
+        ));
     }
 
     #[test]

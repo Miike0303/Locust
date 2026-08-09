@@ -6,8 +6,8 @@ use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 use crate::unity_serialized::{
-    is_binary_looking_script, looks_like_code_identifier, rewrite_text_asset_script_inplace,
-    SerializedFile,
+    is_binary_looking_script, is_textasset_script_worth_extracting, looks_like_code_identifier,
+    rewrite_text_asset_script_inplace, SerializedFile,
 };
 
 /// Plugin for Unity Engine games.
@@ -331,10 +331,7 @@ impl UnityPlugin {
                 for obj in sf.text_asset_objects() {
                     match sf.read_text_asset(obj.path_id) {
                         Ok(ta) => {
-                            if is_binary_looking_script(&ta.script) {
-                                continue;
-                            }
-                            if ta.script.trim().is_empty() {
+                            if !is_textasset_script_worth_extracting(&ta.script) {
                                 continue;
                             }
                             // Keep every structural instance (unique path_id / inject offset).
@@ -860,11 +857,27 @@ fn is_unity_translatable(text: &str) -> bool {
         return false;
     }
     // Shader / UI material path leftovers: `UI/Default Font`, `UI/Lit/…`
-    if s.starts_with("UI/") {
+    if s.starts_with("UI/") || s.starts_with("Skybox/") {
         return false;
     }
     // Animator layer default name (not player-facing).
     if s == "Base Layer" {
+        return false;
+    }
+    // Built-in Light2D default object name (no hierarchy clone suffix).
+    if s == "Light 2D" {
+        return false;
+    }
+    // Editor selection suffixes on hierarchy names: `btn Night (Selected)`.
+    if s.ends_with(" (Selected)")
+        || s.ends_with(" (Highlighted)")
+        || s.ends_with(" (Disabled)")
+        || s.ends_with(" (Pressed)")
+    {
+        return false;
+    }
+    // Asset/addressable-ish path crumbs with spaces: `naninovel/audio/bgm/…`
+    if s.starts_with("naninovel/") || s.contains("/audio/") || s.contains("/bgm/") {
         return false;
     }
     // Shader #define soup: `BLENDMODES_MODE_MULTIPLY ETC1_EXTERNAL_ALPHA`
@@ -1738,6 +1751,42 @@ script Chapter_1_script chapter 1 {
         assert!(!is_unity_translatable(
             "BLENDMODES_MODE_MULTIPLY ETC1_EXTERNAL_ALPHA"
         ));
+        assert!(!is_unity_translatable("Skybox/Procedural"));
+        assert!(!is_unity_translatable("Light 2D"));
+        assert!(!is_unity_translatable("btn Night (Selected)"));
+        assert!(!is_unity_translatable(
+            "naninovel/audio/bgm/hscene_ntr/erotic 01"
+        ));
+    }
+
+    #[test]
+    fn test_textasset_skips_linebreak_charset_tables() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        // Near-zero alphabetic content — TMP line-break character class table.
+        let charset = "([｛〔〈《「『【〘〖〝‘“｟«$—…‥〳〴〵\\［（{£¥\"々〇〉》」＄｠￥￦ #)]｝〕〉》」』】〙〗〟’”｠»";
+        assert!(
+            !crate::unity_serialized::is_textasset_script_worth_extracting(charset),
+            "charset table must be rejected"
+        );
+        assert!(crate::unity_serialized::is_textasset_script_worth_extracting(
+            "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS"
+        ));
+        let bytes = crate::unity_serialized::write_v17_fixture("LineBreak", charset);
+        fs::write(data_dir.join("sharedassets0.assets"), bytes).unwrap();
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let ta: Vec<_> = entries
+            .iter()
+            .filter(|e| e.tags.iter().any(|t| t == "textasset"))
+            .collect();
+        assert!(
+            ta.is_empty(),
+            "line-break charset TextAsset must not extract: {:?}",
+            ta.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
     }
 
     /// MonoScript bodies must not leak type names into heuristic extract.
