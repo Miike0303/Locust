@@ -1383,7 +1383,23 @@ fn is_unity_translatable(text: &str) -> bool {
         return false;
     }
     // uGUI hierarchy defaults (ScrollRect / Mask / Scrollbar).
-    if matches!(s, "Sliding Area" | "Viewport") {
+    if matches!(s, "Sliding Area" | "Viewport" | "Thumbnail") {
+        return false;
+    }
+    // Pure all-lowercase ascii token (code/mode ids). Title Case UI stays.
+    if looks_like_all_lowercase_code_token(s) {
+        return false;
+    }
+    // Animation / timeline clips: `Worker_Deliver Order_03`
+    if looks_like_animation_clip_name(s) {
+        return false;
+    }
+    // Path crumbs with a pure-digit segment: `night/2 centered`
+    if looks_like_slash_digit_path(s) {
+        return false;
+    }
+    // Hierarchy / prefab names ending in asset type: `Pillar Sprite`
+    if looks_like_asset_type_suffix_name(s) {
         return false;
     }
     // Editor selection suffixes on hierarchy names: `btn Night (Selected)`.
@@ -1523,6 +1539,60 @@ fn looks_like_unity_renderer_id_label(s: &str) -> bool {
         }
     }
     s.ends_with(')')
+}
+
+/// Single-token all-lowercase ascii identifier (`bezierpoint`, `workmode`).
+/// Player-facing English UI is almost always Title Case / sentence case.
+fn looks_like_all_lowercase_code_token(s: &str) -> bool {
+    let s = s.trim();
+    if s.len() < 5 || s.contains(' ') {
+        return false;
+    }
+    s.chars().all(|c| c.is_ascii_lowercase())
+}
+
+/// Animator / timeline clip names that end with `_NN` (optionally with spaces).
+/// e.g. `Worker_Deliver Order_03`, `Idle_Walk_12`.
+fn looks_like_animation_clip_name(s: &str) -> bool {
+    let s = s.trim();
+    if !s.contains('_') {
+        return false;
+    }
+    // Last underscore segment is pure digits (length ≥ 2 preferred for scene indices).
+    let Some(last) = s.rsplit('_').next() else {
+        return false;
+    };
+    last.len() >= 2 && last.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Slash path with a pure-digit segment: `night/2 centered`, `maps/03/intro`.
+fn looks_like_slash_digit_path(s: &str) -> bool {
+    let s = s.trim();
+    if !s.contains('/') {
+        return false;
+    }
+    s.split(|c: char| c == '/' || c.is_whitespace())
+        .any(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Prefab / hierarchy names that are just `"… Sprite"` / `"… Mesh"` / `"… Collider"`.
+fn looks_like_asset_type_suffix_name(s: &str) -> bool {
+    let s = s.trim();
+    const SUFFIXES: &[&str] = &[
+        " Sprite",
+        " Mesh",
+        " Collider",
+        " Renderer",
+        " Material",
+        " Texture",
+        " Prefab",
+    ];
+    SUFFIXES.iter().any(|suf| {
+        s.len() > suf.len()
+            && s.ends_with(suf)
+            // Require a simple left token (letters/digits/hyphen/underscore), not a sentence.
+            && !s[..s.len() - suf.len()].contains(' ')
+    })
 }
 
 impl Default for UnityPlugin {
@@ -2555,11 +2625,24 @@ script Chapter_1_script chapter 1 {
         // Binary soup mis-read as length-prefixed strings
         assert!(!is_unity_translatable("\x18$1>JVbmrvv"));
         assert!(!is_unity_translatable("\x16!,7@IOSSS"));
+        // All-lowercase code tokens (no word break) — not Title Case UI
+        assert!(!is_unity_translatable("bezierpoint"));
+        assert!(!is_unity_translatable("workmode"));
+        // Animation / timeline clip names ending in _NN
+        assert!(!is_unity_translatable("Worker_Deliver Order_03"));
+        assert!(!is_unity_translatable("Worker_Pickup Order_01"));
+        // Resource path fragments with a pure-digit segment
+        assert!(!is_unity_translatable("night/2 centered"));
+        // Hierarchy asset-type suffix
+        assert!(!is_unity_translatable("Pillar Sprite"));
+        // Extra uGUI default
+        assert!(!is_unity_translatable("Thumbnail"));
         // Real UI / dialogue with slash must still pass when clearly sentence-like.
         assert!(is_unity_translatable("Press Start"));
         assert!(is_unity_translatable("Save game now"));
         assert!(is_unity_translatable("Delete")); // short UI verb
         assert!(is_unity_translatable("Progress")); // short UI label
+        assert!(is_unity_translatable("Clothing")); // inventory category
     }
 
     #[test]
