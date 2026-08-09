@@ -3,9 +3,10 @@
 //!   `m_Name` / `m_Script` reads + in-place rewrite (payload pad with `0x20`;
 //!   length-prefix u32 left byte-identical so BE assets stay valid).
 //! - **Slice 2:** skip type-tree blobs (no field interpretation), MonoBehaviour
-//!   (class_id 114) base layout (`m_GameObject`, `m_Enabled`, `m_Script`,
-//!   `m_Name`) plus sequential aligned-string fields after the base for
-//!   extract/in-place rewrite. Full type-tree walks remain out of scope.
+//!   (class_id 114 **or negative** script-type ids) base layout (`m_GameObject`,
+//!   `m_Enabled`, `m_Script`, `m_Name`) plus sequential aligned-string fields
+//!   after the base for extract/in-place rewrite. Full type-tree walks remain
+//!   out of scope.
 //!
 //! # Format (AssetStudio / AssetsTools.NET conventions)
 //! Header fields through `data_offset` are **big-endian**. From version ≥ 9 the
@@ -35,6 +36,17 @@ use std::path::Path;
 pub const CLASS_ID_TEXT_ASSET: i32 = 49;
 /// Unity class ID for MonoBehaviour.
 pub const CLASS_ID_MONO_BEHAVIOUR: i32 = 114;
+
+/// True when `class_id` is a MonoBehaviour type in the SerializedFile type table.
+///
+/// AssetsTools / AssetStudio convention: MonoBehaviour is **114**, and in some
+/// older/stripped layouts a **negative** class id marks a MonoBehaviour script
+/// type (script type index + script_id hash still present). Treat both as mono
+/// for extract/inject so those titles are not silently skipped.
+#[inline]
+pub fn is_monobehaviour_class(class_id: i32) -> bool {
+    class_id == CLASS_ID_MONO_BEHAVIOUR || class_id < 0
+}
 
 /// SerializedFile format versions we fully support for slices 1–2.
 pub const MIN_SUPPORTED_VERSION: u32 = 17;
@@ -319,8 +331,8 @@ impl SerializedFile {
             let is_stripped = r.u8()? != 0;
             // v >= 17
             let script_type_index = r.i16()?;
-            // script_id[16] for MonoBehaviour / negative class
-            if class_id == CLASS_ID_MONO_BEHAVIOUR || class_id < 0 {
+            // script_id[16] for MonoBehaviour / negative class (script type)
+            if is_monobehaviour_class(class_id) {
                 let _script_id = r.take(16)?;
             }
             let _old_type_hash = r.take(16)?;
@@ -406,7 +418,7 @@ impl SerializedFile {
     pub fn mono_behaviour_objects(&self) -> impl Iterator<Item = &ObjectInfo> {
         self.objects
             .iter()
-            .filter(|o| o.class_id == CLASS_ID_MONO_BEHAVIOUR)
+            .filter(|o| is_monobehaviour_class(o.class_id))
     }
 
     /// Read TextAsset `m_Name` + `m_Script` at `path_id`.
@@ -444,7 +456,7 @@ impl SerializedFile {
         let obj = self
             .objects
             .iter()
-            .find(|o| o.path_id == path_id && o.class_id == CLASS_ID_MONO_BEHAVIOUR)
+            .find(|o| o.path_id == path_id && is_monobehaviour_class(o.class_id))
             .ok_or_else(|| {
                 err(
                     &label,
@@ -542,7 +554,7 @@ impl SerializedFile {
         self.objects
             .iter()
             .filter(|o| {
-                o.class_id == CLASS_ID_TEXT_ASSET || o.class_id == CLASS_ID_MONO_BEHAVIOUR
+                o.class_id == CLASS_ID_TEXT_ASSET || is_monobehaviour_class(o.class_id)
             })
             .map(|o| {
                 let s = o.data_abs as usize;
@@ -1023,6 +1035,39 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert!(ranges[0].1 > ranges[0].0);
     }
+
+    #[test]
+    fn is_monobehaviour_class_accepts_114_and_negative() {
+        assert!(is_monobehaviour_class(CLASS_ID_MONO_BEHAVIOUR));
+        assert!(is_monobehaviour_class(-1));
+        assert!(is_monobehaviour_class(-12345));
+        assert!(!is_monobehaviour_class(CLASS_ID_TEXT_ASSET));
+        assert!(!is_monobehaviour_class(1));
+        assert!(!is_monobehaviour_class(0));
+    }
+
+    /// Negative type-table class ids are MonoBehaviour script types in some
+    /// SerializedFiles — must extract sequential strings like class 114.
+    #[test]
+    fn parse_v17_negative_class_id_monobehaviour() {
+        let bytes = write_v17_mono_fixture_with_class(
+            -42,
+            "DialogBox",
+            &["Welcome, traveler!"],
+        );
+        let sf = SerializedFile::parse(bytes, "neg.assets").unwrap();
+        let monos: Vec<_> = sf.mono_behaviour_objects().collect();
+        assert_eq!(monos.len(), 1, "negative class_id must count as mono");
+        assert_eq!(monos[0].class_id, -42);
+        assert_eq!(monos[0].path_id, 10);
+
+        let fields = sf.read_mono_strings(10).unwrap();
+        assert!(
+            fields.iter().any(|f| f.text == "Welcome, traveler!"),
+            "fields: {fields:?}"
+        );
+        assert_eq!(sf.structural_object_byte_ranges().len(), 1);
+    }
 }
 
 /// v17 fixture: one TextAsset, enable_type_tree=1 with a minimal skippable blob.
@@ -1090,6 +1135,17 @@ pub fn write_v17_fixture_with_type_tree(text_name: &str, text_script: &str) -> V
 /// v17 fixture: one MonoBehaviour with `m_Name` + sequential string fields.
 #[cfg(test)]
 pub fn write_v17_mono_fixture(mono_name: &str, script_strings: &[&str]) -> Vec<u8> {
+    write_v17_mono_fixture_with_class(CLASS_ID_MONO_BEHAVIOUR, mono_name, script_strings)
+}
+
+/// Like [`write_v17_mono_fixture`] but with an explicit type-table `class_id`
+/// (e.g. negative script-type id).
+#[cfg(test)]
+pub fn write_v17_mono_fixture_with_class(
+    class_id: i32,
+    mono_name: &str,
+    script_strings: &[&str],
+) -> Vec<u8> {
     fn align4(n: usize) -> usize {
         (n + 3) & !3
     }
@@ -1123,10 +1179,13 @@ pub fn write_v17_mono_fixture(mono_name: &str, script_strings: &[&str]) -> Vec<u
     meta.push(0); // no type tree
 
     meta.extend_from_slice(&1i32.to_le_bytes());
-    meta.extend_from_slice(&CLASS_ID_MONO_BEHAVIOUR.to_le_bytes());
+    meta.extend_from_slice(&class_id.to_le_bytes());
     meta.push(0);
     meta.extend_from_slice(&0i16.to_le_bytes()); // script_type_index
-    meta.extend_from_slice(&[0u8; 16]); // script_id (class 114)
+    // script_id present for mono 114 and negative script-type ids
+    if is_monobehaviour_class(class_id) {
+        meta.extend_from_slice(&[0u8; 16]);
+    }
     meta.extend_from_slice(&[0u8; 16]); // old_type_hash
 
     meta.extend_from_slice(&1i32.to_le_bytes());
