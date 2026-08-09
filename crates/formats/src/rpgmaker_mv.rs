@@ -1785,6 +1785,24 @@ impl RpgMakerMvPlugin {
     }
 
     /// Write/merge Iavra multi-packs for `target_lang` from extracted source-pack entries.
+    /// Iavra pack values carry the game's own hand-wrapped line breaks, but a
+    /// provider returns one flat line, which overflows the message window.
+    /// Restore the source's line width when the translation exceeds it.
+    ///
+    /// A single-line source is a name/label slot — it renders on one line, so
+    /// an overlong translation needs shorter wording, never a line break.
+    fn rewrap_iavra_value(source: &str, translation: &str) -> String {
+        if !source.contains('\n') {
+            return translation.to_string();
+        }
+        let width = source.lines().map(visible_len).max().unwrap_or(0);
+        if width == 0 || translation.lines().all(|l| visible_len(l) <= width) {
+            return translation.to_string();
+        }
+        let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
+        wrap_message(&flat, width).join("\n")
+    }
+
     fn inject_add_iavra_packs(
         _game_root: &Path,
         data_dir: &Path,
@@ -1820,10 +1838,10 @@ impl RpgMakerMvPlugin {
                 .strip_prefix(&format!("{filename}#"))
                 .unwrap_or(entry.id.as_str());
             if let Some(ref translation) = entry.translation {
-                by_pack
-                    .entry(pack.to_string())
-                    .or_default()
-                    .insert(key.to_string(), translation.clone());
+                by_pack.entry(pack.to_string()).or_default().insert(
+                    key.to_string(),
+                    Self::rewrap_iavra_value(&entry.source, translation),
+                );
                 strings_written += 1;
             } else {
                 strings_skipped += 1;
@@ -2063,6 +2081,32 @@ mod tests {
         let lines = wrap_message("uno dos tres cuatro cinco seis", 12);
         assert!(lines.iter().all(|l| visible_len(l) <= 12), "{:?}", lines);
         assert_eq!(lines.join(" "), "uno dos tres cuatro cinco seis");
+    }
+
+    #[test]
+    fn test_rewrap_iavra_value_restores_source_line_width() {
+        // Provider flattened a hand-wrapped message: re-wrap to the source width.
+        let src = "Hey, I heard your little brother\nand sister have no food to eat?";
+        let flat = "Oye, escuché que tu hermanito y tu hermanita no tienen nada de comida, ¿verdad?";
+        let out = RpgMakerMvPlugin::rewrap_iavra_value(src, flat);
+        let width = src.lines().map(visible_len).max().unwrap();
+        assert!(out.contains('\n'), "should have been re-wrapped: {out:?}");
+        for line in out.lines() {
+            assert!(visible_len(line) <= width, "line over budget: {line:?}");
+        }
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            flat.split_whitespace().collect::<Vec<_>>(),
+            "re-wrapping must not change wording"
+        );
+
+        // Single-line source is a name/label slot: never gains a break.
+        let name = RpgMakerMvPlugin::rewrap_iavra_value("Dragon Flail", "Mayal de dragón");
+        assert_eq!(name, "Mayal de dragón");
+
+        // A translation that already fits is left exactly as the translator wrote it.
+        let kept = RpgMakerMvPlugin::rewrap_iavra_value(src, "Corto\ny cabe");
+        assert_eq!(kept, "Corto\ny cabe");
     }
 
     #[test]
