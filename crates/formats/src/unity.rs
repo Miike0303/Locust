@@ -322,7 +322,6 @@ impl UnityPlugin {
     ) -> Vec<StringEntry> {
         let mut entries = Vec::new();
         let mut skip_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
 
         match SerializedFile::parse(bytes.to_vec(), file_path) {
             Ok(sf) => {
@@ -336,10 +335,7 @@ impl UnityPlugin {
                             if ta.script.trim().is_empty() {
                                 continue;
                             }
-                            // Keep every structural instance (unique path_id / inject
-                            // offset). Only mark text as seen so the heuristic scan
-                            // below does not re-add the same label.
-                            seen.insert(ta.script.clone());
+                            // Keep every structural instance (unique path_id / inject offset).
                             let id = format!("textasset/{}", ta.path_id);
                             let mut entry =
                                 StringEntry::new(id, ta.script.clone(), file_path.to_path_buf());
@@ -394,9 +390,7 @@ impl UnityPlugin {
                                 if field.text.trim().is_empty() {
                                     continue;
                                 }
-                                // Do not dedupe structural mono fields by text —
-                                // repeated UI labels ("OK", "Cancel") need each slot.
-                                seen.insert(field.text.clone());
+                                // Do not dedupe by text — repeated UI labels need each slot.
                                 let id = format!(
                                     "monobehaviour/{}/{}",
                                     field.path_id, field.field_index
@@ -466,7 +460,6 @@ impl UnityPlugin {
                             if is_binary_looking_script(&tm.text) {
                                 continue;
                             }
-                            seen.insert(tm.text.clone());
                             let id = format!("textmesh/{}", tm.path_id);
                             let mut entry =
                                 StringEntry::new(id, tm.text.clone(), file_path.to_path_buf());
@@ -514,7 +507,6 @@ impl UnityPlugin {
                             if is_binary_looking_script(&gt.text) {
                                 continue;
                             }
-                            seen.insert(gt.text.clone());
                             let id = format!("guitext/{}", gt.path_id);
                             let mut entry =
                                 StringEntry::new(id, gt.text.clone(), file_path.to_path_buf());
@@ -586,7 +578,9 @@ impl UnityPlugin {
                 continue;
             }
             if let Ok(text) = std::str::from_utf8(&bytes[i + 4..i + 4 + str_len]) {
-                if is_unity_translatable(text) && seen.insert(text.to_string()) {
+                // Keep every offset occurrence (do not de-dupe by text). Repeated
+                // UI labels in binary blobs each need their own inject needle.
+                if is_unity_translatable(text) {
                     let id = format!("{}#offset_{}#{}", filename, i, entries.len());
                     let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
                     entry.tags = vec!["unknown".to_string()];
@@ -1800,6 +1794,69 @@ script Chapter_1_script chapter 1 {
         let path = data_dir.join("sharedassets0.assets");
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    /// Heuristic scan must keep every offset of the same label (not de-dupe by text)
+    /// so multi-pattern inject can rewrite all occurrences.
+    #[test]
+    fn test_heuristic_keeps_duplicate_text_offsets() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        // Not a SerializedFile — pure heuristic payload with the same string twice.
+        let s = b"Press Start"; // passes is_unity_translatable
+        let mut data = vec![0u8; 32];
+        for _ in 0..2 {
+            data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            data.extend_from_slice(s);
+            data.extend_from_slice(&[0u8; 8]); // gap so scan continues
+        }
+        let assets = data_dir.join("sharedassets0.assets");
+        fs::write(&assets, &data).unwrap();
+
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let hits: Vec<_> = entries
+            .iter()
+            .filter(|e| e.source == "Press Start")
+            .collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "expected both heuristic offsets, got {:?}",
+            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+        );
+        assert!(hits.iter().all(|e| {
+            e.metadata
+                .get("extraction_method")
+                .and_then(|v| v.as_str())
+                == Some("heuristic")
+        }));
+
+        let mut inject_entries = entries;
+        for e in &mut inject_entries {
+            if e.source == "Press Start" {
+                e.translation = Some("Pulsa!".into()); // 6 < 11
+            }
+        }
+        let report = plugin.inject(&dir, &inject_entries).unwrap();
+        assert!(
+            report.strings_written >= 2,
+            "both occurrences must inject: written={} {:?}",
+            report.strings_written,
+            report.warnings
+        );
+        let out = fs::read(&assets).unwrap();
+        let count = out
+            .windows(6)
+            .filter(|w| w == b"Pulsa!")
+            .count();
+        assert!(
+            count >= 2,
+            "expected ≥2 rewritten payloads, found {count}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Two TextMeshes with identical m_Text must both extract (unique path_ids)
