@@ -573,12 +573,21 @@ fn is_unity_serialized_candidate(path: &Path) -> bool {
     if path.extension().is_some_and(|e| e == "assets") {
         return true;
     }
-    // Built player "level0", "level1", … often have no extension.
+    // Built-player SerializedFiles often have **no extension**:
+    // - level0, level1, … (scenes)
+    // - globalgamemanagers (player settings / managers; Unity 5+)
+    // - resources (legacy / some builds)
+    // Skip .resS / .resource / .dll companions.
     path.file_name()
         .and_then(|n| n.to_str())
         .map(|n| {
             let lower = n.to_ascii_lowercase();
-            lower.starts_with("level") && !lower.contains('.')
+            if lower.contains('.') {
+                return false;
+            }
+            lower.starts_with("level")
+                || lower == "globalgamemanagers"
+                || lower == "resources"
         })
         .unwrap_or(false)
 }
@@ -1115,6 +1124,73 @@ script Chapter_1_script chapter 1 {
         let dir = tempdir();
         let plugin = UnityPlugin::new();
         assert!(!plugin.detect(&dir));
+    }
+
+    #[test]
+    fn test_serialized_candidate_extensionless_managers_and_levels() {
+        use std::path::PathBuf;
+        assert!(is_unity_serialized_candidate(Path::new(
+            "Game_Data/globalgamemanagers"
+        )));
+        assert!(is_unity_serialized_candidate(Path::new("Game_Data/level0")));
+        assert!(is_unity_serialized_candidate(Path::new(
+            "Game_Data/level12"
+        )));
+        assert!(is_unity_serialized_candidate(Path::new(
+            "Game_Data/resources.assets"
+        )));
+        assert!(is_unity_serialized_candidate(Path::new(
+            "Game_Data/resources"
+        )));
+        // Companions / non-serialized
+        assert!(!is_unity_serialized_candidate(Path::new(
+            "Game_Data/globalgamemanagers.assets.resS"
+        )));
+        assert!(!is_unity_serialized_candidate(Path::new(
+            "Game_Data/resources.resource"
+        )));
+        assert!(!is_unity_serialized_candidate(Path::new(
+            "Game_Data/UnityPlayer.dll"
+        )));
+        assert!(!is_unity_serialized_candidate(Path::new(
+            "Game_Data/sharedassets0.assets.resS"
+        )));
+        // PathBuf for Windows-style
+        let p = PathBuf::from(r"C:\Games\Boxman_Data\globalgamemanagers");
+        assert!(is_unity_serialized_candidate(&p));
+    }
+
+    #[test]
+    fn test_extract_finds_extensionless_globalgamemanagers() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+
+        // Real SerializedFile (v17 TextAsset) stored under the classic
+        // extensionless managers name — must be discovered and extracted.
+        let bytes = crate::unity_serialized::write_v17_fixture(
+            "Sys",
+            "Extensionless managers dialogue",
+        );
+        fs::write(data_dir.join("globalgamemanagers"), &bytes).unwrap();
+
+        let plugin = UnityPlugin::new();
+        let found = UnityPlugin::find_assets_files(&dir);
+        assert!(
+            found.iter().any(|p| p
+                .file_name()
+                .is_some_and(|n| n == "globalgamemanagers")),
+            "must discover globalgamemanagers: {found:?}"
+        );
+        let entries = plugin.extract(&dir).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.source == "Extensionless managers dialogue"),
+            "got: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
     }
 
     #[test]
