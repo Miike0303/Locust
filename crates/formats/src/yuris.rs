@@ -798,7 +798,7 @@ fn load_ystb(bytes: &[u8], file_label: &str) -> Result<Option<DecryptedYstb>> {
     }))
 }
 
-fn inject_into_ystb(ystb: &DecryptedYstb, translations: &HashMap<usize, &str>) -> Result<Vec<u8>> {
+fn inject_into_ystb(ystb: &DecryptedYstb, translations: &HashMap<usize, String>) -> Result<Vec<u8>> {
     let (_, attr_desc_off, attr_vals_off, line_off) = section_offsets(&ystb.hdr);
 
     // Build new attribute-values blob; track per-descriptor (size, offset).
@@ -809,7 +809,7 @@ fn inject_into_ystb(ystb: &DecryptedYstb, translations: &HashMap<usize, &str>) -
     let mut by_attr: HashMap<usize, &str> = HashMap::new();
     for s in &ystb.strings {
         if let Some(t) = translations.get(&s.arg_index) {
-            by_attr.insert(s.attr_index, *t);
+            by_attr.insert(s.attr_index, t.as_str());
         }
     }
 
@@ -883,9 +883,7 @@ fn entries_from_ystb_bytes(
     Ok(all)
 }
 
-fn translations_from_entries<'a>(
-    file_entries: &[&'a StringEntry],
-) -> (HashMap<usize, &'a str>, usize) {
+fn translations_from_entries(file_entries: &[&StringEntry]) -> (HashMap<usize, String>, usize) {
     let mut translations = HashMap::new();
     let mut skipped = 0usize;
     for e in file_entries {
@@ -895,7 +893,13 @@ fn translations_from_entries<'a>(
         };
         if let Some(pos) = e.id.rfind("#arg") {
             if let Ok(idx) = e.id[pos + 4..].parse::<usize>() {
-                translations.insert(idx, t);
+                // Messages carry the author's own hard wraps; a provider hands
+                // back one flat line. `escape_c_light` drops bare CR, so
+                // rejoining on LF reproduces the file's original `\n` escapes.
+                translations.insert(
+                    idx,
+                    crate::rpgmaker_mv::rewrap_to_source_width(&e.source, t),
+                );
                 continue;
             }
         }
@@ -1652,6 +1656,74 @@ mod tests {
         assert!(
             sources.iter().any(|s| s.contains("Bienvenido")),
             "re-extract missing: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn test_inject_rewraps_flattened_multiline_message() {
+        // YU-RIS messages carry the author's own hard wraps (confirmed on a
+        // real title: mid-sentence breaks). A provider returns one flat line,
+        // which used to be written back as-is and overflow the textbox.
+        let dir = tempdir();
+        create_fixture(&dir);
+        let plugin = YurisPlugin::new();
+
+        // Stage 1: give the fixture a hand-wrapped message. The source is
+        // single-line here, so this is written verbatim.
+        let wrapped = "Hola viajero del norte\nbienvenido a esta posada.";
+        let mut entries = plugin.extract(&dir).unwrap();
+        let target = entries
+            .iter()
+            .find(|e| e.source.contains("Hello, traveler"))
+            .expect("fixture should have the traveler line")
+            .id
+            .clone();
+        for e in &mut entries {
+            if e.id == target {
+                e.translation = Some(wrapped.to_string());
+            }
+        }
+        plugin.inject(&dir, &entries).unwrap();
+
+        // Stage 2: the source is now multi-line and the provider flattens it.
+        let flat = "Saludos viajero venido desde las montanas del norte, bienvenido.";
+        let mut entries = plugin.extract(&dir).unwrap();
+        let src = entries
+            .iter()
+            .find(|e| e.id == target)
+            .expect("target entry")
+            .source
+            .clone();
+        assert!(
+            src.contains('\n'),
+            "setup: source should now be multi-line, got {src:?}"
+        );
+        let width = src.lines().map(crate::rpgmaker_mv::visible_len).max().unwrap();
+        for e in &mut entries {
+            if e.id == target {
+                e.translation = Some(flat.to_string());
+            }
+        }
+        plugin.inject(&dir, &entries).unwrap();
+
+        let written = plugin
+            .extract(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == target)
+            .expect("target entry")
+            .source;
+        assert!(written.contains('\n'), "should be re-wrapped: {written:?}");
+        for line in written.lines() {
+            assert!(
+                crate::rpgmaker_mv::visible_len(line) <= width,
+                "line over budget: {line:?}"
+            );
+        }
+        assert_eq!(
+            written.split_whitespace().collect::<Vec<_>>(),
+            flat.split_whitespace().collect::<Vec<_>>(),
+            "re-wrapping must not change wording"
         );
     }
 
