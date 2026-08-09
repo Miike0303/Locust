@@ -926,6 +926,10 @@ fn is_mono_engine_noise(t: &str) -> bool {
     ) {
         return true;
     }
+    // Scene/dev markers: `------------------------------ SETUP LIGHTS IN GALLERY MODE`
+    if looks_like_dev_separator_banner(t) {
+        return true;
+    }
     false
 }
 
@@ -938,6 +942,36 @@ fn looks_like_hex_token(t: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit())
         // Require at least one a-f so pure decimal numbers can stay (rare UI).
         && t.chars().any(|c| matches!(c, 'a'..='f' | 'A'..='F'))
+}
+
+/// Editor/scene section banners padded with dashes (BOXMAN gallery setup notes).
+/// e.g. `------------------------------ SETUP LIGHTS IN GALLERY MODE`
+fn looks_like_dev_separator_banner(t: &str) -> bool {
+    let t = t.trim();
+    if t.len() < 12 {
+        return false;
+    }
+    let leading = t
+        .chars()
+        .take_while(|c| matches!(c, '-' | '=' | '_' | '*'))
+        .count();
+    if leading < 8 {
+        return false;
+    }
+    let rest = t[leading..].trim();
+    if rest.is_empty() {
+        return true;
+    }
+    // Remainder is a shouty ALL-CAPS dev note (allow spaces / digits / `/`).
+    let letters: Vec<char> = rest.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.is_empty() {
+        return true;
+    }
+    let upper = letters.iter().filter(|c| c.is_ascii_uppercase()).count();
+    upper * 100 / letters.len() >= 70
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace() || matches!(c, '/' | '_' | '-' | ':' | '.'))
 }
 
 /// Naninovel (and similar) scenario commands: every non-empty line is an `@cmd…`.
@@ -2087,6 +2121,51 @@ mod tests {
             );
         }
         for keep in ["Play", "Emily", "Q.SAVE", "Message speed:"] {
+            assert!(
+                texts.iter().any(|t| *t == keep),
+                "expected keep {keep}: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mono_script_filter_drops_dev_separator_banners() {
+        assert!(looks_like_dev_separator_banner(
+            "------------------------------ SETUP LIGHTS IN GALLERY MODE"
+        ));
+        assert!(looks_like_dev_separator_banner(
+            "------------------------------ SPAWN TOPDOWN SPRITES"
+        ));
+        assert!(looks_like_dev_separator_banner("--------------------"));
+        assert!(!looks_like_dev_separator_banner("---- short"));
+        assert!(!looks_like_dev_separator_banner("----------")); // < 12 chars
+        assert!(!looks_like_dev_separator_banner(
+            "Please wait — loading your save..."
+        ));
+        assert!(!looks_like_dev_separator_banner("Play"));
+
+        let bytes = write_v17_mono_fixture(
+            "Scene",
+            &[
+                "------------------------------ SETUP LIGHTS IN GALLERY MODE",
+                "------------------------------ SPAWN TOPDOWN SPRITES",
+                "Play",
+                "Emily",
+                "Option A",
+            ],
+        );
+        let sf = SerializedFile::parse(bytes, "banner.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("SETUP LIGHTS")),
+            "drop gallery banner: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("SPAWN TOPDOWN")),
+            "drop spawn banner: {texts:?}"
+        );
+        for keep in ["Play", "Emily", "Option A"] {
             assert!(
                 texts.iter().any(|t| *t == keep),
                 "expected keep {keep}: {texts:?}"
