@@ -1354,16 +1354,12 @@ fn is_unity_translatable(text: &str) -> bool {
     if s.contains('/') && s.contains('.') && !s.contains(' ') {
         return false;
     }
-    // Shader / material path-like tokens: "Legacy Shaders/Reflective/Diffuse"
-    // (slash-separated, no sentence whitespace).
-    if !s.contains(' ') && s.matches('/').count() >= 2 {
+    // Shader / material / built-in path crumbs (BOXMAN globalgamemanagers heuristic).
+    if looks_like_unity_shader_or_engine_path(s) {
         return false;
     }
-    if s.contains("Shaders/") || s.starts_with("Hidden/") || s.starts_with("Legacy Shaders/") {
-        return false;
-    }
-    // Shader / UI material path leftovers: `UI/Default Font`, `UI/Lit/…`
-    if s.starts_with("UI/") || s.starts_with("Skybox/") {
+    // Hierarchy debug labels: `Mesh Renderer (Id :1)`.
+    if looks_like_unity_renderer_id_label(s) {
         return false;
     }
     // Animator layer default name (not player-facing).
@@ -1459,6 +1455,58 @@ fn looks_like_unity_instance_name(s: &str) -> bool {
     };
     let inner = &s[open + 2..s.len() - 1];
     !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Built-in shader / material family paths that flood heuristic scans of
+/// `globalgamemanagers` (not player-facing copy).
+fn looks_like_unity_shader_or_engine_path(s: &str) -> bool {
+    let s = s.trim();
+    if s.contains("Shaders/")
+        || s.starts_with("Hidden/")
+        || s.starts_with("Legacy Shaders/")
+        || s.starts_with("UI/")
+        || s.starts_with("Skybox/")
+    {
+        return true;
+    }
+    // Common built-in families (single slash is enough): `Mobile/Diffuse`, `FX/Flare`.
+    const PREFIXES: &[&str] = &[
+        "Mobile/",
+        "Nature/",
+        "FX/",
+        "Particles/",
+        "Sprites/",
+        "Unlit/",
+        "GUI/",
+        "VR/",
+        "AR/",
+        "TextMeshPro/",
+        "Universal Render Pipeline/",
+        "Autodesk/",
+        "Standard/",
+        "Legacy/",
+    ];
+    if PREFIXES.iter().any(|p| s.starts_with(p)) {
+        return true;
+    }
+    // Multi-segment slash paths without sentence whitespace (shader-style).
+    if !s.contains(' ') && s.matches('/').count() >= 2 {
+        return true;
+    }
+    false
+}
+
+/// `Mesh Renderer (Id :1)` / `Collider (Id: 3)` editor debug labels.
+fn looks_like_unity_renderer_id_label(s: &str) -> bool {
+    let s = s.trim();
+    if !(s.contains("(Id :") || s.contains("(Id:") || s.contains("(Id : ") || s.contains("(id :")) {
+        // Case variants
+        let lower = s.to_ascii_lowercase();
+        if !(lower.contains("(id :") || lower.contains("(id:")) {
+            return false;
+        }
+    }
+    s.ends_with(')')
 }
 
 impl Default for UnityPlugin {
@@ -2472,6 +2520,17 @@ script Chapter_1_script chapter 1 {
         assert!(!is_unity_translatable(
             "naninovel/audio/bgm/hscene_ntr/erotic 01"
         ));
+        // BOXMAN globalgamemanagers single-slash shader families
+        assert!(!is_unity_translatable("Mobile/Diffuse"));
+        assert!(!is_unity_translatable("FX/Flare"));
+        assert!(!is_unity_translatable("Nature/Tree Creator Leaves Fast"));
+        assert!(!is_unity_translatable(
+            "Mobile/Bumped Specular (1 Directional Realtime Light)"
+        ));
+        assert!(!is_unity_translatable("Mesh Renderer (Id :1)"));
+        // Real UI / dialogue with slash must still pass when clearly sentence-like.
+        assert!(is_unity_translatable("Press Start"));
+        assert!(is_unity_translatable("Save game now"));
     }
 
     #[test]
