@@ -204,10 +204,25 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
         );
       }
       setRegReports(done);
-      addToast(
-        "success",
-        `Registered ${done.length} language(s) in game UI (backups *.bak-locust)`
+      const anyChange = done.some(
+        (d) =>
+          d.report.plugins_js ||
+          d.report.iavra_languages ||
+          d.report.visumz_options ||
+          (d.report.maps_patched?.length ?? 0) > 0
       );
+      if (anyChange) {
+        addToast(
+          "success",
+          `Registered ${done.length} language(s) in game UI (backups *.bak-locust)`
+        );
+      } else {
+        addToast(
+          "warning",
+          "No Iavra/VisuMZ language patterns or Map boot choices matched — game may not use multi-lang UI plugins",
+          8000
+        );
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       addLog("error", "register-lang failed", msg, "inject");

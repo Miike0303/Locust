@@ -54,4 +54,4 @@ locust providers                    # List translation providers
 - Unreal multi-GB base pak E2E: done (Last Hope); optional more titles
 - RM MZ POR `.jsono` + Iavra multi-pack extract: done (prefer `en`); inject Replace re-encodes `.jsono`; inject Add writes `lang_*_{lang}.jsono` packs
 - RM MZ UI language registration: `locust register-lang <game> -l es --label Español` (Iavra + VisuMZ langs arrays + Map boot choices; `*.bak-locust`); **desktop/server**: `POST /api/register-lang` + Tauri `register_lang` + Inject modal “Register … in game UI” for rpgmaker-* formats
-- Apply patch from URL: `locust apply <game> --url https://…/patch.zip` + desktop/server `zip_url`
+- Apply patch from URL: `locust apply <game> --url https://…/patch.zip` + desktop/server `zip_url` (desktop validates http(s) only + mutually exclusive with local path; register-lang warns when no UI patterns matched)

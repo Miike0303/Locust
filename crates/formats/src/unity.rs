@@ -758,7 +758,7 @@ impl FormatPlugin for UnityPlugin {
     }
 
     fn description(&self) -> &str {
-        "Unity Engine (VN scripts + TextAsset structural + .assets heuristic)"
+        "Unity Engine (VN scripts + TextAsset/MonoBehaviour structural + SerializedFile heuristic)"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {

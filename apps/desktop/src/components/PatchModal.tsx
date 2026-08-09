@@ -127,19 +127,38 @@ export default function PatchModal({
     }
   };
 
-  const patchSource = (): { zip_path?: string; zip_url?: string } | null => {
+  const patchSource = ():
+    | { zip_path?: string; zip_url?: string }
+    | { error: string }
+    | null => {
     const path = zipPath.trim();
     const url = zipUrl.trim();
-    if (path && url) return null;
+    if (path && url) {
+      return { error: "Use either a local zip path or a URL, not both" };
+    }
     if (path) return { zip_path: path };
-    if (url) return { zip_url: url };
+    if (url) {
+      const lower = url.toLowerCase();
+      if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
+        return { error: "Patch URL must start with http:// or https://" };
+      }
+      return { zip_url: url };
+    }
     return null;
   };
 
   const handleVerify = async () => {
     const src = patchSource();
-    if (!gamePath.trim() || !src) {
-      addToast("error", "Select game folder and either a local zip or a zip URL");
+    if (!gamePath.trim()) {
+      addToast("error", "Select a game folder");
+      return;
+    }
+    if (!src) {
+      addToast("error", "Select a local zip or a patch zip URL");
+      return;
+    }
+    if ("error" in src) {
+      addToast("error", src.error);
       return;
     }
     setLoading(true);
@@ -166,8 +185,16 @@ export default function PatchModal({
 
   const handleApply = async () => {
     const src = patchSource();
-    if (!gamePath.trim() || !src) {
-      addToast("error", "Select game folder and either a local zip or a zip URL");
+    if (!gamePath.trim()) {
+      addToast("error", "Select a game folder");
+      return;
+    }
+    if (!src) {
+      addToast("error", "Select a local zip or a patch zip URL");
+      return;
+    }
+    if ("error" in src) {
+      addToast("error", src.error);
       return;
     }
     setLoading(true);
