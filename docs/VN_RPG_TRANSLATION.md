@@ -53,8 +53,8 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
 - **Binary slot engines** (Unity UTF-8, Unreal UTF-16LE heuristic, Wolf Shift-JIS):
   inject **skips** oversize translations (no hard fail). Extract tags
   `metadata.binary_slot` (`utf8` / `utf16le` / `sjis`); `locust validate <db>` reports
-  `ExceedsBinarySlot` before inject. The translation engine does **one length-aware
-  retry** when a provider returns an oversize binary-slot string. First-pass hints use
+  `ExceedsBinarySlot` before inject. The translation engine does **up to **two length-aware
+  retries** when a provider returns an oversize binary-slot string. First-pass hints use
   **HARD MAX** wording for budgets ≤12 encoded bytes; the retry quotes the failed
   attempt and exact excess so the model can edit rather than retranslate. Provider
   **fallback chains**: CLI `--fallback a,b,c` and desktop translate dialog (same core
@@ -67,7 +67,7 @@ locust patch-rollback "<clean_game_copy>"   # restores .locust/backup
   Fitting strings inject cleanly; `locust validate` reports `ExceedsBinarySlot` for
   the rest. Takeaway: length-aware retry helps longer lines; single-word UI slots
   often need manual edit or pad-friendly sources. Prompt tighten (quote previous + HARD MAX for tight slots) re-measured same night:
-  oversize dropped **3→1** (`Load Game`→`Cargar`, `Options`→`Opcns` fit; `New Game` still 9>8).
+  with 2 retries + HARD MAX prompts: **0 oversize** on re-measure (`New Game`→`Nueva Pt`, `Load Game`→`Cargar J`, `Options`→`Opcns`).
 
 **Phase-2 apply / real-game notes (copies or patch paks, mock or equal-length where
 needed):** RPG Maker MV, MZ, XP/VXA, Ren'Py, SugarCube, HTML generic, Unity (BOXMAN +
