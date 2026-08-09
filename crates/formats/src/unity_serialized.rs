@@ -1643,6 +1643,86 @@ pub fn write_v17_textmesh_fixture(m_text: &str) -> Vec<u8> {
     out
 }
 
+/// Two TextMesh objects with the **same** `m_Text` (distinct path_ids 7 and 8).
+/// Used to prove structural extract keeps both instances for inject.
+#[cfg(test)]
+pub fn write_v17_dual_textmesh_same_text(m_text: &str) -> Vec<u8> {
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+        let pad = align4(b.len()) - b.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+    fn write_pptr(buf: &mut Vec<u8>, file_id: i32, path_id: i64) {
+        buf.extend_from_slice(&file_id.to_le_bytes());
+        buf.extend_from_slice(&path_id.to_le_bytes());
+    }
+    fn textmesh_payload(m_text: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        write_pptr(&mut payload, 0, 1);
+        write_aligned_string(&mut payload, m_text);
+        payload.extend_from_slice(&0f32.to_le_bytes());
+        payload.extend_from_slice(&1f32.to_le_bytes());
+        payload
+    }
+
+    let p0 = textmesh_payload(m_text);
+    let p1 = textmesh_payload(m_text);
+    let p0_len = p0.len() as u32;
+    let p1_len = p1.len() as u32;
+
+    let mut meta = Vec::new();
+    meta.extend_from_slice(b"2019.4.0f1\0");
+    meta.extend_from_slice(&1u32.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&1i32.to_le_bytes()); // 1 type
+    meta.extend_from_slice(&CLASS_ID_TEXT_MESH.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&(-1i16).to_le_bytes());
+    meta.extend_from_slice(&[0u8; 16]);
+    meta.extend_from_slice(&2i32.to_le_bytes()); // 2 objects
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    // obj0 path_id=7 byte_start=0
+    meta.extend_from_slice(&7i64.to_le_bytes());
+    meta.extend_from_slice(&0u32.to_le_bytes());
+    meta.extend_from_slice(&p0_len.to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes());
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    // obj1 path_id=8 byte_start after p0
+    meta.extend_from_slice(&8i64.to_le_bytes());
+    meta.extend_from_slice(&p0_len.to_le_bytes());
+    meta.extend_from_slice(&p1_len.to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes());
+
+    let header_len = 20usize;
+    let mut data_offset = header_len + meta.len();
+    data_offset = (data_offset + 15) & !15;
+    let file_size = data_offset + p0.len() + p1.len();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(file_size as u32).to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&meta);
+    while out.len() < data_offset {
+        out.push(0);
+    }
+    out.extend_from_slice(&p0);
+    out.extend_from_slice(&p1);
+    out
+}
+
 /// v17 fixture: one GUIText (class 132) with Behaviour base + m_PixelOffset + m_Text.
 #[cfg(test)]
 pub fn write_v17_guitext_fixture(m_text: &str) -> Vec<u8> {

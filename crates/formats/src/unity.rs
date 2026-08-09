@@ -336,9 +336,10 @@ impl UnityPlugin {
                             if ta.script.trim().is_empty() {
                                 continue;
                             }
-                            if !seen.insert(ta.script.clone()) {
-                                continue;
-                            }
+                            // Keep every structural instance (unique path_id / inject
+                            // offset). Only mark text as seen so the heuristic scan
+                            // below does not re-add the same label.
+                            seen.insert(ta.script.clone());
                             let id = format!("textasset/{}", ta.path_id);
                             let mut entry =
                                 StringEntry::new(id, ta.script.clone(), file_path.to_path_buf());
@@ -393,9 +394,9 @@ impl UnityPlugin {
                                 if field.text.trim().is_empty() {
                                     continue;
                                 }
-                                if !seen.insert(field.text.clone()) {
-                                    continue;
-                                }
+                                // Do not dedupe structural mono fields by text —
+                                // repeated UI labels ("OK", "Cancel") need each slot.
+                                seen.insert(field.text.clone());
                                 let id = format!(
                                     "monobehaviour/{}/{}",
                                     field.path_id, field.field_index
@@ -465,9 +466,7 @@ impl UnityPlugin {
                             if is_binary_looking_script(&tm.text) {
                                 continue;
                             }
-                            if !seen.insert(tm.text.clone()) {
-                                continue;
-                            }
+                            seen.insert(tm.text.clone());
                             let id = format!("textmesh/{}", tm.path_id);
                             let mut entry =
                                 StringEntry::new(id, tm.text.clone(), file_path.to_path_buf());
@@ -515,9 +514,7 @@ impl UnityPlugin {
                             if is_binary_looking_script(&gt.text) {
                                 continue;
                             }
-                            if !seen.insert(gt.text.clone()) {
-                                continue;
-                            }
+                            seen.insert(gt.text.clone());
                             let id = format!("guitext/{}", gt.path_id);
                             let mut entry =
                                 StringEntry::new(id, gt.text.clone(), file_path.to_path_buf());
@@ -1793,6 +1790,74 @@ script Chapter_1_script chapter 1 {
         let path = data_dir.join("sharedassets0.assets");
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    fn create_dual_textmesh_same_text_fixture(dir: &Path) -> PathBuf {
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        let bytes = crate::unity_serialized::write_v17_dual_textmesh_same_text("OK");
+        let path = data_dir.join("sharedassets0.assets");
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Two TextMeshes with identical m_Text must both extract (unique path_ids)
+    /// so inject can rewrite every instance of a repeated UI label.
+    #[test]
+    fn test_structural_keeps_duplicate_text_instances() {
+        let dir = tempdir();
+        create_dual_textmesh_same_text_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let tm: Vec<_> = entries
+            .iter()
+            .filter(|e| e.tags.iter().any(|t| t == "textmesh"))
+            .collect();
+        assert_eq!(
+            tm.len(),
+            2,
+            "expected both OK TextMeshes, got {:?}",
+            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+        );
+        assert!(tm.iter().any(|e| e.id == "textmesh/7"));
+        assert!(tm.iter().any(|e| e.id == "textmesh/8"));
+        assert!(tm.iter().all(|e| e.source == "OK"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_structural_inject_both_duplicate_instances() {
+        let dir = tempdir();
+        let assets = create_dual_textmesh_same_text_fixture(&dir);
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        for e in &mut entries {
+            if e.tags.iter().any(|t| t == "textmesh") {
+                e.translation = Some("Si".into());
+            }
+        }
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(
+            report.strings_written >= 2,
+            "both instances must inject: written={} {:?}",
+            report.strings_written,
+            report.warnings
+        );
+        let again = plugin.extract(&dir).unwrap();
+        let tm: Vec<_> = again
+            .iter()
+            .filter(|e| e.tags.iter().any(|t| t == "textmesh"))
+            .collect();
+        assert_eq!(tm.len(), 2);
+        assert!(
+            tm.iter().all(|e| e.source.starts_with("Si")),
+            "both rewritten: {:?}",
+            tm.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        let sf = SerializedFile::parse_path(&assets).unwrap();
+        assert_eq!(sf.text_mesh_objects().count(), 2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
