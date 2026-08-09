@@ -6,7 +6,8 @@ use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 use crate::unity_serialized::{
-    is_binary_looking_script, rewrite_text_asset_script_inplace, SerializedFile,
+    is_binary_looking_script, looks_like_code_identifier, rewrite_text_asset_script_inplace,
+    SerializedFile,
 };
 
 /// Plugin for Unity Engine games.
@@ -325,7 +326,8 @@ impl UnityPlugin {
 
         match SerializedFile::parse(bytes.to_vec(), file_path) {
             Ok(sf) => {
-                skip_ranges = sf.structural_object_byte_ranges();
+                // Structural ranges + MonoScript/Shader (type names / HLSL noise).
+                skip_ranges = sf.heuristic_skip_byte_ranges();
                 for obj in sf.text_asset_objects() {
                     match sf.read_text_asset(obj.path_id) {
                         Ok(ta) => {
@@ -827,32 +829,105 @@ fn split_format_codes(text: &str) -> (String, String, String) {
 
 fn is_unity_translatable(text: &str) -> bool {
     let s = text.trim();
-    if s.is_empty() || s.len() < 5 { return false; }
-    let total = s.chars().count();
-    let ascii_printable = s.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).count();
-    if (ascii_printable as f64 / total as f64) < 0.85 { return false; }
-    let letters = s.chars().filter(|c| c.is_alphabetic()).count();
-    if letters < 3 { return false; }
-    let has_space = s.contains(' ');
-    if !has_space && s.len() > 20 { return false; }
-    if s.contains('/') && s.contains('.') && !s.contains(' ') { return false; }
-    if s.contains('\\') && s.contains('.') { return false; }
-    if s.chars().all(|c| c.is_ascii_uppercase() || c == '_') { return false; }
-    if !has_space {
-        let transitions = s.as_bytes().windows(2)
-            .filter(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
-            .count();
-        if transitions >= 2 { return false; }
-    }
-    if s.starts_with("http") || s.starts_with("www.") { return false; }
-    if s.contains("::") || (s.contains('.') && !s.contains(' ')) { return false; }
-    if s.contains("(){") || s.contains("};") || s.starts_with("using ") ||
-       s.starts_with("import ") || s.starts_with("public ") || s.starts_with("private ") {
+    if s.is_empty() || s.len() < 5 {
         return false;
     }
-    let punct_ratio = s.chars().filter(|c| !c.is_alphanumeric() && !c.is_whitespace()).count() as f64 / total as f64;
-    if punct_ratio > 0.4 { return false; }
+    let total = s.chars().count();
+    let ascii_printable = s
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+        .count();
+    if (ascii_printable as f64 / total as f64) < 0.85 {
+        return false;
+    }
+    let letters = s.chars().filter(|c| c.is_alphabetic()).count();
+    if letters < 3 {
+        return false;
+    }
+    let has_space = s.contains(' ');
+    if !has_space && s.len() > 20 {
+        return false;
+    }
+    if s.contains('/') && s.contains('.') && !s.contains(' ') {
+        return false;
+    }
+    // Shader / material path-like tokens: "Legacy Shaders/Reflective/Diffuse"
+    // (slash-separated, no sentence whitespace).
+    if !s.contains(' ') && s.matches('/').count() >= 2 {
+        return false;
+    }
+    if s.contains("Shaders/") || s.starts_with("Hidden/") || s.starts_with("Legacy Shaders/") {
+        return false;
+    }
+    if s.contains('\\') && s.contains('.') {
+        return false;
+    }
+    if s
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+        && s.chars().any(|c| c.is_ascii_uppercase())
+    {
+        return false;
+    }
+    // MonoScript / type-name noise: PascalCase, camelCase, Name2, snake_Case ids.
+    if !has_space && looks_like_code_identifier(s) {
+        return false;
+    }
+    // Underscore tokens without spaces (Command_POSGenerator, Sprite_Idle).
+    if !has_space && s.contains('_') {
+        return false;
+    }
+    if !has_space {
+        let transitions = s
+            .as_bytes()
+            .windows(2)
+            .filter(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
+            .count();
+        if transitions >= 1 {
+            return false;
+        }
+    }
+    // Unity hierarchy clone names: "Light 2D (7)", "SpeechBubbleIcon (4)".
+    if looks_like_unity_instance_name(s) {
+        return false;
+    }
+    if s.starts_with("http") || s.starts_with("www.") {
+        return false;
+    }
+    if s.contains("::") || (s.contains('.') && !s.contains(' ')) {
+        return false;
+    }
+    if s.contains("(){")
+        || s.contains("};")
+        || s.starts_with("using ")
+        || s.starts_with("import ")
+        || s.starts_with("public ")
+        || s.starts_with("private ")
+    {
+        return false;
+    }
+    let punct_ratio = s
+        .chars()
+        .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())
+        .count() as f64
+        / total as f64;
+    if punct_ratio > 0.4 {
+        return false;
+    }
     true
+}
+
+/// Unity editor hierarchy instance names end with `" (N)"` (clone index).
+fn looks_like_unity_instance_name(s: &str) -> bool {
+    let s = s.trim();
+    if !s.ends_with(')') {
+        return false;
+    }
+    let Some(open) = s.rfind(" (") else {
+        return false;
+    };
+    let inner = &s[open + 2..s.len() - 1];
+    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
 }
 
 impl Default for UnityPlugin {
@@ -1626,10 +1701,51 @@ script Chapter_1_script chapter 1 {
     fn test_is_translatable() {
         assert!(is_unity_translatable("Hello World"));
         assert!(is_unity_translatable("Press any key to continue"));
+        assert!(is_unity_translatable("Hello")); // plain word, not code id
+        assert!(is_unity_translatable("Save game"));
         assert!(!is_unity_translatable("abc"));
         assert!(!is_unity_translatable("SOME_CONSTANT_NAME"));
         assert!(!is_unity_translatable("Assets/Textures/player.png"));
         assert!(!is_unity_translatable("UnityEngine.CoreModule"));
+        // MonoScript / type-name noise (BOXMAN heuristic flood)
+        // Title-case single words like "Naninovel" stay filter-pass (same as "Hello");
+        // MonoScript class 115 byte ranges are skipped instead.
+        assert!(!is_unity_translatable("QuaternionTween"));
+        assert!(!is_unity_translatable("ISpawnManager"));
+        assert!(!is_unity_translatable("TMPro"));
+        assert!(!is_unity_translatable("Command_POSGenerator"));
+        // Unity hierarchy instance names
+        assert!(!is_unity_translatable("Light 2D (7)"));
+        assert!(!is_unity_translatable("SpeechBubbleIcon (4)"));
+        assert!(!is_unity_translatable("PROPS_STRUCTURE_12 (1)"));
+        // Shader path leftovers outside Shader object ranges
+        assert!(!is_unity_translatable("Legacy Shaders/Reflective/Diffuse"));
+        assert!(!is_unity_translatable("Hidden/Internal-GUITexture"));
+    }
+
+    /// MonoScript bodies must not leak type names into heuristic extract.
+    #[test]
+    fn test_monoscript_range_skipped_by_heuristic() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        let bytes = crate::unity_serialized::write_v17_monoscript_noise_fixture();
+        fs::write(data_dir.join("sharedassets0.assets"), bytes).unwrap();
+
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(&dir).unwrap();
+        let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
+        assert!(
+            sources.iter().any(|s| s.contains("Hello traveler")),
+            "TextAsset script still extracted: {:?}",
+            sources
+        );
+        assert!(
+            !sources.iter().any(|s| *s == "Naninovel" || *s == "QuaternionTween"),
+            "MonoScript type names must not appear: {:?}",
+            sources
+        );
     }
 
     fn create_textasset_assets_fixture(dir: &Path) -> PathBuf {

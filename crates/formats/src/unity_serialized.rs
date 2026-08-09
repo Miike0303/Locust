@@ -8,8 +8,9 @@
 //!   after the base for extract/in-place rewrite (also recovers Unity `string[]` /
 //!   `List<string>` as i32 count + N aligned strings when count is small);
 //!   **TextMesh** (class_id 141) `m_Text` after `m_GameObject` PPtr; **GUIText**
-//!   (class_id 132) `m_Text` after Behaviour base + `m_PixelOffset`. Full
-//!   type-tree walks remain out of scope.
+//!   (class_id 132) `m_Text` after Behaviour base + `m_PixelOffset`. Heuristic
+//!   scan also **skips MonoScript (115) + Shader (48)** ranges (type-name / HLSL
+//!   noise). Full type-tree walks remain out of scope.
 //!
 //! # Format (AssetStudio / AssetsTools.NET conventions)
 //! Header fields through `data_offset` are **big-endian**. From version ≥ 9 the
@@ -37,8 +38,12 @@ use std::path::Path;
 
 /// Unity class ID for TextAsset.
 pub const CLASS_ID_TEXT_ASSET: i32 = 49;
+/// Unity class ID for Shader (HLSL source — not player-facing text).
+pub const CLASS_ID_SHADER: i32 = 48;
 /// Unity class ID for MonoBehaviour.
 pub const CLASS_ID_MONO_BEHAVIOUR: i32 = 114;
+/// Unity class ID for MonoScript (assembly type metadata — heuristic noise).
+pub const CLASS_ID_MONO_SCRIPT: i32 = 115;
 /// Unity class ID for legacy TextMesh (3D text component).
 pub const CLASS_ID_TEXT_MESH: i32 = 141;
 /// Unity class ID for legacy GUIText (screen-space text component).
@@ -703,11 +708,22 @@ impl SerializedFile {
     pub fn structural_object_byte_ranges(&self) -> Vec<(usize, usize)> {
         self.objects
             .iter()
+            .filter(|o| is_structural_extract_class(o.class_id))
+            .map(|o| {
+                let s = o.data_abs as usize;
+                (s, s + o.byte_size as usize)
+            })
+            .collect()
+    }
+
+    /// Ranges the heuristic length-prefix scan must not re-read: structural
+    /// extract classes **plus** known non-text blobs (MonoScript type names,
+    /// Shader source) that flood extracts with engine identifiers.
+    pub fn heuristic_skip_byte_ranges(&self) -> Vec<(usize, usize)> {
+        self.objects
+            .iter()
             .filter(|o| {
-                o.class_id == CLASS_ID_TEXT_ASSET
-                    || is_monobehaviour_class(o.class_id)
-                    || o.class_id == CLASS_ID_TEXT_MESH
-                    || o.class_id == CLASS_ID_GUI_TEXT
+                is_structural_extract_class(o.class_id) || is_heuristic_noise_class(o.class_id)
             })
             .map(|o| {
                 let s = o.data_abs as usize;
@@ -715,6 +731,22 @@ impl SerializedFile {
             })
             .collect()
     }
+}
+
+/// Classes we extract via dedicated structural readers.
+#[inline]
+pub fn is_structural_extract_class(class_id: i32) -> bool {
+    class_id == CLASS_ID_TEXT_ASSET
+        || is_monobehaviour_class(class_id)
+        || class_id == CLASS_ID_TEXT_MESH
+        || class_id == CLASS_ID_GUI_TEXT
+}
+
+/// Classes that are never player-facing dialogue but often contain length-prefixed
+/// ASCII identifiers (type names, HLSL). Heuristic scan skips their byte ranges.
+#[inline]
+pub fn is_heuristic_noise_class(class_id: i32) -> bool {
+    class_id == CLASS_ID_MONO_SCRIPT || class_id == CLASS_ID_SHADER
 }
 
 /// Try reading Unity `string[]` / `List<string>`: i32/u32 count already at `r.pos`,
@@ -844,6 +876,20 @@ fn mono_script_field_worth_extracting(s: &str) -> bool {
     {
         return false;
     }
+    // Assembly-qualified type refs: `UnityEngine.Object, UnityEngine`.
+    if t.contains(", UnityEngine")
+        || t.contains(", Assembly-CSharp")
+        || (t.contains('.') && t.contains(',') && !t.contains(' '))
+    {
+        return false;
+    }
+    // Engine API / serialized method tokens (not player-facing).
+    if matches!(
+        t,
+        "set_text" | "get_text" | "set_enabled" | "get_enabled" | "set_active" | "get_active"
+    ) {
+        return false;
+    }
     // Single-token PascalCase / camelCase identifiers (SpritesDefault, Live2DSceneHolder).
     // Keep multi-word / multi-line / script-ish text (`@showUI …`, `Portable Speaker`).
     let has_word_break = t.chars().any(|c| c.is_whitespace() || c == '@');
@@ -853,7 +899,10 @@ fn mono_script_field_worth_extracting(s: &str) -> bool {
     true
 }
 
-fn looks_like_code_identifier(t: &str) -> bool {
+/// True for PascalCase / camelCase / `name2` style tokens — not plain words
+/// like `"Hola"` / `"Save"`. Shared by MonoBehaviour field filter and heuristic
+/// `is_unity_translatable`.
+pub(crate) fn looks_like_code_identifier(t: &str) -> bool {
     if t.is_empty() || !t.chars().next().unwrap().is_ascii_alphabetic() {
         return false;
     }
@@ -1353,6 +1402,38 @@ mod tests {
         assert!(!is_monobehaviour_class(0));
     }
 
+    #[test]
+    fn is_heuristic_noise_class_monoscript_and_shader() {
+        assert!(is_heuristic_noise_class(CLASS_ID_MONO_SCRIPT));
+        assert!(is_heuristic_noise_class(CLASS_ID_SHADER));
+        assert!(!is_heuristic_noise_class(CLASS_ID_TEXT_ASSET));
+        assert!(!is_heuristic_noise_class(CLASS_ID_MONO_BEHAVIOUR));
+        assert!(!is_heuristic_noise_class(1)); // GameObject — may still be scanned
+    }
+
+    #[test]
+    fn heuristic_skip_includes_monoscript_range() {
+        let bytes = write_v17_monoscript_noise_fixture();
+        let sf = SerializedFile::parse(bytes, "ms.assets").unwrap();
+        let structural = sf.structural_object_byte_ranges();
+        let skip = sf.heuristic_skip_byte_ranges();
+        assert!(
+            skip.len() > structural.len(),
+            "MonoScript range must expand heuristic skip beyond structural"
+        );
+        // MonoScript object path_id=2
+        let ms = sf
+            .objects
+            .iter()
+            .find(|o| o.class_id == CLASS_ID_MONO_SCRIPT)
+            .expect("fixture has MonoScript");
+        let ms_start = ms.data_abs as usize;
+        assert!(
+            skip.iter().any(|&(s, e)| s <= ms_start && ms_start < e),
+            "MonoScript body must be in heuristic skip ranges"
+        );
+    }
+
     /// Negative type-table class ids are MonoBehaviour script types in some
     /// SerializedFiles — must extract sequential strings like class 114.
     #[test]
@@ -1515,6 +1596,38 @@ mod tests {
             gt2.text
         );
         assert_eq!(gt2.text_byte_len, 11);
+    }
+
+    #[test]
+    fn mono_script_filter_drops_assembly_and_api_tokens() {
+        let bytes = write_v17_mono_fixture(
+            "Holder",
+            &[
+                "Portable Speaker",
+                "UnityEngine.Object, UnityEngine",
+                "set_text",
+                "Welcome home",
+            ],
+        );
+        let sf = SerializedFile::parse(bytes, "filt.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| *t == "Portable Speaker"),
+            "keep dialogue-ish: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Welcome home"),
+            "keep sentence: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("UnityEngine")),
+            "drop assembly type: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| *t == "set_text"),
+            "drop API token: {texts:?}"
+        );
     }
 
     /// `List<string>` / `string[]`: i32 count + N aligned strings after m_Name.
@@ -2224,3 +2337,82 @@ pub fn write_v17_mono_fixture_with_int_gap(
     out.extend_from_slice(&payload);
     out
 }
+
+/// v17: TextAsset + MonoScript (class 115). MonoScript body holds a type-name
+/// string that must be covered by [`SerializedFile::heuristic_skip_byte_ranges`].
+#[cfg(test)]
+pub fn write_v17_monoscript_noise_fixture() -> Vec<u8> {
+    fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn write_aligned_string(buf: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+        let pad = align4(b.len()) - b.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+
+    let mut text_payload = Vec::new();
+    write_aligned_string(&mut text_payload, "Note");
+    write_aligned_string(&mut text_payload, "Hello traveler welcome!");
+
+    // Fake MonoScript-ish aligned strings (class names flood heuristics).
+    let mut ms_payload = Vec::new();
+    write_aligned_string(&mut ms_payload, "Naninovel");
+    write_aligned_string(&mut ms_payload, "QuaternionTween");
+
+    let mut meta = Vec::new();
+    meta.extend_from_slice(b"2019.4.0f1\0");
+    meta.extend_from_slice(&1u32.to_le_bytes());
+    meta.push(0); // enable_type_tree
+    meta.extend_from_slice(&2i32.to_le_bytes()); // types
+    // type 0: TextAsset
+    meta.extend_from_slice(&CLASS_ID_TEXT_ASSET.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&(-1i16).to_le_bytes());
+    meta.extend_from_slice(&[0u8; 16]);
+    // type 1: MonoScript
+    meta.extend_from_slice(&CLASS_ID_MONO_SCRIPT.to_le_bytes());
+    meta.push(0);
+    meta.extend_from_slice(&(-1i16).to_le_bytes());
+    meta.extend_from_slice(&[0u8; 16]);
+
+    meta.extend_from_slice(&2i32.to_le_bytes()); // objects
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    meta.extend_from_slice(&1i64.to_le_bytes()); // path_id TextAsset
+    meta.extend_from_slice(&0u32.to_le_bytes());
+    meta.extend_from_slice(&(text_payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&0i32.to_le_bytes());
+
+    while meta.len() % 4 != 0 {
+        meta.push(0);
+    }
+    meta.extend_from_slice(&2i64.to_le_bytes()); // path_id MonoScript
+    meta.extend_from_slice(&(text_payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&(ms_payload.len() as u32).to_le_bytes());
+    meta.extend_from_slice(&1i32.to_le_bytes());
+
+    let header_len = 20usize;
+    let mut data_offset = header_len + meta.len();
+    data_offset = (data_offset + 15) & !15;
+    let file_size = data_offset + text_payload.len() + ms_payload.len();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(file_size as u32).to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&meta);
+    while out.len() < data_offset {
+        out.push(0);
+    }
+    out.extend_from_slice(&text_payload);
+    out.extend_from_slice(&ms_payload);
+    out
+}
+
