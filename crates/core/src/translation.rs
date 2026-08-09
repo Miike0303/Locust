@@ -359,6 +359,7 @@ impl TranslationManager {
                         };
                         // Binary-slot engines (Unity/Unreal/Wolf): hint the model to stay
                         // within the inject byte budget for this string.
+                        let mut slot_budget: Option<(&str, usize)> = None;
                         if let Some(slot) = entry
                             .metadata
                             .get("binary_slot")
@@ -369,6 +370,7 @@ impl TranslationManager {
                             {
                                 budgets_by_id
                                     .insert(entry.id.clone(), (slot.to_string(), budget));
+                                slot_budget = Some((slot, budget));
                                 let hint =
                                     binary_slot_length_hint(slot, budget, &entry.source);
                                 context = Some(match context {
@@ -379,13 +381,14 @@ impl TranslationManager {
                         }
                         let (sanitized, phs) = PlaceholderProcessor::extract(&entry.source);
                         placeholders_by_id.insert(entry.id.clone(), phs);
-                        // Per-entry glossary: only terms present in this source
-                        // (keeps short UI slots free of bulk noise).
+                        // Per-entry glossary: terms present in source; for binary
+                        // slots also drop translations that cannot fit the budget.
                         let glossary_hint = if opts.use_glossary {
-                            self.glossary.build_hint_for_text(
+                            self.glossary.build_hint_for_text_budgeted(
                                 &opts.source_lang,
                                 &opts.target_lang,
                                 &entry.source,
+                                slot_budget,
                             )
                         } else {
                             None

@@ -56,6 +56,20 @@ impl Glossary {
         target_lang: &str,
         text: &str,
     ) -> Option<String> {
+        self.build_hint_for_text_budgeted(source_lang, target_lang, text, None)
+    }
+
+    /// Like [`build_hint_for_text`], but when `max_bytes` is `Some((encoding, budget))`
+    /// drop glossary translations that would exceed a binary inject slot (e.g.
+    /// `Options → Opciones` on a 7-byte utf8 budget). Avoids steering the model
+    /// toward known-oversize forms after exact-match short-circuit declines them.
+    pub fn build_hint_for_text_budgeted(
+        &self,
+        source_lang: &str,
+        target_lang: &str,
+        text: &str,
+        max_bytes: Option<(&str, usize)>,
+    ) -> Option<String> {
         let lang_pair = format!("{}-{}", source_lang, target_lang);
         let entries = self.get_all(&lang_pair).ok()?;
         if entries.is_empty() || text.is_empty() {
@@ -68,10 +82,21 @@ impl Glossary {
                 if e.term.is_empty() {
                     return false;
                 }
-                if e.case_sensitive {
+                let in_text = if e.case_sensitive {
                     text.contains(&e.term)
                 } else {
                     text_lower.contains(&e.term.to_lowercase())
+                };
+                if !in_text {
+                    return false;
+                }
+                if let Some((enc, budget)) = max_bytes {
+                    match crate::validation::encoded_byte_len(enc, &e.translation) {
+                        Some(n) if n <= budget => true,
+                        _ => false,
+                    }
+                } else {
+                    true
                 }
             })
             .collect();
@@ -241,5 +266,33 @@ mod tests {
         assert!(glossary
             .build_hint_for_text("en", "es", "Nothing matching")
             .is_none());
+    }
+
+    #[test]
+    fn test_build_hint_budgeted_drops_oversize_translation() {
+        let (_db, glossary) = setup();
+        // "Options" is 7 utf8 bytes; "Opciones" is 8 → oversize for that slot.
+        glossary
+            .add("Options", "Opciones", "en-es", None)
+            .unwrap();
+        glossary.add("OK", "Si", "en-es", None).unwrap();
+
+        assert!(
+            glossary
+                .build_hint_for_text_budgeted("en", "es", "Options", Some(("utf8", 7)))
+                .is_none(),
+            "oversize glossary form must not appear in binary-slot hint"
+        );
+        let fitting = glossary
+            .build_hint_for_text_budgeted("en", "es", "Options", Some(("utf8", 8)))
+            .unwrap();
+        assert!(fitting.contains("Options → Opciones"), "{fitting}");
+
+        // Substring match still filters by translation size.
+        let mixed = glossary
+            .build_hint_for_text_budgeted("en", "es", "Options OK", Some(("utf8", 7)))
+            .unwrap();
+        assert!(mixed.contains("OK → Si"), "{mixed}");
+        assert!(!mixed.contains("Opciones"), "{mixed}");
     }
 }
