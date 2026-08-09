@@ -1328,6 +1328,14 @@ fn is_unity_translatable(text: &str) -> bool {
     if s.is_empty() || s.len() < 5 {
         return false;
     }
+    // Binary soup / mis-framed length prefixes leave C0 controls in the payload.
+    // Allow tab/CR/LF for multi-line dialogue; reject other controls.
+    if s.chars().any(|c| {
+        let u = c as u32;
+        u < 32 && c != '\t' && c != '\n' && c != '\r'
+    }) {
+        return false;
+    }
     // Managed type refs flood heuristic scans of ScriptableObject blobs.
     if looks_like_assembly_qualified_type(s) {
         return false;
@@ -1362,12 +1370,20 @@ fn is_unity_translatable(text: &str) -> bool {
     if looks_like_unity_renderer_id_label(s) {
         return false;
     }
-    // Animator layer default name (not player-facing).
-    if s == "Base Layer" {
+    // Animator layer default name + `Base Layer.STATE` paths (BOXMAN).
+    if s == "Base Layer" || s.starts_with("Base Layer.") {
+        return false;
+    }
+    // TMP / custom font material object names.
+    if s.ends_with(" Atlas Material") || s.ends_with(" Atlas") {
         return false;
     }
     // Built-in Light2D default object name (no hierarchy clone suffix).
     if s == "Light 2D" {
+        return false;
+    }
+    // uGUI hierarchy defaults (ScrollRect / Mask / Scrollbar).
+    if matches!(s, "Sliding Area" | "Viewport") {
         return false;
     }
     // Editor selection suffixes on hierarchy names: `btn Night (Selected)`.
@@ -2528,9 +2544,22 @@ script Chapter_1_script chapter 1 {
             "Mobile/Bumped Specular (1 Directional Realtime Light)"
         ));
         assert!(!is_unity_translatable("Mesh Renderer (Id :1)"));
+        // Animator state machine paths (layer.STATE) — BOXMAN heuristic flood
+        assert!(!is_unity_translatable("Base Layer.SCENE_JAKE_COWGIRL_1"));
+        assert!(!is_unity_translatable("Base Layer.ElectricityFX34"));
+        // TMP / font material crumbs
+        assert!(!is_unity_translatable("Roboto-Regular Atlas Material"));
+        // Unity uGUI ScrollRect / mask hierarchy defaults
+        assert!(!is_unity_translatable("Sliding Area"));
+        assert!(!is_unity_translatable("Viewport"));
+        // Binary soup mis-read as length-prefixed strings
+        assert!(!is_unity_translatable("\x18$1>JVbmrvv"));
+        assert!(!is_unity_translatable("\x16!,7@IOSSS"));
         // Real UI / dialogue with slash must still pass when clearly sentence-like.
         assert!(is_unity_translatable("Press Start"));
         assert!(is_unity_translatable("Save game now"));
+        assert!(is_unity_translatable("Delete")); // short UI verb
+        assert!(is_unity_translatable("Progress")); // short UI label
     }
 
     #[test]
