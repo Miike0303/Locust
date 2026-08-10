@@ -926,11 +926,12 @@ async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30 * 60))
+        .connect_timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent(format!("locust-server/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let resp = client
+    let mut resp = client
         .get(parsed)
         .send()
         .await
@@ -945,21 +946,38 @@ async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError
             ));
         }
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download body: {e}")))?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "remote zip too large"));
-    }
-    if bytes.is_empty() {
-        return Err(err(StatusCode::BAD_GATEWAY, "download produced empty file"));
-    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
-    std::fs::write(dest, &bytes).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Stream to disk with a running cap, like the CLI does. Buffering the whole
+    // body first would let a chunked response — which sends no Content-Length,
+    // so the check above never fires — allocate without bound before any check.
+    let mut file =
+        std::fs::File::create(dest).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut written: u64 = 0;
+    loop {
+        let chunk = resp
+            .chunk()
+            .await
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download body: {e}")))?;
+        let Some(chunk) = chunk else { break };
+        written += chunk.len() as u64;
+        if written > MAX_BYTES {
+            drop(file);
+            let _ = std::fs::remove_file(dest);
+            return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "remote zip too large"));
+        }
+        use std::io::Write;
+        file.write_all(&chunk)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+    if written == 0 {
+        drop(file);
+        let _ = std::fs::remove_file(dest);
+        return Err(err(StatusCode::BAD_GATEWAY, "download produced empty file"));
+    }
     Ok(())
 }
 

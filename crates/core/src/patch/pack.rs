@@ -245,12 +245,16 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
         }
     }
 
+    // The scratch name must be unique per pack, not per process: the server
+    // packs on a blocking task, so two requests for the same `output_path`
+    // share a PID. `create_new` also refuses to truncate a name already in
+    // use, so a loser fails instead of writing into the winner's zip.
     let tmp = out.with_file_name(format!(
         "{}.tmp-{}",
         out.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
+        uuid::Uuid::new_v4()
     ));
-    let zip_file = std::fs::File::create(&tmp)?;
+    let zip_file = std::fs::File::create_new(&tmp)?;
     let mut tmp_guard = TempFileGuard::new(&tmp);
     let mut zip = zip::ZipWriter::new(zip_file);
     let zip_opts = zip::write::SimpleFileOptions::default()
@@ -534,6 +538,70 @@ mod tests {
             assert_eq!(read_back, contents);
         }
         assert!(archive.by_name(PatchManifest::FILENAME).is_ok());
+    }
+
+    #[test]
+    fn concurrent_packs_to_one_output_do_not_share_a_scratch_file() {
+        // The scratch name used to be PID-derived, so two packs inside one
+        // process (the server packs on a blocking task) targeted the same file
+        // and clobbered each other's zip mid-write.
+        let base = tempdir();
+        let out = base.join("shared-out.zip");
+
+        let handles: Vec<_> = (0..2)
+            .map(|i| {
+                let base = base.clone();
+                let out = out.clone();
+                std::thread::spawn(move || {
+                    let game = base.join(format!("game{i}"));
+                    let game_sub = game.join("game");
+                    fs::create_dir_all(&game_sub).unwrap();
+                    let script = game_sub.join("script.rpy");
+                    fs::write(&script, format!("label start:\n    \"Hola {i}\"\n")).unwrap();
+
+                    let db = Database::open_in_memory().unwrap();
+                    let mut entry = StringEntry::new("script.rpy#2", "Hello", script.clone());
+                    entry.translation = Some("Hola".into());
+                    entry.status = StringStatus::Translated;
+                    db.save_entries(&[entry]).unwrap();
+                    db.record_injection(Some("es"), &game, &[script]).unwrap();
+
+                    pack_injection_recording(
+                        &db,
+                        PackOptions {
+                            game_path: game,
+                            lang: Some("es".into()),
+                            output: out,
+                            pristine: None,
+                            engine: Some("renpy".into()),
+                            project: base.join(format!("project{i}.locust.db")),
+                            require_pristine: false,
+                        },
+                    )
+                    .map(|r| r.files_packed)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            results.iter().any(|r| r.is_ok()),
+            "at least one pack must succeed: {results:?}"
+        );
+
+        // Whoever won, the zip on disk must be a complete archive, not a
+        // half-written file two writers took turns on.
+        let file = fs::File::open(&out).unwrap();
+        let mut archive = zip::ZipArchive::new(file).expect("output must be a valid zip");
+        assert!(archive.by_name(PatchManifest::FILENAME).is_ok());
+
+        let leftovers: Vec<_> = fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "scratch files left behind: {leftovers:?}");
     }
 
     #[test]
