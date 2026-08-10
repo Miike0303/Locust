@@ -953,3 +953,276 @@ async fn test_register_lang_rejects_bad_lang() {
     assert_eq!(resp.status(), 400);
 }
 
+
+/// Recursively copy `src` into `dst` (created if missing).
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in walkdir::WalkDir::new(src).follow_links(false) {
+        let entry = entry.unwrap();
+        let rel = entry.path().strip_prefix(src).unwrap();
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// Snapshot every file under `root` as (relative path, bytes).
+fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.unwrap();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        // `.locust/` is patch bookkeeping, not game content.
+        if rel.starts_with(".locust/") {
+            continue;
+        }
+        out.insert(rel, std::fs::read(entry.path()).unwrap());
+    }
+    out
+}
+
+/// The four patch endpoints that had no coverage, driven in their real order
+/// against a real packed zip: verify → apply → status → rollback. The game must
+/// come back byte-identical, which is the whole promise of the transaction.
+#[tokio::test]
+async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
+    let tmpdir = TempDir::new().unwrap();
+    create_rpgmaker_mv_fixture(tmpdir.path());
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("project.locust.db");
+
+    let state = locust_server::create_test_state_with_db(&db_path);
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+
+    let _open: ProjectOpenResponse = client()
+        .post(format!("{}/api/project/open", base_url))
+        .json(&serde_json::json!({"path": tmpdir.path().to_string_lossy()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client()
+        .post(format!("{}/api/translate/start", base_url))
+        .json(&serde_json::json!({
+            "provider_id": "mock",
+            "options": {
+                "source_lang": "en", "target_lang": "es",
+                "batch_size": 100, "max_concurrent": 1,
+                "cost_limit_usd": null, "game_context": null,
+                "use_glossary": false, "use_memory": false, "skip_approved": true
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let output_dir = TempDir::new().unwrap();
+    let inject_resp = client()
+        .post(format!("{}/api/inject", base_url))
+        .json(&serde_json::json!({
+            "project_path": tmpdir.path().to_string_lossy(),
+            "format_id": "rpgmaker-mv",
+            "mode": "replace",
+            "languages": ["es"],
+            "output_dir": output_dir.path().to_string_lossy()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inject_resp.status(), 200, "inject must succeed before pack");
+
+    let game_name = tmpdir.path().file_name().unwrap().to_string_lossy().to_string();
+    let recorded_root = output_dir.path().join(format!("{}-es", game_name));
+    let pack_out = TempDir::new().unwrap();
+    let zip_path = pack_out.path().join("lifecycle.zip");
+
+    let pack_resp = client()
+        .post(format!("{}/api/patch/pack", base_url))
+        .json(&serde_json::json!({
+            // Pack against the untranslated tree so the manifest carries
+            // original hashes — that is the strict tier apply/rollback need.
+            "game_path": recorded_root.to_string_lossy(),
+            "output_path": zip_path.to_string_lossy(),
+            "languages": ["es"],
+            "pristine": true,
+            "pristine_path": tmpdir.path().to_string_lossy()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pack_resp.status(), 200, "pack: {}", pack_resp.text().await.unwrap());
+
+    // Target a pristine copy of the game, so rollback has something to prove.
+    let target = TempDir::new().unwrap();
+    let game = target.path().join("game");
+    copy_tree(tmpdir.path(), &game);
+    let before = snapshot_tree(&game);
+    assert!(!before.is_empty(), "fixture should have files");
+
+    let paths = serde_json::json!({
+        "game_path": game.to_string_lossy(),
+        "zip_path": zip_path.to_string_lossy(),
+    });
+
+    // status — clean game, nothing applied yet
+    let st: serde_json::Value = client()
+        .post(format!("{}/api/patch/status", base_url))
+        .json(&serde_json::json!({"game_path": game.to_string_lossy()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["status"], "not_patched", "status before apply: {st}");
+
+    // verify — read-only pre-flight
+    let vr = client()
+        .post(format!("{}/api/patch/verify", base_url))
+        .json(&paths)
+        .send()
+        .await
+        .unwrap();
+    let vs = vr.status();
+    let vbody = vr.text().await.unwrap();
+    assert_eq!(vs, 200, "verify: {vbody}");
+    let vjson: serde_json::Value = serde_json::from_str(&vbody).unwrap();
+    assert_eq!(vjson["outcome"], "Clean", "verify outcome: {vbody}");
+    assert_eq!(vjson["tier"], "Strict", "pristine pack must verify strict: {vbody}");
+    assert!(
+        !vjson["replaced"].as_array().expect("replaced is a path list").is_empty(),
+        "verify should plan replacements: {vbody}"
+    );
+    assert!(
+        vjson["conflicts"].as_array().is_some_and(|c| c.is_empty()),
+        "clean game must have no conflicts: {vbody}"
+    );
+    assert_eq!(
+        snapshot_tree(&game),
+        before,
+        "verify must not touch the game"
+    );
+
+    // apply
+    let ar = client()
+        .post(format!("{}/api/patch/apply", base_url))
+        .json(&paths)
+        .send()
+        .await
+        .unwrap();
+    let as_ = ar.status();
+    let abody = ar.text().await.unwrap();
+    assert_eq!(as_, 200, "apply: {abody}");
+    let ajson: serde_json::Value = serde_json::from_str(&abody).unwrap();
+    assert!(
+        ajson["replaced"].as_u64().unwrap_or(0) > 0,
+        "apply should replace files: {abody}"
+    );
+    assert_ne!(
+        snapshot_tree(&game),
+        before,
+        "apply must actually change the game"
+    );
+
+    // status — now patched, and it echoes the receipt
+    let st2: serde_json::Value = client()
+        .post(format!("{}/api/patch/status", base_url))
+        .json(&serde_json::json!({"game_path": game.to_string_lossy()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st2["status"], "patched", "status after apply: {st2}");
+    assert_eq!(st2["patch_id"], ajson["patch_id"], "receipt id mismatch");
+
+    // rollback — the whole point of the backup slot
+    let rr = client()
+        .post(format!("{}/api/patch/rollback", base_url))
+        .json(&serde_json::json!({"game_path": game.to_string_lossy()}))
+        .send()
+        .await
+        .unwrap();
+    let rs = rr.status();
+    let rbody = rr.text().await.unwrap();
+    assert_eq!(rs, 200, "rollback: {rbody}");
+
+    assert_eq!(
+        snapshot_tree(&game),
+        before,
+        "rollback must restore the game byte-identically"
+    );
+
+    // A patch packed with no pristine baseline carries no original hashes, so
+    // every path reads as "added" and collides with the files already there.
+    // Applying it unforced must be refused rather than overwrite blindly.
+    let loose_zip = pack_out.path().join("no-baseline.zip");
+    let loose_pack = client()
+        .post(format!("{}/api/patch/pack", base_url))
+        .json(&serde_json::json!({
+            "game_path": recorded_root.to_string_lossy(),
+            "output_path": loose_zip.to_string_lossy(),
+            "languages": ["es"],
+            "pristine": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(loose_pack.status(), 200, "loose pack should still build");
+
+    let loose_paths = serde_json::json!({
+        "game_path": game.to_string_lossy(),
+        "zip_path": loose_zip.to_string_lossy(),
+    });
+    let lv: serde_json::Value = client()
+        .post(format!("{}/api/patch/verify", base_url))
+        .json(&loose_paths)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lv["tier"], "Structural", "no baseline → structural: {lv}");
+    assert!(
+        !lv["conflicts"].as_array().unwrap().is_empty(),
+        "structural patch over existing files must conflict: {lv}"
+    );
+
+    let la = client()
+        .post(format!("{}/api/patch/apply", base_url))
+        .json(&loose_paths)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        la.status(),
+        200,
+        "unforced structural apply must be refused: {}",
+        la.text().await.unwrap()
+    );
+    assert_eq!(
+        snapshot_tree(&game),
+        before,
+        "a refused apply must leave the game untouched"
+    );
+}
