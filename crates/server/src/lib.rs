@@ -911,7 +911,7 @@ async fn resolve_patch_zip(
 }
 
 async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError> {
-    const MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+    let max_bytes = locust_core::patch::zipsec::max_download_bytes();
     let parsed = reqwest::Url::parse(url).map_err(|e| {
         err(StatusCode::BAD_REQUEST, format!("invalid zip_url: {e}"))
     })?;
@@ -939,7 +939,7 @@ async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError
         .error_for_status()
         .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download HTTP error: {e}")))?;
     if let Some(len) = resp.content_length() {
-        if len > MAX_BYTES {
+        if len > max_bytes {
             return Err(err(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("remote zip too large: {len} bytes"),
@@ -964,7 +964,7 @@ async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError
             .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download body: {e}")))?;
         let Some(chunk) = chunk else { break };
         written += chunk.len() as u64;
-        if written > MAX_BYTES {
+        if written > max_bytes {
             drop(file);
             let _ = std::fs::remove_file(dest);
             return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "remote zip too large"));
@@ -1462,6 +1462,94 @@ async fn delete_backup(
         .delete_backup(&id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod download_guard_tests {
+    use super::*;
+
+    /// Serve one chunked HTTP response with NO Content-Length, which is exactly
+    /// the shape that defeats a pre-flight size check. `total` of `usize::MAX`
+    /// streams until the client hangs up.
+    async fn serve_chunked(total: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut scratch = [0u8; 1024];
+                let _ = sock.read(&mut scratch).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n\
+                          Transfer-Encoding: chunked\r\n\r\n",
+                    )
+                    .await;
+                let chunk = vec![b'A'; 4096];
+                let mut sent = 0usize;
+                while sent < total {
+                    if sock
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await
+                        .is_err()
+                        || sock.write_all(&chunk).await.is_err()
+                        || sock.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                    sent += chunk.len();
+                }
+                let _ = sock.write_all(b"0\r\n\r\n").await;
+            }
+        });
+        format!("http://{addr}/patch.zip")
+    }
+
+    #[tokio::test]
+    async fn download_rejects_non_http_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("p.zip");
+        let e = download_patch_zip_async("file:///C:/Windows/win.ini", &dest)
+            .await
+            .expect_err("file:// must be rejected");
+        assert!(format!("{e:?}").contains("http"), "{e:?}");
+        assert!(!dest.exists(), "nothing should be written");
+    }
+
+    #[tokio::test]
+    async fn download_aborts_past_cap_on_chunked_response() {
+        // The body never ends, so only a running byte count can stop it.
+        // Buffering the whole response first would read forever and time out.
+        let cap = 64 * 1024;
+        std::env::set_var(locust_core::patch::zipsec::MAX_DOWNLOAD_ENV, cap.to_string());
+        let url = serve_chunked(usize::MAX).await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("p.zip");
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            download_patch_zip_async(&url, &dest),
+        )
+        .await;
+        std::env::remove_var(locust_core::patch::zipsec::MAX_DOWNLOAD_ENV);
+
+        let res = res.expect("download must abort at the cap, not read the endless body");
+        let e = res.expect_err("oversize chunked download must abort");
+        assert!(format!("{e:?}").contains("too large"), "{e:?}");
+        assert!(!dest.exists(), "partial download must be unlinked");
+    }
+
+    #[tokio::test]
+    async fn download_rejects_empty_body() {
+        let url = serve_chunked(0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("p.zip");
+        let e = download_patch_zip_async(&url, &dest)
+            .await
+            .expect_err("empty body must be rejected");
+        assert!(format!("{e:?}").contains("empty"), "{e:?}");
+        assert!(!dest.exists());
+    }
 }
 
 #[cfg(test)]

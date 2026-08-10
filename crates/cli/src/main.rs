@@ -758,7 +758,7 @@ fn cmd_apply(
 
 /// Download a patch zip over http(s) with size and scheme guards.
 fn download_patch_zip(url: &str, dest: &Path) -> anyhow::Result<()> {
-    const MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB — same order as patch ceiling
+    let max_bytes = locust_core::patch::zipsec::max_download_bytes();
 
     let parsed = reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
     match parsed.scheme() {
@@ -775,8 +775,8 @@ fn download_patch_zip(url: &str, dest: &Path) -> anyhow::Result<()> {
 
     let mut resp = client.get(parsed).send()?.error_for_status()?;
     if let Some(len) = resp.content_length() {
-        if len > MAX_BYTES {
-            anyhow::bail!("remote zip too large: {len} bytes (max {MAX_BYTES})");
+        if len > max_bytes {
+            anyhow::bail!("remote zip too large: {len} bytes (max {max_bytes})");
         }
     }
 
@@ -795,9 +795,9 @@ fn download_patch_zip(url: &str, dest: &Path) -> anyhow::Result<()> {
             break;
         }
         written += n as u64;
-        if written > MAX_BYTES {
+        if written > max_bytes {
             let _ = std::fs::remove_file(dest);
-            anyhow::bail!("download exceeded {MAX_BYTES} bytes — aborted");
+            anyhow::bail!("download exceeded {max_bytes} bytes — aborted");
         }
         use std::io::Write;
         file.write_all(&buf[..n])?;
@@ -1797,6 +1797,25 @@ mod tests {
 
     /// Process-global env var — serialize tests that set LOCUST_BACKUP_ROOT.
     static BACKUP_ROOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn download_patch_zip_rejects_non_http_schemes() {
+        // A patch URL is attacker-supplied in the CDN case; only http(s) may
+        // ever be fetched, and nothing is written when the scheme is refused.
+        let dir = std::env::temp_dir().join(format!("locust_dl_{}", uuid::Uuid::new_v4()));
+        let dest = dir.join("p.zip");
+        for url in [
+            "file:///C:/Windows/win.ini",
+            "ftp://example.com/a.zip",
+            "data:application/zip;base64,UEsDBA==",
+        ] {
+            let e = download_patch_zip(url, &dest)
+                .expect_err("must refuse non-http scheme")
+                .to_string();
+            assert!(e.contains("http"), "{url} -> {e}");
+            assert!(!dest.exists(), "{url} wrote a file");
+        }
+    }
 
     #[test]
     fn test_cli_parses() {

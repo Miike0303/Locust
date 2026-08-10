@@ -164,6 +164,29 @@ pub fn max_zip_total_bytes() -> u64 {
     MAX_ZIP_TOTAL_BYTES
 }
 
+/// Default ceiling for a patch zip fetched over http(s) (32 GiB).
+///
+/// Bounds a hostile or misconfigured host: a chunked response carries no
+/// `Content-Length`, so the only real defence is counting bytes as they land.
+pub const MAX_DOWNLOAD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+/// Env var for [`max_download_bytes`] (decimal byte count).
+pub const MAX_DOWNLOAD_ENV: &str = "LOCUST_PATCH_MAX_DOWNLOAD";
+
+/// Configured download ceiling (env override or [`MAX_DOWNLOAD_BYTES`]).
+///
+/// Shared by the CLI and the server so the two transports cannot drift apart.
+pub fn max_download_bytes() -> u64 {
+    if let Ok(raw) = std::env::var(MAX_DOWNLOAD_ENV) {
+        if let Ok(n) = raw.trim().parse::<u64>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    MAX_DOWNLOAD_BYTES
+}
+
 /// Charge an entry's **declared** uncompressed size against the running total.
 ///
 /// Does not read entry bytes. Per-entry size is not limited (streaming);
