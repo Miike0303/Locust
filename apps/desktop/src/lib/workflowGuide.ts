@@ -1,5 +1,11 @@
 export type WorkflowGuideStep = "translate" | "review" | "inject";
 
+export const WORKFLOW_STEP_LABELS: Record<WorkflowGuideStep, string> = {
+	translate: "Translate",
+	review: "Review",
+	inject: "Inject",
+};
+
 export interface WorkflowGuideStats {
   pending: number;
   translated: number;

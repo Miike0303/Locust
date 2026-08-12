@@ -8,6 +8,8 @@ import {
 	FileCheck,
 	Package,
 	Loader2,
+	Replace,
+	ChevronRight,
 } from "lucide-react";
 import {
 	getStrings,
@@ -25,6 +27,7 @@ import {
 	resolveWorkflowGuideStep,
 	saveSkipReviewPreference,
 	saveWorkflowGuideDismissed,
+	WORKFLOW_STEP_LABELS,
 } from "../lib/workflowGuide";
 import { addToast } from "../stores/toastStore";
 import { addLog } from "../stores/logStore";
@@ -39,6 +42,7 @@ import ExportModal from "../components/ExportModal";
 import SearchReplaceModal from "../components/SearchReplaceModal";
 import ValidationResultsModal from "../components/ValidationResultsModal";
 import WorkflowGuideBanner from "../components/WorkflowGuideBanner";
+import EmptyState from "../components/EmptyState";
 
 export default function Editor() {
 	const { filter, selectedEntryId, setSelected } = useEditorStore();
@@ -258,65 +262,96 @@ export default function Editor() {
 							{statsData.approved} approved
 						</span>
 					)}
+					{hasProject && guideDismissed && workflowStep && (
+						<button
+							type="button"
+							onClick={handleGuidePrimaryAction}
+							title="Next workflow step"
+							className="ml-3 inline-flex items-center gap-0.5 rounded-full border border-emerald-300 px-2 py-0.5 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
+						>
+							Next: {WORKFLOW_STEP_LABELS[workflowStep]}
+							<ChevronRight size={12} aria-hidden="true" />
+						</button>
+					)}
 				</div>
 
-				<button
-					onClick={() => setShowTranslateModal(true)}
-					disabled={!hasProject}
-					className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
-					title={hasProject ? "Ctrl+T" : "Open a project first"}
-				>
-					<Languages size={16} /> Translate
-				</button>
+				{/* Primary workflow actions */}
+				<div className="flex items-center gap-2">
+					<button
+						onClick={() => setShowTranslateModal(true)}
+						disabled={!hasProject}
+						className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
+						title={hasProject ? "Ctrl+T" : "Open a project first"}
+					>
+						<Languages size={16} /> Translate
+					</button>
 
-				<button
-					onClick={() => setShowInjectModal(true)}
-					disabled={!hasProject}
-					className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-					title={hasProject ? "Ctrl+I" : "Open a project first"}
-				>
-					<FileCheck size={16} /> Inject
-				</button>
+					<button
+						onClick={() => setShowInjectModal(true)}
+						disabled={!hasProject}
+						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
+						title={hasProject ? "Ctrl+I" : "Open a project first"}
+					>
+						<FileCheck size={16} /> Inject
+					</button>
 
-				<button
-					onClick={() => setShowPatchModal(true)}
-					disabled={!hasProject}
-					className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-					title={hasProject ? "Ctrl+Shift+P" : "Open a project first"}
-				>
-					<Package size={16} /> Patch
-				</button>
+					<button
+						onClick={() => setShowPatchModal(true)}
+						disabled={!hasProject}
+						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
+						title={hasProject ? "Ctrl+Shift+P" : "Open a project first"}
+					>
+						<Package size={16} /> Patch
+					</button>
 
-				<PatchStatusIndicator
-					gamePath={project?.path}
-					onOpenPatch={() => setShowPatchModal(true)}
-					refreshKey={patchStatusRefreshKey}
+					<PatchStatusIndicator
+						gamePath={project?.path}
+						onOpenPatch={() => setShowPatchModal(true)}
+						refreshKey={patchStatusRefreshKey}
+					/>
+				</div>
+
+				<div
+					aria-hidden="true"
+					className="h-6 w-px bg-gray-200 dark:bg-gray-700"
 				/>
 
-				<button
-					onClick={() => {
-						void handleValidate();
-					}}
-					disabled={validating || !hasProject}
-					className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-					title={hasProject ? "Ctrl+Shift+V" : "Open a project first"}
-				>
-					{validating ? (
-						<Loader2 size={16} className="animate-spin" />
-					) : (
-						<Shield size={16} />
-					)}
-					Validate
-				</button>
+				{/* Secondary project tools */}
+				<div className="flex items-center gap-2">
+					<button
+						onClick={() => {
+							void handleValidate();
+						}}
+						disabled={validating || !hasProject}
+						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
+						title={hasProject ? "Ctrl+Shift+V" : "Open a project first"}
+					>
+						{validating ? (
+							<Loader2 size={16} className="animate-spin" />
+						) : (
+							<Shield size={16} />
+						)}
+						Validate
+					</button>
 
-				<button
-					onClick={() => setShowExportModal(true)}
-					disabled={!hasProject}
-					className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-					title={hasProject ? "Ctrl+E" : "Open a project first"}
-				>
-					<Download size={16} /> Export
-				</button>
+					<button
+						onClick={() => setShowExportModal(true)}
+						disabled={!hasProject}
+						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
+						title={hasProject ? "Ctrl+E" : "Open a project first"}
+					>
+						<Download size={16} /> Export
+					</button>
+
+					<button
+						onClick={() => setShowReplaceModal(true)}
+						disabled={!hasProject}
+						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
+						title={hasProject ? "Ctrl+Shift+F" : "Open a project first"}
+					>
+						<Replace size={16} /> Replace
+					</button>
+				</div>
 			</div>
 
 			{!guideDismissed && workflowStep && (
@@ -339,18 +374,12 @@ export default function Editor() {
 
 			<div className="flex flex-1 overflow-hidden">
 				{!hasProject ? (
-					<div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
-						<p className="font-medium text-gray-700 dark:text-gray-200">No project open</p>
-						<p className="text-sm text-gray-500">
-							Open a game from Welcome to load its strings. Nothing is shown from a previous session.
-						</p>
-						<button
-							onClick={() => navigate("/")}
-							className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
-						>
-							Go to Welcome
-						</button>
-					</div>
+					<EmptyState
+						title="No project open"
+						description="Open a game from Welcome to load its strings. Nothing is shown from a previous session."
+						actionLabel="Go to Welcome"
+						onAction={() => navigate("/")}
+					/>
 				) : stringsLoading ? (
 					<div className="flex flex-1 items-center justify-center text-gray-500">
 						Loading strings…
