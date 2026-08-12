@@ -1,6 +1,6 @@
 import { X } from "lucide-react";
 import { getGroupedHotkeys, formatKey, useHotkey } from "../lib/hotkeys";
-import { useModalA11y } from "../lib/modalA11y";
+import { useModalA11y, MODAL_BACKDROP_CLASS, modalPanelClass } from "../lib/modalA11y";
 
 interface Props {
   open: boolean;
@@ -17,11 +17,11 @@ export default function HotkeyHelp({ open, onClose }: Props) {
   const groups = getGroupedHotkeys();
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+    <div className={MODAL_BACKDROP_CLASS} onClick={onClose}>
       <div
         ref={dialogRef}
         {...dialogProps}
-        className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-xl max-h-[80vh] overflow-y-auto"
+        className={modalPanelClass("max-w-xl max-h-[80vh] overflow-y-auto")}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">

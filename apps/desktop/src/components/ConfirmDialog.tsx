@@ -1,5 +1,5 @@
 import { useRef } from "react";
-import { useModalA11y } from "../lib/modalA11y";
+import { useModalA11y, MODAL_BACKDROP_CLASS, modalPanelClass } from "../lib/modalA11y";
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -39,13 +39,13 @@ export default function ConfirmDialog({
 
   return (
     <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+      className={MODAL_BACKDROP_CLASS}
       onClick={onCancel}
     >
       <div
         ref={dialogRef}
         {...dialogProps}
-        className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-sm p-5"
+        className={modalPanelClass("max-w-sm p-5")}
         onClick={(e) => e.stopPropagation()}
       >
         <h2 {...titleProps} className="text-base font-bold mb-2">{title}</h2>

@@ -3,7 +3,7 @@ import { X, Replace, AlertCircle } from "lucide-react";
 import { batchPatchStrings, getStrings, type StringEntry } from "../lib/api";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import { useModalA11y } from "../lib/modalA11y";
+import { useModalA11y, MODAL_BACKDROP_CLASS, modalPanelClass } from "../lib/modalA11y";
 
 interface SearchReplaceModalProps {
   open: boolean;
@@ -153,8 +153,8 @@ export default function SearchReplaceModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6">
+    <div className={MODAL_BACKDROP_CLASS}>
+      <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-lg p-6")}>
         <div className="flex justify-between items-center mb-4">
           <h2 {...titleProps} className="text-lg font-bold flex items-center gap-2">
             <Replace size={18} /> Search &amp; Replace

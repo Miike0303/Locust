@@ -10,7 +10,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useQueueStore } from "../stores/queueStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import { useModalA11y } from "../lib/modalA11y";
+import { useModalA11y, MODAL_BACKDROP_CLASS, modalPanelClass } from "../lib/modalA11y";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -201,8 +201,8 @@ export default function Welcome() {
 
       {/* Format Picker Modal — shown when auto-detect fails or on "Choose format manually" */}
       {picker && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-md p-6">
+        <div className={MODAL_BACKDROP_CLASS}>
+          <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-md p-6")}>
             <div className="flex justify-between items-center mb-4">
               <h2 {...titleProps} className="text-lg font-bold">Select Format</h2>
               <button onClick={() => setPicker(null)} className="text-gray-400 hover:text-gray-600">

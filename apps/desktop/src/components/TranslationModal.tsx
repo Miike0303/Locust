@@ -16,7 +16,7 @@ import { useQueueStore } from "../stores/queueStore";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import { useModalA11y } from "../lib/modalA11y";
+import { useModalA11y, MODAL_BACKDROP_CLASS, modalPanelClass } from "../lib/modalA11y";
 import { operationalShortcutTarget, type OperationalShortcut } from "../lib/settingsNav";
 
 interface TranslationModalProps {
@@ -300,8 +300,8 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
   const progressPercent = total > 0 ? (completed / total) * 100 : 0;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6">
+    <div className={MODAL_BACKDROP_CLASS}>
+      <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-lg p-6")}>
         <div className="flex justify-between items-center mb-4">
           <h2 {...titleProps} className="text-lg font-bold">{step === "configure" ? "Start Translation" : "Translation Progress"}</h2>
           <button

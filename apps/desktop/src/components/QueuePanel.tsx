@@ -13,7 +13,7 @@ import {
   readLastUsedTranslationPrefs,
   saveLastUsedTranslationPrefs,
 } from "../lib/translationDefaults";
-import { useModalA11y } from "../lib/modalA11y";
+import { useModalA11y, MODAL_BACKDROP_CLASS, modalPanelClass } from "../lib/modalA11y";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -143,8 +143,8 @@ export default function QueuePanel() {
   const doneCount = items.filter((i) => i.status === "done").length;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+    <div className={MODAL_BACKDROP_CLASS}>
+      <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-2xl max-h-[80vh] flex flex-col")}>
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
           <h2 {...titleProps} className="font-bold text-lg">Project Queue</h2>

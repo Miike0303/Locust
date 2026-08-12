@@ -22,7 +22,7 @@ import {
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import { useModalA11y } from "../lib/modalA11y";
+import { useModalA11y, MODAL_BACKDROP_CLASS, modalPanelClass } from "../lib/modalA11y";
 import { operationalShortcutTarget } from "../lib/settingsNav";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
@@ -281,8 +281,8 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
   const isDirectResult = result?.mode === "direct";
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
+    <div className={MODAL_BACKDROP_CLASS}>
+      <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-lg p-6 max-h-[90vh] overflow-y-auto")}>
         <div className="flex justify-between items-center mb-4">
           <h2 {...titleProps} className="text-lg font-bold">Inject Translations</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600">

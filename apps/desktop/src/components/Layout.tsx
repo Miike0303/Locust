@@ -10,6 +10,7 @@ import BottomBar from "./BottomBar";
 import QueuePanel from "./QueuePanel";
 import { useLogStore } from "../stores/logStore";
 import { useQueueStore } from "../stores/queueStore";
+import { APP_VERSION } from "../lib/appVersion";
 
 const navItems = [
   { to: "/", icon: Home, label: "Home", shortcut: "Alt+1" },
@@ -33,7 +34,7 @@ export default function Layout() {
       <aside className="w-60 flex flex-col bg-gray-50 dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
         <div className="p-4">
           <h1 className="text-lg font-bold text-emerald-600">Project Locust</h1>
-          <p className="text-xs text-gray-500">v0.1.0</p>
+          <p className="text-xs text-gray-500">v{APP_VERSION}</p>
         </div>
 
         <nav className="flex-1 px-2 space-y-1">
