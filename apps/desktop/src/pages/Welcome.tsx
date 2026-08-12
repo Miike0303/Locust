@@ -2,445 +2,541 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
-  FolderOpen, File, Globe, Swords, Heart, Box, Shield, Code,
-  Clock, X, Plus, Wand2, Loader, Settings2,
+	FolderOpen,
+	File,
+	Globe,
+	Swords,
+	Heart,
+	Box,
+	Shield,
+	Code,
+	Clock,
+	X,
+	Plus,
+	Wand2,
+	Loader,
+	Settings2,
 } from "lucide-react";
 import { getFormats, getConfig, openProject } from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
 import { useQueueStore } from "../stores/queueStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import { useModalA11y, MODAL_BACKDROP_CLASS, modalPanelClass } from "../lib/modalA11y";
+import {
+	useModalA11y,
+	MODAL_BACKDROP_CLASS,
+	modalPanelClass,
+} from "../lib/modalA11y";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 const FORMAT_ICONS: Record<string, typeof Globe> = {
-  "rpgmaker-mv": Swords,
-  "rpgmaker-vxa": Swords,
-  renpy: Heart,
-  unity: Box,
-  "wolf-rpg": Shield,
-  sugarcube: Globe,
-  "html-game": Code,
-  unreal: Box,
+	"rpgmaker-mv": Swords,
+	"rpgmaker-vxa": Swords,
+	renpy: Heart,
+	unity: Box,
+	"wolf-rpg": Shield,
+	sugarcube: Globe,
+	"html-game": Code,
+	unreal: Box,
 };
 
 const FORMAT_COLORS: Record<string, string> = {
-  "rpgmaker-mv": "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300",
-  "rpgmaker-vxa": "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300",
-  renpy: "bg-pink-100 text-pink-700 dark:bg-pink-900/40 dark:text-pink-300",
-  unity: "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300",
-  "wolf-rpg": "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300",
-  sugarcube: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300",
-  "html-game": "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/40 dark:text-cyan-300",
-  unreal: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
+	"rpgmaker-mv":
+		"bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300",
+	"rpgmaker-vxa":
+		"bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300",
+	renpy: "bg-pink-100 text-pink-700 dark:bg-pink-900/40 dark:text-pink-300",
+	unity:
+		"bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300",
+	"wolf-rpg":
+		"bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300",
+	sugarcube:
+		"bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300",
+	"html-game":
+		"bg-cyan-100 text-cyan-700 dark:bg-cyan-900/40 dark:text-cyan-300",
+	unreal: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
 };
 
 export default function Welcome() {
-  const navigate = useNavigate();
-  const setProject = useProjectStore((s) => s.setProject);
-  const { data: formats } = useQuery({ queryKey: ["formats"], queryFn: getFormats });
-  const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
+	const navigate = useNavigate();
+	const setProject = useProjectStore((s) => s.setProject);
+	const { data: formats } = useQuery({
+		queryKey: ["formats"],
+		queryFn: getFormats,
+	});
+	const { data: config } = useQuery({
+		queryKey: ["config"],
+		queryFn: getConfig,
+	});
 
-  const addToQueue = useQueueStore((s) => s.addItem);
-  const setQueueOpen = useQueueStore((s) => s.setPanelOpen);
+	const addToQueue = useQueueStore((s) => s.addItem);
+	const setQueueOpen = useQueueStore((s) => s.setPanelOpen);
 
-  // Format picker state — shown only when auto-detect fails, or on explicit request.
-  const [picker, setPicker] = useState<
-    { path: string | null; reason: "manual" | "detect-failed" } | null
-  >(null);
-  const [selectedFormat, setSelectedFormat] = useState("auto");
-  const [opening, setOpening] = useState(false);
-  const { dialogRef, dialogProps, titleProps } = useModalA11y({
-    open: !!picker,
-    onClose: () => setPicker(null),
-    ownEscape: true,
-  });
+	// Format picker state — shown only when auto-detect fails, or on explicit request.
+	const [picker, setPicker] = useState<{
+		path: string | null;
+		reason: "manual" | "detect-failed";
+	} | null>(null);
+	const [selectedFormat, setSelectedFormat] = useState("auto");
+	const [opening, setOpening] = useState(false);
+	const { dialogRef, dialogProps, titleProps } = useModalA11y({
+		open: !!picker,
+		onClose: () => setPicker(null),
+		ownEscape: true,
+	});
 
-  /** Backend detection failure (Tauri: "Could not detect game format"; HTTP 422: "format not detected"). */
-  const isDetectionFailure = (msg: string) =>
-    /detect/i.test(msg) && /format/i.test(msg);
+	/** Backend detection failure (Tauri: "Could not detect game format"; HTTP 422: "format not detected"). */
+	const isDetectionFailure = (msg: string) =>
+		/detect/i.test(msg) && /format/i.test(msg);
 
-  const openWithPath = async (path: string, formatId?: string) => {
-    setOpening(true);
-    try {
-      const result = await openProject(path, formatId);
-      setProject({
-        path: result.project_path,
-        format_id: result.format_id,
-        name: result.project_name,
-        supported_modes: result.supported_modes,
-      });
-      addLog("info", `Opened: ${result.project_name} (${result.format_name}, ${result.total_strings} strings)`, undefined, "project");
-      setPicker(null);
-      navigate("/editor");
-    } catch (err: any) {
-      const msg = err?.message ?? String(err);
-      if (!formatId && isDetectionFailure(msg)) {
-        // Auto-detect failed — let the user pick the engine instead of toasting.
-        addLog("warning", "Could not auto-detect game engine", path, "project");
-        setSelectedFormat("");
-        setPicker({ path, reason: "detect-failed" });
-      } else {
-        addLog("error", `Failed to open project`, msg, "project");
-        addToast("error", `Failed to open: ${msg}`);
-      }
-    } finally {
-      setOpening(false);
-    }
-  };
+	const openWithPath = async (path: string, formatId?: string) => {
+		setOpening(true);
+		try {
+			const result = await openProject(path, formatId);
+			setProject({
+				path: result.project_path,
+				format_id: result.format_id,
+				name: result.project_name,
+				supported_modes: result.supported_modes,
+			});
+			addLog(
+				"info",
+				`Opened: ${result.project_name} (${result.format_name}, ${result.total_strings} strings)`,
+				undefined,
+				"project",
+			);
+			setPicker(null);
+			navigate("/editor");
+		} catch (err: any) {
+			const msg = err?.message ?? String(err);
+			if (!formatId && isDetectionFailure(msg)) {
+				// Auto-detect failed — let the user pick the engine instead of toasting.
+				addLog("warning", "Could not auto-detect game engine", path, "project");
+				setSelectedFormat("");
+				setPicker({ path, reason: "detect-failed" });
+			} else {
+				addLog("error", `Failed to open project`, msg, "project");
+				addToast("error", `Failed to open: ${msg}`);
+			}
+		} finally {
+			setOpening(false);
+		}
+	};
 
-  const pickFolderPath = async (): Promise<string | null> => {
-    if (IS_TAURI) {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const selected = await open({
-        title: "Select game folder",
-        directory: true,
-      });
-      return typeof selected === "string" ? selected : null;
-    }
-    return prompt("Enter game folder path:");
-  };
+	const pickFolderPath = async (): Promise<string | null> => {
+		if (IS_TAURI) {
+			const { open } = await import("@tauri-apps/plugin-dialog");
+			const selected = await open({
+				title: "Select game folder",
+				directory: true,
+			});
+			return typeof selected === "string" ? selected : null;
+		}
+		return prompt("Enter game folder path:");
+	};
 
-  const handleConfirmFormat = async () => {
-    if (!picker) return;
-    const formatId = selectedFormat === "auto" ? undefined : selectedFormat;
-    if (picker.path) {
-      await openWithPath(picker.path, formatId);
-      return;
-    }
-    // Manual mode: format chosen first, now pick the game folder.
-    const path = await pickFolderPath();
-    if (path) await openWithPath(path, formatId);
-  };
+	const handleConfirmFormat = async () => {
+		if (!picker) return;
+		const formatId = selectedFormat === "auto" ? undefined : selectedFormat;
+		if (picker.path) {
+			await openWithPath(picker.path, formatId);
+			return;
+		}
+		// Manual mode: format chosen first, now pick the game folder.
+		const path = await pickFolderPath();
+		if (path) await openWithPath(path, formatId);
+	};
 
-  const handleAddToQueue = (path: string) => {
-    addToQueue(path);
-    setQueueOpen(true);
-    addToast("info", "Added to queue");
-  };
+	const handleAddToQueue = (path: string) => {
+		addToQueue(path);
+		setQueueOpen(true);
+		addToast("info", "Added to queue");
+	};
 
-  const handleOpenFile = async () => {
-    let path: string | null = null;
-    if (IS_TAURI) {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const selected = await open({
-        title: "Select game executable or main file",
-        filters: [
-          {
-            name: "Game files",
-            extensions: ["exe", "html", "htm", "rpy", "rpa", "rpgproject", "rvproj2"],
-          },
-          { name: "All files", extensions: ["*"] },
-        ],
-      });
-      if (typeof selected === "string") path = selected;
-    } else {
-      path = prompt("Enter game executable or file path:");
-    }
-    if (path) await openWithPath(path);
-  };
+	const handleOpenFile = async () => {
+		let path: string | null = null;
+		if (IS_TAURI) {
+			const { open } = await import("@tauri-apps/plugin-dialog");
+			const selected = await open({
+				title: "Select game executable or main file",
+				filters: [
+					{
+						name: "Game files",
+						extensions: [
+							"exe",
+							"html",
+							"htm",
+							"rpy",
+							"rpa",
+							"rpgproject",
+							"rvproj2",
+						],
+					},
+					{ name: "All files", extensions: ["*"] },
+				],
+			});
+			if (typeof selected === "string") path = selected;
+		} else {
+			path = prompt("Enter game executable or file path:");
+		}
+		if (path) await openWithPath(path);
+	};
 
-  const handleOpenFolder = async () => {
-    const path = await pickFolderPath();
-    if (path) await openWithPath(path);
-  };
+	const handleOpenFolder = async () => {
+		const path = await pickFolderPath();
+		if (path) await openWithPath(path);
+	};
 
-  const handleChooseFormatManually = () => {
-    setSelectedFormat("auto");
-    setPicker({ path: null, reason: "manual" });
-  };
+	const handleChooseFormatManually = () => {
+		setSelectedFormat("auto");
+		setPicker({ path: null, reason: "manual" });
+	};
 
-  const recentProjects = config?.recent_projects ?? [];
+	const recentProjects = config?.recent_projects ?? [];
 
-  return (
-    <div className="flex flex-col min-h-full p-8 max-w-4xl mx-auto">
-      {/* Hero */}
-      <div className="text-center mb-8">
-        <Globe size={48} className="mx-auto mb-3 text-emerald-500" />
-        <h1 className="text-3xl font-bold mb-1">Project Locust</h1>
-        <p className="text-gray-500">LOCalization Universal Scripting Tool</p>
-      </div>
+	return (
+		<div className="flex flex-col min-h-full p-8 max-w-4xl mx-auto">
+			{/* Hero */}
+			<div className="text-center mb-8">
+				<Globe size={48} className="mx-auto mb-3 text-emerald-500" />
+				<h1 className="text-3xl font-bold mb-1">Project Locust</h1>
+				<p className="text-gray-500">LOCalization Universal Scripting Tool</p>
+			</div>
 
-      {/* Open buttons */}
-      <div className="mb-10">
-        <div className="flex justify-center gap-4">
-          <button
-            onClick={handleOpenFile}
-            disabled={opening}
-            className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors"
-          >
-            {opening ? <Loader size={18} className="animate-spin" /> : <File size={18} />}
-            {opening ? "Opening…" : "Open Game File"}
-          </button>
-          <button
-            onClick={handleOpenFolder}
-            disabled={opening}
-            className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
-          >
-            {opening ? <Loader size={18} className="animate-spin" /> : <FolderOpen size={18} />}
-            {opening ? "Opening…" : "Open Game Folder"}
-          </button>
-        </div>
-        <div className="flex justify-center mt-2">
-          <button
-            onClick={handleChooseFormatManually}
-            disabled={opening}
-            className="flex items-center gap-1 text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-50"
-          >
-            <Settings2 size={12} />
-            Choose format manually
-          </button>
-        </div>
-        {opening && (
-          <p className="text-center text-xs text-gray-400 mt-2">
-            Extracting strings — large games can take a while…
-          </p>
-        )}
-      </div>
+			{/* Open buttons */}
+			<div className="mb-10">
+				<div className="flex justify-center gap-4">
+					<button
+						onClick={handleOpenFile}
+						disabled={opening}
+						className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors"
+					>
+						{opening ? (
+							<Loader size={18} className="animate-spin" />
+						) : (
+							<File size={18} />
+						)}
+						{opening ? "Opening…" : "Open Game File"}
+					</button>
+					<button
+						onClick={handleOpenFolder}
+						disabled={opening}
+						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
+					>
+						{opening ? (
+							<Loader size={18} className="animate-spin" />
+						) : (
+							<FolderOpen size={18} />
+						)}
+						{opening ? "Opening…" : "Open Game Folder"}
+					</button>
+				</div>
+				<div className="flex justify-center mt-2">
+					<button
+						onClick={handleChooseFormatManually}
+						disabled={opening}
+						className="flex items-center gap-1 text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-50"
+					>
+						<Settings2 size={12} />
+						Choose format manually
+					</button>
+				</div>
+				{opening && (
+					<p className="text-center text-xs text-gray-400 mt-2">
+						Extracting strings — large games can take a while…
+					</p>
+				)}
+			</div>
 
-      {/* Format Picker Modal — shown when auto-detect fails or on "Choose format manually" */}
-      {picker && (
-        <div className={MODAL_BACKDROP_CLASS}>
-          <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-md p-6")}>
-            <div className="flex justify-between items-center mb-4">
-              <h2 {...titleProps} className="text-lg font-bold">Select Format</h2>
-              <button onClick={() => setPicker(null)} className="text-gray-400 hover:text-gray-600">
-                <X size={20} />
-              </button>
-            </div>
+			{/* Format Picker Modal — shown when auto-detect fails or on "Choose format manually" */}
+			{picker && (
+				<div className={MODAL_BACKDROP_CLASS}>
+					<div
+						ref={dialogRef}
+						{...dialogProps}
+						className={modalPanelClass("max-w-md p-6")}
+					>
+						<div className="flex justify-between items-center mb-4">
+							<h2 {...titleProps} className="text-lg font-bold">
+								Select Format
+							</h2>
+							<button
+								onClick={() => setPicker(null)}
+								className="text-gray-400 hover:text-gray-600"
+							>
+								<X size={20} />
+							</button>
+						</div>
 
-            {picker.path && <p className="text-sm text-gray-500 mb-1 truncate">{picker.path}</p>}
-            {picker.reason === "detect-failed" ? (
-              <p className="text-xs text-amber-600 dark:text-amber-400 mb-4">
-                Couldn&apos;t detect the game engine automatically — pick one:
-              </p>
-            ) : (
-              <p className="text-xs text-gray-400 mb-4">
-                Choose the game engine format first, then pick the game folder.
-              </p>
-            )}
+						{picker.path && (
+							<p className="text-sm text-gray-500 mb-1 truncate">
+								{picker.path}
+							</p>
+						)}
+						{picker.reason === "detect-failed" ? (
+							<p className="text-xs text-amber-600 dark:text-amber-400 mb-4">
+								Couldn&apos;t detect the game engine automatically — pick one:
+							</p>
+						) : (
+							<p className="text-xs text-gray-400 mb-4">
+								Choose the game engine format first, then pick the game folder.
+							</p>
+						)}
 
-            <div className="space-y-1.5 max-h-64 overflow-y-auto mb-4">
-              {picker.reason !== "detect-failed" && (
-                <button
-                  onClick={() => setSelectedFormat("auto")}
-                  className={`w-full text-left p-3 rounded-lg border transition-colors flex items-center gap-3 ${
-                    selectedFormat === "auto"
-                      ? "border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20"
-                      : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
-                  }`}
-                >
-                  <div className="p-1.5 rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
-                    <Wand2 size={16} />
-                  </div>
-                  <div>
-                    <div className="text-sm font-medium">Auto-detect</div>
-                    <div className="text-xs text-gray-500">Let Locust detect the format automatically</div>
-                  </div>
-                </button>
-              )}
+						<div className="space-y-1.5 max-h-64 overflow-y-auto mb-4">
+							{picker.reason !== "detect-failed" && (
+								<button
+									onClick={() => setSelectedFormat("auto")}
+									className={`w-full text-left p-3 rounded-lg border transition-colors flex items-center gap-3 ${
+										selectedFormat === "auto"
+											? "border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20"
+											: "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
+									}`}
+								>
+									<div className="p-1.5 rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
+										<Wand2 size={16} />
+									</div>
+									<div>
+										<div className="text-sm font-medium">Auto-detect</div>
+										<div className="text-xs text-gray-500">
+											Let Locust detect the format automatically
+										</div>
+									</div>
+								</button>
+							)}
 
-              {formats?.filter(f => f.stability !== "comingsoon").map((f) => {
-                const Icon = FORMAT_ICONS[f.id] ?? Globe;
-                const colorClass = FORMAT_COLORS[f.id] ?? "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
-                const experimental = f.stability === "experimental";
-                return (
-                  <button
-                    key={f.id}
-                    onClick={() => setSelectedFormat(f.id)}
-                    className={`w-full text-left p-3 rounded-lg border transition-colors flex items-center gap-3 ${
-                      selectedFormat === f.id
-                        ? "border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20"
-                        : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
-                    }`}
-                  >
-                    <div className={`p-1.5 rounded ${colorClass}`}>
-                      <Icon size={16} />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm font-medium flex items-center gap-2">
-                        <span className="truncate">{f.name}</span>
-                        {experimental && (
-                          <span className="shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
-                            experimental
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-xs text-gray-500">{f.extensions.join(", ")}</div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
+							{formats
+								?.filter((f) => f.stability !== "comingsoon")
+								.map((f) => {
+									const Icon = FORMAT_ICONS[f.id] ?? Globe;
+									const colorClass =
+										FORMAT_COLORS[f.id] ??
+										"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+									const experimental = f.stability === "experimental";
+									return (
+										<button
+											key={f.id}
+											onClick={() => setSelectedFormat(f.id)}
+											className={`w-full text-left p-3 rounded-lg border transition-colors flex items-center gap-3 ${
+												selectedFormat === f.id
+													? "border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20"
+													: "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
+											}`}
+										>
+											<div className={`p-1.5 rounded ${colorClass}`}>
+												<Icon size={16} />
+											</div>
+											<div className="min-w-0 flex-1">
+												<div className="text-sm font-medium flex items-center gap-2">
+													<span className="truncate">{f.name}</span>
+													{experimental && (
+														<span className="shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+															experimental
+														</span>
+													)}
+												</div>
+												<div className="text-xs text-gray-500">
+													{f.extensions.join(", ")}
+												</div>
+											</div>
+										</button>
+									);
+								})}
+						</div>
 
-            <button
-              onClick={handleConfirmFormat}
-              disabled={opening || !selectedFormat}
-              className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg font-medium transition-colors"
-            >
-              {opening
-                ? "Opening..."
-                : picker.path
-                  ? "Open Project"
-                  : "Choose Game Folder…"}
-            </button>
-          </div>
-        </div>
-      )}
+						<button
+							onClick={handleConfirmFormat}
+							disabled={opening || !selectedFormat}
+							className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg font-medium transition-colors"
+						>
+							{opening
+								? "Opening..."
+								: picker.path
+									? "Open Project"
+									: "Choose Game Folder…"}
+						</button>
+					</div>
+				</div>
+			)}
 
-      {/* Recent Projects */}
-      {recentProjects.length > 0 && (
-        <div className="mb-10">
-          <h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
-            Recent Projects
-          </h2>
-          <div className="space-y-2">
-            {recentProjects.map((p, i) => {
-              const Icon = FORMAT_ICONS[p.format_id] ?? Globe;
-              const colorClass = FORMAT_COLORS[p.format_id] ?? "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
-              return (
-                <div
-                  key={i}
-                  className="w-full p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors flex items-center gap-3"
-                >
-                  <button
-                    onClick={() => openWithPath(p.path, p.format_id)}
-                    disabled={opening}
-                    className="flex items-center gap-3 flex-1 min-w-0 text-left disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <div className={`p-2 rounded-lg ${colorClass}`}>
-                      <Icon size={18} />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="font-medium truncate">{p.name}</div>
-                      <div className="text-xs text-gray-500 truncate">{p.path}</div>
-                    </div>
-                  </button>
-                  <div className="flex items-center gap-2 text-xs text-gray-400 shrink-0">
-                    <span className={`px-2 py-0.5 rounded-full text-xs ${colorClass}`}>
-                      {p.format_id}
-                    </span>
-                    {p.last_opened && (
-                      <span className="flex items-center gap-1">
-                        <Clock size={12} />
-                        {new Date(p.last_opened).toLocaleDateString()}
-                      </span>
-                    )}
-                    <button
-                      onClick={(e) => { e.stopPropagation(); handleAddToQueue(p.path); }}
-                      className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-400 hover:text-emerald-500"
-                      title="Add to queue"
-                    >
-                      <Plus size={14} />
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+			{/* Recent Projects */}
+			{recentProjects.length > 0 && (
+				<div className="mb-10">
+					<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
+						Recent Projects
+					</h2>
+					<div className="space-y-2">
+						{recentProjects.map((p, i) => {
+							const Icon = FORMAT_ICONS[p.format_id] ?? Globe;
+							const colorClass =
+								FORMAT_COLORS[p.format_id] ??
+								"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+							return (
+								<div
+									key={i}
+									className="w-full p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors flex items-center gap-3"
+								>
+									<button
+										onClick={() => openWithPath(p.path, p.format_id)}
+										disabled={opening}
+										className="flex items-center gap-3 flex-1 min-w-0 text-left disabled:opacity-50 disabled:cursor-not-allowed"
+									>
+										<div className={`p-2 rounded-lg ${colorClass}`}>
+											<Icon size={18} />
+										</div>
+										<div className="flex-1 min-w-0">
+											<div className="font-medium truncate">{p.name}</div>
+											<div className="text-xs text-gray-500 truncate">
+												{p.path}
+											</div>
+										</div>
+									</button>
+									<div className="flex items-center gap-2 text-xs text-gray-400 shrink-0">
+										<span
+											className={`px-2 py-0.5 rounded-full text-xs ${colorClass}`}
+										>
+											{p.format_id}
+										</span>
+										{p.last_opened && (
+											<span className="flex items-center gap-1">
+												<Clock size={12} />
+												{new Date(p.last_opened).toLocaleDateString()}
+											</span>
+										)}
+										<button
+											onClick={(e) => {
+												e.stopPropagation();
+												handleAddToQueue(p.path);
+											}}
+											className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-400 hover:text-emerald-500"
+											title="Add to queue"
+										>
+											<Plus size={14} />
+										</button>
+									</div>
+								</div>
+							);
+						})}
+					</div>
+				</div>
+			)}
 
-      {/* Supported Formats — split into Available + Coming Soon */}
-      {formats && formats.length > 0 && (() => {
-        const available = formats.filter(f => f.stability !== "comingsoon");
-        const comingSoon = formats.filter(f => f.stability === "comingsoon");
-        return (
-          <>
-            <div>
-              <h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
-                Available Formats
-              </h2>
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-                {available.map((f) => {
-                  const Icon = FORMAT_ICONS[f.id] ?? Globe;
-                  const colorClass = FORMAT_COLORS[f.id] ?? "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
-                  const experimental = f.stability === "experimental";
-                  return (
-                    <div
-                      key={f.id}
-                      className="p-3 rounded-lg border border-gray-200 dark:border-gray-700"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <div className={`p-1.5 rounded ${colorClass}`}>
-                          <Icon size={14} />
-                        </div>
-                        <span className="text-sm font-medium truncate">{f.name}</span>
-                        {experimental && (
-                          <span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
-                            exp
-                          </span>
-                        )}
-                      </div>
-                      {f.description && (
-                        <p className="text-xs text-gray-500 line-clamp-2">
-                          {f.description}
-                        </p>
-                      )}
-                      <div className="mt-1.5 flex flex-wrap gap-1">
-                        {f.extensions.slice(0, 3).map((ext) => (
-                          <span
-                            key={ext}
-                            className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-gray-500"
-                          >
-                            {ext}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+			{/* Supported Formats — split into Available + Coming Soon */}
+			{formats &&
+				formats.length > 0 &&
+				(() => {
+					const available = formats.filter((f) => f.stability !== "comingsoon");
+					const comingSoon = formats.filter(
+						(f) => f.stability === "comingsoon",
+					);
+					return (
+						<>
+							<div>
+								<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
+									Available Formats
+								</h2>
+								<div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+									{available.map((f) => {
+										const Icon = FORMAT_ICONS[f.id] ?? Globe;
+										const colorClass =
+											FORMAT_COLORS[f.id] ??
+											"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+										const experimental = f.stability === "experimental";
+										return (
+											<div
+												key={f.id}
+												className="p-3 rounded-lg border border-gray-200 dark:border-gray-700"
+											>
+												<div className="flex items-center gap-2 mb-1">
+													<div className={`p-1.5 rounded ${colorClass}`}>
+														<Icon size={14} />
+													</div>
+													<span className="text-sm font-medium truncate">
+														{f.name}
+													</span>
+													{experimental && (
+														<span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+															exp
+														</span>
+													)}
+												</div>
+												{f.description && (
+													<p className="text-xs text-gray-500 line-clamp-2">
+														{f.description}
+													</p>
+												)}
+												<div className="mt-1.5 flex flex-wrap gap-1">
+													{f.extensions.slice(0, 3).map((ext) => (
+														<span
+															key={ext}
+															className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-gray-500"
+														>
+															{ext}
+														</span>
+													))}
+												</div>
+											</div>
+										);
+									})}
+								</div>
+							</div>
 
-            {comingSoon.length > 0 && (
-              <div className="mt-8">
-                <h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
-                  Coming Soon
-                </h2>
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-                  {comingSoon.map((f) => {
-                    const Icon = FORMAT_ICONS[f.id] ?? Globe;
-                    return (
-                      <div
-                        key={f.id}
-                        className="p-3 rounded-lg border border-dashed border-gray-300 dark:border-gray-700 opacity-60"
-                      >
-                        <div className="flex items-center gap-2 mb-1">
-                          <div className="p-1.5 rounded bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">
-                            <Icon size={14} />
-                          </div>
-                          <span className="text-sm font-medium">{f.name}</span>
-                          <span className="ml-auto text-xs px-1.5 py-0.5 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 rounded">
-                            soon
-                          </span>
-                        </div>
-                        {f.description && (
-                          <p className="text-xs text-gray-500 line-clamp-2">
-                            {f.description}
-                          </p>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </>
-        );
-      })()}
+							{comingSoon.length > 0 && (
+								<div className="mt-8">
+									<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
+										Coming Soon
+									</h2>
+									<div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+										{comingSoon.map((f) => {
+											const Icon = FORMAT_ICONS[f.id] ?? Globe;
+											return (
+												<div
+													key={f.id}
+													className="p-3 rounded-lg border border-dashed border-gray-300 dark:border-gray-700 opacity-60"
+												>
+													<div className="flex items-center gap-2 mb-1">
+														<div className="p-1.5 rounded bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">
+															<Icon size={14} />
+														</div>
+														<span className="text-sm font-medium">
+															{f.name}
+														</span>
+														<span className="ml-auto text-xs px-1.5 py-0.5 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 rounded">
+															soon
+														</span>
+													</div>
+													{f.description && (
+														<p className="text-xs text-gray-500 line-clamp-2">
+															{f.description}
+														</p>
+													)}
+												</div>
+											);
+										})}
+									</div>
+								</div>
+							)}
+						</>
+					);
+				})()}
 
-      {/* Footer stats */}
-      <div className="mt-auto pt-8 flex justify-center gap-6 text-xs text-gray-400">
-        <span>{formats?.filter(f => f.stability !== "comingsoon").length ?? 0} formats available</span>
-        <span>{recentProjects.length} recent projects</span>
-        <span>
-          <a href="https://github.com/Miike0303/Locust" className="hover:underline">
-            GitHub
-          </a>
-        </span>
-      </div>
-    </div>
-  );
+			{/* Footer stats */}
+			<div className="mt-auto pt-8 flex justify-center gap-6 text-xs text-gray-400">
+				<span>
+					{formats?.filter((f) => f.stability !== "comingsoon").length ?? 0}{" "}
+					formats available
+				</span>
+				<span>{recentProjects.length} recent projects</span>
+				<span>
+					<a
+						href="https://github.com/Miike0303/Locust"
+						className="hover:underline"
+					>
+						GitHub
+					</a>
+				</span>
+			</div>
+		</div>
+	);
 }
