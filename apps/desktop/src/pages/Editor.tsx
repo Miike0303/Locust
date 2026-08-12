@@ -21,6 +21,7 @@ import DetailPanel from "../components/DetailPanel";
 import TranslationModal from "../components/TranslationModal";
 import InjectModal from "../components/InjectModal";
 import PatchModal from "../components/PatchModal";
+import PatchStatusIndicator from "../components/PatchStatusIndicator";
 import ExportModal from "../components/ExportModal";
 import SearchReplaceModal from "../components/SearchReplaceModal";
 import ValidationResultsModal from "../components/ValidationResultsModal";
@@ -35,6 +36,7 @@ export default function Editor() {
   const [showInjectModal, setShowInjectModal] = useState(false);
   const [showPatchModal, setShowPatchModal] = useState(false);
   const [patchInitialTab, setPatchInitialTab] = useState<"apply" | "pack">("apply");
+  const [patchStatusRefreshKey, setPatchStatusRefreshKey] = useState(0);
   const [showExportModal, setShowExportModal] = useState(false);
   const [showReplaceModal, setShowReplaceModal] = useState(false);
   const [showValidationModal, setShowValidationModal] = useState(false);
@@ -70,6 +72,10 @@ export default function Editor() {
     queryFn: () => getString(selectedEntryId!),
     enabled: !!selectedEntryId,
   });
+
+  const bumpPatchStatus = useCallback(() => {
+    setPatchStatusRefreshKey((key) => key + 1);
+  }, []);
 
   const handleRefetch = useCallback(() => {
     refetch();
@@ -216,6 +222,12 @@ export default function Editor() {
           <Package size={16} /> Patch
         </button>
 
+        <PatchStatusIndicator
+          gamePath={project?.path}
+          onOpenPatch={() => setShowPatchModal(true)}
+          refreshKey={patchStatusRefreshKey}
+        />
+
         <button
           onClick={() => { void handleValidate(); }}
           disabled={validating || !hasProject}
@@ -307,6 +319,7 @@ export default function Editor() {
         }}
         defaultGamePath={project?.path}
         initialTab={patchInitialTab}
+        onPatchStateChanged={bumpPatchStatus}
       />
 
       {/* PO / XLIFF export + import */}

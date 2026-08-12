@@ -24,7 +24,7 @@ import {
 } from "../lib/patchSource";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import { useModalA11y } from "../lib/modalA11y";
+import { useModalA11y, MODAL_BACKDROP_CLASS, modalPanelClass } from "../lib/modalA11y";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -37,6 +37,8 @@ interface PatchModalProps {
   defaultGamePath?: string;
   /** Open on Apply or Pack (e.g. after direct inject). */
   initialTab?: Tab;
+  /** Called after apply/rollback refresh so ambient indicators can update. */
+  onPatchStateChanged?: () => void;
 }
 
 export default function PatchModal({
@@ -44,6 +46,7 @@ export default function PatchModal({
   onClose,
   defaultGamePath,
   initialTab = "apply",
+  onPatchStateChanged,
 }: PatchModalProps) {
   const remembered = (() => {
     try {
@@ -162,6 +165,7 @@ export default function PatchModal({
     try {
       const s = await patchStatus({ game_path: gamePath.trim() });
       setStatus(s);
+      onPatchStateChanged?.();
     } catch (err: any) {
       setStatus(null);
       setError(err.message);
@@ -354,8 +358,8 @@ export default function PatchModal({
   );
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-xl p-6 max-h-[90vh] overflow-y-auto">
+    <div className={MODAL_BACKDROP_CLASS}>
+      <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-xl p-6 max-h-[90vh] overflow-y-auto")}>
         <div className="flex justify-between items-center mb-2">
           <h2 {...titleProps} className="text-lg font-bold flex items-center gap-2">
             <Package size={20} /> Patch
