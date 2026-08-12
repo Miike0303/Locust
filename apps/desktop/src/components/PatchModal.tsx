@@ -457,22 +457,50 @@ export default function PatchModal({
                 )}
               </div>
 
-              <div className="flex flex-wrap gap-4 text-sm">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
-                  Force (override mismatch / already-applied / unknown)
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
+              <div className="space-y-2 text-sm">
+                <label className="flex items-start gap-2 cursor-pointer">
                   <input
                     type="checkbox"
+                    className="mt-0.5"
+                    checked={force}
+                    onChange={(e) => setForce(e.target.checked)}
+                  />
+                  <span>
+                    <span className="font-medium">Force</span>
+                    <span className="block text-xs text-gray-500 mt-0.5">
+                      Apply even when checks fail — use when the game files were modified or a patch
+                      is already applied and you accept overwriting them.
+                    </span>
+                  </span>
+                </label>
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
                     checked={confirmLegacy}
                     onChange={(e) => setConfirmLegacy(e.target.checked)}
                   />
-                  Confirm legacy / structural (no original hashes)
+                  <span>
+                    <span className="font-medium">Confirm legacy patch</span>
+                    <span className="block text-xs text-gray-500 mt-0.5">
+                      Needed for older patches that carry no fingerprints of the original files —
+                      check it to confirm you trust where the patch came from.
+                    </span>
+                  </span>
                 </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
-                  Dry run
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={dryRun}
+                    onChange={(e) => setDryRun(e.target.checked)}
+                  />
+                  <span>
+                    <span className="font-medium">Dry run</span>
+                    <span className="block text-xs text-gray-500 mt-0.5">
+                      Preview what the patch would change without writing anything.
+                    </span>
+                  </span>
                 </label>
               </div>
 
@@ -574,10 +602,9 @@ export default function PatchModal({
               )}
 
               <p className="text-xs text-gray-500">
-                Verify is read-only. Apply writes under the game&apos;s{" "}
-                <code className="px-1 bg-gray-100 dark:bg-gray-800 rounded">.locust/</code> backup so
-                rollback can restore pristine files. Prefer packing with pristine hashes for strict
-                verification.
+                Verify only checks — it never changes files. Apply first saves Locust&apos;s backup of
+                the original files inside the game folder, so Rollback can restore them exactly.
+                Patches packed with pristine hashes get the strictest safety checks.
               </p>
             </>
           )}
@@ -626,9 +653,9 @@ export default function PatchModal({
                 <span>
                   <span className="font-medium">Pristine hashes</span>
                   <span className="block text-xs text-gray-500 mt-0.5">
-                    Require original file hashes from a valid{" "}
-                    <code className="px-0.5 bg-gray-100 dark:bg-gray-800 rounded">.locust/backup</code>{" "}
-                    so apply can use strict-tier verification. Fails if no backup exists.
+                    Include fingerprints of the original files (from Locust&apos;s backup of this
+                    game) so anyone applying the patch gets the strictest safety checks. Fails when
+                    Locust has no backup of the original files.
                   </span>
                 </span>
               </label>
@@ -667,10 +694,10 @@ export default function PatchModal({
               )}
 
               <p className="text-xs text-gray-500">
-                Packs exactly the files a recorded inject wrote. Run inject first, then point the
-                game folder at that recording root (project path for direct inject, or the{" "}
-                <code className="px-1 bg-gray-100 dark:bg-gray-800 rounded">*-lang</code> copy when
-                inject used an output folder).
+                Packs exactly the files a previous inject wrote into a shareable patch zip. Run
+                Inject first, then point the folder above at where those files were written — the
+                game folder itself for Direct inject, or the translated copy when Replace inject
+                used an output folder.
               </p>
             </>
           )}

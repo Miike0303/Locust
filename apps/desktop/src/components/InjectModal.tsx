@@ -13,6 +13,7 @@ import {
   defaultInjectMode,
   type InjectUiMode,
 } from "../lib/injectModes";
+import { LANGUAGES, languageLabel } from "../lib/languages";
 import {
   loadRegLabelOverride,
   rememberRegLabelOverride,
@@ -22,24 +23,6 @@ import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
-
-const LANGUAGES: { code: string; name: string }[] = [
-  { code: "es", name: "Español" },
-  { code: "en", name: "English" },
-  { code: "ja", name: "日本語" },
-  { code: "zh-CN", name: "简体中文" },
-  { code: "zh-TW", name: "繁體中文" },
-  { code: "ko", name: "한국어" },
-  { code: "fr", name: "Français" },
-  { code: "de", name: "Deutsch" },
-  { code: "it", name: "Italiano" },
-  { code: "pt", name: "Português" },
-  { code: "pt-BR", name: "Português BR" },
-  { code: "ru", name: "Русский" },
-  { code: "nl", name: "Nederlands" },
-  { code: "pl", name: "Polski" },
-  { code: "tr", name: "Türkçe" },
-];
 
 const INJECT_LANG_KEY = "locust.inject.langs";
 
@@ -102,8 +85,7 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
     );
   };
 
-  const defaultLabelFor = (code: string) =>
-    LANGUAGES.find((l) => l.code === code)?.name ?? code;
+  const defaultLabelFor = (code: string) => languageLabel(code);
 
   /** Resolve menu label for register-lang (override only when one language is selected). */
   const labelForRegister = (code: string) => {
@@ -321,17 +303,17 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                 )}
                 {injectModes.includes("direct") && (
                   <option value="direct">
-                    Direct — write into the game and record for patch packing
+                    Direct — write into the game folder (backup created first)
                   </option>
                 )}
               </select>
               <p className="text-xs text-gray-500 mt-1">
                 {mode === "replace" &&
-                  `Creates a translated copy at: [output]/${gameName}-[lang]/`}
+                  `Copies the game to a new folder with translations applied — your original stays untouched. Creates: [output]/${gameName}-[lang]/`}
                 {mode === "add" &&
-                  "Adds a tl/[lang]/ folder inside the original game directory"}
+                  "Adds the translation as an extra language the game can switch to (a tl/[lang]/ folder inside the game)"}
                 {mode === "direct" &&
-                  "Writes translations into the game folder (same as CLI --direct). Required before Patch → Pack."}
+                  "Writes translations into the game folder in place (a backup is created first). Required before packing a patch in Patch → Pack."}
                 {!injectModes.includes("add") && (
                   <span className="block mt-0.5">
                     This format only supports Replace/Direct (no Add language packs).
@@ -348,12 +330,10 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                 <ul className="list-disc pl-5 text-xs space-y-0.5">
                   <li>An automatic backup is created when the engine writes in place.</li>
                   <li>
-                    Selected language(s) name the injection recording (same as CLI{" "}
-                    <code className="px-0.5 bg-amber-100/80 dark:bg-amber-900/50 rounded">-l</code>
-                    ).
+                    Locust records what it writes, labeled by the selected language(s).
                   </li>
                   <li>
-                    After success you can pack a patch zip from the recording (Patch → Pack).
+                    After success you can pack that recording into a shareable patch zip (Patch → Pack).
                   </li>
                 </ul>
               </div>
@@ -374,7 +354,7 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                       checked={selectedLangs.includes(l.code)}
                       onChange={() => toggleLang(l.code)}
                     />
-                    <span>{l.name}</span>
+                    <span>{l.label}</span>
                   </label>
                 ))}
               </div>
@@ -382,7 +362,7 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                 Selected: {selectedLangs.length === 0 ? "none" : selectedLangs.join(", ")}
                 {mode === "direct" && selectedLangs.length > 1 && (
                   <span className="block mt-0.5">
-                    Each language gets its own recording (same as CLI -l for each).
+                    Each language gets its own recording for patch packing.
                   </span>
                 )}
               </p>
@@ -444,10 +424,8 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
             {isRpgMaker && (
               <div className="pt-1 border-t dark:border-gray-700 space-y-2">
                 <p className="text-xs text-gray-500">
-                  Multi-lang RM only: register selected language(s) in the in-game language menu
-                  without injecting strings (CLI{" "}
-                  <code className="px-0.5 bg-gray-100 dark:bg-gray-800 rounded">register-lang</code>
-                  ).
+                  For RPG Maker games with an in-game language menu: add the selected language(s)
+                  to that menu without writing any translations.
                 </p>
                 <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400 cursor-pointer">
                   <input
@@ -478,9 +456,8 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                       className="w-full mt-0.5 p-1.5 text-sm border rounded dark:bg-gray-800 dark:border-gray-600"
                     />
                     <p className="text-[11px] text-gray-500 mt-0.5">
-                      Shown in the game language picker — same as CLI{" "}
-                      <code className="px-0.5 bg-gray-100 dark:bg-gray-800 rounded">--label</code>
-                      . Leave empty for “{defaultLabelFor(selectedLangs[0])}”. Remembered across sessions.
+                      Name shown in the game&apos;s language menu. Leave empty for “
+                      {defaultLabelFor(selectedLangs[0])}”. Remembered across sessions.
                     </p>
                   </div>
                 )}
@@ -587,12 +564,9 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                   Register language in game UI
                 </p>
                 <p className="text-xs text-violet-800 dark:text-violet-200">
-                  For multi-lang Iavra / VisuMZ titles: add selected language(s) to plugins.js and
-                  Map boot choices (same as{" "}
-                  <code className="px-0.5 bg-violet-100/80 dark:bg-violet-900/40 rounded">
-                    locust register-lang
-                  </code>
-                  ). Writes <code className="px-0.5">*.bak-locust</code> backups.
+                  For games with a built-in language menu (Iavra / VisuMZ): adds the selected
+                  language(s) to that menu. Every changed file is backed up first (
+                  <code className="px-0.5">*.bak-locust</code>).
                 </p>
                 {selectedLangs.length === 1 && (
                   <div>
@@ -607,7 +581,7 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
                       className="w-full mt-0.5 p-1.5 text-sm border border-violet-200 dark:border-violet-700 rounded dark:bg-gray-900"
                     />
                     <p className="text-[11px] text-violet-700 dark:text-violet-300 mt-0.5">
-                      CLI <code className="px-0.5">--label</code> equivalent. Empty → “
+                      Name shown in the game&apos;s language menu. Leave empty for “
                       {defaultLabelFor(selectedLangs[0])}”.
                     </p>
                   </div>

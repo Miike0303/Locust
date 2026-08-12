@@ -5,23 +5,12 @@ import {
   importTranslations,
   type ExportFormat,
 } from "../lib/api";
+import { LANGUAGES } from "../lib/languages";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
-
-const LANGUAGES: { code: string; name: string }[] = [
-  { code: "es", name: "Español" },
-  { code: "en", name: "English" },
-  { code: "ja", name: "日本語" },
-  { code: "zh-CN", name: "简体中文" },
-  { code: "ko", name: "한국어" },
-  { code: "fr", name: "Français" },
-  { code: "de", name: "Deutsch" },
-  { code: "pt-BR", name: "Português BR" },
-  { code: "ru", name: "Русский" },
-];
 
 type Mode = "export" | "import";
 
@@ -214,7 +203,7 @@ export default function ExportModal({ open, onClose, onImported }: ExportModalPr
               >
                 {LANGUAGES.map((l) => (
                   <option key={l.code} value={l.code}>
-                    {l.name} ({l.code})
+                    {l.label} ({l.code})
                   </option>
                 ))}
               </select>

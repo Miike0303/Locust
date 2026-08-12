@@ -10,6 +10,8 @@ import {
 } from "../lib/api";
 import type { GlossaryEntry, TranslationRun } from "../lib/api";
 import { applyAppearance } from "../lib/appearance";
+import ConfirmDialog from "../components/ConfirmDialog";
+import { addToast } from "../stores/toastStore";
 
 const SECTIONS = [
   "Providers",
@@ -105,8 +107,7 @@ function HistorySection() {
         <div>
           <h2 className="text-xl font-bold">Translation history</h2>
           <p className="text-sm text-gray-500 mt-1">
-            Past runs for this project (provider, cost, tokens, duration). Same ledger as{" "}
-            <code className="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">locust stats</code>.
+            Every translation run recorded for this project — provider, cost, tokens and duration.
           </p>
         </div>
         <button
@@ -436,6 +437,7 @@ function GlossarySection() {
   const [term, setTerm] = useState("");
   const [translation, setTranslation] = useState("");
   const [saving, setSaving] = useState(false);
+  const [entryToDelete, setEntryToDelete] = useState<GlossaryEntry | null>(null);
 
   const filtered = useMemo(() => {
     const list = entries ?? [];
@@ -453,11 +455,11 @@ function GlossarySection() {
     const t = term.trim();
     const tr = translation.trim();
     if (!t || !tr) {
-      alert("Term and translation are required.");
+      addToast("error", "Term and translation are required.");
       return;
     }
     if (!activePair.trim()) {
-      alert("Language pair is required (e.g. ja-en).");
+      addToast("error", "Language pair is required (e.g. ja-en).");
       return;
     }
     setSaving(true);
@@ -475,20 +477,20 @@ function GlossarySection() {
       refetch();
       qc.invalidateQueries({ queryKey: ["glossary"] });
     } catch (e: any) {
-      alert(`Failed to add entry: ${e.message}`);
+      addToast("error", `Failed to add entry: ${e.message}`);
     } finally {
       setSaving(false);
     }
   };
 
-  const handleDelete = async (entry: GlossaryEntry) => {
-    if (!confirm(`Delete glossary term “${entry.term}”?`)) return;
+  const handleDeleteConfirmed = async (entry: GlossaryEntry) => {
+    setEntryToDelete(null);
     try {
       await deleteGlossaryEntry(entry.term, entry.lang_pair);
       refetch();
       qc.invalidateQueries({ queryKey: ["glossary"] });
     } catch (e: any) {
-      alert(`Failed to delete: ${e.message}`);
+      addToast("error", `Failed to delete: ${e.message}`);
     }
   };
 
@@ -595,7 +597,7 @@ function GlossarySection() {
                   </td>
                   <td className="py-2">
                     <button
-                      onClick={() => handleDelete(e)}
+                      onClick={() => setEntryToDelete(e)}
                       className="text-red-500 hover:text-red-700"
                       title="Delete entry"
                     >
@@ -608,30 +610,44 @@ function GlossarySection() {
           </table>
         )}
       </div>
+
+      <ConfirmDialog
+        open={entryToDelete !== null}
+        title="Delete glossary term"
+        message={entryToDelete ? `Delete glossary term “${entryToDelete.term}”?` : ""}
+        confirmLabel="Delete"
+        destructive
+        onConfirm={() => entryToDelete && handleDeleteConfirmed(entryToDelete)}
+        onCancel={() => setEntryToDelete(null)}
+      />
     </div>
   );
 }
 
 function DataSection() {
   const { data: backups, refetch } = useQuery({ queryKey: ["backups"], queryFn: getBackups });
+  const [pendingAction, setPendingAction] = useState<
+    { kind: "restore" | "delete"; id: string } | null
+  >(null);
 
-  const handleRestore = async (id: string) => {
-    if (!confirm(`Restore backup ${id}? This will overwrite current project files.`)) return;
-    try {
-      await restoreBackup(id);
-      alert("Restored successfully");
-    } catch (e: any) {
-      alert(`Restore failed: ${e.message}`);
-    }
-  };
-
-  const handleDelete = async (id: string) => {
-    if (!confirm(`Delete backup ${id}?`)) return;
-    try {
-      await deleteBackup(id);
-      refetch();
-    } catch (e: any) {
-      alert(`Delete failed: ${e.message}`);
+  const runPendingAction = async () => {
+    if (!pendingAction) return;
+    const { kind, id } = pendingAction;
+    setPendingAction(null);
+    if (kind === "restore") {
+      try {
+        await restoreBackup(id);
+        addToast("success", `Backup ${id} restored`);
+      } catch (e: any) {
+        addToast("error", `Restore failed: ${e.message}`);
+      }
+    } else {
+      try {
+        await deleteBackup(id);
+        refetch();
+      } catch (e: any) {
+        addToast("error", `Delete failed: ${e.message}`);
+      }
     }
   };
 
@@ -656,8 +672,8 @@ function DataSection() {
                   <td className="py-2">{new Date(b.created_at).toLocaleString()}</td>
                   <td className="py-2">{b.file_count}</td>
                   <td className="py-2 flex gap-2">
-                    <button onClick={() => handleRestore(b.id)} className="text-emerald-600 hover:text-emerald-800"><RotateCcw size={14} /></button>
-                    <button onClick={() => handleDelete(b.id)} className="text-red-500 hover:text-red-700"><Trash2 size={14} /></button>
+                    <button onClick={() => setPendingAction({ kind: "restore", id: b.id })} className="text-emerald-600 hover:text-emerald-800" title="Restore backup"><RotateCcw size={14} /></button>
+                    <button onClick={() => setPendingAction({ kind: "delete", id: b.id })} className="text-red-500 hover:text-red-700" title="Delete backup"><Trash2 size={14} /></button>
                   </td>
                 </tr>
               ))}
@@ -665,6 +681,20 @@ function DataSection() {
           </table>
         )}
       </div>
+
+      <ConfirmDialog
+        open={pendingAction !== null}
+        title={pendingAction?.kind === "restore" ? "Restore backup" : "Delete backup"}
+        message={
+          pendingAction?.kind === "restore"
+            ? `Restore backup ${pendingAction.id}? This will overwrite current project files.`
+            : `Delete backup ${pendingAction?.id ?? ""}?`
+        }
+        confirmLabel={pendingAction?.kind === "restore" ? "Restore" : "Delete"}
+        destructive
+        onConfirm={runPendingAction}
+        onCancel={() => setPendingAction(null)}
+      />
     </div>
   );
 }

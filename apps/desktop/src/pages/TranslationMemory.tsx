@@ -2,6 +2,7 @@ import { useState, useCallback } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Search, Trash2, Database, ChevronLeft, ChevronRight } from "lucide-react";
 import { getTranslationMemory, getTranslationMemoryStats, getTranslationMemoryLangPairs, deleteTranslationMemoryEntry, clearTranslationMemory } from "../lib/api";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 const PAGE_SIZE = 50;
 
@@ -38,15 +39,20 @@ export default function TranslationMemory() {
     setOffset(0);
   }, [searchInput]);
 
-  const handleDelete = async (hash: string, lp: string) => {
-    if (!confirm("Delete this memory entry?")) return;
+  const [entryToDelete, setEntryToDelete] = useState<{ hash: string; lp: string } | null>(null);
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+
+  const handleDeleteConfirmed = async () => {
+    if (!entryToDelete) return;
+    const { hash, lp } = entryToDelete;
+    setEntryToDelete(null);
     await deleteTranslationMemoryEntry(hash, lp);
     refetch();
     qc.invalidateQueries({ queryKey: ["tm-stats"] });
   };
 
-  const handleClearAll = async () => {
-    if (!confirm("Clear ALL translation memory entries? This cannot be undone.")) return;
+  const handleClearAllConfirmed = async () => {
+    setConfirmClearAll(false);
     await clearTranslationMemory();
     refetch();
     qc.invalidateQueries({ queryKey: ["tm-stats"] });
@@ -63,7 +69,7 @@ export default function TranslationMemory() {
             <h1 className="text-xl font-bold">Translation Memory</h1>
           </div>
           <button
-            onClick={handleClearAll}
+            onClick={() => setConfirmClearAll(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 dark:bg-red-900/30 dark:hover:bg-red-900/50 dark:text-red-400 rounded text-sm font-medium"
           >
             <Trash2 size={14} /> Clear All
@@ -151,7 +157,7 @@ export default function TranslationMemory() {
                   </td>
                   <td className="px-4 py-2">
                     <button
-                      onClick={() => handleDelete(entry.source_hash, entry.lang_pair)}
+                      onClick={() => setEntryToDelete({ hash: entry.source_hash, lp: entry.lang_pair })}
                       className="text-red-400 hover:text-red-600"
                     >
                       <Trash2 size={14} />
@@ -191,6 +197,25 @@ export default function TranslationMemory() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={entryToDelete !== null}
+        title="Delete memory entry"
+        message="Delete this memory entry?"
+        confirmLabel="Delete"
+        destructive
+        onConfirm={handleDeleteConfirmed}
+        onCancel={() => setEntryToDelete(null)}
+      />
+      <ConfirmDialog
+        open={confirmClearAll}
+        title="Clear translation memory"
+        message="Clear ALL translation memory entries? This cannot be undone."
+        confirmLabel="Clear All"
+        destructive
+        onConfirm={handleClearAllConfirmed}
+        onCancel={() => setConfirmClearAll(false)}
+      />
     </div>
   );
 }

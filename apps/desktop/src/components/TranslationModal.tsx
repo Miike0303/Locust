@@ -9,6 +9,7 @@ import {
   readLastUsedTranslationPrefs,
   saveLastUsedTranslationPrefs,
 } from "../lib/translationDefaults";
+import { LANGUAGES } from "../lib/languages";
 import { useEditorStore } from "../stores/editorStore";
 import { useQueueStore } from "../stores/queueStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -21,28 +22,6 @@ interface TranslationModalProps {
   totalPending: number;
   onComplete: () => void;
 }
-
-const LANGUAGES: { code: string; name: string }[] = [
-  { code: "en", name: "English" },
-  { code: "es", name: "Español (Spanish)" },
-  { code: "ja", name: "日本語 (Japanese)" },
-  { code: "zh-CN", name: "简体中文 (Chinese Simplified)" },
-  { code: "zh-TW", name: "繁體中文 (Chinese Traditional)" },
-  { code: "ko", name: "한국어 (Korean)" },
-  { code: "fr", name: "Français (French)" },
-  { code: "de", name: "Deutsch (German)" },
-  { code: "it", name: "Italiano (Italian)" },
-  { code: "pt", name: "Português (Portuguese)" },
-  { code: "pt-BR", name: "Português Brasileiro" },
-  { code: "ru", name: "Русский (Russian)" },
-  { code: "nl", name: "Nederlands (Dutch)" },
-  { code: "pl", name: "Polski (Polish)" },
-  { code: "tr", name: "Türkçe (Turkish)" },
-  { code: "ar", name: "العربية (Arabic)" },
-  { code: "vi", name: "Tiếng Việt (Vietnamese)" },
-  { code: "th", name: "ไทย (Thai)" },
-  { code: "id", name: "Bahasa Indonesia" },
-];
 
 const FALLBACK_STORAGE_KEY = "locust.translation.fallbacks";
 
@@ -390,14 +369,14 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
                 <select value={sourceLang} onChange={(e) => setSourceLang(e.target.value)}
                   className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm">
                   <option value="auto">Auto-detect</option>
-                  {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
+                  {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
                 </select>
               </div>
               <div>
                 <label className="text-sm font-medium">Target</label>
                 <select value={targetLang} onChange={(e) => setTargetLang(e.target.value)}
                   className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm">
-                  {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
+                  {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
                 </select>
               </div>
             </div>
