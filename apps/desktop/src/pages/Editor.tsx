@@ -246,7 +246,7 @@ export default function Editor() {
       )}
 
       {/* Filter + Table + Detail */}
-          <FilterBar total={total} showing={entries.length} />
+          <FilterBar total={total} showing={entries.length} entries={entries} />
 
           <div className="flex flex-1 overflow-hidden">
             {stringsLoading ? (
