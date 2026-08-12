@@ -9,6 +9,7 @@ license.workspace = true
 locust-core = { path = "../../../crates/core" }
 locust-server = { path = "../../../crates/server" }
 locust-formats = { path = "../../../crates/formats" }
+locust-providers = { path = "../../../crates/providers" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

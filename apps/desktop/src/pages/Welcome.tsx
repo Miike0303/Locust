@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	FolderOpen,
 	File,
@@ -66,6 +66,7 @@ const FORMAT_COLORS: Record<string, string> = {
 
 export default function Welcome() {
 	const navigate = useNavigate();
+	const queryClient = useQueryClient();
 	const setProject = useProjectStore((s) => s.setProject);
 	const { data: formats } = useQuery({
 		queryKey: ["formats"],
@@ -114,6 +115,11 @@ export default function Welcome() {
 				name: result.project_name,
 				supported_modes: result.supported_modes,
 			});
+			// Drop cached strings/stats from any previous project (or stale DB session).
+			void queryClient.removeQueries({ queryKey: ["strings"] });
+			void queryClient.removeQueries({ queryKey: ["stats"] });
+			void queryClient.removeQueries({ queryKey: ["string"] });
+			void queryClient.removeQueries({ queryKey: ["review-strings"] });
 			addLog(
 				"info",
 				`Opened: ${result.project_name} (${result.format_name}, ${result.total_strings} strings)`,
