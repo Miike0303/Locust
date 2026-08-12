@@ -31,7 +31,7 @@ import {
 	operationalShortcutTarget,
 	type OperationalShortcut,
 } from "../lib/settingsNav";
-import { resolveProviderReadiness } from "../lib/providerReadiness";
+import { resolveProviderReadiness, formatProviderOptionLabel } from "../lib/providerReadiness";
 
 interface TranslationModalProps {
 	open: boolean;
@@ -148,21 +148,18 @@ export default function TranslationModal({
 			config,
 			readLastUsedTranslationPrefs(),
 		);
-		setProviderId(coerceProviderId(d.providerId, providers));
+		setProviderId(coerceProviderId(d.providerId, providers, config));
 		setSourceLang(d.sourceLang);
 		setTargetLang(d.targetLang);
 		setBatchSize(d.batchSize);
 		setCostLimit(d.costLimit);
 	}, [open, config, configFetched, configError, providers]);
 
-	// If the current provider id is not in the fetched list, the <select> can't
-	// show it — fall back to the first available provider.
+	// If the current provider id is missing or not ready, fall back to the first ready one.
 	useEffect(() => {
 		if (!providers || providers.length === 0) return;
-		setProviderId((prev) =>
-			providers.some((p) => p.id === prev) ? prev : providers[0].id,
-		);
-	}, [providers]);
+		setProviderId((prev) => coerceProviderId(prev, providers, config));
+	}, [providers, config]);
 
 	useEffect(() => {
 		setHealthResult(null);
@@ -458,7 +455,7 @@ export default function TranslationModal({
 							>
 								{providers?.map((p) => (
 									<option key={p.id} value={p.id}>
-										{p.name} {p.is_free ? "(free)" : ""}
+										{formatProviderOptionLabel(p)}
 									</option>
 								))}
 							</select>
@@ -515,7 +512,7 @@ export default function TranslationModal({
 										)
 										.map((p) => (
 											<option key={p.id} value={p.id}>
-												{p.name} {p.is_free ? "(free)" : ""}
+												{formatProviderOptionLabel(p)}
 											</option>
 										))}
 								</select>

@@ -121,9 +121,21 @@ assert.deepEqual(
   { providerId: "deepl", sourceLang: "ja", targetLang: "en", batchSize: 40, costLimit: "" }
 );
 
-// coerceProviderId: keep a known id, replace an unknown one with the first available
-const providers = [{ id: "mock" }, { id: "deepl" }];
-assert.equal(coerceProviderId("deepl", providers), "deepl");
+// coerceProviderId: keep a known ready id, replace unknown/unready with first ready provider
+const providers = [
+	{ id: "mock", requires_api_key: false },
+	{ id: "deepl", requires_api_key: true, configured: false },
+];
+assert.equal(coerceProviderId("deepl", providers), "mock");
+assert.equal(coerceProviderId("mock", providers), "mock");
+assert.equal(
+	coerceProviderId(
+		"deepl",
+		[{ id: "deepl", requires_api_key: true, configured: true }],
+		{ providers: { deepl: { api_key: "***" } } },
+	),
+	"deepl",
+);
 assert.equal(coerceProviderId("google", providers), "mock");
 assert.equal(coerceProviderId("", providers), "mock");
 // Without a provider list there is nothing to coerce against

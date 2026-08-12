@@ -8,10 +8,103 @@ pub mod mock;
 pub mod retry;
 pub mod xai_oauth;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use locust_core::config::AppConfig;
 use locust_core::translation::ProviderRegistry;
+use serde::{Deserialize, Serialize};
+
+/// Metadata for providers registered only when `config.providers[id].api_key` is set.
+/// Shared by `default_registry` and `list_providers_for_api` so listing cannot drift.
+pub struct KeyGatedProviderDef {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub is_free: bool,
+    /// OpenAI-compatible endpoint defaults (`base_url`, `model`); `None` for native providers.
+    pub compatible_defaults: Option<(&'static str, &'static str)>,
+}
+
+pub const KEY_GATED_PROVIDERS: &[KeyGatedProviderDef] = &[
+    KeyGatedProviderDef {
+        id: "deepl",
+        name: "DeepL",
+        is_free: false,
+        compatible_defaults: None,
+    },
+    KeyGatedProviderDef {
+        id: "openai",
+        name: "OpenAI",
+        is_free: false,
+        compatible_defaults: None,
+    },
+    KeyGatedProviderDef {
+        id: "claude",
+        name: "Claude",
+        is_free: false,
+        compatible_defaults: None,
+    },
+    KeyGatedProviderDef {
+        id: "deepseek",
+        name: "DeepSeek",
+        is_free: false,
+        compatible_defaults: Some(("https://api.deepseek.com", "deepseek-v4-flash")),
+    },
+    KeyGatedProviderDef {
+        id: "grok",
+        name: "Grok (xAI)",
+        is_free: false,
+        compatible_defaults: Some(("https://api.x.ai", "grok-4-1-fast")),
+    },
+    KeyGatedProviderDef {
+        id: "gemini",
+        name: "Google Gemini",
+        is_free: false,
+        compatible_defaults: Some((
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-2.5-flash",
+        )),
+    },
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoverableProviderInfo {
+    pub id: String,
+    pub name: String,
+    pub is_free: bool,
+    pub requires_api_key: bool,
+    pub configured: bool,
+}
+
+/// Registered providers plus unconfigured key-gated catalog entries for GET /api/providers.
+pub fn list_providers_for_api(reg: &ProviderRegistry) -> Vec<DiscoverableProviderInfo> {
+    let mut out: Vec<DiscoverableProviderInfo> = reg
+        .list()
+        .into_iter()
+        .map(|p| DiscoverableProviderInfo {
+            id: p.id,
+            name: p.name,
+            is_free: p.is_free,
+            requires_api_key: p.requires_api_key,
+            configured: true,
+        })
+        .collect();
+
+    let registered: HashSet<String> = out.iter().map(|p| p.id.clone()).collect();
+    for def in KEY_GATED_PROVIDERS {
+        if registered.contains(def.id) {
+            continue;
+        }
+        out.push(DiscoverableProviderInfo {
+            id: def.id.to_string(),
+            name: def.name.to_string(),
+            is_free: def.is_free,
+            requires_api_key: true,
+            configured: false,
+        });
+    }
+    out
+}
 
 pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
     let mut reg = ProviderRegistry::new();
@@ -63,31 +156,22 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
     }
 
     // Register OpenAI-compatible API providers when an API key is configured.
-    // All of these speak the same chat-completions protocol as OpenAI.
-    const COMPATIBLE_APIS: [(&str, &str, &str, &str); 3] = [
-        (
-            "deepseek",
-            "DeepSeek",
-            "https://api.deepseek.com",
-            "deepseek-v4-flash",
-        ),
-        ("grok", "Grok (xAI)", "https://api.x.ai", "grok-4-1-fast"),
-        (
-            "gemini",
-            "Google Gemini",
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            "gemini-2.5-flash",
-        ),
-    ];
-    for (id, name, default_url, default_model) in COMPATIBLE_APIS {
-        if let Some(pc) = config.get_provider_config(id) {
+    for def in KEY_GATED_PROVIDERS {
+        let Some((default_url, default_model)) = def.compatible_defaults else {
+            continue;
+        };
+        if let Some(pc) = config.get_provider_config(def.id) {
             if let Some(ref api_key) = pc.api_key {
                 reg.register(Arc::new(openai::OpenAiProvider::compatible(
-                    id.to_string(),
-                    name.to_string(),
+                    def.id.to_string(),
+                    def.name.to_string(),
                     api_key.clone(),
-                    pc.base_url.clone().unwrap_or_else(|| default_url.to_string()),
-                    pc.model.clone().unwrap_or_else(|| default_model.to_string()),
+                    pc.base_url
+                        .clone()
+                        .unwrap_or_else(|| default_url.to_string()),
+                    pc.model
+                        .clone()
+                        .unwrap_or_else(|| default_model.to_string()),
                 )));
             }
         }
@@ -144,4 +228,58 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
     }
 
     reg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use locust_core::config::ProviderConfig;
+
+    #[test]
+    fn list_providers_for_api_includes_unconfigured_key_gated_catalog() {
+        let reg = default_registry(&AppConfig::default());
+        let list = list_providers_for_api(&reg);
+
+        let deepl = list
+            .iter()
+            .find(|p| p.id == "deepl")
+            .expect("deepl should be discoverable without a key");
+        assert_eq!(
+            deepl,
+            &DiscoverableProviderInfo {
+                id: "deepl".to_string(),
+                name: "DeepL".to_string(),
+                is_free: false,
+                requires_api_key: true,
+                configured: false,
+            }
+        );
+
+        assert!(
+            list.iter().any(|p| p.id == "mock" && p.configured),
+            "registered providers stay configured=true"
+        );
+    }
+
+    #[test]
+    fn list_providers_for_api_marks_key_gated_provider_configured_when_registered() {
+        let mut config = AppConfig::default();
+        config.providers.insert(
+            "deepl".to_string(),
+            ProviderConfig {
+                api_key: Some("test-key".to_string()),
+                base_url: None,
+                model: None,
+                free_tier: false,
+                extra: std::collections::HashMap::new(),
+            },
+        );
+        let reg = default_registry(&config);
+        let list = list_providers_for_api(&reg);
+
+        let deepl_entries: Vec<_> = list.iter().filter(|p| p.id == "deepl").collect();
+        assert_eq!(deepl_entries.len(), 1, "deepl must not be duplicated");
+        assert!(deepl_entries[0].configured);
+        assert!(deepl_entries[0].requires_api_key);
+    }
 }

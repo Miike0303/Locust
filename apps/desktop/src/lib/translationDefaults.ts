@@ -9,6 +9,12 @@
  * read/save helpers below (browser only).
  */
 
+import {
+	resolveProviderReadiness,
+	type ProviderReadinessConfig,
+	type ProviderReadinessMeta,
+} from "./providerReadiness";
+
 /** Subset of AppConfig (src/lib/api.ts) this module needs — kept structural so tests don't import api.ts. */
 export interface TranslationDefaultsConfig {
   default_provider?: string | null;
@@ -67,13 +73,31 @@ export function resolveTranslationDefaults(
   };
 }
 
-/** Keep the id if the fetched provider list contains it; otherwise fall back to the first available. */
-export function coerceProviderId(
-  id: string,
-  providers: readonly { id: string }[] | null | undefined
+function firstReadyProviderId(
+	providers: readonly ProviderReadinessMeta[],
+	config?: ProviderReadinessConfig | null,
 ): string {
-  if (!providers || providers.length === 0) return id;
-  return providers.some((p) => p.id === id) ? id : providers[0].id;
+	const ready = providers.find(
+		(p) => resolveProviderReadiness(p.id, providers, config).ready,
+	);
+	return ready?.id ?? providers[0]?.id ?? "";
+}
+
+/** Keep the id when it is listed and ready; otherwise prefer the first ready provider. */
+export function coerceProviderId(
+	id: string,
+	providers: readonly ProviderReadinessMeta[] | null | undefined,
+	config?: ProviderReadinessConfig | null,
+): string {
+	if (!providers || providers.length === 0) return id;
+	if (
+		providers.some((p) => p.id === id) &&
+		resolveProviderReadiness(id, providers, config).ready
+	) {
+		return id;
+	}
+	const fallback = firstReadyProviderId(providers, config);
+	return fallback || id;
 }
 
 // ─── localStorage persistence (browser only) ───────────────────────────────

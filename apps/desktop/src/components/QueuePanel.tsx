@@ -34,7 +34,7 @@ import {
 	MODAL_BACKDROP_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
-import { resolveProviderReadiness } from "../lib/providerReadiness";
+import { resolveProviderReadiness, formatProviderOptionLabel } from "../lib/providerReadiness";
 import { buildSettingsPath } from "../lib/settingsNav";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
@@ -130,7 +130,7 @@ export default function QueuePanel() {
 			config,
 			readLastUsedTranslationPrefs(),
 		);
-		setProviderId(coerceProviderId(d.providerId, providers));
+		setProviderId(coerceProviderId(d.providerId, providers, config));
 		setSourceLang(d.sourceLang);
 		setTargetLang(d.targetLang);
 		setBatchSize(d.batchSize);
@@ -143,13 +143,11 @@ export default function QueuePanel() {
 		translationParams,
 	]);
 
-	// Keep the provider <select> valid: unknown id → first available provider.
+	// Keep the provider <select> on a listed, ready id when possible.
 	useEffect(() => {
 		if (!providers || providers.length === 0) return;
-		setProviderId((prev) =>
-			providers.some((p) => p.id === prev) ? prev : providers[0].id,
-		);
-	}, [providers]);
+		setProviderId((prev) => coerceProviderId(prev, providers, config));
+	}, [providers, config]);
 
 	if (!isPanelOpen) return null;
 
@@ -326,7 +324,7 @@ export default function QueuePanel() {
 									>
 										{providers?.map((p) => (
 											<option key={p.id} value={p.id}>
-												{p.name}
+												{formatProviderOptionLabel(p)}
 											</option>
 										))}
 									</select>

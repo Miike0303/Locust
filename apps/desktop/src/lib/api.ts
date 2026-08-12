@@ -63,6 +63,8 @@ export interface PluginInfo {
 
 export interface ProviderInfo {
   id: string; name: string; is_free: boolean; requires_api_key: boolean;
+  /** False when the server knows the provider but it is not registered yet (no API key). */
+  configured?: boolean;
 }
 
 export interface ProjectInfo {

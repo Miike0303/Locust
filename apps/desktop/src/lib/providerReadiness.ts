@@ -8,6 +8,8 @@
 export interface ProviderReadinessMeta {
 	id: string;
 	requires_api_key: boolean;
+	/** When false, the provider is listed but not registered (no API key yet). */
+	configured?: boolean;
 }
 
 export interface ProviderReadinessConfig {
@@ -45,6 +47,9 @@ export function resolveProviderReadiness(
 	if (!meta.requires_api_key) {
 		return { ready: true };
 	}
+	if (meta.configured === false) {
+		return { ready: false, reason: "missing_key" };
+	}
 	if (hasConfiguredApiKey(config?.providers?.[providerId])) {
 		return { ready: true };
 	}
@@ -61,7 +66,16 @@ export function hasAnyReadyProvider(
 	);
 }
 
-// ─── Welcome hint dismiss (localStorage) ───────────────────────────────────
+export function formatProviderOptionLabel(meta: {
+	name: string;
+	is_free?: boolean;
+	configured?: boolean;
+}): string {
+	let label = meta.name;
+	if (meta.is_free) label += " (free)";
+	if (meta.configured === false) label += " (needs API key)";
+	return label;
+}
 
 const HINT_DISMISSED_KEY = "locust.providerReadiness.hintDismissed";
 

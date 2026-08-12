@@ -119,7 +119,7 @@ pub fn get_formats(state: State<AppStateWrapper>) -> Vec<PluginInfo> {
 #[tauri::command]
 pub async fn get_providers(state: State<'_, AppStateWrapper>) -> Result<Vec<serde_json::Value>, String> {
     let reg = state.0.provider_registry.read().await;
-    Ok(serde_json::to_value(reg.list())
+    Ok(serde_json::to_value(locust_providers::list_providers_for_api(&reg))
         .unwrap_or_default()
         .as_array()
         .cloned()

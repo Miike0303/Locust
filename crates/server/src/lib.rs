@@ -262,7 +262,7 @@ async fn list_providers(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let reg = state.provider_registry.read().await;
-    Json(serde_json::to_value(reg.list()).unwrap_or_default())
+    Json(serde_json::to_value(locust_providers::list_providers_for_api(&reg)).unwrap_or_default())
 }
 
 async fn provider_health(
@@ -1596,6 +1596,57 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: Vec<serde_json::Value> = resp.json().await.unwrap();
         assert!(!body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_providers_includes_unconfigured_deepl() {
+        let (url, _h) = setup().await;
+        let resp = client()
+            .get(format!("{}/api/providers", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+        let deepl = body
+            .iter()
+            .find(|p| p["id"] == "deepl")
+            .expect("deepl should be listed even without an API key");
+        assert_eq!(deepl["configured"], false);
+        assert_eq!(deepl["requires_api_key"], true);
+    }
+
+    #[tokio::test]
+    async fn test_list_providers_deepl_configured_when_key_set() {
+        let state = create_test_state();
+        {
+            let mut config = state.config.write().await;
+            config.providers.insert(
+                "deepl".to_string(),
+                locust_core::config::ProviderConfig {
+                    api_key: Some("secret-key-123".to_string()),
+                    base_url: None,
+                    model: None,
+                    free_tier: false,
+                    extra: std::collections::HashMap::new(),
+                },
+            );
+            let reg = locust_providers::default_registry(&config);
+            *state.provider_registry.write().await = reg;
+        }
+
+        let (url, _h) = start_test_server(state).await;
+        let resp = client()
+            .get(format!("{}/api/providers", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+        let deepl_entries: Vec<_> = body.iter().filter(|p| p["id"] == "deepl").collect();
+        assert_eq!(deepl_entries.len(), 1, "deepl must not be duplicated");
+        assert_eq!(deepl_entries[0]["configured"], true);
+        assert_eq!(deepl_entries[0]["requires_api_key"], true);
     }
 
     #[tokio::test]

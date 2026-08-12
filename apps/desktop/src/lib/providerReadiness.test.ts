@@ -23,6 +23,32 @@ assert.deepEqual(resolveProviderReadiness("mock", providers, { providers: {} }),
 	ready: true,
 });
 
+// configured=false from server means missing key even without config lookup
+assert.deepEqual(
+	resolveProviderReadiness(
+		"deepl",
+		[{ id: "deepl", requires_api_key: true, configured: false }],
+		undefined,
+	),
+	{ ready: false, reason: "missing_key" },
+);
+assert.deepEqual(
+	resolveProviderReadiness(
+		"deepl",
+		[{ id: "deepl", requires_api_key: true, configured: true }],
+		undefined,
+	),
+	{ ready: false, reason: "missing_key" },
+);
+assert.deepEqual(
+	resolveProviderReadiness(
+		"deepl",
+		[{ id: "deepl", requires_api_key: true, configured: true }],
+		{ providers: { deepl: { api_key: "***" } } },
+	),
+	{ ready: true },
+);
+
 // Key-required providers need a configured key
 assert.deepEqual(resolveProviderReadiness("deepl", providers, undefined), {
 	ready: false,
