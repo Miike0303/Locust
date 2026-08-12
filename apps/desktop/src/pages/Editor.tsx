@@ -75,18 +75,20 @@ export default function Editor() {
 		queryKey: ["strings", filter],
 		queryFn: () => getStrings(filter),
 		staleTime: 30_000,
+		enabled: !!project,
 	});
 
 	const { data: statsData } = useQuery({
 		queryKey: ["stats"],
 		queryFn: getStats,
 		staleTime: 10_000,
+		enabled: !!project,
 	});
 
 	const { data: selectedEntry } = useQuery({
 		queryKey: ["string", selectedEntryId],
 		queryFn: () => getString(selectedEntryId!),
-		enabled: !!selectedEntryId,
+		enabled: !!project && !!selectedEntryId,
 	});
 
 	const bumpPatchStatus = useCallback(() => {
@@ -331,10 +333,25 @@ export default function Editor() {
 			)}
 
 			{/* Filter + Table + Detail */}
-			<FilterBar total={total} showing={entries.length} entries={entries} />
+			{hasProject ? (
+				<FilterBar total={total} showing={entries.length} entries={entries} />
+			) : null}
 
 			<div className="flex flex-1 overflow-hidden">
-				{stringsLoading ? (
+				{!hasProject ? (
+					<div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+						<p className="font-medium text-gray-700 dark:text-gray-200">No project open</p>
+						<p className="text-sm text-gray-500">
+							Open a game from Welcome to load its strings. Nothing is shown from a previous session.
+						</p>
+						<button
+							onClick={() => navigate("/")}
+							className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+						>
+							Go to Welcome
+						</button>
+					</div>
+				) : stringsLoading ? (
 					<div className="flex flex-1 items-center justify-center text-gray-500">
 						Loading strings…
 					</div>
@@ -358,7 +375,7 @@ export default function Editor() {
 				) : (
 					<StringTable data={entries} onRefetch={handleRefetch} />
 				)}
-				{!stringsLoading && !stringsError && selectedEntry && (
+				{hasProject && !stringsLoading && !stringsError && selectedEntry && (
 					<DetailPanel
 						entry={selectedEntry}
 						onRefetch={handleRefetch}

@@ -396,6 +396,18 @@ async fn get_strings(
     State(state): State<Arc<AppState>>,
     Query(q): Query<StringsQuery>,
 ) -> Result<Json<StringsResponse>, ApiError> {
+    // Without an open project, never surface leftover rows from project.db.
+    if state.current_project.read().await.is_none() {
+        let limit = q.limit.unwrap_or(100);
+        let offset = q.offset.unwrap_or(0);
+        return Ok(Json(StringsResponse {
+            entries: vec![],
+            total: 0,
+            offset,
+            limit,
+        }));
+    }
+
     let status = q.status.and_then(|s| s.parse::<StringStatus>().ok());
     let limit = q.limit.unwrap_or(100);
     let offset = q.offset.unwrap_or(0);
@@ -521,6 +533,9 @@ async fn batch_patch_strings(
 async fn get_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProjectStats>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Ok(Json(ProjectStats::default()));
+    }
     state
         .db
         .get_stats()
@@ -1677,7 +1692,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_strings_before_project_returns_empty() {
-        let (url, _h) = setup().await;
+        let (url, _h, state) = setup_with_state().await;
+        // Leftover rows in project.db must not leak without an open project.
+        let leftover = StringEntry::new("stale", "Old session", PathBuf::from("old.json"));
+        state.db.save_entries(&[leftover]).unwrap();
+
         let resp = client()
             .get(format!("{}/api/strings", url))
             .send()
@@ -1686,6 +1705,16 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: StringsResponse = resp.json().await.unwrap();
         assert!(body.entries.is_empty());
+        assert_eq!(body.total, 0);
+
+        let stats = client()
+            .get(format!("{}/api/stats", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stats.status(), 200);
+        let stats_body: ProjectStats = stats.json().await.unwrap();
+        assert_eq!(stats_body.total, 0);
     }
 
     #[tokio::test]

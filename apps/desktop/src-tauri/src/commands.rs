@@ -147,15 +147,30 @@ pub struct StringsResponse {
 }
 
 #[tauri::command]
-pub fn get_stats(state: State<AppStateWrapper>) -> Result<ProjectStats, String> {
+pub async fn get_stats(state: State<'_, AppStateWrapper>) -> Result<ProjectStats, String> {
+    if state.0.current_project.read().await.is_none() {
+        return Ok(ProjectStats::default());
+    }
     state.0.db.get_stats().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_strings(filter: StringsFilter, state: State<AppStateWrapper>) -> Result<StringsResponse, String> {
-    let status = filter.status.and_then(|s| s.parse::<StringStatus>().ok());
+pub async fn get_strings(
+    filter: StringsFilter,
+    state: State<'_, AppStateWrapper>,
+) -> Result<StringsResponse, String> {
     let limit = filter.limit.unwrap_or(100);
     let offset = filter.offset.unwrap_or(0);
+    if state.0.current_project.read().await.is_none() {
+        return Ok(StringsResponse {
+            entries: vec![],
+            total: 0,
+            offset,
+            limit,
+        });
+    }
+
+    let status = filter.status.and_then(|s| s.parse::<StringStatus>().ok());
 
     let count_filter = EntryFilter {
         status: status.clone(),

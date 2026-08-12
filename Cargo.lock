@@ -3212,6 +3212,7 @@ dependencies = [
  "human-panic",
  "locust-core",
  "locust-formats",
+ "locust-providers",
  "locust-server",
  "portpicker",
  "serde",
