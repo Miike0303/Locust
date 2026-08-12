@@ -6,6 +6,8 @@ import {
   buildModalTitleProps,
   canRestoreFocus,
   chooseInitialFocus,
+  isTabFocusTrapKey,
+  resolveFocusTrapTarget,
   shouldOwnModalEscape,
 } from "./modalA11y.ts";
 
@@ -63,5 +65,29 @@ assert.equal(shouldOwnModalEscape({ open: true, ownEscape: true }), true);
 assert.equal(shouldOwnModalEscape({ open: true, ownEscape: false }), false);
 assert.equal(shouldOwnModalEscape({ open: false, ownEscape: true }), false);
 assert.equal(shouldOwnModalEscape({ open: false, ownEscape: false }), false);
+
+assert.equal(isTabFocusTrapKey("Tab"), true);
+assert.equal(isTabFocusTrapKey("Escape"), false);
+
+const first = { name: "first" } as unknown as HTMLElement;
+const middle = { name: "middle" } as unknown as HTMLElement;
+const last = { name: "last" } as unknown as HTMLElement;
+const focusable = [first, middle, last];
+assert.equal(
+  resolveFocusTrapTarget({ focusable, active: last, shiftKey: false }),
+  first
+);
+assert.equal(
+  resolveFocusTrapTarget({ focusable, active: first, shiftKey: true }),
+  last
+);
+assert.equal(
+  resolveFocusTrapTarget({ focusable, active: middle, shiftKey: false }),
+  null
+);
+assert.equal(
+  resolveFocusTrapTarget({ focusable, active: null, shiftKey: false }),
+  first
+);
 
 console.log("modalA11y.test.ts: ok");

@@ -54,7 +54,49 @@ export function shouldOwnModalEscape({
   return open && ownEscape;
 }
 
-const FOCUSABLE_SELECTOR = [
+export const MODAL_BACKDROP_CLASS =
+  "fixed inset-0 bg-black/50 flex items-center justify-center z-50";
+
+/** Shared modal panel chrome; pass size/overflow utilities as extraClass. */
+export function modalPanelClass(extraClass = ""): string {
+  const base = "bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full";
+  return extraClass ? `${base} ${extraClass}` : base;
+}
+
+export function isTabFocusTrapKey(key: string): boolean {
+  return key === "Tab";
+}
+
+export function isTopmostOverlayDialog(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  const dialogs = document.querySelectorAll<HTMLElement>(
+    "[role='dialog'][data-hotkey-overlay]"
+  );
+  return dialogs.item(dialogs.length - 1) === el;
+}
+
+export function resolveFocusTrapTarget({
+  focusable,
+  active,
+  shiftKey,
+}: {
+  focusable: readonly HTMLElement[];
+  active: HTMLElement | null;
+  shiftKey: boolean;
+}): HTMLElement | null {
+  if (focusable.length === 0) return null;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const activeInList = active !== null && focusable.includes(active);
+  if (shiftKey) {
+    if (!activeInList || active === first) return last;
+    return null;
+  }
+  if (!activeInList || active === last) return first;
+  return null;
+}
+
+export const FOCUSABLE_SELECTOR = [
   "button:not([disabled])",
   "[href]",
   "input:not([disabled])",
@@ -62,6 +104,12 @@ const FOCUSABLE_SELECTOR = [
   "textarea:not([disabled])",
   "[tabindex]:not([tabindex='-1'])",
 ].join(",");
+
+export function listFocusableElements(root: HTMLElement): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (el) => !el.hasAttribute("disabled") && el.tabIndex !== -1
+  );
+}
 
 export function useModalA11y({
   open,
@@ -121,6 +169,26 @@ export function useModalA11y({
     window.addEventListener("keydown", handleEscape, true);
     return () => window.removeEventListener("keydown", handleEscape, true);
   }, [open, ownEscape]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleTabTrap = (event: KeyboardEvent) => {
+      if (!isTabFocusTrapKey(event.key)) return;
+      const dialog = dialogRef.current;
+      if (!dialog || !isTopmostOverlayDialog(dialog)) return;
+      const focusable = listFocusableElements(dialog);
+      const trapTarget = resolveFocusTrapTarget({
+        focusable,
+        active: document.activeElement as HTMLElement | null,
+        shiftKey: event.shiftKey,
+      });
+      if (!trapTarget) return;
+      event.preventDefault();
+      trapTarget.focus();
+    };
+    window.addEventListener("keydown", handleTabTrap, true);
+    return () => window.removeEventListener("keydown", handleTabTrap, true);
+  }, [open]);
 
   return {
     dialogRef,
