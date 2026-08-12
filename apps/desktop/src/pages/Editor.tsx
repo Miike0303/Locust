@@ -91,12 +91,23 @@ export default function Editor() {
     }
   }, [validating]);
 
+  // Project-gated actions: buttons are disabled without a project, and the
+  // matching hotkeys give toast feedback instead of a silent no-op.
+  const hasProject = !!project;
+  const requireProject = useCallback((fn: () => void) => {
+    if (!useProjectStore.getState().project) {
+      addToast("info", "Open a project first");
+      return;
+    }
+    fn();
+  }, []);
+
   // Hotkeys
-  useHotkey("translate", () => setShowTranslateModal(true));
-  useHotkey("inject", () => setShowInjectModal(true));
-  useHotkey("applyPatch", () => setShowPatchModal(true));
-  useHotkey("validate", () => { void handleValidate(); });
-  useHotkey("exportFile", () => setShowExportModal(true));
+  useHotkey("translate", () => requireProject(() => setShowTranslateModal(true)));
+  useHotkey("inject", () => requireProject(() => setShowInjectModal(true)));
+  useHotkey("applyPatch", () => requireProject(() => setShowPatchModal(true)));
+  useHotkey("validate", () => requireProject(() => { void handleValidate(); }));
+  useHotkey("exportFile", () => requireProject(() => setShowExportModal(true)));
   useHotkey("searchReplace", () => setShowReplaceModal(true));
   useHotkey("closePanel", () => {
     if (showValidationModal) setShowValidationModal(false);
@@ -134,33 +145,36 @@ export default function Editor() {
 
         <button
           onClick={() => setShowTranslateModal(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium transition-colors"
-          title="Ctrl+T"
+          disabled={!hasProject}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
+          title={hasProject ? "Ctrl+T" : "Open a project first"}
         >
           <Languages size={16} /> Translate
         </button>
 
         <button
           onClick={() => setShowInjectModal(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
-          title="Ctrl+I"
+          disabled={!hasProject}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
+          title={hasProject ? "Ctrl+I" : "Open a project first"}
         >
           <FileCheck size={16} /> Inject
         </button>
 
         <button
           onClick={() => setShowPatchModal(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
-          title="Ctrl+Shift+P"
+          disabled={!hasProject}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
+          title={hasProject ? "Ctrl+Shift+P" : "Open a project first"}
         >
           <Package size={16} /> Patch
         </button>
 
         <button
           onClick={() => { void handleValidate(); }}
-          disabled={validating}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 rounded text-sm font-medium transition-colors"
-          title="Ctrl+Shift+V"
+          disabled={validating || !hasProject}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
+          title={hasProject ? "Ctrl+Shift+V" : "Open a project first"}
         >
           {validating ? <Loader2 size={16} className="animate-spin" /> : <Shield size={16} />}
           Validate
@@ -168,8 +182,9 @@ export default function Editor() {
 
         <button
           onClick={() => setShowExportModal(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium transition-colors"
-          title="Ctrl+E"
+          disabled={!hasProject}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
+          title={hasProject ? "Ctrl+E" : "Open a project first"}
         >
           <Download size={16} /> Export
         </button>

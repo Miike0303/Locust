@@ -1,8 +1,14 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { getProviders, startTranslation } from "../lib/api";
+import { getProviders, getConfig, startTranslation, cancelTranslation } from "../lib/api";
 import { subscribeToJob } from "../lib/ws";
+import {
+  resolveTranslationDefaults,
+  coerceProviderId,
+  readLastUsedTranslationPrefs,
+  saveLastUsedTranslationPrefs,
+} from "../lib/translationDefaults";
 import { useEditorStore } from "../stores/editorStore";
 import { useQueueStore } from "../stores/queueStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -38,18 +44,18 @@ const LANGUAGES: { code: string; name: string }[] = [
   { code: "id", name: "Bahasa Indonesia" },
 ];
 
-const LANG_STORAGE_KEY = "locust.translation.langs";
 const FALLBACK_STORAGE_KEY = "locust.translation.fallbacks";
 
 export default function TranslationModal({ open, onClose, totalPending, onComplete }: TranslationModalProps) {
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders, enabled: open });
+  const { data: config, isFetched: configFetched, isError: configError } = useQuery({
+    queryKey: ["config"],
+    queryFn: getConfig,
+    enabled: open,
+  });
   const { setJob, setTranslating } = useEditorStore();
 
-  const [providerId, setProviderId] = useState("google");
-  // Load saved language preferences (fallback: auto-detect source, Spanish target)
-  const saved = (() => {
-    try { return JSON.parse(localStorage.getItem(LANG_STORAGE_KEY) || "{}"); } catch { return {}; }
-  })();
+  const [providerId, setProviderId] = useState("");
   const savedFallbacks: string[] = (() => {
     try {
       const v = JSON.parse(localStorage.getItem(FALLBACK_STORAGE_KEY) || "[]");
@@ -58,8 +64,8 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
       return [];
     }
   })();
-  const [sourceLang, setSourceLang] = useState<string>(saved.source ?? "auto");
-  const [targetLang, setTargetLang] = useState<string>(saved.target ?? "es");
+  const [sourceLang, setSourceLang] = useState("auto");
+  const [targetLang, setTargetLang] = useState("es");
   const [fallbackIds, setFallbackIds] = useState<string[]>(savedFallbacks);
   const [fallbackPick, setFallbackPick] = useState("");
   const [batchSize, setBatchSize] = useState(40);
@@ -77,7 +83,15 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
   const [lastTranslated, setLastTranslated] = useState("");
   const [activeProviderLabel, setActiveProviderLabel] = useState("");
   const [done, setDone] = useState(false);
+  const [cancelled, setCancelled] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Live job bookkeeping (refs so WS callbacks see current values)
+  const unsubRef = useRef<(() => void) | null>(null);
+  const jobIdRef = useRef<string | null>(null);
+  const finishedRef = useRef(false);
+  const cancelRequestedRef = useRef(false);
 
   useEffect(() => {
     if (open) {
@@ -86,11 +100,56 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
       setTotal(0);
       setCostSoFar(0);
       setDone(false);
+      setCancelled(false);
+      setCancelling(false);
       setError(null);
       setLastTranslated("");
       setActiveProviderLabel("");
+      jobIdRef.current = null;
+      finishedRef.current = false;
+      cancelRequestedRef.current = false;
     }
   }, [open]);
+
+  // Apply resolved defaults (last-used > Settings config > fallbacks) once per open,
+  // as soon as the config query settles (success or error — dead backend keeps fallbacks).
+  const defaultsAppliedRef = useRef(false);
+  useEffect(() => {
+    if (!open) {
+      defaultsAppliedRef.current = false;
+      return;
+    }
+    if (defaultsAppliedRef.current || !(configFetched || configError)) return;
+    defaultsAppliedRef.current = true;
+    const d = resolveTranslationDefaults(config, readLastUsedTranslationPrefs());
+    setProviderId(coerceProviderId(d.providerId, providers));
+    setSourceLang(d.sourceLang);
+    setTargetLang(d.targetLang);
+    setBatchSize(d.batchSize);
+    setCostLimit(d.costLimit);
+  }, [open, config, configFetched, configError, providers]);
+
+  // If the current provider id is not in the fetched list, the <select> can't
+  // show it — fall back to the first available provider.
+  useEffect(() => {
+    if (!providers || providers.length === 0) return;
+    setProviderId((prev) => (providers.some((p) => p.id === prev) ? prev : providers[0].id));
+  }, [providers]);
+
+  // Clean up the progress WebSocket on modal close / unmount.
+  useEffect(() => {
+    if (!open) {
+      unsubRef.current?.();
+      unsubRef.current = null;
+    }
+  }, [open]);
+  useEffect(
+    () => () => {
+      unsubRef.current?.();
+      unsubRef.current = null;
+    },
+    []
+  );
 
   const addFallback = () => {
     if (!fallbackPick || fallbackPick === providerId || fallbackIds.includes(fallbackPick)) return;
@@ -103,9 +162,15 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
   };
 
   const handleStart = async () => {
-    // Persist language selection for next time
+    // Persist last-used selection for next time
+    saveLastUsedTranslationPrefs({
+      provider: providerId,
+      source: sourceLang,
+      target: targetLang,
+      batchSize,
+      costLimit,
+    });
     try {
-      localStorage.setItem(LANG_STORAGE_KEY, JSON.stringify({ source: sourceLang, target: targetLang }));
       localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(fallbackIds));
     } catch {}
     const chainLabel = [providerId, ...fallbackIds].join(" → ");
@@ -131,6 +196,9 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
       addLog("info", `Got job_id: ${result.job_id}`, undefined, "translation");
 
       setJob(result.job_id);
+      jobIdRef.current = result.job_id;
+      finishedRef.current = false;
+      cancelRequestedRef.current = false;
       setTranslating(true);
       setStep("progress");
       setActiveProviderLabel(providers?.find((p) => p.id === providerId)?.name ?? providerId);
@@ -138,7 +206,7 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
 
       const projectName = useProjectStore.getState().project?.name ?? "Project";
 
-      const unsub = subscribeToJob(result.job_id, {
+      unsubRef.current = subscribeToJob(result.job_id, {
         onStarted: (e) => {
           setTotal(e.total);
           useQueueStore.getState().setGlobalProgress({
@@ -172,6 +240,7 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
           addToast("info", `Switched to ${e.provider_name}`);
         },
         onCompleted: (e) => {
+          finishedRef.current = true;
           setDone(true);
           setTranslating(false);
           setJob(null);
@@ -180,6 +249,7 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
           addToast("success", `Translation complete: ${e.total_translated} strings`);
         },
         onFailed: (e) => {
+          finishedRef.current = true;
           setError(e.error);
           setTranslating(false);
           setJob(null);
@@ -187,15 +257,46 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
           addLog("error", `Translation failed`, e.error, "translation");
           addToast("error", `Translation failed: ${e.error}`);
         },
+        onClosed: () => {
+          // Stream ended without a completed/failed event after a cancel
+          // request — the server stopped the job, mark it cancelled.
+          if (finishedRef.current || !cancelRequestedRef.current) return;
+          finishedRef.current = true;
+          setCancelled(true);
+          setCancelling(false);
+          setTranslating(false);
+          setJob(null);
+          useQueueStore.getState().setGlobalProgress(null);
+          addLog("info", "Translation cancelled", undefined, "translation");
+          addToast("info", "Translation cancelled");
+        },
       });
-
-      // Cleanup on unmount
-      return unsub;
     } catch (err: any) {
       addLog("error", `Translation start failed: ${err.message ?? err}`, err.stack ?? String(err), "translation");
       addToast("error", `Translation failed to start: ${err.message ?? err}`);
       setError(err.message ?? String(err));
     }
+  };
+
+  const handleCancel = async () => {
+    const jobId = jobIdRef.current;
+    if (!jobId || cancelling) return;
+    cancelRequestedRef.current = true;
+    setCancelling(true);
+    try {
+      await cancelTranslation(jobId);
+      addLog("info", `Cancel requested for job ${jobId}`, undefined, "translation");
+      addToast("info", "Cancelling translation…");
+    } catch (err: any) {
+      cancelRequestedRef.current = false;
+      setCancelling(false);
+      addToast("error", `Cancel failed: ${err.message ?? err}`);
+    }
+  };
+
+  const handleClose = () => {
+    onClose();
+    if (done) onComplete();
   };
 
   if (!open) return null;
@@ -207,7 +308,13 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
       <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6">
         <div className="flex justify-between items-center mb-4">
           <h2 className="text-lg font-bold">{step === "configure" ? "Start Translation" : "Translation Progress"}</h2>
-          <button onClick={() => { onClose(); if (done) onComplete(); }} className="text-gray-400 hover:text-gray-600"><X size={20} /></button>
+          <button
+            onClick={handleClose}
+            aria-label="Close translation dialog"
+            className="text-gray-400 hover:text-gray-600"
+          >
+            <X aria-hidden="true" size={20} />
+          </button>
         </div>
 
         {step === "configure" && (
@@ -339,21 +446,29 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
               <div className="bg-emerald-500 h-3 rounded-full transition-all" style={{ width: `${progressPercent}%` }} />
             </div>
             <div className="text-center text-sm">
-              {done ? "Complete!" : `${completed} / ${total}`}
+              {done ? "Complete!" : cancelled ? "Cancelled" : `${completed} / ${total}`}
               {costSoFar > 0 && ` · $${costSoFar.toFixed(4)}`}
             </div>
-            {activeProviderLabel && !done && (
+            {activeProviderLabel && !done && !cancelled && (
               <div className="text-xs text-center text-emerald-700 dark:text-emerald-400">
                 Using provider: {activeProviderLabel}
               </div>
             )}
-            {lastTranslated && !done && (
+            {lastTranslated && !done && !cancelled && (
               <div className="text-xs text-gray-500 truncate">Last: {lastTranslated}</div>
             )}
             {error && <div className="p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 rounded text-sm text-red-600">{error}</div>}
-            {done && (
-              <button onClick={() => { onClose(); onComplete(); }}
-                className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium">
+            {!done && !cancelled && !error && (
+              <button onClick={handleCancel} disabled={cancelling}
+                className="w-full py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors">
+                {cancelling ? "Cancelling…" : "Cancel"}
+              </button>
+            )}
+            {(done || cancelled) && (
+              <button
+                onClick={handleClose}
+                className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
+              >
                 Close
               </button>
             )}

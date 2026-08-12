@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   X, Plus, ChevronUp, ChevronDown, Trash2, Play, Square,
@@ -6,7 +6,13 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { useQueueStore, type QueueItem } from "../stores/queueStore";
-import { getProviders, type TranslationStartParams } from "../lib/api";
+import { getProviders, getConfig, type TranslationStartParams } from "../lib/api";
+import {
+  resolveTranslationDefaults,
+  coerceProviderId,
+  readLastUsedTranslationPrefs,
+  saveLastUsedTranslationPrefs,
+} from "../lib/translationDefaults";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -31,12 +37,42 @@ const statusColors: Record<string, string> = {
 export default function QueuePanel() {
   const { items, isRunning, isPanelOpen, translationParams, setPanelOpen, addItem, removeItem, moveItem, clearCompleted, setParams, startQueue, cancelQueue } = useQueueStore();
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders, enabled: isPanelOpen });
+  const { data: config, isFetched: configFetched, isError: configError } = useQuery({
+    queryKey: ["config"],
+    queryFn: getConfig,
+    enabled: isPanelOpen,
+  });
 
-  const [providerId, setProviderId] = useState(translationParams?.provider_id ?? "mock");
-  const [sourceLang, setSourceLang] = useState(translationParams?.options.source_lang ?? "ja");
-  const [targetLang, setTargetLang] = useState(translationParams?.options.target_lang ?? "en");
-  const [batchSize, setBatchSize] = useState(translationParams?.options.batch_size ?? 40);
+  // Same defaults chain as TranslationModal: last-used > Settings config > fallbacks.
+  const initialDefaults = useMemo(
+    () => resolveTranslationDefaults(undefined, readLastUsedTranslationPrefs()),
+    []
+  );
+  const [providerId, setProviderId] = useState(translationParams?.provider_id ?? initialDefaults.providerId);
+  const [sourceLang, setSourceLang] = useState(translationParams?.options.source_lang ?? initialDefaults.sourceLang);
+  const [targetLang, setTargetLang] = useState(translationParams?.options.target_lang ?? initialDefaults.targetLang);
+  const [batchSize, setBatchSize] = useState(translationParams?.options.batch_size ?? initialDefaults.batchSize);
   const [gameContext, setGameContext] = useState(translationParams?.options.game_context ?? "");
+
+  // Once the config query settles, fill in config defaults — unless params from
+  // an earlier run this session already seeded the form.
+  const defaultsAppliedRef = useRef(false);
+  useEffect(() => {
+    if (!isPanelOpen || defaultsAppliedRef.current || !(configFetched || configError)) return;
+    defaultsAppliedRef.current = true;
+    if (translationParams) return;
+    const d = resolveTranslationDefaults(config, readLastUsedTranslationPrefs());
+    setProviderId(coerceProviderId(d.providerId, providers));
+    setSourceLang(d.sourceLang);
+    setTargetLang(d.targetLang);
+    setBatchSize(d.batchSize);
+  }, [isPanelOpen, config, configFetched, configError, providers, translationParams]);
+
+  // Keep the provider <select> valid: unknown id → first available provider.
+  useEffect(() => {
+    if (!providers || providers.length === 0) return;
+    setProviderId((prev) => (providers.some((p) => p.id === prev) ? prev : providers[0].id));
+  }, [providers]);
 
   if (!isPanelOpen) return null;
 
@@ -87,6 +123,12 @@ export default function QueuePanel() {
 
   const handleStart = () => {
     const params = buildParams();
+    saveLastUsedTranslationPrefs({
+      provider: providerId,
+      source: sourceLang,
+      target: targetLang,
+      batchSize,
+    });
     setParams(params);
     startQueue();
   };

@@ -9,6 +9,7 @@ import {
   getTranslationRuns,
 } from "../lib/api";
 import type { GlossaryEntry, TranslationRun } from "../lib/api";
+import { applyAppearance } from "../lib/appearance";
 
 const SECTIONS = [
   "Providers",
@@ -377,18 +378,17 @@ function AppearanceSection() {
   const qc = useQueryClient();
 
   const setTheme = async (theme: string) => {
-    await updateConfig({ ui: { ...config?.ui, theme } } as any);
+    const ui = { ...config?.ui, theme };
+    await updateConfig({ ui } as any);
     qc.invalidateQueries({ queryKey: ["config"] });
-    const root = document.documentElement;
-    root.classList.remove("dark", "light");
-    if (theme === "dark") root.classList.add("dark");
-    else if (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches) root.classList.add("dark");
+    applyAppearance(ui);
   };
 
   const setFontSize = async (size: number) => {
-    await updateConfig({ ui: { ...config?.ui, font_size: size } } as any);
+    const ui = { ...config?.ui, font_size: size };
+    await updateConfig({ ui } as any);
     qc.invalidateQueries({ queryKey: ["config"] });
-    document.documentElement.style.fontSize = `${size}px`;
+    applyAppearance(ui);
   };
 
   if (!config) return null;

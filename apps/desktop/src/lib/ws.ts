@@ -16,6 +16,8 @@ interface JobHandlers {
   onFailed?: (e: ProgressEventFailed) => void;
   onPaused?: () => void;
   onProviderSwitched?: (e: ProgressEventProviderSwitched) => void;
+  /** Socket closed (server ended the stream or unsubscribe was called). */
+  onClosed?: () => void;
 }
 
 interface WaitOptions {
@@ -71,6 +73,10 @@ export function subscribeToJob(jobId: string, handlers: JobHandlers): () => void
 
     ws.onerror = (err) => {
       console.error("WebSocket error:", err);
+    };
+
+    ws.onclose = () => {
+      handlers.onClosed?.();
     };
   });
 

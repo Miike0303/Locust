@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:unit": "npx --yes tsx src/lib/patchSource.test.ts && npx --yes tsx src/lib/injectModes.test.ts && npx --yes tsx src/lib/registerLangPrefs.test.ts"
+    "test:unit": "npx --yes tsx src/lib/patchSource.test.ts && npx --yes tsx src/lib/injectModes.test.ts && npx --yes tsx src/lib/registerLangPrefs.test.ts && npx --yes tsx src/lib/translationDefaults.test.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.21",
