@@ -21,11 +21,12 @@ interface TranslationModalProps {
   onClose: () => void;
   totalPending: number;
   onComplete: () => void;
+  onReview?: () => void;
 }
 
 const FALLBACK_STORAGE_KEY = "locust.translation.fallbacks";
 
-export default function TranslationModal({ open, onClose, totalPending, onComplete }: TranslationModalProps) {
+export default function TranslationModal({ open, onClose, totalPending, onComplete, onReview }: TranslationModalProps) {
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders, enabled: open });
   const { data: config, isFetched: configFetched, isError: configError } = useQuery({
     queryKey: ["config"],
@@ -278,6 +279,12 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
     if (done) onComplete();
   };
 
+  const handleReview = () => {
+    onClose();
+    onComplete();
+    onReview?.();
+  };
+
   if (!open) return null;
 
   const progressPercent = total > 0 ? (completed / total) * 100 : 0;
@@ -444,12 +451,26 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
               </button>
             )}
             {(done || cancelled) && (
-              <button
-                onClick={handleClose}
-                className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
-              >
-                Close
-              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={handleClose}
+                  className={`w-full py-2 rounded font-medium ${
+                    done && onReview
+                      ? "bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
+                      : "bg-emerald-600 hover:bg-emerald-700 text-white"
+                  }`}
+                >
+                  Close
+                </button>
+                {done && onReview && (
+                  <button
+                    onClick={handleReview}
+                    className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
+                  >
+                    Review translations
+                  </button>
+                )}
+              </div>
             )}
           </div>
         )}

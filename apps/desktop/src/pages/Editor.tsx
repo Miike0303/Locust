@@ -1,10 +1,18 @@
 import { useState, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Languages, Shield, Download, FileCheck, Package, Loader2 } from "lucide-react";
 import { getStrings, getStats, getString, validate, type ValidationResponse } from "../lib/api";
 import { useEditorStore } from "../stores/editorStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useHotkey } from "../lib/hotkeys";
+import {
+  readSkipReviewPreference,
+  readWorkflowGuideDismissed,
+  resolveWorkflowGuideStep,
+  saveSkipReviewPreference,
+  saveWorkflowGuideDismissed,
+} from "../lib/workflowGuide";
 import { addToast } from "../stores/toastStore";
 import { addLog } from "../stores/logStore";
 import FilterBar from "../components/FilterBar";
@@ -16,10 +24,12 @@ import PatchModal from "../components/PatchModal";
 import ExportModal from "../components/ExportModal";
 import SearchReplaceModal from "../components/SearchReplaceModal";
 import ValidationResultsModal from "../components/ValidationResultsModal";
+import WorkflowGuideBanner from "../components/WorkflowGuideBanner";
 
 export default function Editor() {
   const { filter, selectedEntryId, setSelected } = useEditorStore();
   const { project } = useProjectStore();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [showTranslateModal, setShowTranslateModal] = useState(false);
   const [showInjectModal, setShowInjectModal] = useState(false);
@@ -30,6 +40,12 @@ export default function Editor() {
   const [showValidationModal, setShowValidationModal] = useState(false);
   const [validationResult, setValidationResult] = useState<ValidationResponse | null>(null);
   const [validating, setValidating] = useState(false);
+  const [guideDismissed, setGuideDismissed] = useState<boolean>(() =>
+    readWorkflowGuideDismissed()
+  );
+  const [skipReview, setSkipReview] = useState<boolean>(() =>
+    readSkipReviewPreference()
+  );
 
   const { data: stringsData, refetch } = useQuery({
     queryKey: ["strings", filter],
@@ -124,6 +140,27 @@ export default function Editor() {
 
   const entries = stringsData?.entries || [];
   const total = stringsData?.total || 0;
+  const workflowStep = resolveWorkflowGuideStep({
+    hasProject,
+    stats: statsData,
+    skipReview,
+  });
+
+  const handleGuidePrimaryAction = () => {
+    if (workflowStep === "translate") setShowTranslateModal(true);
+    else if (workflowStep === "review") navigate("/review");
+    else if (workflowStep === "inject") setShowInjectModal(true);
+  };
+
+  const handleSkipReview = () => {
+    saveSkipReviewPreference(true);
+    setSkipReview(true);
+  };
+
+  const handleDismissGuide = () => {
+    saveWorkflowGuideDismissed(true);
+    setGuideDismissed(true);
+  };
 
   return (
     <div className="flex flex-col h-full">
@@ -190,6 +227,15 @@ export default function Editor() {
         </button>
       </div>
 
+      {!guideDismissed && workflowStep && (
+        <WorkflowGuideBanner
+          step={workflowStep}
+          onPrimaryAction={handleGuidePrimaryAction}
+          onSkipReview={workflowStep === "review" && !skipReview ? handleSkipReview : undefined}
+          onDismiss={handleDismissGuide}
+        />
+      )}
+
       {/* Filter + Table + Detail */}
       <FilterBar total={total} showing={entries.length} />
 
@@ -210,6 +256,7 @@ export default function Editor() {
         onClose={() => setShowTranslateModal(false)}
         totalPending={statsData?.pending || 0}
         onComplete={handleRefetch}
+        onReview={() => navigate("/review")}
       />
 
       {/* Inject Modal */}
