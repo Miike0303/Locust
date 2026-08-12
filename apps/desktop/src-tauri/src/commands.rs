@@ -119,7 +119,7 @@ pub fn get_formats(state: State<AppStateWrapper>) -> Vec<PluginInfo> {
 #[tauri::command]
 pub async fn get_providers(state: State<'_, AppStateWrapper>) -> Result<Vec<serde_json::Value>, String> {
     let reg = state.0.provider_registry.read().await;
-    Ok(serde_json::to_value(reg.list())
+    Ok(serde_json::to_value(locust_providers::list_providers_for_api(&reg))
         .unwrap_or_default()
         .as_array()
         .cloned()
@@ -206,6 +206,51 @@ pub async fn patch_string(
     s.db.get_entry(&id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Entry not found".to_string())
+}
+
+#[derive(Deserialize)]
+pub struct BatchPatchItem {
+    pub id: String,
+    pub translation: String,
+}
+
+#[derive(Deserialize)]
+pub struct BatchPatchReq {
+    pub updates: Vec<BatchPatchItem>,
+    #[serde(default = "default_batch_provider")]
+    pub provider: String,
+}
+
+fn default_batch_provider() -> String {
+    "manual".into()
+}
+
+/// Bulk translation updates in one SQLite transaction (search-replace).
+#[tauri::command]
+pub async fn batch_patch_strings(
+    data: BatchPatchReq,
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
+    if data.updates.len() > 50_000 {
+        return Err("batch too large (max 50000 updates)".into());
+    }
+    let pairs: Vec<(String, String)> = data
+        .updates
+        .into_iter()
+        .map(|u| (u.id, u.translation))
+        .collect();
+    let requested = pairs.len();
+    let applied = state
+        .0
+        .db
+        .save_translations_batch(pairs, &data.provider)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "requested": requested,
+        "applied": applied,
+        "skipped": requested.saturating_sub(applied),
+    }))
 }
 
 // ─── Translation commands ───────────────────────────────────────────────────
@@ -317,21 +362,188 @@ pub async fn run_validation(state: State<'_, AppStateWrapper>) -> Result<serde_j
     }))
 }
 
+/// Export current project translations to a PO or XLIFF file at `path`.
+/// Frontend picks the path via the native save dialog.
+#[tauri::command]
+pub async fn export_translations(
+    format: String,
+    lang: String,
+    path: String,
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
+    let s = &state.0;
+    let entries = s
+        .db
+        .get_entries(&EntryFilter::default())
+        .map_err(|e| e.to_string())?;
+    if entries.is_empty() {
+        return Err("no strings in project — open a game and extract first".into());
+    }
+    let config = s.config.read().await;
+    let source = s
+        .db
+        .resolve_export_source_lang(&lang, &config.default_source_lang)
+        .map_err(|e| e.to_string())?;
+    let body = match format.as_str() {
+        "po" => locust_core::export::export_po(&entries, &source, &lang),
+        "xliff" => locust_core::export::export_xliff(&entries, &source, &lang),
+        other => {
+            return Err(format!(
+                "unknown export format \"{other}\" — use \"po\" or \"xliff\""
+            ))
+        }
+    };
+    let out = PathBuf::from(&path);
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::write(&out, body.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "path": path,
+        "format": format,
+        "lang": lang,
+        "entries": entries.len(),
+        "bytes": body.len(),
+    }))
+}
+
+/// Import translations from a PO or XLIFF file into the open project DB.
+#[tauri::command]
+pub async fn import_translations(
+    format: String,
+    path: String,
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
+    let s = &state.0;
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    if content.trim().is_empty() {
+        return Err("import file is empty".into());
+    }
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    match format.as_str() {
+        "po" => {
+            let entries =
+                locust_core::export::import_po(&content).map_err(|e| e.to_string())?;
+            for pe in &entries {
+                if pe.translation.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+                let Some(ref id) = pe.id else {
+                    skipped += 1;
+                    continue;
+                };
+                if s.db
+                    .save_translation(id, &pe.translation, "import")
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    imported += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+        "xliff" => {
+            let units =
+                locust_core::export::import_xliff(&content).map_err(|e| e.to_string())?;
+            for unit in &units {
+                if unit.target.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+                if s.db
+                    .save_translation(&unit.id, &unit.target, "import")
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    imported += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown import format \"{other}\" — use \"po\" or \"xliff\""
+            ))
+        }
+    }
+    Ok(serde_json::json!({
+        "path": path,
+        "format": format,
+        "imported": imported,
+        "skipped": skipped,
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct InjectParams {
     pub project_path: String,
     pub format_id: String,
-    pub mode: OutputMode,
+    /// Ignored when `direct` is true.
+    #[serde(default)]
+    pub mode: Option<OutputMode>,
     pub languages: Vec<String>,
     pub output_dir: Option<String>,
+    /// CLI `--direct`: in-place inject + recording for patch pack.
+    #[serde(default)]
+    pub direct: bool,
 }
+
+/// Unblocking advice attached to a containment failure when recording an
+/// injection made through the desktop app. The app cannot know the exact
+/// paths the user's shell will use, so it names the shape of the working
+/// command rather than a copy-pasteable line.
+const INJECT_RECORD_REMEDY: &str =
+    "Restore the original game files from the backup listed above (or from a \
+     clean copy) first — this engine writes translations into the ORIGINAL \
+     tree, and a re-run against the mutated tree writes and records nothing. \
+     Then record the injection with the CLI's direct mode: locust inject \
+     <game folder> -P <project db> --direct -l <lang> — `locust patch` packs \
+     from that recording.";
 
 #[tauri::command]
 pub async fn run_inject(
     params: InjectParams,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
+    // Same guard as CLI/server: empty languages used to return success with
+    // zero work and zero recording — a silent no-op that breaks `locust patch`.
+    if params.languages.is_empty() {
+        return Err(
+            "inject requires at least one language (e.g. [\"es\"])".into(),
+        );
+    }
     let s = &state.0;
+
+    if params.direct {
+        let game_path = PathBuf::from(&params.project_path);
+        let format_id = params.format_id.clone();
+        let languages = params.languages.clone();
+        let registry = s.format_registry.clone();
+        let db = s.db.clone();
+        let backup = s.backup_manager.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            locust_core::extraction::inject_direct(
+                &registry,
+                &db,
+                &backup,
+                &game_path,
+                &format_id,
+                &languages,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        return serde_json::to_value(report).map_err(|e| e.to_string());
+    }
+
+    let mode = params.mode.unwrap_or(OutputMode::Replace);
     let injector = locust_core::extraction::MultiLangInjector::new(
         s.format_registry.clone(),
         s.db.clone(),
@@ -340,11 +552,12 @@ pub async fn run_inject(
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
+    let languages = params.languages.clone();
     let report = injector
         .inject(
             &PathBuf::from(&params.project_path),
             &params.format_id,
-            params.mode,
+            mode,
             params.languages,
             params.output_dir.map(PathBuf::from),
             tx,
@@ -352,6 +565,46 @@ pub async fn run_inject(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Persist what each language's injection wrote — `locust patch` packs
+    // exclusively from this recording, so an inject seam that skips it
+    // produces projects that can never be packed.
+    locust_core::extraction::record_multilang_injection(
+        &s.db,
+        &report,
+        &languages,
+        &|_lang| INJECT_RECORD_REMEDY.to_string(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    serde_json::to_value(report).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+pub struct RegisterLangParams {
+    pub game_path: String,
+    pub lang: String,
+    pub label: String,
+}
+
+/// Register a language in RM MZ multi-lang UI (Iavra / VisuMZ / Map choices).
+/// Same as CLI `locust register-lang`. Mutates game files; writes `*.bak-locust`.
+#[tauri::command]
+pub async fn register_lang(params: RegisterLangParams) -> Result<serde_json::Value, String> {
+    let game_path = PathBuf::from(params.game_path.trim());
+    if params.game_path.trim().is_empty() || !game_path.is_dir() {
+        return Err(format!(
+            "game_path must be an existing directory (got {:?})",
+            params.game_path
+        ));
+    }
+    let lang = params.lang;
+    let label = params.label;
+    let report = tokio::task::spawn_blocking(move || {
+        locust_formats::rpgmaker_lang::register_language(&game_path, &lang, &label)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     serde_json::to_value(report).map_err(|e| e.to_string())
 }
 

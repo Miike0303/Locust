@@ -138,6 +138,12 @@ pub struct TranslationResult {
     pub detected_source_lang: Option<String>,
     pub provider: String,
     pub tokens_used: Option<u32>,
+    /// Prompt (input) tokens for the batch, when the provider reports them.
+    #[serde(default)]
+    pub input_tokens: Option<u32>,
+    /// Completion (output) tokens for the batch, when the provider reports them.
+    #[serde(default)]
+    pub output_tokens: Option<u32>,
     pub cost_usd: Option<f64>,
 }
 
@@ -146,6 +152,9 @@ pub struct ValidationIssue {
     pub entry_id: String,
     pub kind: ValidationKind,
     pub message: String,
+    /// Optional source snippet for UI (not persisted in validation table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -153,6 +162,12 @@ pub enum ValidationKind {
     MissingPlaceholder { placeholder: String },
     ExtraPlaceholder { placeholder: String },
     ExceedsCharLimit { limit: usize, actual: usize },
+    /// Binary inject slot overflow (Unity UTF-8 / Unreal UTF-16LE / Wolf Shift-JIS).
+    ExceedsBinarySlot {
+        encoding: String,
+        limit: usize,
+        actual: usize,
+    },
     EmptyTranslation,
     IdenticalToSource,
 }
@@ -187,6 +202,12 @@ pub enum ProgressEvent {
     Failed {
         entry_id: Option<String>,
         error: String,
+    },
+    /// Emitted when a multi-provider fallback chain advances to the next provider.
+    ProviderSwitched {
+        provider_id: String,
+        provider_name: String,
+        remaining_pending: usize,
     },
 }
 
@@ -314,6 +335,26 @@ mod tests {
             ProgressEvent::Failed { entry_id, error } => {
                 assert_eq!(entry_id, Some("e1".to_string()));
                 assert_eq!(error, "timeout");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let switched = ProgressEvent::ProviderSwitched {
+            provider_id: "lmstudio".into(),
+            provider_name: "LM Studio".into(),
+            remaining_pending: 12,
+        };
+        let json = serde_json::to_string(&switched).unwrap();
+        assert!(json.contains("provider_switched"), "{json}");
+        let back: ProgressEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            ProgressEvent::ProviderSwitched {
+                provider_id,
+                remaining_pending,
+                ..
+            } => {
+                assert_eq!(provider_id, "lmstudio");
+                assert_eq!(remaining_pending, 12);
             }
             _ => panic!("wrong variant"),
         }

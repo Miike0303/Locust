@@ -34,7 +34,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     addLog("error", `API ${res.status}: ${path}`, text, "api");
     throw new Error(`${res.status}: ${text}`);
   }
-  return res.json();
+  // 204 / empty body (DELETE, some POSTs) — do not call res.json()
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 async function requestText(path: string): Promise<string> {
@@ -59,10 +63,14 @@ export interface PluginInfo {
 
 export interface ProviderInfo {
   id: string; name: string; is_free: boolean; requires_api_key: boolean;
+  /** False when the server knows the provider but it is not registered yet (no API key). */
+  configured?: boolean;
 }
 
 export interface ProjectInfo {
   path: string; format_id: string; name: string;
+  /** From project open; drives Inject modal mode list. */
+  supported_modes?: OutputMode[];
 }
 
 export interface ProjectOpenResponse {
@@ -73,6 +81,8 @@ export interface ProjectOpenResponse {
 export interface StringEntry {
   id: string; source: string; translation: string | null;
   file_path: string; context: string | null; tags: string[];
+  /** Engine extract tags e.g. binary_slot: "utf8" | "utf16le" | "sjis" */
+  metadata?: Record<string, unknown>;
   status: StringStatus; provider_used: string | null;
   char_limit: number | null; created_at: string;
   translated_at: string | null; reviewed_at: string | null;
@@ -116,6 +126,8 @@ export interface AppConfig {
 
 export interface TranslationStartParams {
   provider_id: string;
+  /** Ordered fallbacks after the primary (optional; same chain rules as CLI --fallback). */
+  fallback_provider_ids?: string[];
   options: {
     source_lang: string; target_lang: string; batch_size: number;
     max_concurrent: number; cost_limit_usd: number | null;
@@ -125,18 +137,105 @@ export interface TranslationStartParams {
 }
 
 export interface InjectParams {
-  project_path: string; format_id: string; mode: OutputMode;
-  languages: string[]; output_dir?: string;
+  project_path: string;
+  format_id: string;
+  /** Replace/Add; ignored when `direct` is true. */
+  mode?: OutputMode;
+  languages: string[];
+  output_dir?: string;
+  /** In-place inject + injection recording for Patch → Pack (CLI `--direct`). */
+  direct?: boolean;
 }
 
 export interface MultiLangReport {
-  mode: OutputMode; languages_processed: string[];
-  languages_failed: [string, string][]; backup_id: string;
+  mode: OutputMode | "direct" | string;
+  languages_processed: string[];
+  languages_failed: [string, string][];
+  backup_id: string;
+  /** Absolute backup path when direct inject created one. */
+  backup_path?: string | null;
+  files_modified?: number;
+  strings_written?: number;
+  strings_skipped?: number;
+  warnings?: string[];
   reports: Record<string, any>;
 }
 
+/** Mirrors serde for core::models::ValidationKind (externally tagged). */
+export type ValidationKind =
+  | { MissingPlaceholder: { placeholder: string } }
+  | { ExtraPlaceholder: { placeholder: string } }
+  | { ExceedsCharLimit: { limit: number; actual: number } }
+  | { ExceedsBinarySlot: { encoding: string; limit: number; actual: number } }
+  | "EmptyTranslation"
+  | "IdenticalToSource";
+
+export interface ValidationIssue {
+  entry_id: string;
+  kind: ValidationKind;
+  message: string;
+  /** Optional source snippet (UI); not always present. */
+  source?: string | null;
+}
+
+export interface ValidationReport {
+  total_checked: number;
+  issues_found: number;
+  entries_with_issues: number;
+  /** Counts by kind name, e.g. ExceedsBinarySlot, MissingPlaceholder */
+  by_kind: Record<string, number>;
+  issues: ValidationIssue[];
+}
+
+/** Mirrors core::font_validation::FontCoverageReport */
+export interface FontCoverageReport {
+  font_path: string;
+  font_name: string | null;
+  total_unique_chars: number;
+  /** JSON chars as single-codepoint strings */
+  missing_chars: string[];
+  missing_count: number;
+  coverage_percent: number;
+  has_full_coverage: boolean;
+}
+
 export interface ValidationResponse {
-  validation: any; fonts: any[];
+  validation: ValidationReport;
+  fonts: FontCoverageReport[];
+}
+
+/** Human label for a ValidationKind discriminant. */
+export function validationKindLabel(kind: ValidationKind): string {
+  if (typeof kind === "string") return kind;
+  if ("MissingPlaceholder" in kind) return "MissingPlaceholder";
+  if ("ExtraPlaceholder" in kind) return "ExtraPlaceholder";
+  if ("ExceedsCharLimit" in kind) return "ExceedsCharLimit";
+  if ("ExceedsBinarySlot" in kind) return "ExceedsBinarySlot";
+  return "Unknown";
+}
+
+/** UTF-8 / UTF-16LE byte length of text for inject-slot UI.
+ *  JS strings are UTF-16 code units, so utf16le = length × 2.
+ *  Shift-JIS needs a native encoder — live UI returns null; full check is Rust `validate`.
+ */
+export function encodedByteLen(encoding: string, text: string): number | null {
+  switch (encoding) {
+    case "utf8":
+      return new TextEncoder().encode(text).length;
+    case "utf16le":
+      return text.length * 2;
+    case "sjis":
+    case "shift_jis":
+    case "shift-jis":
+      return null;
+    default:
+      return null;
+  }
+}
+
+export function binarySlotOf(entry: StringEntry): string | null {
+  const v = entry.metadata?.binary_slot;
+  return typeof v === "string" ? v : null;
 }
 
 export interface ProgressEventStarted { type: "started"; total: number; job_id: string }
@@ -144,6 +243,12 @@ export interface ProgressEventBatchCompleted { type: "batch_completed"; complete
 export interface ProgressEventStringTranslated { type: "string_translated"; entry_id: string; translation: string }
 export interface ProgressEventCompleted { type: "completed"; total_translated: number; total_cost: number; duration_secs: number }
 export interface ProgressEventFailed { type: "failed"; entry_id: string | null; error: string }
+export interface ProgressEventProviderSwitched {
+  type: "provider_switched";
+  provider_id: string;
+  provider_name: string;
+  remaining_pending: number;
+}
 
 // ─── API functions (Tauri IPC with HTTP fallback) ─────────────────────────
 
@@ -186,6 +291,24 @@ export const patchString = (id: string, data: Partial<Pick<StringEntry, "transla
     ? invoke("patch_string", { id, data })
     : request(`/strings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
 
+export interface BatchPatchResult {
+  requested: number;
+  applied: number;
+  skipped: number;
+}
+
+/** Bulk update translations in one transaction (search-replace). */
+export const batchPatchStrings = (
+  updates: { id: string; translation: string }[],
+  provider = "manual"
+): Promise<BatchPatchResult> =>
+  IS_TAURI
+    ? invoke("batch_patch_strings", { data: { updates, provider } })
+    : request("/strings/batch", {
+        method: "POST",
+        body: JSON.stringify({ updates, provider }),
+      });
+
 export const getStats = (): Promise<ProjectStats> =>
   IS_TAURI ? invoke("get_stats") : request("/stats");
 
@@ -203,6 +326,27 @@ export const inject = (params: InjectParams): Promise<MultiLangReport> =>
   IS_TAURI
     ? invoke("run_inject", { params })
     : request("/inject", { method: "POST", body: JSON.stringify(params) });
+
+/** Register a language in RM multi-lang UI (Iavra / VisuMZ / Map choices). */
+export interface RegisterLangParams {
+  game_path: string;
+  lang: string;
+  label: string;
+}
+
+export interface RegisterLangReport {
+  plugins_js: boolean;
+  iavra_languages: boolean;
+  visumz_options: boolean;
+  maps_patched: string[];
+  backups: string[];
+  notes: string[];
+}
+
+export const registerLang = (params: RegisterLangParams): Promise<RegisterLangReport> =>
+  IS_TAURI
+    ? invoke("register_lang", { params })
+    : request("/register-lang", { method: "POST", body: JSON.stringify(params) });
 
 export const validate = (): Promise<ValidationResponse> =>
   IS_TAURI
@@ -224,8 +368,107 @@ export const deleteGlossaryEntry = (term: string, langPair: string) =>
 
 export const exportPo = (lang: string) => requestText(`/export/po?lang=${encodeURIComponent(lang)}`);
 export const exportXliff = (lang: string) => requestText(`/export/xliff?lang=${encodeURIComponent(lang)}`);
-export const importPo = (lang: string, content: string) =>
-  request<{ imported: number }>(`/import/po?lang=${encodeURIComponent(lang)}`, { method: "POST", body: content, headers: { "Content-Type": "text/plain" } });
+export const importPo = (content: string) =>
+  request<{ imported: number }>(`/import/po`, {
+    method: "POST",
+    body: content,
+    headers: { "Content-Type": "text/plain" },
+  });
+
+export const importXliff = (content: string) =>
+  request<{ imported: number }>(`/import/xliff`, {
+    method: "POST",
+    body: content,
+    headers: { "Content-Type": "text/plain" },
+  });
+
+export type ExportFormat = "po" | "xliff";
+
+export interface ExportResult {
+  path: string;
+  format: string;
+  lang: string;
+  entries: number;
+  bytes: number;
+}
+
+export interface ImportResult {
+  path: string;
+  format: string;
+  imported: number;
+  skipped: number;
+}
+
+/** Save translations to a PO or XLIFF file.
+ *  Tauri: writes via `export_translations` after the UI picks a path.
+ *  Browser: fetches text and triggers a download (path ignored).
+ */
+export async function exportTranslations(
+  format: ExportFormat,
+  lang: string,
+  path?: string
+): Promise<ExportResult> {
+  if (IS_TAURI) {
+    if (!path) throw new Error("path required for Tauri export");
+    return invoke<ExportResult>("export_translations", { format, lang, path });
+  }
+  const text = format === "po" ? await exportPo(lang) : await exportXliff(lang);
+  const filename = path?.split(/[/\\]/).pop() || `translation_${lang}.${format === "po" ? "po" : "xliff"}`;
+  const blob = new Blob([text], {
+    type: format === "po" ? "text/plain;charset=utf-8" : "application/xml;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+  return { path: filename, format, lang, entries: 0, bytes: text.length };
+}
+
+/** Import translations from a PO/XLIFF file path (Tauri) or raw content (browser). */
+export async function importTranslations(
+  format: ExportFormat,
+  pathOrContent: string
+): Promise<ImportResult> {
+  if (IS_TAURI) {
+    return invoke<ImportResult>("import_translations", {
+      format,
+      path: pathOrContent,
+    });
+  }
+  const content = pathOrContent;
+  const res =
+    format === "po" ? await importPo(content) : await importXliff(content);
+  return {
+    path: "(browser upload)",
+    format,
+    imported: res.imported,
+    skipped: 0,
+  };
+}
+
+// ─── Translation run history ─────────────────────────────────────────────
+
+/** Mirrors core::database::TranslationRun (all ledger columns). */
+export interface TranslationRun {
+  id: number;
+  started_at: string;
+  duration_secs: number;
+  /** Single provider or chain like "mock→deepl". */
+  provider: string;
+  source_lang: string;
+  target_lang: string;
+  strings_translated: number;
+  tokens_used: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+}
+
+/** Newest-first list of translation runs for the open project. */
+export const getTranslationRuns = (): Promise<TranslationRun[]> =>
+  request("/runs");
 
 export const getConfig = (): Promise<AppConfig> =>
   IS_TAURI ? invoke("get_config") : request("/config");
@@ -239,7 +482,109 @@ export const getBackups = (): Promise<BackupEntry[]> =>
   IS_TAURI ? invoke("get_backups") : request("/backups");
 
 export const restoreBackup = (id: string) =>
-  request<void>(`/backups/${id}/restore`, { method: "POST" });
+  request<void>(`/backups/${encodeURIComponent(id)}/restore`, { method: "POST" });
+
+/** Delete a backup by id (HTTP DELETE — uses baseUrl for Tauri port). */
+export const deleteBackup = (id: string): Promise<void> =>
+  request<void>(`/backups/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+// ─── Patch apply / rollback (HTTP — server embeds the core engine) ────────
+
+export interface PatchPathsParams {
+  game_path: string;
+  zip_path?: string;
+  /** http(s) URL of a patch zip — server downloads then applies/verifies. */
+  zip_url?: string;
+  force?: boolean;
+  confirm_legacy?: boolean;
+  dry_run?: boolean;
+}
+
+export interface PatchVerifyResult {
+  outcome: string;
+  tier: string | null;
+  replaced: string[];
+  added: string[];
+  conflicts: string[];
+  backup_compromised: boolean;
+  messages: string[];
+  manifest: any;
+}
+
+export interface PatchApplyResult {
+  patch_id: string;
+  patch_version: string;
+  replaced: number;
+  added: number;
+  forced: boolean;
+  baseline: string;
+  dry_run: boolean;
+  user_edits_overwritten: string[];
+  messages: string[];
+}
+
+export interface PatchRollbackResult {
+  restored: number;
+  deleted: number;
+  baseline: string | null;
+  messages: string[];
+  aborted_edited: string[];
+  torn_deleted: string[];
+}
+
+export interface PatchStatusResult {
+  status: "not_patched" | "patched" | "interrupted" | "unknown";
+  patch_id?: string;
+  patch_version?: string;
+  engine?: string;
+  language?: string;
+  baseline?: string;
+  forced?: boolean;
+  applied_at?: string;
+  replaced?: number;
+  added?: number;
+  state?: string;
+}
+
+export const patchVerify = (params: PatchPathsParams): Promise<PatchVerifyResult> =>
+  request("/patch/verify", { method: "POST", body: JSON.stringify(params) });
+
+export const patchApply = (params: PatchPathsParams): Promise<PatchApplyResult> =>
+  request("/patch/apply", { method: "POST", body: JSON.stringify(params) });
+
+export const patchRollback = (params: PatchPathsParams): Promise<PatchRollbackResult> =>
+  request("/patch/rollback", { method: "POST", body: JSON.stringify(params) });
+
+export const patchStatus = (params: Pick<PatchPathsParams, "game_path">): Promise<PatchStatusResult> =>
+  request("/patch/status", { method: "POST", body: JSON.stringify(params) });
+
+export interface PatchPackParams {
+  game_path: string;
+  output_path: string;
+  /** At most one language; empty = auto when a single recording exists. */
+  languages?: string[];
+  /** Require pristine hashes (.locust/backup or pristine_path). */
+  pristine?: boolean;
+  pristine_path?: string;
+}
+
+export interface PatchPackResult {
+  output_path: string;
+  recording_lang: string | null;
+  recorded_root: string;
+  files_packed: number;
+  translated_strings: number;
+  size_bytes: number;
+  patch_id: string;
+  patch_version: string;
+  engine: string;
+  language: string;
+  tier: string;
+  messages: string[];
+}
+
+export const patchPack = (params: PatchPackParams): Promise<PatchPackResult> =>
+  request("/patch/pack", { method: "POST", body: JSON.stringify(params) });
 
 // ─── Translation Memory ──────────────────────────────────────────────────
 

@@ -14,9 +14,7 @@ pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) 
     lines.push(String::new());
     lines.push("msgid \"\"".to_string());
     lines.push("msgstr \"\"".to_string());
-    lines.push(format!(
-        "\"Content-Type: text/plain; charset=UTF-8\\n\""
-    ));
+    lines.push("\"Content-Type: text/plain; charset=UTF-8\\n\"".to_string());
     lines.push("\"Content-Transfer-Encoding: 8bit\\n\"".to_string());
     lines.push(format!("\"Language: {}\\n\"", target_lang));
     lines.push(String::new());
@@ -26,11 +24,11 @@ pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) 
         if let Some(ref ctx) = entry.context {
             lines.push(format!("#. {}", ctx));
         }
-        lines.push(format!(
-            "#: {}#{}",
-            entry.file_path.display(),
-            entry.id
-        ));
+        // File location only — Locust ids often contain `#` (e.g. file#idx#key).
+        // Putting the id after path# and re-importing with rfind broke multi-# ids.
+        lines.push(format!("#: {}", entry.file_path.display()));
+        // Full entry id for lossless import (preferred over legacy path#id).
+        lines.push(format!("msgctxt \"{}\"", escape_po(&entry.id)));
         lines.push(format!("msgid \"{}\"", escape_po(&entry.source)));
         let translation = entry.translation.as_deref().unwrap_or("");
         lines.push(format!("msgstr \"{}\"", escape_po(translation)));
@@ -66,11 +64,14 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
             continue;
         }
 
-        if trimmed.starts_with("#: ") {
-            let reference = &trimmed[3..];
-            // Extract id from reference (after last #)
-            if let Some(hash_pos) = reference.rfind('#') {
-                current_id = Some(reference[hash_pos + 1..].to_string());
+        if let Some(reference) = trimmed.strip_prefix("#: ") {
+            // Legacy Locust exports used `#: path#id`. Prefer msgctxt when present;
+            // only fill id from the reference if we do not already have one.
+            if current_id.is_none() {
+                // First `#` separates path from id so multi-# ids stay intact.
+                if let Some(hash_pos) = reference.find('#') {
+                    current_id = Some(reference[hash_pos + 1..].to_string());
+                }
             }
             continue;
         }
@@ -79,15 +80,22 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
             continue;
         }
 
-        if trimmed.starts_with("msgid ") {
-            let val = extract_po_string(&trimmed[6..]);
+        if let Some(rest) = trimmed.strip_prefix("msgctxt ") {
+            let val = extract_po_string(rest);
+            current_id = Some(unescape_po(&val));
+            reading = ReadingState::None;
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("msgid ") {
+            let val = extract_po_string(rest);
             current_msgid = Some(unescape_po(&val));
             reading = ReadingState::Msgid;
             continue;
         }
 
-        if trimmed.starts_with("msgstr ") {
-            let val = extract_po_string(&trimmed[7..]);
+        if let Some(rest) = trimmed.strip_prefix("msgstr ") {
+            let val = extract_po_string(rest);
             current_msgstr = Some(unescape_po(&val));
             reading = ReadingState::Msgstr;
             continue;
@@ -348,10 +356,62 @@ mod tests {
         assert_eq!(imported.len(), 3);
         assert_eq!(imported[0].source, "Hello");
         assert_eq!(imported[0].translation, "Hola");
+        assert_eq!(imported[0].id.as_deref(), Some("e1"));
         assert_eq!(imported[1].source, "World");
         assert_eq!(imported[1].translation, "Mundo");
         assert_eq!(imported[2].source, "Untranslated");
         assert_eq!(imported[2].translation, "");
+        assert!(po.contains("msgctxt \"e1\""), "export must write msgctxt ids");
+    }
+
+    #[test]
+    fn test_import_po_preserves_multi_hash_ids() {
+        // VNTP / Ren'Py style ids: file#index#key — must survive export→import.
+        let mut e = StringEntry::new(
+            "S004b.ks.json#0#message",
+            "Hello there",
+            PathBuf::from(r"C:\work\S004b.ks.json"),
+        );
+        e.translation = Some("Hola".to_string());
+        let po = export_po(std::slice::from_ref(&e), "en", "es");
+        assert!(
+            po.contains("msgctxt \"S004b.ks.json#0#message\""),
+            "msgctxt missing full id: {po}"
+        );
+        assert!(
+            !po.contains("#: C:\\work\\S004b.ks.json#S004b"),
+            "must not glue path#id (legacy broken form): {po}"
+        );
+        let imported = import_po(&po).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(
+            imported[0].id.as_deref(),
+            Some("S004b.ks.json#0#message"),
+            "id truncated on import"
+        );
+        assert_eq!(imported[0].translation, "Hola");
+    }
+
+    #[test]
+    fn test_import_po_legacy_path_hash_id_uses_first_hash() {
+        // Pre-msgctxt Locust export: `#: path#id` with multi-# id.
+        let legacy = r#"
+msgid ""
+msgstr ""
+"Language: es\n"
+
+#: C:\work\S004b.ks.json#S004b.ks.json#0#message
+msgid "Hello"
+msgstr "Hola"
+"#;
+        let imported = import_po(legacy).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(
+            imported[0].id.as_deref(),
+            Some("S004b.ks.json#0#message"),
+            "legacy import must keep full id after first #, got {:?}",
+            imported[0].id
+        );
     }
 
     #[test]

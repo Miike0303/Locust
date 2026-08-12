@@ -8,9 +8,8 @@ impl EncodingDetector {
     pub fn detect_and_decode(bytes: &[u8]) -> Result<(String, &'static str)> {
         // Check for UTF-8 BOM
         if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
-            match std::str::from_utf8(&bytes[3..]) {
-                Ok(s) => return Ok((s.to_string(), "UTF-8")),
-                Err(_) => {}
+            if let Ok(s) = std::str::from_utf8(&bytes[3..]) {
+                return Ok((s.to_string(), "UTF-8"));
             }
         }
 

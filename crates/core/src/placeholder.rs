@@ -206,7 +206,7 @@ impl PlaceholderProcessor {
                     // Basic validation: must look like a tag
                     if tag.len() >= 3
                         && (tag.starts_with("</")
-                            || tag.chars().nth(1).map_or(false, |c| c.is_ascii_alphabetic()))
+                            || tag.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic()))
                     {
                         matches.push(PatternMatch {
                             start: i,
@@ -279,13 +279,8 @@ impl PlaceholderProcessor {
                 if let Some(close) = source[i..].find('}') {
                     let end = i + close + 1;
                     let inner = &source[i + 1..end - 1];
-                    // {} or {0} or {name} or {name_here}
-                    if inner.is_empty()
-                        || inner.chars().all(|c| c.is_ascii_digit())
-                        || inner
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    {
+                    // {} / {0} / {name} / Ren'Py-style {i} — not binary-noise {P}
+                    if is_rust_format_inner(inner) {
                         matches.push(PatternMatch {
                             start: i,
                             end,
@@ -372,6 +367,44 @@ impl PlaceholderProcessor {
     }
 }
 
+/// Whether `{inner}` looks like a real format/text tag, not binary-scan noise.
+///
+/// Accepts `{}`, `{0}`, `{name}`, Ren'Py open tags (`{i}`, `{b}`, …), and Ren'Py
+/// **closing** tags (`{/i}`, `{/b}`, `{/color}`). Rejects single **uppercase**
+/// letters (`{P}`, `{F}`, `{G}`) that dominate Unreal/Unity heuristic dumps and
+/// only produce restore-fail noise under mock/length-safe translate.
+fn is_rust_format_inner(inner: &str) -> bool {
+    // Ren'Py closing tag: same rules on the name after the leading '/'.
+    if let Some(rest) = inner.strip_prefix('/') {
+        return !rest.is_empty() && is_rust_format_name(rest);
+    }
+    if inner.is_empty() {
+        return true;
+    }
+    if inner.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    is_rust_format_name(inner)
+}
+
+/// Identifier body for open tags / names: `{name}`, `{i}`, not `{P}`.
+fn is_rust_format_name(name: &str) -> bool {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return false;
+    }
+    let n = name.chars().count();
+    if n >= 2 {
+        return true;
+    }
+    // n == 1: lowercase Ren'Py-style only
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +438,54 @@ mod tests {
         assert_eq!(placeholders.len(), 2);
         assert_eq!(placeholders[0].original, "{name}");
         assert_eq!(placeholders[1].original, "{count}");
+    }
+
+    #[test]
+    fn test_extract_renpy_single_letter_tags() {
+        let source = "{i}italic{/i} and {b}bold{/b}";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        let originals: Vec<&str> = placeholders.iter().map(|p| p.original.as_str()).collect();
+        for expected in ["{i}", "{/i}", "{b}", "{/b}"] {
+            assert!(
+                originals.contains(&expected),
+                "expected {expected} protected, got {originals:?} sanitized={sanitized}"
+            );
+        }
+        assert_eq!(
+            sanitized, "{PL_0}italic{PL_1} and {PL_2}bold{PL_3}",
+            "open+close tags must both become tokens"
+        );
+    }
+
+    #[test]
+    fn test_extract_renpy_closing_rejects_uppercase_noise() {
+        // {/P} is not a real Ren'Py close tag we care about; still name-rule based.
+        let source = "noise {/P} end";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        assert_eq!(sanitized, source);
+        assert!(placeholders.is_empty());
+    }
+
+    #[test]
+    fn test_extract_ignores_uppercase_single_letter_noise() {
+        // Unreal/Unity heuristic scans often emit lone {P}/{F}/{G} fragments.
+        let source = "Score {P} and flag {F} then {G} done";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        assert_eq!(sanitized, source, "noise braces must stay as plain text");
+        assert!(
+            placeholders.is_empty(),
+            "expected no placeholders, got {placeholders:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_still_keeps_digit_and_empty_braces() {
+        let source = "Hi {} player {0}";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        assert_eq!(sanitized, "Hi {PL_0} player {PL_1}");
+        assert_eq!(placeholders.len(), 2);
+        assert_eq!(placeholders[0].original, "{}");
+        assert_eq!(placeholders[1].original, "{0}");
     }
 
     #[test]

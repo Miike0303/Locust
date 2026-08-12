@@ -1,5 +1,6 @@
 # Build output
 /target
+/target-alt
 /dist
 **/dist/
 node_modules/
@@ -64,3 +65,10 @@ data/
 session/
 notes.md
 TODO.local.md
+
+# Generated skill registry cache (gentle-ai)
+.atl/
+
+# Built KiriKiri proxy DLLs and the renamed original system DLL they forward to.
+# Build from docs/vn-tools/proxy/src instead of committing binaries.
+docs/vn-tools/proxy/*.dll

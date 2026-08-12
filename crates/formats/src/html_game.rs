@@ -151,7 +151,8 @@ impl FormatPlugin for HtmlGamePlugin {
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
-        locust_core::extraction::FormatStability::ComingSoon
+        // Phase-2 apply proven on synthetic non-SugarCube HTML fixture.
+        locust_core::extraction::FormatStability::Experimental
     }
 
     fn supported_extensions(&self) -> &[&str] {
@@ -231,6 +232,7 @@ impl FormatPlugin for HtmlGamePlugin {
             strings_written: 0,
             strings_skipped: 0,
             warnings: Vec::new(),
+            files_written: Vec::new(),
         };
 
         for file in &files {
@@ -258,6 +260,7 @@ impl FormatPlugin for HtmlGamePlugin {
             if file_changed {
                 std::fs::write(file, &modified)?;
                 report.files_modified += 1;
+                report.files_written.push(file.clone());
             }
         }
 
@@ -533,6 +536,15 @@ mod tests {
         assert_eq!(strip_inner_tags("Hello <b>world</b>!"), "Hello world!");
         assert_eq!(strip_inner_tags("Plain text"), "Plain text");
         assert_eq!(strip_inner_tags("&amp; &lt; &gt;"), "& < >");
+    }
+
+    #[test]
+    fn test_stability_is_experimental_after_phase2() {
+        let plugin = HtmlGamePlugin::new();
+        assert_eq!(
+            plugin.stability(),
+            locust_core::extraction::FormatStability::Experimental
+        );
     }
 
     #[test]

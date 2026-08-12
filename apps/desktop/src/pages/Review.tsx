@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, ArrowRight, Check, SkipForward, X } from "lucide-react";
+import { ArrowLeft, Check, SkipForward, X } from "lucide-react";
 import { getStrings, patchString } from "../lib/api";
 import DiffView from "../components/DiffView";
+import { shouldHandleEscape, shouldRunActionHotkey } from "../lib/hotkeyPolicy";
 
 export default function Review() {
   const navigate = useNavigate();
@@ -12,10 +13,17 @@ export default function Review() {
   const [showDiff, setShowDiff] = useState(false);
   const [translation, setTranslation] = useState("");
   const [approved, setApproved] = useState(0);
+  const [reviewComplete, setReviewComplete] = useState(false);
 
-  const { data } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["review-strings"],
-    queryFn: () => getStrings({ status: "translated", limit: 50000 }),
+    queryFn: async () => {
+      const [translated, reviewed] = await Promise.all([
+        getStrings({ status: "translated", limit: 50000 }),
+        getStrings({ status: "reviewed", limit: 50000 }),
+      ]);
+      return { entries: [...translated.entries, ...reviewed.entries] };
+    },
   });
 
   const entries = data?.entries || [];
@@ -31,14 +39,20 @@ export default function Review() {
   }, [index, total]);
 
   const handleApprove = useCallback(async () => {
-    if (!entry) return;
+    if (!entry || reviewComplete) return;
     if (translation !== (entry.translation || "")) {
       await patchString(entry.id, { translation } as any);
     }
     await patchString(entry.id, { status: "approved" } as any);
     setApproved((a) => a + 1);
-    advance();
-  }, [entry, translation, advance]);
+    if (index >= total - 1) setReviewComplete(true);
+    else advance();
+
+    // Keep active review data stable while paging, but make both views refresh
+    // from the backend on the next navigation.
+    void qc.invalidateQueries({ queryKey: ["review-strings"], refetchType: "none" });
+    void qc.invalidateQueries({ queryKey: ["stats"], refetchType: "none" });
+  }, [entry, reviewComplete, translation, index, total, advance, qc]);
 
   const handleSkip = useCallback(() => advance(), [advance]);
   const handlePrev = useCallback(() => {
@@ -47,22 +61,67 @@ export default function Review() {
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
+      if (e.key === "Escape") {
+        if (shouldHandleEscape({ overlayOpen: false, target: e.target as HTMLElement | null })) {
+          navigate("/editor");
+        }
+        return;
+      }
+      if (!shouldRunActionHotkey({
+        overlayOpen: !!document.querySelector("[data-hotkey-overlay]"),
+        target: e.target as HTMLElement | null,
+      })) return;
       if (e.key === "a" || (e.ctrlKey && e.key === "Enter")) { e.preventDefault(); handleApprove(); }
       if (e.key === "s") handleSkip();
       if (e.key === "p") handlePrev();
       if (e.key === "e") document.querySelector<HTMLTextAreaElement>("#review-textarea")?.focus();
-      if (e.key === "Escape") navigate("/editor");
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [handleApprove, handleSkip, handlePrev, navigate]);
 
-  if (total === 0) {
+  if (isLoading) {
     return (
-      <div className="flex flex-col items-center justify-center h-full">
-        <p className="text-gray-500 text-lg mb-4">No translated strings to review.</p>
-        <button onClick={() => navigate("/editor")} className="px-4 py-2 bg-emerald-600 text-white rounded">Back to Editor</button>
+      <div className="flex h-full items-center justify-center text-gray-500">
+        Loading translations…
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+        <h1 className="text-xl font-semibold text-red-600">Could not load review</h1>
+        <p className="text-sm text-gray-500">
+          {error instanceof Error ? error.message : "Please try again."}
+        </p>
+        <button
+          onClick={() => { void refetch(); }}
+          className="rounded bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  if (total === 0 || reviewComplete) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+        <h1 className="text-xl font-semibold">
+          {reviewComplete ? "Review complete" : "Nothing to review"}
+        </h1>
+        <p className="mt-2 mb-4 text-gray-500">
+          {reviewComplete
+            ? "All translations in this review are approved. Return to Editor to see the next suggested step."
+            : "No translated or reviewed strings are ready for approval."}
+        </p>
+        <button
+          onClick={() => navigate("/editor")}
+          className="rounded bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700"
+        >
+          Return to Editor
+        </button>
       </div>
     );
   }

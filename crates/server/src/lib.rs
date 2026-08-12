@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -15,13 +15,15 @@ use tower_http::cors::CorsLayer;
 
 use locust_core::backup::{BackupEntry, BackupManager};
 use locust_core::config::AppConfig;
-use locust_core::database::{Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, MemoryEntry, ProjectStats};
+use locust_core::database::{
+    Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, ProjectStats, TranslationRun,
+};
 use locust_core::export;
 use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
 use locust_core::font_validation::{FontCoverageReport, FontValidator};
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
-use locust_core::translation::{ProviderRegistry, TranslationManager, TranslationOptions};
+use locust_core::translation::{run_fallback_chain, ProviderRegistry, TranslationOptions};
 use locust_core::validation::Validator;
 
 type ApiError = (StatusCode, String);
@@ -49,6 +51,8 @@ pub struct AppState {
     pub format_registry: Arc<FormatRegistry>,
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
     pub db: Arc<Database>,
+    /// On-disk path of `db` — used to render runnable CLI commands in errors.
+    pub db_path: PathBuf,
     pub glossary: Arc<Glossary>,
     pub config: Arc<RwLock<AppConfig>>,
     pub backup_manager: Arc<BackupManager>,
@@ -95,6 +99,7 @@ pub fn create_app_state() -> Arc<AppState> {
         format_registry: Arc::new(format_registry),
         provider_registry: Arc::new(RwLock::new(provider_registry)),
         db,
+        db_path,
         glossary,
         config: Arc::new(RwLock::new(config)),
         backup_manager: Arc::new(BackupManager::new(backup_root)),
@@ -106,7 +111,24 @@ pub fn create_app_state() -> Arc<AppState> {
 }
 
 pub fn create_test_state() -> Arc<AppState> {
-    let db = Arc::new(Database::open_in_memory().unwrap());
+    create_test_state_inner(
+        Arc::new(Database::open_in_memory().unwrap()),
+        PathBuf::from(":memory:"),
+    )
+}
+
+/// Test state whose project database lives at `db_path` — for integration
+/// tests that must verify persisted side effects (e.g., the injection
+/// recording `locust patch` packs from) by reopening the same file after a
+/// request completes.
+pub fn create_test_state_with_db(db_path: &std::path::Path) -> Arc<AppState> {
+    create_test_state_inner(
+        Arc::new(Database::open(db_path).unwrap()),
+        db_path.to_path_buf(),
+    )
+}
+
+fn create_test_state_inner(db: Arc<Database>, db_path: PathBuf) -> Arc<AppState> {
     let glossary = Arc::new(Glossary::new(db.clone()));
     let backup_root = std::env::temp_dir().join(format!("locust_srv_{}", uuid::Uuid::new_v4()));
     let format_registry = locust_formats::default_registry();
@@ -117,6 +139,7 @@ pub fn create_test_state() -> Arc<AppState> {
         format_registry: Arc::new(format_registry),
         provider_registry: Arc::new(RwLock::new(provider_registry)),
         db,
+        db_path,
         glossary,
         config: Arc::new(RwLock::new(config)),
         backup_manager: Arc::new(BackupManager::new(backup_root.clone())),
@@ -139,12 +162,21 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/project/open", post(project_open))
         .route("/api/project/current", get(project_current))
         .route("/api/strings", get(get_strings))
+        // Static path before `:id` so "batch" is never captured as an entry id.
+        .route("/api/strings/batch", post(batch_patch_strings))
         .route("/api/strings/:id", get(get_string).patch(patch_string))
         .route("/api/stats", get(get_stats))
+        .route("/api/runs", get(list_translation_runs))
         .route("/api/translate/start", post(translate_start))
         .route("/api/translate/cancel/:job_id", post(translate_cancel))
         .route("/api/translate/ws/:job_id", get(translate_ws))
         .route("/api/inject", post(inject))
+        .route("/api/register-lang", post(register_lang))
+        .route("/api/patch/verify", post(patch_verify))
+        .route("/api/patch/apply", post(patch_apply))
+        .route("/api/patch/rollback", post(patch_rollback))
+        .route("/api/patch/status", post(patch_status))
+        .route("/api/patch/pack", post(patch_pack))
         .route("/api/validate", post(validate))
         .route("/api/glossary", get(get_glossary).post(add_glossary))
         .route("/api/glossary/:term", delete(delete_glossary))
@@ -165,9 +197,19 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 }
 
 pub async fn start_server(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
+    // Loopback only by default: patch apply/rollback take absolute filesystem
+    // paths and must not be reachable from the LAN without an explicit opt-in
+    // (see start_server_on). Desktop and CLI talk over localhost.
+    start_server_on(state, format!("127.0.0.1:{port}")).await
+}
+
+/// Bind the API on an explicit address (`127.0.0.1:7842` or `0.0.0.0:7842`).
+/// Prefer loopback unless the operator knowingly exposes the process.
+pub async fn start_server_on(state: Arc<AppState>, addr: impl AsRef<str>) -> anyhow::Result<()> {
     let app = create_router(state);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    tracing::info!("Server listening on port {}", port);
+    let addr = addr.as_ref();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("Server listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -220,7 +262,7 @@ async fn list_providers(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let reg = state.provider_registry.read().await;
-    Json(serde_json::to_value(reg.list()).unwrap_or_default())
+    Json(serde_json::to_value(locust_providers::list_providers_for_api(&reg)).unwrap_or_default())
 }
 
 async fn provider_health(
@@ -431,6 +473,51 @@ async fn patch_string(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "entry not found"))
 }
 
+#[derive(Deserialize)]
+struct BatchPatchItem {
+    id: String,
+    translation: String,
+}
+
+#[derive(Deserialize)]
+struct BatchPatchRequest {
+    updates: Vec<BatchPatchItem>,
+    #[serde(default = "default_batch_provider")]
+    provider: String,
+}
+
+fn default_batch_provider() -> String {
+    "manual".into()
+}
+
+async fn batch_patch_strings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BatchPatchRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.updates.len() > 50_000 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "batch too large (max 50000 updates)",
+        ));
+    }
+    let pairs: Vec<(String, String)> = req
+        .updates
+        .into_iter()
+        .map(|u| (u.id, u.translation))
+        .collect();
+    let requested = pairs.len();
+    let applied = state
+        .db
+        .save_translations_batch(pairs, &req.provider)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({
+        "requested": requested,
+        "applied": applied,
+        "skipped": requested.saturating_sub(applied),
+    })))
+}
+
 async fn get_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProjectStats>, ApiError> {
@@ -441,9 +528,24 @@ async fn get_stats(
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
+/// Translation run ledger (same rows as CLI `locust stats`), newest first.
+async fn list_translation_runs(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<TranslationRun>>, ApiError> {
+    let mut runs = state
+        .db
+        .get_translation_runs()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    runs.reverse();
+    Ok(Json(runs))
+}
+
 #[derive(Deserialize)]
 struct TranslateStartRequest {
     provider_id: String,
+    /// Optional ordered fallbacks after the primary (same chain rules as CLI `--fallback`).
+    #[serde(default)]
+    fallback_provider_ids: Option<Vec<String>>,
     options: TranslationOptions,
 }
 
@@ -457,31 +559,48 @@ async fn translate_start(
     Json(req): Json<TranslateStartRequest>,
 ) -> Result<Json<TranslateStartResponse>, ApiError> {
     let reg = state.provider_registry.read().await;
-    let provider = reg
-        .get(&req.provider_id)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "provider not found"))?;
+    if reg.get(&req.provider_id).is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "provider not found"));
+    }
+
+    // Primary first, then unique fallbacks (skip duplicates of primary).
+    let mut chain = vec![req.provider_id.clone()];
+    if let Some(fallbacks) = &req.fallback_provider_ids {
+        for id in fallbacks {
+            if !chain.iter().any(|c| c == id) {
+                chain.push(id.clone());
+            }
+        }
+    }
+
+    let mut resolve_map: std::collections::HashMap<
+        String,
+        Arc<dyn locust_core::translation::TranslationProvider>,
+    > = std::collections::HashMap::new();
+    for id in &chain {
+        if let Some(p) = reg.get(id) {
+            resolve_map.insert(id.clone(), p);
+        }
+    }
+    drop(reg);
 
     let job_id = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1000);
     let (broadcast_tx, _) = broadcast::channel::<ProgressEvent>(1000);
     let broadcast_tx_clone = broadcast_tx.clone();
 
-    let entries = state
-        .db
-        .get_entries(&EntryFilter::default())
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    let manager = TranslationManager::new(provider, state.db.clone(), state.glossary.clone());
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel.clone();
     let job_id_clone = job_id.clone();
 
-    // Bridge mpsc → broadcast so WebSocket clients can subscribe
+    // Bridge mpsc → broadcast so WebSocket clients can subscribe.
+    // ProviderSwitched is non-terminal; only Completed / Failed end the stream.
     let jobs = state.active_jobs.clone();
     let cleanup_job_id = job_id.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            let is_terminal = matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
+            let is_terminal =
+                matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
             let _ = broadcast_tx_clone.send(event);
             if is_terminal {
                 break;
@@ -493,15 +612,31 @@ async fn translate_start(
     });
 
     // Insert job BEFORE spawning so WebSocket can find it immediately
-    state.active_jobs.insert(job_id.clone(), JobState {
-        abort_handle: tokio::spawn(async {}).abort_handle(), // placeholder
-        progress_tx: broadcast_tx,
-    });
+    state.active_jobs.insert(
+        job_id.clone(),
+        JobState {
+            abort_handle: tokio::spawn(async {}).abort_handle(), // placeholder
+            progress_tx: broadcast_tx,
+        },
+    );
 
+    let db = state.db.clone();
+    let glossary = state.glossary.clone();
+    let resolve_map = Arc::new(resolve_map);
     let handle = tokio::spawn(async move {
-        let _ = manager
-            .translate_entries(entries, req.options, tx, job_id_clone, cancel_clone)
-            .await;
+        let map = resolve_map;
+        let resolve = |id: &str| map.get(id).cloned();
+        let _ = run_fallback_chain(
+            &chain,
+            &resolve,
+            db,
+            glossary,
+            req.options,
+            tx,
+            job_id_clone,
+            cancel_clone,
+        )
+        .await;
     });
 
     // Update with real abort handle
@@ -549,7 +684,7 @@ async fn handle_translate_ws(
     let Some(mut rx) = rx else {
         let _ = socket
             .send(Message::Text(
-                serde_json::json!({"type": "failed", "error": "job not found"}).to_string().into(),
+                serde_json::json!({"type": "failed", "error": "job not found"}).to_string(),
             ))
             .await;
         let _ = socket.close().await;
@@ -561,7 +696,7 @@ async fn handle_translate_ws(
             Ok(event) => {
                 let is_terminal = matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
                 let json = serde_json::to_string(&event).unwrap_or_default();
-                if socket.send(Message::Text(json.into())).await.is_err() {
+                if socket.send(Message::Text(json)).await.is_err() {
                     break;
                 }
                 if is_terminal {
@@ -583,15 +718,66 @@ async fn handle_translate_ws(
 struct InjectRequest {
     project_path: String,
     format_id: String,
-    mode: OutputMode,
+    /// Ignored when `direct` is true.
+    #[serde(default)]
+    mode: Option<OutputMode>,
     languages: Vec<String>,
     output_dir: Option<String>,
+    /// When true, inject into the game tree in place and record for pack
+    /// (CLI `--direct`). Default false preserves Replace/Add MultiLangInjector.
+    #[serde(default)]
+    direct: bool,
 }
+
+/// Unblocking advice attached to a containment failure when recording an
+/// injection made through the HTTP API. The server cannot know the exact
+/// paths the user's shell will use, so it names the shape of the working
+/// command rather than a copy-pasteable line.
+const INJECT_RECORD_REMEDY: &str =
+    "Restore the original game files from the backup listed above (or from a \
+     clean copy) first — this engine writes translations into the ORIGINAL \
+     tree, and a re-run against the mutated tree writes and records nothing. \
+     Then record the injection with the CLI's direct mode: locust inject \
+     <game folder> -P <project db> --direct -l <lang> — `locust patch` packs \
+     from that recording.";
 
 async fn inject(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InjectRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Same guard as CLI: empty languages used to return 200 with zero work and
+    // zero recording — a silent no-op that becomes an untranslatable patch later.
+    if req.languages.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "inject requires at least one language in `languages` (e.g. [\"es\"])",
+        ));
+    }
+
+    if req.direct {
+        let game_path = PathBuf::from(&req.project_path);
+        let format_id = req.format_id.clone();
+        let languages = req.languages.clone();
+        let registry = state.format_registry.clone();
+        let db = state.db.clone();
+        let backup = state.backup_manager.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            locust_core::extraction::inject_direct(
+                &registry,
+                &db,
+                &backup,
+                &game_path,
+                &format_id,
+                &languages,
+            )
+        })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        return Ok(Json(serde_json::to_value(report).unwrap_or_default()));
+    }
+
+    let mode = req.mode.unwrap_or(OutputMode::Replace);
     let injector = MultiLangInjector::new(
         state.format_registry.clone(),
         state.db.clone(),
@@ -600,11 +786,12 @@ async fn inject(
     let (tx, mut rx) = mpsc::channel(100);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
+    let languages = req.languages.clone();
     let report = injector
         .inject(
             &PathBuf::from(&req.project_path),
             &req.format_id,
-            req.mode,
+            mode,
             req.languages,
             req.output_dir.map(PathBuf::from),
             tx,
@@ -612,7 +799,374 @@ async fn inject(
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    // Persist what each language's injection wrote — `locust patch` packs
+    // exclusively from this recording, so an inject seam that skips it
+    // produces projects that can never be packed.
+    locust_core::extraction::record_multilang_injection(
+        &state.db,
+        &report,
+        &languages,
+        &|_lang| INJECT_RECORD_REMEDY.to_string(),
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+}
+
+// ─── Register language (RPG Maker multi-lang UI) ───────────────────────────
+
+#[derive(Deserialize)]
+struct RegisterLangRequest {
+    /// Game root (folder with `js/plugins.js` and/or `data/`).
+    game_path: String,
+    /// Language code (e.g. `es`).
+    lang: String,
+    /// Display label (e.g. `Español`).
+    label: String,
+}
+
+/// Patch Iavra/VisuMZ language lists + Map boot choices so a new lang is
+/// selectable in the game UI. Writes `*.bak-locust` siblings (same as CLI).
+async fn register_lang(
+    Json(req): Json<RegisterLangRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let game_path = PathBuf::from(req.game_path.trim());
+    if req.game_path.trim().is_empty() || !game_path.is_dir() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "game_path must be an existing directory (got {:?})",
+                req.game_path
+            ),
+        ));
+    }
+    let lang = req.lang;
+    let label = req.label;
+    let report = tokio::task::spawn_blocking(move || {
+        locust_formats::rpgmaker_lang::register_language(&game_path, &lang, &label)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(|e| {
+        // Invalid lang/label is a client error; other failures stay 500.
+        let msg = e.to_string();
+        if msg.contains("invalid language") || msg.contains("label must not be empty") {
+            err(StatusCode::BAD_REQUEST, msg)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, msg)
+        }
+    })?;
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+}
+
+// ─── Patch apply / rollback / status ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PatchPathsRequest {
+    game_path: String,
+    zip_path: Option<String>,
+    /// http(s) URL of a patch zip — downloaded to a temp file then applied/verified.
+    /// Mutually exclusive with `zip_path`. Loopback server only; still scheme-gated.
+    zip_url: Option<String>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    confirm_legacy: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Resolve local zip path or download `zip_url` into a TempDir (caller must keep it alive).
+async fn resolve_patch_zip(
+    zip_path: Option<String>,
+    zip_url: Option<String>,
+) -> Result<(PathBuf, Option<tempfile::TempDir>), ApiError> {
+    match (zip_path, zip_url) {
+        (Some(p), None) => {
+            let path = PathBuf::from(p);
+            if !path.is_file() {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!("zip_path not found: {}", path.display()),
+                ));
+            }
+            Ok((path, None))
+        }
+        (None, Some(url)) => {
+            let dir = tempfile::TempDir::new()
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let dest = dir.path().join("locust-patch.zip");
+            download_patch_zip_async(&url, &dest).await?;
+            Ok((dest, Some(dir)))
+        }
+        (Some(_), Some(_)) => Err(err(
+            StatusCode::BAD_REQUEST,
+            "pass either zip_path or zip_url, not both",
+        )),
+        (None, None) => Err(err(
+            StatusCode::BAD_REQUEST,
+            "zip_path or zip_url required",
+        )),
+    }
+}
+
+async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError> {
+    let max_bytes = locust_core::patch::zipsec::max_download_bytes();
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        err(StatusCode::BAD_REQUEST, format!("invalid zip_url: {e}"))
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("only http/https zip_url allowed (got {other})"),
+            ));
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30 * 60))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent(format!("locust-server/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut resp = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download HTTP error: {e}")))?;
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes {
+            return Err(err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("remote zip too large: {len} bytes"),
+            ));
+        }
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+
+    // Stream to disk with a running cap, like the CLI does. Buffering the whole
+    // body first would let a chunked response — which sends no Content-Length,
+    // so the check above never fires — allocate without bound before any check.
+    let mut file =
+        std::fs::File::create(dest).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut written: u64 = 0;
+    loop {
+        let chunk = resp
+            .chunk()
+            .await
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download body: {e}")))?;
+        let Some(chunk) = chunk else { break };
+        written += chunk.len() as u64;
+        if written > max_bytes {
+            drop(file);
+            let _ = std::fs::remove_file(dest);
+            return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "remote zip too large"));
+        }
+        use std::io::Write;
+        file.write_all(&chunk)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+    if written == 0 {
+        drop(file);
+        let _ = std::fs::remove_file(dest);
+        return Err(err(StatusCode::BAD_GATEWAY, "download produced empty file"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct PatchPackRequest {
+    game_path: String,
+    /// Destination patch zip path.
+    output_path: String,
+    /// Optional language keys; empty = auto when exactly one recording exists.
+    /// More than one language is refused (one zip = one recording).
+    #[serde(default)]
+    languages: Vec<String>,
+    /// When true, require pristine hashes (`.locust/backup` or fail).
+    #[serde(default)]
+    pristine: bool,
+    /// Optional path to a pristine game tree for original hashes (overrides backup).
+    #[serde(default)]
+    pristine_path: Option<String>,
+}
+
+fn map_patch_err(e: locust_core::error::LocustError) -> ApiError {
+    use locust_core::error::LocustError::*;
+    let status = match &e {
+        PatchAlreadyApplied(_) | PatchDowngradeBlocked { .. } | PatchInterrupted(_)
+        | PatchLegacyUnconfirmed(_) | PatchVerificationFailed(_) | PatchBackupIncomplete(_) => {
+            StatusCode::CONFLICT
+        }
+        PatchUnsafeEntry(_) | GameDirNotWritable(_) | PatchError(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(status, e)
+}
+
+async fn patch_pack(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PatchPackRequest>,
+) -> Result<Json<locust_core::patch::PackReport>, ApiError> {
+    if req.game_path.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "game_path required"));
+    }
+    if req.output_path.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "output_path required"));
+    }
+    if req.languages.len() > 1 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "pack accepts at most one language (one zip = one injection recording)",
+        ));
+    }
+    let lang = req.languages.into_iter().next();
+    let game_path = PathBuf::from(&req.game_path);
+    let output = PathBuf::from(&req.output_path);
+    let pristine = req.pristine_path.map(PathBuf::from);
+    let require_pristine = req.pristine;
+    let engine = locust_formats::default_registry()
+        .detect(&game_path)
+        .map(|p| p.id().to_string());
+
+    let db = state.db.clone();
+    let db_path_for_errors = state.db_path.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        locust_core::patch::pack_injection_recording(
+            &db,
+            locust_core::patch::PackOptions {
+                game_path,
+                lang,
+                output,
+                pristine,
+                engine,
+                project: db_path_for_errors,
+                require_pristine,
+            },
+        )
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(map_patch_err)?;
+
+    Ok(Json(report))
+}
+
+async fn patch_verify(
+    Json(req): Json<PatchPathsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (zip, _guard) = resolve_patch_zip(req.zip_path, req.zip_url).await?;
+    let report = locust_core::patch::verify(
+        &PathBuf::from(&req.game_path),
+        &zip,
+    )
+    .map_err(map_patch_err)?;
+    Ok(Json(serde_json::json!({
+        "outcome": format!("{:?}", report.outcome),
+        "tier": report.tier.map(|t| format!("{:?}", t)),
+        "replaced": report.replaced,
+        "added": report.added,
+        "conflicts": report.conflicts,
+        "backup_compromised": report.backup_compromised,
+        "messages": report.messages,
+        "manifest": report.manifest,
+    })))
+}
+
+async fn patch_apply(
+    Json(req): Json<PatchPathsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (zip, _guard) = resolve_patch_zip(req.zip_path, req.zip_url).await?;
+    let opts = locust_core::patch::ApplyOptions {
+        force: req.force,
+        confirm_legacy: req.confirm_legacy,
+        dry_run: req.dry_run,
+    };
+    // Apply is disk-bound and journaled; run off the async runtime.
+    let game = PathBuf::from(&req.game_path);
+    let report = tokio::task::spawn_blocking(move || {
+        locust_core::patch::apply(&game, &zip, opts, |_| {})
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(map_patch_err)?;
+    Ok(Json(serde_json::json!({
+        "patch_id": report.patch_id,
+        "patch_version": report.patch_version,
+        "replaced": report.replaced,
+        "added": report.added,
+        "forced": report.forced,
+        "baseline": format!("{:?}", report.baseline),
+        "dry_run": report.dry_run,
+        "user_edits_overwritten": report.user_edits_overwritten,
+        "messages": report.messages,
+    })))
+}
+
+async fn patch_rollback(
+    Json(req): Json<PatchPathsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let game = PathBuf::from(&req.game_path);
+    let force = req.force;
+    let report = tokio::task::spawn_blocking(move || {
+        locust_core::patch::rollback(
+            &game,
+            locust_core::patch::RollbackOptions {
+                delete_modified_added: force,
+            },
+        )
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(map_patch_err)?;
+    Ok(Json(serde_json::json!({
+        "restored": report.restored,
+        "deleted": report.deleted,
+        "baseline": report.baseline.map(|b| format!("{:?}", b)),
+        "messages": report.messages,
+        "aborted_edited": report.aborted_edited,
+        "torn_deleted": report.torn_deleted,
+    })))
+}
+
+async fn patch_status(
+    Json(req): Json<PatchPathsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = locust_core::patch::PatchStore::new(PathBuf::from(&req.game_path));
+    let status = store.status().map_err(map_patch_err)?;
+    let body = match status {
+        locust_core::patch::PatchStatus::NotPatched => {
+            serde_json::json!({ "status": "not_patched" })
+        }
+        locust_core::patch::PatchStatus::Patched(r) => serde_json::json!({
+            "status": "patched",
+            "patch_id": r.patch_id,
+            "patch_version": r.patch_version,
+            "engine": r.engine,
+            "language": r.language,
+            "baseline": format!("{:?}", r.baseline),
+            "forced": r.forced,
+            "applied_at": r.applied_at,
+            "replaced": r.replaced.len(),
+            "added": r.added.len(),
+        }),
+        locust_core::patch::PatchStatus::Interrupted(j) => serde_json::json!({
+            "status": "interrupted",
+            "patch_id": j.patch_id,
+            "state": format!("{:?}", j.state),
+        }),
+        locust_core::patch::PatchStatus::Unknown => {
+            serde_json::json!({ "status": "unknown" })
+        }
+    };
+    Ok(Json(body))
 }
 
 async fn validate(
@@ -688,7 +1242,11 @@ async fn export_po(
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
     let entries = state.db.get_entries(&EntryFilter::default()).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let config = state.config.read().await;
-    let po = export::export_po(&entries, &config.default_source_lang, &q.lang);
+    let source = state
+        .db
+        .resolve_export_source_lang(&q.lang, &config.default_source_lang)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let po = export::export_po(&entries, &source, &q.lang);
     Ok((
         StatusCode::OK,
         [
@@ -705,15 +1263,23 @@ async fn import_po(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let po_entries = export::import_po(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let mut imported = 0;
+    let mut skipped = 0;
     for pe in &po_entries {
-        if !pe.translation.is_empty() {
-            if let Some(ref id) = pe.id {
-                let _ = state.db.save_translation(id, &pe.translation, "import").await;
-                imported += 1;
-            }
+        if pe.translation.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let Some(ref id) = pe.id else {
+            skipped += 1;
+            continue;
+        };
+        match state.db.save_translation(id, &pe.translation, "import").await {
+            Ok(true) => imported += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     }
-    Ok(Json(serde_json::json!({"imported": imported})))
+    Ok(Json(serde_json::json!({"imported": imported, "skipped": skipped})))
 }
 
 async fn export_xliff(
@@ -722,7 +1288,11 @@ async fn export_xliff(
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
     let entries = state.db.get_entries(&EntryFilter::default()).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let config = state.config.read().await;
-    let xliff = export::export_xliff(&entries, &config.default_source_lang, &q.lang);
+    let source = state
+        .db
+        .resolve_export_source_lang(&q.lang, &config.default_source_lang)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let xliff = export::export_xliff(&entries, &source, &q.lang);
     Ok((
         StatusCode::OK,
         [
@@ -739,13 +1309,19 @@ async fn import_xliff(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let units = export::import_xliff(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let mut imported = 0;
+    let mut skipped = 0;
     for unit in &units {
-        if !unit.target.is_empty() {
-            let _ = state.db.save_translation(&unit.id, &unit.target, "import").await;
-            imported += 1;
+        if unit.target.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        match state.db.save_translation(&unit.id, &unit.target, "import").await {
+            Ok(true) => imported += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     }
-    Ok(Json(serde_json::json!({"imported": imported})))
+    Ok(Json(serde_json::json!({"imported": imported, "skipped": skipped})))
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -755,7 +1331,7 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     if let Some(providers) = val.get_mut("providers").and_then(|v| v.as_object_mut()) {
         for (_id, pc) in providers.iter_mut() {
             if let Some(obj) = pc.as_object_mut() {
-                if obj.get("api_key").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty()) {
+                if obj.get("api_key").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
                     obj.insert("api_key".to_string(), serde_json::Value::String("***".to_string()));
                 }
             }
@@ -889,6 +1465,94 @@ async fn delete_backup(
 }
 
 #[cfg(test)]
+mod download_guard_tests {
+    use super::*;
+
+    /// Serve one chunked HTTP response with NO Content-Length, which is exactly
+    /// the shape that defeats a pre-flight size check. `total` of `usize::MAX`
+    /// streams until the client hangs up.
+    async fn serve_chunked(total: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut scratch = [0u8; 1024];
+                let _ = sock.read(&mut scratch).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n\
+                          Transfer-Encoding: chunked\r\n\r\n",
+                    )
+                    .await;
+                let chunk = vec![b'A'; 4096];
+                let mut sent = 0usize;
+                while sent < total {
+                    if sock
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await
+                        .is_err()
+                        || sock.write_all(&chunk).await.is_err()
+                        || sock.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                    sent += chunk.len();
+                }
+                let _ = sock.write_all(b"0\r\n\r\n").await;
+            }
+        });
+        format!("http://{addr}/patch.zip")
+    }
+
+    #[tokio::test]
+    async fn download_rejects_non_http_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("p.zip");
+        let e = download_patch_zip_async("file:///C:/Windows/win.ini", &dest)
+            .await
+            .expect_err("file:// must be rejected");
+        assert!(format!("{e:?}").contains("http"), "{e:?}");
+        assert!(!dest.exists(), "nothing should be written");
+    }
+
+    #[tokio::test]
+    async fn download_aborts_past_cap_on_chunked_response() {
+        // The body never ends, so only a running byte count can stop it.
+        // Buffering the whole response first would read forever and time out.
+        let cap = 64 * 1024;
+        std::env::set_var(locust_core::patch::zipsec::MAX_DOWNLOAD_ENV, cap.to_string());
+        let url = serve_chunked(usize::MAX).await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("p.zip");
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            download_patch_zip_async(&url, &dest),
+        )
+        .await;
+        std::env::remove_var(locust_core::patch::zipsec::MAX_DOWNLOAD_ENV);
+
+        let res = res.expect("download must abort at the cap, not read the endless body");
+        let e = res.expect_err("oversize chunked download must abort");
+        assert!(format!("{e:?}").contains("too large"), "{e:?}");
+        assert!(!dest.exists(), "partial download must be unlinked");
+    }
+
+    #[tokio::test]
+    async fn download_rejects_empty_body() {
+        let url = serve_chunked(0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("p.zip");
+        let e = download_patch_zip_async(&url, &dest)
+            .await
+            .expect_err("empty body must be rejected");
+        assert!(format!("{e:?}").contains("empty"), "{e:?}");
+        assert!(!dest.exists());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -932,6 +1596,57 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: Vec<serde_json::Value> = resp.json().await.unwrap();
         assert!(!body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_providers_includes_unconfigured_deepl() {
+        let (url, _h) = setup().await;
+        let resp = client()
+            .get(format!("{}/api/providers", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+        let deepl = body
+            .iter()
+            .find(|p| p["id"] == "deepl")
+            .expect("deepl should be listed even without an API key");
+        assert_eq!(deepl["configured"], false);
+        assert_eq!(deepl["requires_api_key"], true);
+    }
+
+    #[tokio::test]
+    async fn test_list_providers_deepl_configured_when_key_set() {
+        let state = create_test_state();
+        {
+            let mut config = state.config.write().await;
+            config.providers.insert(
+                "deepl".to_string(),
+                locust_core::config::ProviderConfig {
+                    api_key: Some("secret-key-123".to_string()),
+                    base_url: None,
+                    model: None,
+                    free_tier: false,
+                    extra: std::collections::HashMap::new(),
+                },
+            );
+            let reg = locust_providers::default_registry(&config);
+            *state.provider_registry.write().await = reg;
+        }
+
+        let (url, _h) = start_test_server(state).await;
+        let resp = client()
+            .get(format!("{}/api/providers", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+        let deepl_entries: Vec<_> = body.iter().filter(|p| p["id"] == "deepl").collect();
+        assert_eq!(deepl_entries.len(), 1, "deepl must not be duplicated");
+        assert_eq!(deepl_entries[0]["configured"], true);
+        assert_eq!(deepl_entries[0]["requires_api_key"], true);
     }
 
     #[tokio::test]
@@ -1033,6 +1748,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_translation_runs_seeded() {
+        use locust_core::database::TranslationRun;
+
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .record_translation_run(&TranslationRun {
+                id: 0,
+                started_at: "2026-03-15T12:34:56Z".into(),
+                duration_secs: 42.5,
+                provider: "mock→deepl".into(),
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                strings_translated: 12,
+                tokens_used: 100,
+                input_tokens: 60,
+                output_tokens: 40,
+                cost_usd: 0.0012,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .record_translation_run(&TranslationRun {
+                id: 0,
+                started_at: "2026-03-16T08:00:00Z".into(),
+                duration_secs: 10.0,
+                provider: "mock".into(),
+                source_lang: "en".into(),
+                target_lang: "fr".into(),
+                strings_translated: 3,
+                tokens_used: 20,
+                input_tokens: 10,
+                output_tokens: 10,
+                cost_usd: 0.0001,
+            })
+            .await
+            .unwrap();
+
+        let resp = client()
+            .get(format!("{}/api/runs", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+        assert_eq!(body.len(), 2, "{body:?}");
+        // Newest first
+        assert_eq!(body[0]["started_at"], "2026-03-16T08:00:00Z");
+        assert_eq!(body[0]["provider"], "mock");
+        assert_eq!(body[0]["target_lang"], "fr");
+        assert_eq!(body[1]["provider"], "mock→deepl");
+        assert_eq!(body[1]["strings_translated"], 12);
+        assert_eq!(body[1]["input_tokens"], 60);
+        assert_eq!(body[1]["output_tokens"], 40);
+        assert!((body[1]["cost_usd"].as_f64().unwrap() - 0.0012).abs() < 1e-9);
+        assert!((body[1]["duration_secs"].as_f64().unwrap() - 42.5).abs() < 1e-9);
+        assert!(body[0]["id"].as_i64().unwrap() >= 1);
+        // All ledger columns present
+        for key in [
+            "id",
+            "started_at",
+            "duration_secs",
+            "provider",
+            "source_lang",
+            "target_lang",
+            "strings_translated",
+            "tokens_used",
+            "input_tokens",
+            "output_tokens",
+            "cost_usd",
+        ] {
+            assert!(body[0].get(key).is_some(), "missing {key}");
+        }
+    }
+
+    #[tokio::test]
     async fn test_translate_start_returns_job_id() {
         let (url, _h, state) = setup_with_state().await;
         let entry = StringEntry::new("t1", "Hello", PathBuf::from("f.json"));
@@ -1050,6 +1842,62 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body.get("job_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_translate_start_accepts_fallback_provider_ids() {
+        let (url, _h, state) = setup_with_state().await;
+        let entry = StringEntry::new("t1", "Hello", PathBuf::from("f.json"));
+        state.db.save_entries(&[entry]).unwrap();
+
+        // Optional field present — same status as without it (primary must exist).
+        let resp = client()
+            .post(format!("{}/api/translate/start", url))
+            .json(&serde_json::json!({
+                "provider_id": "mock",
+                "fallback_provider_ids": ["mock"],
+                "options": TranslationOptions::default()
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body.get("job_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_translate_start_without_fallback_field_unchanged() {
+        let (url, _h, state) = setup_with_state().await;
+        let entry = StringEntry::new("t2", "World", PathBuf::from("f.json"));
+        state.db.save_entries(&[entry]).unwrap();
+
+        // Omitting fallback_provider_ids must still deserialize and run.
+        let resp = client()
+            .post(format!("{}/api/translate/start", url))
+            .json(&serde_json::json!({
+                "provider_id": "mock",
+                "options": {
+                    "source_lang": "en",
+                    "target_lang": "es",
+                    "batch_size": 40,
+                    "max_concurrent": 1,
+                    "cost_limit_usd": null,
+                    "game_context": null,
+                    "use_glossary": false,
+                    "use_memory": false,
+                    "skip_approved": true
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "missing fallback_provider_ids must not break start: {}",
+            resp.text().await.unwrap_or_default()
+        );
     }
 
     #[tokio::test]

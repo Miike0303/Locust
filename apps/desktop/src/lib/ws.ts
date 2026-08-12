@@ -5,6 +5,7 @@ import type {
   ProgressEventStringTranslated,
   ProgressEventCompleted,
   ProgressEventFailed,
+  ProgressEventProviderSwitched,
 } from "./api";
 
 interface JobHandlers {
@@ -14,6 +15,9 @@ interface JobHandlers {
   onCompleted?: (e: ProgressEventCompleted) => void;
   onFailed?: (e: ProgressEventFailed) => void;
   onPaused?: () => void;
+  onProviderSwitched?: (e: ProgressEventProviderSwitched) => void;
+  /** Socket closed (server ended the stream or unsubscribe was called). */
+  onClosed?: () => void;
 }
 
 interface WaitOptions {
@@ -58,6 +62,9 @@ export function subscribeToJob(jobId: string, handlers: JobHandlers): () => void
           case "paused":
             handlers.onPaused?.();
             break;
+          case "provider_switched":
+            handlers.onProviderSwitched?.(data);
+            break;
         }
       } catch (err) {
         console.error("Failed to parse WS message:", err);
@@ -66,6 +73,10 @@ export function subscribeToJob(jobId: string, handlers: JobHandlers): () => void
 
     ws.onerror = (err) => {
       console.error("WebSocket error:", err);
+    };
+
+    ws.onclose = () => {
+      handlers.onClosed?.();
     };
   });
 

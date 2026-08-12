@@ -27,35 +27,7 @@ impl Default for OllamaProvider {
     }
 }
 
-fn build_system_prompt(req: &TranslationRequest) -> String {
-    let mut prompt = format!(
-        "You are a professional game translator. Translate the following strings from {} to {}.",
-        req.source_lang, req.target_lang
-    );
-    if let Some(ref ctx) = req.context {
-        prompt.push_str(&format!("\nGame context: {}", ctx));
-    }
-    if let Some(ref hint) = req.glossary_hint {
-        prompt.push_str(&format!("\n{}", hint));
-    }
-    prompt.push_str(
-        "\nRules:\n- Preserve all placeholder tokens like {PL_0}, {PL_1} exactly as-is\n- Return ONLY a JSON array of translated strings, in the same order as input\n- Do not add explanations or notes",
-    );
-    prompt
-}
-
-fn parse_json_array(text: &str) -> std::result::Result<Vec<String>, String> {
-    if let Ok(arr) = serde_json::from_str::<Vec<String>>(text) {
-        return Ok(arr);
-    }
-    if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
-        let substr = &text[start..=end];
-        if let Ok(arr) = serde_json::from_str::<Vec<String>>(substr) {
-            return Ok(arr);
-        }
-    }
-    Err(format!("could not parse JSON array from response: {}", text))
-}
+use crate::openai::{build_system_prompt, parse_json_array};
 
 #[derive(Serialize)]
 struct OllamaRequest {
@@ -73,7 +45,10 @@ struct OllamaMessage {
 #[derive(Deserialize)]
 struct OllamaResponse {
     message: OllamaRespMessage,
+    /// Output tokens generated.
     eval_count: Option<u32>,
+    /// Input tokens (prompt) evaluated.
+    prompt_eval_count: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -155,20 +130,40 @@ impl TranslationProvider for OllamaProvider {
             LocustError::ProviderError(format!("Ollama malformed response: {}", e))
         })?;
 
-        let translations = parse_json_array(&ollama_resp.message.content)
-            .map_err(|e| LocustError::ProviderError(e))?;
+        let translations =
+            parse_json_array(&ollama_resp.message.content).map_err(LocustError::ProviderError)?;
 
-        let tokens_used = ollama_resp.eval_count;
+        // A count mismatch would silently shift every translation onto the
+        // wrong entry via zip; discard the whole batch instead.
+        if translations.len() != requests.len() {
+            return Err(LocustError::ProviderError(format!(
+                "translation count mismatch: sent {} strings, got {} back",
+                requests.len(),
+                translations.len()
+            )));
+        }
 
+        let input_tokens = ollama_resp.prompt_eval_count;
+        let output_tokens = ollama_resp.eval_count;
+        let tokens_used = match (input_tokens, output_tokens) {
+            (Some(i), Some(o)) => Some(i + o),
+            (a, b) => a.or(b),
+        };
+
+        // Counts are batch-level; attach them to the first result only so
+        // that summing across results yields the true totals.
         Ok(requests
             .iter()
             .zip(translations.iter())
-            .map(|(req, trans)| TranslationResult {
+            .enumerate()
+            .map(|(i, (req, trans))| TranslationResult {
                 entry_id: req.entry_id.clone(),
                 translation: trans.clone(),
                 detected_source_lang: None,
                 provider: "ollama".to_string(),
-                tokens_used,
+                tokens_used: if i == 0 { tokens_used } else { None },
+                input_tokens: if i == 0 { input_tokens } else { None },
+                output_tokens: if i == 0 { output_tokens } else { None },
                 cost_usd: None,
             })
             .collect())

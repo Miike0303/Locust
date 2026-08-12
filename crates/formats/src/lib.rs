@@ -1,11 +1,27 @@
+pub mod binary_search;
 pub mod rpgmaker_mv;
+pub mod rpgmaker_lang;
 pub mod rpgmaker_vxa;
 pub mod renpy;
 pub mod wolf_rpg;
 pub mod sugarcube;
 pub mod unreal;
+pub mod unreal_locres;
+pub mod unreal_pak;
 pub mod unity;
+pub mod unity_serialized;
 pub mod html_game;
+pub mod vntextpatch;
+pub mod qsp;
+// tyrano before kirikiri: both may see loose .ks; Tyrano claims data/scenario/ + tyrano/ trees.
+pub mod tyrano;
+pub mod tyrano_asar;
+pub mod tyrano_nw;
+pub mod kirikiri;
+pub mod kirikiri_xp3;
+pub mod yuris;
+pub mod yuris_ypf;
+pub mod nscripter;
 
 use locust_core::extraction::FormatRegistry;
 
@@ -20,5 +36,14 @@ pub fn default_registry() -> FormatRegistry {
     r.register(Box::new(unity::UnityPlugin::new()));
     // html-game must be AFTER sugarcube (more specific wins first)
     r.register(Box::new(html_game::HtmlGamePlugin::new()));
+    r.register(Box::new(qsp::QspPlugin::new()));
+    // tyrano before kirikiri so TyranoBuilder dirs are not claimed as KiriKiri.
+    r.register(Box::new(tyrano::TyranoPlugin::new()));
+    r.register(Box::new(kirikiri::KirikiriPlugin::new()));
+    r.register(Box::new(yuris::YurisPlugin::new()));
+    r.register(Box::new(nscripter::NScripterPlugin::new()));
+    // vntextpatch last: only claims folders of {"message":...} JSON, so it
+    // never shadows a real game format detected above.
+    r.register(Box::new(vntextpatch::VnTextPatchPlugin::new()));
     r
 }

@@ -1,43 +1,220 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle, XCircle, Loader, Trash2, RotateCcw } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { CheckCircle, XCircle, Loader, Trash2, RotateCcw, Plus, Search } from "lucide-react";
 import clsx from "clsx";
 import {
   getProviders, checkProviderHealth, getConfig, updateConfig,
-  getBackups, restoreBackup, deleteGlossaryEntry,
+  getBackups, restoreBackup, deleteBackup,
+  getGlossary, addGlossaryEntry, deleteGlossaryEntry,
+  getTranslationRuns,
 } from "../lib/api";
-import type { AppConfig, ProviderInfo } from "../lib/api";
-
-const SECTIONS = ["Providers", "Translation Defaults", "Appearance", "Data"] as const;
-type Section = (typeof SECTIONS)[number];
+import type { GlossaryEntry, TranslationRun } from "../lib/api";
+import { applyAppearance } from "../lib/appearance";
+import {
+  SETTINGS_SECTIONS,
+  buildSettingsPath,
+  parseSettingsSectionParam,
+  type SettingsSectionId,
+} from "../lib/settingsNav";
+import ConfirmDialog from "../components/ConfirmDialog";
+import { addToast } from "../stores/toastStore";
 
 export default function Settings() {
-  const [section, setSection] = useState<Section>("Providers");
+  const location = useLocation();
+  const navigate = useNavigate();
+  const section = parseSettingsSectionParam(location.search);
+
+  useEffect(() => {
+    const requested = new URLSearchParams(location.search).get("section");
+    if (requested !== section) navigate(buildSettingsPath(section), { replace: true });
+  }, [location.search, navigate, section]);
+
+  const selectSection = (next: SettingsSectionId) => {
+    navigate(buildSettingsPath(next), { replace: true });
+  };
 
   return (
     <div className="flex h-full">
       <nav className="w-48 border-r border-gray-200 dark:border-gray-700 p-4 space-y-1">
-        {SECTIONS.map((s) => (
+        {SETTINGS_SECTIONS.map(({ id, label }) => (
           <button
-            key={s}
-            onClick={() => setSection(s)}
+            key={id}
+            onClick={() => selectSection(id)}
             className={clsx(
               "block w-full text-left px-3 py-2 rounded text-sm font-medium",
-              section === s
+              section === id
                 ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
                 : "text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800"
             )}
           >
-            {s}
+            {label}
           </button>
         ))}
       </nav>
       <div className="flex-1 p-6 overflow-y-auto">
-        {section === "Providers" && <ProvidersSection />}
-        {section === "Translation Defaults" && <DefaultsSection />}
-        {section === "Appearance" && <AppearanceSection />}
-        {section === "Data" && <DataSection />}
+        {section === "providers" && <ProvidersSection />}
+        {section === "defaults" && <DefaultsSection />}
+        {section === "appearance" && <AppearanceSection />}
+        {section === "glossary" && <GlossarySection />}
+        {section === "history" && <HistorySection />}
+        {section === "data" && <DataSection />}
       </div>
+    </div>
+  );
+}
+
+function formatRunDate(iso: string): string {
+  if (!iso) return "—";
+  // Prefer local short form; fall back to first 16 chars of ISO.
+  const d = new Date(iso);
+  if (!Number.isNaN(d.getTime())) {
+    return d.toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+  return iso.length >= 16 ? iso.slice(0, 16) : iso;
+}
+
+function formatDuration(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+function HistorySection() {
+  const { data: runs, isLoading, isError, error, refetch } = useQuery({
+    queryKey: ["translation-runs"],
+    queryFn: getTranslationRuns,
+  });
+
+  const totals = useMemo(() => {
+    const list = runs ?? [];
+    return list.reduce(
+      (acc, r) => {
+        acc.strings += r.strings_translated;
+        acc.tokens += r.tokens_used;
+        acc.input += r.input_tokens;
+        acc.output += r.output_tokens;
+        acc.cost += r.cost_usd;
+        acc.secs += r.duration_secs;
+        return acc;
+      },
+      { strings: 0, tokens: 0, input: 0, output: 0, cost: 0, secs: 0 }
+    );
+  }, [runs]);
+
+  return (
+    <div className="space-y-4 max-w-5xl">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-xl font-bold">Translation history</h2>
+          <p className="text-sm text-gray-500 mt-1">
+            Every translation run recorded for this project — provider, cost, tokens and duration.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => refetch()}
+          className="text-sm text-emerald-700 hover:underline dark:text-emerald-400"
+        >
+          Refresh
+        </button>
+      </div>
+
+      {isLoading && (
+        <div className="flex items-center gap-2 text-sm text-gray-500">
+          <Loader size={16} className="animate-spin" /> Loading runs…
+        </div>
+      )}
+
+      {isError && (
+        <div className="text-sm text-red-600 dark:text-red-400">
+          Failed to load runs: {(error as Error)?.message ?? "unknown error"}
+        </div>
+      )}
+
+      {!isLoading && !isError && (runs?.length ?? 0) === 0 && (
+        <div className="border border-dashed border-gray-300 dark:border-gray-600 rounded-lg p-8 text-center text-sm text-gray-500">
+          No translation runs recorded yet. Run a translation from the Editor to populate this
+          history.
+        </div>
+      )}
+
+      {!isLoading && !isError && (runs?.length ?? 0) > 0 && (
+        <div className="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 dark:bg-gray-800/80 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                <th className="px-3 py-2">Date</th>
+                <th className="px-3 py-2">Provider</th>
+                <th className="px-3 py-2">Langs</th>
+                <th className="px-3 py-2 text-right">Strings</th>
+                <th className="px-3 py-2 text-right">Tokens</th>
+                <th className="px-3 py-2 text-right">In</th>
+                <th className="px-3 py-2 text-right">Out</th>
+                <th className="px-3 py-2 text-right">Cost (USD)</th>
+                <th className="px-3 py-2 text-right">Duration</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+              {runs!.map((r: TranslationRun) => (
+                <tr key={r.id} className="hover:bg-gray-50/80 dark:hover:bg-gray-800/40">
+                  <td className="px-3 py-2 whitespace-nowrap text-gray-700 dark:text-gray-300">
+                    {formatRunDate(r.started_at)}
+                  </td>
+                  <td className="px-3 py-2 font-mono text-xs" title={r.provider}>
+                    {r.provider}
+                  </td>
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    {r.source_lang}→{r.target_lang}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">{r.strings_translated}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{r.tokens_used}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                    {r.input_tokens}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                    {r.output_tokens}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    {r.cost_usd.toFixed(4)}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums whitespace-nowrap">
+                    {formatDuration(r.duration_secs)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr className="bg-gray-50 dark:bg-gray-800/80 font-semibold text-gray-800 dark:text-gray-200 border-t border-gray-200 dark:border-gray-700">
+                <td className="px-3 py-2" colSpan={3}>
+                  Total ({runs!.length} run{runs!.length === 1 ? "" : "s"})
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums">{totals.strings}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{totals.tokens}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                  {totals.input}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                  {totals.output}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {totals.cost.toFixed(4)}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums whitespace-nowrap">
+                  {formatDuration(totals.secs)}
+                </td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -210,18 +387,17 @@ function AppearanceSection() {
   const qc = useQueryClient();
 
   const setTheme = async (theme: string) => {
-    await updateConfig({ ui: { ...config?.ui, theme } } as any);
+    const ui = { ...config?.ui, theme };
+    await updateConfig({ ui } as any);
     qc.invalidateQueries({ queryKey: ["config"] });
-    const root = document.documentElement;
-    root.classList.remove("dark", "light");
-    if (theme === "dark") root.classList.add("dark");
-    else if (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches) root.classList.add("dark");
+    applyAppearance(ui);
   };
 
   const setFontSize = async (size: number) => {
-    await updateConfig({ ui: { ...config?.ui, font_size: size } } as any);
+    const ui = { ...config?.ui, font_size: size };
+    await updateConfig({ ui } as any);
     qc.invalidateQueries({ queryKey: ["config"] });
-    document.documentElement.style.fontSize = `${size}px`;
+    applyAppearance(ui);
   };
 
   if (!config) return null;
@@ -250,27 +426,236 @@ function AppearanceSection() {
   );
 }
 
-function DataSection() {
-  const { data: backups, refetch } = useQuery({ queryKey: ["backups"], queryFn: getBackups });
+function GlossarySection() {
+  const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
   const qc = useQueryClient();
+  const configPair = config
+    ? `${config.default_source_lang}-${config.default_target_lang}`
+    : "ja-en";
+  const [langPairOverride, setLangPairOverride] = useState<string | null>(null);
+  const activePair = (langPairOverride ?? configPair).trim() || "ja-en";
 
-  const handleRestore = async (id: string) => {
-    if (!confirm(`Restore backup ${id}? This will overwrite current project files.`)) return;
+  const { data: entries, refetch, isLoading } = useQuery({
+    queryKey: ["glossary", activePair],
+    queryFn: () => getGlossary(activePair),
+    enabled: !!activePair,
+  });
+
+  const [filter, setFilter] = useState("");
+  const [term, setTerm] = useState("");
+  const [translation, setTranslation] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [entryToDelete, setEntryToDelete] = useState<GlossaryEntry | null>(null);
+
+  const filtered = useMemo(() => {
+    const list = entries ?? [];
+    const q = filter.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter(
+      (e) =>
+        e.term.toLowerCase().includes(q) ||
+        e.translation.toLowerCase().includes(q) ||
+        (e.context?.toLowerCase().includes(q) ?? false)
+    );
+  }, [entries, filter]);
+
+  const handleAdd = async () => {
+    const t = term.trim();
+    const tr = translation.trim();
+    if (!t || !tr) {
+      addToast("error", "Term and translation are required.");
+      return;
+    }
+    if (!activePair.trim()) {
+      addToast("error", "Language pair is required (e.g. ja-en).");
+      return;
+    }
+    setSaving(true);
     try {
-      await restoreBackup(id);
-      alert("Restored successfully");
+      const entry: GlossaryEntry = {
+        term: t,
+        translation: tr,
+        lang_pair: activePair.trim(),
+        context: null,
+        case_sensitive: false,
+      };
+      await addGlossaryEntry(entry);
+      setTerm("");
+      setTranslation("");
+      refetch();
+      qc.invalidateQueries({ queryKey: ["glossary"] });
     } catch (e: any) {
-      alert(`Restore failed: ${e.message}`);
+      addToast("error", `Failed to add entry: ${e.message}`);
+    } finally {
+      setSaving(false);
     }
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm(`Delete backup ${id}?`)) return;
+  const handleDeleteConfirmed = async (entry: GlossaryEntry) => {
+    setEntryToDelete(null);
     try {
-      await fetch(`/api/backups/${id}`, { method: "DELETE" });
+      await deleteGlossaryEntry(entry.term, entry.lang_pair);
       refetch();
+      qc.invalidateQueries({ queryKey: ["glossary"] });
     } catch (e: any) {
-      alert(`Delete failed: ${e.message}`);
+      addToast("error", `Failed to delete: ${e.message}`);
+    }
+  };
+
+  return (
+    <div className="space-y-6 max-w-3xl">
+      <h2 className="text-xl font-bold">Glossary</h2>
+      <p className="text-sm text-gray-500">
+        Preferred term translations used when “Use glossary” is enabled in the translation dialog.
+      </p>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+        <div>
+          <label className="text-sm font-medium">Language pair</label>
+          <input
+            value={langPairOverride ?? configPair}
+            onChange={(e) => setLangPairOverride(e.target.value)}
+            placeholder="ja-en"
+            className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+          />
+        </div>
+        <div className="sm:col-span-2 relative">
+          <label className="text-sm font-medium">Filter</label>
+          <div className="relative mt-1">
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
+            <input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Search terms or translations..."
+              className="w-full pl-8 pr-3 py-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 space-y-3">
+        <h3 className="text-sm font-semibold text-gray-500 uppercase">Add entry</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label className="text-sm text-gray-600">Term</label>
+            <input
+              value={term}
+              onChange={(e) => setTerm(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+              placeholder="Source term"
+              className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+            />
+          </div>
+          <div>
+            <label className="text-sm text-gray-600">Translation</label>
+            <input
+              value={translation}
+              onChange={(e) => setTranslation(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+              placeholder="Preferred translation"
+              className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+            />
+          </div>
+        </div>
+        <button
+          onClick={handleAdd}
+          disabled={saving}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded text-sm font-medium"
+        >
+          <Plus size={14} /> {saving ? "Adding..." : "Add entry"}
+        </button>
+      </div>
+
+      <div>
+        <h3 className="text-sm font-semibold text-gray-500 uppercase mb-2">
+          Entries {entries ? `(${filtered.length})` : ""}
+        </h3>
+        {isLoading ? (
+          <p className="text-sm text-gray-500 flex items-center gap-2">
+            <Loader size={14} className="animate-spin" /> Loading...
+          </p>
+        ) : filtered.length === 0 ? (
+          <p className="text-sm text-gray-500">
+            {filter
+              ? "No glossary entries match your filter."
+              : "No glossary entries for this language pair yet. Add a term above."}
+          </p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-gray-500 text-xs uppercase">
+                <th className="pb-2">Term</th>
+                <th className="pb-2">Translation</th>
+                <th className="pb-2 w-24">Pair</th>
+                <th className="pb-2 w-12"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((e) => (
+                <tr
+                  key={`${e.lang_pair}:${e.term}`}
+                  className="border-t border-gray-100 dark:border-gray-800"
+                >
+                  <td className="py-2 font-medium">{e.term}</td>
+                  <td className="py-2">{e.translation}</td>
+                  <td className="py-2">
+                    <span className="px-2 py-0.5 bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 rounded text-xs">
+                      {e.lang_pair}
+                    </span>
+                  </td>
+                  <td className="py-2">
+                    <button
+                      onClick={() => setEntryToDelete(e)}
+                      className="text-red-500 hover:text-red-700"
+                      title="Delete entry"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <ConfirmDialog
+        open={entryToDelete !== null}
+        title="Delete glossary term"
+        message={entryToDelete ? `Delete glossary term “${entryToDelete.term}”?` : ""}
+        confirmLabel="Delete"
+        destructive
+        onConfirm={() => entryToDelete && handleDeleteConfirmed(entryToDelete)}
+        onCancel={() => setEntryToDelete(null)}
+      />
+    </div>
+  );
+}
+
+function DataSection() {
+  const { data: backups, refetch } = useQuery({ queryKey: ["backups"], queryFn: getBackups });
+  const [pendingAction, setPendingAction] = useState<
+    { kind: "restore" | "delete"; id: string } | null
+  >(null);
+
+  const runPendingAction = async () => {
+    if (!pendingAction) return;
+    const { kind, id } = pendingAction;
+    setPendingAction(null);
+    if (kind === "restore") {
+      try {
+        await restoreBackup(id);
+        addToast("success", `Backup ${id} restored`);
+      } catch (e: any) {
+        addToast("error", `Restore failed: ${e.message}`);
+      }
+    } else {
+      try {
+        await deleteBackup(id);
+        refetch();
+      } catch (e: any) {
+        addToast("error", `Delete failed: ${e.message}`);
+      }
     }
   };
 
@@ -295,8 +680,8 @@ function DataSection() {
                   <td className="py-2">{new Date(b.created_at).toLocaleString()}</td>
                   <td className="py-2">{b.file_count}</td>
                   <td className="py-2 flex gap-2">
-                    <button onClick={() => handleRestore(b.id)} className="text-emerald-600 hover:text-emerald-800"><RotateCcw size={14} /></button>
-                    <button onClick={() => handleDelete(b.id)} className="text-red-500 hover:text-red-700"><Trash2 size={14} /></button>
+                    <button onClick={() => setPendingAction({ kind: "restore", id: b.id })} className="text-emerald-600 hover:text-emerald-800" title="Restore backup"><RotateCcw size={14} /></button>
+                    <button onClick={() => setPendingAction({ kind: "delete", id: b.id })} className="text-red-500 hover:text-red-700" title="Delete backup"><Trash2 size={14} /></button>
                   </td>
                 </tr>
               ))}
@@ -304,6 +689,20 @@ function DataSection() {
           </table>
         )}
       </div>
+
+      <ConfirmDialog
+        open={pendingAction !== null}
+        title={pendingAction?.kind === "restore" ? "Restore backup" : "Delete backup"}
+        message={
+          pendingAction?.kind === "restore"
+            ? `Restore backup ${pendingAction.id}? This will overwrite current project files.`
+            : `Delete backup ${pendingAction?.id ?? ""}?`
+        }
+        confirmLabel={pendingAction?.kind === "restore" ? "Restore" : "Delete"}
+        destructive
+        onConfirm={runPendingAction}
+        onCancel={() => setPendingAction(null)}
+      />
     </div>
   );
 }

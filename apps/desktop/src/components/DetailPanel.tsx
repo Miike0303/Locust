@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import clsx from "clsx";
 import type { StringEntry, StringStatus } from "../lib/api";
-import { patchString } from "../lib/api";
+import { binarySlotOf, encodedByteLen, patchString } from "../lib/api";
 
 const statusButtons: { value: StringStatus; label: string; color: string }[] = [
   { value: "pending", label: "Pending", color: "bg-gray-200 text-gray-700" },
@@ -38,6 +38,13 @@ export default function DetailPanel({ entry, onRefetch, onClose }: DetailPanelPr
 
   const charCount = translation.length;
   const limitExceeded = entry.char_limit != null && charCount > entry.char_limit;
+  const binarySlot = binarySlotOf(entry);
+  const srcSlotBytes =
+    binarySlot != null ? encodedByteLen(binarySlot, entry.source) : null;
+  const trSlotBytes =
+    binarySlot != null ? encodedByteLen(binarySlot, translation) : null;
+  const binarySlotExceeded =
+    srcSlotBytes != null && trSlotBytes != null && trSlotBytes > srcSlotBytes;
 
   return (
     <aside className="w-[360px] border-l border-gray-200 dark:border-gray-700 overflow-y-auto bg-white dark:bg-gray-900 flex flex-col">
@@ -66,9 +73,19 @@ export default function DetailPanel({ entry, onRefetch, onClose }: DetailPanelPr
             className="mt-1 w-full p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 resize-y min-h-[80px]"
             rows={4}
           />
-          <div className={clsx("text-xs mt-1", limitExceeded ? "text-red-500 font-semibold" : "text-gray-400")}>
+          <div className={clsx("text-xs mt-1", limitExceeded || binarySlotExceeded ? "text-red-500 font-semibold" : "text-gray-400")}>
             {charCount} chars
             {entry.char_limit != null && ` / ${entry.char_limit} limit`}
+            {binarySlot && srcSlotBytes != null && trSlotBytes != null && (
+              <span className="ml-2">
+                · {binarySlot} {trSlotBytes}/{srcSlotBytes} B
+              </span>
+            )}
+            {binarySlot === "sjis" && (
+              <span className="ml-2 text-gray-400 font-normal">
+                · SJIS checked on Validate
+              </span>
+            )}
           </div>
         </div>
 
@@ -96,6 +113,12 @@ export default function DetailPanel({ entry, onRefetch, onClose }: DetailPanelPr
           <div className="flex items-center gap-2 p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm text-red-700 dark:text-red-400">
             <AlertTriangle size={16} />
             Translation exceeds character limit
+          </div>
+        )}
+        {binarySlotExceeded && (
+          <div className="flex items-center gap-2 p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm text-red-700 dark:text-red-400">
+            <AlertTriangle size={16} />
+            Exceeds binary inject slot ({binarySlot}: {trSlotBytes} &gt; {srcSlotBytes} bytes) — inject will skip
           </div>
         )}
 

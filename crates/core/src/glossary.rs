@@ -47,6 +47,98 @@ impl Glossary {
         }
         Some(hint)
     }
+
+    /// Glossary lines for terms that actually appear in `text` (reduces noise on
+    /// short UI binary slots). Prefers longer terms first. Cap 20 matches.
+    pub fn build_hint_for_text(
+        &self,
+        source_lang: &str,
+        target_lang: &str,
+        text: &str,
+    ) -> Option<String> {
+        self.build_hint_for_text_budgeted(source_lang, target_lang, text, None)
+    }
+
+    /// Like [`build_hint_for_text`], but when `max_bytes` is `Some((encoding, budget))`
+    /// drop glossary translations that would exceed a binary inject slot (e.g.
+    /// `Options → Opciones` on a 7-byte utf8 budget). Avoids steering the model
+    /// toward known-oversize forms after exact-match short-circuit declines them.
+    pub fn build_hint_for_text_budgeted(
+        &self,
+        source_lang: &str,
+        target_lang: &str,
+        text: &str,
+        max_bytes: Option<(&str, usize)>,
+    ) -> Option<String> {
+        let lang_pair = format!("{}-{}", source_lang, target_lang);
+        let entries = self.get_all(&lang_pair).ok()?;
+        if entries.is_empty() || text.is_empty() {
+            return None;
+        }
+        let text_lower = text.to_lowercase();
+        let mut matched: Vec<&GlossaryEntry> = entries
+            .iter()
+            .filter(|e| {
+                if e.term.is_empty() {
+                    return false;
+                }
+                let in_text = if e.case_sensitive {
+                    text.contains(&e.term)
+                } else {
+                    text_lower.contains(&e.term.to_lowercase())
+                };
+                if !in_text {
+                    return false;
+                }
+                if let Some((enc, budget)) = max_bytes {
+                    match crate::validation::encoded_byte_len(enc, &e.translation) {
+                        Some(n) if n <= budget => true,
+                        _ => false,
+                    }
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if matched.is_empty() {
+            return None;
+        }
+        matched.sort_by(|a, b| b.term.len().cmp(&a.term.len()));
+        let mut hint = String::from("Glossary (use these translations consistently):\n");
+        for entry in matched.into_iter().take(20) {
+            hint.push_str(&format!("  {} → {}\n", entry.term, entry.translation));
+        }
+        Some(hint)
+    }
+
+    /// Exact full-string glossary hit (trim + case per entry). Used to short-circuit
+    /// the provider for known UI labels (Options → Opcns, etc.).
+    pub fn lookup_exact(
+        &self,
+        source: &str,
+        source_lang: &str,
+        target_lang: &str,
+    ) -> Option<String> {
+        let lang_pair = format!("{}-{}", source_lang, target_lang);
+        let entries = self.get_all(&lang_pair).ok()?;
+        let trimmed = source.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        for e in &entries {
+            let hit = if e.case_sensitive {
+                e.term == trimmed || e.term == source
+            } else {
+                e.term.eq_ignore_ascii_case(trimmed)
+                    || (!trimmed.is_ascii()
+                        && e.term.to_lowercase() == trimmed.to_lowercase())
+            };
+            if hit {
+                return Some(e.translation.clone());
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +219,80 @@ mod tests {
         let entries = glossary.get_all("ja-en").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].translation, "Hit Points");
+    }
+
+    #[test]
+    fn test_lookup_exact_case_insensitive() {
+        let (_db, glossary) = setup();
+        glossary.add("Options", "Opcns", "en-es", None).unwrap();
+        assert_eq!(
+            glossary.lookup_exact("Options", "en", "es").as_deref(),
+            Some("Opcns")
+        );
+        assert_eq!(
+            glossary.lookup_exact("  options  ", "en", "es").as_deref(),
+            Some("Opcns")
+        );
+        assert!(glossary.lookup_exact("Option", "en", "es").is_none());
+        assert!(glossary.lookup_exact("Options", "en", "fr").is_none());
+    }
+
+    #[test]
+    fn test_build_hint_for_text_filters_to_source() {
+        let (_db, glossary) = setup();
+        glossary.add("HP", "PV", "en-es", None).unwrap();
+        glossary.add("Options", "Opcns", "en-es", None).unwrap();
+        glossary.add("Load Game", "Cargar J", "en-es", None).unwrap();
+
+        let only_hp = glossary
+            .build_hint_for_text("en", "es", "Current HP: 12")
+            .unwrap();
+        assert!(only_hp.contains("HP → PV"), "{only_hp}");
+        assert!(
+            !only_hp.contains("Options"),
+            "unrelated term must not appear: {only_hp}"
+        );
+
+        let multi = glossary
+            .build_hint_for_text("en", "es", "Load Game / Options")
+            .unwrap();
+        assert!(multi.contains("Load Game → Cargar J"), "{multi}");
+        assert!(multi.contains("Options → Opcns"), "{multi}");
+        // Longer term first
+        let load_pos = multi.find("Load Game").unwrap();
+        let opt_pos = multi.find("Options").unwrap();
+        assert!(load_pos < opt_pos, "longer terms first: {multi}");
+
+        assert!(glossary
+            .build_hint_for_text("en", "es", "Nothing matching")
+            .is_none());
+    }
+
+    #[test]
+    fn test_build_hint_budgeted_drops_oversize_translation() {
+        let (_db, glossary) = setup();
+        // "Options" is 7 utf8 bytes; "Opciones" is 8 → oversize for that slot.
+        glossary
+            .add("Options", "Opciones", "en-es", None)
+            .unwrap();
+        glossary.add("OK", "Si", "en-es", None).unwrap();
+
+        assert!(
+            glossary
+                .build_hint_for_text_budgeted("en", "es", "Options", Some(("utf8", 7)))
+                .is_none(),
+            "oversize glossary form must not appear in binary-slot hint"
+        );
+        let fitting = glossary
+            .build_hint_for_text_budgeted("en", "es", "Options", Some(("utf8", 8)))
+            .unwrap();
+        assert!(fitting.contains("Options → Opciones"), "{fitting}");
+
+        // Substring match still filters by translation size.
+        let mixed = glossary
+            .build_hint_for_text_budgeted("en", "es", "Options OK", Some(("utf8", 7)))
+            .unwrap();
+        assert!(mixed.contains("OK → Si"), "{mixed}");
+        assert!(!mixed.contains("Opciones"), "{mixed}");
     }
 }

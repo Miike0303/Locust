@@ -134,7 +134,7 @@ fn is_system_passage(name: &str, tags: &str) -> bool {
 
 fn is_html(path: &Path) -> bool {
     path.extension()
-        .map_or(false, |e| e == "html" || e == "htm")
+        .is_some_and(|e| e == "html" || e == "htm")
 }
 
 fn extract_attr(tag: &str, name: &str) -> Option<String> {
@@ -465,7 +465,8 @@ impl FormatPlugin for SugarCubePlugin {
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
-        locust_core::extraction::FormatStability::ComingSoon
+        // Phase-2 apply proven (Zabulon's Archive); html-game is separate Experimental.
+        locust_core::extraction::FormatStability::Experimental
     }
 
     fn supported_extensions(&self) -> &[&str] {
@@ -602,6 +603,9 @@ impl FormatPlugin for SugarCubePlugin {
             strings_written: written,
             strings_skipped: skipped,
             warnings: Vec::new(),
+            // Reported only when a translation landed, matching
+            // `files_modified`: a zero-replacement rewrite is byte-identical.
+            files_written: if written > 0 { vec![html_file] } else { Vec::new() },
         })
     }
 }
@@ -647,7 +651,7 @@ fn replace_safe(passage: &str, source: &str, replacement: &str) -> (String, bool
 
 /// Check if a position falls inside a context that should not be modified:
 /// encoded HTML tags, SugarCube macros, link targets, or code blocks.
-fn is_inside_unsafe_context(s: &str, pos: usize, end: usize) -> bool {
+fn is_inside_unsafe_context(s: &str, pos: usize, _end: usize) -> bool {
     let before = &s[..pos];
 
     // Inside HTML-encoded tag: &lt;...&gt;

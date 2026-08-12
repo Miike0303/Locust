@@ -462,7 +462,7 @@ mod tests {
         let dir = tempdir();
         let fonts_dir = dir.join("fonts");
         fs::create_dir_all(&fonts_dir).unwrap();
-        fs::write(fonts_dir.join("test.ttf"), &build_minimal_ascii_font()).unwrap();
+        fs::write(fonts_dir.join("test.ttf"), build_minimal_ascii_font()).unwrap();
         let fonts = FontValidator::find_game_fonts(&dir);
         assert_eq!(fonts.len(), 1);
     }

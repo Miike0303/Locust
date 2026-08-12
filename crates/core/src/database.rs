@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::error::Result;
+use crate::error::{LocustError, Result};
 use crate::models::{StringEntry, StringStatus, ValidationIssue, ValidationKind};
 
 pub struct Database {
@@ -21,6 +22,26 @@ pub struct EntryFilter {
     pub search: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+/// One completed translation run — the unit of the per-project
+/// tokens/time/cost ledger.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TranslationRun {
+    /// Auto-increment primary key (0 when constructing a run to insert).
+    #[serde(default)]
+    pub id: i64,
+    pub started_at: String,
+    pub duration_secs: f64,
+    /// Provider id, or a chain summary when multiple were used (e.g. `"a→b"`).
+    pub provider: String,
+    pub source_lang: String,
+    pub target_lang: String,
+    pub strings_translated: usize,
+    pub tokens_used: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -53,6 +74,139 @@ pub struct GlossaryEntry {
     pub case_sensitive: bool,
 }
 
+/// One file in an injection recording: the game-root-relative path (always
+/// forward slashes, never `..`), the SHA-256 of the bytes injection wrote,
+/// and their size. `locust patch` re-verifies both before packing, so a
+/// packed file is provably the file injection reported writing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedFile {
+    pub rel: String,
+    pub hash: String,
+    pub size: u64,
+}
+
+/// Everything one `locust inject` run recorded for one language key: the
+/// absolutized root of the tree it wrote into and the files it wrote there.
+/// `lang: None` is the reserved language-unspecified key (`--direct` without
+/// `-l`), rendered as "(unspecified)" and matched only by `patch` without `-l`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InjectionRecording {
+    pub lang: Option<String>,
+    pub root: PathBuf,
+    pub files: Vec<RecordedFile>,
+    pub recorded_at: String,
+}
+
+/// Lowercase hex SHA-256 of `bytes` — the hash stored in injection recordings.
+/// SHA-256 over BLAKE3 because `sha2` is already in the dependency tree; the
+/// column is TEXT, so nothing else depends on the choice.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// Case-fold a path fragment for comparison — ONLY where the filesystem
+/// itself folds case (NTFS, APFS). On ext4 two case spellings are two
+/// different files, and folding would invent a match between them.
+pub fn fold_path_case(s: &str) -> String {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        s.to_string()
+    }
+}
+
+/// Decompose a path into comparable (folded key, raw component) pairs.
+///
+/// Both sides of every recording comparison go through this, because the two
+/// spellings of one path routinely diverge: relative vs absolute, drive or
+/// directory case, or a `\\?\` verbatim prefix left behind by `canonicalize`.
+/// A literal `strip_prefix` silently fails on all of those.
+///
+/// `canonicalize` is preferred (it resolves symlinks and on-disk casing); a
+/// path that does not exist on disk cannot be canonicalized, so it falls back
+/// to lexical absolutization, which still repairs relative-vs-absolute
+/// divergence.
+///
+/// ponytail: duplicated in spirit with `normalize_path_for_compare` in the
+/// Ren'Py plugin; unify once core grows a path-identity module. Ceiling: the
+/// two implementations could drift on a platform-specific edge.
+fn resolved_parts(p: &Path) -> Vec<(String, std::ffi::OsString)> {
+    use std::path::{Component, Prefix};
+    let resolved = p
+        .canonicalize()
+        .or_else(|_| std::path::absolute(p))
+        .unwrap_or_else(|_| p.to_path_buf());
+    let mut out = Vec::new();
+    for c in resolved.components() {
+        let key = match c {
+            // `\\?\C:\` (verbatim, from canonicalize) and `C:\` (plain) name
+            // the same drive and must compare equal.
+            Component::Prefix(pr) => match pr.kind() {
+                Prefix::VerbatimDisk(d) | Prefix::Disk(d) => {
+                    format!("{}:", (d as char))
+                }
+                Prefix::VerbatimUNC(server, share) | Prefix::UNC(server, share) => format!(
+                    r"\\{}\{}",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                ),
+                _ => pr.as_os_str().to_string_lossy().into_owned(),
+            },
+            // Both sides are absolute after resolution, so the root marker
+            // carries no information.
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => "..".to_string(),
+            Component::Normal(s) => s.to_string_lossy().into_owned(),
+        };
+        out.push((fold_path_case(&key), c.as_os_str().to_os_string()));
+    }
+    out
+}
+
+/// True when two spellings name the same on-disk location. This is the
+/// identity check `locust patch` runs between its game-path argument and a
+/// recording's root: packing from a different tree would ship that tree's
+/// files, not the ones injection wrote.
+pub fn paths_identical(a: &Path, b: &Path) -> bool {
+    let ka: Vec<String> = resolved_parts(a).into_iter().map(|(k, _)| k).collect();
+    let kb: Vec<String> = resolved_parts(b).into_iter().map(|(k, _)| k).collect();
+    !ka.is_empty() && ka == kb
+}
+
+/// Forward-slash path of `file` relative to `root`, or `None` when `file` is
+/// not strictly under `root`. This is the containment check behind injection
+/// recordings: a file that does not resolve under its language's root must
+/// hard-fail at record time, never be recorded against the wrong tree.
+pub fn rel_under_root(file: &Path, root: &Path) -> Option<String> {
+    let f = resolved_parts(file);
+    let r = resolved_parts(root);
+    if f.len() <= r.len() || !f.iter().zip(&r).all(|(a, b)| a.0 == b.0) {
+        return None;
+    }
+    Some(
+        f[r.len()..]
+            .iter()
+            .map(|(_, raw)| raw.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// Resolved, case-folded identity key for one physical file — two spellings
+/// of the same file compare equal, two different files never do.
+fn path_identity_key(p: &Path) -> String {
+    resolved_parts(p)
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -77,9 +231,31 @@ impl Database {
 
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // The injected_files table was rebuilt (lang/root/rel/hash/size) when
+        // `locust patch` moved to packing exclusively from recordings. Any
+        // table missing part of that column set — the legacy file_path
+        // schema, or an intermediate one — cannot serve the new contract and
+        // would fail at runtime with a raw SQL error the first time a
+        // recording is read or written, so it is dropped whole. Recordings
+        // are reproducible caches: the next `locust inject` rebuilds one,
+        // and `locust patch` on a missing recording names that exact
+        // command.
+        let legacy: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'injected_files'
+               AND (SELECT COUNT(*) FROM pragma_table_info('injected_files')
+                    WHERE name IN ('lang', 'root', 'rel', 'hash', 'size',
+                                   'recorded_at')) < 6",
+            [],
+            |row| row.get(0),
+        )?;
+        if legacy > 0 {
+            conn.execute("DROP TABLE injected_files", [])?;
+        }
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS strings (
@@ -127,13 +303,50 @@ impl Database {
                 message TEXT NOT NULL,
                 resolved INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS translation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                duration_secs REAL NOT NULL,
+                provider TEXT NOT NULL,
+                source_lang TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                strings_translated INTEGER NOT NULL,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS injected_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lang TEXT,
+                root TEXT NOT NULL,
+                rel TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
             ",
         )?;
+        // Migrate older DBs that predate the input/output token columns.
+        // ADD COLUMN errors if the column already exists — ignore that.
+        let _ = conn.execute(
+            "ALTER TABLE translation_runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE translation_runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(())
     }
 
     pub fn save_entries(&self, entries: &[StringEntry]) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
+        // Single transaction: per-row implicit transactions fsync each insert,
+        // which takes minutes for a full game extraction.
+        let tx = conn.unchecked_transaction()?;
         let mut count = 0usize;
         for entry in entries {
             let tags_json = serde_json::to_string(&entry.tags)?;
@@ -145,7 +358,7 @@ impl Database {
             let reviewed_at_str = entry.reviewed_at.map(|d| d.to_rfc3339());
             let char_limit = entry.char_limit.map(|l| l as i64);
 
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO strings
                  (id, source, translation, status, file_path, context, tags, metadata,
                   char_limit, provider_used, created_at, translated_at, reviewed_at)
@@ -168,6 +381,7 @@ impl Database {
             )?;
             count += 1;
         }
+        tx.commit()?;
         Ok(count)
     }
 
@@ -297,12 +511,15 @@ impl Database {
         Ok(count)
     }
 
+    /// Update an existing string's translation. Returns `true` if a row was
+    /// updated, `false` if `entry_id` is unknown (import must not count misses
+    /// as successes).
     pub async fn save_translation(
         &self,
         entry_id: &str,
         translation: &str,
         provider: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let conn = self.conn.clone();
         let entry_id = entry_id.to_string();
         let translation = translation.to_string();
@@ -310,11 +527,47 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let now = Utc::now().to_rfc3339();
-            conn.execute(
+            let n = conn.execute(
                 "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3 WHERE id = ?4",
                 params![translation, provider, now, entry_id],
             )?;
-            Ok(())
+            Ok(n > 0)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Apply many translation updates in one transaction (search-replace, bulk
+    /// import). Each item is `(entry_id, translation)`. Returns how many rows
+    /// were actually updated (unknown ids are skipped, not errors).
+    pub async fn save_translations_batch(
+        &self,
+        updates: Vec<(String, String)>,
+        provider: &str,
+    ) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.clone();
+        let provider = provider.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            let tx = conn.unchecked_transaction()?;
+            let mut applied = 0usize;
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3 WHERE id = ?4",
+                )?;
+                for (id, translation) in &updates {
+                    let n = stmt.execute(params![translation, provider, now, id])?;
+                    if n > 0 {
+                        applied += 1;
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(applied)
         })
         .await
         .unwrap()
@@ -378,6 +631,237 @@ impl Database {
         })
         .await
         .unwrap()
+    }
+
+    pub async fn record_translation_run(&self, run: &TranslationRun) -> Result<()> {
+        let conn = self.conn.clone();
+        let run = run.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO translation_runs
+                 (started_at, duration_secs, provider, source_lang, target_lang,
+                  strings_translated, tokens_used, input_tokens, output_tokens, cost_usd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    run.started_at,
+                    run.duration_secs,
+                    run.provider,
+                    run.source_lang,
+                    run.target_lang,
+                    run.strings_translated as i64,
+                    run.tokens_used as i64,
+                    run.input_tokens as i64,
+                    run.output_tokens as i64,
+                    run.cost_usd,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Record the files an injection run actually wrote for the `lang` key,
+    /// under the root it targeted. `locust patch` packs EXCLUSIVELY from this
+    /// recording: entries only name where text was READ, and for archive-based
+    /// engines the files injection writes can never become entries.
+    ///
+    /// - `root` is absolutized here, so the recording survives any later cwd.
+    /// - Each file is stored as a forward-slash rel under `root` plus the
+    ///   SHA-256 and size of its bytes (read back once, right now).
+    /// - CONTAINMENT: any file that does not resolve under `root` — or whose
+    ///   rel keeps a `..` component — is a hard error and NOTHING is recorded
+    ///   for this key. Recording a cross-tree write is how patches silently
+    ///   shipped the wrong tree's files.
+    /// - One physical file listed under two spellings is deduplicated; two
+    ///   DIFFERENT files whose rels collide under case folding are an error,
+    ///   because they cannot both extract from the patch zip on NTFS/APFS.
+    /// - A new recording REPLACES the previous one for the SAME key only. An
+    ///   EMPTY list is a no-op: a run that wrote nothing must not clobber the
+    ///   last good recording, whose files are still on disk.
+    pub fn record_injection(
+        &self,
+        lang: Option<&str>,
+        root: &Path,
+        written: &[PathBuf],
+    ) -> Result<()> {
+        if written.is_empty() {
+            return Ok(());
+        }
+        let root_abs = std::path::absolute(root)?;
+        let mut seen: HashMap<String, (String, PathBuf)> = HashMap::new();
+        let mut rows: Vec<(String, String, u64)> = Vec::new();
+        for p in written {
+            let rel = rel_under_root(p, &root_abs).ok_or_else(|| {
+                LocustError::InjectionError(format!(
+                    "cannot record injection output: \"{}\" is not under the \
+                     injection root \"{}\"",
+                    p.display(),
+                    root_abs.display()
+                ))
+            })?;
+            if Path::new(&rel)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(LocustError::InjectionError(format!(
+                    "cannot record injection output: \"{}\" escapes the \
+                     injection root \"{}\" via a `..` component",
+                    p.display(),
+                    root_abs.display()
+                )));
+            }
+            let identity = path_identity_key(p);
+            match seen.get(&fold_path_case(&rel)) {
+                Some((existing_identity, existing_path)) => {
+                    if existing_identity != &identity {
+                        return Err(LocustError::InjectionError(format!(
+                            "two different written files collide on the same \
+                             archive path \"{}\": \"{}\" and \"{}\" — they \
+                             cannot both extract from the patch zip on a \
+                             case-folding filesystem",
+                            rel,
+                            existing_path.display(),
+                            p.display()
+                        )));
+                    }
+                    continue; // same physical file listed twice
+                }
+                None => {
+                    seen.insert(fold_path_case(&rel), (identity, p.clone()));
+                }
+            }
+            let bytes = std::fs::read(p)?;
+            rows.push((rel, sha256_hex(&bytes), bytes.len() as u64));
+        }
+
+        let root_str = root_abs.to_string_lossy().to_string();
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM injected_files WHERE lang IS ?1", params![lang])?;
+        for (rel, hash, size) in &rows {
+            tx.execute(
+                "INSERT INTO injected_files (lang, root, rel, hash, size, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![lang, root_str, rel, hash, *size as i64, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The recording persisted by [`Self::record_injection`] for exactly this
+    /// key — `None` matches only the language-unspecified recording, never a
+    /// named one, and vice versa. `Ok(None)` when nothing is recorded for it.
+    pub fn get_injection(&self, lang: Option<&str>) -> Result<Option<InjectionRecording>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT root, rel, hash, size, recorded_at FROM injected_files
+             WHERE lang IS ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![lang], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut root = None;
+        let mut recorded_at = String::new();
+        let mut files = Vec::new();
+        for row in rows {
+            let (r, rel, hash, size, at) = row?;
+            root.get_or_insert(r);
+            recorded_at = at;
+            files.push(RecordedFile {
+                rel,
+                hash,
+                size: size as u64,
+            });
+        }
+        match root {
+            Some(r) => Ok(Some(InjectionRecording {
+                lang: lang.map(str::to_string),
+                root: PathBuf::from(r),
+                files,
+                recorded_at,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Every language key with a recording, named keys first, the reserved
+    /// language-unspecified key (`None`) last. Empty when no injection has
+    /// ever been recorded — `locust patch` must then hard-error with the
+    /// exact inject command, never fall back to guessing from entries.
+    pub fn list_recorded_langs(&self) -> Result<Vec<Option<String>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT lang FROM injected_files ORDER BY (lang IS NULL), lang",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+        let mut langs = Vec::new();
+        for row in rows {
+            langs.push(row?);
+        }
+        Ok(langs)
+    }
+
+    /// All ledger rows, oldest first (CLI `stats` chronological table).
+    /// Callers that want newest-first (HTTP UI) reverse the slice.
+    pub fn get_translation_runs(&self) -> Result<Vec<TranslationRun>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, started_at, duration_secs, provider, source_lang, target_lang,
+                    strings_translated, tokens_used, input_tokens, output_tokens, cost_usd
+             FROM translation_runs ORDER BY started_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TranslationRun {
+                id: row.get(0)?,
+                started_at: row.get(1)?,
+                duration_secs: row.get(2)?,
+                provider: row.get(3)?,
+                source_lang: row.get(4)?,
+                target_lang: row.get(5)?,
+                strings_translated: row.get::<_, i64>(6)? as usize,
+                tokens_used: row.get::<_, i64>(7)? as u64,
+                input_tokens: row.get::<_, i64>(8)? as u64,
+                output_tokens: row.get::<_, i64>(9)? as u64,
+                cost_usd: row.get(10)?,
+            })
+        })?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
+
+    /// Source language for export headers: prefer the latest run that targeted
+    /// `target_lang`, else the latest run of any target, else `fallback`.
+    /// Config defaults are not project ground truth once a run exists.
+    pub fn resolve_export_source_lang(
+        &self,
+        target_lang: &str,
+        fallback: &str,
+    ) -> Result<String> {
+        let runs = self.get_translation_runs()?;
+        if let Some(run) = runs
+            .iter()
+            .rev()
+            .find(|r| r.target_lang.eq_ignore_ascii_case(target_lang) && !r.source_lang.is_empty())
+        {
+            return Ok(run.source_lang.clone());
+        }
+        if let Some(run) = runs.iter().rev().find(|r| !r.source_lang.is_empty()) {
+            return Ok(run.source_lang.clone());
+        }
+        Ok(fallback.to_string())
     }
 
     pub fn get_stats(&self) -> Result<ProjectStats> {
@@ -514,6 +998,7 @@ impl Database {
                 entry_id: row.get(0)?,
                 kind,
                 message: row.get(2)?,
+                source: None,
             })
         })?;
         let mut issues = Vec::new();
@@ -762,6 +1247,327 @@ mod tests {
         assert!(db.get_entries(&EntryFilter::default()).unwrap().is_empty());
     }
 
+    // ─── injection recording (root + rel + hash per language) ──────────────
+
+    fn recording_tempdir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("locust_db_rec_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A minimal injected tree: `<base>/root/game/script.rpy` with known bytes.
+    fn make_recorded_tree(base: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+        let root = base.join("root");
+        let sub = root.join("game");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("script.rpy");
+        let bytes = b"label start:\n    \"Hola\"\n".to_vec();
+        std::fs::write(&file, &bytes).unwrap();
+        (root, file, bytes)
+    }
+
+    #[test]
+    fn test_record_injection_roundtrip_stores_rel_hash_and_size() {
+        let base = recording_tempdir();
+        let (root, file, bytes) = make_recorded_tree(&base);
+        let db = Database::open_in_memory().unwrap();
+
+        db.record_injection(Some("es"), &root, &[file]).unwrap();
+
+        let rec = db
+            .get_injection(Some("es"))
+            .unwrap()
+            .expect("a recording must exist for es");
+        assert!(
+            paths_identical(&rec.root, &root),
+            "recorded root {} must name the injection root {}",
+            rec.root.display(),
+            root.display()
+        );
+        assert!(rec.root.is_absolute(), "the root must be absolutized at record time");
+        assert_eq!(rec.files.len(), 1);
+        assert_eq!(
+            rec.files[0].rel, "game/script.rpy",
+            "rels are stored with forward slashes, relative to the root"
+        );
+        assert_eq!(rec.files[0].hash, sha256_hex(&bytes));
+        assert_eq!(rec.files[0].size, bytes.len() as u64);
+    }
+
+    #[test]
+    fn test_record_injection_null_key_is_its_own_recording() {
+        // `--direct` without -l records under the reserved NULL key, matched
+        // only by `patch` without -l — never silently by a named language.
+        let base = recording_tempdir();
+        let (root, file, _) = make_recorded_tree(&base);
+        let db = Database::open_in_memory().unwrap();
+
+        db.record_injection(None, &root, &[file]).unwrap();
+
+        assert!(db.get_injection(None).unwrap().is_some());
+        assert!(
+            db.get_injection(Some("es")).unwrap().is_none(),
+            "a named language must never match the language-unspecified recording"
+        );
+        assert_eq!(db.list_recorded_langs().unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn test_record_injection_replaces_only_its_own_key() {
+        let base = recording_tempdir();
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("game")).unwrap();
+        let a = root.join("game").join("a.rpy");
+        let b = root.join("game").join("b.rpy");
+        let c = root.join("game").join("c.rpy");
+        for f in [&a, &b, &c] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let db = Database::open_in_memory().unwrap();
+
+        db.record_injection(Some("es"), &root, &[a]).unwrap();
+        db.record_injection(Some("fr"), &root, &[b]).unwrap();
+        db.record_injection(Some("es"), &root, &[c]).unwrap();
+
+        let es = db.get_injection(Some("es")).unwrap().unwrap();
+        assert_eq!(
+            es.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(),
+            vec!["game/c.rpy"],
+            "a new recording replaces the previous one for the SAME key only"
+        );
+        let fr = db.get_injection(Some("fr")).unwrap().unwrap();
+        assert_eq!(fr.files[0].rel, "game/b.rpy");
+        assert_eq!(
+            db.list_recorded_langs().unwrap(),
+            vec![Some("es".to_string()), Some("fr".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_record_injection_empty_report_keeps_previous_recording() {
+        // An inject run that wrote nothing must not clobber the last good
+        // recording — the files it previously wrote are still on disk.
+        let base = recording_tempdir();
+        let (root, file, _) = make_recorded_tree(&base);
+        let db = Database::open_in_memory().unwrap();
+        db.record_injection(Some("es"), &root, &[file]).unwrap();
+
+        db.record_injection(Some("es"), &root, &[]).unwrap();
+
+        let rec = db.get_injection(Some("es")).unwrap().unwrap();
+        assert_eq!(rec.files[0].rel, "game/script.rpy");
+    }
+
+    #[test]
+    fn test_record_injection_refuses_a_file_outside_the_root() {
+        // Containment is checked at record time: a plugin that wrote into a
+        // different tree (Unity/Unreal/Wolf/Ren'Py-loose in Replace mode) must
+        // produce a hard error and record NOTHING — recording the paths would
+        // silently re-create the packs-the-wrong-tree corruption.
+        let base = recording_tempdir();
+        let (root, file, _) = make_recorded_tree(&base);
+        let outside = base.join("elsewhere.rpy");
+        std::fs::write(&outside, b"y").unwrap();
+        let db = Database::open_in_memory().unwrap();
+
+        let err = db
+            .record_injection(Some("es"), &root, &[file, outside.clone()])
+            .expect_err("a write outside the root must refuse to record");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&outside.display().to_string()),
+            "error must name the escaping file: {msg}"
+        );
+        assert!(
+            db.get_injection(Some("es")).unwrap().is_none(),
+            "nothing may be recorded when any file escapes the root"
+        );
+    }
+
+    #[test]
+    fn test_record_injection_refuses_parent_dir_escape() {
+        // Zip-slip guard at record time: a dot-dot path escaping the root
+        // must refuse to record. On Windows `std::path::absolute` collapses
+        // `..` lexically, so the CONTAINMENT branch catches it; on POSIX the
+        // `..` survives resolution and the explicit `..` branch does. Either
+        // way the refusal must come from the recording guards (shared
+        // "cannot record injection output" contract), never from an
+        // incidental read failure later on.
+        let base = recording_tempdir();
+        let (root, _file, _) = make_recorded_tree(&base);
+        let sneaky = root.join("game").join("..").join("..").join("evil.txt");
+        let db = Database::open_in_memory().unwrap();
+
+        let err = db
+            .record_injection(Some("es"), &root, &[sneaky])
+            .expect_err("a dot-dot path escaping the root must refuse to record");
+        assert!(
+            err.to_string().contains("cannot record injection output"),
+            "the refusal must come from the recording guards: {err}"
+        );
+        assert!(db.get_injection(Some("es")).unwrap().is_none());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn test_record_injection_dedupes_two_case_spellings_of_one_file() {
+        // ONE physical file reached under two case spellings is a duplicate,
+        // not a collision — NTFS/APFS fold case, so both spellings name the
+        // same bytes and the file must be recorded exactly once.
+        let base = recording_tempdir();
+        let (root, file, _) = make_recorded_tree(&base);
+        let respelled = root.join("game").join("SCRIPT.RPY");
+        let db = Database::open_in_memory().unwrap();
+
+        db.record_injection(Some("es"), &root, &[file, respelled])
+            .unwrap();
+
+        let rec = db.get_injection(Some("es")).unwrap().unwrap();
+        assert_eq!(rec.files.len(), 1, "one physical file must be recorded once");
+    }
+
+    #[test]
+    fn test_migration_drops_the_legacy_injected_files_table() {
+        // The pre-recording table (file_path/lang, no root) cannot say which
+        // tree injection targeted, so it is dropped on open; `locust patch`
+        // then gives the exact inject command that rebuilds the recording.
+        let base = recording_tempdir();
+        let db_path = base.join("legacy.locust.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE injected_files (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     file_path TEXT NOT NULL,
+                     lang TEXT NOT NULL,
+                     recorded_at TEXT NOT NULL
+                 );
+                 INSERT INTO injected_files (file_path, lang, recorded_at)
+                 VALUES ('/g/game/a.rpy', 'es', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+        assert!(
+            db.list_recorded_langs().unwrap().is_empty(),
+            "legacy rows must be gone — they never recorded a root"
+        );
+        // And the new API works against the rebuilt table.
+        let (root, file, _) = make_recorded_tree(&base);
+        db.record_injection(Some("es"), &root, &[file]).unwrap();
+        assert!(db.get_injection(Some("es")).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_migration_drops_an_injected_files_table_missing_any_expected_column() {
+        // Keying the migration on a missing `root` alone under-detects: a
+        // table WITH `root` but WITHOUT hash/size (an intermediate schema)
+        // survives and then fails at runtime with a raw SQL error the first
+        // time a recording is read or written.
+        let base = recording_tempdir();
+        let db_path = base.join("intermediate.locust.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE injected_files (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     lang TEXT,
+                     root TEXT NOT NULL,
+                     rel TEXT NOT NULL,
+                     recorded_at TEXT NOT NULL
+                 );
+                 INSERT INTO injected_files (lang, root, rel, recorded_at)
+                 VALUES ('es', '/g/game', 'a.rpy', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+        assert!(
+            db.list_recorded_langs().unwrap().is_empty(),
+            "a table without the full column set must be rebuilt, not kept"
+        );
+        // The full round-trip works against the rebuilt table — this is what
+        // raw-SQL-errored before the migration detected the column set.
+        let (root, file, _) = make_recorded_tree(&base);
+        db.record_injection(Some("es"), &root, &[file]).unwrap();
+        let rec = db.get_injection(Some("es")).unwrap().unwrap();
+        assert!(!rec.files[0].hash.is_empty());
+    }
+
+    // ─── path helpers backing the recording contract ────────────────────────
+
+    #[test]
+    fn test_rel_under_root_uses_forward_slashes() {
+        let base = recording_tempdir();
+        let (root, file, _) = make_recorded_tree(&base);
+        assert_eq!(
+            rel_under_root(&file, &root),
+            Some("game/script.rpy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rel_under_root_resolves_relative_vs_absolute_spelling() {
+        // The recording is absolutized at record time, but the file list a
+        // plugin reports can be spelled relative when inject was invoked with
+        // a relative game path. A purely lexical prefix match would fail.
+        let cwd = std::env::current_dir().unwrap();
+        let stored = cwd.join("mygame").join("Data").join("BasicData.wolf");
+        assert_eq!(
+            rel_under_root(&stored, Path::new("mygame")),
+            Some("Data/BasicData.wolf".to_string())
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn test_rel_under_root_is_case_insensitive_where_the_filesystem_is() {
+        assert_eq!(
+            rel_under_root(
+                Path::new("/games/MYGAME/Data/BasicData.wolf"),
+                Path::new("/Games/MyGame")
+            ),
+            Some("Data/BasicData.wolf".to_string())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_rel_under_root_resolves_verbatim_prefix_spelling() {
+        // `canonicalize()` yields `\\?\C:\...` verbatim paths on Windows. A
+        // plainly spelled file must still match a verbatim-spelled root.
+        let base = recording_tempdir();
+        let (root, file, _) = make_recorded_tree(&base);
+        let verbatim_root = root.canonicalize().unwrap();
+        assert_eq!(
+            rel_under_root(&file, &verbatim_root),
+            Some("game/script.rpy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rel_under_root_is_none_outside_the_root_and_for_the_root_itself() {
+        let base = recording_tempdir();
+        let (root, _file, _) = make_recorded_tree(&base);
+        assert_eq!(rel_under_root(&base.join("elsewhere.txt"), &root), None);
+        assert_eq!(
+            rel_under_root(&root, &root),
+            None,
+            "the root itself is not a file under the root"
+        );
+    }
+
+    #[test]
+    fn test_paths_identical_across_spellings() {
+        let base = recording_tempdir();
+        let (root, _file, _) = make_recorded_tree(&base);
+        let canonical = root.canonicalize().unwrap();
+        assert!(paths_identical(&root, &canonical));
+        assert!(!paths_identical(&root, &base));
+    }
+
     #[test]
     fn test_save_and_get_entries() {
         let db = Database::open_in_memory().unwrap();
@@ -844,13 +1650,100 @@ mod tests {
     async fn test_save_translation_updates_status() {
         let db = Database::open_in_memory().unwrap();
         db.save_entries(&[make_entry("tr1", "Hello")]).unwrap();
-        db.save_translation("tr1", "Hola", "test-provider")
-            .await
-            .unwrap();
+        assert!(
+            db.save_translation("tr1", "Hola", "test-provider")
+                .await
+                .unwrap()
+        );
         let entry = db.get_entry("tr1").unwrap().unwrap();
         assert_eq!(entry.translation, Some("Hola".to_string()));
         assert_eq!(entry.status, StringStatus::Translated);
         assert_eq!(entry.provider_used, Some("test-provider".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_save_translation_unknown_id_returns_false() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(
+            !db.save_translation("missing", "Hola", "import")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_translations_batch_applies_known_skips_unknown() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[
+            make_entry("a", "Hello"),
+            make_entry("b", "World"),
+        ])
+        .unwrap();
+        let applied = db
+            .save_translations_batch(
+                vec![
+                    ("a".into(), "Hola".into()),
+                    ("missing".into(), "X".into()),
+                    ("b".into(), "Mundo".into()),
+                ],
+                "batch",
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied, 2);
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().translation.as_deref(),
+            Some("Hola")
+        );
+        assert_eq!(
+            db.get_entry("b").unwrap().unwrap().translation.as_deref(),
+            Some("Mundo")
+        );
+        assert!(db.get_entry("missing").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_export_import_po_multi_hash_id_through_db() {
+        use crate::export::{export_po, import_po};
+        use crate::models::StringEntry;
+        use std::path::PathBuf;
+
+        let db = Database::open_in_memory().unwrap();
+        let id = "S004b.ks.json#0#message";
+        let mut entry = StringEntry::new(id, "Hello there", PathBuf::from(r"C:\work\S004b.ks.json"));
+        entry.translation = Some("PLACEHOLDER".to_string());
+        db.save_entries(&[entry]).unwrap();
+
+        // External CAT tool "edits" the PO.
+        let mut e = db.get_entry(id).unwrap().unwrap();
+        e.translation = Some("Hola alli".to_string());
+        let po = export_po(std::slice::from_ref(&e), "en", "es");
+        let imported = import_po(&po).unwrap();
+        assert_eq!(imported[0].id.as_deref(), Some(id));
+
+        let mut applied = 0usize;
+        let mut missed = 0usize;
+        for pe in &imported {
+            if pe.translation.is_empty() {
+                continue;
+            }
+            if let Some(ref pe_id) = pe.id {
+                if db
+                    .save_translation(pe_id, &pe.translation, "import")
+                    .await
+                    .unwrap()
+                {
+                    applied += 1;
+                } else {
+                    missed += 1;
+                }
+            }
+        }
+        assert_eq!(applied, 1);
+        assert_eq!(missed, 0);
+        let again = db.get_entry(id).unwrap().unwrap();
+        assert_eq!(again.translation.as_deref(), Some("Hola alli"));
+        assert_eq!(again.status, StringStatus::Translated);
     }
 
     #[test]
@@ -946,11 +1839,13 @@ mod tests {
                 entry_id: "e1".to_string(),
                 kind: ValidationKind::EmptyTranslation,
                 message: "empty".to_string(),
+                source: None,
             },
             ValidationIssue {
                 entry_id: "e2".to_string(),
                 kind: ValidationKind::IdenticalToSource,
                 message: "identical".to_string(),
+                source: None,
             },
         ];
         rt.block_on(async {
@@ -997,5 +1892,54 @@ mod tests {
         // Simulate new project checking global memory
         let result = gm.lookup_memory("hash_g2", "en-es").unwrap();
         assert_eq!(result, Some("Mundo".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_export_source_lang_prefers_matching_target_run() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        rt.block_on(async {
+            db.record_translation_run(&TranslationRun {
+                id: 0,
+                started_at: "2026-01-01T00:00:00Z".into(),
+                duration_secs: 1.0,
+                provider: "mock".into(),
+                source_lang: "ja".into(),
+                target_lang: "en".into(),
+                strings_translated: 1,
+                tokens_used: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            })
+            .await
+            .unwrap();
+            db.record_translation_run(&TranslationRun {
+                id: 0,
+                started_at: "2026-01-02T00:00:00Z".into(),
+                duration_secs: 1.0,
+                provider: "mock".into(),
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                strings_translated: 1,
+                tokens_used: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(
+            db.resolve_export_source_lang("es", "ja").unwrap(),
+            "en"
+        );
+        assert_eq!(
+            db.resolve_export_source_lang("fr", "xx").unwrap(),
+            "en",
+            "unknown target falls back to latest run overall"
+        );
+        let empty = Database::open_in_memory().unwrap();
+        assert_eq!(empty.resolve_export_source_lang("es", "ja").unwrap(), "ja");
     }
 }

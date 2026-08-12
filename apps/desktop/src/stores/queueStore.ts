@@ -138,6 +138,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           path: result.project_path,
           format_id: result.format_id,
           name: result.project_name,
+          supported_modes: result.supported_modes,
         });
 
         // Step 2: Start translation

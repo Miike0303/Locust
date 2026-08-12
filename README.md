@@ -13,31 +13,44 @@
 Locust extracts translatable text from game files, runs it through a translation provider (free or paid), and injects the translations back — all while **preserving variables, formatting tags, and code** so the game keeps working.
 
 ```
-  [ Game files ]  →  extract  →  [ SQLite DB ]  →  translate  →  [ translations ]  →  inject  →  [ Translated game ]
+  extract → SQLite DB → translate → inject → patch zip → apply (verify/backup/receipt)
+                ↑ edit/review in desktop or export PO/XLIFF anytime
 ```
 
 You can stop at any stage, review/edit translations in the built-in editor, then continue.
-Your progress is saved automatically in the project database so you can revisit it later.
+Progress is saved in the project database. Prefer **patch → apply** on a *copy* of the game
+(never the only original without backup).
 
 ---
 
 ## Supported game engines
 
-### ✅ Available now
+Stability matches `locust formats` / the desktop Welcome screen
+(`stable` | `experimental` | `coming soon`).
 
-| Engine                    | Extensions       | Notes                                           |
-| ------------------------- | ---------------- | ----------------------------------------------- |
-| **RPG Maker MV / MZ**     | `.json`          | Maps, Events, Items, Actors, Troops, System, plugins |
-| **RPG Maker XP / VX Ace** | `.rvdata2`, `.rxdata` | Ruby-marshal data files                    |
-| **Ren'Py**                | `.rpy`, `.rpa`   | Proper `translate <lang> <label>_<hash>:` blocks, in-game language picker |
+### Stable
 
-### 🚧 Coming soon
+| Engine                    | Extensions            | Notes |
+| ------------------------- | --------------------- | ----- |
+| **RPG Maker MV / MZ**     | `.json`               | Maps, events, system, plugins; shared `rpgmaker-mv` plugin |
+| **RPG Maker XP / VX Ace** | `.rvdata2`, `.rxdata` | Ruby Marshal data |
+| **Ren'Py**                | `.rpy`, `.rpa`        | Loose scripts + RPA; Add-mode `game/tl/<lang>/` language packs |
 
-- **Unity** — `.assets` / Il2Cpp VN script extraction
-- **Unreal Engine** — `.pak` asset extraction
-- **HTML / Twine / SugarCube** — interactive fiction
-- **QSP** — Russian-style text adventures
-- **Japanese light novel engines** — KiriKiri, NScripter, Yuris, TyranoBuilder
+### Experimental (Phase-2 extract → inject → patch → apply proven on fixtures or sample games)
+
+| Engine                    | Extensions       | Notes |
+| ------------------------- | ---------------- | ----- |
+| **SugarCube / Twine**     | `.html`, `.htm`  | Interactive fiction |
+| **HTML (generic)**        | `.html`, `.htm`  | Non-SugarCube HTML adventures |
+| **Unity**                 | `.assets`, `level*` | TextAsset structural + heuristic UTF-8 slots (≤ source) |
+| **Unreal Engine**         | `.pak`, `.locres` | UTF-16LE heuristic + structural `.locres`; inject → `*_LOCUST_P.pak` |
+| **Wolf RPG Editor**       | `.wolf`          | Shift-JIS binary; length ≤ source |
+| **VNTextPatch JSON**      | `.json`          | VN intermediate (KiriKiri/YU-RIS/… via VNTextPatch); Phase-2 patch apply proven on fixture |
+| **QSP**                   | `.qsp`, `.gam`   | QuestSoft Player; synthetic fixture only |
+| **TyranoBuilder**         | `.ks`, `.asar`, `.nw`, `.exe` | `data/scenario` loose + `app.asar` + NW.js `package.nw` / `data.exe`; UTF-8 |
+| **KiriKiri / KAG**        | `.ks`, `.xp3`    | Loose + XP3; FE FE 0/1/2 (zlib); patch.xp3 write; no cxdec |
+| **YU-RIS**                | `.ybn`, `.ypf`   | Loose YSTB + YPF unpack/repack (common versions); synthetic + real-game YSTB |
+| **NScripter / ONScripter**| `0.txt`, `nscr_sec.dat`, `nscript.dat` | Shift-JIS; rot5 / XOR 0x84; synthetic; no NSA / nscript.___ |
 
 Not seeing your engine? [Open an issue](https://github.com/Miike0303/Locust/issues).
 
@@ -45,13 +58,15 @@ Not seeing your engine? [Open an issue](https://github.com/Miike0303/Locust/issu
 
 ## Supported translation providers
 
+Always available in the CLI (`locust providers`):
+
 - **Google Translate** (free web endpoint) — no API key
-- **DeepL** — paid API
-- **OpenAI (GPT-4 / GPT-3.5)** — paid API
-- **Anthropic Claude** — paid API
-- **Ollama** — free local models
 - **Argos Translate** — free offline
-- **Mock** — for testing
+- **Ollama** / **LM Studio** — free local models
+- **Grok SuperGrok** (`grok-sub`) — subscription OAuth (`locust auth`)
+- **Mock** — length-safe for binary-engine inject tests
+
+When API keys are configured: **DeepL**, **OpenAI-compatible**, **Anthropic Claude**, etc.
 
 ---
 
@@ -88,10 +103,28 @@ cargo build --release -p locust-desktop
 3. Locust auto-detects the format and extracts all translatable strings.
 4. Click **Translate** in the editor toolbar, choose a provider and target language (Spanish by default).
 5. Watch the progress — translations are saved to the database as they come in.
-6. When done, click **Inject**, pick language(s), and choose:
-   - **Add mode** *(recommended)* — writes standard Ren'Py translation files to `game/tl/<lang>/`, leaves the original game untouched. Includes an in-game language picker.
-   - **Replace mode** — copies the game to a new folder and modifies it in place.
-7. Play your translated game.
+6. Edit in the desktop editor as needed:
+   - **Validate** (Ctrl+Shift+V) — placeholders + binary inject-slot length (Unity/Unreal/Wolf).
+   - **Search & replace** (Ctrl+Shift+F) — bulk edit translations only (one DB batch).
+   - **Export / Import** (Ctrl+E) — PO or XLIFF for external CAT tools (ids survive round-trip).
+7. Click **Inject**, pick language(s), and choose:
+   - **Add mode** *(where supported, e.g. Ren'Py)* — language packs beside the original tree.
+   - **Replace mode** — writes into a work copy (always keep a pristine original).
+8. Package and apply a patch (recommended distribution path):
+   - Desktop: Editor → **Patch** (Ctrl+Shift+P), or CLI below.
+9. Play your translated game.
+
+### CLI sketch
+
+```bash
+locust extract "<game>" -o project.locust.db
+locust translate project.locust.db -p mock -s en -t es   # or grok-sub / google / …
+locust inject "<work_copy>" -P project.locust.db -l es --direct
+locust patch "<work_copy>" -P project.locust.db -l es -o game-es-patch.zip --pristine "<pristine_copy>"
+locust apply "<clean_copy>" game-es-patch.zip
+locust patch-status "<clean_copy>"
+locust patch-rollback "<clean_copy>"   # restores .locust/backup
+```
 
 Got suspicious strings? Open the Editor, filter by tag (`dialogue`, `ui_label`, `menu`, etc.), and edit or approve translations manually before injecting.
 
@@ -143,10 +176,10 @@ MIT. See [LICENSE](LICENSE).
 Pull requests welcome. See [CLAUDE.md](CLAUDE.md) for the project architecture overview and [RELEASE.md](RELEASE.md) for the release process.
 
 Priority areas:
-- Unity .assets extractor (VN-style games, not full engine)
-- HTML/Twine handling
-- More providers (Anthropic, local Llama via Ollama)
-- Better handling of string interpolation across languages
+- NScripter NSA / nscript.___; KiriKiri cxdec/Hxv4; YU-RIS exotic YPF schemes
+- Length-aware real-ES for binary engines (Unity / Unreal / Wolf)
+- Deeper Unity parsers beyond heuristic scans; Unreal full pak index
+- Real commercial Wolf RPG end-to-end proof
 
 ---
 

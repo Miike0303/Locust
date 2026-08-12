@@ -17,6 +17,15 @@ encoding_rs = "0.8"
 uuid.workspace = true
 miniz_oxide = "0.8"
 md-5 = "0.10"
+# Locked at 1.1.4 via Cargo.lock (already pulled by regex); direct dep for multi-pattern inject.
+aho-corasick = "1.1.4"
+# Same line as locust-core (workspace lock has 2.4.x); NW.js package.nw / data.exe.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Already in Cargo.lock (0.10.6); pak index SHA-1.
+sha1 = "0.10"
+# POR_DatabaseEncoder / Iavra deploy: data/*.jsono is LZString base64 (UTF-16 payload).
+lz-str = "0.2.1"
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber.workspace = true

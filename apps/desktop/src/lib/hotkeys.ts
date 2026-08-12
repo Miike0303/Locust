@@ -1,5 +1,10 @@
-import { useEffect, useCallback, useRef } from "react";
+import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
+import {
+  HELP_ACTIONS,
+  shouldHandleEscape,
+  shouldRunActionHotkey,
+} from "./hotkeyPolicy";
 
 export interface HotkeyBinding {
   key: string;
@@ -15,6 +20,7 @@ export const HOTKEY_MAP: Record<string, HotkeyBinding> = {
   openProject:    { key: "o", ctrl: true, description: "Open project", group: "General" },
   translate:      { key: "t", ctrl: true, description: "Start translation", group: "Editor" },
   inject:         { key: "i", ctrl: true, description: "Inject translations", group: "Editor" },
+  applyPatch:     { key: "p", ctrl: true, shift: true, description: "Apply patch zip", group: "Editor" },
   exportFile:     { key: "e", ctrl: true, description: "Export translations", group: "Editor" },
   validate:       { key: "v", ctrl: true, shift: true, description: "Validate translations", group: "Editor" },
   search:         { key: "f", ctrl: true, description: "Focus search / filter", group: "Editor" },
@@ -50,7 +56,9 @@ function matchesEvent(e: KeyboardEvent, binding: HotkeyBinding): boolean {
 export function useHotkey(
   action: string,
   callback: () => void,
-  enabled = true
+  enabled = true,
+  allowInEditable = false,
+  capture = false
 ) {
   const cbRef = useRef(callback);
   cbRef.current = callback;
@@ -61,16 +69,24 @@ export function useHotkey(
     if (!binding) return;
 
     const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
+      const context = {
+        overlayOpen: !!document.querySelector("[data-hotkey-overlay]"),
+        target: e.target as HTMLElement | null,
+      };
+      const permitted = action === "closePanel"
+        ? allowInEditable || shouldHandleEscape(context)
+        : !context.overlayOpen && (allowInEditable || shouldRunActionHotkey(context));
+      if (!permitted) return;
       if (matchesEvent(e, binding)) {
         e.preventDefault();
+        e.stopImmediatePropagation();
         cbRef.current();
       }
     };
 
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [action, enabled]);
+    window.addEventListener("keydown", handler, capture);
+    return () => window.removeEventListener("keydown", handler, capture);
+  }, [action, enabled, allowInEditable, capture]);
 }
 
 export function useGlobalHotkeys(onShowHelp: () => void) {
@@ -107,8 +123,8 @@ export function formatKey(binding: HotkeyBinding): string {
 
 export function getGroupedHotkeys(): Record<string, { action: string; binding: HotkeyBinding }[]> {
   const groups: Record<string, { action: string; binding: HotkeyBinding }[]> = {};
-  for (const [action, binding] of Object.entries(HOTKEY_MAP)) {
-    if (action === "showHelpF1") continue; // skip duplicate
+  for (const action of HELP_ACTIONS) {
+    const binding = HOTKEY_MAP[action];
     if (!groups[binding.group]) groups[binding.group] = [];
     groups[binding.group].push({ action, binding });
   }

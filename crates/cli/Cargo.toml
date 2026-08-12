@@ -22,6 +22,11 @@ clap = { version = "4", features = ["derive", "env"] }
 indicatif = "0.17"
 comfy-table = "7"
 uuid.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tempfile = "3"
 
 [dependencies.tokio-util]
 version = "0.7"
@@ -30,3 +35,6 @@ features = ["rt"]
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# Tests fabricate database states `locust` itself refuses to write (legacy
+# schemas, tampered recording rows) to prove patch-time defenses hold.
+rusqlite.workspace = true

@@ -128,8 +128,6 @@ impl TranslationProvider for DeepLProvider {
             LocustError::ProviderError(format!("DeepL returned malformed response: {}", e))
         })?;
 
-        let char_count: usize = requests.iter().map(|r| r.source.len()).sum();
-
         Ok(requests
             .iter()
             .zip(deepl_resp.translations.iter())
@@ -139,6 +137,8 @@ impl TranslationProvider for DeepLProvider {
                 detected_source_lang: trans.detected_source_language.clone(),
                 provider: "deepl".to_string(),
                 tokens_used: None,
+                input_tokens: None,
+                output_tokens: None,
                 cost_usd: if !self.free_tier {
                     Some(req.source.len() as f64 * 0.00002)
                 } else {
