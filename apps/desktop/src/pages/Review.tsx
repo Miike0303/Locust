@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, ArrowRight, Check, SkipForward, X } from "lucide-react";
+import { ArrowLeft, Check, SkipForward, X } from "lucide-react";
 import { getStrings, patchString } from "../lib/api";
 import DiffView from "../components/DiffView";
+import { shouldHandleEscape, shouldRunActionHotkey } from "../lib/hotkeyPolicy";
 
 export default function Review() {
   const navigate = useNavigate();
@@ -14,7 +15,7 @@ export default function Review() {
   const [approved, setApproved] = useState(0);
   const [reviewComplete, setReviewComplete] = useState(false);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["review-strings"],
     queryFn: async () => {
       const [translated, reviewed] = await Promise.all([
@@ -60,12 +61,20 @@ export default function Review() {
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
+      if (e.key === "Escape") {
+        if (shouldHandleEscape({ overlayOpen: false, target: e.target as HTMLElement | null })) {
+          navigate("/editor");
+        }
+        return;
+      }
+      if (!shouldRunActionHotkey({
+        overlayOpen: !!document.querySelector("[data-hotkey-overlay]"),
+        target: e.target as HTMLElement | null,
+      })) return;
       if (e.key === "a" || (e.ctrlKey && e.key === "Enter")) { e.preventDefault(); handleApprove(); }
       if (e.key === "s") handleSkip();
       if (e.key === "p") handlePrev();
       if (e.key === "e") document.querySelector<HTMLTextAreaElement>("#review-textarea")?.focus();
-      if (e.key === "Escape") navigate("/editor");
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -75,6 +84,23 @@ export default function Review() {
     return (
       <div className="flex h-full items-center justify-center text-gray-500">
         Loading translations…
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+        <h1 className="text-xl font-semibold text-red-600">Could not load review</h1>
+        <p className="text-sm text-gray-500">
+          {error instanceof Error ? error.message : "Please try again."}
+        </p>
+        <button
+          onClick={() => { void refetch(); }}
+          className="rounded bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700"
+        >
+          Retry
+        </button>
       </div>
     );
   }

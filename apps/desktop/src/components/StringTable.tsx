@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo } from "react";
+import { useState, useRef, useMemo } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -179,7 +179,7 @@ export default function StringTable({ data, onRefetch }: StringTableProps) {
       </table>
       {data.length === 0 && (
         <div className="flex items-center justify-center h-48 text-gray-400">
-          No strings found. Open a project to get started.
+          No strings match the current view.
         </div>
       )}
     </div>

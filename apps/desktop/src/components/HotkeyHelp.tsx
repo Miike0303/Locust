@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { getGroupedHotkeys, formatKey } from "../lib/hotkeys";
+import { getGroupedHotkeys, formatKey, useHotkey } from "../lib/hotkeys";
 
 interface Props {
   open: boolean;
@@ -9,11 +9,13 @@ interface Props {
 const GROUP_ORDER = ["Navigation", "Editor", "Review", "General"];
 
 export default function HotkeyHelp({ open, onClose }: Props) {
+  useHotkey("closePanel", onClose, open, true, true);
+
   if (!open) return null;
   const groups = getGroupedHotkeys();
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+    <div data-hotkey-overlay className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
       <div
         className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-xl max-h-[80vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}

@@ -63,6 +63,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
       <div className="flex-1 relative max-w-md">
         <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
         <input
+          data-search-input
           type="text"
           value={searchInput}
           onChange={(e) => setSearchInput(e.target.value)}

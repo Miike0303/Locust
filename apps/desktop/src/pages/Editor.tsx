@@ -47,7 +47,13 @@ export default function Editor() {
     readSkipReviewPreference()
   );
 
-  const { data: stringsData, refetch } = useQuery({
+  const {
+    data: stringsData,
+    isLoading: stringsLoading,
+    isError: stringsError,
+    error: stringsErrorDetail,
+    refetch,
+  } = useQuery({
     queryKey: ["strings", filter],
     queryFn: () => getStrings(filter),
     staleTime: 30_000,
@@ -118,13 +124,19 @@ export default function Editor() {
     fn();
   }, []);
 
-  // Hotkeys
-  useHotkey("translate", () => requireProject(() => setShowTranslateModal(true)));
-  useHotkey("inject", () => requireProject(() => setShowInjectModal(true)));
-  useHotkey("applyPatch", () => requireProject(() => setShowPatchModal(true)));
-  useHotkey("validate", () => requireProject(() => { void handleValidate(); }));
-  useHotkey("exportFile", () => requireProject(() => setShowExportModal(true)));
-  useHotkey("searchReplace", () => setShowReplaceModal(true));
+  const editorModalOpen = showTranslateModal || showInjectModal || showPatchModal ||
+    showExportModal || showReplaceModal || showValidationModal;
+
+  // Action hotkeys pause behind work modals; Escape remains available in their inputs.
+  useHotkey("translate", () => requireProject(() => setShowTranslateModal(true)), !editorModalOpen);
+  useHotkey("inject", () => requireProject(() => setShowInjectModal(true)), !editorModalOpen);
+  useHotkey("applyPatch", () => requireProject(() => setShowPatchModal(true)), !editorModalOpen);
+  useHotkey("validate", () => requireProject(() => { void handleValidate(); }), !editorModalOpen);
+  useHotkey("exportFile", () => requireProject(() => setShowExportModal(true)), !editorModalOpen);
+  useHotkey("searchReplace", () => requireProject(() => setShowReplaceModal(true)), !editorModalOpen);
+  useHotkey("search", () => {
+    document.querySelector<HTMLInputElement>('[data-search-input]')?.focus();
+  }, !editorModalOpen);
   useHotkey("closePanel", () => {
     if (showValidationModal) setShowValidationModal(false);
     else if (showReplaceModal) setShowReplaceModal(false);
@@ -133,10 +145,7 @@ export default function Editor() {
     else if (showInjectModal) setShowInjectModal(false);
     else if (showTranslateModal) setShowTranslateModal(false);
     else if (selectedEntryId) setSelected(null);
-  });
-  useHotkey("search", () => {
-    document.querySelector<HTMLInputElement>('[data-search-input]')?.focus();
-  });
+  }, editorModalOpen || !!selectedEntryId, true);
 
   const entries = stringsData?.entries || [];
   const total = stringsData?.total || 0;
@@ -237,18 +246,37 @@ export default function Editor() {
       )}
 
       {/* Filter + Table + Detail */}
-      <FilterBar total={total} showing={entries.length} />
+          <FilterBar total={total} showing={entries.length} />
 
-      <div className="flex flex-1 overflow-hidden">
-        <StringTable data={entries} onRefetch={handleRefetch} />
-        {selectedEntry && (
-          <DetailPanel
-            entry={selectedEntry}
-            onRefetch={handleRefetch}
-            onClose={() => setSelected(null)}
-          />
-        )}
-      </div>
+          <div className="flex flex-1 overflow-hidden">
+            {stringsLoading ? (
+              <div className="flex flex-1 items-center justify-center text-gray-500">
+                Loading strings…
+              </div>
+            ) : stringsError ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+                <p className="font-medium text-red-600">Could not load strings</p>
+                <p className="text-sm text-gray-500">
+                  {stringsErrorDetail instanceof Error ? stringsErrorDetail.message : "Please try again."}
+                </p>
+                <button
+                  onClick={() => { void refetch(); }}
+                  className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : (
+              <StringTable data={entries} onRefetch={handleRefetch} />
+            )}
+            {!stringsLoading && !stringsError && selectedEntry && (
+              <DetailPanel
+                entry={selectedEntry}
+                onRefetch={handleRefetch}
+                onClose={() => setSelected(null)}
+              />
+            )}
+          </div>
 
       {/* Translation Modal */}
       <TranslationModal
@@ -264,6 +292,7 @@ export default function Editor() {
         open={showInjectModal}
         onClose={() => setShowInjectModal(false)}
         onOpenPack={() => {
+          setShowInjectModal(false);
           setPatchInitialTab("pack");
           setShowPatchModal(true);
         }}
