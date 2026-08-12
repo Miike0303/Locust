@@ -237,21 +237,9 @@ export default function Welcome() {
 			<div className="mb-10">
 				<div className="flex justify-center gap-4">
 					<button
-						onClick={handleOpenFile}
-						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors"
-					>
-						{opening ? (
-							<Loader size={18} className="animate-spin" />
-						) : (
-							<File size={18} />
-						)}
-						{opening ? "Opening…" : "Open Game File"}
-					</button>
-					<button
 						onClick={handleOpenFolder}
 						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
+						className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors"
 					>
 						{opening ? (
 							<Loader size={18} className="animate-spin" />
@@ -259,6 +247,18 @@ export default function Welcome() {
 							<FolderOpen size={18} />
 						)}
 						{opening ? "Opening…" : "Open Game Folder"}
+					</button>
+					<button
+						onClick={handleOpenFile}
+						disabled={opening}
+						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
+					>
+						{opening ? (
+							<Loader size={18} className="animate-spin" />
+						) : (
+							<File size={18} />
+						)}
+						{opening ? "Opening…" : "Open Game File"}
 					</button>
 				</div>
 				<div className="flex justify-center mt-2">
@@ -430,7 +430,7 @@ export default function Welcome() {
 							return (
 								<div
 									key={i}
-									className="w-full p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors flex items-center gap-3"
+									className="w-full p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-emerald-300 hover:bg-gray-50 dark:hover:border-emerald-700 dark:hover:bg-gray-800 transition-colors flex items-center gap-3"
 								>
 									<button
 										onClick={() => openWithPath(p.path, p.format_id)}

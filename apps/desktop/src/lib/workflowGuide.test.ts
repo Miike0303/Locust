@@ -2,7 +2,11 @@
  * Lightweight asserts for workflowGuide (run: npx --yes tsx src/lib/workflowGuide.test.ts).
  */
 import assert from "node:assert/strict";
-import { resolveWorkflowGuideStep } from "./workflowGuide.ts";
+import {
+	WORKFLOW_STEP_LABELS,
+	resolveWorkflowGuideStep,
+	type WorkflowGuideStep,
+} from "./workflowGuide.ts";
 
 const stats = (
   pending = 0,
@@ -95,5 +99,15 @@ for (const testCase of cases) {
     testCase.name
   );
 }
+
+const labelSteps: readonly WorkflowGuideStep[] = ["translate", "review", "inject"];
+for (const step of labelSteps) {
+	assert.ok(WORKFLOW_STEP_LABELS[step].length > 0, `label for ${step}`);
+}
+assert.equal(
+	Object.keys(WORKFLOW_STEP_LABELS).length,
+	labelSteps.length,
+	"labels cover exactly the workflow steps"
+);
 
 console.log("workflowGuide.test.ts: ok");

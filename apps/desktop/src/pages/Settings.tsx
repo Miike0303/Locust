@@ -11,6 +11,7 @@ import {
 } from "../lib/api";
 import type { GlossaryEntry, TranslationRun } from "../lib/api";
 import { applyAppearance } from "../lib/appearance";
+import { resolveProviderReadiness } from "../lib/providerReadiness";
 import {
   SETTINGS_SECTIONS,
   buildSettingsPath,
@@ -41,6 +42,7 @@ export default function Settings() {
           <button
             key={id}
             onClick={() => selectSection(id)}
+            aria-current={section === id ? "page" : undefined}
             className={clsx(
               "block w-full text-left px-3 py-2 rounded text-sm font-medium",
               section === id
@@ -246,13 +248,25 @@ function ProvidersSection() {
   return (
     <div className="space-y-4">
       <h2 className="text-xl font-bold">Providers</h2>
-      {providers?.map((p) => (
+      {providers?.map((p) => {
+        const readiness = resolveProviderReadiness(p.id, providers, config);
+        return (
         <div key={p.id} className="border border-gray-200 dark:border-gray-700 rounded-lg p-4">
           <div className="flex items-center gap-2 mb-3">
             <h3 className="font-semibold">{p.name}</h3>
             <span className={clsx("px-2 py-0.5 rounded-full text-xs", p.is_free ? "bg-green-100 text-green-700" : "bg-amber-100 text-amber-700")}>
               {p.is_free ? "Free" : "Paid"}
             </span>
+            {p.requires_api_key && (
+              <span className={clsx(
+                "px-2 py-0.5 rounded-full text-xs font-medium",
+                readiness.ready
+                  ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+                  : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+              )}>
+                {readiness.ready ? "Configured" : "Needs API key"}
+              </span>
+            )}
           </div>
 
           {p.requires_api_key && (
@@ -325,7 +339,8 @@ function ProvidersSection() {
             )}
           </div>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

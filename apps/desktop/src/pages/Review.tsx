@@ -4,11 +4,14 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, SkipForward, X } from "lucide-react";
 import { getStrings, patchString } from "../lib/api";
 import DiffView from "../components/DiffView";
+import EmptyState from "../components/EmptyState";
 import { shouldHandleEscape, shouldRunActionHotkey } from "../lib/hotkeyPolicy";
+import { useProjectStore } from "../stores/projectStore";
 
 export default function Review() {
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const project = useProjectStore((s) => s.project);
   const [index, setIndex] = useState(0);
   const [showDiff, setShowDiff] = useState(false);
   const [translation, setTranslation] = useState("");
@@ -24,6 +27,7 @@ export default function Review() {
       ]);
       return { entries: [...translated.entries, ...reviewed.entries] };
     },
+    enabled: !!project,
   });
 
   const entries = data?.entries || [];
@@ -79,6 +83,17 @@ export default function Review() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [handleApprove, handleSkip, handlePrev, navigate]);
+
+  if (!project) {
+    return (
+      <EmptyState
+        title="No project open"
+        description="Open a game from Welcome to load its strings. Nothing is shown from a previous session."
+        actionLabel="Go to Welcome"
+        onAction={() => navigate("/")}
+      />
+    );
+  }
 
   if (isLoading) {
     return (
