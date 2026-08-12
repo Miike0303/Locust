@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useLocation, useNavigate } from "react-router-dom";
 import { CheckCircle, XCircle, Loader, Trash2, RotateCcw, Plus, Search } from "lucide-react";
 import clsx from "clsx";
 import {
@@ -10,47 +11,54 @@ import {
 } from "../lib/api";
 import type { GlossaryEntry, TranslationRun } from "../lib/api";
 import { applyAppearance } from "../lib/appearance";
+import {
+  SETTINGS_SECTIONS,
+  buildSettingsPath,
+  parseSettingsSectionParam,
+  type SettingsSectionId,
+} from "../lib/settingsNav";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { addToast } from "../stores/toastStore";
 
-const SECTIONS = [
-  "Providers",
-  "Translation Defaults",
-  "Appearance",
-  "Glossary",
-  "History",
-  "Data",
-] as const;
-type Section = (typeof SECTIONS)[number];
-
 export default function Settings() {
-  const [section, setSection] = useState<Section>("Providers");
+  const location = useLocation();
+  const navigate = useNavigate();
+  const section = parseSettingsSectionParam(location.search);
+
+  useEffect(() => {
+    const requested = new URLSearchParams(location.search).get("section");
+    if (requested !== section) navigate(buildSettingsPath(section), { replace: true });
+  }, [location.search, navigate, section]);
+
+  const selectSection = (next: SettingsSectionId) => {
+    navigate(buildSettingsPath(next), { replace: true });
+  };
 
   return (
     <div className="flex h-full">
       <nav className="w-48 border-r border-gray-200 dark:border-gray-700 p-4 space-y-1">
-        {SECTIONS.map((s) => (
+        {SETTINGS_SECTIONS.map(({ id, label }) => (
           <button
-            key={s}
-            onClick={() => setSection(s)}
+            key={id}
+            onClick={() => selectSection(id)}
             className={clsx(
               "block w-full text-left px-3 py-2 rounded text-sm font-medium",
-              section === s
+              section === id
                 ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
                 : "text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800"
             )}
           >
-            {s}
+            {label}
           </button>
         ))}
       </nav>
       <div className="flex-1 p-6 overflow-y-auto">
-        {section === "Providers" && <ProvidersSection />}
-        {section === "Translation Defaults" && <DefaultsSection />}
-        {section === "Appearance" && <AppearanceSection />}
-        {section === "Glossary" && <GlossarySection />}
-        {section === "History" && <HistorySection />}
-        {section === "Data" && <DataSection />}
+        {section === "providers" && <ProvidersSection />}
+        {section === "defaults" && <DefaultsSection />}
+        {section === "appearance" && <AppearanceSection />}
+        {section === "glossary" && <GlossarySection />}
+        {section === "history" && <HistorySection />}
+        {section === "data" && <DataSection />}
       </div>
     </div>
   );

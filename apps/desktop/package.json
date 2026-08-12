@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:unit": "npx --yes tsx src/lib/patchSource.test.ts && npx --yes tsx src/lib/injectModes.test.ts && npx --yes tsx src/lib/registerLangPrefs.test.ts && npx --yes tsx src/lib/translationDefaults.test.ts && npx --yes tsx src/lib/languages.test.ts && npx --yes tsx src/lib/workflowGuide.test.ts && npx --yes tsx src/lib/hotkeyPolicy.test.ts && npx --yes tsx src/lib/stringFilterFacets.test.ts && npx --yes tsx src/lib/modalA11y.test.ts"
+    "test:unit": "npx --yes tsx src/lib/patchSource.test.ts && npx --yes tsx src/lib/injectModes.test.ts && npx --yes tsx src/lib/registerLangPrefs.test.ts && npx --yes tsx src/lib/translationDefaults.test.ts && npx --yes tsx src/lib/languages.test.ts && npx --yes tsx src/lib/workflowGuide.test.ts && npx --yes tsx src/lib/hotkeyPolicy.test.ts && npx --yes tsx src/lib/stringFilterFacets.test.ts && npx --yes tsx src/lib/modalA11y.test.ts && npx --yes tsx src/lib/settingsNav.test.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.21",

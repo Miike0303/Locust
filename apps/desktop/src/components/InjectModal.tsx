@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { X, FolderOpen, FileCheck, AlertCircle, Package } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import {
   inject,
   registerLang,
@@ -22,6 +23,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 import { useModalA11y } from "../lib/modalA11y";
+import { operationalShortcutTarget } from "../lib/settingsNav";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -35,6 +37,7 @@ interface InjectModalProps {
 }
 
 export default function InjectModal({ open, onClose, onOpenPack }: InjectModalProps) {
+  const navigate = useNavigate();
   const { project } = useProjectStore();
   const { dialogRef, dialogProps, titleProps } = useModalA11y({
     open: open && !!project,
@@ -619,12 +622,22 @@ export default function InjectModal({ open, onClose, onOpenPack }: InjectModalPr
               </div>
             )}
 
-            <button
-              onClick={onClose}
-              className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
-            >
-              Close
-            </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    navigate(operationalShortcutTarget("manage-backups").path);
+                  }}
+                  className="text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+                >
+                  Manage backups
+                </button>
+                <button
+                  onClick={onClose}
+                  className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
+                >
+                  Close
+                </button>
           </div>
         )}
       </div>

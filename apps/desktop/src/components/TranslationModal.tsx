@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import { getProviders, getConfig, startTranslation, cancelTranslation } from "../lib/api";
 import { subscribeToJob } from "../lib/ws";
 import {
@@ -16,6 +17,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 import { useModalA11y } from "../lib/modalA11y";
+import { operationalShortcutTarget, type OperationalShortcut } from "../lib/settingsNav";
 
 interface TranslationModalProps {
   open: boolean;
@@ -28,6 +30,7 @@ interface TranslationModalProps {
 const FALLBACK_STORAGE_KEY = "locust.translation.fallbacks";
 
 export default function TranslationModal({ open, onClose, totalPending, onComplete, onReview }: TranslationModalProps) {
+  const navigate = useNavigate();
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders, enabled: open });
   const { data: config, isFetched: configFetched, isError: configError } = useQuery({
     queryKey: ["config"],
@@ -281,6 +284,11 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
     if (done) onComplete();
   };
 
+  const openSettings = (shortcut: OperationalShortcut) => {
+    handleClose();
+    navigate(operationalShortcutTarget(shortcut).path);
+  };
+
   const handleReview = () => {
     onClose();
     onComplete();
@@ -315,10 +323,17 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
                 }}
                 className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm">
                 {providers?.map((p) => <option key={p.id} value={p.id}>{p.name} {p.is_free ? "(free)" : ""}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="text-sm font-medium">Fallback providers (optional)</label>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => openSettings("provider-settings")}
+                    className="mt-1 text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+                  >
+                    Provider health &amp; settings
+                  </button>
+                </div>
+                <div>
+                  <label className="text-sm font-medium">Fallback providers (optional)</label>
               <p className="text-xs text-gray-500 mt-0.5 mb-1">
                 Tried in order if the primary stops making progress on pending strings.
               </p>
@@ -395,10 +410,17 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
                 placeholder="Describe genre, tone, setting..."
                 className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm" />
             </div>
-            <div className="flex gap-4">
-              <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={useGlossary} onChange={(e) => setUseGlossary(e.target.checked)} /> Use glossary</label>
-              <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={useMemory} onChange={(e) => setUseMemory(e.target.checked)} /> Use memory</label>
-            </div>
+                <div className="flex items-center gap-4">
+                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={useGlossary} onChange={(e) => setUseGlossary(e.target.checked)} /> Use glossary</label>
+                  <button
+                    type="button"
+                    onClick={() => openSettings("manage-glossary")}
+                    className="text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+                  >
+                    Manage glossary
+                  </button>
+                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={useMemory} onChange={(e) => setUseMemory(e.target.checked)} /> Use memory</label>
+                </div>
             <div className="grid grid-cols-3 gap-3">
               <div>
                 <label className="text-sm font-medium">Batch size</label>
