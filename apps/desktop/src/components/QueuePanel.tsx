@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
 	X,
@@ -33,6 +34,8 @@ import {
 	MODAL_BACKDROP_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
+import { resolveProviderReadiness } from "../lib/providerReadiness";
+import { buildSettingsPath } from "../lib/settingsNav";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -55,6 +58,7 @@ const statusColors: Record<string, string> = {
 };
 
 export default function QueuePanel() {
+	const navigate = useNavigate();
 	const {
 		items,
 		isRunning,
@@ -222,6 +226,11 @@ export default function QueuePanel() {
 
 	const pendingCount = items.filter((i) => i.status === "pending").length;
 	const doneCount = items.filter((i) => i.status === "done").length;
+	const providerReadiness = resolveProviderReadiness(
+		providerId,
+		providers,
+		config,
+	);
 
 	return (
 		<div className={MODAL_BACKDROP_CLASS}>
@@ -374,28 +383,48 @@ export default function QueuePanel() {
 				</div>
 
 				{/* Footer */}
-				<div className="p-4 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between">
-					<span className="text-sm text-gray-500">
-						{pendingCount} pending · {doneCount} done
-					</span>
-					{isRunning ? (
-						<button
-							onClick={cancelQueue}
-							className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition-colors"
-						>
-							<Square size={14} />
-							Cancel Queue
-						</button>
-					) : (
-						<button
-							onClick={handleStart}
-							disabled={pendingCount === 0}
-							className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors"
-						>
-							<Play size={14} />
-							Start Queue ({pendingCount})
-						</button>
-					)}
+				<div className="p-4 border-t border-gray-200 dark:border-gray-700">
+					{!providerReadiness.ready &&
+						providerReadiness.reason === "missing_key" &&
+						!isRunning &&
+						pendingCount > 0 && (
+							<div className="mb-3 p-2 rounded border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20 text-sm text-amber-800 dark:text-amber-200">
+								This provider needs an API key — add it in Settings.{" "}
+								<button
+									type="button"
+									onClick={() => {
+										setPanelOpen(false);
+										navigate(buildSettingsPath("providers"));
+									}}
+									className="font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+								>
+									Open Settings
+								</button>
+							</div>
+						)}
+					<div className="flex items-center justify-between">
+						<span className="text-sm text-gray-500">
+							{pendingCount} pending · {doneCount} done
+						</span>
+						{isRunning ? (
+							<button
+								onClick={cancelQueue}
+								className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition-colors"
+							>
+								<Square size={14} />
+								Cancel Queue
+							</button>
+						) : (
+							<button
+								onClick={handleStart}
+								disabled={pendingCount === 0}
+								className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors"
+							>
+								<Play size={14} />
+								Start Queue ({pendingCount})
+							</button>
+						)}
+					</div>
 				</div>
 			</div>
 		</div>

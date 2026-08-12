@@ -17,7 +17,7 @@ import {
 	Loader,
 	Settings2,
 } from "lucide-react";
-import { getFormats, getConfig, openProject } from "../lib/api";
+import { getFormats, getConfig, getProviders, openProject } from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
 import { useQueueStore } from "../stores/queueStore";
 import { addLog } from "../stores/logStore";
@@ -27,6 +27,12 @@ import {
 	MODAL_BACKDROP_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
+import {
+	hasAnyReadyProvider,
+	readProviderSetupHintDismissed,
+	saveProviderSetupHintDismissed,
+} from "../lib/providerReadiness";
+import { buildSettingsPath } from "../lib/settingsNav";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -69,6 +75,14 @@ export default function Welcome() {
 		queryKey: ["config"],
 		queryFn: getConfig,
 	});
+	const { data: providers } = useQuery({
+		queryKey: ["providers"],
+		queryFn: getProviders,
+	});
+
+	const [hintDismissed, setHintDismissed] = useState(() =>
+		readProviderSetupHintDismissed(),
+	);
 
 	const addToQueue = useQueueStore((s) => s.addItem);
 	const setQueueOpen = useQueueStore((s) => s.setPanelOpen);
@@ -194,6 +208,15 @@ export default function Welcome() {
 	};
 
 	const recentProjects = config?.recent_projects ?? [];
+	const showProviderHint =
+		providers !== undefined &&
+		!hasAnyReadyProvider(providers, config) &&
+		!hintDismissed;
+
+	const dismissProviderHint = () => {
+		setHintDismissed(true);
+		saveProviderSetupHintDismissed(true);
+	};
 
 	return (
 		<div className="flex flex-col min-h-full p-8 max-w-4xl mx-auto">
@@ -248,6 +271,32 @@ export default function Welcome() {
 					</p>
 				)}
 			</div>
+
+			{showProviderHint && (
+				<div className="mb-8 p-4 rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20">
+					<div className="flex items-start justify-between gap-3">
+						<p className="text-sm text-amber-900 dark:text-amber-100">
+							To translate you&apos;ll need a translation provider —{" "}
+							<button
+								type="button"
+								onClick={() => navigate(buildSettingsPath("providers"))}
+								className="font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+							>
+								configure one in Settings
+							</button>
+							.
+						</p>
+						<button
+							type="button"
+							onClick={dismissProviderHint}
+							aria-label="Dismiss provider setup hint"
+							className="shrink-0 text-amber-700 dark:text-amber-300 hover:text-amber-900 dark:hover:text-amber-100"
+						>
+							<X size={16} />
+						</button>
+					</div>
+				</div>
+			)}
 
 			{/* Format Picker Modal — shown when auto-detect fails or on "Choose format manually" */}
 			{picker && (

@@ -7,6 +7,7 @@ import {
 	getConfig,
 	startTranslation,
 	cancelTranslation,
+	checkProviderHealth,
 } from "../lib/api";
 import { subscribeToJob } from "../lib/ws";
 import {
@@ -30,6 +31,7 @@ import {
 	operationalShortcutTarget,
 	type OperationalShortcut,
 } from "../lib/settingsNav";
+import { resolveProviderReadiness } from "../lib/providerReadiness";
 
 interface TranslationModalProps {
 	open: boolean;
@@ -102,6 +104,11 @@ export default function TranslationModal({
 	const [cancelled, setCancelled] = useState(false);
 	const [cancelling, setCancelling] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [testingHealth, setTestingHealth] = useState(false);
+	const [healthResult, setHealthResult] = useState<{
+		ok: boolean;
+		message: string;
+	} | null>(null);
 
 	// Live job bookkeeping (refs so WS callbacks see current values)
 	const unsubRef = useRef<(() => void) | null>(null);
@@ -156,6 +163,10 @@ export default function TranslationModal({
 			providers.some((p) => p.id === prev) ? prev : providers[0].id,
 		);
 	}, [providers]);
+
+	useEffect(() => {
+		setHealthResult(null);
+	}, [providerId]);
 
 	// Clean up the progress WebSocket on modal close / unmount.
 	useEffect(() => {
@@ -368,6 +379,27 @@ export default function TranslationModal({
 		navigate(operationalShortcutTarget(shortcut).path);
 	};
 
+	const providerReadiness = resolveProviderReadiness(
+		providerId,
+		providers,
+		config,
+	);
+
+	const handleTestConnection = async () => {
+		if (!providerId || testingHealth) return;
+		setTestingHealth(true);
+		setHealthResult(null);
+		try {
+			const result = await checkProviderHealth(providerId);
+			setHealthResult(result);
+		} catch (err: unknown) {
+			const message = err instanceof Error ? err.message : String(err);
+			setHealthResult({ ok: false, message });
+		} finally {
+			setTestingHealth(false);
+		}
+	};
+
 	const handleReview = () => {
 		onClose();
 		onComplete();
@@ -403,7 +435,17 @@ export default function TranslationModal({
 				{step === "configure" && (
 					<div className="space-y-4">
 						<div>
-							<label className="text-sm font-medium">Provider</label>
+							<div className="flex items-end justify-between gap-2">
+								<label className="text-sm font-medium">Provider</label>
+								<button
+									type="button"
+									onClick={handleTestConnection}
+									disabled={!providerId || testingHealth}
+									className="text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
+								>
+									{testingHealth ? "Testing…" : "Test connection"}
+								</button>
+							</div>
 							<select
 								value={providerId}
 								onChange={(e) => {
@@ -420,6 +462,30 @@ export default function TranslationModal({
 									</option>
 								))}
 							</select>
+							{!providerReadiness.ready &&
+								providerReadiness.reason === "missing_key" && (
+									<div className="mt-2 p-2 rounded border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20 text-sm text-amber-800 dark:text-amber-200">
+										This provider needs an API key — add it in Settings.{" "}
+										<button
+											type="button"
+											onClick={() => openSettings("provider-settings")}
+											className="font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+										>
+											Open Settings
+										</button>
+									</div>
+								)}
+							{healthResult && (
+								<div
+									className={`mt-2 p-2 rounded border text-sm ${
+										healthResult.ok
+											? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-200"
+											: "border-red-200 bg-red-50 text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300"
+									}`}
+								>
+									{healthResult.message}
+								</div>
+							)}
 							<button
 								type="button"
 								onClick={() => openSettings("provider-settings")}
