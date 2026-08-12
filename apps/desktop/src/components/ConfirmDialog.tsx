@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useRef } from "react";
+import { useModalA11y } from "../lib/modalA11y";
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -26,14 +27,13 @@ export default function ConfirmDialog({
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onCancel]);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  const { dialogRef, dialogProps, titleProps } = useModalA11y({
+    open,
+    onClose: onCancel,
+    ownEscape: true,
+    initialFocusRef: destructive ? confirmRef : undefined,
+  });
 
   if (!open) return null;
 
@@ -43,10 +43,12 @@ export default function ConfirmDialog({
       onClick={onCancel}
     >
       <div
+        ref={dialogRef}
+        {...dialogProps}
         className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-sm p-5"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="text-base font-bold mb-2">{title}</h2>
+        <h2 {...titleProps} className="text-base font-bold mb-2">{title}</h2>
         <p className="text-sm text-gray-600 dark:text-gray-300 mb-4 whitespace-pre-wrap">
           {message}
         </p>
@@ -59,8 +61,8 @@ export default function ConfirmDialog({
             {cancelLabel}
           </button>
           <button
+            ref={confirmRef}
             type="button"
-            autoFocus
             onClick={onConfirm}
             className={`px-4 py-2 text-sm font-medium rounded text-white ${
               destructive

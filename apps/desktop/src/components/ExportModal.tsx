@@ -9,6 +9,7 @@ import { LANGUAGES } from "../lib/languages";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
+import { useModalA11y } from "../lib/modalA11y";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -27,6 +28,7 @@ export default function ExportModal({ open, onClose, onImported }: ExportModalPr
   const [lang, setLang] = useState("es");
   const [loading, setLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const { dialogRef, dialogProps, titleProps } = useModalA11y({ open, ownEscape: false });
 
   if (!open || !project) return null;
 
@@ -144,9 +146,9 @@ export default function ExportModal({ open, onClose, onImported }: ExportModalPr
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-md p-6">
+      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-md p-6">
         <div className="flex justify-between items-center mb-4">
-          <h2 className="text-lg font-bold flex items-center gap-2">
+          <h2 {...titleProps} className="text-lg font-bold flex items-center gap-2">
             {mode === "export" ? <Download size={18} /> : <Upload size={18} />}
             {mode === "export" ? "Export Translations" : "Import Translations"}
           </h2>

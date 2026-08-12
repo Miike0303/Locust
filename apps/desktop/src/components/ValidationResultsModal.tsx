@@ -7,6 +7,7 @@ import type {
   FontCoverageReport,
 } from "../lib/api";
 import { validationKindLabel } from "../lib/api";
+import { useModalA11y } from "../lib/modalA11y";
 
 interface ValidationResultsModalProps {
   open: boolean;
@@ -86,6 +87,10 @@ export default function ValidationResultsModal({
   onClose,
   onSelectEntry,
 }: ValidationResultsModalProps) {
+  const { dialogRef, dialogProps, titleProps } = useModalA11y({
+    open: open && !!result,
+    ownEscape: false,
+  });
   if (!open || !result) return null;
 
   const { validation, fonts } = result;
@@ -98,11 +103,11 @@ export default function ValidationResultsModal({
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col">
+      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col">
         <div className="flex justify-between items-center px-5 py-4 border-b border-gray-200 dark:border-gray-700">
           <div className="flex items-center gap-2">
             <Shield size={18} className="text-emerald-600" />
-            <h2 className="text-lg font-bold">Validation results</h2>
+            <h2 {...titleProps} className="text-lg font-bold">Validation results</h2>
           </div>
           <button
             onClick={onClose}

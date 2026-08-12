@@ -3,6 +3,7 @@ import { X, Replace, AlertCircle } from "lucide-react";
 import { batchPatchStrings, getStrings, type StringEntry } from "../lib/api";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
+import { useModalA11y } from "../lib/modalA11y";
 
 interface SearchReplaceModalProps {
   open: boolean;
@@ -62,6 +63,7 @@ export default function SearchReplaceModal({
     occurrences: number;
     samples: { id: string; before: string; after: string }[];
   } | null>(null);
+  const { dialogRef, dialogProps, titleProps } = useModalA11y({ open, ownEscape: false });
 
   if (!open) return null;
 
@@ -152,9 +154,9 @@ export default function SearchReplaceModal({
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6">
+      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6">
         <div className="flex justify-between items-center mb-4">
-          <h2 className="text-lg font-bold flex items-center gap-2">
+          <h2 {...titleProps} className="text-lg font-bold flex items-center gap-2">
             <Replace size={18} /> Search &amp; Replace
           </h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600">

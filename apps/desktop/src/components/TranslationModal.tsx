@@ -15,6 +15,7 @@ import { useQueueStore } from "../stores/queueStore";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
+import { useModalA11y } from "../lib/modalA11y";
 
 interface TranslationModalProps {
   open: boolean;
@@ -34,6 +35,7 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
     enabled: open,
   });
   const { setJob, setTranslating } = useEditorStore();
+  const { dialogRef, dialogProps, titleProps } = useModalA11y({ open, ownEscape: false });
 
   const [providerId, setProviderId] = useState("");
   const savedFallbacks: string[] = (() => {
@@ -291,9 +293,9 @@ export default function TranslationModal({ open, onClose, totalPending, onComple
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6">
+      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg p-6">
         <div className="flex justify-between items-center mb-4">
-          <h2 className="text-lg font-bold">{step === "configure" ? "Start Translation" : "Translation Progress"}</h2>
+          <h2 {...titleProps} className="text-lg font-bold">{step === "configure" ? "Start Translation" : "Translation Progress"}</h2>
           <button
             onClick={handleClose}
             aria-label="Close translation dialog"

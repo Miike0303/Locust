@@ -13,6 +13,7 @@ import {
   readLastUsedTranslationPrefs,
   saveLastUsedTranslationPrefs,
 } from "../lib/translationDefaults";
+import { useModalA11y } from "../lib/modalA11y";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -53,6 +54,11 @@ export default function QueuePanel() {
   const [targetLang, setTargetLang] = useState(translationParams?.options.target_lang ?? initialDefaults.targetLang);
   const [batchSize, setBatchSize] = useState(translationParams?.options.batch_size ?? initialDefaults.batchSize);
   const [gameContext, setGameContext] = useState(translationParams?.options.game_context ?? "");
+  const { dialogRef, dialogProps, titleProps } = useModalA11y({
+    open: isPanelOpen,
+    onClose: () => setPanelOpen(false),
+    ownEscape: true,
+  });
 
   // Once the config query settles, fill in config defaults — unless params from
   // an earlier run this session already seeded the form.
@@ -138,10 +144,10 @@ export default function QueuePanel() {
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+      <div ref={dialogRef} {...dialogProps} className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
-          <h2 className="font-bold text-lg">Project Queue</h2>
+          <h2 {...titleProps} className="font-bold text-lg">Project Queue</h2>
           <div className="flex items-center gap-2">
             {doneCount > 0 && (
               <button onClick={clearCompleted} className="text-xs text-gray-400 hover:text-gray-600">

@@ -1,5 +1,6 @@
 import { X } from "lucide-react";
 import { getGroupedHotkeys, formatKey, useHotkey } from "../lib/hotkeys";
+import { useModalA11y } from "../lib/modalA11y";
 
 interface Props {
   open: boolean;
@@ -10,18 +11,21 @@ const GROUP_ORDER = ["Navigation", "Editor", "Review", "General"];
 
 export default function HotkeyHelp({ open, onClose }: Props) {
   useHotkey("closePanel", onClose, open, true, true);
+  const { dialogRef, dialogProps, titleProps } = useModalA11y({ open, ownEscape: false });
 
   if (!open) return null;
   const groups = getGroupedHotkeys();
 
   return (
-    <div data-hotkey-overlay className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
       <div
+        ref={dialogRef}
+        {...dialogProps}
         className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-xl max-h-[80vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
-          <h2 className="text-lg font-bold">Keyboard Shortcuts</h2>
+          <h2 {...titleProps} className="text-lg font-bold">Keyboard Shortcuts</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
             <X size={18} />
           </button>
