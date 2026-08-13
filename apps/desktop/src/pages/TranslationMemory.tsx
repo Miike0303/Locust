@@ -3,8 +3,14 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Search, Trash2, Database, ChevronLeft, ChevronRight } from "lucide-react";
 import { getTranslationMemory, getTranslationMemoryStats, getTranslationMemoryLangPairs, deleteTranslationMemoryEntry, clearTranslationMemory } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
+import EmptyState from "../components/EmptyState";
+import { addToast } from "../stores/toastStore";
 
 const PAGE_SIZE = 50;
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : "Please try again.";
+}
 
 export default function TranslationMemory() {
   const qc = useQueryClient();
@@ -23,7 +29,7 @@ export default function TranslationMemory() {
     queryFn: getTranslationMemoryLangPairs,
   });
 
-  const { data, refetch } = useQuery({
+  const { data, refetch, isLoading, isError, error } = useQuery({
     queryKey: ["tm-entries", search, langPair, offset],
     queryFn: () => getTranslationMemory({ search: search || undefined, lang_pair: langPair, limit: PAGE_SIZE, offset }),
     staleTime: 10_000,
@@ -33,11 +39,19 @@ export default function TranslationMemory() {
   const total = data?.total ?? 0;
   const totalPages = Math.ceil(total / PAGE_SIZE);
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
+  const hasActiveFilter = Boolean(search || langPair);
 
   const handleSearch = useCallback(() => {
     setSearch(searchInput);
     setOffset(0);
   }, [searchInput]);
+
+  const handleClearSearch = useCallback(() => {
+    setSearchInput("");
+    setSearch("");
+    setLangPair(undefined);
+    setOffset(0);
+  }, []);
 
   const [entryToDelete, setEntryToDelete] = useState<{ hash: string; lp: string } | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
@@ -46,17 +60,27 @@ export default function TranslationMemory() {
     if (!entryToDelete) return;
     const { hash, lp } = entryToDelete;
     setEntryToDelete(null);
-    await deleteTranslationMemoryEntry(hash, lp);
-    refetch();
-    qc.invalidateQueries({ queryKey: ["tm-stats"] });
+    try {
+      await deleteTranslationMemoryEntry(hash, lp);
+      addToast("success", "Memory entry deleted");
+      refetch();
+      qc.invalidateQueries({ queryKey: ["tm-stats"] });
+    } catch (err) {
+      addToast("error", `Failed to delete entry: ${errorMessage(err)}`);
+    }
   };
 
   const handleClearAllConfirmed = async () => {
     setConfirmClearAll(false);
-    await clearTranslationMemory();
-    refetch();
-    qc.invalidateQueries({ queryKey: ["tm-stats"] });
-    qc.invalidateQueries({ queryKey: ["tm-lang-pairs"] });
+    try {
+      await clearTranslationMemory();
+      addToast("success", "Translation memory cleared");
+      refetch();
+      qc.invalidateQueries({ queryKey: ["tm-stats"] });
+      qc.invalidateQueries({ queryKey: ["tm-lang-pairs"] });
+    } catch (err) {
+      addToast("error", `Failed to clear translation memory: ${errorMessage(err)}`);
+    }
   };
 
   return (
@@ -114,28 +138,54 @@ export default function TranslationMemory() {
         </div>
       </div>
 
-      {/* Table */}
+      {/* Table / page states */}
       <div className="flex-1 overflow-auto">
-        <table className="w-full text-sm">
-          <thead className="sticky top-0 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
-            <tr className="text-left text-gray-500 text-xs uppercase">
-              <th className="px-4 py-2">Source</th>
-              <th className="px-4 py-2">Translation</th>
-              <th className="px-4 py-2 w-24">Language</th>
-              <th className="px-4 py-2 w-16 text-center">Uses</th>
-              <th className="px-4 py-2 w-36">Last Used</th>
-              <th className="px-4 py-2 w-12"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {entries.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="px-4 py-8 text-center text-gray-400">
-                  {search ? "No matches found." : "Translation memory is empty."}
-                </td>
+        {isLoading ? (
+          <div className="flex h-full items-center justify-center text-gray-500">
+            Loading memory…
+          </div>
+        ) : isError ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+            <p className="font-medium text-red-600 dark:text-red-400">Could not load translation memory</p>
+            <p className="text-sm text-gray-500">
+              {errorMessage(error)}
+            </p>
+            <button
+              type="button"
+              onClick={() => { void refetch(); }}
+              className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+            >
+              Retry
+            </button>
+          </div>
+        ) : entries.length === 0 ? (
+          hasActiveFilter ? (
+            <EmptyState
+              title="No matches found"
+              description="No entries match the current search or language filter."
+              actionLabel="Clear search"
+              onAction={handleClearSearch}
+            />
+          ) : (
+            <EmptyState
+              title="Translation memory is empty"
+              description="Translations are stored here automatically after you translate a project."
+            />
+          )
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
+              <tr className="text-left text-gray-500 text-xs uppercase">
+                <th className="px-4 py-2">Source</th>
+                <th className="px-4 py-2">Translation</th>
+                <th className="px-4 py-2 w-24">Language</th>
+                <th className="px-4 py-2 w-16 text-center">Uses</th>
+                <th className="px-4 py-2 w-36">Last Used</th>
+                <th className="px-4 py-2 w-12"></th>
               </tr>
-            ) : (
-              entries.map((entry, i) => (
+            </thead>
+            <tbody>
+              {entries.map((entry, i) => (
                 <tr
                   key={`${entry.source_hash}-${entry.lang_pair}-${i}`}
                   className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50"
@@ -157,6 +207,8 @@ export default function TranslationMemory() {
                   </td>
                   <td className="px-4 py-2">
                     <button
+                      type="button"
+                      aria-label={`Delete memory entry: ${entry.source.trim() || entry.source_hash}`}
                       onClick={() => setEntryToDelete({ hash: entry.source_hash, lp: entry.lang_pair })}
                       className="text-red-400 hover:text-red-600"
                     >
@@ -164,14 +216,14 @@ export default function TranslationMemory() {
                     </button>
                   </td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* Pagination */}
-      {totalPages > 1 && (
+      {!isLoading && !isError && totalPages > 1 && (
         <div className="flex items-center justify-between px-6 py-3 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
           <span className="text-sm text-gray-500">
             Showing {offset + 1}-{Math.min(offset + PAGE_SIZE, total)} of {total}
