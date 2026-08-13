@@ -6,29 +6,44 @@ const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 // ─── HTTP fallback helpers ────────────────────────────────────────────────
 let _serverPort = 7842;
+let _basePromise: Promise<string> | null = null;
 
 async function getBaseUrl(): Promise<string> {
   if (IS_TAURI) {
     try {
       _serverPort = await invoke<number>("get_server_port");
-    } catch { /* use default */ }
+    } catch {
+      // Fallback may serve this call, but must not be memoized — sidecar may still be booting.
+      _basePromise = null;
+      return `http://localhost:${_serverPort}/api`;
+    }
     return `http://localhost:${_serverPort}/api`;
   }
   return import.meta.env.DEV ? "/api" : `http://localhost:7842/api`;
 }
 
-let _basePromise: Promise<string> | null = null;
 function baseUrl(): Promise<string> {
   if (!_basePromise) _basePromise = getBaseUrl();
   return _basePromise;
 }
 
+function unreachableBackend(base: string, path: string): Error {
+  const msg = `Cannot reach Locust backend at ${base} — is locust server running?`;
+  addLog("error", `API unreachable: ${path}`, msg, "api");
+  return new Error(msg);
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const base = await baseUrl();
-  const res = await fetch(`${base}${path}`, {
-    headers: { "Content-Type": "application/json", ...options?.headers },
-    ...options,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${base}${path}`, {
+      headers: { "Content-Type": "application/json", ...options?.headers },
+      ...options,
+    });
+  } catch {
+    throw unreachableBackend(base, path);
+  }
   if (!res.ok) {
     const text = await res.text();
     addLog("error", `API ${res.status}: ${path}`, text, "api");
@@ -43,7 +58,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 async function requestText(path: string): Promise<string> {
   const base = await baseUrl();
-  const res = await fetch(`${base}${path}`);
+  let res: Response;
+  try {
+    res = await fetch(`${base}${path}`);
+  } catch {
+    throw unreachableBackend(base, path);
+  }
   if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
   return res.text();
 }
