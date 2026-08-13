@@ -223,6 +223,9 @@ export default function Editor() {
 
 	const entries = stringsData?.entries || [];
 	const total = stringsData?.total || 0;
+	const hasActiveFilters = Boolean(
+		filter.status || filter.search || filter.file_path || filter.tag,
+	);
 	const workflowStep = resolveWorkflowGuideStep({
 		hasProject,
 		stats: statsData,
@@ -402,7 +405,11 @@ export default function Editor() {
 						</button>
 					</div>
 				) : (
-					<StringTable data={entries} onRefetch={handleRefetch} />
+					<StringTable
+						data={entries}
+						onRefetch={handleRefetch}
+						hasActiveFilters={hasActiveFilters}
+					/>
 				)}
 				{hasProject && !stringsLoading && !stringsError && selectedEntry && (
 					<DetailPanel

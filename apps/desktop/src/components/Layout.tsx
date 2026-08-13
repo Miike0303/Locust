@@ -54,7 +54,9 @@ export default function Layout() {
 			<aside className="w-60 flex flex-col bg-gray-50 dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
 				<div className="p-4">
 					<h1 className="text-lg font-bold text-emerald-600">Project Locust</h1>
-					<p className="text-xs text-gray-500">v{APP_VERSION}</p>
+					<p className="text-xs text-gray-500 dark:text-gray-400">
+						v{APP_VERSION}
+					</p>
 				</div>
 
 				<nav className="flex-1 px-2 space-y-1">
@@ -74,7 +76,7 @@ export default function Layout() {
 						>
 							<Icon size={18} />
 							<span className="flex-1">{label}</span>
-							<kbd className="text-[10px] text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity">
+							<kbd className="text-[10px] text-gray-400 dark:text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity">
 								{shortcut}
 							</kbd>
 						</NavLink>
@@ -85,10 +87,10 @@ export default function Layout() {
 					<button
 						onClick={() => setQueueOpen(true)}
 						className={clsx(
-							"flex items-center gap-2 text-xs w-full",
+							"flex items-center gap-2 text-xs w-full focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1 py-0.5",
 							queueRunning
-								? "text-emerald-500"
-								: "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300",
+								? "text-emerald-600 dark:text-emerald-400"
+								: "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200",
 						)}
 					>
 						<ListOrdered size={14} />
@@ -101,7 +103,7 @@ export default function Layout() {
 					</button>
 					<button
 						onClick={() => setLogOpen(!logOpen)}
-						className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 w-full"
+						className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 w-full focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1 py-0.5"
 					>
 						<ScrollText size={14} />
 						Activity Log
@@ -113,17 +115,19 @@ export default function Layout() {
 					</button>
 					<button
 						onClick={() => setShowHelp(true)}
-						className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 w-full"
+						className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 w-full focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1 py-0.5"
 					>
 						<Keyboard size={14} />
 						Shortcuts
-						<kbd className="ml-auto text-[10px] text-gray-400">?</kbd>
+						<kbd className="ml-auto text-[10px] text-gray-400 dark:text-gray-500">
+							?
+						</kbd>
 					</button>
 					<a
 						href="https://github.com/Miike0303/Locust"
 						target="_blank"
 						rel="noopener noreferrer"
-						className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-700"
+						className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1 py-0.5"
 					>
 						<Github size={14} />
 						GitHub

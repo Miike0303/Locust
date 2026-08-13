@@ -16,6 +16,8 @@ import {
 	Wand2,
 	Loader,
 	Settings2,
+	Languages,
+	FileCheck,
 } from "lucide-react";
 import { getFormats, getConfig, getProviders, openProject } from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
@@ -33,6 +35,11 @@ import {
 	saveProviderSetupHintDismissed,
 } from "../lib/providerReadiness";
 import { buildSettingsPath } from "../lib/settingsNav";
+import {
+	readWelcomeGuideDismissed,
+	saveWelcomeGuideDismissed,
+	WELCOME_WORKFLOW_STEPS,
+} from "../lib/workflowGuide";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -81,8 +88,13 @@ export default function Welcome() {
 		queryFn: getProviders,
 	});
 
+	const project = useProjectStore((s) => s.project);
+
 	const [hintDismissed, setHintDismissed] = useState(() =>
 		readProviderSetupHintDismissed(),
+	);
+	const [welcomeGuideDismissed, setWelcomeGuideDismissed] = useState(() =>
+		readWelcomeGuideDismissed(),
 	);
 
 	const addToQueue = useQueueStore((s) => s.addItem);
@@ -214,10 +226,17 @@ export default function Welcome() {
 	};
 
 	const recentProjects = config?.recent_projects ?? [];
+	const showWelcomeGuide =
+		!welcomeGuideDismissed && recentProjects.length === 0 && !project;
 	const showProviderHint =
 		providers !== undefined &&
 		!hasAnyReadyProvider(providers, config) &&
 		!hintDismissed;
+
+	const dismissWelcomeGuide = () => {
+		setWelcomeGuideDismissed(true);
+		saveWelcomeGuideDismissed(true);
+	};
 
 	const dismissProviderHint = () => {
 		setHintDismissed(true);
@@ -230,8 +249,69 @@ export default function Welcome() {
 			<div className="text-center mb-8">
 				<Globe size={48} className="mx-auto mb-3 text-emerald-500" />
 				<h1 className="text-3xl font-bold mb-1">Project Locust</h1>
-				<p className="text-gray-500">LOCalization Universal Scripting Tool</p>
+				<p className="text-gray-500 dark:text-gray-400">
+					LOCalization Universal Scripting Tool
+				</p>
 			</div>
+
+			{showWelcomeGuide && (
+				<section
+					aria-label="Getting started guide"
+					className="mb-8 rounded-lg border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 p-4"
+				>
+					<div className="flex items-start justify-between gap-3 mb-3">
+						<div>
+							<h2 className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">
+								New to Locust?
+							</h2>
+							<p className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">
+								Three steps to localize your first game.
+							</p>
+						</div>
+						<button
+							type="button"
+							onClick={dismissWelcomeGuide}
+							aria-label="Dismiss getting started guide"
+							className="shrink-0 text-emerald-700 hover:text-emerald-900 dark:text-emerald-300 dark:hover:text-emerald-100 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded p-0.5"
+						>
+							<X size={16} />
+						</button>
+					</div>
+					<ol className="grid gap-2 sm:grid-cols-3">
+						{WELCOME_WORKFLOW_STEPS.map((step, index) => {
+							const StepIcon =
+								step.id === "open"
+									? FolderOpen
+									: step.id === "translate"
+										? Languages
+										: FileCheck;
+							return (
+								<li
+									key={step.id}
+									className="flex items-start gap-2 rounded-md border border-emerald-100 bg-white/70 p-3 dark:border-emerald-900/50 dark:bg-gray-900/40"
+								>
+									<span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-xs font-bold text-white">
+										{index + 1}
+									</span>
+									<div className="min-w-0">
+										<div className="flex items-center gap-1.5 text-sm font-medium text-gray-800 dark:text-gray-200">
+											<StepIcon
+												size={14}
+												className="text-emerald-600 dark:text-emerald-400"
+												aria-hidden="true"
+											/>
+											{step.label}
+										</div>
+										<p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+											{step.description}
+										</p>
+									</div>
+								</li>
+							);
+						})}
+					</ol>
+				</section>
+			)}
 
 			{/* Open buttons */}
 			<div className="mb-10">

@@ -3,7 +3,6 @@ import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
 	X,
-	Plus,
 	ChevronUp,
 	ChevronDown,
 	Trash2,
@@ -34,8 +33,12 @@ import {
 	MODAL_BACKDROP_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
-import { resolveProviderReadiness, formatProviderOptionLabel } from "../lib/providerReadiness";
+import {
+	resolveProviderReadiness,
+	formatProviderOptionLabel,
+} from "../lib/providerReadiness";
 import { buildSettingsPath } from "../lib/settingsNav";
+import EmptyState from "./EmptyState";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -48,14 +51,37 @@ const statusIcons: Record<string, typeof Clock> = {
 	cancelled: Square,
 };
 
-const statusColors: Record<string, string> = {
-	pending: "text-gray-400",
-	extracting: "text-blue-400 animate-spin",
-	translating: "text-emerald-400 animate-spin",
-	done: "text-emerald-500",
-	error: "text-red-500",
-	cancelled: "text-gray-500",
+const statusRowStyles: Record<string, string> = {
+	pending: "border-l-transparent",
+	extracting: "bg-blue-50/70 dark:bg-blue-950/30 border-l-blue-500",
+	translating: "bg-emerald-50/70 dark:bg-emerald-950/30 border-l-emerald-500",
+	done: "bg-gray-50 dark:bg-gray-800/50 border-l-emerald-500/60",
+	error: "bg-red-50 dark:bg-red-950/30 border-l-red-500",
+	cancelled: "opacity-60 border-l-gray-400",
 };
+
+const statusLabels: Record<string, string> = {
+	pending: "Waiting",
+	extracting: "Extracting",
+	translating: "Translating",
+	done: "Done",
+	error: "Failed",
+	cancelled: "Cancelled",
+};
+
+const statusIconColors: Record<string, string> = {
+	pending: "text-gray-400 dark:text-gray-500",
+	extracting: "text-blue-500 dark:text-blue-400 animate-spin",
+	translating: "text-emerald-500 dark:text-emerald-400 animate-spin",
+	done: "text-emerald-600 dark:text-emerald-400",
+	error: "text-red-500 dark:text-red-400",
+	cancelled: "text-gray-500 dark:text-gray-500",
+};
+
+const settingsInputClass =
+	"mt-1 w-full p-1.5 border rounded text-sm dark:bg-gray-900 dark:border-gray-600 dark:text-gray-100";
+const settingsLabelClass =
+	"text-xs font-medium text-gray-500 dark:text-gray-400";
 
 export default function QueuePanel() {
 	const navigate = useNavigate();
@@ -224,6 +250,10 @@ export default function QueuePanel() {
 
 	const pendingCount = items.filter((i) => i.status === "pending").length;
 	const doneCount = items.filter((i) => i.status === "done").length;
+	const activeCount = items.filter((i) =>
+		["extracting", "translating"].includes(i.status),
+	).length;
+	const totalCount = items.length;
 	const providerReadiness = resolveProviderReadiness(
 		providerId,
 		providers,
@@ -245,15 +275,18 @@ export default function QueuePanel() {
 					<div className="flex items-center gap-2">
 						{doneCount > 0 && (
 							<button
+								type="button"
 								onClick={clearCompleted}
-								className="text-xs text-gray-400 hover:text-gray-600"
+								className="text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1"
 							>
-								Clear completed
+								Clear completed ({doneCount})
 							</button>
 						)}
 						<button
+							type="button"
 							onClick={() => setPanelOpen(false)}
-							className="text-gray-400 hover:text-gray-600"
+							aria-label="Close queue panel"
+							className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded p-0.5"
 						>
 							<X size={20} />
 						</button>
@@ -263,14 +296,12 @@ export default function QueuePanel() {
 				<div className="flex-1 overflow-y-auto">
 					{/* Queue list */}
 					{items.length === 0 ? (
-						<div className="p-8 text-center text-gray-500">
-							<p className="mb-2">No projects in queue</p>
-							<p className="text-xs">
-								Add game files or folders to translate in batch
-							</p>
-						</div>
+						<EmptyState
+							title="Queue is empty"
+							description="Add game files or folders below to translate multiple projects in batch."
+						/>
 					) : (
-						<div className="divide-y divide-gray-100 dark:divide-gray-800">
+						<div className="divide-y divide-gray-100 dark:divide-gray-800 border-b border-gray-100 dark:border-gray-800">
 							{items.map((item, idx) => (
 								<QueueItemRow
 									key={item.id}
@@ -308,19 +339,17 @@ export default function QueuePanel() {
 
 					{/* Translation settings */}
 					{!isRunning && items.length > 0 && (
-						<div className="p-4 border-t border-gray-200 dark:border-gray-700 space-y-3">
-							<h3 className="text-sm font-semibold text-gray-500 uppercase">
+						<div className="p-4 border-t border-gray-200 dark:border-gray-700 space-y-3 bg-gray-50/50 dark:bg-gray-800/30">
+							<h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">
 								Translation Settings
 							</h3>
 							<div className="grid grid-cols-3 gap-3">
 								<div>
-									<label className="text-xs font-medium text-gray-500">
-										Provider
-									</label>
+									<label className={settingsLabelClass}>Provider</label>
 									<select
 										value={providerId}
 										onChange={(e) => setProviderId(e.target.value)}
-										className="mt-1 w-full p-1.5 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+										className={settingsInputClass}
 									>
 										{providers?.map((p) => (
 											<option key={p.id} value={p.id}>
@@ -330,49 +359,41 @@ export default function QueuePanel() {
 									</select>
 								</div>
 								<div>
-									<label className="text-xs font-medium text-gray-500">
-										Source
-									</label>
+									<label className={settingsLabelClass}>Source</label>
 									<input
 										value={sourceLang}
 										onChange={(e) => setSourceLang(e.target.value)}
-										className="mt-1 w-full p-1.5 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+										className={settingsInputClass}
 									/>
 								</div>
 								<div>
-									<label className="text-xs font-medium text-gray-500">
-										Target
-									</label>
+									<label className={settingsLabelClass}>Target</label>
 									<input
 										value={targetLang}
 										onChange={(e) => setTargetLang(e.target.value)}
-										className="mt-1 w-full p-1.5 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+										className={settingsInputClass}
 									/>
 								</div>
 							</div>
 							<div className="grid grid-cols-2 gap-3">
 								<div>
-									<label className="text-xs font-medium text-gray-500">
-										Batch size
-									</label>
+									<label className={settingsLabelClass}>Batch size</label>
 									<input
 										type="number"
 										value={batchSize}
 										onChange={(e) => setBatchSize(+e.target.value)}
 										min={1}
 										max={100}
-										className="mt-1 w-full p-1.5 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+										className={settingsInputClass}
 									/>
 								</div>
 								<div>
-									<label className="text-xs font-medium text-gray-500">
-										Game context
-									</label>
+									<label className={settingsLabelClass}>Game context</label>
 									<input
 										value={gameContext}
 										onChange={(e) => setGameContext(e.target.value)}
 										placeholder="Optional"
-										className="mt-1 w-full p-1.5 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+										className={settingsInputClass}
 									/>
 								</div>
 							</div>
@@ -400,26 +421,37 @@ export default function QueuePanel() {
 								</button>
 							</div>
 						)}
-					<div className="flex items-center justify-between">
-						<span className="text-sm text-gray-500">
-							{pendingCount} pending · {doneCount} done
-						</span>
+					<div className="flex items-center justify-between gap-4">
+						<div className="text-sm text-gray-600 dark:text-gray-300 tabular-nums">
+							{isRunning ? (
+								<span>
+									{activeCount > 0 ? "Running" : "Starting"} · {doneCount}/
+									{totalCount} done
+								</span>
+							) : (
+								<span>
+									{pendingCount} waiting · {doneCount} done
+								</span>
+							)}
+						</div>
 						{isRunning ? (
 							<button
+								type="button"
 								onClick={cancelQueue}
-								className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition-colors"
+								className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-red-400 focus:ring-offset-2 dark:focus:ring-offset-gray-900"
 							>
-								<Square size={14} />
-								Cancel Queue
+								<Square size={14} aria-hidden="true" />
+								Cancel queue
 							</button>
 						) : (
 							<button
+								type="button"
 								onClick={handleStart}
 								disabled={pendingCount === 0}
-								className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors"
+								className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 dark:focus:ring-offset-gray-900"
 							>
-								<Play size={14} />
-								Start Queue ({pendingCount})
+								<Play size={14} aria-hidden="true" />
+								Start queue ({pendingCount})
 							</button>
 						)}
 					</div>
@@ -451,55 +483,110 @@ function QueueItemRow({
 		item.progress.total > 0
 			? Math.round((item.progress.completed / item.progress.total) * 100)
 			: 0;
+	const isActive =
+		item.status === "extracting" || item.status === "translating";
+	const showProgress = isActive || item.status === "done";
+	const canDismiss = ["done", "error", "cancelled"].includes(item.status);
 
 	return (
-		<div className="flex items-center gap-3 px-4 py-3">
-			<Icon size={16} className={statusColors[item.status]} />
+		<div
+			className={clsx(
+				"flex items-center gap-3 px-4 py-2.5 border-l-2",
+				statusRowStyles[item.status] ?? statusRowStyles.pending,
+			)}
+		>
+			<Icon
+				size={16}
+				className={statusIconColors[item.status]}
+				aria-hidden="true"
+			/>
 			<div className="flex-1 min-w-0">
-				<div className="text-sm font-medium truncate">{item.projectName}</div>
-				<div className="text-xs text-gray-500 truncate">{item.projectPath}</div>
-				{item.status === "translating" && item.progress.total > 0 && (
-					<div className="mt-1 flex items-center gap-2">
-						<div className="flex-1 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-							<div
-								className="h-full bg-emerald-500 rounded-full transition-all"
-								style={{ width: `${percent}%` }}
-							/>
-						</div>
-						<span className="text-xs text-gray-400 tabular-nums">
-							{percent}%
-						</span>
+				<div className="flex items-center gap-2">
+					<div className="text-sm font-medium truncate text-gray-900 dark:text-gray-100">
+						{item.projectName}
 					</div>
-				)}
+					<span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{statusLabels[item.status] ?? item.status}
+					</span>
+				</div>
+				<div className="text-xs text-gray-500 dark:text-gray-400 truncate">
+					{item.projectPath}
+				</div>
+				<div className="mt-1 h-4 flex items-center gap-2">
+					{showProgress && item.progress.total > 0 ? (
+						<>
+							<div className="flex-1 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+								<div
+									className={clsx(
+										"h-full rounded-full transition-all duration-300",
+										item.status === "done"
+											? "bg-emerald-500"
+											: "bg-emerald-500",
+									)}
+									style={{
+										width: `${item.status === "done" ? 100 : percent}%`,
+									}}
+								/>
+							</div>
+							<span className="text-[11px] text-gray-500 dark:text-gray-400 tabular-nums w-24 text-right shrink-0">
+								{item.progress.completed}/{item.progress.total} ·{" "}
+								{item.status === "done" ? 100 : percent}%
+							</span>
+						</>
+					) : item.status === "extracting" ? (
+						<span className="text-[11px] text-blue-600 dark:text-blue-400">
+							Extracting strings…
+						</span>
+					) : null}
+				</div>
 				{item.error && (
-					<div className="text-xs text-red-500 mt-0.5 truncate">
+					<div
+						className="text-xs text-red-600 dark:text-red-400 mt-0.5 truncate"
+						title={item.error}
+					>
 						{item.error}
 					</div>
 				)}
 			</div>
 			{!disabled && item.status === "pending" && (
-				<div className="flex items-center gap-1 shrink-0">
+				<div className="flex items-center gap-0.5 shrink-0">
 					<button
+						type="button"
 						onClick={onMoveUp}
 						disabled={index === 0}
-						className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30"
+						aria-label="Move up"
+						className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded"
 					>
 						<ChevronUp size={14} />
 					</button>
 					<button
+						type="button"
 						onClick={onMoveDown}
 						disabled={index === total - 1}
-						className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30"
+						aria-label="Move down"
+						className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded"
 					>
 						<ChevronDown size={14} />
 					</button>
 					<button
+						type="button"
 						onClick={onRemove}
-						className="p-1 text-gray-400 hover:text-red-500"
+						aria-label="Remove from queue"
+						className="p-1 text-gray-400 hover:text-red-500 dark:hover:text-red-400 focus:outline-none focus:ring-2 focus:ring-red-400 rounded"
 					>
 						<Trash2 size={14} />
 					</button>
 				</div>
+			)}
+			{canDismiss && !disabled && (
+				<button
+					type="button"
+					onClick={onRemove}
+					aria-label="Dismiss from queue"
+					className="shrink-0 px-2 py-1 text-[11px] font-medium text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 border border-gray-200 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-emerald-500"
+				>
+					Dismiss
+				</button>
 			)}
 		</div>
 	);
