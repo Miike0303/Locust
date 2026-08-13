@@ -1,9 +1,11 @@
 import { create } from "zustand";
-import { openProject, startTranslation, type TranslationStartParams } from "../lib/api";
+import { openProject, startTranslation, cancelTranslation, type TranslationStartParams } from "../lib/api";
 import { waitForJob } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
 import { addLog } from "./logStore";
 import { addToast } from "./toastStore";
+
+let activeJobId: string | null = null;
 
 export type QueueItemStatus = "pending" | "extracting" | "translating" | "done" | "error" | "cancelled";
 
@@ -86,7 +88,14 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   setPanelOpen: (isPanelOpen) => set({ isPanelOpen }),
   setGlobalProgress: (globalProgress) => set({ globalProgress }),
 
-  cancelQueue: () => set({ cancelRequested: true }),
+  cancelQueue: () => {
+    set({ cancelRequested: true });
+    const jobId = activeJobId;
+    if (!jobId) return;
+    void cancelTranslation(jobId).catch((err: any) => {
+      addLog("error", "Failed to cancel in-flight queue job", err.message ?? String(err), "queue");
+    });
+  },
 
   startQueue: async () => {
     const { items, translationParams } = get();
@@ -96,15 +105,12 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     }
 
     set({ isRunning: true, cancelRequested: false });
+    activeJobId = null;
     const pending = items.filter((i) => i.status === "pending");
     addLog("info", `Queue started: ${pending.length} projects`, undefined, "queue");
 
     for (let idx = 0; idx < pending.length; idx++) {
-      if (get().cancelRequested) {
-        addLog("warning", "Queue cancelled by user", undefined, "queue");
-        addToast("warning", "Queue cancelled");
-        break;
-      }
+      if (get().cancelRequested) break;
 
       const item = pending[idx];
       const updateItem = (patch: Partial<QueueItem>) =>
@@ -141,6 +147,11 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           supported_modes: result.supported_modes,
         });
 
+        if (get().cancelRequested) {
+          updateItem({ status: "cancelled", error: null });
+          break;
+        }
+
         // Step 2: Start translation
         updateItem({
           status: "translating",
@@ -155,33 +166,59 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         }));
 
         const job = await startTranslation(translationParams);
-
-        // Step 3: Wait for completion
-        await waitForJob(job.job_id, {
-          onProgress: (completed, total, costSoFar) => {
-            updateItem({ progress: { completed, total, costSoFar, startedAt: get().items.find((i) => i.id === item.id)?.progress.startedAt ?? null } });
-            set((s) => ({
-              globalProgress: s.globalProgress
-                ? { ...s.globalProgress, completed, total, costSoFar }
-                : null,
-            }));
-          },
-        });
+        activeJobId = job.job_id;
+        try {
+          if (get().cancelRequested) get().cancelQueue();
+          // Step 3: Wait for completion
+          await waitForJob(job.job_id, {
+            onProgress: (completed, total, costSoFar) => {
+              updateItem({ progress: { completed, total, costSoFar, startedAt: get().items.find((i) => i.id === item.id)?.progress.startedAt ?? null } });
+              set((s) => ({
+                globalProgress: s.globalProgress
+                  ? { ...s.globalProgress, completed, total, costSoFar }
+                  : null,
+              }));
+            },
+          });
+        } finally {
+          activeJobId = null;
+        }
 
         updateItem({ status: "done" });
         addLog("info", `Completed: ${result.project_name} (${result.total_strings} strings)`, undefined, "queue");
         addToast("success", `${result.project_name} translated`);
       } catch (err: any) {
-        updateItem({ status: "error", error: err.message });
-        addLog("error", `Failed: ${item.projectName}`, err.message, "queue");
-        addToast("error", `Queue error: ${item.projectName}`);
+        if (get().cancelRequested) {
+          updateItem({ status: "cancelled", error: null });
+        } else {
+          updateItem({ status: "error", error: err.message });
+          addLog("error", `Failed: ${item.projectName}`, err.message, "queue");
+          addToast("error", `Queue error: ${item.projectName}`);
+        }
       }
     }
 
     set({ isRunning: false, globalProgress: null });
-    if (!get().cancelRequested) {
-      addLog("info", "Queue finished", undefined, "queue");
-      addToast("success", "All projects in queue completed");
+    if (get().cancelRequested) {
+      addLog("warning", "Queue cancelled by user", undefined, "queue");
+      addToast("warning", "Queue cancelled");
+    } else {
+      const runIds = new Set(pending.map((i) => i.id));
+      let finished = 0;
+      let failed = 0;
+      for (const i of get().items) {
+        if (!runIds.has(i.id)) continue;
+        if (i.status === "done") finished++;
+        else if (i.status === "error") failed++;
+      }
+      if (failed === 0) {
+        addLog("info", "Queue finished", undefined, "queue");
+        addToast("success", "All projects in queue completed");
+      } else {
+        const summary = `${finished} finished, ${failed} failed`;
+        addLog("error", `Queue finished: ${summary}`, undefined, "queue");
+        addToast("error", summary);
+      }
     }
   },
 }));
