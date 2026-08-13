@@ -11,7 +11,6 @@ import {
 } from "../lib/api";
 import {
 	JOB_STREAM_LOST_MESSAGE,
-	jobStreamCloseAction,
 	subscribeToJob,
 } from "../lib/ws";
 import {
@@ -324,16 +323,12 @@ export default function TranslationModal({
 					addToast("error", `Translation failed: ${e.error}`);
 				},
 				onClosed: () => {
-					const action = jobStreamCloseAction(
-						finishedRef.current,
-						cancelRequestedRef.current,
-					);
-					if (action === "ignore") return;
+					if (finishedRef.current) return;
 					finishedRef.current = true;
 					setTranslating(false);
 					setJob(null);
 					useQueueStore.getState().setGlobalProgress(null);
-					if (action === "cancelled") {
+					if (cancelRequestedRef.current) {
 						setCancelled(true);
 						setCancelling(false);
 						addLog("info", "Translation cancelled", undefined, "translation");

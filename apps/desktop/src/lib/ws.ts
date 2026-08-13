@@ -27,16 +27,6 @@ interface WaitOptions {
 export const JOB_STREAM_LOST_MESSAGE =
   "connection to the translation job was lost";
 
-/** Close with no completed/failed event: ignore if already terminal, else cancelled vs lost. */
-export function jobStreamCloseAction(
-  finished: boolean,
-  cancelRequested: boolean,
-): "ignore" | "cancelled" | "lost" {
-  if (finished) return "ignore";
-  if (cancelRequested) return "cancelled";
-  return "lost";
-}
-
 export function waitForJob(jobId: string, opts?: WaitOptions): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;

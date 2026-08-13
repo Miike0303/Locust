@@ -5,6 +5,7 @@
  * before the dynamic import. Real lib/api.ts cannot load under tsx
  * (import.meta.env.DEV is undefined), so getWsUrl is stubbed via registerHooks.
  */
+import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 
 globalThis.window ??= {} as any;
@@ -43,7 +44,6 @@ class FakeWebSocket {
 
 (globalThis as any).WebSocket = FakeWebSocket;
 
-type GetWsUrl = (jobId: string) => Promise<string>;
 (globalThis as any).__locustGetWsUrl = async (jobId: string) =>
 	`ws://localhost:7842/api/translate/ws/${jobId}`;
 
@@ -65,38 +65,10 @@ registerHooks({
 
 const {
 	JOB_STREAM_LOST_MESSAGE,
-	jobStreamCloseAction,
 	subscribeToJob,
 	waitForJob,
 } = await import("./ws.ts");
 
-const assert = {
-	equal(actual: unknown, expected: unknown, message?: string) {
-		if (actual !== expected)
-			throw new Error(message ?? `${actual} !== ${expected}`);
-	},
-	async rejects(promise: Promise<unknown>, pattern: RegExp, message?: string) {
-		let fulfilled = false;
-		try {
-			await promise;
-			fulfilled = true;
-		} catch (err) {
-			const text = err instanceof Error ? err.message : String(err);
-			if (!pattern.test(text)) {
-				throw new Error(
-					message ?? `rejected with ${JSON.stringify(text)}, expected ${pattern}`,
-				);
-			}
-			return;
-		}
-		if (fulfilled) throw new Error(message ?? "expected promise to reject");
-	},
-};
-
-assert.equal(jobStreamCloseAction(true, false), "ignore");
-assert.equal(jobStreamCloseAction(true, true), "ignore");
-assert.equal(jobStreamCloseAction(false, true), "cancelled");
-assert.equal(jobStreamCloseAction(false, false), "lost");
 assert.equal(
 	JOB_STREAM_LOST_MESSAGE,
 	"connection to the translation job was lost",
