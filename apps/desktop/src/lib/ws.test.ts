@@ -63,7 +63,12 @@ registerHooks({
 	},
 });
 
-const { subscribeToJob, waitForJob } = await import("./ws.ts");
+const {
+	JOB_STREAM_LOST_MESSAGE,
+	jobStreamCloseAction,
+	subscribeToJob,
+	waitForJob,
+} = await import("./ws.ts");
 
 const assert = {
 	equal(actual: unknown, expected: unknown, message?: string) {
@@ -87,6 +92,15 @@ const assert = {
 		if (fulfilled) throw new Error(message ?? "expected promise to reject");
 	},
 };
+
+assert.equal(jobStreamCloseAction(true, false), "ignore");
+assert.equal(jobStreamCloseAction(true, true), "ignore");
+assert.equal(jobStreamCloseAction(false, true), "cancelled");
+assert.equal(jobStreamCloseAction(false, false), "lost");
+assert.equal(
+	JOB_STREAM_LOST_MESSAGE,
+	"connection to the translation job was lost",
+);
 
 function reset() {
 	FakeWebSocket.instances.length = 0;

@@ -24,6 +24,19 @@ interface WaitOptions {
   onProgress?: (completed: number, total: number, costSoFar: number) => void;
 }
 
+export const JOB_STREAM_LOST_MESSAGE =
+  "connection to the translation job was lost";
+
+/** Close with no completed/failed event: ignore if already terminal, else cancelled vs lost. */
+export function jobStreamCloseAction(
+  finished: boolean,
+  cancelRequested: boolean,
+): "ignore" | "cancelled" | "lost" {
+  if (finished) return "ignore";
+  if (cancelRequested) return "cancelled";
+  return "lost";
+}
+
 export function waitForJob(jobId: string, opts?: WaitOptions): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -32,7 +45,7 @@ export function waitForJob(jobId: string, opts?: WaitOptions): Promise<void> {
       onCompleted: () => settle(() => resolve()),
       onFailed: (e) => settle(() => reject(new Error(e.error))),
       onClosed: () =>
-        settle(() => reject(new Error("connection to the translation job was lost"))),
+        settle(() => reject(new Error(JOB_STREAM_LOST_MESSAGE))),
     });
     function settle(done: () => void) {
       if (settled) return;

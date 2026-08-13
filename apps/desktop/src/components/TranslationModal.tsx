@@ -9,7 +9,11 @@ import {
 	cancelTranslation,
 	checkProviderHealth,
 } from "../lib/api";
-import { subscribeToJob } from "../lib/ws";
+import {
+	JOB_STREAM_LOST_MESSAGE,
+	jobStreamCloseAction,
+	subscribeToJob,
+} from "../lib/ws";
 import {
 	resolveTranslationDefaults,
 	coerceProviderId,
@@ -320,17 +324,30 @@ export default function TranslationModal({
 					addToast("error", `Translation failed: ${e.error}`);
 				},
 				onClosed: () => {
-					// Stream ended without a completed/failed event after a cancel
-					// request — the server stopped the job, mark it cancelled.
-					if (finishedRef.current || !cancelRequestedRef.current) return;
+					const action = jobStreamCloseAction(
+						finishedRef.current,
+						cancelRequestedRef.current,
+					);
+					if (action === "ignore") return;
 					finishedRef.current = true;
-					setCancelled(true);
-					setCancelling(false);
 					setTranslating(false);
 					setJob(null);
 					useQueueStore.getState().setGlobalProgress(null);
-					addLog("info", "Translation cancelled", undefined, "translation");
-					addToast("info", "Translation cancelled");
+					if (action === "cancelled") {
+						setCancelled(true);
+						setCancelling(false);
+						addLog("info", "Translation cancelled", undefined, "translation");
+						addToast("info", "Translation cancelled");
+						return;
+					}
+					setError(JOB_STREAM_LOST_MESSAGE);
+					addLog(
+						"error",
+						"Translation failed",
+						JOB_STREAM_LOST_MESSAGE,
+						"translation",
+					);
+					addToast("error", `Translation failed: ${JOB_STREAM_LOST_MESSAGE}`);
 				},
 			});
 		} catch (err: any) {
@@ -368,7 +385,7 @@ export default function TranslationModal({
 
 	const handleClose = () => {
 		onClose();
-		if (done) onComplete();
+		if (done || (step === "progress" && error)) onComplete();
 	};
 
 	const openSettings = (shortcut: OperationalShortcut) => {
@@ -687,12 +704,12 @@ export default function TranslationModal({
 									: `${completed} / ${total}`}
 							{costSoFar > 0 && ` · $${costSoFar.toFixed(4)}`}
 						</div>
-						{activeProviderLabel && !done && !cancelled && (
+						{activeProviderLabel && !done && !cancelled && !error && (
 							<div className="text-xs text-center text-emerald-700 dark:text-emerald-400">
 								Using provider: {activeProviderLabel}
 							</div>
 						)}
-						{lastTranslated && !done && !cancelled && (
+						{lastTranslated && !done && !cancelled && !error && (
 							<div className="text-xs text-gray-500 truncate">
 								Last: {lastTranslated}
 							</div>
@@ -711,7 +728,7 @@ export default function TranslationModal({
 								{cancelling ? "Cancelling…" : "Cancel"}
 							</button>
 						)}
-						{(done || cancelled) && (
+						{(done || cancelled || error) && (
 							<div className="flex gap-2">
 								<button
 									onClick={handleClose}
