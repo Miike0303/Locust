@@ -1,7 +1,9 @@
 import { useRef } from "react";
+import clsx from "clsx";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
 
@@ -55,7 +57,7 @@ export default function ConfirmDialog({
 				<p className="text-sm text-gray-600 dark:text-gray-300 mb-4 whitespace-pre-wrap">
 					{message}
 				</p>
-				<div className="flex justify-end gap-2">
+				<div className={clsx(MODAL_FOOTER_CLASS, "-mx-5 -mb-5")}>
 					<button
 						type="button"
 						onClick={onCancel}

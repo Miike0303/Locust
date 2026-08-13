@@ -10,6 +10,7 @@ import { validationKindLabel } from "../lib/api";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
 
@@ -257,7 +258,7 @@ export default function ValidationResultsModal({
 					<FontSection fonts={fonts ?? []} />
 				</div>
 
-				<div className="px-5 py-3 border-t border-gray-200 dark:border-gray-700 flex justify-end">
+				<div className={MODAL_FOOTER_CLASS}>
 					<button
 						onClick={onClose}
 						className="px-4 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium"

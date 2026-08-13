@@ -1,4 +1,5 @@
 import { useState, useRef } from "react";
+import clsx from "clsx";
 import { X, Download, Upload, FolderOpen } from "lucide-react";
 import {
 	exportTranslations,
@@ -12,6 +13,7 @@ import { addToast } from "../stores/toastStore";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
 
@@ -256,7 +258,7 @@ export default function ExportModal({
 						}}
 					/>
 
-					<div className="flex justify-end gap-2 pt-2">
+					<div className={clsx(MODAL_FOOTER_CLASS, "-mx-6 -mb-6")}>
 						<button
 							onClick={onClose}
 							className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
