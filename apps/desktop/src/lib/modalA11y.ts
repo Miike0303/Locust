@@ -59,6 +59,10 @@ export function shouldOwnModalEscape({
 export const MODAL_BACKDROP_CLASS =
 	"fixed inset-0 bg-black/50 flex items-center justify-center z-50";
 
+/** Shared modal action footer. Append layout extras with clsx. */
+export const MODAL_FOOTER_CLASS =
+	"flex justify-end gap-2 border-t border-gray-200 px-5 py-3 dark:border-gray-700";
+
 /** Shared modal panel chrome; pass size/overflow utilities as extraClass. */
 export function modalPanelClass(extraClass = ""): string {
 	const base = "bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full";
