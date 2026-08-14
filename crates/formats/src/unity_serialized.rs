@@ -1251,7 +1251,7 @@ pub fn is_textasset_script_worth_extracting(script: &str) -> bool {
 /// word of length ≥3, dense symbols (and often small kana which *are* alphabetic).
 fn looks_like_linebreak_charset_table(t: &str) -> bool {
     let total = t.chars().count();
-    if total < 20 || total > 400 {
+    if !(20..=400).contains(&total) {
         return false;
     }
     let ws = t.chars().filter(|c| c.is_whitespace()).count();
@@ -1760,7 +1760,7 @@ mod tests {
         let d2 = fields2
             .iter()
             .find(|f| f.text.starts_with("Hola"))
-            .expect(&format!("post-rewrite fields: {fields2:?}"));
+            .unwrap_or_else(|| panic!("post-rewrite fields: {fields2:?}"));
         assert_eq!(d2.byte_len, 8);
     }
 
@@ -1851,11 +1851,11 @@ mod tests {
         let fields = sf.read_mono_strings(10).unwrap();
         let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
         assert!(
-            texts.iter().any(|t| *t == "First line of dialogue"),
+            texts.contains(&"First line of dialogue"),
             "fields: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == "Second line after int"),
+            texts.contains(&"Second line after int"),
             "must recover string after non-string int gap: {texts:?}"
         );
     }
@@ -1998,11 +1998,11 @@ mod tests {
         let fields = sf.read_mono_strings(10).unwrap();
         let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
         assert!(
-            texts.iter().any(|t| *t == "Portable Speaker"),
+            texts.contains(&"Portable Speaker"),
             "keep dialogue-ish: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == "Welcome home"),
+            texts.contains(&"Welcome home"),
             "keep sentence: {texts:?}"
         );
         assert!(
@@ -2018,7 +2018,7 @@ mod tests {
             "drop Naninovel/TMPro AQN: {texts:?}"
         );
         assert!(
-            !texts.iter().any(|t| *t == "set_text"),
+            !texts.contains(&"set_text"),
             "drop API token: {texts:?}"
         );
     }
@@ -2050,7 +2050,7 @@ mod tests {
         let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
         // m_Name "Naninovel" must not extract
         assert!(
-            !texts.iter().any(|t| *t == "Naninovel"),
+            !texts.contains(&"Naninovel"),
             "drop engine product m_Name: {texts:?}"
         );
         for drop in [
@@ -2065,20 +2065,20 @@ mod tests {
             "Master/HFX",
         ] {
             assert!(
-                !texts.iter().any(|t| *t == drop),
+                !texts.contains(&drop),
                 "expected drop {drop}: {texts:?}"
             );
         }
         assert!(
-            texts.iter().any(|t| *t == "Q.SAVE"),
+            texts.contains(&"Q.SAVE"),
             "keep quick-save UI: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == "Play"),
+            texts.contains(&"Play"),
             "keep short UI verb: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == "Save game now"),
+            texts.contains(&"Save game now"),
             "keep sentence: {texts:?}"
         );
         assert!(
@@ -2106,15 +2106,15 @@ mod tests {
         let fields = sf.read_mono_strings(10).unwrap();
         let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
         assert!(
-            texts.iter().any(|t| *t == "Play"),
+            texts.contains(&"Play"),
             "keep UI: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == "Emily"),
+            texts.contains(&"Emily"),
             "keep name: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == "Save game"),
+            texts.contains(&"Save game"),
             "keep sentence: {texts:?}"
         );
         for drop_sub in ["@novel", "@hideUI", "@else", "@moveMode", "Lorem ipsum"] {
@@ -2162,13 +2162,13 @@ mod tests {
             "v'",
         ] {
             assert!(
-                !texts.iter().any(|t| *t == drop),
+                !texts.contains(&drop),
                 "expected drop {drop}: {texts:?}"
             );
         }
         for keep in ["Play", "Emily", "Q.SAVE", "Message speed:"] {
             assert!(
-                texts.iter().any(|t| *t == keep),
+                texts.contains(&keep),
                 "expected keep {keep}: {texts:?}"
             );
         }
@@ -2217,13 +2217,13 @@ mod tests {
             "Day/2 Standard",
         ] {
             assert!(
-                !texts.iter().any(|t| *t == drop),
+                !texts.contains(&drop),
                 "expected drop {drop}: {texts:?}"
             );
         }
         for keep in ["START / LOAD", "Fridge / Microwave", "Play", "Emily"] {
             assert!(
-                texts.iter().any(|t| *t == keep),
+                texts.contains(&keep),
                 "expected keep {keep}: {texts:?}"
             );
         }
@@ -2268,7 +2268,7 @@ mod tests {
         );
         for keep in ["Play", "Emily", "Option A"] {
             assert!(
-                texts.iter().any(|t| *t == keep),
+                texts.contains(&keep),
                 "expected keep {keep}: {texts:?}"
             );
         }
@@ -2319,7 +2319,7 @@ mod tests {
             "{g_saveslot}",
         ] {
             assert!(
-                !texts.iter().any(|t| *t == drop),
+                !texts.contains(&drop),
                 "expected drop {drop}: {texts:?}"
             );
         }
@@ -2332,7 +2332,7 @@ mod tests {
             "Message speed:",
         ] {
             assert!(
-                texts.iter().any(|t| *t == keep),
+                texts.contains(&keep),
                 "expected keep {keep}: {texts:?}"
             );
         }
@@ -2349,15 +2349,15 @@ mod tests {
         let fields = sf.read_mono_strings(10).unwrap();
         let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
         assert!(
-            texts.iter().any(|t| *t == "New Game"),
+            texts.contains(&"New Game"),
             "fields: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == "Load Game"),
+            texts.contains(&"Load Game"),
             "fields: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == "Options"),
+            texts.contains(&"Options"),
             "fields: {texts:?}"
         );
         // Count u32 must not appear as a garbage 3-byte "string".
@@ -2412,11 +2412,11 @@ mod tests {
         let fields = sf.read_mono_strings(10).unwrap();
         let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
         assert!(
-            texts.iter().any(|t| *t == "Yes"),
+            texts.contains(&"Yes"),
             "short string must extract as itself: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == "See you later."),
+            texts.contains(&"See you later."),
             "following string must still extract: {texts:?}"
         );
     }

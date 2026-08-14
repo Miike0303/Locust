@@ -171,7 +171,7 @@ fn patch_iavra_languages_param(raw: &str, lang: &str) -> Option<String> {
     let end = raw[start..].find('"')? + start;
     let list = &raw[start..end];
     let codes: Vec<&str> = list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-    if codes.iter().any(|c| *c == lang) {
+    if codes.contains(&lang) {
         return None;
     }
     let mut new_list = list.to_string();
@@ -600,7 +600,7 @@ fn patch_event_list(list: &mut Vec<serde_json::Value>, lang: &str, label: &str) 
         let template = en_branch.or_else(|| branches.first().copied());
         if let Some((start, end)) = template {
             let mut new_cmds: Vec<serde_json::Value> =
-                list[start..end].iter().cloned().collect();
+                list[start..end].to_vec();
             if let Some(first) = new_cmds.first_mut() {
                 if let Some(params) = first.get_mut("parameters").and_then(|p| p.as_array_mut()) {
                     if !params.is_empty() {

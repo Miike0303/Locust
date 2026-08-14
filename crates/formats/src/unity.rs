@@ -2874,10 +2874,10 @@ Confirmation.Yes: YES\r\n";
         let entries = UnityPlugin::new().extract(&dir).unwrap();
         let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
         assert!(
-            sources.iter().any(|s| *s == "NEW GAME"),
+            sources.contains(&"NEW GAME"),
             "keep UI: {sources:?}"
         );
-        assert!(sources.iter().any(|s| *s == "YES"), "keep YES: {sources:?}");
+        assert!(sources.contains(&"YES"), "keep YES: {sources:?}");
         assert!(
             !sources.iter().any(|s| s.to_ascii_lowercase().contains("lorem")),
             "drop lorem loc value: {sources:?}"
@@ -3039,9 +3039,9 @@ Electronics,video games,13\r\n",
             })
             .map(|e| e.source.as_str())
             .collect();
-        assert!(values.iter().any(|v| *v == "toalla"), "{values:?}");
-        assert!(values.iter().any(|v| *v == "mp3"), "{values:?}");
-        assert!(values.iter().any(|v| *v == "video games"), "{values:?}");
+        assert!(values.contains(&"toalla"), "{values:?}");
+        assert!(values.contains(&"mp3"), "{values:?}");
+        assert!(values.contains(&"video games"), "{values:?}");
     }
 
     #[test]
@@ -3197,15 +3197,15 @@ Confirmation.Yes: YES\r\n\
             .map(|e| e.source.as_str())
             .collect();
         assert!(
-            values.iter().any(|v| *v == "NUEVA"),
+            values.contains(&"NUEVA"),
             "re-extract values: {values:?}"
         );
         assert!(
-            values.iter().any(|v| *v == "SI"),
+            values.contains(&"SI"),
             "re-extract values: {values:?}"
         );
         assert!(
-            values.iter().any(|v| *v == "CREDITS"),
+            values.contains(&"CREDITS"),
             "untouched line kept: {values:?}"
         );
     }
