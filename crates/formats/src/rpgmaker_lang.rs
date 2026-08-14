@@ -361,8 +361,6 @@ fn append_language_draw_label(raw: &str, _lang: &str, label: &str) -> Option<Str
             run = &before[s..=idx];
         }
         run
-    } else if before.contains("\\n") {
-        "\\n"
     } else {
         "\\n"
     };
@@ -370,8 +368,6 @@ fn append_language_draw_label(raw: &str, _lang: &str, label: &str) -> Option<Str
     // Quote style for center from the 中文 call
     let center_q = if raw[zi..end].contains("\\\"center\\\"") {
         "\\\"center\\\""
-    } else if raw[zi..end].contains("\"center\"") {
-        "\"center\""
     } else {
         "\"center\""
     };

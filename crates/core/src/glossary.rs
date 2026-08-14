@@ -91,10 +91,10 @@ impl Glossary {
                     return false;
                 }
                 if let Some((enc, budget)) = max_bytes {
-                    match crate::validation::encoded_byte_len(enc, &e.translation) {
-                        Some(n) if n <= budget => true,
-                        _ => false,
-                    }
+                    matches!(
+                        crate::validation::encoded_byte_len(enc, &e.translation),
+                        Some(n) if n <= budget
+                    )
                 } else {
                     true
                 }
