@@ -1,4 +1,5 @@
 import { useState, useRef, useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
 	useReactTable,
 	getCoreRowModel,
@@ -6,10 +7,12 @@ import {
 	flexRender,
 	type ColumnDef,
 	type SortingState,
+	type VisibilityState,
 } from "@tanstack/react-table";
 import clsx from "clsx";
 import type { StringEntry } from "../lib/api";
-import { patchString } from "../lib/api";
+import { getConfig, patchString } from "../lib/api";
+import { clampTableRowHeight, showSourceColumnEnabled } from "../lib/appearance";
 import { useEditorStore } from "../stores/editorStore";
 import { useT } from "../lib/i18n";
 
@@ -97,6 +100,13 @@ export default function StringTable({
 	const t = useT();
 	const { selectedEntryId, setSelected } = useEditorStore();
 	const [sorting, setSorting] = useState<SortingState>([]);
+	const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
+	const showSource = showSourceColumnEnabled(config?.ui.show_source_column);
+	const rowHeight = clampTableRowHeight(config?.ui.table_row_height);
+	const columnVisibility = useMemo<VisibilityState>(
+		() => ({ source: showSource }),
+		[showSource],
+	);
 
 	const columns = useMemo<ColumnDef<StringEntry, any>[]>(
 		() => [
@@ -181,7 +191,7 @@ export default function StringTable({
 	const table = useReactTable({
 		data,
 		columns,
-		state: { sorting },
+		state: { sorting, columnVisibility },
 		onSortingChange: setSorting,
 		getCoreRowModel: getCoreRowModel(),
 		getSortedRowModel: getSortedRowModel(),
@@ -217,6 +227,7 @@ export default function StringTable({
 						<tr
 							key={row.id}
 							onClick={() => setSelected(row.original.id)}
+							style={{ height: rowHeight }}
 							className={clsx(
 								"border-b border-gray-100 dark:border-gray-800/80 cursor-pointer transition-colors",
 								selectedEntryId === row.original.id

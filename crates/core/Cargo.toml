@@ -35,6 +35,14 @@ wasmtime = { version = "25", optional = true }
 version = "0.7"
 features = ["rt"]
 
+# The retry/rate-limiter tests use `#[tokio::test(start_paused = true)]`, which
+# needs tokio's `test-util`. The workspace tokio is `full`, and `full` does not
+# include it — this crate only compiled its tests because another workspace
+# member enabled the feature and Cargo unified it. Declared here so
+# `cargo test -p locust-core` works on its own.
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
 [features]
 default = []
 wasm-plugins = ["wasmtime"]

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
@@ -163,6 +164,94 @@ pub fn open_project(
         stale_source_reset: merge.stale_source_reset,
         removed: merge.removed,
         preserved_translations: merge.preserved_translations,
+    })
+}
+
+fn not_a_locust_db(path: &Path) -> LocustError {
+    LocustError::IoError(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("not a Locust project database: {}", path.display()),
+    ))
+}
+
+/// Read-only check that `path` is an existing Locust project database.
+/// Does not create, migrate, or write. Returns the `strings` row count.
+fn probe_locust_project_db(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Err(LocustError::ProjectNotFound(path.display().to_string()));
+    }
+    if !path.is_file() {
+        return Err(not_a_locust_db(path));
+    }
+
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| not_a_locust_db(path))?;
+
+    let has_strings: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'strings'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| not_a_locust_db(path))?;
+    if has_strings == 0 {
+        return Err(not_a_locust_db(path));
+    }
+
+    let cols: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('strings')
+             WHERE name IN ('id', 'source', 'translation', 'status', 'file_path')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| not_a_locust_db(path))?;
+    if cols < 5 {
+        return Err(not_a_locust_db(path));
+    }
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM strings", [], |row| row.get(0))
+        .map_err(|_| not_a_locust_db(path))?;
+    Ok(count as usize)
+}
+
+/// Reopen an existing project database without extracting or merging.
+/// Shared by HTTP `POST /api/project/open-db` and the Tauri `open_project_db`
+/// command. Merge counters on the shared [`ProjectOpenOutcome`] are zero.
+pub fn open_project_db(
+    db: &Database,
+    registry: &FormatRegistry,
+    database_path: &Path,
+    game_path: &Path,
+    format_id: &str,
+) -> Result<ProjectOpenOutcome> {
+    let plugin = registry
+        .get(format_id)
+        .ok_or_else(|| LocustError::UnsupportedFormat(format!("Unknown format: {format_id}")))?;
+
+    let total_strings = probe_locust_project_db(database_path)?;
+    db.reopen(database_path)?;
+
+    let project_name = game_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    Ok(ProjectOpenOutcome {
+        format_id: plugin.id().to_string(),
+        format_name: plugin.name().to_string(),
+        total_strings,
+        project_path: game_path.to_path_buf(),
+        project_name,
+        supported_modes: plugin.supported_modes(),
+        database_path: database_path.to_path_buf(),
+        added: 0,
+        updated: 0,
+        stale_source_reset: 0,
+        removed: 0,
+        preserved_translations: 0,
     })
 }
 
@@ -390,5 +479,242 @@ mod tests {
         // Compile-time contract: callers import this single function.
         let _: fn(&Database, &FormatRegistry, &Path, Option<&str>) -> Result<ProjectOpenOutcome> =
             open_project;
+    }
+
+    struct PanicExtractPlugin;
+
+    impl FormatPlugin for PanicExtractPlugin {
+        fn id(&self) -> &str {
+            "tsv-no-extract"
+        }
+        fn name(&self) -> &str {
+            "No Extract"
+        }
+        fn supported_extensions(&self) -> &[&str] {
+            &[".tsv"]
+        }
+        fn detect(&self, _path: &Path) -> bool {
+            true
+        }
+        fn extract(&self, _path: &Path) -> Result<Vec<StringEntry>> {
+            panic!("open_project_db must not extract");
+        }
+        fn inject(&self, _path: &Path, _entries: &[StringEntry]) -> Result<InjectionReport> {
+            Ok(InjectionReport {
+                files_modified: 0,
+                strings_written: 0,
+                strings_skipped: 0,
+                warnings: Vec::new(),
+                files_written: Vec::new(),
+            })
+        }
+    }
+
+    fn panic_extract_registry() -> FormatRegistry {
+        let mut reg = FormatRegistry::new();
+        reg.register(Box::new(PanicExtractPlugin));
+        reg
+    }
+
+    fn write_locust_db(label: &str, rows: &[(&str, &str, Option<&str>)]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "locust_opendb_{label}_{}.locust.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        let entries: Vec<StringEntry> = rows
+            .iter()
+            .map(|(id, source, translation)| {
+                let mut e = StringEntry::new(*id, *source, PathBuf::from("data/a.json"));
+                if let Some(t) = translation {
+                    e.translation = Some((*t).to_string());
+                    e.status = StringStatus::Translated;
+                }
+                e
+            })
+            .collect();
+        db.save_entries(&entries).unwrap();
+        drop(db);
+        path
+    }
+
+    fn snapshot_db_sidecars(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{suffix}", path.display()));
+            if p.is_file() {
+                out.push((suffix.to_string(), std::fs::read(&p).unwrap()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn open_project_db_is_reachable_as_shared_core_entry() {
+        let _: fn(&Database, &FormatRegistry, &Path, &Path, &str) -> Result<ProjectOpenOutcome> =
+            open_project_db;
+    }
+
+    #[test]
+    fn open_project_db_opens_pivoted_db_without_extract_or_row_change() {
+        use crate::database::EntryFilter;
+
+        let source_path = write_locust_db(
+            "src",
+            &[
+                ("a", "Hello", Some("Hola")),
+                ("b", "World", Some("Mundo")),
+                ("c", "Skip", None),
+            ],
+        );
+        let source_db = Database::open(&source_path).unwrap();
+        let pivot_path = std::env::temp_dir().join(format!(
+            "locust_opendb_pivot_{}.locust.db",
+            uuid::Uuid::new_v4()
+        ));
+        let pivoted = source_db.pivot_to(&pivot_path).unwrap();
+        assert_eq!(pivoted.entries, 2);
+        drop(source_db);
+        let source_snapshot = snapshot_db_sidecars(&source_path);
+
+        let snap = Database::open(&pivot_path).unwrap();
+        let before = snap.get_entries(&EntryFilter::default()).unwrap();
+        drop(snap);
+
+        let live = Database::open_in_memory().unwrap();
+        let game =
+            std::env::temp_dir().join(format!("locust_opendb_game_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("extract.tsv"), "hero\tEXTRACTED").unwrap();
+
+        let reg = panic_extract_registry();
+        let out = open_project_db(&live, &reg, &pivot_path, &game, "tsv-no-extract").unwrap();
+
+        assert_eq!(out.total_strings, 2);
+        assert_eq!(out.added, 0);
+        assert_eq!(out.updated, 0);
+        assert_eq!(out.stale_source_reset, 0);
+        assert_eq!(out.removed, 0);
+        assert_eq!(out.preserved_translations, 0);
+        assert_eq!(out.format_id, "tsv-no-extract");
+        assert_eq!(out.format_name, "No Extract");
+        assert_eq!(out.project_path, game);
+        assert_eq!(out.database_path, pivot_path);
+        assert_eq!(live.path(), pivot_path);
+
+        let after = live.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(after.len(), before.len());
+        for e in &before {
+            let got = after.iter().find(|x| x.id == e.id).expect(&e.id);
+            assert_eq!(got.source, e.source);
+            assert_eq!(got.translation, e.translation);
+            assert_eq!(got.status, e.status);
+        }
+        assert!(after.iter().any(|e| e.source == "Hola"));
+        assert!(after.iter().any(|e| e.source == "Mundo"));
+        assert!(!after
+            .iter()
+            .any(|e| e.source == "EXTRACTED" || e.id == "hero"));
+        assert!(!after.iter().any(|e| e.id == "c"));
+
+        assert_eq!(snapshot_db_sidecars(&source_path), source_snapshot);
+
+        drop(live);
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&pivot_path);
+        let _ = std::fs::remove_dir_all(&game);
+    }
+
+    #[test]
+    fn open_project_db_rejects_unrelated_db_and_leaves_live_connection() {
+        let live_path = write_locust_db("live", &[("keep", "Stay", Some("Queda"))]);
+        let live = Database::open(&live_path).unwrap();
+
+        let other =
+            std::env::temp_dir().join(format!("locust_opendb_other_{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = rusqlite::Connection::open(&other).unwrap();
+            conn.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY)", [])
+                .unwrap();
+            conn.execute("INSERT INTO foo (id) VALUES (1)", []).unwrap();
+        }
+        let other_bytes = std::fs::read(&other).unwrap();
+
+        let game = std::env::temp_dir().join(format!("locust_opendb_g_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&game).unwrap();
+
+        let err = open_project_db(&live, &registry(), &other, &game, "tsv-test").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("not a locust project database"),
+            "clean error: {err}"
+        );
+
+        assert_eq!(live.path(), live_path);
+        let keep = live.get_entry("keep").unwrap().unwrap();
+        assert_eq!(keep.source, "Stay");
+        assert_eq!(keep.translation.as_deref(), Some("Queda"));
+        assert_eq!(std::fs::read(&other).unwrap(), other_bytes);
+
+        drop(live);
+        let _ = std::fs::remove_file(&live_path);
+        let _ = std::fs::remove_file(&other);
+        let _ = std::fs::remove_dir_all(&game);
+    }
+
+    #[test]
+    fn open_project_db_rejects_missing_file() {
+        let live = Database::open_in_memory().unwrap();
+        let missing = std::env::temp_dir().join(format!(
+            "locust_opendb_missing_{}.locust.db",
+            uuid::Uuid::new_v4()
+        ));
+        let err = open_project_db(&live, &registry(), &missing, Path::new("game"), "tsv-test")
+            .unwrap_err();
+        match err {
+            LocustError::ProjectNotFound(p) => {
+                assert!(p.contains("locust_opendb_missing_"), "{p}");
+            }
+            other => panic!("expected ProjectNotFound, got {other}"),
+        }
+        assert_eq!(live.path(), PathBuf::from(":memory:"));
+    }
+
+    #[test]
+    fn open_project_db_rejects_directory() {
+        let live = Database::open_in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!("locust_opendb_dir_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = open_project_db(&live, &registry(), &dir, &dir, "tsv-test").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("not a locust project database"),
+            "clean error: {err}"
+        );
+        assert_eq!(live.path(), PathBuf::from(":memory:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_project_db_rejects_unknown_format() {
+        let db_path = write_locust_db("fmt", &[("a", "A", None)]);
+        let live = Database::open_in_memory().unwrap();
+        let err = open_project_db(
+            &live,
+            &registry(),
+            &db_path,
+            Path::new("game"),
+            "not-a-format",
+        )
+        .unwrap_err();
+        match err {
+            LocustError::UnsupportedFormat(msg) => {
+                assert!(msg.contains("not-a-format"), "{msg}");
+            }
+            other => panic!("expected UnsupportedFormat, got {other}"),
+        }
+        assert_eq!(live.path(), PathBuf::from(":memory:"));
+        drop(live);
+        let _ = std::fs::remove_file(&db_path);
     }
 }

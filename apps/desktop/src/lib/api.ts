@@ -1,6 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { addLog } from "../stores/logStore";
 import { t } from "./i18n";
+import {
+  PIVOT_OPEN_DB_HTTP_PATH,
+  PIVOT_OPEN_DB_TAURI_CMD,
+  pivotOpenDbHttpBody,
+  pivotOpenDbTauriArgs,
+} from "./pivot";
 
 // ─── Runtime detection ────────────────────────────────────────────────────
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
@@ -287,6 +293,21 @@ export const openProject = (path: string, formatId?: string): Promise<ProjectOpe
     ? invoke("open_project", { path, formatId })
     : request("/project/open", { method: "POST", body: JSON.stringify({ path, format_id: formatId }) });
 
+/** Reopen a .locust.db without extracting or merging (pivoted projects). */
+export const openProjectDb = (
+  databasePath: string,
+  gamePath: string,
+  formatId: string,
+): Promise<ProjectOpenResponse> => {
+  const args = pivotOpenDbTauriArgs({ databasePath, gamePath, formatId });
+  return IS_TAURI
+    ? invoke(PIVOT_OPEN_DB_TAURI_CMD, args)
+    : request(PIVOT_OPEN_DB_HTTP_PATH, {
+        method: "POST",
+        body: JSON.stringify(pivotOpenDbHttpBody(args)),
+      });
+};
+
 export const getCurrentProject = () =>
   request<ProjectInfo | null>("/project/current");
 
@@ -303,6 +324,29 @@ export const getStrings = (filter: StringFilter): Promise<StringsResponse> =>
         if (filter.offset) params.set("offset", String(filter.offset));
         return request<StringsResponse>(`/strings?${params}`);
       })();
+
+/** Distinct file paths and tags for the open project (not the current page). */
+export interface StringFacets {
+  file_paths: string[];
+  tags: string[];
+}
+
+export const getStringFacets = (): Promise<StringFacets> =>
+  IS_TAURI ? invoke("get_string_facets") : request("/strings/facets");
+
+export interface PivotResult {
+  database_path: string;
+  entries: number;
+}
+
+/** New project whose SOURCE is the current project's translations. */
+export const runPivot = (outputPath: string): Promise<PivotResult> =>
+  IS_TAURI
+    ? invoke("run_pivot", { outputPath })
+    : request("/pivot", {
+        method: "POST",
+        body: JSON.stringify({ output_path: outputPath }),
+      });
 
 export const getString = (id: string) =>
   request<StringEntry>(`/strings/${encodeURIComponent(id)}`);

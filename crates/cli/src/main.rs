@@ -667,7 +667,9 @@ fn write_astro_stub(
          dateAdded: TODO-YYYY-MM-DD\n\
          ---\n\n\
          Translation into {target} of *{title}*, made with Locust.\n\n\
-         **How to apply:** extract the patch over the game folder, replacing files.\n"
+         **How to apply:** `locust apply <game> <patch.zip>` (or `--url https://…/patch.zip`), \
+         or the desktop Patch modal. This creates a restorable backup; \
+         `locust patch-rollback <game>` undoes it.\n"
     );
 
     if let Some(parent) = path.parent() {
@@ -886,42 +888,14 @@ fn cmd_patch_status(game_path: PathBuf) -> anyhow::Result<()> {
 }
 
 fn cmd_pivot(source: PathBuf, output: PathBuf) -> anyhow::Result<()> {
-    use locust_core::models::StringEntry;
-
+    // Shared with HTTP `POST /api/pivot` and the Tauri `run_pivot` command.
     let src_db = Database::open(&source)?;
-    let entries = src_db.get_entries(&EntryFilter::default())?;
-
-    // Each translated entry becomes a pending entry in the new project whose
-    // SOURCE is the old translation. Ids, file paths, tags and speaker context
-    // carry over unchanged, so inject/patch still target the same game files
-    // and the next language keeps the same context.
-    let mut pivoted: Vec<StringEntry> = Vec::new();
-    for e in entries {
-        let Some(translation) = e.translation.filter(|t| !t.trim().is_empty()) else {
-            continue;
-        };
-        let mut ne = StringEntry::new(e.id, translation, e.file_path);
-        ne.context = e.context;
-        ne.tags = e.tags;
-        ne.char_limit = e.char_limit;
-        ne.metadata = e.metadata;
-        pivoted.push(ne);
-    }
-
-    if pivoted.is_empty() {
-        anyhow::bail!(
-            "no translated entries in {} to pivot from",
-            source.display()
-        );
-    }
-
-    let out_db = Database::open(&output)?;
-    let count = out_db.save_entries(&pivoted)?;
+    let result = src_db.pivot_to(&output)?;
 
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
-    table.add_row(vec!["Pivoted project", &output.display().to_string()]);
-    table.add_row(vec!["Source entries used", &count.to_string()]);
+    table.add_row(vec!["Pivoted project", &result.database_path]);
+    table.add_row(vec!["Source entries used", &result.entries.to_string()]);
     println!("{table}");
     println!(
         "\nNow translate the new project into any language, e.g.:\n  \
@@ -1840,6 +1814,71 @@ mod tests {
         // Verify the CLI struct parses without panicking
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cmd_pivot_skips_pending_and_refuses_overwrite() {
+        let dir = std::env::temp_dir().join(format!("locust_cli_pivot_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("src.locust.db");
+        let src = Database::open(&src_path).unwrap();
+        let mut done = StringEntry::new("a", "Hello", PathBuf::from("f.json"));
+        done.translation = Some("Hola".into());
+        done.status = StringStatus::Translated;
+        src.save_entries(&[
+            done,
+            StringEntry::new("b", "World", PathBuf::from("f.json")),
+        ])
+        .unwrap();
+        drop(src);
+
+        let out = dir.join("out.locust.db");
+        cmd_pivot(src_path.clone(), out.clone()).unwrap();
+        let new_db = Database::open(&out).unwrap();
+        let pivoted = new_db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(pivoted.len(), 1);
+        assert_eq!(pivoted[0].source, "Hola");
+        drop(new_db);
+
+        let src = Database::open(&src_path).unwrap();
+        assert_eq!(src.get_entries(&EntryFilter::default()).unwrap().len(), 2);
+
+        let err = cmd_pivot(src_path, out.clone()).expect_err("must refuse overwrite");
+        assert!(
+            err.to_string().to_lowercase().contains("exist")
+                || err.to_string().to_lowercase().contains("overwrite"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn astro_stub_tells_users_to_use_locust_apply() {
+        let dir = std::env::temp_dir().join(format!("locust_astro_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("release.md");
+        let game = dir.join("MyGame");
+        fs::create_dir_all(&game).unwrap();
+        write_astro_stub(&stub, &game, Some("es")).unwrap();
+        let md = fs::read_to_string(&stub).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            !md.contains("extract the patch over the game folder"),
+            "unzip-over-game skips verify/backup/receipt:\n{md}"
+        );
+        assert!(
+            md.contains("locust apply <game> <patch.zip>"),
+            "must name locust apply:\n{md}"
+        );
+        assert!(md.contains("--url"), "must mention --url:\n{md}");
+        assert!(
+            md.contains("locust patch-rollback <game>"),
+            "must name rollback:\n{md}"
+        );
+        assert!(
+            md.to_lowercase().contains("backup"),
+            "must mention restorable backup:\n{md}"
+        );
     }
 
     #[test]

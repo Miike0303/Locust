@@ -43,6 +43,7 @@ assert.equal(shouldRunActionHotkey({ overlayOpen: false, target: textarea }), fa
 assert.equal(shouldRunActionHotkey({ overlayOpen: false, target: div }), true);
 
 const wiredHelpActions = [
+  "openProject",
   "translate",
   "inject",
   "applyPatch",
@@ -67,7 +68,7 @@ assert.deepEqual(
   wiredHelpActions,
   "help registry contains exactly the user-facing wired actions"
 );
-assert.equal(HELP_ACTIONS.includes("openProject"), false, "Ctrl+O is not advertised");
+assert.equal(HELP_ACTIONS.includes("openProject"), true, "Ctrl+O is advertised");
 assert.equal(HELP_ACTIONS.includes("save"), false, "Ctrl+S is not advertised");
 
 console.log("hotkeyPolicy.test.ts: ok");

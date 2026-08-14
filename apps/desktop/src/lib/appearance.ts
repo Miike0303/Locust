@@ -9,6 +9,22 @@ export interface AppearanceConfig {
   font_size?: number;
 }
 
+export const TABLE_ROW_HEIGHT_MIN = 24;
+export const TABLE_ROW_HEIGHT_MAX = 56;
+export const TABLE_ROW_HEIGHT_DEFAULT = 36;
+
+export function clampTableRowHeight(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return TABLE_ROW_HEIGHT_DEFAULT;
+  return Math.min(
+    TABLE_ROW_HEIGHT_MAX,
+    Math.max(TABLE_ROW_HEIGHT_MIN, Math.round(value)),
+  );
+}
+
+export function showSourceColumnEnabled(value: unknown): boolean {
+  return value !== false;
+}
+
 export function applyAppearance(ui: AppearanceConfig | null | undefined): void {
   const root = document.documentElement;
   const theme = ui?.theme ?? "system";

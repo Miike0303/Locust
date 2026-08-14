@@ -10,6 +10,7 @@ import {
 	Loader2,
 	Replace,
 	ChevronRight,
+	GitBranch,
 } from "lucide-react";
 import {
 	getStrings,
@@ -42,6 +43,8 @@ import SearchReplaceModal from "../components/SearchReplaceModal";
 import ValidationResultsModal from "../components/ValidationResultsModal";
 import WorkflowGuideBanner from "../components/WorkflowGuideBanner";
 import EmptyState from "../components/EmptyState";
+import PivotModal from "../components/PivotModal";
+import { pivotCarryOverCount } from "../lib/pivot";
 import { useT } from "../lib/i18n";
 
 export default function Editor() {
@@ -58,6 +61,7 @@ export default function Editor() {
 	);
 	const [patchStatusRefreshKey, setPatchStatusRefreshKey] = useState(0);
 	const [showExportModal, setShowExportModal] = useState(false);
+	const [showPivotModal, setShowPivotModal] = useState(false);
 	const [showReplaceModal, setShowReplaceModal] = useState(false);
 	const [showValidationModal, setShowValidationModal] = useState(false);
 	const [validationResult, setValidationResult] =
@@ -171,6 +175,7 @@ export default function Editor() {
 		showInjectModal ||
 		showPatchModal ||
 		showExportModal ||
+		showPivotModal ||
 		showReplaceModal ||
 		showValidationModal;
 
@@ -220,6 +225,7 @@ export default function Editor() {
 		() => {
 			if (showValidationModal) setShowValidationModal(false);
 			else if (showReplaceModal) setShowReplaceModal(false);
+			else if (showPivotModal) setShowPivotModal(false);
 			else if (showExportModal) setShowExportModal(false);
 			else if (showPatchModal) setShowPatchModal(false);
 			else if (showInjectModal) setShowInjectModal(false);
@@ -366,6 +372,16 @@ export default function Editor() {
 					>
 						<Replace size={16} /> {t("editor.replace")}
 					</button>
+
+					<button
+						type="button"
+						onClick={() => setShowPivotModal(true)}
+						disabled={!hasProject}
+						className="flex items-center gap-1 px-2 py-1.5 text-xs text-gray-500 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+						title={t("pivot.title")}
+					>
+						<GitBranch size={14} /> {t("editor.pivot")}
+					</button>
 				</div>
 			</div>
 
@@ -384,7 +400,7 @@ export default function Editor() {
 
 			{/* Filter + Table + Detail */}
 			{hasProject ? (
-				<FilterBar total={total} showing={entries.length} entries={entries} />
+				<FilterBar total={total} showing={entries.length} />
 			) : null}
 
 			<div className="flex flex-1 overflow-hidden">
@@ -469,6 +485,14 @@ export default function Editor() {
 				open={showExportModal}
 				onClose={() => setShowExportModal(false)}
 				onImported={handleRefetch}
+			/>
+
+			<PivotModal
+				open={showPivotModal}
+				onClose={() => setShowPivotModal(false)}
+				carryOverCount={
+					statsData ? pivotCarryOverCount(statsData) : null
+				}
 			/>
 
 			<SearchReplaceModal

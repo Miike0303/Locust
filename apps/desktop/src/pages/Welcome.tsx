@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, useEffect } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	FolderOpen,
@@ -19,13 +19,25 @@ import {
 	Languages,
 	FileCheck,
 	Package,
+	BookOpen,
+	Sparkles,
+	Terminal,
+	Clapperboard,
+	Puzzle,
+	Braces,
 } from "lucide-react";
-import { getFormats, getConfig, getProviders, openProject } from "../lib/api";
+import { getFormats, getConfig, getProviders } from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
 import { useQueueStore } from "../stores/queueStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 import PatchModal from "../components/PatchModal";
+import {
+	completeOpenProject,
+	formatPickerPathFromState,
+	isDetectionFailure,
+	pickGameFolder,
+} from "../lib/openProjectFlow";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
@@ -55,6 +67,12 @@ const FORMAT_ICONS: Record<string, typeof Globe> = {
 	sugarcube: Globe,
 	"html-game": Code,
 	unreal: Box,
+	kirikiri: BookOpen,
+	yuris: Sparkles,
+	nscripter: Terminal,
+	tyrano: Clapperboard,
+	qsp: Puzzle,
+	vntextpatch: Braces,
 };
 
 const FORMAT_COLORS: Record<string, string> = {
@@ -72,11 +90,22 @@ const FORMAT_COLORS: Record<string, string> = {
 	"html-game":
 		"bg-cyan-100 text-cyan-700 dark:bg-cyan-900/40 dark:text-cyan-300",
 	unreal: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
+	kirikiri:
+		"bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
+	yuris:
+		"bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300",
+	nscripter:
+		"bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
+	tyrano: "bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300",
+	qsp: "bg-teal-100 text-teal-700 dark:bg-teal-900/40 dark:text-teal-300",
+	vntextpatch:
+		"bg-lime-100 text-lime-800 dark:bg-lime-900/40 dark:text-lime-300",
 };
 
 export default function Welcome() {
 	const t = useT();
 	const navigate = useNavigate();
+	const location = useLocation();
 	const queryClient = useQueryClient();
 	const setProject = useProjectStore((s) => s.setProject);
 	const { data: formats } = useQuery({
@@ -118,25 +147,21 @@ export default function Welcome() {
 		ownEscape: true,
 	});
 
-	/** Backend detection failure (Tauri: "Could not detect game format"; HTTP 422: "format not detected"). */
-	const isDetectionFailure = (msg: string) =>
-		/detect/i.test(msg) && /format/i.test(msg);
+	useEffect(() => {
+		const pendingPath = formatPickerPathFromState(location.state);
+		if (!pendingPath) return;
+		setSelectedFormat("");
+		setPicker({ path: pendingPath, reason: "detect-failed" });
+		navigate(".", { replace: true, state: {} });
+	}, [location.state, navigate]);
 
 	const openWithPath = async (path: string, formatId?: string) => {
 		setOpening(true);
 		try {
-			const result = await openProject(path, formatId);
-			setProject({
-				path: result.project_path,
-				format_id: result.format_id,
-				name: result.project_name,
-				supported_modes: result.supported_modes,
+			const result = await completeOpenProject(path, formatId, {
+				setProject,
+				queryClient,
 			});
-			// Drop cached strings/stats from any previous project (or stale DB session).
-			void queryClient.removeQueries({ queryKey: ["strings"] });
-			void queryClient.removeQueries({ queryKey: ["stats"] });
-			void queryClient.removeQueries({ queryKey: ["string"] });
-			void queryClient.removeQueries({ queryKey: ["review-strings"] });
 			addLog(
 				"info",
 				`Opened: ${result.project_name} (${result.format_name}, ${result.total_strings} strings)`,
@@ -161,17 +186,7 @@ export default function Welcome() {
 		}
 	};
 
-	const pickFolderPath = async (): Promise<string | null> => {
-		if (IS_TAURI) {
-			const { open } = await import("@tauri-apps/plugin-dialog");
-			const selected = await open({
-				title: t("welcome.dialog.selectFolder"),
-				directory: true,
-			});
-			return typeof selected === "string" ? selected : null;
-		}
-		return prompt(t("welcome.prompt.folderPath"));
-	};
+	const pickFolderPath = () => pickGameFolder(t);
 
 	const handleConfirmFormat = async () => {
 		if (!picker) return;
@@ -571,104 +586,59 @@ export default function Welcome() {
 				</div>
 			)}
 
-			{/* Supported Formats — split into Available + Coming Soon */}
-			{formats &&
-				formats.length > 0 &&
-				(() => {
-					const available = formats.filter((f) => f.stability !== "comingsoon");
-					const comingSoon = formats.filter(
-						(f) => f.stability === "comingsoon",
-					);
-					return (
-						<>
-							<div>
-								<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
-									{t("welcome.availableFormats")}
-								</h2>
-								<div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-									{available.map((f) => {
-										const Icon = FORMAT_ICONS[f.id] ?? Globe;
-										const colorClass =
-											FORMAT_COLORS[f.id] ??
-											"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
-										const experimental = f.stability === "experimental";
-										return (
-											<div
-												key={f.id}
-												className="p-3 rounded-lg border border-gray-200 dark:border-gray-700"
-											>
-												<div className="flex items-center gap-2 mb-1">
-													<div className={`p-1.5 rounded ${colorClass}`}>
-														<Icon size={14} />
-													</div>
-													<span className="text-sm font-medium truncate">
-														{f.name}
-													</span>
-													{experimental && (
-														<span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
-															{t("welcome.format.exp")}
-														</span>
-													)}
-												</div>
-												{f.description && (
-													<p className="text-xs text-gray-500 line-clamp-2">
-														{f.description}
-													</p>
-												)}
-												<div className="mt-1.5 flex flex-wrap gap-1">
-													{f.extensions.slice(0, 3).map((ext) => (
-														<span
-															key={ext}
-															className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-gray-500"
-														>
-															{ext}
-														</span>
-													))}
-												</div>
+			{formats && formats.length > 0 && (
+				<div>
+					<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
+						{t("welcome.availableFormats")}
+					</h2>
+					<div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+						{formats
+							.filter((f) => f.stability !== "comingsoon")
+							.map((f) => {
+								const Icon = FORMAT_ICONS[f.id] ?? Globe;
+								const colorClass =
+									FORMAT_COLORS[f.id] ??
+									"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+								const experimental = f.stability === "experimental";
+								return (
+									<div
+										key={f.id}
+										className="p-3 rounded-lg border border-gray-200 dark:border-gray-700"
+									>
+										<div className="flex items-center gap-2 mb-1">
+											<div className={`p-1.5 rounded ${colorClass}`}>
+												<Icon size={14} />
 											</div>
-										);
-									})}
-								</div>
-							</div>
-
-							{comingSoon.length > 0 && (
-								<div className="mt-8">
-									<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
-										{t("welcome.comingSoon")}
-									</h2>
-									<div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-										{comingSoon.map((f) => {
-											const Icon = FORMAT_ICONS[f.id] ?? Globe;
-											return (
-												<div
-													key={f.id}
-													className="p-3 rounded-lg border border-dashed border-gray-300 dark:border-gray-700 opacity-60"
+											<span className="text-sm font-medium truncate">
+												{f.name}
+											</span>
+											{experimental && (
+												<span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+													{t("welcome.format.exp")}
+												</span>
+											)}
+										</div>
+										{f.description && (
+											<p className="text-xs text-gray-500 line-clamp-2">
+												{f.description}
+											</p>
+										)}
+										<div className="mt-1.5 flex flex-wrap gap-1">
+											{f.extensions.slice(0, 3).map((ext) => (
+												<span
+													key={ext}
+													className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-gray-500"
 												>
-													<div className="flex items-center gap-2 mb-1">
-														<div className="p-1.5 rounded bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">
-															<Icon size={14} />
-														</div>
-														<span className="text-sm font-medium">
-															{f.name}
-														</span>
-														<span className="ml-auto text-xs px-1.5 py-0.5 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 rounded">
-															{t("welcome.soon")}
-														</span>
-													</div>
-													{f.description && (
-														<p className="text-xs text-gray-500 line-clamp-2">
-															{f.description}
-														</p>
-													)}
-												</div>
-											);
-										})}
+													{ext}
+												</span>
+											))}
+										</div>
 									</div>
-								</div>
-							)}
-						</>
-					);
-				})()}
+								);
+							})}
+					</div>
+				</div>
+			)}
 
 			{/* Footer stats */}
 			<div className="mt-auto pt-8 flex justify-center gap-6 text-xs text-gray-400">

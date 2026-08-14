@@ -17,7 +17,8 @@ use tower_http::cors::CorsLayer;
 use locust_core::backup::{BackupEntry, BackupManager};
 use locust_core::config::AppConfig;
 use locust_core::database::{
-    Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, ProjectStats, TranslationRun,
+    Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, PivotResult, ProjectStats, StringFacets,
+    TranslationRun,
 };
 use locust_core::export;
 use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
@@ -215,10 +216,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/providers", get(list_providers))
         .route("/api/providers/:id/health", post(provider_health))
         .route("/api/project/open", post(project_open))
+        .route("/api/project/open-db", post(project_open_db))
         .route("/api/project/current", get(project_current))
+        .route("/api/pivot", post(pivot_project))
         .route("/api/strings", get(get_strings))
-        // Static path before `:id` so "batch" is never captured as an entry id.
+        // Static paths before `:id` so "batch" / "facets" are never captured as ids.
         .route("/api/strings/batch", post(batch_patch_strings))
+        .route("/api/strings/facets", get(get_string_facets))
         .route("/api/strings/:id", get(get_string).patch(patch_string))
         .route("/api/stats", get(get_stats))
         .route("/api/runs", get(list_translation_runs))
@@ -426,6 +430,49 @@ async fn project_open(
     Ok(Json(ProjectOpenResponse::from(outcome)))
 }
 
+#[derive(Deserialize)]
+struct OpenProjectDbRequest {
+    database_path: String,
+    game_path: String,
+    format_id: String,
+}
+
+fn map_open_db_err(e: locust_core::error::LocustError) -> ApiError {
+    let status = match &e {
+        locust_core::error::LocustError::UnsupportedFormat(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        locust_core::error::LocustError::ProjectNotFound(_)
+        | locust_core::error::LocustError::IoError(_)
+        | locust_core::error::LocustError::DatabaseError(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    err(status, e)
+}
+
+async fn project_open_db(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OpenProjectDbRequest>,
+) -> Result<Json<ProjectOpenResponse>, ApiError> {
+    let outcome = project::open_project_db(
+        &state.db,
+        &state.format_registry,
+        Path::new(&req.database_path),
+        Path::new(&req.game_path),
+        &req.format_id,
+    )
+    .map_err(map_open_db_err)?;
+
+    {
+        let mut proj = state.current_project.write().await;
+        *proj = Some(ProjectInfo {
+            path: outcome.project_path.clone(),
+            format_id: outcome.format_id.clone(),
+            name: outcome.project_name.clone(),
+        });
+    }
+
+    Ok(Json(ProjectOpenResponse::from(outcome)))
+}
+
 async fn project_current(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProjectInfo>, ApiError> {
@@ -434,6 +481,34 @@ async fn project_current(
         Some(p) => Ok(Json(p.clone())),
         None => Err(err(StatusCode::NOT_FOUND, "no project open")),
     }
+}
+
+#[derive(Deserialize)]
+struct PivotRequest {
+    output_path: String,
+}
+
+async fn pivot_project(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PivotRequest>,
+) -> Result<Json<PivotResult>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
+    let output = PathBuf::from(&req.output_path);
+    state.db.pivot_to(&output).map(Json).map_err(|e| {
+        let msg = e.to_string();
+        let status = match &e {
+            locust_core::error::LocustError::IoError(io)
+                if io.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                StatusCode::CONFLICT
+            }
+            _ if msg.to_lowercase().contains("no translated") => StatusCode::UNPROCESSABLE_ENTITY,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        err(status, e)
+    })
 }
 
 #[derive(Deserialize)]
@@ -506,6 +581,20 @@ async fn get_strings(
         offset,
         limit,
     }))
+}
+
+async fn get_string_facets(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<StringFacets>, ApiError> {
+    // Same convention as GET /api/strings: leftover rows must not leak.
+    if state.current_project.read().await.is_none() {
+        return Ok(Json(StringFacets::default()));
+    }
+    state
+        .db
+        .get_string_facets()
+        .map(Json)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 async fn get_string(
@@ -2250,6 +2339,15 @@ mod tests {
         assert_eq!(resp.status(), 422);
     }
 
+    async fn mark_project_open(state: &AppState) {
+        let mut proj = state.current_project.write().await;
+        *proj = Some(ProjectInfo {
+            path: PathBuf::from("/tmp/locust-test-game"),
+            format_id: "rpgmaker-mv".into(),
+            name: "test-game".into(),
+        });
+    }
+
     #[tokio::test]
     async fn test_get_strings_before_project_returns_empty() {
         let (url, _h, state) = setup_with_state().await;
@@ -2275,6 +2373,404 @@ mod tests {
         assert_eq!(stats.status(), 200);
         let stats_body: ProjectStats = stats.json().await.unwrap();
         assert_eq!(stats_body.total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_string_facets_before_project_returns_empty() {
+        let (url, _h, state) = setup_with_state().await;
+        let leftover = StringEntry::new("stale", "Old session", PathBuf::from("old.json"))
+            .with_tags(vec!["dialogue".into()]);
+        state.db.save_entries(&[leftover]).unwrap();
+
+        let resp = client()
+            .get(format!("{}/api/strings/facets", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["file_paths"], serde_json::json!([]));
+        assert_eq!(body["tags"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_string_facets_are_project_wide_not_the_current_page() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+
+        let mut entries = Vec::new();
+        for i in 0..120 {
+            let file = match i % 3 {
+                0 => "data/Map001.json",
+                1 => "data/Actors.json",
+                _ => "data/Map002.json",
+            };
+            let mut e = StringEntry::new(format!("e{i}"), format!("S{i}"), PathBuf::from(file));
+            e.tags = match i % 3 {
+                0 => vec!["dialogue".into(), "ui_label".into()],
+                1 => vec!["ui_label".into()],
+                _ => vec!["dialogue".into()],
+            };
+            entries.push(e);
+        }
+        let mut extra = StringEntry::new("zz", "Last", PathBuf::from("data/System.json"));
+        extra.tags = vec!["system".into()];
+        entries.push(extra);
+        state.db.save_entries(&entries).unwrap();
+
+        let resp = client()
+            .get(format!("{}/api/strings/facets", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.status());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["file_paths"],
+            serde_json::json!([
+                "data/Actors.json",
+                "data/Map001.json",
+                "data/Map002.json",
+                "data/System.json"
+            ])
+        );
+        assert_eq!(
+            body["tags"],
+            serde_json::json!(["dialogue", "system", "ui_label"])
+        );
+    }
+
+    fn translated(id: &str, source: &str, file: &str, translation: &str) -> StringEntry {
+        let mut e = StringEntry::new(id, source, PathBuf::from(file));
+        e.translation = Some(translation.into());
+        e.status = StringStatus::Translated;
+        e
+    }
+
+    #[tokio::test]
+    async fn test_pivot_without_project_is_clean_error() {
+        let (url, _h) = setup().await;
+        let resp = client()
+            .post(format!("{}/api/pivot", url))
+            .json(&serde_json::json!({"output_path": "/tmp/x.locust.db"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{}", resp.status());
+        assert_ne!(resp.status(), 500);
+        let text = resp.text().await.unwrap();
+        assert!(
+            text.to_lowercase().contains("no project"),
+            "clean error: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pivot_creates_new_db_skips_pending_leaves_source_untouched() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[
+                translated("a", "Hello", "data/Actors.json", "Hola"),
+                StringEntry::new("b", "World", PathBuf::from("data/Actors.json")),
+            ])
+            .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("locust_pivot_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("new.locust.db");
+
+        let resp = client()
+            .post(format!("{}/api/pivot", url))
+            .json(&serde_json::json!({"output_path": out.to_string_lossy()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.status());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["entries"], 1);
+        assert_eq!(body["database_path"], out.to_string_lossy().as_ref());
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "test-game");
+
+        let src_entries = state.db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(src_entries.len(), 2);
+        assert_eq!(
+            src_entries.iter().find(|e| e.id == "a").unwrap().source,
+            "Hello"
+        );
+
+        let new_db = Database::open(&out).unwrap();
+        let pivoted = new_db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(pivoted.len(), 1);
+        assert_eq!(pivoted[0].source, "Hola");
+        assert!(pivoted[0].translation.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pivot_refuses_existing_output_path() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[translated("a", "Hello", "f.json", "Hola")])
+            .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("locust_pivot_ex_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("exists.locust.db");
+        std::fs::write(&out, b"keep-me").unwrap();
+
+        let resp = client()
+            .post(format!("{}/api/pivot", url))
+            .json(&serde_json::json!({"output_path": out.to_string_lossy()}))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{}", resp.status());
+        assert_ne!(resp.status(), 500);
+        let text = resp.text().await.unwrap();
+        assert!(
+            text.to_lowercase().contains("exist") || text.to_lowercase().contains("overwrite"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"keep-me");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_opendb_locust(dir: &Path, name: &str, rows: &[StringEntry]) -> PathBuf {
+        let path = dir.join(name);
+        let db = Database::open(&path).unwrap();
+        db.save_entries(rows).unwrap();
+        drop(db);
+        path
+    }
+
+    #[tokio::test]
+    async fn test_open_db_switches_without_extract_or_touching_source() {
+        let dir = std::env::temp_dir().join(format!("locust_opendb_ok_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source_path = write_opendb_locust(
+            &dir,
+            "source.locust.db",
+            &[
+                translated("a", "Hello", "data/Actors.json", "Hola"),
+                StringEntry::new("b", "World", PathBuf::from("data/Actors.json")),
+            ],
+        );
+        let state = create_test_state_with_db(&source_path);
+        mark_project_open(&state).await;
+        let (url, _h) = start_test_server(state.clone()).await;
+
+        let pivot = dir.join("pivoted.locust.db");
+        let pivoted = state.db.pivot_to(&pivot).unwrap();
+        assert_eq!(pivoted.entries, 1);
+
+        let game = dir.join("SomeGame");
+        std::fs::create_dir_all(&game).unwrap();
+
+        let resp = client()
+            .post(format!("{}/api/project/open-db", url))
+            .json(&serde_json::json!({
+                "database_path": pivot.to_string_lossy(),
+                "game_path": game.to_string_lossy(),
+                "format_id": "rpgmaker-mv"
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["format_id"], "rpgmaker-mv");
+        assert_eq!(body["format_name"], "RPG Maker MV/MZ");
+        assert_eq!(body["total_strings"], 1);
+        assert_eq!(body["added"], 0);
+        assert_eq!(body["updated"], 0);
+        assert_eq!(body["stale_source_reset"], 0);
+        assert_eq!(body["removed"], 0);
+        assert_eq!(body["preserved_translations"], 0);
+        assert_eq!(body["project_name"], "SomeGame");
+        assert_eq!(body["database_path"], pivot.to_string_lossy().as_ref());
+        assert_eq!(body["project_path"], game.to_string_lossy().as_ref());
+        assert!(body["supported_modes"]
+            .as_array()
+            .is_some_and(|m| !m.is_empty()));
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "SomeGame");
+        assert_eq!(cur_body["format_id"], "rpgmaker-mv");
+
+        let live = state.db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, "a");
+        assert_eq!(live[0].source, "Hola");
+        assert!(live[0].translation.is_none());
+
+        let src = Database::open(&source_path).unwrap();
+        let src_rows = src.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(src_rows.len(), 2);
+        assert_eq!(
+            src_rows.iter().find(|e| e.id == "a").unwrap().source,
+            "Hello"
+        );
+        assert_eq!(
+            src_rows
+                .iter()
+                .find(|e| e.id == "a")
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Hola")
+        );
+        drop(src);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_open_db_rejects_non_locust_and_keeps_current() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[translated("keep", "Hello", "f.json", "Hola")])
+            .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("locust_opendb_bad_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = dir.join("not-locust.db");
+        std::fs::write(&other, b"not-a-sqlite-database").unwrap();
+
+        let resp = client()
+            .post(format!("{}/api/project/open-db", url))
+            .json(&serde_json::json!({
+                "database_path": other.to_string_lossy(),
+                "game_path": dir.to_string_lossy(),
+                "format_id": "rpgmaker-mv"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{}", resp.status());
+        assert_ne!(resp.status(), 500);
+        let text = resp.text().await.unwrap();
+        assert!(
+            text.to_lowercase()
+                .contains("not a locust project database"),
+            "clean error: {text}"
+        );
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "test-game");
+        assert_eq!(cur_body["format_id"], "rpgmaker-mv");
+
+        let keep = state.db.get_entry("keep").unwrap().unwrap();
+        assert_eq!(keep.source, "Hello");
+        assert_eq!(keep.translation.as_deref(), Some("Hola"));
+        assert_eq!(std::fs::read(&other).unwrap(), b"not-a-sqlite-database");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_open_db_rejects_missing_file() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[translated("keep", "Hello", "f.json", "Hola")])
+            .unwrap();
+
+        let missing = std::env::temp_dir().join(format!(
+            "locust_opendb_missing_{}.locust.db",
+            uuid::Uuid::new_v4()
+        ));
+        let resp = client()
+            .post(format!("{}/api/project/open-db", url))
+            .json(&serde_json::json!({
+                "database_path": missing.to_string_lossy(),
+                "game_path": "/tmp/game",
+                "format_id": "rpgmaker-mv"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{}", resp.status());
+        assert_ne!(resp.status(), 500);
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "test-game");
+        assert!(state.db.get_entry("keep").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_open_db_rejects_unknown_format() {
+        let dir = std::env::temp_dir().join(format!("locust_opendb_fmt_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = write_opendb_locust(
+            &dir,
+            "ok.locust.db",
+            &[translated("a", "Hello", "f.json", "Hola")],
+        );
+
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[translated("keep", "Stay", "f.json", "Queda")])
+            .unwrap();
+
+        let resp = client()
+            .post(format!("{}/api/project/open-db", url))
+            .json(&serde_json::json!({
+                "database_path": db_path.to_string_lossy(),
+                "game_path": dir.to_string_lossy(),
+                "format_id": "not-a-format"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("not-a-format"), "{text}");
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "test-game");
+        assert_eq!(state.db.path(), PathBuf::from(":memory:"));
+        assert!(state.db.get_entry("keep").unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

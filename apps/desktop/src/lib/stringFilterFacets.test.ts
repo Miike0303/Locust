@@ -4,11 +4,10 @@
  */
 import {
   coerceExactFilterValue,
+  facetOptions,
   filePathFilterPatch,
   filePathOptionLabel,
   tagFilterPatch,
-  uniqueSortedFilePaths,
-  uniqueSortedTags,
 } from "./stringFilterFacets.ts";
 
 const assert = {
@@ -23,24 +22,6 @@ const assert = {
     }
   },
 };
-
-const entries = [
-  { file_path: "scripts/zeta.json", tags: [" ui ", "quest", ""] },
-  { file_path: "scripts/alpha.json", tags: ["quest", "  combat  "] },
-  { file_path: "scripts/zeta.json", tags: ["ui", "   "] },
-  { file_path: "", tags: [] },
-];
-
-assert.deepEqual(
-  uniqueSortedFilePaths(entries),
-  ["scripts/alpha.json", "scripts/zeta.json"],
-  "file paths are unique, sorted, and non-empty"
-);
-assert.deepEqual(
-  uniqueSortedTags(entries),
-  ["combat", "quest", "ui"],
-  "tags are flattened, trimmed, non-empty, unique, and sorted"
-);
 
 assert.equal(coerceExactFilterValue("  scripts/alpha.json  "), "scripts/alpha.json");
 assert.equal(coerceExactFilterValue("quest"), "quest");
@@ -61,5 +42,13 @@ assert.deepEqual(tagFilterPatch(""), { tag: undefined, offset: 0 });
 assert.equal(filePathOptionLabel("scripts/dialogue/main.json"), "main.json");
 assert.equal(filePathOptionLabel("scripts\\dialogue\\main.json"), "main.json");
 assert.equal(filePathOptionLabel("main.json"), "main.json");
+
+assert.deepEqual(facetOptions(undefined), []);
+assert.deepEqual(facetOptions([]), []);
+assert.deepEqual(
+  facetOptions(["  ui ", "", "quest", "   "]),
+  ["ui", "quest"],
+  "blank facet values are dropped"
+);
 
 console.log("stringFilterFacets.test.ts: ok");

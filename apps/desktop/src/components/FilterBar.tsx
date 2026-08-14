@@ -1,14 +1,15 @@
 import { useState, useEffect, type KeyboardEvent } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Search, X, ChevronLeft, ChevronRight } from "lucide-react";
 import clsx from "clsx";
 import { useEditorStore } from "../stores/editorStore";
-import type { StringEntry, StringStatus } from "../lib/api";
+import { useProjectStore } from "../stores/projectStore";
+import { getStringFacets, type StringStatus } from "../lib/api";
 import {
+	facetOptions,
 	filePathFilterPatch,
 	filePathOptionLabel,
 	tagFilterPatch,
-	uniqueSortedFilePaths,
-	uniqueSortedTags,
 } from "../lib/stringFilterFacets";
 import { useT } from "../lib/i18n";
 
@@ -32,17 +33,24 @@ const statusColors: Record<string, string> = {
 interface FilterBarProps {
 	total: number;
 	showing: number;
-	entries: StringEntry[];
 }
 
-export default function FilterBar({ total, showing, entries }: FilterBarProps) {
+export default function FilterBar({ total, showing }: FilterBarProps) {
 	const t = useT();
+	const projectPath = useProjectStore((s) => s.project?.path);
 	const { filter, setFilter } = useEditorStore();
 	const [searchInput, setSearchInput] = useState(filter.search || "");
 	const [filePathDraft, setFilePathDraft] = useState(filter.file_path || "");
 	const [tagDraft, setTagDraft] = useState(filter.tag || "");
-	const filePaths = uniqueSortedFilePaths(entries);
-	const tags = uniqueSortedTags(entries);
+	const { data: facets } = useQuery({
+		queryKey: ["string-facets", projectPath],
+		queryFn: getStringFacets,
+		enabled: !!projectPath,
+		staleTime: Infinity,
+		retry: false,
+	});
+	const filePaths = facetOptions(facets?.file_paths);
+	const tags = facetOptions(facets?.tags);
 
 	useEffect(() => {
 		const timer = setTimeout(() => {

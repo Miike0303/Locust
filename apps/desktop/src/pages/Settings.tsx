@@ -11,7 +11,7 @@ import {
   xaiAuthStart, xaiAuthPoll,
 } from "../lib/api";
 import type { GlossaryEntry, TranslationRun, ProviderInfo } from "../lib/api";
-import { applyAppearance } from "../lib/appearance";
+import { applyAppearance, clampTableRowHeight, TABLE_ROW_HEIGHT_MAX, TABLE_ROW_HEIGHT_MIN } from "../lib/appearance";
 import { resolveProviderReadiness } from "../lib/providerReadiness";
 import {
   GROK_SUB_PROVIDER_ID,
@@ -664,6 +664,18 @@ function AppearanceSection() {
     applyAppearance(ui);
   };
 
+  const setShowSourceColumn = async (show: boolean) => {
+    const ui = { ...config?.ui, show_source_column: show };
+    await updateConfig({ ui } as any);
+    qc.invalidateQueries({ queryKey: ["config"] });
+  };
+
+  const setTableRowHeight = async (height: number) => {
+    const ui = { ...config?.ui, table_row_height: height };
+    await updateConfig({ ui } as any);
+    qc.invalidateQueries({ queryKey: ["config"] });
+  };
+
   if (!config) return null;
 
   return (
@@ -685,6 +697,38 @@ function AppearanceSection() {
         <input type="range" min={12} max={18} value={config.ui.font_size}
           onChange={(e) => setFontSize(+e.target.value)}
           className="mt-1 w-full" />
+      </div>
+      <label className="flex items-start gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={config.ui.show_source_column !== false}
+          onChange={(e) => setShowSourceColumn(e.target.checked)}
+        />
+        <span>
+          <span className="text-sm font-medium">{t("settings.appearance.showSourceColumn")}</span>
+          <span className="block text-xs text-gray-500 mt-0.5">
+            {t("settings.appearance.showSourceColumnHint")}
+          </span>
+        </span>
+      </label>
+      <div>
+        <label className="text-sm font-medium">
+          {t("settings.appearance.tableRowHeight", {
+            size: clampTableRowHeight(config.ui.table_row_height),
+          })}
+        </label>
+        <input
+          type="range"
+          min={TABLE_ROW_HEIGHT_MIN}
+          max={TABLE_ROW_HEIGHT_MAX}
+          value={clampTableRowHeight(config.ui.table_row_height)}
+          onChange={(e) => setTableRowHeight(+e.target.value)}
+          className="mt-1 w-full"
+        />
+        <p className="text-xs text-gray-500 mt-0.5">
+          {t("settings.appearance.tableRowHeightHint")}
+        </p>
       </div>
       <div>
         <label className="text-sm font-medium" htmlFor="ui-language">

@@ -81,6 +81,7 @@ export default function PatchModal({
 	const [outputPath, setOutputPath] = useState("");
 	const [languages, setLanguages] = useState("");
 	const [pristine, setPristine] = useState(false);
+	const [pristinePath, setPristinePath] = useState("");
 	const [force, setForce] = useState(false);
 	const [confirmLegacy, setConfirmLegacy] = useState(false);
 	const [dryRun, setDryRun] = useState(false);
@@ -214,6 +215,26 @@ export default function PatchModal({
 				outputPath || "locust-patch.zip",
 			);
 			if (path) setOutputPath(path);
+		}
+	};
+
+	const pickPristineFolder = async () => {
+		if (IS_TAURI) {
+			const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
+			const selected = await openDialog({
+				title: t("patch.dialog.pristineFolder"),
+				directory: true,
+			});
+			if (typeof selected === "string") {
+				setPristinePath(selected);
+				setPristine(true);
+			}
+		} else {
+			const path = prompt(t("patch.prompt.pristineFolder"));
+			if (path) {
+				setPristinePath(path);
+				setPristine(true);
+			}
 		}
 	};
 
@@ -516,6 +537,7 @@ export default function PatchModal({
 				output_path: outputPath.trim(),
 				languages: langs,
 				pristine,
+				pristine_path: pristinePath.trim() || undefined,
 			});
 			setPackResult(report);
 			addLog(
@@ -993,6 +1015,35 @@ export default function PatchModal({
 									</span>
 								</span>
 							</label>
+
+							<div>
+								<label className="text-sm font-medium">{t("patch.pristinePath")}</label>
+								<div className="flex gap-2 mt-1">
+									<input
+										value={pristinePath}
+										onChange={(e) => {
+											const value = e.target.value;
+											setPristinePath(value);
+											if (value.trim()) setPristine(true);
+										}}
+										placeholder={t("patch.pristinePathPlaceholder")}
+										className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+									/>
+									<button
+										type="button"
+										onClick={() => {
+											void pickPristineFolder();
+										}}
+										className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"
+										title={t("common.browse")}
+									>
+										<FolderOpen size={16} />
+									</button>
+								</div>
+								<p className="text-xs text-gray-500 mt-1">
+									{t("patch.pristinePathHint")}
+								</p>
+							</div>
 
 							<button
 								onClick={handlePack}

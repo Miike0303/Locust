@@ -9,6 +9,7 @@ export interface HotkeyPolicyContext {
 }
 
 export const HELP_ACTIONS: readonly string[] = [
+  "openProject",
   "translate",
   "inject",
   "applyPatch",

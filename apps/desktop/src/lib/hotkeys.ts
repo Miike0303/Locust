@@ -1,10 +1,20 @@
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   HELP_ACTIONS,
   shouldHandleEscape,
   shouldRunActionHotkey,
 } from "./hotkeyPolicy";
+import {
+  completeOpenProject,
+  isDetectionFailure,
+  pickGameFolder,
+} from "./openProjectFlow";
+import { useProjectStore } from "../stores/projectStore";
+import { addLog } from "../stores/logStore";
+import { addToast } from "../stores/toastStore";
+import { useT } from "./i18n";
 
 export interface HotkeyBinding {
   key: string;
@@ -28,7 +38,6 @@ export const HOTKEY_MAP: Record<string, HotkeyBinding> = {
   reviewMode:     { key: "r", ctrl: true, shift: true, description: "Open review mode", group: "Navigation" },
   settings:       { key: "s", ctrl: true, shift: true, description: "Open settings", group: "Navigation" },
   memory:         { key: "m", ctrl: true, shift: true, description: "Translation memory", group: "Navigation" },
-  save:           { key: "s", ctrl: true, description: "Save current edit", group: "Editor" },
   closePanel:     { key: "Escape", description: "Close panel / modal", group: "General" },
   showHelp:       { key: "?", description: "Show keyboard shortcuts", group: "General" },
   showHelpF1:     { key: "F1", description: "Show keyboard shortcuts", group: "General" },
@@ -89,9 +98,48 @@ export function useHotkey(
   }, [action, enabled, allowInEditable, capture]);
 }
 
+let openProjectInFlight = false;
+
 export function useGlobalHotkeys(onShowHelp: () => void) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const setProject = useProjectStore((s) => s.setProject);
+  const t = useT();
 
+  useHotkey("openProject", () => {
+    if (openProjectInFlight) return;
+    void (async () => {
+      openProjectInFlight = true;
+      try {
+        const path = await pickGameFolder(t);
+        if (!path) return;
+        try {
+          const result = await completeOpenProject(path, undefined, {
+            setProject,
+            queryClient,
+          });
+          addLog(
+            "info",
+            `Opened: ${result.project_name} (${result.format_name}, ${result.total_strings} strings)`,
+            undefined,
+            "project",
+          );
+          navigate("/editor");
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (isDetectionFailure(msg)) {
+            addLog("warning", "Could not auto-detect game engine", path, "project");
+            navigate("/", { state: { formatPickerPath: path } });
+          } else {
+            addLog("error", "Failed to open project", msg, "project");
+            addToast("error", t("welcome.toast.failedOpen", { error: msg }));
+          }
+        }
+      } finally {
+        openProjectInFlight = false;
+      }
+    })();
+  });
   useHotkey("navHome", () => navigate("/"));
   useHotkey("navEditor", () => navigate("/editor"));
   useHotkey("navReview", () => navigate("/review"));

@@ -66,6 +66,21 @@ pub struct ProjectStats {
     pub total_cost_usd: f64,
 }
 
+/// Distinct file paths and tags across the whole project (not one page).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StringFacets {
+    pub file_paths: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+/// Result of [`Database::pivot_to`]: a new project whose SOURCE is this
+/// project's translations.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PivotResult {
+    pub database_path: String,
+    pub entries: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub source_hash: String,
@@ -512,6 +527,75 @@ impl Database {
             Some(row) => Ok(Some(raw_to_entry(row?)?)),
             None => Ok(None),
         }
+    }
+
+    /// Distinct `file_path` and tag values for the whole project.
+    /// Tags are a JSON array column; flattened via `json_each`, not by
+    /// loading every `StringEntry`.
+    pub fn get_string_facets(&self) -> Result<StringFacets> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut file_stmt =
+            conn.prepare("SELECT DISTINCT file_path FROM strings ORDER BY file_path")?;
+        let file_paths = file_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+
+        let mut tag_stmt = conn.prepare(
+            "SELECT DISTINCT je.value
+             FROM strings
+             JOIN json_each(strings.tags) AS je
+             WHERE json_valid(strings.tags)
+               AND json_type(strings.tags) = 'array'
+               AND typeof(je.value) = 'text'
+               AND length(je.value) > 0
+             ORDER BY je.value",
+        )?;
+        let tags = tag_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+
+        Ok(StringFacets { file_paths, tags })
+    }
+
+    /// Write a new project DB at `output` whose SOURCE text is this project's
+    /// non-empty translations. Does not modify `self`. Refuses to overwrite.
+    pub fn pivot_to(&self, output: &Path) -> Result<PivotResult> {
+        if output.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("refusing to overwrite existing file: {}", output.display()),
+            )
+            .into());
+        }
+
+        let entries = self.get_entries(&EntryFilter::default())?;
+        let mut pivoted: Vec<StringEntry> = Vec::new();
+        for e in entries {
+            let Some(translation) = e.translation.filter(|t| !t.trim().is_empty()) else {
+                continue;
+            };
+            let mut ne = StringEntry::new(e.id, translation, e.file_path);
+            ne.context = e.context;
+            ne.tags = e.tags;
+            ne.char_limit = e.char_limit;
+            ne.metadata = e.metadata;
+            pivoted.push(ne);
+        }
+
+        if pivoted.is_empty() {
+            return Err(LocustError::Other(anyhow::anyhow!(
+                "no translated entries in {} to pivot from",
+                self.path().display()
+            )));
+        }
+
+        let out_db = Database::open(output)?;
+        let count = out_db.save_entries(&pivoted)?;
+        Ok(PivotResult {
+            database_path: output.to_string_lossy().into_owned(),
+            entries: count,
+        })
     }
 
     pub fn count_entries(&self, filter: &EntryFilter) -> Result<usize> {
@@ -2215,5 +2299,127 @@ mod tests {
         );
         let empty = Database::open_in_memory().unwrap();
         assert_eq!(empty.resolve_export_source_lang("es", "ja").unwrap(), "ja");
+    }
+
+    #[test]
+    fn test_string_facets_are_distinct_sorted_and_project_wide() {
+        let db = Database::open_in_memory().unwrap();
+        let mut entries = Vec::new();
+        // More rows than a typical 100-row page so facets cannot come from
+        // whatever is currently on screen.
+        for i in 0..120 {
+            let file = match i % 3 {
+                0 => "data/Map001.json",
+                1 => "data/Actors.json",
+                _ => "data/Map002.json",
+            };
+            let mut e = StringEntry::new(format!("e{i}"), format!("S{i}"), PathBuf::from(file));
+            e.tags = match i % 3 {
+                0 => vec!["dialogue".into(), "ui_label".into()],
+                1 => vec!["ui_label".into()],
+                _ => vec!["dialogue".into()],
+            };
+            entries.push(e);
+        }
+        let mut extra = StringEntry::new("zz", "Last", PathBuf::from("data/System.json"));
+        extra.tags = vec!["system".into()];
+        entries.push(extra);
+        db.save_entries(&entries).unwrap();
+
+        let facets = db.get_string_facets().unwrap();
+        assert_eq!(
+            facets.file_paths,
+            vec![
+                "data/Actors.json",
+                "data/Map001.json",
+                "data/Map002.json",
+                "data/System.json",
+            ]
+        );
+        assert_eq!(facets.tags, vec!["dialogue", "system", "ui_label"]);
+    }
+
+    #[test]
+    fn test_string_facets_empty_project() {
+        let db = Database::open_in_memory().unwrap();
+        let facets = db.get_string_facets().unwrap();
+        assert!(facets.file_paths.is_empty());
+        assert!(facets.tags.is_empty());
+    }
+
+    fn translated_entry(id: &str, source: &str, file: &str, translation: &str) -> StringEntry {
+        let mut e = StringEntry::new(id, source, PathBuf::from(file));
+        e.translation = Some(translation.into());
+        e.status = StringStatus::Translated;
+        e
+    }
+
+    #[test]
+    fn test_pivot_to_uses_translations_as_sources_and_skips_pending() {
+        let src = Database::open_in_memory().unwrap();
+        let mut done = translated_entry("a", "Hello", "data/Actors.json", "Hola");
+        done.context = Some("npc".into());
+        done.tags = vec!["dialogue".into()];
+        done.char_limit = Some(20);
+        let pending = StringEntry::new("b", "World", PathBuf::from("data/Actors.json"));
+        let whitespace = translated_entry("c", "Skip me", "data/Actors.json", "   ");
+        src.save_entries(&[done, pending, whitespace]).unwrap();
+
+        let dir = recording_tempdir();
+        let out = dir.join("pivoted.locust.db");
+        let result = src.pivot_to(&out).unwrap();
+        assert_eq!(result.entries, 1);
+        assert_eq!(result.database_path, out.to_string_lossy());
+
+        let new_db = Database::open(&out).unwrap();
+        let entries = new_db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "a");
+        assert_eq!(entries[0].source, "Hola");
+        assert!(entries[0].translation.is_none());
+        assert_eq!(entries[0].status, StringStatus::Pending);
+        assert_eq!(entries[0].context.as_deref(), Some("npc"));
+        assert_eq!(entries[0].tags, vec!["dialogue".to_string()]);
+        assert_eq!(entries[0].char_limit, Some(20));
+
+        let original = src.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(original.len(), 3);
+        let hello = original.iter().find(|e| e.id == "a").unwrap();
+        assert_eq!(hello.source, "Hello");
+        assert_eq!(hello.translation.as_deref(), Some("Hola"));
+        assert_eq!(hello.status, StringStatus::Translated);
+        let world = original.iter().find(|e| e.id == "b").unwrap();
+        assert_eq!(world.source, "World");
+        assert!(world.translation.is_none());
+    }
+
+    #[test]
+    fn test_pivot_to_refuses_existing_output_path() {
+        let src = Database::open_in_memory().unwrap();
+        src.save_entries(&[translated_entry("a", "Hello", "f.json", "Hola")])
+            .unwrap();
+
+        let dir = recording_tempdir();
+        let out = dir.join("exists.locust.db");
+        std::fs::write(&out, b"nope").unwrap();
+        let err = src.pivot_to(&out).expect_err("must refuse overwrite");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("exist") || msg.contains("overwrite"), "{msg}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"nope");
+    }
+
+    #[test]
+    fn test_pivot_to_errors_when_nothing_is_translated() {
+        let src = Database::open_in_memory().unwrap();
+        src.save_entries(&[StringEntry::new("b", "World", PathBuf::from("f.json"))])
+            .unwrap();
+        let dir = recording_tempdir();
+        let out = dir.join("empty-pivot.locust.db");
+        let err = src.pivot_to(&out).expect_err("must refuse empty pivot");
+        assert!(
+            err.to_string().to_lowercase().contains("no translated"),
+            "{err}"
+        );
+        assert!(!out.exists(), "must not create an empty output db");
     }
 }

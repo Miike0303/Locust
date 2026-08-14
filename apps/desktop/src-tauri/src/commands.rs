@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use locust_core::config::AppConfig;
-use locust_core::database::{EntryFilter, GlossaryEntry, ProjectStats};
+use locust_core::database::{EntryFilter, GlossaryEntry, PivotResult, ProjectStats, StringFacets};
 use locust_core::extraction::PluginInfo;
 use locust_core::models::{OutputMode, StringEntry, StringStatus};
 use locust_core::project;
@@ -36,7 +36,9 @@ pub async fn pick_game_folder() -> Result<Option<String>, String> {
 
 // ─── Project commands ───────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+// Plain derive is fine here — unlike `TokenStore`, every field is already
+// serialized to the frontend, so `{:?}` exposes nothing new.
+#[derive(Serialize, Debug)]
 pub struct ProjectOpenResponse {
     pub format_id: String,
     pub format_name: String,
@@ -96,6 +98,57 @@ pub async fn open_project(
         removed: outcome.removed,
         preserved_translations: outcome.preserved_translations,
     })
+}
+
+async fn apply_open_project_db(
+    s: &AppState,
+    database_path: String,
+    game_path: String,
+    format_id: String,
+) -> Result<ProjectOpenResponse, String> {
+    let outcome = project::open_project_db(
+        &s.db,
+        &s.format_registry,
+        Path::new(&database_path),
+        Path::new(&game_path),
+        &format_id,
+    )
+    .map_err(|e| e.to_string())?;
+
+    {
+        let mut proj = s.current_project.write().await;
+        *proj = Some(ProjectInfo {
+            path: outcome.project_path.clone(),
+            format_id: outcome.format_id.clone(),
+            name: outcome.project_name.clone(),
+        });
+    }
+
+    Ok(ProjectOpenResponse {
+        format_id: outcome.format_id,
+        format_name: outcome.format_name,
+        total_strings: outcome.total_strings,
+        project_path: outcome.project_path.to_string_lossy().into_owned(),
+        project_name: outcome.project_name,
+        supported_modes: outcome.supported_modes,
+        database_path: outcome.database_path.to_string_lossy().into_owned(),
+        added: outcome.added,
+        updated: outcome.updated,
+        stale_source_reset: outcome.stale_source_reset,
+        removed: outcome.removed,
+        preserved_translations: outcome.preserved_translations,
+    })
+}
+
+/// Open an existing Locust project database without extracting or merging.
+#[tauri::command]
+pub async fn open_project_db(
+    database_path: String,
+    game_path: String,
+    format_id: String,
+    state: State<'_, AppStateWrapper>,
+) -> Result<ProjectOpenResponse, String> {
+    apply_open_project_db(&state.0, database_path, game_path, format_id).await
 }
 
 // ─── Format & Provider commands ─────────────────────────────────────────────
@@ -199,6 +252,29 @@ pub async fn get_strings(
         offset,
         limit,
     })
+}
+
+#[tauri::command]
+pub async fn get_string_facets(state: State<'_, AppStateWrapper>) -> Result<StringFacets, String> {
+    if state.0.current_project.read().await.is_none() {
+        return Ok(StringFacets::default());
+    }
+    state.0.db.get_string_facets().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn run_pivot(
+    output_path: String,
+    state: State<'_, AppStateWrapper>,
+) -> Result<PivotResult, String> {
+    if state.0.current_project.read().await.is_none() {
+        return Err("no project open".into());
+    }
+    state
+        .0
+        .db
+        .pivot_to(&PathBuf::from(output_path))
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize)]
@@ -682,6 +758,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn string_facets_and_pivot_json_keep_contract_field_names() {
+        let facets = serde_json::to_value(StringFacets {
+            file_paths: vec!["data/Actors.json".into()],
+            tags: vec!["dialogue".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            facets.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["file_paths", "tags"]
+        );
+
+        let pivoted = serde_json::to_value(PivotResult {
+            database_path: "/tmp/out.locust.db".into(),
+            entries: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            pivoted.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["database_path", "entries"]
+        );
+    }
+
+    #[test]
     fn translate_params_deserializes_fallback_provider_ids() {
         let params: TranslateParams = serde_json::from_value(serde_json::json!({
             "provider_id": "always-error",
@@ -773,6 +872,184 @@ mod tests {
         );
         let resp = poll_xai_device_login(&state, &handle).await.unwrap();
         assert_eq!(resp.status, XaiAuthStatus::Pending);
+    }
+
+    fn write_tauri_locust_db(rows: &[StringEntry]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "locust_opendb_tauri_{}.locust.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = locust_core::database::Database::open(&path).unwrap();
+        db.save_entries(rows).unwrap();
+        drop(db);
+        path
+    }
+
+    fn translated_entry(id: &str, source: &str, translation: &str) -> StringEntry {
+        let mut e = StringEntry::new(id, source, PathBuf::from("data/a.json"));
+        e.translation = Some(translation.into());
+        e.status = StringStatus::Translated;
+        e
+    }
+
+    #[tokio::test]
+    async fn open_project_db_switches_without_extract_or_touching_source() {
+        let dir = std::env::temp_dir().join(format!("locust_opendb_t_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source_path = dir.join("source.locust.db");
+        {
+            let src = locust_core::database::Database::open(&source_path).unwrap();
+            src.save_entries(&[
+                translated_entry("a", "Hello", "Hola"),
+                StringEntry::new("b", "World", PathBuf::from("data/a.json")),
+            ])
+            .unwrap();
+            drop(src);
+        }
+
+        let state = locust_server::create_test_state_with_db(&source_path);
+        *state.current_project.write().await = Some(ProjectInfo {
+            path: PathBuf::from("/tmp/original-game"),
+            format_id: "rpgmaker-mv".into(),
+            name: "original-game".into(),
+        });
+
+        let pivot = dir.join("pivoted.locust.db");
+        assert_eq!(state.db.pivot_to(&pivot).unwrap().entries, 1);
+
+        let game = dir.join("PivotedGame");
+        std::fs::create_dir_all(&game).unwrap();
+
+        let out = apply_open_project_db(
+            &state,
+            pivot.to_string_lossy().into_owned(),
+            game.to_string_lossy().into_owned(),
+            "rpgmaker-mv".into(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.total_strings, 1);
+        assert_eq!(out.added, 0);
+        assert_eq!(out.updated, 0);
+        assert_eq!(out.stale_source_reset, 0);
+        assert_eq!(out.removed, 0);
+        assert_eq!(out.preserved_translations, 0);
+        assert_eq!(out.format_id, "rpgmaker-mv");
+        assert_eq!(out.project_name, "PivotedGame");
+        assert_eq!(out.database_path, pivot.to_string_lossy());
+
+        let live = state.db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].source, "Hola");
+
+        let cur = state.current_project.read().await.clone().unwrap();
+        assert_eq!(cur.name, "PivotedGame");
+        assert_eq!(cur.format_id, "rpgmaker-mv");
+
+        let src = locust_core::database::Database::open(&source_path).unwrap();
+        let src_rows = src.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(src_rows.len(), 2);
+        assert_eq!(
+            src_rows.iter().find(|e| e.id == "a").unwrap().source,
+            "Hello"
+        );
+        drop(src);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_project_db_rejects_non_locust_and_keeps_current() {
+        let state = locust_server::create_test_state();
+        *state.current_project.write().await = Some(ProjectInfo {
+            path: PathBuf::from("/tmp/original-game"),
+            format_id: "rpgmaker-mv".into(),
+            name: "original-game".into(),
+        });
+        state
+            .db
+            .save_entries(&[translated_entry("keep", "Hello", "Hola")])
+            .unwrap();
+
+        let other = std::env::temp_dir().join(format!(
+            "locust_opendb_tauri_bad_{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&other, b"not-a-sqlite-database").unwrap();
+
+        let err = apply_open_project_db(
+            &state,
+            other.to_string_lossy().into_owned(),
+            "/tmp/game".into(),
+            "rpgmaker-mv".into(),
+        )
+        .await
+        .expect_err("must reject");
+        assert!(
+            err.to_lowercase().contains("not a locust project database"),
+            "{err}"
+        );
+
+        let cur = state.current_project.read().await.clone().unwrap();
+        assert_eq!(cur.name, "original-game");
+        assert_eq!(state.db.get_entry("keep").unwrap().unwrap().source, "Hello");
+        assert_eq!(std::fs::read(&other).unwrap(), b"not-a-sqlite-database");
+        let _ = std::fs::remove_file(&other);
+    }
+
+    #[tokio::test]
+    async fn open_project_db_rejects_missing_file() {
+        let state = locust_server::create_test_state();
+        *state.current_project.write().await = Some(ProjectInfo {
+            path: PathBuf::from("/tmp/original-game"),
+            format_id: "rpgmaker-mv".into(),
+            name: "original-game".into(),
+        });
+        let missing = std::env::temp_dir().join(format!(
+            "locust_opendb_tauri_missing_{}.locust.db",
+            uuid::Uuid::new_v4()
+        ));
+        let err = apply_open_project_db(
+            &state,
+            missing.to_string_lossy().into_owned(),
+            "/tmp/game".into(),
+            "rpgmaker-mv".into(),
+        )
+        .await
+        .expect_err("must reject");
+        assert!(
+            err.to_lowercase().contains("project not found")
+                || err.to_lowercase().contains("not found"),
+            "{err}"
+        );
+        let cur = state.current_project.read().await.clone().unwrap();
+        assert_eq!(cur.name, "original-game");
+        assert_eq!(state.db.path(), PathBuf::from(":memory:"));
+    }
+
+    #[tokio::test]
+    async fn open_project_db_rejects_unknown_format() {
+        let db_path = write_tauri_locust_db(&[translated_entry("a", "Hello", "Hola")]);
+        let state = locust_server::create_test_state();
+        *state.current_project.write().await = Some(ProjectInfo {
+            path: PathBuf::from("/tmp/original-game"),
+            format_id: "rpgmaker-mv".into(),
+            name: "original-game".into(),
+        });
+        let err = apply_open_project_db(
+            &state,
+            db_path.to_string_lossy().into_owned(),
+            "/tmp/game".into(),
+            "not-a-format".into(),
+        )
+        .await
+        .expect_err("must reject");
+        assert!(err.contains("not-a-format"), "{err}");
+        let cur = state.current_project.read().await.clone().unwrap();
+        assert_eq!(cur.name, "original-game");
+        assert_eq!(state.db.path(), PathBuf::from(":memory:"));
+        drop(state);
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[tokio::test]
