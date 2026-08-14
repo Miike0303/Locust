@@ -1,12 +1,14 @@
-use std::path::Path;
 use locust_core::extraction::FormatPlugin;
+use std::path::Path;
 
 #[test]
 #[ignore]
 fn test_inject_sugarcube_direct() {
     let game_dir = Path::new(r"D:\juegos\html\The SUP v1.0 backer version");
     let db_path = Path::new(r"C:\Projects\Locust\The SUP v1.0 backer version.locust.db");
-    if !game_dir.exists() || !db_path.exists() { return; }
+    if !game_dir.exists() || !db_path.exists() {
+        return;
+    }
 
     // Make a copy of just the HTML file to avoid modifying original
     let output_dir = std::env::temp_dir().join("locust_sup_inject");
@@ -15,12 +17,19 @@ fn test_inject_sugarcube_direct() {
     std::fs::copy(
         game_dir.join("The SUP.html"),
         output_dir.join("The SUP.html"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = locust_core::database::Database::open(db_path).unwrap();
-    let mut entries = db.get_entries(&locust_core::database::EntryFilter::default()).unwrap();
+    let mut entries = db
+        .get_entries(&locust_core::database::EntryFilter::default())
+        .unwrap();
     let translated = entries.iter().filter(|e| e.translation.is_some()).count();
-    println!("SugarCube: {} entries, {} translated", entries.len(), translated);
+    println!(
+        "SugarCube: {} entries, {} translated",
+        entries.len(),
+        translated
+    );
 
     // Rewrite file_path to the copy
     for entry in &mut entries {
@@ -48,7 +57,9 @@ fn test_inject_sugarcube_direct() {
 fn test_inject_rpgmaker_xp_direct() {
     let game_dir = Path::new(r"D:\juegos\rpgm\en\LoQOO\Legend of Queen Opala - Origin");
     let db_path = Path::new(r"C:\Projects\Locust\Legend of Queen Opala - Origin.locust.db");
-    if !game_dir.exists() || !db_path.exists() { return; }
+    if !game_dir.exists() || !db_path.exists() {
+        return;
+    }
 
     // Copy only the Data directory
     let output_dir = std::env::temp_dir().join("locust_loqo_inject");
@@ -56,13 +67,23 @@ fn test_inject_rpgmaker_xp_direct() {
     let _ = copy_dir_recursive(game_dir, &output_dir);
 
     let db = locust_core::database::Database::open(db_path).unwrap();
-    let mut entries = db.get_entries(&locust_core::database::EntryFilter::default()).unwrap();
+    let mut entries = db
+        .get_entries(&locust_core::database::EntryFilter::default())
+        .unwrap();
     let translated = entries.iter().filter(|e| e.translation.is_some()).count();
-    println!("RPG Maker XP: {} entries, {} translated", entries.len(), translated);
+    println!(
+        "RPG Maker XP: {} entries, {} translated",
+        entries.len(),
+        translated
+    );
 
     // Rewrite file_paths to the copy
     for entry in &mut entries {
-        let fname = entry.file_path.file_name().unwrap_or_default().to_os_string();
+        let fname = entry
+            .file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_os_string();
         entry.file_path = output_dir.join("Data").join(fname);
     }
 

@@ -293,7 +293,10 @@ fn unsupported_add_mode_fails_loudly_and_the_advice_unblocks() {
         stderr.contains("does not support Add mode"),
         "the per-language failure must be printed, not swallowed: {stderr}"
     );
-    assert!(stderr.contains("es:"), "the failed language must be named: {stderr}");
+    assert!(
+        stderr.contains("es:"),
+        "the failed language must be named: {stderr}"
+    );
     assert!(
         stderr.contains("--direct -l es"),
         "the advice must include direct mode: {stderr}"
@@ -421,7 +424,10 @@ fn patch_without_lang_over_es_and_unspecified_keys_requires_a_choice() {
         .assert()
         .failure();
     let stderr = stderr_of(assert);
-    assert!(stderr.contains("es"), "the named key must be listed: {stderr}");
+    assert!(
+        stderr.contains("es"),
+        "the named key must be listed: {stderr}"
+    );
     assert!(
         stderr.contains("(unspecified)"),
         "the language-unspecified key must be listed: {stderr}"
@@ -761,7 +767,10 @@ fn legacy_database_on_an_already_injected_entry_tree_game_gets_a_restore_first_r
         .assert()
         .failure();
     let stderr = stderr_of(assert);
-    assert!(stderr.contains("no injection has been recorded"), "{stderr}");
+    assert!(
+        stderr.contains("no injection has been recorded"),
+        "{stderr}"
+    );
     assert!(stderr.contains("--direct -l es"), "{stderr}");
     assert!(
         stderr.contains("0 files written") && stderr.contains("restore the original"),
@@ -902,7 +911,10 @@ fn a_first_direct_inject_that_writes_zero_files_explains_why_nothing_was_recorde
         .assert()
         .failure();
     let stderr = stderr_of(assert);
-    assert!(stderr.contains("no injection has been recorded"), "{stderr}");
+    assert!(
+        stderr.contains("no injection has been recorded"),
+        "{stderr}"
+    );
     assert!(
         stderr.contains("0 files written"),
         "the advice must acknowledge the zero-write outcome instead of \

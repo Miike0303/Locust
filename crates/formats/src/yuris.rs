@@ -331,18 +331,14 @@ fn verify_first_attr_descriptor(data: &[u8], hdr: &YstbHeader, file_label: &str)
         ));
     }
     // u16 id at +0 (layout documentation; value unused for the check)
-    let _id = read_i16(data, attr_off).ok_or_else(|| {
-        parse_err(file_label, "truncated first attribute id after decrypt")
-    })?;
-    let _type = read_i16(data, attr_off + 2).ok_or_else(|| {
-        parse_err(file_label, "truncated first attribute type after decrypt")
-    })?;
-    let size = read_u32(data, attr_off + 4).ok_or_else(|| {
-        parse_err(file_label, "truncated first attribute size after decrypt")
-    })?;
-    let offset = read_u32(data, attr_off + 8).ok_or_else(|| {
-        parse_err(file_label, "truncated first attribute offset after decrypt")
-    })?;
+    let _id = read_i16(data, attr_off)
+        .ok_or_else(|| parse_err(file_label, "truncated first attribute id after decrypt"))?;
+    let _type = read_i16(data, attr_off + 2)
+        .ok_or_else(|| parse_err(file_label, "truncated first attribute type after decrypt"))?;
+    let size = read_u32(data, attr_off + 4)
+        .ok_or_else(|| parse_err(file_label, "truncated first attribute size after decrypt"))?;
+    let offset = read_u32(data, attr_off + 8)
+        .ok_or_else(|| parse_err(file_label, "truncated first attribute offset after decrypt"))?;
 
     if offset != 0 {
         return Err(parse_err(
@@ -366,7 +362,11 @@ fn verify_first_attr_descriptor(data: &[u8], hdr: &YstbHeader, file_label: &str)
 
 // ─── Attribute / string decode ─────────────────────────────────────────────
 
-fn parse_attr_descs(data: &[u8], attr_desc_off: usize, attr_desc_size: u32) -> Result<Vec<AttrDesc>> {
+fn parse_attr_descs(
+    data: &[u8],
+    attr_desc_off: usize,
+    attr_desc_size: u32,
+) -> Result<Vec<AttrDesc>> {
     if !(attr_desc_size as usize).is_multiple_of(ATTR_DESC_SIZE) {
         return Err(parse_err(
             "ystb",
@@ -605,7 +605,10 @@ fn is_yuris_engine_token(t: &str) -> bool {
         let parts: Vec<&str> = t.split('.').filter(|p| !p.is_empty()).collect();
         if parts.len() >= 2
             && parts.iter().all(|p| {
-                let alnum = p.chars().filter(|c| *c != '_').all(|c| c.is_ascii_alphanumeric());
+                let alnum = p
+                    .chars()
+                    .filter(|c| *c != '_')
+                    .all(|c| c.is_ascii_alphanumeric());
                 alnum && !p.is_empty() && p.len() <= 28
             })
         {
@@ -614,13 +617,18 @@ fn is_yuris_engine_token(t: &str) -> bool {
     }
 
     // snake_case / SCREAMING_SNAKE resource labels.
-    if t.contains('_') && t.chars().filter(|c| *c != '_').all(|c| c.is_ascii_alphanumeric()) {
+    if t.contains('_')
+        && t.chars()
+            .filter(|c| *c != '_')
+            .all(|c| c.is_ascii_alphanumeric())
+    {
         return true;
     }
 
     // Short lowercase resource colors / stubs (black, white, tran, trbn).
     if t.len() <= 6
-        && t.chars().all(|c| c.is_ascii_alphabetic() && c.is_ascii_lowercase())
+        && t.chars()
+            .all(|c| c.is_ascii_alphabetic() && c.is_ascii_lowercase())
     {
         return true;
     }
@@ -798,7 +806,10 @@ fn load_ystb(bytes: &[u8], file_label: &str) -> Result<Option<DecryptedYstb>> {
     }))
 }
 
-fn inject_into_ystb(ystb: &DecryptedYstb, translations: &HashMap<usize, String>) -> Result<Vec<u8>> {
+fn inject_into_ystb(
+    ystb: &DecryptedYstb,
+    translations: &HashMap<usize, String>,
+) -> Result<Vec<u8>> {
     let (_, attr_desc_off, attr_vals_off, line_off) = section_offsets(&ystb.hdr);
 
     // Build new attribute-values blob; track per-descriptor (size, offset).
@@ -834,7 +845,8 @@ fn inject_into_ystb(ystb: &DecryptedYstb, translations: &HashMap<usize, String>)
     let desc_size = ystb.hdr.attr_desc_size as usize;
     let line_size = ystb.hdr.line_numbers_size as usize;
 
-    let mut out = Vec::with_capacity(HEADER_SIZE + inst_size + desc_size + new_values.len() + line_size);
+    let mut out =
+        Vec::with_capacity(HEADER_SIZE + inst_size + desc_size + new_values.len() + line_size);
     out.extend_from_slice(&ystb.data[..HEADER_SIZE]);
     write_u32(&mut out, 0x14, new_values.len() as u32);
 
@@ -1399,11 +1411,7 @@ mod tests {
     }
 
     fn create_fixture(dir: &Path) -> PathBuf {
-        let bytes = build_minimal_ystb(
-            TRUE_KEY_B4626AD8,
-            "Hello, traveler!",
-            "Welcome home.",
-        );
+        let bytes = build_minimal_ystb(TRUE_KEY_B4626AD8, "Hello, traveler!", "Welcome home.");
         let sub = dir.join("ysbin");
         fs::create_dir_all(&sub).unwrap();
         let path = sub.join("yst00001.ybn");
@@ -1457,11 +1465,7 @@ mod tests {
     #[test]
     fn test_bad_first_descriptor_errors_not_garbage() {
         let dir = tempdir();
-        let mut bytes = build_minimal_ystb(
-            TRUE_KEY_B4626AD8,
-            "Hello, traveler!",
-            "Welcome home.",
-        );
+        let mut bytes = build_minimal_ystb(TRUE_KEY_B4626AD8, "Hello, traveler!", "Welcome home.");
         let hdr = parse_header(&bytes, "t").unwrap();
         let (_, attr_off, _, _) = section_offsets(&hdr);
         // Corrupt only the size field (+4..+8). Leave the key dword at +8 intact:
@@ -1545,10 +1549,7 @@ mod tests {
             "「こんにちは」",
             "なし",
         ] {
-            assert!(
-                looks_player_visible(s),
-                "player text should be kept: {s}"
-            );
+            assert!(looks_player_visible(s), "player text should be kept: {s}");
         }
     }
 
@@ -1572,12 +1573,17 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(
-            names.iter().filter(|n| n.eq_ignore_ascii_case("yst00000.ybn")).count(),
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("yst00000.ybn"))
+                .count(),
             1,
             "dedupe basename: {found:?}"
         );
         assert!(
-            found.iter().any(|p| p.to_string_lossy().to_ascii_lowercase().contains("pac")),
+            found
+                .iter()
+                .any(|p| p.to_string_lossy().to_ascii_lowercase().contains("pac")),
             "prefer pac/: {found:?}"
         );
         assert!(
@@ -1698,7 +1704,11 @@ mod tests {
             src.contains('\n'),
             "setup: source should now be multi-line, got {src:?}"
         );
-        let width = src.lines().map(crate::rpgmaker_mv::visible_len).max().unwrap();
+        let width = src
+            .lines()
+            .map(crate::rpgmaker_mv::visible_len)
+            .max()
+            .unwrap();
         for e in &mut entries {
             if e.id == target {
                 e.translation = Some(flat.to_string());
@@ -1756,12 +1766,9 @@ mod tests {
             0,
             0,
         );
-        let ypf_bytes = crate::yuris_ypf::write_ypf(
-            0x1E4,
-            0xFF,
-            &[("yst00000.ybn".into(), ystb, true)],
-        )
-        .unwrap();
+        let ypf_bytes =
+            crate::yuris_ypf::write_ypf(0x1E4, 0xFF, &[("yst00000.ybn".into(), ystb, true)])
+                .unwrap();
         let ypf_path = ysbin.join("test.ypf");
         fs::write(&ypf_path, &ypf_bytes).unwrap();
 
@@ -1790,7 +1797,10 @@ mod tests {
         assert!(report.files_modified >= 1, "{report:?}");
 
         let backup = PathBuf::from(format!("{}.locust-old", ypf_path.display()));
-        assert!(backup.is_file(), "expected .locust-old backup at {backup:?}");
+        assert!(
+            backup.is_file(),
+            "expected .locust-old backup at {backup:?}"
+        );
         assert!(ypf_path.is_file(), "rebuilt ypf must exist");
 
         let again = plugin.extract(&dir).unwrap();
@@ -1825,7 +1835,9 @@ mod tests {
         let plugin = YurisPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
         assert!(
-            entries.iter().any(|e| e.source.contains("Only real script")),
+            entries
+                .iter()
+                .any(|e| e.source.contains("Only real script")),
             "YSTB strings missing: {:?}",
             entries.iter().map(|e| &e.source).collect::<Vec<_>>()
         );

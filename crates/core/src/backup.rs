@@ -83,7 +83,9 @@ impl BackupManager {
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let metadata = entry.metadata().map_err(|e| LocustError::BackupError(e.to_string()))?;
+                let metadata = entry
+                    .metadata()
+                    .map_err(|e| LocustError::BackupError(e.to_string()))?;
                 size_bytes += metadata.len();
                 std::fs::copy(entry.path(), &dest)?;
                 file_count += 1;
@@ -179,10 +181,7 @@ impl BackupManager {
             }
             let manifest_str = std::fs::read_to_string(&manifest_path)?;
             let manifest: BackupManifest = serde_json::from_str(&manifest_str)?;
-            let id = dir_entry
-                .file_name()
-                .to_string_lossy()
-                .to_string();
+            let id = dir_entry.file_name().to_string_lossy().to_string();
             entries.push(BackupEntry {
                 id,
                 path: dir_entry.path(),
@@ -284,10 +283,10 @@ mod tests {
         // so a traversal must not reach outside the backup root — delete in
         // particular would remove the directory tree it lands on.
         let backup_root = tempdir();
-        let outsider = backup_root.parent().unwrap().join(format!(
-            "locust_outsider_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let outsider = backup_root
+            .parent()
+            .unwrap()
+            .join(format!("locust_outsider_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&outsider).unwrap();
         fs::write(outsider.join("keep.txt"), "important").unwrap();
 
@@ -308,10 +307,7 @@ mod tests {
                 mgr.restore(bad, &restore_target).is_err(),
                 "restore accepted {bad:?}"
             );
-            assert!(
-                mgr.delete_backup(bad).is_err(),
-                "delete accepted {bad:?}"
-            );
+            assert!(mgr.delete_backup(bad).is_err(), "delete accepted {bad:?}");
         }
 
         assert!(
@@ -369,7 +365,10 @@ mod tests {
 
         // Modify original file
         fs::write(game_dir.join("data.json"), "MODIFIED").unwrap();
-        assert_eq!(fs::read_to_string(game_dir.join("data.json")).unwrap(), "MODIFIED");
+        assert_eq!(
+            fs::read_to_string(game_dir.join("data.json")).unwrap(),
+            "MODIFIED"
+        );
 
         // Restore
         mgr.restore(&entry.id, &game_dir).unwrap();

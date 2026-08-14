@@ -20,10 +20,7 @@ pub enum VerificationOutcome {
     Clean,
     AlreadyApplied,
     UpgradeAvailable,
-    DowngradeBlocked {
-        installed: String,
-        incoming: String,
-    },
+    DowngradeBlocked { installed: String, incoming: String },
     Unknown,
     Interrupted,
     Mismatch(Vec<FileMismatch>),
@@ -88,7 +85,9 @@ pub fn verify(game_root: &Path, zip_path: &Path) -> Result<VerificationReport> {
     let backup_compromised = receipt.is_some() && !backup_ok && store.backup_dir().exists();
 
     match manifest {
-        Some(m) => verify_with_manifest(game_root, &entries, m, receipt.as_ref(), backup_compromised),
+        Some(m) => {
+            verify_with_manifest(game_root, &entries, m, receipt.as_ref(), backup_compromised)
+        }
         None => verify_legacy(game_root, &entries, backup_compromised),
     }
 }
@@ -118,9 +117,9 @@ fn scan_zip_entries(archive: &mut ZipArchive<File>) -> Result<Vec<ZipEntryMeta>>
     let mut total_bytes = 0u64;
 
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| {
-            LocustError::PatchError(format!("zip entry {i}: {e}"))
-        })?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LocustError::PatchError(format!("zip entry {i}: {e}")))?;
         let original = entry.name().to_string();
         // Symlink entries (unix external attrs) — zip crate exposes is_symlink on ZipFile in v2.
         if entry.is_symlink() {
@@ -140,8 +139,8 @@ fn scan_zip_entries(archive: &mut ZipArchive<File>) -> Result<Vec<ZipEntryMeta>>
             continue;
         }
         // Skip the manifest file from the content plan later.
-        let is_meta = normalized == PatchManifest::FILENAME
-            || normalized.eq_ignore_ascii_case("readme.txt");
+        let is_meta =
+            normalized == PatchManifest::FILENAME || normalized.eq_ignore_ascii_case("readme.txt");
         let rel = if is_meta {
             None
         } else {
@@ -207,9 +206,8 @@ fn load_manifest_from_entries(entries: &[ZipEntryMeta]) -> Result<Option<PatchMa
     else {
         return Ok(None);
     };
-    let parsed: PatchManifest = serde_json::from_slice(&m.meta_data).map_err(|e| {
-        LocustError::PatchError(format!("corrupt locust-patch.json: {e}"))
-    })?;
+    let parsed: PatchManifest = serde_json::from_slice(&m.meta_data)
+        .map_err(|e| LocustError::PatchError(format!("corrupt locust-patch.json: {e}")))?;
     Ok(Some(parsed))
 }
 
@@ -300,10 +298,7 @@ fn verify_with_manifest(
         }
         match compare_versions(&r.patch_version, &manifest.patch_version) {
             VersionOrder::Equal => {
-                let msg = format!(
-                    "patch {}@{} already applied",
-                    r.patch_id, r.patch_version
-                );
+                let msg = format!("patch {}@{} already applied", r.patch_id, r.patch_version);
                 return Ok(VerificationReport {
                     outcome: VerificationOutcome::AlreadyApplied,
                     tier: Some(if manifest.supports_strict_tier() {
@@ -604,9 +599,7 @@ fn verify_structural(
         added,
         conflicts,
         backup_compromised,
-        messages: vec![
-            "structural tier: no original hashes — apply requires confirmation".into(),
-        ],
+        messages: vec!["structural tier: no original hashes — apply requires confirmation".into()],
     })
 }
 
@@ -701,14 +694,16 @@ fn compare_versions(installed: &str, incoming: &str) -> VersionOrder {
     }
 }
 
-
 /// Build a synthetic plan classification from a report (used by apply).
 pub fn classify_files(
     game_root: &Path,
     files: &[PatchFileEntry],
     force: bool,
-) -> Result<(Vec<super::manifest::ReceiptReplaced>, Vec<super::manifest::ReceiptAdded>, Vec<String>)>
-{
+) -> Result<(
+    Vec<super::manifest::ReceiptReplaced>,
+    Vec<super::manifest::ReceiptAdded>,
+    Vec<String>,
+)> {
     use super::manifest::{ReceiptAdded, ReceiptReplaced};
     let mut replaced = Vec::new();
     let mut added = Vec::new();

@@ -70,12 +70,10 @@ pub trait FormatPlugin: Send + Sync {
     fn detect(&self, path: &Path) -> bool {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
-            self.supported_extensions()
-                .iter()
-                .any(|supported| {
-                    let s = supported.strip_prefix('.').unwrap_or(supported);
-                    s.to_lowercase() == ext_lower
-                })
+            self.supported_extensions().iter().any(|supported| {
+                let s = supported.strip_prefix('.').unwrap_or(supported);
+                s.to_lowercase() == ext_lower
+            })
         } else {
             false
         }
@@ -166,9 +164,9 @@ pub fn inject_direct(
     format_id: &str,
     languages: &[String],
 ) -> Result<DirectInjectReport> {
-    let plugin = registry.get(format_id).ok_or_else(|| {
-        LocustError::UnsupportedFormat(format!("format not found: {format_id}"))
-    })?;
+    let plugin = registry
+        .get(format_id)
+        .ok_or_else(|| LocustError::UnsupportedFormat(format!("format not found: {format_id}")))?;
 
     let entries = db.get_entries(&EntryFilter::default())?;
     let translated: Vec<_> = entries
@@ -187,10 +185,7 @@ pub fn inject_direct(
                  directory, then re-run."
             ))
         })?;
-        (
-            entry.id.clone(),
-            Some(entry.path.display().to_string()),
-        )
+        (entry.id.clone(), Some(entry.path.display().to_string()))
     } else {
         ("none".to_string(), None)
     };
@@ -272,7 +267,10 @@ impl FormatRegistry {
     }
 
     pub fn detect(&self, path: &Path) -> Option<&dyn FormatPlugin> {
-        self.plugins.iter().find(|p| p.detect(path)).map(|p| p.as_ref())
+        self.plugins
+            .iter()
+            .find(|p| p.detect(path))
+            .map(|p| p.as_ref())
     }
 
     pub fn get(&self, id: &str) -> Option<&dyn FormatPlugin> {
@@ -603,9 +601,7 @@ async fn emit_binary_slot_preflight(
         "translations exceed binary inject slot length (UTF-8 / UTF-16LE / Shift-JIS); \
          engine will skip them — run locust validate for entry IDs"
     );
-    let _ = tx
-        .send(ProgressEvent::ValidationFailed { issues })
-        .await;
+    let _ = tx.send(ProgressEvent::ValidationFailed { issues }).await;
 }
 
 /// What [`record_injection_for_lang`] did for one language key.
@@ -730,23 +726,30 @@ fn copy_dir_for_inject(src: &Path, dst: &Path) -> Result<()> {
     // next to the game inside the same parent folder).
     let dst_canon = dst.canonicalize().ok();
 
-    let media_extensions = ["png", "ogg", "wav", "m4a", "mp4", "jpg", "jpeg", "bmp", "mp3"];
+    let media_extensions = [
+        "png", "ogg", "wav", "m4a", "mp4", "jpg", "jpeg", "bmp", "mp3",
+    ];
 
-    for entry in WalkDir::new(src).follow_links(false).into_iter().filter_entry(|e| {
-        // Skip the destination directory itself to avoid recursive copy loops
-        if let Some(ref dc) = dst_canon {
-            if let Ok(entry_canon) = e.path().canonicalize() {
-                if entry_canon == *dc {
-                    return false;
+    for entry in WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            // Skip the destination directory itself to avoid recursive copy loops
+            if let Some(ref dc) = dst_canon {
+                if let Ok(entry_canon) = e.path().canonicalize() {
+                    if entry_canon == *dc {
+                        return false;
+                    }
                 }
             }
-        }
-        true
-    }) {
+            true
+        })
+    {
         let entry = entry.map_err(|e| LocustError::IoError(std::io::Error::other(e)))?;
-        let rel = entry.path().strip_prefix(src).map_err(|e| {
-            LocustError::InjectionError(e.to_string())
-        })?;
+        let rel = entry
+            .path()
+            .strip_prefix(src)
+            .map_err(|e| LocustError::InjectionError(e.to_string()))?;
         let dest = dst.join(rel);
 
         if entry.file_type().is_dir() {
@@ -1270,7 +1273,11 @@ mod tests {
         fs::write(&bad_backup_root, b"occupied").unwrap();
 
         let db = Arc::new(Database::open_in_memory().unwrap());
-        let mut entries = vec![StringEntry::new("mock#0", "Hello", PathBuf::from("game.mock"))];
+        let mut entries = vec![StringEntry::new(
+            "mock#0",
+            "Hello",
+            PathBuf::from("game.mock"),
+        )];
         entries[0].translation = Some("Hola".to_string());
         db.save_entries(&entries).unwrap();
         let mut registry = FormatRegistry::new();
@@ -1340,26 +1347,57 @@ mod tests {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let backup = Arc::new(BackupManager::new(backup_root));
 
-        let entries = vec![StringEntry::new("mock#0", "Hello", PathBuf::from("game.mock"))];
+        let entries = vec![StringEntry::new(
+            "mock#0",
+            "Hello",
+            PathBuf::from("game.mock"),
+        )];
         db.save_entries(&entries).unwrap();
 
         // Register a plugin where inject_add fails for "bad" lang
         struct FailOnBadLang;
         impl FormatPlugin for FailOnBadLang {
-            fn id(&self) -> &str { "failmock" }
-            fn name(&self) -> &str { "Fail Mock" }
-            fn supported_extensions(&self) -> &[&str] { &[".mock"] }
-            fn supported_modes(&self) -> Vec<OutputMode> { vec![OutputMode::Add] }
-            fn extract(&self, _: &Path) -> Result<Vec<StringEntry>> { Ok(vec![]) }
-            fn inject(&self, _: &Path, _: &[StringEntry]) -> Result<InjectionReport> {
-                Ok(InjectionReport { files_modified: 0, strings_written: 0, strings_skipped: 0, warnings: vec![], files_written: vec![] })
+            fn id(&self) -> &str {
+                "failmock"
             }
-            fn inject_add(&self, _path: &Path, lang: &str, _entries: &[StringEntry]) -> Result<InjectionReport> {
+            fn name(&self) -> &str {
+                "Fail Mock"
+            }
+            fn supported_extensions(&self) -> &[&str] {
+                &[".mock"]
+            }
+            fn supported_modes(&self) -> Vec<OutputMode> {
+                vec![OutputMode::Add]
+            }
+            fn extract(&self, _: &Path) -> Result<Vec<StringEntry>> {
+                Ok(vec![])
+            }
+            fn inject(&self, _: &Path, _: &[StringEntry]) -> Result<InjectionReport> {
+                Ok(InjectionReport {
+                    files_modified: 0,
+                    strings_written: 0,
+                    strings_skipped: 0,
+                    warnings: vec![],
+                    files_written: vec![],
+                })
+            }
+            fn inject_add(
+                &self,
+                _path: &Path,
+                lang: &str,
+                _entries: &[StringEntry],
+            ) -> Result<InjectionReport> {
                 if lang == "bad" {
                     return Err(LocustError::InjectionError("bad language".to_string()));
                 }
                 fs::create_dir_all(_path.join("tl").join(lang))?;
-                Ok(InjectionReport { files_modified: 1, strings_written: 1, strings_skipped: 0, warnings: vec![], files_written: vec![] })
+                Ok(InjectionReport {
+                    files_modified: 1,
+                    strings_written: 1,
+                    strings_skipped: 0,
+                    warnings: vec![],
+                    files_written: vec![],
+                })
             }
         }
 
@@ -1374,7 +1412,11 @@ mod tests {
                 &game_dir,
                 "failmock",
                 OutputMode::Add,
-                vec!["good".to_string(), "bad".to_string(), "also_good".to_string()],
+                vec![
+                    "good".to_string(),
+                    "bad".to_string(),
+                    "also_good".to_string(),
+                ],
                 None,
                 tx,
             )
@@ -1437,7 +1479,11 @@ mod tests {
 
         let db = Arc::new(Database::open_in_memory().unwrap());
         let backup = Arc::new(BackupManager::new(backup_root));
-        let mut entries = vec![StringEntry::new("mock#0", "Hello", PathBuf::from("game.mock"))];
+        let mut entries = vec![StringEntry::new(
+            "mock#0",
+            "Hello",
+            PathBuf::from("game.mock"),
+        )];
         entries[0].translation = Some("Hola".to_string());
         db.save_entries(&entries).unwrap();
 

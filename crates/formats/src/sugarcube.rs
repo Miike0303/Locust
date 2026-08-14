@@ -113,10 +113,20 @@ impl SugarCubePlugin {
 fn is_system_passage(name: &str, tags: &str) -> bool {
     // Skip known system passages
     let system_names = [
-        "StoryInit", "StoryCaption", "StoryBanner", "StoryMenu",
-        "StoryInterface", "StoryShare", "StoryAuthor", "StoryTitle",
-        "StorySubtitle", "StoryDisplayTitle",
-        "PassageHeader", "PassageFooter", "PassageReady", "PassageDone",
+        "StoryInit",
+        "StoryCaption",
+        "StoryBanner",
+        "StoryMenu",
+        "StoryInterface",
+        "StoryShare",
+        "StoryAuthor",
+        "StoryTitle",
+        "StorySubtitle",
+        "StoryDisplayTitle",
+        "PassageHeader",
+        "PassageFooter",
+        "PassageReady",
+        "PassageDone",
     ];
     if system_names.iter().any(|s| name.starts_with(s)) {
         return true;
@@ -133,8 +143,7 @@ fn is_system_passage(name: &str, tags: &str) -> bool {
 }
 
 fn is_html(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|e| e == "html" || e == "htm")
+    path.extension().is_some_and(|e| e == "html" || e == "htm")
 }
 
 fn extract_attr(tag: &str, name: &str) -> Option<String> {
@@ -357,7 +366,10 @@ fn extract_text_from_passage(content: &str) -> Vec<String> {
     }
 
     // Filter out CSS, JS, and code-like lines
-    lines.into_iter().filter(|line| is_translatable_text(line)).collect()
+    lines
+        .into_iter()
+        .filter(|line| is_translatable_text(line))
+        .collect()
 }
 
 /// Check if a line is extractable (not just a variable, path, or code fragment).
@@ -370,7 +382,9 @@ fn is_extractable_line(line: &str) -> bool {
     }
 
     // Skip lines that are just a bare SugarCube variable (_var or $var)
-    if (s.starts_with('_') || s.starts_with('$')) && s[1..].chars().all(|c| c.is_alphanumeric() || c == '_') {
+    if (s.starts_with('_') || s.starts_with('$'))
+        && s[1..].chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
         return false;
     }
 
@@ -395,13 +409,24 @@ fn is_translatable_text(line: &str) -> bool {
     }
 
     // CSS properties
-    if s.contains(':') && (
-        s.contains("px") || s.contains("em") || s.contains("rem") || s.contains("vh") || s.contains("vw") ||
-        s.contains("rgb") || (s.contains("#") && s.len() < 50) ||
-        s.contains("var(--") || s.contains("solid") || s.contains("none;") ||
-        s.contains("flex") || s.contains("grid") || s.contains("block") ||
-        s.contains("absolute") || s.contains("relative") || s.contains("fixed")
-    ) {
+    if s.contains(':')
+        && (s.contains("px")
+            || s.contains("em")
+            || s.contains("rem")
+            || s.contains("vh")
+            || s.contains("vw")
+            || s.contains("rgb")
+            || (s.contains("#") && s.len() < 50)
+            || s.contains("var(--")
+            || s.contains("solid")
+            || s.contains("none;")
+            || s.contains("flex")
+            || s.contains("grid")
+            || s.contains("block")
+            || s.contains("absolute")
+            || s.contains("relative")
+            || s.contains("fixed"))
+    {
         return false;
     }
 
@@ -411,22 +436,48 @@ fn is_translatable_text(line: &str) -> bool {
     if s.starts_with('.') && s.contains('{') {
         return false;
     }
-    if s.contains("background") || s.contains("font-size") || s.contains("margin") ||
-       s.contains("padding") || s.contains("border") || s.contains("display:") ||
-       s.contains("position:") || s.contains("color:") || s.contains("width:") ||
-       s.contains("height:") || s.contains("text-align") || s.contains("box-shadow") ||
-       s.contains("opacity") || s.contains("z-index") || s.contains("overflow") ||
-       s.contains("transform") || s.contains("transition") || s.contains("cursor:") {
+    if s.contains("background")
+        || s.contains("font-size")
+        || s.contains("margin")
+        || s.contains("padding")
+        || s.contains("border")
+        || s.contains("display:")
+        || s.contains("position:")
+        || s.contains("color:")
+        || s.contains("width:")
+        || s.contains("height:")
+        || s.contains("text-align")
+        || s.contains("box-shadow")
+        || s.contains("opacity")
+        || s.contains("z-index")
+        || s.contains("overflow")
+        || s.contains("transform")
+        || s.contains("transition")
+        || s.contains("cursor:")
+    {
         return false;
     }
 
     // JavaScript patterns
-    if s.starts_with("var ") || s.starts_with("let ") || s.starts_with("const ") ||
-       s.starts_with("function") || s.starts_with("return ") || s.starts_with("if (") ||
-       s.starts_with("else") || s.starts_with("for (") || s.starts_with("while (") ||
-       s.contains("document.") || s.contains("window.") || s.contains("console.") ||
-       s.contains("addEventListener") || s.contains("querySelector") || s.contains("setTimeout") ||
-       s.contains("=>") || s.contains("===") || s.contains("!==") {
+    if s.starts_with("var ")
+        || s.starts_with("let ")
+        || s.starts_with("const ")
+        || s.starts_with("function")
+        || s.starts_with("return ")
+        || s.starts_with("if (")
+        || s.starts_with("else")
+        || s.starts_with("for (")
+        || s.starts_with("while (")
+        || s.contains("document.")
+        || s.contains("window.")
+        || s.contains("console.")
+        || s.contains("addEventListener")
+        || s.contains("querySelector")
+        || s.contains("setTimeout")
+        || s.contains("=>")
+        || s.contains("===")
+        || s.contains("!==")
+    {
         return false;
     }
 
@@ -502,8 +553,7 @@ impl FormatPlugin for SugarCubePlugin {
         let mut skipped = 0;
 
         // Collect all passage names — these must NEVER be translated
-        let mut passage_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut passage_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         {
             let mut scan = 0;
             while let Some(pos) = content[scan..].find("<tw-passagedata") {
@@ -568,11 +618,8 @@ impl FormatPlugin for SugarCubePlugin {
                     let encoded_translation = encode_html_entities(&final_translation);
 
                     // Safe replacement: skip macros, links, and HTML tags
-                    let (new_content, did_replace) = replace_safe(
-                        &passage_content,
-                        &encoded_source,
-                        &encoded_translation,
-                    );
+                    let (new_content, did_replace) =
+                        replace_safe(&passage_content, &encoded_source, &encoded_translation);
                     if did_replace {
                         passage_content = new_content;
                         written += 1;
@@ -605,7 +652,11 @@ impl FormatPlugin for SugarCubePlugin {
             warnings: Vec::new(),
             // Reported only when a translation landed, matching
             // `files_modified`: a zero-replacement rewrite is byte-identical.
-            files_written: if written > 0 { vec![html_file] } else { Vec::new() },
+            files_written: if written > 0 {
+                vec![html_file]
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -731,7 +782,9 @@ mod tests {
 
     fn create_fixture(dir: &Path) -> PathBuf {
         let html = dir.join("game.html");
-        fs::write(&html, r#"<!DOCTYPE html>
+        fs::write(
+            &html,
+            r#"<!DOCTYPE html>
 <html>
 <head><meta name="application-name" content="SugarCube" /></head>
 <body>
@@ -744,7 +797,9 @@ This is the second line.
 &lt;&lt;if $health &gt; 0&gt;&gt;You are alive.&lt;&lt;/if&gt;&gt;
 The adventure awaits!</tw-passagedata>
 </tw-storydata>
-</body></html>"#).unwrap();
+</body></html>"#,
+        )
+        .unwrap();
         html
     }
 
@@ -770,7 +825,12 @@ The adventure awaits!</tw-passagedata>
         create_fixture(&dir);
         let plugin = SugarCubePlugin::new();
         let entries = plugin.extract(&dir).unwrap();
-        assert!(entries.len() >= 4, "got {} entries: {:?}", entries.len(), entries.iter().map(|e| &e.source).collect::<Vec<_>>());
+        assert!(
+            entries.len() >= 4,
+            "got {} entries: {:?}",
+            entries.len(),
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
 
         let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
         assert!(sources.iter().any(|s| s.contains("welcome")));
@@ -784,7 +844,11 @@ The adventure awaits!</tw-passagedata>
         let plugin = SugarCubePlugin::new();
         let entries = plugin.extract(&dir).unwrap();
         for e in &entries {
-            assert!(!e.source.contains("<<"), "source should not contain macros: {}", e.source);
+            assert!(
+                !e.source.contains("<<"),
+                "source should not contain macros: {}",
+                e.source
+            );
         }
     }
 
@@ -811,8 +875,12 @@ The adventure awaits!</tw-passagedata>
         create_fixture(&dir);
         let plugin = SugarCubePlugin::new();
         let entries = plugin.extract(&dir).unwrap();
-        assert!(entries.iter().any(|e| e.context == Some("Start".to_string())));
-        assert!(entries.iter().any(|e| e.context == Some("next".to_string())));
+        assert!(entries
+            .iter()
+            .any(|e| e.context == Some("Start".to_string())));
+        assert!(entries
+            .iter()
+            .any(|e| e.context == Some("next".to_string())));
     }
 
     #[test]

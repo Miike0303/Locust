@@ -99,8 +99,8 @@ impl NwArchive {
         check_declared_budget(zip_slice, &label)?;
 
         let cursor = Cursor::new(zip_slice.to_vec());
-        let mut archive = ZipArchive::new(cursor)
-            .map_err(|e| err(&label, format!("ZIP open failed: {e}")))?;
+        let mut archive =
+            ZipArchive::new(cursor).map_err(|e| err(&label, format!("ZIP open failed: {e}")))?;
 
         let mut entries = Vec::with_capacity(archive.len());
         let mut total_declared = 0u64;
@@ -113,10 +113,7 @@ impl NwArchive {
             }
             let name = file.name().replace('\\', "/");
             // Skip absolute / traversal names — never surface them as inject targets.
-            if name.is_empty()
-                || name.starts_with('/')
-                || name.split('/').any(|c| c == "..")
-            {
+            if name.is_empty() || name.starts_with('/') || name.split('/').any(|c| c == "..") {
                 continue;
             }
             let size = file.size();
@@ -144,8 +141,8 @@ impl NwArchive {
     pub fn read_entry(&self, entry: &NwEntry) -> Result<Vec<u8>, NwError> {
         let label = self.path.display().to_string();
         let cursor = Cursor::new(self.zip_bytes().to_vec());
-        let mut archive = ZipArchive::new(cursor)
-            .map_err(|e| err(&label, format!("ZIP reopen failed: {e}")))?;
+        let mut archive =
+            ZipArchive::new(cursor).map_err(|e| err(&label, format!("ZIP reopen failed: {e}")))?;
         // Two-step name resolution: NLL can't hold both by_name borrows at once.
         let name = if archive.index_for_name(&entry.path).is_some() {
             entry.path.clone()
@@ -239,8 +236,7 @@ fn find_eocd(data: &[u8], label: &str) -> Result<EocdInfo, NwError> {
         }
         if data[i..i + 4] == EOCD_SIG {
             // comment length at +20
-            let comment_len =
-                u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
+            let comment_len = u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
             if i + 22 + comment_len == data.len() || i + 22 + comment_len <= data.len() {
                 // Prefer EOCD that lands at/near EOF (standard).
                 if i + 22 + comment_len == data.len() {
@@ -281,7 +277,10 @@ fn find_eocd(data: &[u8], label: &str) -> Result<EocdInfo, NwError> {
         }
         i -= 1;
     }
-    Err(err(label, "no ZIP end-of-central-directory signature found"))
+    Err(err(
+        label,
+        "no ZIP end-of-central-directory signature found",
+    ))
 }
 
 fn check_declared_budget(zip_slice: &[u8], label: &str) -> Result<(), NwError> {
@@ -453,7 +452,9 @@ pub fn probe_scenario_in_zip_tail(path: &Path) -> bool {
         None => return false,
     };
     let cd_abs = zip_start.saturating_add(eocd_rel.cd_offset);
-    if cd_abs >= file_len || eocd_rel.cd_size == 0 || eocd_rel.cd_size > MAX_NW_UNCOMPRESSED as usize
+    if cd_abs >= file_len
+        || eocd_rel.cd_size == 0
+        || eocd_rel.cd_size > MAX_NW_UNCOMPRESSED as usize
     {
         return false;
     }
@@ -547,7 +548,9 @@ Hello NW world.\n\
         fs::write(&path, &zip).unwrap();
         let arch = NwArchive::open(&path).unwrap();
         assert_eq!(arch.zip_start, 0);
-        assert!(arch.scenario_ks_entries().any(|e| e.path == "data/scenario/first.ks"));
+        assert!(arch
+            .scenario_ks_entries()
+            .any(|e| e.path == "data/scenario/first.ks"));
         let body = arch
             .read_entry(
                 arch.scenario_ks_entries()

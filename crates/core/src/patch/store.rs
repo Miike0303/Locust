@@ -226,9 +226,8 @@ impl PatchStore {
         let rel_path = safe_stored_rel(rel)?;
         let dest = self.backup_files_dir().join(&rel_path);
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                LocustError::PatchError(format!("mkdir {}: {e}", parent.display()))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| LocustError::PatchError(format!("mkdir {}: {e}", parent.display())))?;
         }
         fs::copy(src, &dest).map_err(|e| {
             LocustError::PatchError(format!(
@@ -237,13 +236,13 @@ impl PatchStore {
                 dest.display()
             ))
         })?;
-        let bytes = fs::read(&dest).map_err(|e| {
-            LocustError::PatchError(format!("read backup {}: {e}", dest.display()))
-        })?;
+        let bytes = fs::read(&dest)
+            .map_err(|e| LocustError::PatchError(format!("read backup {}: {e}", dest.display())))?;
         let hash = sha256_hex(&bytes);
-        let src_hash = sha256_hex(&fs::read(src).map_err(|e| {
-            LocustError::PatchError(format!("read src {}: {e}", src.display()))
-        })?);
+        let src_hash =
+            sha256_hex(&fs::read(src).map_err(|e| {
+                LocustError::PatchError(format!("read src {}: {e}", src.display()))
+            })?);
         if hash != src_hash {
             return Err(LocustError::PatchError(format!(
                 "backup hash mismatch for {rel}"
@@ -257,10 +256,7 @@ impl PatchStore {
                 .write(true)
                 .open(&dest)
                 .map_err(|e| {
-                    LocustError::PatchError(format!(
-                        "open backup for sync {}: {e}",
-                        dest.display()
-                    ))
+                    LocustError::PatchError(format!("open backup for sync {}: {e}", dest.display()))
                 })?;
             f.sync_all().map_err(|e| {
                 LocustError::PatchError(format!("sync backup {}: {e}", dest.display()))
@@ -345,4 +341,3 @@ fn hide_dir_windows(path: &Path) -> std::io::Result<()> {
         .status();
     Ok(())
 }
-

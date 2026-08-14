@@ -235,15 +235,16 @@ fn parse_game(bytes: &[u8], file_label: &str) -> Result<QspGame> {
 
     let version = String::from_utf16_lossy(&records[1]);
     let password = decode_field(&records[2]);
-    let loc_count: usize = decode_field(&records[3]).parse().map_err(|_| {
-        LocustError::ParseError {
-            file: file_label.into(),
-            message: format!(
-                "invalid location count field: {:?}",
-                decode_field(&records[3])
-            ),
-        }
-    })?;
+    let loc_count: usize =
+        decode_field(&records[3])
+            .parse()
+            .map_err(|_| LocustError::ParseError {
+                file: file_label.into(),
+                message: format!(
+                    "invalid location count field: {:?}",
+                    decode_field(&records[3])
+                ),
+            })?;
 
     let mut idx = 4;
     let mut locations = Vec::with_capacity(loc_count);
@@ -264,12 +265,13 @@ fn parse_game(bytes: &[u8], file_label: &str) -> Result<QspGame> {
                 message: "missing actsCount".into(),
             });
         }
-        let acts_count: usize = decode_field(&records[idx]).parse().map_err(|_| {
-            LocustError::ParseError {
-                file: file_label.into(),
-                message: "invalid actsCount".into(),
-            }
-        })?;
+        let acts_count: usize =
+            decode_field(&records[idx])
+                .parse()
+                .map_err(|_| LocustError::ParseError {
+                    file: file_label.into(),
+                    message: "invalid actsCount".into(),
+                })?;
         idx += 1;
         let mut actions = Vec::with_capacity(acts_count);
         for _ in 0..acts_count {

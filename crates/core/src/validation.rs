@@ -58,7 +58,10 @@ pub fn mechanical_fit_binary_slot(encoding: &str, budget: usize, text: &str) -> 
     if budget == 0 || text.is_empty() {
         return None;
     }
-    if encoded_byte_len(encoding, text).map(|n| n <= budget).unwrap_or(false) {
+    if encoded_byte_len(encoding, text)
+        .map(|n| n <= budget)
+        .unwrap_or(false)
+    {
         return Some(text.to_string());
     }
 
@@ -191,10 +194,7 @@ fn drop_inner_vowels(s: &str) -> String {
             at_word_start = true;
             continue;
         }
-        let is_vowel = matches!(
-            c.to_ascii_lowercase(),
-            'a' | 'e' | 'i' | 'o' | 'u'
-        );
+        let is_vowel = matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u');
         if at_word_start || !is_vowel {
             out.push(c);
         }
@@ -242,7 +242,10 @@ fn truncate_to_encoded_budget(encoding: &str, budget: usize, text: &str) -> Opti
     if budget == 0 || text.is_empty() {
         return None;
     }
-    if encoded_byte_len(encoding, text).map(|n| n <= budget).unwrap_or(false) {
+    if encoded_byte_len(encoding, text)
+        .map(|n| n <= budget)
+        .unwrap_or(false)
+    {
         return Some(text.to_string());
     }
     match encoding {
@@ -333,10 +336,7 @@ impl Validator {
                 issues.push(ValidationIssue {
                     entry_id: entry.id.clone(),
                     kind: ValidationKind::ExceedsCharLimit { limit, actual },
-                    message: format!(
-                        "translation exceeds char limit: {} > {}",
-                        actual, limit
-                    ),
+                    message: format!("translation exceeds char limit: {} > {}", actual, limit),
                     source: None,
                 });
             }
@@ -352,11 +352,9 @@ impl Validator {
                             placeholder: m.placeholder.clone(),
                         }
                     }
-                    crate::placeholder::MismatchKind::Extra => {
-                        ValidationKind::ExtraPlaceholder {
-                            placeholder: m.placeholder.clone(),
-                        }
-                    }
+                    crate::placeholder::MismatchKind::Extra => ValidationKind::ExtraPlaceholder {
+                        placeholder: m.placeholder.clone(),
+                    },
                 };
                 issues.push(ValidationIssue {
                     entry_id: entry.id.clone(),
@@ -369,11 +367,7 @@ impl Validator {
 
         // Check 5 — Binary inject slot (Unity UTF-8 / Unreal UTF-16LE / Wolf SJIS)
         if !translation.is_empty() {
-            if let Some(enc) = entry
-                .metadata
-                .get("binary_slot")
-                .and_then(|v| v.as_str())
-            {
+            if let Some(enc) = entry.metadata.get("binary_slot").and_then(|v| v.as_str()) {
                 if let (Some(src_len), Some(tr_len)) = (
                     encoded_byte_len(enc, &entry.source),
                     encoded_byte_len(enc, translation),
@@ -400,10 +394,7 @@ impl Validator {
     }
 
     pub fn validate_all(entries: &[StringEntry]) -> Vec<ValidationIssue> {
-        entries
-            .iter()
-            .flat_map(Self::validate_entry)
-            .collect()
+        entries.iter().flat_map(Self::validate_entry).collect()
     }
 
     pub async fn validate_and_save(
@@ -578,10 +569,7 @@ mod tests {
         let src = "Canción"; // C a n c i ó n = 1*5 + 2 + 1 = 8
         assert_eq!(encoded_byte_len("utf8", src).unwrap(), 8);
         let fit = mechanical_fit_binary_slot("utf8", 7, src).unwrap();
-        assert!(
-            encoded_byte_len("utf8", &fit).unwrap() <= 7,
-            "fit={fit:?}"
-        );
+        assert!(encoded_byte_len("utf8", &fit).unwrap() <= 7, "fit={fit:?}");
         assert_eq!(fit, "Cancion");
     }
 
@@ -602,10 +590,7 @@ mod tests {
         // Naive truncate → "Opcione"; inner-vowel drop → "Opcns" (matches real ES E2E style).
         assert_eq!(encoded_byte_len("utf8", "Opciones").unwrap(), 8);
         let fit = mechanical_fit_binary_slot("utf8", 7, "Opciones").unwrap();
-        assert!(
-            encoded_byte_len("utf8", &fit).unwrap() <= 7,
-            "fit={fit:?}"
-        );
+        assert!(encoded_byte_len("utf8", &fit).unwrap() <= 7, "fit={fit:?}");
         assert_eq!(fit, "Opcns");
         // Accented: drop_inner_vowels keeps non-ASCII vowels (ó) so "Canción"→"Cncón"
         // (6 utf8 bytes) fits budget 6 without mid-word chop; preferred over shorter
@@ -663,7 +648,7 @@ mod tests {
     #[test]
     fn test_validate_all_aggregates() {
         let entries = vec![
-            make_entry("e1", "Hello", Some("")),   // EmptyTranslation
+            make_entry("e1", "Hello", Some("")),      // EmptyTranslation
             make_entry("e2", "World", Some("World")), // IdenticalToSource
             {
                 let mut e = make_entry("e3", "Hi", Some("Very long translation here!"));

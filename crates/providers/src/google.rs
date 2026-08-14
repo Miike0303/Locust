@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 
-
 use locust_core::error::{LocustError, Result};
 use locust_core::models::{TranslationRequest, TranslationResult};
 use locust_core::translation::TranslationProvider;
@@ -79,7 +78,8 @@ impl TranslationProvider for GoogleTranslateProvider {
 
                 // Concatenate all sources with separator
                 let combined = sources.join(SEPARATOR);
-                let translated = Self::translate_single_static(&client, &combined, &sl, &tl).await?;
+                let translated =
+                    Self::translate_single_static(&client, &combined, &sl, &tl).await?;
 
                 // Split result back by separator
                 let parts: Vec<&str> = translated.split("|||").collect();
@@ -110,7 +110,8 @@ impl TranslationProvider for GoogleTranslateProvider {
 
         let mut all_results = Vec::with_capacity(requests.len());
         for handle in handles {
-            let chunk_results = handle.await
+            let chunk_results = handle
+                .await
                 .map_err(|e| LocustError::ProviderError(format!("task join error: {}", e)))??;
             all_results.extend(chunk_results);
         }
@@ -130,11 +131,21 @@ impl TranslationProvider for GoogleTranslateProvider {
 }
 
 impl GoogleTranslateProvider {
-    async fn translate_single(&self, text: &str, source_lang: &str, target_lang: &str) -> Result<String> {
+    async fn translate_single(
+        &self,
+        text: &str,
+        source_lang: &str,
+        target_lang: &str,
+    ) -> Result<String> {
         Self::translate_single_static(&self.client, text, source_lang, target_lang).await
     }
 
-    async fn translate_single_static(client: &reqwest::Client, text: &str, source_lang: &str, target_lang: &str) -> Result<String> {
+    async fn translate_single_static(
+        client: &reqwest::Client,
+        text: &str,
+        source_lang: &str,
+        target_lang: &str,
+    ) -> Result<String> {
         let url = "https://translate.googleapis.com/translate_a/single";
 
         let resp = client
@@ -148,7 +159,9 @@ impl GoogleTranslateProvider {
             ])
             .send()
             .await
-            .map_err(|e| LocustError::ProviderError(format!("Google Translate request failed: {}", e)))?;
+            .map_err(|e| {
+                LocustError::ProviderError(format!("Google Translate request failed: {}", e))
+            })?;
 
         if !resp.status().is_success() {
             return Err(LocustError::ProviderError(format!(
@@ -163,10 +176,9 @@ impl GoogleTranslateProvider {
 
         // Response format: [[["translated text","source text",null,null,confidence],...],null,"en",...]
         // We need to concatenate all translated segments from body[0]
-        let segments = body
-            .get(0)
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| LocustError::ProviderError("unexpected Google Translate response format".to_string()))?;
+        let segments = body.get(0).and_then(|v| v.as_array()).ok_or_else(|| {
+            LocustError::ProviderError("unexpected Google Translate response format".to_string())
+        })?;
 
         let mut translated = String::new();
         for segment in segments {
@@ -176,7 +188,9 @@ impl GoogleTranslateProvider {
         }
 
         if translated.is_empty() {
-            return Err(LocustError::ProviderError("Google Translate returned empty translation".to_string()));
+            return Err(LocustError::ProviderError(
+                "Google Translate returned empty translation".to_string(),
+            ));
         }
 
         Ok(translated)
@@ -186,11 +200,7 @@ impl GoogleTranslateProvider {
 #[cfg(test)]
 mod tests {
     fn make_google_response(translated: &str) -> serde_json::Value {
-        serde_json::json!([
-            [[translated, "source", null, null, 1.0]],
-            null,
-            "en"
-        ])
+        serde_json::json!([[[translated, "source", null, null, 1.0]], null, "en"])
     }
 
     #[tokio::test]

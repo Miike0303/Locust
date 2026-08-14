@@ -10,10 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 
 fn tmp(prefix: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "locust_{prefix}_{}",
-        uuid::Uuid::new_v4()
-    ));
+    let d = std::env::temp_dir().join(format!("locust_{prefix}_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&d).unwrap();
     d
 }

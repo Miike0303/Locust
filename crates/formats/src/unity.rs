@@ -6,9 +6,10 @@ use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 use crate::unity_serialized::{
-    is_binary_looking_script, is_textasset_script_worth_extracting, looks_like_assembly_qualified_type,
-    looks_like_code_identifier, looks_like_lorem_ipsum, looks_like_naninovel_script,
-    looks_like_unity_asset_path, rewrite_text_asset_script_inplace, SerializedFile,
+    is_binary_looking_script, is_textasset_script_worth_extracting,
+    looks_like_assembly_qualified_type, looks_like_code_identifier, looks_like_lorem_ipsum,
+    looks_like_naninovel_script, looks_like_unity_asset_path, rewrite_text_asset_script_inplace,
+    SerializedFile,
 };
 
 /// Plugin for Unity Engine games.
@@ -66,7 +67,10 @@ impl UnityPlugin {
             let p = entry.path();
             if p.is_dir() {
                 let dir_name = p.file_name()?.to_string_lossy();
-                if dir_name.contains("SCRIPT") || dir_name.contains("script") || dir_name.contains("Script") {
+                if dir_name.contains("SCRIPT")
+                    || dir_name.contains("script")
+                    || dir_name.contains("Script")
+                {
                     return Some(p);
                 }
             }
@@ -185,7 +189,10 @@ impl UnityPlugin {
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
-            by_file.entry(entry.file_path.clone()).or_default().push(entry);
+            by_file
+                .entry(entry.file_path.clone())
+                .or_default()
+                .push(entry);
         }
 
         for (file_path, file_entries) in &by_file {
@@ -247,8 +254,7 @@ impl UnityPlugin {
                         let char_id = &trimmed_line[..space_pos];
                         let translated_with_codes = format!(
                             "{}{} {}{}{}",
-                            indent, char_id,
-                            prefix_codes, translation, suffix_codes
+                            indent, char_id, prefix_codes, translation, suffix_codes
                         );
                         new_lines.push(translated_with_codes);
                         modified = true;
@@ -366,10 +372,8 @@ impl UnityPlugin {
                                         cell.value.clone(),
                                         file_path.to_path_buf(),
                                     );
-                                    entry.tags = vec![
-                                        "textasset".to_string(),
-                                        "textasset_csv".to_string(),
-                                    ];
+                                    entry.tags =
+                                        vec!["textasset".to_string(), "textasset_csv".to_string()];
                                     entry.context = Some(if ta.name.is_empty() {
                                         format!("csv col={} row={}", cell.header, cell.row)
                                     } else {
@@ -380,9 +384,7 @@ impl UnityPlugin {
                                     });
                                     entry.metadata.insert(
                                         "extraction_method".to_string(),
-                                        serde_json::Value::String(
-                                            "textasset_csv_cell".to_string(),
-                                        ),
+                                        serde_json::Value::String("textasset_csv_cell".to_string()),
                                     );
                                     entry.metadata.insert(
                                         "path_id".to_string(),
@@ -400,14 +402,12 @@ impl UnityPlugin {
                                         "textasset_script_byte_len".to_string(),
                                         serde_json::json!(ta.script_byte_len),
                                     );
-                                    entry.metadata.insert(
-                                        "csv_row".to_string(),
-                                        serde_json::json!(cell.row),
-                                    );
-                                    entry.metadata.insert(
-                                        "csv_col".to_string(),
-                                        serde_json::json!(cell.col),
-                                    );
+                                    entry
+                                        .metadata
+                                        .insert("csv_row".to_string(), serde_json::json!(cell.row));
+                                    entry
+                                        .metadata
+                                        .insert("csv_col".to_string(), serde_json::json!(cell.col));
                                     entry.metadata.insert(
                                         "csv_header".to_string(),
                                         serde_json::Value::String(cell.header),
@@ -433,19 +433,15 @@ impl UnityPlugin {
                                     "\n"
                                 };
                                 for (line_index, loc) in lines.into_iter().enumerate() {
-                                    let id = format!(
-                                        "textasset/{}/line/{}",
-                                        ta.path_id, line_index
-                                    );
+                                    let id =
+                                        format!("textasset/{}/line/{}", ta.path_id, line_index);
                                     let mut entry = StringEntry::new(
                                         id,
                                         loc.value.clone(),
                                         file_path.to_path_buf(),
                                     );
-                                    entry.tags = vec![
-                                        "textasset".to_string(),
-                                        "textasset_loc".to_string(),
-                                    ];
+                                    entry.tags =
+                                        vec!["textasset".to_string(), "textasset_loc".to_string()];
                                     entry.context = Some(match (&ta.name, &loc.key) {
                                         (n, Some(k)) if !n.is_empty() => {
                                             format!("m_Name={n} key={k}")
@@ -456,9 +452,7 @@ impl UnityPlugin {
                                     });
                                     entry.metadata.insert(
                                         "extraction_method".to_string(),
-                                        serde_json::Value::String(
-                                            "textasset_loc_line".to_string(),
-                                        ),
+                                        serde_json::Value::String("textasset_loc_line".to_string()),
                                     );
                                     entry.metadata.insert(
                                         "path_id".to_string(),
@@ -526,14 +520,12 @@ impl UnityPlugin {
                                 "extraction_method".to_string(),
                                 serde_json::Value::String("textasset".to_string()),
                             );
-                            entry.metadata.insert(
-                                "path_id".to_string(),
-                                serde_json::json!(ta.path_id),
-                            );
-                            entry.metadata.insert(
-                                "name".to_string(),
-                                serde_json::Value::String(ta.name),
-                            );
+                            entry
+                                .metadata
+                                .insert("path_id".to_string(), serde_json::json!(ta.path_id));
+                            entry
+                                .metadata
+                                .insert("name".to_string(), serde_json::Value::String(ta.name));
                             entry.metadata.insert(
                                 "textasset_script_offset".to_string(),
                                 serde_json::json!(ta.script_len_offset),
@@ -646,10 +638,9 @@ impl UnityPlugin {
                                 "extraction_method".to_string(),
                                 serde_json::Value::String("textmesh".to_string()),
                             );
-                            entry.metadata.insert(
-                                "path_id".to_string(),
-                                serde_json::json!(tm.path_id),
-                            );
+                            entry
+                                .metadata
+                                .insert("path_id".to_string(), serde_json::json!(tm.path_id));
                             entry.metadata.insert(
                                 "textmesh_text_offset".to_string(),
                                 serde_json::json!(tm.text_len_offset),
@@ -693,10 +684,9 @@ impl UnityPlugin {
                                 "extraction_method".to_string(),
                                 serde_json::Value::String("guitext".to_string()),
                             );
-                            entry.metadata.insert(
-                                "path_id".to_string(),
-                                serde_json::json!(gt.path_id),
-                            );
+                            entry
+                                .metadata
+                                .insert("path_id".to_string(), serde_json::json!(gt.path_id));
                             entry.metadata.insert(
                                 "guitext_text_offset".to_string(),
                                 serde_json::json!(gt.text_len_offset),
@@ -856,9 +846,7 @@ fn is_unity_serialized_candidate(path: &Path) -> bool {
             if lower.contains('.') {
                 return false;
             }
-            lower.starts_with("level")
-                || lower == "globalgamemanagers"
-                || lower == "resources"
+            lower.starts_with("level") || lower == "globalgamemanagers" || lower == "resources"
         })
         .unwrap_or(false)
 }
@@ -868,9 +856,7 @@ fn find_bytes_once(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn range_contains(ranges: &[(usize, usize)], pos: usize) -> bool {
@@ -951,7 +937,10 @@ fn parse_textasset_loc_lines(script: &str) -> Option<Vec<TextAssetLocLine>> {
             line_count: 1,
         }]);
     }
-    let kv_hits = non_empty.iter().filter(|l| split_loc_kv(l).is_some()).count();
+    let kv_hits = non_empty
+        .iter()
+        .filter(|l| split_loc_kv(l).is_some())
+        .count();
     if kv_hits * 100 / non_empty.len() < 70 {
         return None;
     }
@@ -1167,7 +1156,9 @@ fn is_csv_header_token(h: &str) -> bool {
 
 fn is_pure_int_token(s: &str) -> bool {
     let s = s.trim();
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '+')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == '+')
 }
 
 /// Detect simple CSV: header of identifier columns, ≥2 data rows, no quotes,
@@ -1252,10 +1243,7 @@ fn parse_textasset_csv(script: &str) -> Option<TextAssetCsv> {
 }
 
 /// Apply CSV cell translations onto the original script (re-parse + rewrite).
-fn apply_csv_translations_to_script(
-    original: &str,
-    cells: &[&StringEntry],
-) -> Option<String> {
+fn apply_csv_translations_to_script(original: &str, cells: &[&StringEntry]) -> Option<String> {
     let newline = if original.contains("\r\n") {
         "\r\n"
     } else {
@@ -1380,7 +1368,11 @@ fn extract_quoted_in_line(line: &str) -> Option<&str> {
     let rest = &line[start..];
     let end = rest.find('"')?;
     let text = &rest[..end];
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Extract VN dialogue: `CharID Dialogue text here`
@@ -1388,16 +1380,29 @@ fn extract_quoted_in_line(line: &str) -> Option<&str> {
 /// Returns (char_id, clean_text) where clean_text has format codes stripped
 fn extract_vn_dialogue(line: &str) -> Option<(&str, &str)> {
     let trimmed = line.trim();
-    if trimmed.is_empty() { return None; }
+    if trimmed.is_empty() {
+        return None;
+    }
 
     let space_pos = trimmed.find(' ')?;
     let char_id = &trimmed[..space_pos];
     let text = trimmed[space_pos + 1..].trim();
 
-    if char_id.is_empty() || char_id.len() > 8 { return None; }
-    if !char_id.chars().next()?.is_ascii_uppercase() { return None; }
-    if !char_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return None; }
-    if text.is_empty() || text.starts_with('{') || text.starts_with('+') { return None; }
+    if char_id.is_empty() || char_id.len() > 8 {
+        return None;
+    }
+    if !char_id.chars().next()?.is_ascii_uppercase() {
+        return None;
+    }
+    if !char_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    if text.is_empty() || text.starts_with('{') || text.starts_with('+') {
+        return None;
+    }
 
     Some((char_id, text))
 }
@@ -1434,8 +1439,12 @@ fn split_format_codes(text: &str) -> (String, String, String) {
                 prefix_end += 2;
                 // Skip any following whitespace
                 while let Some(&ws) = chars.peek() {
-                    if ws == ' ' { chars.next(); prefix_end += 1; }
-                    else { break; }
+                    if ws == ' ' {
+                        chars.next();
+                        prefix_end += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
         } else {
@@ -1558,8 +1567,7 @@ fn is_unity_translatable(text: &str) -> bool {
     if s.contains('\\') && s.contains('.') {
         return false;
     }
-    if s
-        .chars()
+    if s.chars()
         .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
         && s.chars().any(|c| c.is_ascii_uppercase())
     {
@@ -1797,16 +1805,18 @@ impl FormatPlugin for UnityPlugin {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            all.extend(Self::extract_strings_from_assets(&bytes, &filename, asset_file));
+            all.extend(Self::extract_strings_from_assets(
+                &bytes, &filename, asset_file,
+            ));
         }
         Ok(all)
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
         // Check if entries come from text scripts (file_path ends in .txt)
-        let from_text = entries.iter().any(|e| {
-            e.file_path.extension().is_some_and(|ext| ext == "txt")
-        });
+        let from_text = entries
+            .iter()
+            .any(|e| e.file_path.extension().is_some_and(|ext| ext == "txt"));
 
         if from_text {
             return Self::inject_text_scripts(path, entries);
@@ -1822,7 +1832,10 @@ impl FormatPlugin for UnityPlugin {
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
-            by_file.entry(entry.file_path.clone()).or_default().push(entry);
+            by_file
+                .entry(entry.file_path.clone())
+                .or_default()
+                .push(entry);
         }
 
         for (file_path, file_entries) in &by_file {
@@ -1836,16 +1849,13 @@ impl FormatPlugin for UnityPlugin {
             // ── TextAsset CSV cell groups (re-parse original blob, apply cells) ──
             {
                 let mut csv_groups: HashMap<i64, Vec<&StringEntry>> = HashMap::new();
-                for entry in file_entries.iter().filter(|e| is_textasset_csv_cell_entry(e)) {
-                    let Some(path_id) = entry
-                        .metadata
-                        .get("path_id")
-                        .and_then(|v| v.as_i64())
+                for entry in file_entries
+                    .iter()
+                    .filter(|e| is_textasset_csv_cell_entry(e))
+                {
+                    let Some(path_id) = entry.metadata.get("path_id").and_then(|v| v.as_i64())
                     else {
-                        warnings.push(format!(
-                            "TextAsset csv cell '{}' missing path_id",
-                            entry.id
-                        ));
+                        warnings.push(format!("TextAsset csv cell '{}' missing path_id", entry.id));
                         strings_skipped += 1;
                         continue;
                     };
@@ -1873,14 +1883,12 @@ impl FormatPlugin for UnityPlugin {
                         continue;
                     }
                     // Payload starts after the u32 length prefix.
-                    let payload =
-                        &bytes[script_off + 4..script_off + 4 + orig_len];
+                    let payload = &bytes[script_off + 4..script_off + 4 + orig_len];
                     let Ok(original) = std::str::from_utf8(payload) else {
                         strings_skipped += group.len();
                         continue;
                     };
-                    let Some(mut rebuilt) =
-                        apply_csv_translations_to_script(original, &group)
+                    let Some(mut rebuilt) = apply_csv_translations_to_script(original, &group)
                     else {
                         strings_skipped += group.len();
                         continue;
@@ -1902,11 +1910,7 @@ impl FormatPlugin for UnityPlugin {
                         rebuilt.push(' ');
                     }
                     match rewrite_text_asset_script_inplace(
-                        &mut bytes,
-                        script_off,
-                        orig_len,
-                        &rebuilt,
-                        &label,
+                        &mut bytes, script_off, orig_len, &rebuilt, &label,
                     ) {
                         Ok(()) => {
                             let changed = group
@@ -1933,16 +1937,13 @@ impl FormatPlugin for UnityPlugin {
             // ── TextAsset loc-line groups (rebuild whole m_Script once per path_id) ──
             {
                 let mut loc_groups: HashMap<i64, Vec<&StringEntry>> = HashMap::new();
-                for entry in file_entries.iter().filter(|e| is_textasset_loc_line_entry(e)) {
-                    let Some(path_id) = entry
-                        .metadata
-                        .get("path_id")
-                        .and_then(|v| v.as_i64())
+                for entry in file_entries
+                    .iter()
+                    .filter(|e| is_textasset_loc_line_entry(e))
+                {
+                    let Some(path_id) = entry.metadata.get("path_id").and_then(|v| v.as_i64())
                     else {
-                        warnings.push(format!(
-                            "TextAsset loc line '{}' missing path_id",
-                            entry.id
-                        ));
+                        warnings.push(format!("TextAsset loc line '{}' missing path_id", entry.id));
                         strings_skipped += 1;
                         continue;
                     };
@@ -1996,11 +1997,7 @@ impl FormatPlugin for UnityPlugin {
                         rebuilt.push(' ');
                     }
                     match rewrite_text_asset_script_inplace(
-                        &mut bytes,
-                        script_off,
-                        orig_len,
-                        &rebuilt,
-                        &label,
+                        &mut bytes, script_off, orig_len, &rebuilt, &label,
                     ) {
                         Ok(()) => {
                             let changed = group
@@ -2048,17 +2045,9 @@ impl FormatPlugin for UnityPlugin {
                         "TextAsset",
                     )
                 } else if is_textmesh_entry(entry) {
-                    (
-                        "textmesh_text_offset",
-                        "textmesh_text_byte_len",
-                        "TextMesh",
-                    )
+                    ("textmesh_text_offset", "textmesh_text_byte_len", "TextMesh")
                 } else if is_guitext_entry(entry) {
-                    (
-                        "guitext_text_offset",
-                        "guitext_text_byte_len",
-                        "GUIText",
-                    )
+                    ("guitext_text_offset", "guitext_text_byte_len", "GUIText")
                 } else {
                     (
                         "mono_string_offset",
@@ -2072,10 +2061,7 @@ impl FormatPlugin for UnityPlugin {
                     .and_then(|v| v.as_u64())
                     .map(|u| u as usize)
                 else {
-                    warnings.push(format!(
-                        "{kind} entry '{}' missing {off_key}",
-                        entry.id
-                    ));
+                    warnings.push(format!("{kind} entry '{}' missing {off_key}", entry.id));
                     strings_skipped += 1;
                     continue;
                 };
@@ -2188,8 +2174,9 @@ impl FormatPlugin for UnityPlugin {
                     crate::binary_search::MatchCursor::from_patterns(&bytes, &patterns);
 
                 for (i, w) in work.iter().enumerate() {
-                    let mut matched: Option<(usize, LengthEndian)> =
-                        cursor.next_valid(i, &bytes, &w.needle).map(|p| (p, w.endian));
+                    let mut matched: Option<(usize, LengthEndian)> = cursor
+                        .next_valid(i, &bytes, &w.needle)
+                        .map(|p| (p, w.endian));
                     if matched.is_none() {
                         if let (Some(alt), Some(ae)) = (&w.alt_needle, w.alt_endian) {
                             if let Some(pos) = find_bytes_once(&bytes, alt) {
@@ -2230,7 +2217,13 @@ impl FormatPlugin for UnityPlugin {
             ));
         }
 
-        Ok(InjectionReport { files_modified, strings_written, strings_skipped, warnings, files_written })
+        Ok(InjectionReport {
+            files_modified,
+            strings_written,
+            strings_skipped,
+            warnings,
+            files_written,
+        })
     }
 }
 
@@ -2274,7 +2267,9 @@ mod tests {
         let scripts_dir = data_dir.join("SCRIPTS~");
         fs::create_dir_all(&scripts_dir).unwrap();
 
-        fs::write(scripts_dir.join("Chapter_1.txt"), r#"version 1.0
+        fs::write(
+            scripts_dir.join("Chapter_1.txt"),
+            r#"version 1.0
 
 script Chapter_1_script chapter 1 {
 
@@ -2294,16 +2289,22 @@ script Chapter_1_script chapter 1 {
   index 4
     J Let's go!
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
-        fs::write(scripts_dir.join("Menus.txt"), r#"version 1.0
+        fs::write(
+            scripts_dir.join("Menus.txt"),
+            r#"version 1.0
 
   menu MainMenu {
     button 0 "Talk" jump 10
     button 1 "Examine" jump 20
     button 2 "Leave" +main jump 30
   }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         dir.to_path_buf()
     }
@@ -2366,18 +2367,16 @@ script Chapter_1_script chapter 1 {
 
         // Real SerializedFile (v17 TextAsset) stored under the classic
         // extensionless managers name — must be discovered and extracted.
-        let bytes = crate::unity_serialized::write_v17_fixture(
-            "Sys",
-            "Extensionless managers dialogue",
-        );
+        let bytes =
+            crate::unity_serialized::write_v17_fixture("Sys", "Extensionless managers dialogue");
         fs::write(data_dir.join("globalgamemanagers"), &bytes).unwrap();
 
         let plugin = UnityPlugin::new();
         let found = UnityPlugin::find_assets_files(&dir);
         assert!(
-            found.iter().any(|p| p
-                .file_name()
-                .is_some_and(|n| n == "globalgamemanagers")),
+            found
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "globalgamemanagers")),
             "must discover globalgamemanagers: {found:?}"
         );
         let entries = plugin.extract(&dir).unwrap();
@@ -2397,14 +2396,15 @@ script Chapter_1_script chapter 1 {
         let nested = data_dir.join("Scenes").join("Act1");
         fs::create_dir_all(&nested).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
-        let bytes =
-            crate::unity_serialized::write_v17_fixture("N", "Nested level dialogue here");
+        let bytes = crate::unity_serialized::write_v17_fixture("N", "Nested level dialogue here");
         // Depth from *_Data: Scenes (1) / Act1 (2) / level0 (3)
         fs::write(nested.join("level0"), &bytes).unwrap();
 
         let found = UnityPlugin::find_assets_files(&dir);
         assert!(
-            found.iter().any(|p| p.file_name().is_some_and(|n| n == "level0")),
+            found
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "level0")),
             "max_depth 3 must reach nested level0: {found:?}"
         );
         let plugin = UnityPlugin::new();
@@ -2426,7 +2426,11 @@ script Chapter_1_script chapter 1 {
         let entries = plugin.extract(&dir).unwrap();
         let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
         assert!(sources.contains(&"Hello World"), "got: {:?}", sources);
-        assert!(sources.contains(&"Press any key to continue"), "got: {:?}", sources);
+        assert!(
+            sources.contains(&"Press any key to continue"),
+            "got: {:?}",
+            sources
+        );
     }
 
     #[test]
@@ -2454,9 +2458,17 @@ script Chapter_1_script chapter 1 {
         let entries = plugin.extract(&dir).unwrap();
 
         let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
-        assert!(sources.contains(&"This is the beginning of our story."), "got: {:?}", sources);
+        assert!(
+            sources.contains(&"This is the beginning of our story."),
+            "got: {:?}",
+            sources
+        );
         assert!(sources.contains(&"My name is Jamie."), "got: {:?}", sources);
-        assert!(sources.contains(&"I'm waiting for my best friend!"), "got: {:?}", sources);
+        assert!(
+            sources.contains(&"I'm waiting for my best friend!"),
+            "got: {:?}",
+            sources
+        );
         assert!(sources.contains(&"Let's go!"), "got: {:?}", sources);
 
         // Menu buttons
@@ -2472,11 +2484,17 @@ script Chapter_1_script chapter 1 {
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
 
-        let jamie = entries.iter().find(|e| e.source == "My name is Jamie.").unwrap();
+        let jamie = entries
+            .iter()
+            .find(|e| e.source == "My name is Jamie.")
+            .unwrap();
         assert_eq!(jamie.context, Some("J".to_string()));
         assert!(jamie.tags.contains(&"dialogue".to_string()));
 
-        let nar = entries.iter().find(|e| e.source.contains("beginning")).unwrap();
+        let nar = entries
+            .iter()
+            .find(|e| e.source.contains("beginning"))
+            .unwrap();
         assert_eq!(nar.context, Some("Nar".to_string()));
     }
 
@@ -2502,8 +2520,11 @@ script Chapter_1_script chapter 1 {
 
         // Verify replacement
         let content = fs::read_to_string(
-            dir.join("TestGame_Data").join("SCRIPTS~").join("Chapter_1.txt")
-        ).unwrap();
+            dir.join("TestGame_Data")
+                .join("SCRIPTS~")
+                .join("Chapter_1.txt"),
+        )
+        .unwrap();
         assert!(content.contains("Mi nombre es Jamie."));
     }
 
@@ -2551,10 +2572,7 @@ script Chapter_1_script chapter 1 {
             .find(|e| e.source == "Hello World")
             .expect("BE length-prefixed Hello World must extract");
         assert_eq!(
-            hello
-                .metadata
-                .get("length_endian")
-                .and_then(|v| v.as_str()),
+            hello.metadata.get("length_endian").and_then(|v| v.as_str()),
             Some("be"),
             "must record big-endian length: {:?}",
             hello.metadata
@@ -2657,11 +2675,11 @@ script Chapter_1_script chapter 1 {
             e
         };
         let inject_list = vec![
-            mk("dup1", "DupStr!!", Some("DupOk!!!")), // 8 → 8
-            mk("id", "SameSame", Some("SameSame")),   // identity → skip
-            mk("dup2", "DupStr!!", Some("DupOk!!!")), // second occurrence
+            mk("dup1", "DupStr!!", Some("DupOk!!!")),   // 8 → 8
+            mk("id", "SameSame", Some("SameSame")),     // identity → skip
+            mk("dup2", "DupStr!!", Some("DupOk!!!")),   // second occurrence
             mk("over", "SlotTxt!", Some("WAYTOOLONG")), // oversize → skip
-            mk("ok", "OkText!!", Some("OkTxt!!!")),   // 8 → 8
+            mk("ok", "OkText!!", Some("OkTxt!!!")),     // 8 → 8
         ];
 
         let plugin = UnityPlugin::new();
@@ -2669,9 +2687,7 @@ script Chapter_1_script chapter 1 {
         assert_eq!(
             report.strings_written, 3,
             "two dups + ok; got written={} skipped={} warnings={:?}",
-            report.strings_written,
-            report.strings_skipped,
-            report.warnings
+            report.strings_written, report.strings_skipped, report.warnings
         );
         assert_eq!(report.strings_skipped, 2, "identity + oversize");
         assert!(
@@ -2690,8 +2706,14 @@ script Chapter_1_script chapter 1 {
             "both DupStr slots rewritten"
         );
         assert!(out.windows(8).any(|w| w == b"OkTxt!!!"));
-        assert!(out.windows(8).any(|w| w == b"SameSame"), "identity unchanged");
-        assert!(out.windows(8).any(|w| w == b"SlotTxt!"), "oversize target unchanged");
+        assert!(
+            out.windows(8).any(|w| w == b"SameSame"),
+            "identity unchanged"
+        );
+        assert!(
+            out.windows(8).any(|w| w == b"SlotTxt!"),
+            "oversize target unchanged"
+        );
     }
 
     #[test]
@@ -2800,9 +2822,11 @@ script Chapter_1_script chapter 1 {
             !crate::unity_serialized::is_textasset_script_worth_extracting(charset),
             "charset table must be rejected"
         );
-        assert!(crate::unity_serialized::is_textasset_script_worth_extracting(
-            "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS"
-        ));
+        assert!(
+            crate::unity_serialized::is_textasset_script_worth_extracting(
+                "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS"
+            )
+        );
         let bytes = crate::unity_serialized::write_v17_fixture("LineBreak", charset);
         fs::write(data_dir.join("sharedassets0.assets"), bytes).unwrap();
         let plugin = UnityPlugin::new();
@@ -2847,7 +2871,9 @@ script Chapter_1_script chapter 1 {
         fs::write(data_dir.join("sharedassets0.assets"), &bytes).unwrap();
         let entries = UnityPlugin::new().extract(&dir).unwrap();
         assert!(
-            !entries.iter().any(|e| e.source == "Emily" || e.source == "Carter"),
+            !entries
+                .iter()
+                .any(|e| e.source == "Emily" || e.source == "Carter"),
             "CharacterNames must not extract: {:?}",
             entries.iter().map(|e| &e.source).collect::<Vec<_>>()
         );
@@ -2873,13 +2899,12 @@ Confirmation.Yes: YES\r\n";
         fs::write(data_dir.join("sharedassets0.assets"), &bytes).unwrap();
         let entries = UnityPlugin::new().extract(&dir).unwrap();
         let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
-        assert!(
-            sources.contains(&"NEW GAME"),
-            "keep UI: {sources:?}"
-        );
+        assert!(sources.contains(&"NEW GAME"), "keep UI: {sources:?}");
         assert!(sources.contains(&"YES"), "keep YES: {sources:?}");
         assert!(
-            !sources.iter().any(|s| s.to_ascii_lowercase().contains("lorem")),
+            !sources
+                .iter()
+                .any(|s| s.to_ascii_lowercase().contains("lorem")),
             "drop lorem loc value: {sources:?}"
         );
     }
@@ -2903,7 +2928,9 @@ Confirmation.Yes: YES\r\n";
             sources
         );
         assert!(
-            !sources.iter().any(|s| *s == "Naninovel" || *s == "QuaternionTween"),
+            !sources
+                .iter()
+                .any(|s| *s == "Naninovel" || *s == "QuaternionTween"),
             "MonoScript type names must not appear: {:?}",
             sources
         );
@@ -2959,7 +2986,10 @@ Electronics,video games,13\r\n";
         let parsed = parse_textasset_csv(csv).expect("csv");
         // CATEGORY + NAME are text; TEST_ID numeric skipped.
         assert!(
-            parsed.cells.iter().any(|c| c.value == "mp3 player" && c.header == "ITEM_NAME"),
+            parsed
+                .cells
+                .iter()
+                .any(|c| c.value == "mp3 player" && c.header == "ITEM_NAME"),
             "{:?}",
             parsed.cells
         );
@@ -3000,16 +3030,17 @@ Electronics,video games,13\r\n",
         let cells: Vec<_> = entries
             .iter()
             .filter(|e| {
-                e.metadata
-                    .get("extraction_method")
-                    .and_then(|v| v.as_str())
+                e.metadata.get("extraction_method").and_then(|v| v.as_str())
                     == Some("textasset_csv_cell")
             })
             .collect();
         assert!(
             cells.len() >= 4,
             "expected csv cells, got {:?}",
-            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
         );
         assert!(cells.iter().any(|e| e.source == "towel"));
 
@@ -3032,9 +3063,7 @@ Electronics,video games,13\r\n",
         let values: Vec<&str> = again
             .iter()
             .filter(|e| {
-                e.metadata
-                    .get("extraction_method")
-                    .and_then(|v| v.as_str())
+                e.metadata.get("extraction_method").and_then(|v| v.as_str())
                     == Some("textasset_csv_cell")
             })
             .map(|e| e.source.as_str())
@@ -3046,7 +3075,8 @@ Electronics,video games,13\r\n",
 
     #[test]
     fn test_parse_textasset_loc_lines_key_value() {
-        let doc = "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS\r\nConfirmation.Yes: YES\r\n";
+        let doc =
+            "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS\r\nConfirmation.Yes: YES\r\n";
         let lines = parse_textasset_loc_lines(doc).expect("loc doc");
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].key.as_deref(), Some("TitleMenu.START"));
@@ -3150,24 +3180,22 @@ Confirmation.Yes: YES\r\n\
         let loc: Vec<_> = entries
             .iter()
             .filter(|e| {
-                e.metadata
-                    .get("extraction_method")
-                    .and_then(|v| v.as_str())
+                e.metadata.get("extraction_method").and_then(|v| v.as_str())
                     == Some("textasset_loc_line")
             })
             .collect();
         assert!(
             loc.len() >= 3,
             "expected loc lines, got {:?}",
-            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
         );
         assert!(loc.iter().any(|e| e.source == "NEW GAME"));
         assert!(loc.iter().any(|e| e.source == "CREDITS"));
         assert!(loc.iter().any(|e| {
-            e.metadata
-                .get("loc_key")
-                .and_then(|v| v.as_str())
-                == Some("TitleMenu.START")
+            e.metadata.get("loc_key").and_then(|v| v.as_str()) == Some("TitleMenu.START")
         }));
 
         for e in &mut entries {
@@ -3189,21 +3217,13 @@ Confirmation.Yes: YES\r\n\
         let values: Vec<&str> = again
             .iter()
             .filter(|e| {
-                e.metadata
-                    .get("extraction_method")
-                    .and_then(|v| v.as_str())
+                e.metadata.get("extraction_method").and_then(|v| v.as_str())
                     == Some("textasset_loc_line")
             })
             .map(|e| e.source.as_str())
             .collect();
-        assert!(
-            values.contains(&"NUEVA"),
-            "re-extract values: {values:?}"
-        );
-        assert!(
-            values.contains(&"SI"),
-            "re-extract values: {values:?}"
-        );
+        assert!(values.contains(&"NUEVA"), "re-extract values: {values:?}");
+        assert!(values.contains(&"SI"), "re-extract values: {values:?}");
         assert!(
             values.contains(&"CREDITS"),
             "untouched line kept: {values:?}"
@@ -3268,7 +3288,10 @@ Confirmation.Yes: YES\r\n\
         assert!(
             mono.len() >= 2,
             "expected m_Name + dialogue, got {:?}",
-            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
         );
         assert!(mono.iter().any(|e| e.source == "DialogBox"));
         assert!(mono.iter().any(|e| e.source.contains("Hello traveler")));
@@ -3305,7 +3328,8 @@ Confirmation.Yes: YES\r\n\
         assert!(
             again
                 .iter()
-                .any(|e| e.tags.iter().any(|t| t == "monobehaviour") && e.source.starts_with("Hola!")),
+                .any(|e| e.tags.iter().any(|t| t == "monobehaviour")
+                    && e.source.starts_with("Hola!")),
             "re-extract: {:?}",
             again.iter().map(|e| &e.source).collect::<Vec<_>>()
         );
@@ -3363,13 +3387,13 @@ Confirmation.Yes: YES\r\n\
             hits.len(),
             2,
             "expected both heuristic offsets, got {:?}",
-            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
         );
         assert!(hits.iter().all(|e| {
-            e.metadata
-                .get("extraction_method")
-                .and_then(|v| v.as_str())
-                == Some("heuristic")
+            e.metadata.get("extraction_method").and_then(|v| v.as_str()) == Some("heuristic")
         }));
 
         let mut inject_entries = entries;
@@ -3386,14 +3410,8 @@ Confirmation.Yes: YES\r\n\
             report.warnings
         );
         let out = fs::read(&assets).unwrap();
-        let count = out
-            .windows(6)
-            .filter(|w| w == b"Pulsa!")
-            .count();
-        assert!(
-            count >= 2,
-            "expected ≥2 rewritten payloads, found {count}"
-        );
+        let count = out.windows(6).filter(|w| w == b"Pulsa!").count();
+        assert!(count >= 2, "expected ≥2 rewritten payloads, found {count}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3413,7 +3431,10 @@ Confirmation.Yes: YES\r\n\
             tm.len(),
             2,
             "expected both OK TextMeshes, got {:?}",
-            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
         );
         assert!(tm.iter().any(|e| e.id == "textmesh/7"));
         assert!(tm.iter().any(|e| e.id == "textmesh/8"));
@@ -3468,7 +3489,10 @@ Confirmation.Yes: YES\r\n\
         assert!(
             !tm.is_empty(),
             "expected TextMesh entries, got {:?}",
-            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
         );
         assert!(tm.iter().any(|e| e.id.starts_with("textmesh/")));
         assert!(tm.iter().any(|e| e.source == "Hello, world!"));
@@ -3537,7 +3561,10 @@ Confirmation.Yes: YES\r\n\
         assert!(
             !gt.is_empty(),
             "expected GUIText entries, got {:?}",
-            entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
         );
         assert!(gt.iter().any(|e| e.id.starts_with("guitext/")));
         assert!(gt.iter().any(|e| e.source == "Press Start"));

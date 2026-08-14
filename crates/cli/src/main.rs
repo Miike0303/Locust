@@ -30,7 +30,10 @@ fn warn_binary_slot_oversize(entries: &[StringEntry]) {
 }
 
 #[derive(Parser)]
-#[command(name = "locust", about = "Project Locust — Universal game translation tool")]
+#[command(
+    name = "locust",
+    about = "Project Locust — Universal game translation tool"
+)]
 #[command(version, author)]
 struct Cli {
     #[command(subcommand)]
@@ -173,9 +176,7 @@ enum Commands {
         force: bool,
     },
     /// Show whether a game has a Locust patch applied
-    PatchStatus {
-        game_path: PathBuf,
-    },
+    PatchStatus { game_path: PathBuf },
     /// Authenticate with a provider via OAuth (currently: grok)
     Auth {
         /// Provider to authenticate: grok
@@ -258,11 +259,7 @@ enum GlossaryCommands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let filter = if cli.verbose {
-        "debug"
-    } else {
-        "info"
-    };
+    let filter = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -288,8 +285,16 @@ async fn main() -> anyhow::Result<()> {
             context,
         } => {
             cmd_translate(
-                config, project, provider, source, target, batch_size, concurrency, fallback,
-                cost_limit, context,
+                config,
+                project,
+                provider,
+                source,
+                target,
+                batch_size,
+                concurrency,
+                fallback,
+                cost_limit,
+                context,
             )
             .await?
         }
@@ -509,9 +514,9 @@ fn print_record_outcome(
     use locust_core::extraction::RecordOutcome;
     match outcome {
         RecordOutcome::Recorded { .. } => {}
-        RecordOutcome::KeptPrevious { recorded_at } => println!(
-            "{label}: 0 files written — previous recording (dated {recorded_at}) kept"
-        ),
+        RecordOutcome::KeptPrevious { recorded_at } => {
+            println!("{label}: 0 files written — previous recording (dated {recorded_at}) kept")
+        }
         RecordOutcome::NothingRecorded => {
             // Say WHY nothing was recorded and name a remedy that fits this
             // state — `locust patch` on this project will only ever advise
@@ -581,10 +586,7 @@ fn cmd_patch(
         // Preserve CLI remedies that mention inject paths when useful.
         let mut msg = e.to_string();
         if msg.contains("no injection has been recorded") {
-            msg = format!(
-                "{msg}{}",
-                maybe_mutated_note(&game_path)
-            );
+            msg = format!("{msg}{}", maybe_mutated_note(&game_path));
         }
         anyhow::anyhow!(msg)
     })?;
@@ -907,7 +909,10 @@ fn cmd_pivot(source: PathBuf, output: PathBuf) -> anyhow::Result<()> {
     }
 
     if pivoted.is_empty() {
-        anyhow::bail!("no translated entries in {} to pivot from", source.display());
+        anyhow::bail!(
+            "no translated entries in {} to pivot from",
+            source.display()
+        );
     }
 
     let out_db = Database::open(&output)?;
@@ -1044,10 +1049,7 @@ fn cmd_extract(
     let mut table = Table::new();
     table.set_header(vec!["Property", "Value"]);
     table.add_row(vec!["Format", plugin.name()]);
-    table.add_row(vec![
-        "Strings extracted",
-        &total.to_string(),
-    ]);
+    table.add_row(vec!["Strings extracted", &total.to_string()]);
     table.add_row(vec!["Output file", &db_path.display().to_string()]);
     println!("{table}");
 
@@ -1239,8 +1241,16 @@ async fn cmd_inject(
              \"{}\" -P \"{}\"{} -l es{}",
             game_path.display(),
             project.display(),
-            if matches!(mode, OutputMode::Add) { " -m add" } else { "" },
-            if matches!(mode, OutputMode::Replace) { " -o <output_dir>" } else { "" },
+            if matches!(mode, OutputMode::Add) {
+                " -m add"
+            } else {
+                ""
+            },
+            if matches!(mode, OutputMode::Replace) {
+                " -o <output_dir>"
+            } else {
+                ""
+            },
         );
     }
 
@@ -1293,12 +1303,10 @@ async fn cmd_inject(
     // shared with the HTTP server and the desktop app so no inject seam can
     // skip it); the CLI supplies the per-engine remedy and surfaces the
     // zero-write outcomes.
-    let outcomes = locust_core::extraction::record_multilang_injection(
-        &db,
-        &report,
-        &languages,
-        &|lang| replace_containment_remedy(&format_id, &game_path, &project, lang),
-    )?;
+    let outcomes =
+        locust_core::extraction::record_multilang_injection(&db, &report, &languages, &|lang| {
+            replace_containment_remedy(&format_id, &game_path, &project, lang)
+        })?;
     for (lang, outcome) in &outcomes {
         if let Some(rep) = report.reports.get(lang) {
             print_record_outcome(lang, outcome, rep, &format_id);
@@ -1343,7 +1351,9 @@ async fn cmd_inject(
             .any(|(_, e)| e.contains("does not support Add mode"))
         {
             msg.push('\n');
-            msg.push_str(&add_mode_remedy(&format_id, &game_path, &project, &languages));
+            msg.push_str(&add_mode_remedy(
+                &format_id, &game_path, &project, &languages,
+            ));
         }
         anyhow::bail!("{msg}");
     }
@@ -1383,12 +1393,7 @@ async fn cmd_inject_direct(
         println!("Creating backup (engine mutates the original game tree)...");
     }
     let report = locust_core::extraction::inject_direct(
-        &registry,
-        &db,
-        &mgr,
-        &game_path,
-        &format_id,
-        &languages,
+        &registry, &db, &mgr, &game_path, &format_id, &languages,
     )?;
 
     // Contractual zero-write reporting (same messages as multilang inject):
@@ -1577,9 +1582,7 @@ async fn cmd_replace(
         return Ok(());
     }
 
-    let applied = db
-        .save_translations_batch(updates, "cli-replace")
-        .await?;
+    let applied = db.save_translations_batch(updates, "cli-replace").await?;
     println!(
         "Updated {applied} string(s), {occurrences} occurrence(s) in {}.",
         project.display()
@@ -1606,8 +1609,16 @@ fn cmd_providers(config: &AppConfig) -> anyhow::Result<()> {
         table.add_row(vec![
             p.id.clone(),
             p.name.clone(),
-            if p.is_free { "Yes".to_string() } else { "No".to_string() },
-            if p.requires_api_key { "Yes".to_string() } else { "No".to_string() },
+            if p.is_free {
+                "Yes".to_string()
+            } else {
+                "No".to_string()
+            },
+            if p.requires_api_key {
+                "Yes".to_string()
+            } else {
+                "No".to_string()
+            },
         ]);
     }
     println!("{table}");
@@ -1777,13 +1788,20 @@ async fn cmd_import(
         _ => anyhow::bail!("unsupported import format: {}. Use 'po' or 'xliff'", format),
     }
 
-    println!("Imported {} translations from {}", imported, input.display());
+    println!(
+        "Imported {} translations from {}",
+        imported,
+        input.display()
+    );
     Ok(())
 }
 
 async fn cmd_server(port: u16) -> anyhow::Result<()> {
     let state = locust_server::create_app_state();
-    println!("Starting Project Locust server on http://localhost:{}", port);
+    println!(
+        "Starting Project Locust server on http://localhost:{}",
+        port
+    );
     println!("Press Ctrl+C to stop");
     locust_server::start_server(state, port).await?;
     Ok(())
@@ -1884,7 +1902,6 @@ mod tests {
         assert_eq!(n2, 1);
     }
 
-
     // ─── cmd_patch packaging tests: `patch` packs EXCLUSIVELY from the
     // recording injection persisted (root + rel + hash per language key);
     // every mismatch is a loud error naming a remedy that works ─────────────
@@ -1933,7 +1950,8 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, contents) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, &[script]).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script])
+            .unwrap();
         drop(db);
 
         let out_zip = base.join("out-patch.zip");
@@ -1959,7 +1977,8 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, &[script]).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script])
+            .unwrap();
         drop(db);
 
         let respelled = base.join("MYGAME");
@@ -2037,7 +2056,8 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-            None)
+            None,
+        )
         .expect_err("no recording must be a hard error, never an entry-derived guess");
         let msg = err.to_string();
         assert!(
@@ -2065,7 +2085,8 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("fr"), &game_dir, &[script]).unwrap();
+        db.record_injection(Some("fr"), &game_dir, &[script])
+            .unwrap();
         drop(db);
 
         let out_zip = base.join("out-patch.zip");
@@ -2075,14 +2096,18 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip),
             None,
-            None)
+            None,
+        )
         .expect_err("a language with no recording must be a hard error");
         let msg = err.to_string();
         assert!(
             msg.contains("no injection recorded for language \"es\""),
             "error must name the missing key: {msg}"
         );
-        assert!(msg.contains("\"fr\""), "error must list the recorded keys: {msg}");
+        assert!(
+            msg.contains("\"fr\""),
+            "error must list the recorded keys: {msg}"
+        );
         assert!(
             msg.contains("--direct -l es"),
             "error must advise recording the requested language: {msg}"
@@ -2111,7 +2136,8 @@ mod tests {
             None,
             Some(out_zip.clone()),
             None,
-            None)
+            None,
+        )
         .expect("the language-unspecified recording must pack without -l");
         assert!(out_zip.exists());
 
@@ -2121,7 +2147,8 @@ mod tests {
             Some("es".to_string()),
             Some(base.join("other.zip")),
             None,
-            None)
+            None,
+        )
         .expect_err("a named language must never silently match the unspecified key");
         let msg = err.to_string();
         assert!(
@@ -2143,7 +2170,8 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script)).unwrap();
+        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script))
+            .unwrap();
         db.record_injection(None, &game_dir, &[script]).unwrap();
         drop(db);
 
@@ -2154,7 +2182,8 @@ mod tests {
             None,
             Some(out_zip.clone()),
             None,
-            None)
+            None,
+        )
         .expect_err("multiple keys without -l must be a hard error, not a guess");
         let msg = err.to_string();
         assert!(msg.contains("es"), "error must list the named key: {msg}");
@@ -2162,7 +2191,10 @@ mod tests {
             msg.contains("(unspecified)"),
             "error must list the unspecified key too: {msg}"
         );
-        assert!(msg.contains("-l"), "error must require an explicit -l: {msg}");
+        assert!(
+            msg.contains("-l"),
+            "error must require an explicit -l: {msg}"
+        );
         // "Pass -l <lang>" alone cannot reach the (unspecified) recording —
         // no -l value names the NULL key. The error must say how to reach it:
         // re-record it under a named key.
@@ -2174,8 +2206,15 @@ mod tests {
         assert!(!out_zip.exists());
 
         // The advised choice unblocks.
-        cmd_patch(game_dir, db_path, Some("es".to_string()), Some(out_zip.clone()), None, None)
-            .expect("choosing a key with -l must unblock");
+        cmd_patch(
+            game_dir,
+            db_path,
+            Some("es".to_string()),
+            Some(out_zip.clone()),
+            None,
+            None,
+        )
+        .expect("choosing a key with -l must unblock");
         assert!(out_zip.exists());
     }
 
@@ -2240,8 +2279,15 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, _wolf_file, db_path) = make_wolf_game(&base);
 
-        let err = cmd_patch(game_dir.clone(), db_path.clone(), Some("es".to_string()), None, None, None)
-            .expect_err("no recording must be a hard error");
+        let err = cmd_patch(
+            game_dir.clone(),
+            db_path.clone(),
+            Some("es".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect_err("no recording must be a hard error");
         let msg = err.to_string();
         assert!(msg.contains("no injection has been recorded"), "{msg}");
         assert!(
@@ -2261,10 +2307,20 @@ mod tests {
         let base3 = patch_test_tempdir();
         let game3 = base3.join("htmlgame");
         fs::create_dir_all(&game3).unwrap();
-        fs::write(game3.join("index.html"), "<html><body><p>Hi there world</p></body></html>").unwrap();
+        fs::write(
+            game3.join("index.html"),
+            "<html><body><p>Hi there world</p></body></html>",
+        )
+        .unwrap();
         let db3 = base3.join("project.locust.db");
         let dbh = Database::open(&db3).unwrap();
-        save_translated(&dbh, "index.html#0", "Hi there world", &game3.join("index.html"), "Hola");
+        save_translated(
+            &dbh,
+            "index.html#0",
+            "Hi there world",
+            &game3.join("index.html"),
+            "Hola",
+        );
         drop(dbh);
         let err3 = cmd_patch(game3, db3, Some("es".to_string()), None, None, None).unwrap_err();
         let msg3 = err3.to_string();
@@ -2283,13 +2339,17 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, wolf_file, db_path) = make_wolf_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("fr"), &game_dir, &[wolf_file]).unwrap();
+        db.record_injection(Some("fr"), &game_dir, &[wolf_file])
+            .unwrap();
         drop(db);
 
         let err = cmd_patch(game_dir, db_path, Some("es".to_string()), None, None, None)
             .expect_err("a key miss must be a hard error");
         let msg = err.to_string();
-        assert!(msg.contains("no injection recorded for language \"es\""), "{msg}");
+        assert!(
+            msg.contains("no injection recorded for language \"es\""),
+            "{msg}"
+        );
         assert!(
             msg.contains("0 files written") && msg.contains("restore the original"),
             "the advised --direct re-run dead-ends on the already-patched \
@@ -2308,7 +2368,8 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, &[script]).unwrap();
+        db.record_injection(Some("es"), &game_dir, &[script])
+            .unwrap();
         drop(db);
 
         let secret = base.join("secret.txt");
@@ -2330,7 +2391,8 @@ mod tests {
             None,
             Some(out_zip.clone()),
             None,
-            None)
+            None,
+        )
         .expect_err("an absolute recorded rel must be refused, never packed");
         assert!(
             err.to_string().contains("escapes the game root"),
@@ -2415,7 +2477,8 @@ mod tests {
         let copy_script = copy_sub.join("script.rpy");
         fs::write(&copy_script, "label start:\n    \"Hola\"\n").unwrap();
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &copy_dir, &[copy_script]).unwrap();
+        db.record_injection(Some("es"), &copy_dir, &[copy_script])
+            .unwrap();
         drop(db);
 
         let out_zip = base.join("out-patch.zip");
@@ -2425,7 +2488,8 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-            None)
+            None,
+        )
         .expect_err("packing recorded rels out of a different tree must be refused");
         let msg = err.to_string();
         assert!(
@@ -2441,7 +2505,8 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-            None)
+            None,
+        )
         .expect("patch pointed at the recorded root must pack");
         assert!(out_zip.exists());
     }
@@ -2455,7 +2520,8 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script)).unwrap();
+        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script))
+            .unwrap();
         drop(db);
 
         fs::write(&script, "label start:\n    \"Overwritten\"\n").unwrap();
@@ -2467,7 +2533,8 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-            None)
+            None,
+        )
         .expect_err("a changed file must refuse to pack");
         let msg = err.to_string();
         assert!(
@@ -2493,7 +2560,8 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script)).unwrap();
+        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script))
+            .unwrap();
         drop(db);
 
         fs::remove_file(&script).unwrap();
@@ -2505,7 +2573,8 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-            None)
+            None,
+        )
         .expect_err("a missing recorded file must be an error, not a silent skip");
         let msg = err.to_string();
         assert!(msg.contains("missing from disk"), "{msg}");
@@ -2535,7 +2604,13 @@ mod tests {
 
         let db_path = base.join("project.locust.db");
         let db = Database::open(&db_path).unwrap();
-        save_translated(&db, "script.rpy#2", "Hello, world!", &script, "Hola, mundo!");
+        save_translated(
+            &db,
+            "script.rpy#2",
+            "Hello, world!",
+            &script,
+            "Hola, mundo!",
+        );
         drop(db);
 
         {
@@ -2587,7 +2662,13 @@ mod tests {
 
         let db_path = base.join("project.locust.db");
         let db = Database::open(&db_path).unwrap();
-        save_translated(&db, "script.rpy#2", "Hello, world!", &script, "Hola, mundo!");
+        save_translated(
+            &db,
+            "script.rpy#2",
+            "Hello, world!",
+            &script,
+            "Hola, mundo!",
+        );
         drop(db);
 
         {
@@ -2639,7 +2720,13 @@ mod tests {
 
         let db_path = base.join("project.locust.db");
         let db = Database::open(&db_path).unwrap();
-        save_translated(&db, "script.rpy#2", "Hello, world!", &script, "Hola, mundo!");
+        save_translated(
+            &db,
+            "script.rpy#2",
+            "Hello, world!",
+            &script,
+            "Hola, mundo!",
+        );
         drop(db);
 
         {
@@ -2671,7 +2758,8 @@ mod tests {
         let base = patch_test_tempdir();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
-        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script)).unwrap();
+        db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script))
+            .unwrap();
         drop(db);
         fs::remove_file(&script).unwrap();
 
@@ -2685,7 +2773,8 @@ mod tests {
             Some("es".to_string()),
             Some(out_zip.clone()),
             None,
-            None)
+            None,
+        )
         .expect_err("a recording that cannot be honored must remain an error");
         assert!(err.to_string().contains("missing from disk"), "{err}");
         assert_eq!(
@@ -2700,6 +2789,9 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 }

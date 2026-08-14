@@ -480,8 +480,7 @@ impl RpgMakerVxaPlugin {
                         if let Some(s) = val.as_str() {
                             if !s.trim().is_empty() {
                                 let id = format!("{}#{}#{}", filename, idx, field);
-                                let mut entry =
-                                    StringEntry::new(id, s, file_path.to_path_buf());
+                                let mut entry = StringEntry::new(id, s, file_path.to_path_buf());
                                 entry.tags = vec![tag.to_string()];
                                 entries.push(entry);
                             }
@@ -493,11 +492,7 @@ impl RpgMakerVxaPlugin {
         entries
     }
 
-    fn extract_map_file(
-        filename: &str,
-        root: &MarshalValue,
-        file_path: &Path,
-    ) -> Vec<StringEntry> {
+    fn extract_map_file(filename: &str, root: &MarshalValue, file_path: &Path) -> Vec<StringEntry> {
         let mut entries = Vec::new();
         let events = match root.get_ivar("@events") {
             Some(v) => v,
@@ -585,11 +580,8 @@ impl RpgMakerVxaPlugin {
                                                 "{}#0#event_{}#page_{}#cmd_{}#choice_{}",
                                                 filename, ev_id, page_idx, cmd_idx, ci
                                             );
-                                            let mut entry = StringEntry::new(
-                                                id,
-                                                text,
-                                                file_path.to_path_buf(),
-                                            );
+                                            let mut entry =
+                                                StringEntry::new(id, text, file_path.to_path_buf());
                                             entry.tags = vec!["menu".to_string()];
                                             entries.push(entry);
                                         }
@@ -639,9 +631,7 @@ impl RpgMakerVxaPlugin {
                 if code == 101 || code == 401 {
                     let mut lines: Vec<String> = Vec::new();
                     match params.first() {
-                        Some(MarshalValue::Str(text))
-                            if code == 401 || !text.trim().is_empty() =>
-                        {
+                        Some(MarshalValue::Str(text)) if code == 401 || !text.trim().is_empty() => {
                             lines.push(text.clone());
                         }
                         _ => continue,
@@ -659,8 +649,7 @@ impl RpgMakerVxaPlugin {
                     let text = lines.join("\n");
                     if !text.trim().is_empty() {
                         let id = format!("{}#{}#cmd_{}#msg", filename, ev_idx, cmd_idx);
-                        let mut entry =
-                            StringEntry::new(id, &text, file_path.to_path_buf());
+                        let mut entry = StringEntry::new(id, &text, file_path.to_path_buf());
                         entry.tags = vec!["dialogue".to_string()];
                         entries.push(entry);
                     }
@@ -705,7 +694,11 @@ impl RpgMakerVxaPlugin {
         }
     }
 
-    fn apply_array_translations(root: &mut MarshalValue, filename: &str, lookup: &HashMap<&str, &str>) {
+    fn apply_array_translations(
+        root: &mut MarshalValue,
+        filename: &str,
+        lookup: &HashMap<&str, &str>,
+    ) {
         let stem = strip_marshal_ext(filename);
         let fields = Self::fields_for_file(stem);
 
@@ -728,7 +721,11 @@ impl RpgMakerVxaPlugin {
         }
     }
 
-    fn apply_map_translations(root: &mut MarshalValue, filename: &str, lookup: &HashMap<&str, &str>) {
+    fn apply_map_translations(
+        root: &mut MarshalValue,
+        filename: &str,
+        lookup: &HashMap<&str, &str>,
+    ) {
         let events = match root.get_ivar_mut("@events") {
             Some(v) => v,
             None => return,
@@ -759,7 +756,11 @@ impl RpgMakerVxaPlugin {
         }
     }
 
-    fn apply_common_event_translations(root: &mut MarshalValue, filename: &str, lookup: &HashMap<&str, &str>) {
+    fn apply_common_event_translations(
+        root: &mut MarshalValue,
+        filename: &str,
+        lookup: &HashMap<&str, &str>,
+    ) {
         let arr = match root {
             MarshalValue::Array(a) => a,
             _ => return,
@@ -793,8 +794,12 @@ impl RpgMakerVxaPlugin {
 
         let mut ops: Vec<(usize, Op)> = Vec::new();
         for (id, translation) in lookup {
-            let Some(suffix) = id.strip_prefix(prefix) else { continue };
-            let Some(rest) = suffix.strip_prefix("#cmd_") else { continue };
+            let Some(suffix) = id.strip_prefix(prefix) else {
+                continue;
+            };
+            let Some(rest) = suffix.strip_prefix("#cmd_") else {
+                continue;
+            };
             let mut parts = rest.splitn(2, '#');
             let Some(idx) = parts.next().and_then(|s| s.parse::<usize>().ok()) else {
                 continue;
@@ -821,9 +826,7 @@ impl RpgMakerVxaPlugin {
                 }
                 Op::Choice(ci, t) => {
                     if let Some(cmd) = list.get_mut(idx) {
-                        if let Some(MarshalValue::Array(params)) =
-                            cmd.get_ivar_mut("@parameters")
-                        {
+                        if let Some(MarshalValue::Array(params)) = cmd.get_ivar_mut("@parameters") {
                             if let Some(MarshalValue::Array(choices)) = params.first_mut() {
                                 if let Some(MarshalValue::Str(s)) = choices.get_mut(ci) {
                                     *s = t.to_string();
@@ -974,9 +977,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                     .map(|entries| {
                         entries
                             .filter_map(|e| e.ok())
-                            .any(|e| {
-                                e.path().extension().is_some_and(is_marshal_ext)
-                            })
+                            .any(|e| e.path().extension().is_some_and(is_marshal_ext))
                     })
                     .unwrap_or(false);
             }
@@ -1021,7 +1022,11 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                 let bytes = std::fs::read(&fpath)?;
                 match MarshalValue::parse(&bytes) {
                     Ok(root) => {
-                        let fname = fpath.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let fname = fpath
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
                         let stem_lower = strip_marshal_ext(&fname).to_lowercase();
                         if stem_lower.starts_with("map") {
                             all.extend(Self::extract_map_file(&fname, &root, &fpath));
@@ -1110,13 +1115,19 @@ pub fn build_test_fixture() -> Vec<u8> {
             class: "RPG::Actor".to_string(),
             ivars: {
                 let mut m = HashMap::new();
-                m.insert("@name".to_string(), MarshalValue::Str("TestHero".to_string()));
+                m.insert(
+                    "@name".to_string(),
+                    MarshalValue::Str("TestHero".to_string()),
+                );
                 m.insert(
                     "@description".to_string(),
                     MarshalValue::Str("A test hero".to_string()),
                 );
                 m.insert("@note".to_string(), MarshalValue::Str(String::new()));
-                m.insert("@nickname".to_string(), MarshalValue::Str("Brave".to_string()));
+                m.insert(
+                    "@nickname".to_string(),
+                    MarshalValue::Str("Brave".to_string()),
+                );
                 m.insert("@id".to_string(), MarshalValue::Int(1));
                 m
             },
@@ -1125,13 +1136,19 @@ pub fn build_test_fixture() -> Vec<u8> {
             class: "RPG::Actor".to_string(),
             ivars: {
                 let mut m = HashMap::new();
-                m.insert("@name".to_string(), MarshalValue::Str("TestMage".to_string()));
+                m.insert(
+                    "@name".to_string(),
+                    MarshalValue::Str("TestMage".to_string()),
+                );
                 m.insert(
                     "@description".to_string(),
                     MarshalValue::Str("A test mage".to_string()),
                 );
                 m.insert("@note".to_string(), MarshalValue::Str(String::new()));
-                m.insert("@nickname".to_string(), MarshalValue::Str("Wise".to_string()));
+                m.insert(
+                    "@nickname".to_string(),
+                    MarshalValue::Str("Wise".to_string()),
+                );
                 m.insert("@id".to_string(), MarshalValue::Int(2));
                 m
             },
@@ -1180,8 +1197,14 @@ mod tests {
         fs::create_dir_all(&data_dir).unwrap();
 
         let list = MarshalValue::Array(vec![
-            make_cmd(101, vec![MarshalValue::Str("Hello there, brave".to_string())]),
-            make_cmd(401, vec![MarshalValue::Str("adventurer of the realm!".to_string())]),
+            make_cmd(
+                101,
+                vec![MarshalValue::Str("Hello there, brave".to_string())],
+            ),
+            make_cmd(
+                401,
+                vec![MarshalValue::Str("adventurer of the realm!".to_string())],
+            ),
             make_cmd(0, vec![]),
         ]);
         let page = MarshalValue::Object {
@@ -1225,8 +1248,12 @@ mod tests {
         let msg = entries
             .iter()
             .find(|e| e.id.ends_with("#msg"))
-            .unwrap_or_else(|| panic!("no #msg entry: {:?}",
-                entries.iter().map(|e| &e.id).collect::<Vec<_>>()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "no #msg entry: {:?}",
+                    entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+                )
+            });
         assert_eq!(msg.source, "Hello there, brave\nadventurer of the realm!");
 
         // Inject a longer Spanish translation and verify structure
@@ -1314,7 +1341,11 @@ mod tests {
         let entries = plugin.extract(&dir).unwrap();
 
         let hero = entries.iter().find(|e| e.id == "Actors.rvdata2#1#@name");
-        assert!(hero.is_some(), "entries: {:?}", entries.iter().map(|e| &e.id).collect::<Vec<_>>());
+        assert!(
+            hero.is_some(),
+            "entries: {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
         assert_eq!(hero.unwrap().source, "TestHero");
 
         let mage = entries.iter().find(|e| e.id == "Actors.rvdata2#2#@name");
@@ -1338,7 +1369,10 @@ mod tests {
 
         // Re-extract and verify
         let entries2 = plugin.extract(&dir).unwrap();
-        let hero = entries2.iter().find(|e| e.id == "Actors.rvdata2#1#@name").unwrap();
+        let hero = entries2
+            .iter()
+            .find(|e| e.id == "Actors.rvdata2#1#@name")
+            .unwrap();
         assert_eq!(hero.source, "TranslatedHero");
     }
 
@@ -1376,7 +1410,11 @@ mod tests {
 
         let out = plugin.extract(&dir).unwrap();
         let written = &out.iter().find(|e| e.id == ID).unwrap().source;
-        let width = wrapped.lines().map(crate::rpgmaker_mv::visible_len).max().unwrap();
+        let width = wrapped
+            .lines()
+            .map(crate::rpgmaker_mv::visible_len)
+            .max()
+            .unwrap();
         assert!(written.contains('\n'), "should be re-wrapped: {written:?}");
         for line in written.lines() {
             assert!(

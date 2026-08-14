@@ -40,18 +40,15 @@ impl RenPyPlugin {
     fn has_rpy_files(dir: &Path) -> bool {
         std::fs::read_dir(dir)
             .map(|entries| {
-                entries.filter_map(|e| e.ok()).any(|e| {
-                    e.path().extension().is_some_and(|ext| ext == "rpy")
-                })
+                entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.path().extension().is_some_and(|ext| ext == "rpy"))
             })
             .unwrap_or(false)
     }
 
     fn extract_rpa_archive(&self, rpa_path: &Path) -> Result<Vec<StringEntry>> {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "locust_rpa_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_dir = std::env::temp_dir().join(format!("locust_rpa_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir)?;
         // Dropped on every exit path below, including the `?` on extract_rpa.
         let _temp_guard = TempDirGuard(temp_dir.clone());
@@ -86,8 +83,7 @@ impl RenPyPlugin {
                                 rel_str,
                                 n
                             );
-                            let mut entry =
-                                StringEntry::new(id, &text, rpa_path.to_path_buf());
+                            let mut entry = StringEntry::new(id, &text, rpa_path.to_path_buf());
                             entry.tags = vec!["dialogue".to_string(), "rpyc".to_string()];
                             all.push(entry);
                         }
@@ -265,11 +261,13 @@ impl RenPyPlugin {
         }
 
         // Extract .rpy files from each RPA to a temp dir
-        let temp_dir = std::env::temp_dir().join(format!("locust_rpa_inject_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("locust_rpa_inject_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir)?;
 
         // Run the actual injection logic, ensuring temp_dir is always cleaned up
-        let result = Self::inject_rpa_inner(&game_dir, &temp_dir, &rpa_files, entries, loose_dest_paths);
+        let result =
+            Self::inject_rpa_inner(&game_dir, &temp_dir, &rpa_files, entries, loose_dest_paths);
 
         // Always cleanup temp dir, even on error
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -303,10 +301,8 @@ impl RenPyPlugin {
                         };
                         let line_str = parts.last().unwrap_or(&"0");
                         if let Ok(line_num) = line_str.parse::<usize>() {
-                            line_translations.insert(
-                                (filename, line_num),
-                                (entry.source.clone(), t.clone()),
-                            );
+                            line_translations
+                                .insert((filename, line_num), (entry.source.clone(), t.clone()));
                         }
                     }
                 }
@@ -342,7 +338,11 @@ impl RenPyPlugin {
 
             // Get the filename (with subdirectory path from temp_dir)
             let rel_path = fpath.strip_prefix(temp_dir).unwrap_or(fpath);
-            let filename = rel_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let filename = rel_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
 
             let mut modified = false;
             let mut new_lines: Vec<String> = Vec::new();
@@ -436,9 +436,9 @@ impl RenPyPlugin {
     fn has_rpa_files(dir: &Path) -> bool {
         std::fs::read_dir(dir)
             .map(|entries| {
-                entries.filter_map(|e| e.ok()).any(|e| {
-                    e.path().extension().is_some_and(|ext| ext == "rpa")
-                })
+                entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.path().extension().is_some_and(|ext| ext == "rpa"))
             })
             .unwrap_or(false)
     }
@@ -477,12 +477,13 @@ impl RenPyPlugin {
         file.read_to_end(&mut compressed)?;
 
         // Decompress with zlib (raw deflate with zlib wrapper)
-        let decompressed = miniz_oxide::inflate::decompress_to_vec_zlib(&compressed).map_err(|e| {
-            locust_core::error::LocustError::ParseError {
-                file: rpa_path.display().to_string(),
-                message: format!("failed to decompress RPA index: {:?}", e),
-            }
-        })?;
+        let decompressed =
+            miniz_oxide::inflate::decompress_to_vec_zlib(&compressed).map_err(|e| {
+                locust_core::error::LocustError::ParseError {
+                    file: rpa_path.display().to_string(),
+                    message: format!("failed to decompress RPA index: {:?}", e),
+                }
+            })?;
 
         // Parse the Python pickle to extract file entries
         // We use a simplified pickle parser that handles the common RPA format
@@ -592,7 +593,8 @@ impl RenPyPlugin {
             }
 
             // Track python blocks (skip most content inside them)
-            if trimmed.starts_with("python:") || trimmed.starts_with("init python:")
+            if trimmed.starts_with("python:")
+                || trimmed.starts_with("init python:")
                 || trimmed.starts_with("init -") && trimmed.contains("python:")
             {
                 in_python = true;
@@ -601,7 +603,8 @@ impl RenPyPlugin {
             }
             if in_python && !trimmed.is_empty() {
                 let cur_indent = line.len() - line.trim_start().len();
-                if cur_indent <= python_indent && !trimmed.starts_with("python:")
+                if cur_indent <= python_indent
+                    && !trimmed.starts_with("python:")
                     && !trimmed.starts_with("init ")
                     && !trimmed.starts_with('#')
                 {
@@ -743,10 +746,9 @@ impl RenPyPlugin {
                     }
                     // Store label in metadata for proper Ren'Py translation block generation
                     if let Some(ref lbl) = current_label {
-                        entry.metadata.insert(
-                            "label".to_string(),
-                            serde_json::Value::String(lbl.clone()),
-                        );
+                        entry
+                            .metadata
+                            .insert("label".to_string(), serde_json::Value::String(lbl.clone()));
                     }
                     entries.push(entry);
                 }
@@ -889,13 +891,15 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
             if !words.is_empty() {
                 let character = words[0];
                 // Character must be a valid identifier and not a keyword
-                if character.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                if character
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
                     && !is_renpy_keyword(character)
                 {
                     // All words between character and quote must be identifiers/numbers (expression tags)
-                    let valid_middle = words[1..].iter().all(|w| {
-                        w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    });
+                    let valid_middle = words[1..]
+                        .iter()
+                        .all(|w| w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
                     if valid_middle {
                         let rest = &trimmed[quote_pos..];
                         if let Some((text, _)) = extract_quoted_string(rest) {
@@ -958,9 +962,9 @@ fn is_dialogue_line(trimmed: &str) -> bool {
                 if first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                     && !is_renpy_keyword(first)
                 {
-                    let valid_middle = words[1..].iter().all(|w| {
-                        w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    });
+                    let valid_middle = words[1..]
+                        .iter()
+                        .all(|w| w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
                     if valid_middle {
                         return true;
                     }
@@ -978,23 +982,119 @@ fn is_dialogue_line(trimmed: &str) -> bool {
 }
 
 fn is_renpy_keyword(word: &str) -> bool {
-    matches!(word,
-        "screen" | "style" | "transform" | "define" | "default" | "init" | "label" |
-        "image" | "python" | "if" | "elif" | "else" | "while" | "for" | "return" |
-        "jump" | "call" | "pass" | "menu" | "scene" | "show" | "hide" | "with" |
-        "play" | "stop" | "pause" | "use" | "has" | "at" | "frame" | "vbox" | "hbox" |
-        "grid" | "text" | "textbutton" | "add" | "window" | "null" | "timer" |
-        "input" | "key" | "on" | "action" | "bar" | "viewport" | "imagemap" |
-        "hotspot" | "hotbar" | "button" | "fixed" | "side" | "drag" | "draggroup" |
-        "translate" | "class" | "import" | "from" | "as" | "in" | "not" | "and" | "or" |
-        "id" | "layout" | "xalign" | "yalign" | "xpos" | "ypos" | "xsize" | "ysize" |
-        "xoffset" | "yoffset" | "xanchor" | "yanchor" | "pos" | "anchor" | "align" |
-        "area" | "size" | "xysize" | "idle" | "hover" | "insensitive" | "selected_idle" |
-        "selected_hover" | "ground" | "background" | "foreground" | "child" |
-        "font" | "color" | "outlines" | "kerning" | "spacing" | "first_indent" |
-        "rest_indent" | "prefix" | "suffix" | "alt" | "tooltip" | "focus" |
-        "selected" | "sensitive" | "keysym" | "alternate" | "hovered" | "unhovered" |
-        "clicked" | "released" | "activate_sound" | "hover_sound"
+    matches!(
+        word,
+        "screen"
+            | "style"
+            | "transform"
+            | "define"
+            | "default"
+            | "init"
+            | "label"
+            | "image"
+            | "python"
+            | "if"
+            | "elif"
+            | "else"
+            | "while"
+            | "for"
+            | "return"
+            | "jump"
+            | "call"
+            | "pass"
+            | "menu"
+            | "scene"
+            | "show"
+            | "hide"
+            | "with"
+            | "play"
+            | "stop"
+            | "pause"
+            | "use"
+            | "has"
+            | "at"
+            | "frame"
+            | "vbox"
+            | "hbox"
+            | "grid"
+            | "text"
+            | "textbutton"
+            | "add"
+            | "window"
+            | "null"
+            | "timer"
+            | "input"
+            | "key"
+            | "on"
+            | "action"
+            | "bar"
+            | "viewport"
+            | "imagemap"
+            | "hotspot"
+            | "hotbar"
+            | "button"
+            | "fixed"
+            | "side"
+            | "drag"
+            | "draggroup"
+            | "translate"
+            | "class"
+            | "import"
+            | "from"
+            | "as"
+            | "in"
+            | "not"
+            | "and"
+            | "or"
+            | "id"
+            | "layout"
+            | "xalign"
+            | "yalign"
+            | "xpos"
+            | "ypos"
+            | "xsize"
+            | "ysize"
+            | "xoffset"
+            | "yoffset"
+            | "xanchor"
+            | "yanchor"
+            | "pos"
+            | "anchor"
+            | "align"
+            | "area"
+            | "size"
+            | "xysize"
+            | "idle"
+            | "hover"
+            | "insensitive"
+            | "selected_idle"
+            | "selected_hover"
+            | "ground"
+            | "background"
+            | "foreground"
+            | "child"
+            | "font"
+            | "color"
+            | "outlines"
+            | "kerning"
+            | "spacing"
+            | "first_indent"
+            | "rest_indent"
+            | "prefix"
+            | "suffix"
+            | "alt"
+            | "tooltip"
+            | "focus"
+            | "selected"
+            | "sensitive"
+            | "keysym"
+            | "alternate"
+            | "hovered"
+            | "unhovered"
+            | "clicked"
+            | "released"
+            | "activate_sound"
+            | "hover_sound"
     )
 }
 
@@ -1025,13 +1125,32 @@ fn escape_inner_quotes(s: &str) -> String {
 fn is_file_reference(text: &str) -> bool {
     let t = text.trim();
     // File extensions
-    if t.ends_with(".png") || t.ends_with(".jpg") || t.ends_with(".jpeg") || t.ends_with(".webp") ||
-       t.ends_with(".gif") || t.ends_with(".svg") || t.ends_with(".bmp") ||
-       t.ends_with(".mp3") || t.ends_with(".ogg") || t.ends_with(".wav") || t.ends_with(".flac") ||
-       t.ends_with(".mp4") || t.ends_with(".webm") || t.ends_with(".avi") || t.ends_with(".ogv") ||
-       t.ends_with(".ttf") || t.ends_with(".otf") || t.ends_with(".woff") ||
-       t.ends_with(".rpy") || t.ends_with(".rpyc") || t.ends_with(".rpa") ||
-       t.ends_with(".json") || t.ends_with(".txt") || t.ends_with(".xml") || t.ends_with(".csv") {
+    if t.ends_with(".png")
+        || t.ends_with(".jpg")
+        || t.ends_with(".jpeg")
+        || t.ends_with(".webp")
+        || t.ends_with(".gif")
+        || t.ends_with(".svg")
+        || t.ends_with(".bmp")
+        || t.ends_with(".mp3")
+        || t.ends_with(".ogg")
+        || t.ends_with(".wav")
+        || t.ends_with(".flac")
+        || t.ends_with(".mp4")
+        || t.ends_with(".webm")
+        || t.ends_with(".avi")
+        || t.ends_with(".ogv")
+        || t.ends_with(".ttf")
+        || t.ends_with(".otf")
+        || t.ends_with(".woff")
+        || t.ends_with(".rpy")
+        || t.ends_with(".rpyc")
+        || t.ends_with(".rpa")
+        || t.ends_with(".json")
+        || t.ends_with(".txt")
+        || t.ends_with(".xml")
+        || t.ends_with(".csv")
+    {
         return true;
     }
     // Path-like patterns
@@ -1189,9 +1308,7 @@ fn extract_screen_text(line: &str) -> Option<&str> {
     let trimmed = line.trim();
 
     // Match: text "string", textbutton "string", tooltip "string", tooltip ("string")
-    let prefixes = &[
-        "text ", "textbutton ", "tooltip ",
-    ];
+    let prefixes = &["text ", "textbutton ", "tooltip "];
 
     for &prefix in prefixes {
         if !trimmed.starts_with(prefix) {
@@ -1234,22 +1351,40 @@ fn is_gui_non_translatable(var: &str) -> bool {
     }
     let prop = &var[4..];
     // Explicit non-translatable system values
-    if prop == "language" || prop == "unscrollable" || prop == "rollback_side"
+    if prop == "language"
+        || prop == "unscrollable"
+        || prop == "rollback_side"
         || prop == "history_allow_tags"
     {
         return true;
     }
     // Skip color, size, font, border, padding, spacing, position properties
-    prop.contains("color") || prop.contains("size") || prop.contains("font")
-        || prop.contains("border") || prop.contains("padding") || prop.contains("spacing")
-        || prop.contains("height") || prop.contains("width") || prop.contains("align")
-        || prop.contains("offset") || prop.contains("xpos") || prop.contains("ypos")
-        || prop.contains("tile") || prop.contains("opacity") || prop.contains("outlines")
-        || prop.contains("background") || prop.contains("icon")
-        || prop.ends_with("_idle") || prop.ends_with("_hover") || prop.ends_with("_insensitive")
-        || prop.starts_with("show_") || prop.starts_with("button_")
-        || prop.starts_with("choice_") || prop.starts_with("navigation_")
-        || prop.starts_with("slot_") || prop.starts_with("namebox_")
+    prop.contains("color")
+        || prop.contains("size")
+        || prop.contains("font")
+        || prop.contains("border")
+        || prop.contains("padding")
+        || prop.contains("spacing")
+        || prop.contains("height")
+        || prop.contains("width")
+        || prop.contains("align")
+        || prop.contains("offset")
+        || prop.contains("xpos")
+        || prop.contains("ypos")
+        || prop.contains("tile")
+        || prop.contains("opacity")
+        || prop.contains("outlines")
+        || prop.contains("background")
+        || prop.contains("icon")
+        || prop.ends_with("_idle")
+        || prop.ends_with("_hover")
+        || prop.ends_with("_insensitive")
+        || prop.starts_with("show_")
+        || prop.starts_with("button_")
+        || prop.starts_with("choice_")
+        || prop.starts_with("navigation_")
+        || prop.starts_with("slot_")
+        || prop.starts_with("namebox_")
 }
 
 /// Simplified Python pickle parser for RPA index data.
@@ -1283,7 +1418,9 @@ fn harvest_rpyc_strings(bytes: &[u8]) -> Vec<String> {
             slot1 = Some((start, len));
         }
     }
-    let Some((start, len)) = slot1 else { return Vec::new() };
+    let Some((start, len)) = slot1 else {
+        return Vec::new();
+    };
     if start + len > bytes.len() {
         return Vec::new();
     }
@@ -1407,9 +1544,9 @@ fn scan_pickle_strings(data: &[u8]) -> Vec<String> {
             }
 
             // No-argument opcodes seen in protocol <= 2 streams
-            b'(' | b')' | b'.' | b']' | b'}' | b'a' | b'e' | b's' | b'u' | b't' | b'd'
-            | b'l' | b'b' | b'R' | b'N' | b'0' | b'1' | b'2' | b'Q' | b'o' | 0x81 | 0x85
-            | 0x86 | 0x87 | 0x88 | 0x89 => {}
+            b'(' | b')' | b'.' | b']' | b'}' | b'a' | b'e' | b's' | b'u' | b't' | b'd' | b'l'
+            | b'b' | b'R' | b'N' | b'0' | b'1' | b'2' | b'Q' | b'o' | 0x81 | 0x85 | 0x86 | 0x87
+            | 0x88 | 0x89 => {}
 
             // Unknown opcode: stop rather than misparse
             _ => break,
@@ -1520,9 +1657,14 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
         let op = data[pos];
         pos += 1;
         match op {
-            0x80 => { pos += 1; } // PROTO
-            0x95 => { pos += 8; } // FRAME (protocol 4+) — skip 8-byte frame length
-            0x94 => { // MEMOIZE (protocol 4+) — store stack top in memo
+            0x80 => {
+                pos += 1;
+            } // PROTO
+            0x95 => {
+                pos += 8;
+            } // FRAME (protocol 4+) — skip 8-byte frame length
+            0x94 => {
+                // MEMOIZE (protocol 4+) — store stack top in memo
                 if let Some(top) = stack.last() {
                     memo.push(top.clone());
                 }
@@ -1530,123 +1672,208 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
             0x7d => stack.push(PickleVal::Dict), // EMPTY_DICT
             0x5d => stack.push(PickleVal::List(Vec::new())), // EMPTY_LIST
             0x28 => mark_stack.push(stack.len()), // MARK
-            0x71 => { // SHORT_BINPUT (memo)
-                if pos >= len { break; }
+            0x71 => {
+                // SHORT_BINPUT (memo)
+                if pos >= len {
+                    break;
+                }
                 let idx = data[pos] as usize;
                 pos += 1;
                 if let Some(top) = stack.last() {
-                    while memo.len() <= idx { memo.push(PickleVal::None); }
+                    while memo.len() <= idx {
+                        memo.push(PickleVal::None);
+                    }
                     memo[idx] = top.clone();
                 }
             }
-            0x72 => { // LONG_BINPUT
-                if pos + 4 > len { break; }
-                let idx = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            0x72 => {
+                // LONG_BINPUT
+                if pos + 4 > len {
+                    break;
+                }
+                let idx =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if let Some(top) = stack.last() {
-                    while memo.len() <= idx { memo.push(PickleVal::None); }
+                    while memo.len() <= idx {
+                        memo.push(PickleVal::None);
+                    }
                     memo[idx] = top.clone();
                 }
             }
-            0x68 => { // SHORT_BINGET
-                if pos >= len { break; }
+            0x68 => {
+                // SHORT_BINGET
+                if pos >= len {
+                    break;
+                }
                 let idx = data[pos] as usize;
                 pos += 1;
                 let val = memo.get(idx).cloned().unwrap_or(PickleVal::None);
                 stack.push(val);
             }
-            0x6a => { // LONG_BINGET
-                if pos + 4 > len { break; }
-                let idx = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            0x6a => {
+                // LONG_BINGET
+                if pos + 4 > len {
+                    break;
+                }
+                let idx =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 let val = memo.get(idx).cloned().unwrap_or(PickleVal::None);
                 stack.push(val);
             }
-            0x43 => { // SHORT_BINBYTES
-                if pos >= len { break; }
+            0x43 => {
+                // SHORT_BINBYTES
+                if pos >= len {
+                    break;
+                }
                 let slen = data[pos] as usize;
                 pos += 1;
-                if pos + slen > len { break; }
-                let s = String::from_utf8_lossy(&data[pos..pos+slen]).to_string();
+                if pos + slen > len {
+                    break;
+                }
+                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
                 pos += slen;
                 stack.push(PickleVal::Str(s));
             }
-            0x44 => { // BINBYTES (4-byte len)
-                if pos + 4 > len { break; }
-                let slen = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            0x44 => {
+                // BINBYTES (4-byte len)
+                if pos + 4 > len {
+                    break;
+                }
+                let slen =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
-                if pos + slen > len { break; }
-                let s = String::from_utf8_lossy(&data[pos..pos+slen]).to_string();
+                if pos + slen > len {
+                    break;
+                }
+                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
                 pos += slen;
                 stack.push(PickleVal::Str(s));
             }
-            0x8e => { // BINBYTES8 (8-byte len, protocol 4+)
-                if pos + 8 > len { break; }
-                let slen = u64::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3], data[pos+4], data[pos+5], data[pos+6], data[pos+7]]) as usize;
+            0x8e => {
+                // BINBYTES8 (8-byte len, protocol 4+)
+                if pos + 8 > len {
+                    break;
+                }
+                let slen = u64::from_le_bytes([
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
+                ]) as usize;
                 pos += 8;
-                if pos + slen > len { break; }
-                let s = String::from_utf8_lossy(&data[pos..pos+slen]).to_string();
+                if pos + slen > len {
+                    break;
+                }
+                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
                 pos += slen;
                 stack.push(PickleVal::Str(s));
             }
-            0x58 => { // BINUNICODE (4-byte length + utf8) — how real RPA indexes encode filenames
-                if pos + 4 > len { break; }
-                let slen = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            0x58 => {
+                // BINUNICODE (4-byte length + utf8) — how real RPA indexes encode filenames
+                if pos + 4 > len {
+                    break;
+                }
+                let slen =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
-                if pos + slen > len { break; }
-                let s = String::from_utf8_lossy(&data[pos..pos+slen]).to_string();
+                if pos + slen > len {
+                    break;
+                }
+                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
                 pos += slen;
                 stack.push(PickleVal::Str(s));
             }
-            0x8c => { // SHORT_BINUNICODE (protocol 4+) — 1-byte length
-                if pos >= len { break; }
+            0x8c => {
+                // SHORT_BINUNICODE (protocol 4+) — 1-byte length
+                if pos >= len {
+                    break;
+                }
                 let slen = data[pos] as usize;
                 pos += 1;
-                if pos + slen > len { break; }
-                let s = String::from_utf8_lossy(&data[pos..pos+slen]).to_string();
+                if pos + slen > len {
+                    break;
+                }
+                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
                 pos += slen;
                 stack.push(PickleVal::Str(s));
             }
-            0x55 => { // SHORT_BINSTRING
-                if pos >= len { break; }
+            0x55 => {
+                // SHORT_BINSTRING
+                if pos >= len {
+                    break;
+                }
                 let slen = data[pos] as usize;
                 pos += 1;
-                if pos + slen > len { break; }
-                let s = String::from_utf8_lossy(&data[pos..pos+slen]).to_string();
+                if pos + slen > len {
+                    break;
+                }
+                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
                 pos += slen;
                 stack.push(PickleVal::Str(s));
             }
-            0x54 => { // BINSTRING (4-byte len)
-                if pos + 4 > len { break; }
-                let slen = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            0x54 => {
+                // BINSTRING (4-byte len)
+                if pos + 4 > len {
+                    break;
+                }
+                let slen =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
-                if pos + slen > len { break; }
-                let s = String::from_utf8_lossy(&data[pos..pos+slen]).to_string();
+                if pos + slen > len {
+                    break;
+                }
+                let s = String::from_utf8_lossy(&data[pos..pos + slen]).to_string();
                 pos += slen;
                 stack.push(PickleVal::Str(s));
             }
-            0x4a => { // BININT
-                if pos + 4 > len { break; }
-                let v = i32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as i64;
+            0x4a => {
+                // BININT
+                if pos + 4 > len {
+                    break;
+                }
+                let v = i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as i64;
                 pos += 4;
                 stack.push(PickleVal::Int(v));
             }
-            0x4b => { // BININT1
-                if pos >= len { break; }
+            0x4b => {
+                // BININT1
+                if pos >= len {
+                    break;
+                }
                 stack.push(PickleVal::Int(data[pos] as i64));
                 pos += 1;
             }
-            0x4d => { // BININT2
-                if pos + 2 > len { break; }
-                let v = u16::from_le_bytes([data[pos], data[pos+1]]) as i64;
+            0x4d => {
+                // BININT2
+                if pos + 2 > len {
+                    break;
+                }
+                let v = u16::from_le_bytes([data[pos], data[pos + 1]]) as i64;
                 pos += 2;
                 stack.push(PickleVal::Int(v));
             }
-            0x8a => { // LONG1
-                if pos >= len { break; }
+            0x8a => {
+                // LONG1
+                if pos >= len {
+                    break;
+                }
                 let nbytes = data[pos] as usize;
                 pos += 1;
-                if pos + nbytes > len { break; }
+                if pos + nbytes > len {
+                    break;
+                }
                 let mut v: i64 = 0;
                 for i in 0..nbytes.min(8) {
                     v |= (data[pos + i] as i64) << (i * 8);
@@ -1654,40 +1881,47 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                 pos += nbytes;
                 stack.push(PickleVal::Int(v));
             }
-            0x74 => { // TUPLE
+            0x74 => {
+                // TUPLE
                 let mark = mark_stack.pop().unwrap_or(0).min(stack.len());
                 let items: Vec<PickleVal> = stack.drain(mark..).collect();
                 stack.push(PickleVal::Tuple(items));
             }
-            0x85 => { // TUPLE1
+            0x85 => {
+                // TUPLE1
                 let v = stack.pop().unwrap_or(PickleVal::None);
                 stack.push(PickleVal::Tuple(vec![v]));
             }
-            0x86 => { // TUPLE2
+            0x86 => {
+                // TUPLE2
                 let b = stack.pop().unwrap_or(PickleVal::None);
                 let a = stack.pop().unwrap_or(PickleVal::None);
                 stack.push(PickleVal::Tuple(vec![a, b]));
             }
-            0x87 => { // TUPLE3
+            0x87 => {
+                // TUPLE3
                 let c = stack.pop().unwrap_or(PickleVal::None);
                 let b = stack.pop().unwrap_or(PickleVal::None);
                 let a = stack.pop().unwrap_or(PickleVal::None);
                 stack.push(PickleVal::Tuple(vec![a, b, c]));
             }
-            0x61 => { // APPEND
+            0x61 => {
+                // APPEND
                 let val = stack.pop().unwrap_or(PickleVal::None);
                 if let Some(PickleVal::List(ref mut list)) = stack.last_mut() {
                     list.push(val);
                 }
             }
-            0x65 => { // APPENDS
+            0x65 => {
+                // APPENDS
                 let mark = mark_stack.pop().unwrap_or(stack.len()).min(stack.len());
                 let items: Vec<PickleVal> = stack.drain(mark..).collect();
                 if let Some(PickleVal::List(ref mut list)) = stack.last_mut() {
                     list.extend(items);
                 }
             }
-            0x73 => { // SETITEM
+            0x73 => {
+                // SETITEM
                 let val = stack.pop().unwrap_or(PickleVal::None);
                 let k = stack.pop().unwrap_or(PickleVal::None);
                 if let PickleVal::Str(ref name) = k {
@@ -1701,8 +1935,14 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                                 let offset = t[0].as_int().unwrap_or(0) ^ key;
                                 let length = t[1].as_int().unwrap_or(0) ^ key;
                                 let prefix_len = if t.len() >= 3 {
-                                    if let PickleVal::Str(ref s) = t[2] { s.len() } else { 0 }
-                                } else { 0 };
+                                    if let PickleVal::Str(ref s) = t[2] {
+                                        s.len()
+                                    } else {
+                                        0
+                                    }
+                                } else {
+                                    0
+                                };
                                 result.push((
                                     filename.clone(),
                                     (offset as u64) + prefix_len as u64,
@@ -1714,7 +1954,8 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                     current_key = None;
                 }
             }
-            0x75 => { // SETITEMS
+            0x75 => {
+                // SETITEMS
                 let mark = mark_stack.pop().unwrap_or(0).min(stack.len());
                 let items: Vec<PickleVal> = stack.drain(mark..).collect();
                 // Items come in pairs: key, val, key, val, ...
@@ -1730,8 +1971,14 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                                         let offset = t[0].as_int().unwrap_or(0) ^ key;
                                         let length = t[1].as_int().unwrap_or(0) ^ key;
                                         let prefix_len = if t.len() >= 3 {
-                                            if let PickleVal::Str(ref s) = t[2] { s.len() } else { 0 }
-                                        } else { 0 };
+                                            if let PickleVal::Str(ref s) = t[2] {
+                                                s.len()
+                                            } else {
+                                                0
+                                            }
+                                        } else {
+                                            0
+                                        };
                                         result.push((
                                             filename.clone(),
                                             (offset as u64) + prefix_len as u64,
@@ -1745,10 +1992,10 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                     i += 2;
                 }
             }
-            0x4e => stack.push(PickleVal::None), // NONE
+            0x4e => stack.push(PickleVal::None),   // NONE
             0x88 => stack.push(PickleVal::Int(1)), // NEWTRUE
             0x89 => stack.push(PickleVal::Int(0)), // NEWFALSE
-            0x2e => break, // STOP
+            0x2e => break,                         // STOP
             op => {
                 // Every no-argument opcode a real index emits has an explicit
                 // arm above. Anything else carries an argument of unknown
@@ -2045,7 +2292,8 @@ impl FormatPlugin for RenPyPlugin {
                 }
             }
 
-            let mut matched_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut matched_lines: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
             let mut new_lines = Vec::new();
             let mut modified = false;
             for (line_idx, line) in content.lines().enumerate() {
@@ -2155,8 +2403,15 @@ impl FormatPlugin for RenPyPlugin {
             let _ = translation;
 
             // Dialogue entries (with known label) go into per-file translate blocks
-            let is_dialogue = entry.tags.iter().any(|t| t == "dialogue" || t == "scroll_text" || t == "menu");
-            let has_label = entry.metadata.get("label").and_then(|v| v.as_str()).is_some();
+            let is_dialogue = entry
+                .tags
+                .iter()
+                .any(|t| t == "dialogue" || t == "scroll_text" || t == "menu");
+            let has_label = entry
+                .metadata
+                .get("label")
+                .and_then(|v| v.as_str())
+                .is_some();
 
             if is_dialogue && has_label {
                 let filename = entry
@@ -2194,7 +2449,11 @@ impl FormatPlugin for RenPyPlugin {
                 let mut hasher = Md5::new();
                 hasher.update(entry.source.as_bytes());
                 let digest = hasher.finalize();
-                let hash: String = digest.iter().take(4).map(|b| format!("{:02x}", b)).collect();
+                let hash: String = digest
+                    .iter()
+                    .take(4)
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
 
                 let translation_id = format!("{}_{}", label, hash);
                 if !seen_ids.insert(translation_id.clone()) {
@@ -2220,7 +2479,10 @@ impl FormatPlugin for RenPyPlugin {
                         format!("{} \"{}\"", ch, safe_source),
                         format!("{} \"{}\"", ch, safe_trans),
                     ),
-                    None => (format!("\"{}\"", safe_source), format!("\"{}\"", safe_trans)),
+                    None => (
+                        format!("\"{}\"", safe_source),
+                        format!("\"{}\"", safe_trans),
+                    ),
                 };
 
                 lines.push(format!("# game/{}:{}", filename, line_num));
@@ -2250,7 +2512,8 @@ impl FormatPlugin for RenPyPlugin {
             lines.push(format!("translate {} strings:", lang));
             lines.push(String::new());
 
-            let mut seen_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_sources: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for entry in &string_entries {
                 let translation = entry.translation.as_ref().unwrap();
                 if !seen_sources.insert(entry.source.clone()) {
@@ -2358,7 +2621,9 @@ fn build_language_picker_script(game_dir: &Path, just_added_lang: &str) -> Strin
 
     let mut buttons = String::new();
     // Original language button (None = use original game language)
-    buttons.push_str("            textbutton \"Original\" action Language(None) xalign 0.5 text_size 22\n");
+    buttons.push_str(
+        "            textbutton \"Original\" action Language(None) xalign 0.5 text_size 22\n",
+    );
     for code in &langs {
         let name = lang_name(code);
         buttons.push_str(&format!(
@@ -2578,7 +2843,8 @@ mod tests {
         let report = plugin.inject(&dir, &[e]).unwrap();
         assert_eq!(report.strings_written, 1);
 
-        let content = fs::read_to_string(dir.join("game").join("zzz_locust_translate.rpy")).unwrap();
+        let content =
+            fs::read_to_string(dir.join("game").join("zzz_locust_translate.rpy")).unwrap();
         assert!(content.contains("say_menu_text_filter"));
         assert!(content.contains(r#""Welcome to \"Area 69\"!": "¡Bienvenido a \"Área 69\"!""#));
     }
@@ -2597,7 +2863,8 @@ mod tests {
         assert_eq!(report.strings_written, 1);
         assert_eq!(report.files_modified, 1);
 
-        let content = fs::read_to_string(dir.join("game").join("zzz_locust_translate.rpy")).unwrap();
+        let content =
+            fs::read_to_string(dir.join("game").join("zzz_locust_translate.rpy")).unwrap();
         // Must capture whatever filter the game already had installed and call
         // it first, rather than unconditionally replacing config.say_menu_text_filter.
         assert!(content.contains("locust_previous_filter = config.say_menu_text_filter"));
@@ -2638,7 +2905,11 @@ mod tests {
             "# Generated by Locust\ninit 999 python:\n    pass\n",
         )
         .unwrap();
-        fs::write(game_dir.join("zzz_locust_translate.rpyc"), b"stale compiled twin").unwrap();
+        fs::write(
+            game_dir.join("zzz_locust_translate.rpyc"),
+            b"stale compiled twin",
+        )
+        .unwrap();
 
         let mut e = StringEntry::new("scripts.rpa#a.rpyc#s0", "Hello!", dir.join("scripts.rpa"));
         e.tags = vec!["dialogue".to_string(), "rpyc".to_string()];
@@ -2664,7 +2935,8 @@ mod tests {
 
     #[test]
     fn test_inject_rpyc_filter_reconciles_written_and_skipped() {
-        let dir = std::env::temp_dir().join(format!("locust_rpycf_reconcile_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("locust_rpycf_reconcile_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(dir.join("game")).unwrap();
 
         let mut translated =
@@ -2672,7 +2944,8 @@ mod tests {
         translated.tags = vec!["dialogue".to_string(), "rpyc".to_string()];
         translated.translation = Some("¡Hola!".to_string());
 
-        let mut missing = StringEntry::new("scripts.rpa#a.rpyc#s1", "Bye!", dir.join("scripts.rpa"));
+        let mut missing =
+            StringEntry::new("scripts.rpa#a.rpyc#s1", "Bye!", dir.join("scripts.rpa"));
         missing.tags = vec!["dialogue".to_string(), "rpyc".to_string()];
         missing.translation = None;
 
@@ -2748,7 +3021,14 @@ mod tests {
         let plugin = RenPyPlugin::new();
         let entries = plugin.extract(&fixture_dir()).unwrap();
         let hello = entries.iter().find(|e| e.source == "Hello, world!");
-        assert!(hello.is_some(), "entries: {:?}", entries.iter().map(|e| (&e.id, &e.source)).collect::<Vec<_>>());
+        assert!(
+            hello.is_some(),
+            "entries: {:?}",
+            entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(hello.unwrap().context, Some("e".to_string()));
 
         let narrator = entries

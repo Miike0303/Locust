@@ -31,10 +31,10 @@ const SYSTEM_TYPE_ARRAYS: &[(&str, &str)] = &[
 
 /// Known text-display plugin command prefixes (MV code 356).
 const TEXT_DISPLAY_PLUGINS: &[&str] = &[
-    "D_TEXT",      // Dynamic Text plugin (shows text on screen)
-    "SHOW_TEXT",   // Various show-text plugins
-    "T_TEXT",      // Text plugins
-    "GN_TEXT",     // Game Note text
+    "D_TEXT",    // Dynamic Text plugin (shows text on screen)
+    "SHOW_TEXT", // Various show-text plugins
+    "T_TEXT",    // Text plugins
+    "GN_TEXT",   // Game Note text
 ];
 
 /// Argument keys in MZ plugin commands (code 357) that contain translatable text.
@@ -60,8 +60,7 @@ fn extract_plugin_command_text(command: &str) -> Option<String> {
         if trimmed.starts_with(prefix) {
             // Verify it has CJK text content
             if trimmed.chars().any(|c| {
-                ('\u{3000}'..='\u{9FFF}').contains(&c)
-                    || ('\u{FF00}'..='\u{FFEF}').contains(&c)
+                ('\u{3000}'..='\u{9FFF}').contains(&c) || ('\u{FF00}'..='\u{FFEF}').contains(&c)
             }) {
                 return Some(trimmed.to_string());
             }
@@ -100,11 +99,14 @@ fn extract_mz_plugin_command(params: &[serde_json::Value]) -> Vec<(String, Strin
                         };
                         if let Some(obj) = choice_obj {
                             if let Some(label) = obj.get("label").and_then(|v| v.as_str()) {
-                                if !label.trim().is_empty() && label.chars().any(|c| {
-                                    ('\u{3000}'..='\u{9FFF}').contains(&c)
-                                        || ('\u{FF00}'..='\u{FFEF}').contains(&c)
-                                }) {
-                                    results.push((format!("choices#{}#label", ci), label.to_string()));
+                                if !label.trim().is_empty()
+                                    && label.chars().any(|c| {
+                                        ('\u{3000}'..='\u{9FFF}').contains(&c)
+                                            || ('\u{FF00}'..='\u{FFEF}').contains(&c)
+                                    })
+                                {
+                                    results
+                                        .push((format!("choices#{}#label", ci), label.to_string()));
                                 }
                             }
                         }
@@ -114,8 +116,7 @@ fn extract_mz_plugin_command(params: &[serde_json::Value]) -> Vec<(String, Strin
             }
             // Regular text field — only if it contains CJK characters
             if val.chars().any(|c| {
-                ('\u{3000}'..='\u{9FFF}').contains(&c)
-                    || ('\u{FF00}'..='\u{FFEF}').contains(&c)
+                ('\u{3000}'..='\u{9FFF}').contains(&c) || ('\u{FF00}'..='\u{FFEF}').contains(&c)
             }) {
                 results.push((key.to_string(), val.to_string()));
             }
@@ -123,7 +124,6 @@ fn extract_mz_plugin_command(params: &[serde_json::Value]) -> Vec<(String, Strin
     }
     results
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MvMzVersion {
@@ -180,14 +180,13 @@ impl RpgMakerMvPlugin {
         let Ok(rd) = std::fs::read_dir(dir) else {
             return false;
         };
-        rd.filter_map(|e| e.ok())
-            .any(|e| {
-                let name = e.file_name();
-                let Some(s) = name.to_str() else {
-                    return false;
-                };
-                Self::is_map_data_name(s)
-            })
+        rd.filter_map(|e| e.ok()).any(|e| {
+            let name = e.file_name();
+            let Some(s) = name.to_str() else {
+                return false;
+            };
+            Self::is_map_data_name(s)
+        })
     }
 
     fn dir_has_iavra_lang_pack(dir: &Path) -> bool {
@@ -239,13 +238,12 @@ impl RpgMakerMvPlugin {
             return Ok(raw.to_string());
         }
         let trimmed = raw.trim();
-        let units = lz_str::decompress_from_base64(trimmed).ok_or_else(|| {
-            LocustError::ParseError {
+        let units =
+            lz_str::decompress_from_base64(trimmed).ok_or_else(|| LocustError::ParseError {
                 file: file_path.display().to_string(),
                 message: "failed to decompress .jsono (LZString base64 / POR_DatabaseEncoder)"
                     .to_string(),
-            }
-        })?;
+            })?;
         Ok(String::from_utf16_lossy(&units))
     }
 
@@ -357,11 +355,9 @@ impl RpgMakerMvPlugin {
         file_path: &Path,
     ) -> Result<Vec<StringEntry>> {
         let mut entries = Vec::new();
-        let arr = json.as_array().ok_or_else(|| {
-            LocustError::ParseError {
-                file: filename.to_string(),
-                message: "expected JSON array".to_string(),
-            }
+        let arr = json.as_array().ok_or_else(|| LocustError::ParseError {
+            file: filename.to_string(),
+            message: "expected JSON array".to_string(),
         })?;
 
         for (idx, item) in arr.iter().enumerate() {
@@ -461,7 +457,11 @@ impl RpgMakerMvPlugin {
                     let text = lines.join("\n");
                     if !text.trim().is_empty() {
                         let id = format!("{}#cmd_{}#msg", id_prefix, cmd_idx);
-                        let tag = if code == 405 { "scroll_text" } else { "dialogue" };
+                        let tag = if code == 405 {
+                            "scroll_text"
+                        } else {
+                            "dialogue"
+                        };
                         let mut entry = StringEntry::new(id, &text, file_path.to_path_buf());
                         entry.tags = vec![tag.to_string()];
                         if code == 401 {
@@ -476,10 +476,7 @@ impl RpgMakerMvPlugin {
                         for (ci, choice) in choices.iter().enumerate() {
                             if let Some(text) = choice.as_str() {
                                 if !text.trim().is_empty() {
-                                    let id = format!(
-                                        "{}#cmd_{}#choice_{}",
-                                        id_prefix, cmd_idx, ci
-                                    );
+                                    let id = format!("{}#cmd_{}#choice_{}", id_prefix, cmd_idx, ci);
                                     let mut entry =
                                         StringEntry::new(id, text, file_path.to_path_buf());
                                     entry.tags = vec!["menu".to_string()];
@@ -494,8 +491,7 @@ impl RpgMakerMvPlugin {
                     if let Some(text) = params.get(1).and_then(|v| v.as_str()) {
                         if !text.trim().is_empty() {
                             let id = format!("{}#cmd_{}", id_prefix, cmd_idx);
-                            let mut entry =
-                                StringEntry::new(id, text, file_path.to_path_buf());
+                            let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
                             entry.tags = vec!["actor_name".to_string()];
                             entries.push(entry);
                         }
@@ -517,8 +513,7 @@ impl RpgMakerMvPlugin {
                 357 => {
                     for (arg_key, text) in extract_mz_plugin_command(params) {
                         let id = format!("{}#cmd_{}#arg_{}", id_prefix, cmd_idx, arg_key);
-                        let mut entry =
-                            StringEntry::new(id, &text, file_path.to_path_buf());
+                        let mut entry = StringEntry::new(id, &text, file_path.to_path_buf());
                         entry.tags = vec!["plugin_cmd".to_string()];
                         entries.push(entry);
                     }
@@ -538,8 +533,11 @@ impl RpgMakerMvPlugin {
         // gameTitle
         if let Some(title) = json.get("gameTitle").and_then(|v| v.as_str()) {
             if !title.trim().is_empty() {
-                let mut entry =
-                    StringEntry::new(format!("{}#gameTitle", filename), title, file_path.to_path_buf());
+                let mut entry = StringEntry::new(
+                    format!("{}#gameTitle", filename),
+                    title,
+                    file_path.to_path_buf(),
+                );
                 entry.tags = vec!["system".to_string()];
                 entries.push(entry);
             }
@@ -655,12 +653,8 @@ impl RpgMakerMvPlugin {
                             }) {
                                 continue;
                             }
-                            let id = format!(
-                                "{}#plugins#{}#{}#{}",
-                                filename, pi, plugin_name, key
-                            );
-                            let mut entry =
-                                StringEntry::new(id, s, file_path.to_path_buf());
+                            let id = format!("{}#plugins#{}#{}#{}", filename, pi, plugin_name, key);
+                            let mut entry = StringEntry::new(id, s, file_path.to_path_buf());
                             entry.tags = vec!["plugin_param".to_string()];
                             entries.push(entry);
                         }
@@ -1009,7 +1003,9 @@ impl RpgMakerMvPlugin {
             // Handle nested choice labels: "arg_choices#0#label"
             let choice_idx: usize = arg_parts[1].parse().unwrap_or(0);
             if let Some(choices_str) = args.get(arg_key).and_then(|v| v.as_str()) {
-                if let Ok(mut choices_arr) = serde_json::from_str::<Vec<serde_json::Value>>(choices_str) {
+                if let Ok(mut choices_arr) =
+                    serde_json::from_str::<Vec<serde_json::Value>>(choices_str)
+                {
                     if let Some(choice_val) = choices_arr.get_mut(choice_idx) {
                         // Choice may be a string containing JSON
                         let mut choice_obj = if let Some(s) = choice_val.as_str() {
@@ -1018,7 +1014,10 @@ impl RpgMakerMvPlugin {
                             choice_val.clone()
                         };
                         if let Some(obj) = choice_obj.as_object_mut() {
-                            obj.insert("label".to_string(), serde_json::Value::String(translation.to_string()));
+                            obj.insert(
+                                "label".to_string(),
+                                serde_json::Value::String(translation.to_string()),
+                            );
                         }
                         // Write back
                         if choice_val.is_string() {
@@ -1036,7 +1035,10 @@ impl RpgMakerMvPlugin {
         } else {
             // Simple arg replacement (text, destination, message, etc.)
             if args.contains_key(arg_key) {
-                args.insert(arg_key.to_string(), serde_json::Value::String(translation.to_string()));
+                args.insert(
+                    arg_key.to_string(),
+                    serde_json::Value::String(translation.to_string()),
+                );
             }
         }
     }
@@ -1108,11 +1110,7 @@ impl RpgMakerMvPlugin {
         }
     }
 
-    fn apply_troops_translation(
-        json: &mut serde_json::Value,
-        suffix: &str,
-        translation: &str,
-    ) {
+    fn apply_troops_translation(json: &mut serde_json::Value, suffix: &str, translation: &str) {
         let parts: Vec<&str> = suffix.split('#').collect();
         // Format: "idx#page_N#cmd_N[#choice_N|#arg_X]"
         if parts.len() < 3 {
@@ -1192,11 +1190,7 @@ impl RpgMakerMvPlugin {
     /// `cmd_idx` with the translation re-wrapped to the original line width.
     /// The run may grow or shrink; callers must apply entries in descending
     /// cmd_idx order so earlier indices stay valid.
-    fn apply_message_block(
-        list: &mut Vec<serde_json::Value>,
-        cmd_idx: usize,
-        translation: &str,
-    ) {
+    fn apply_message_block(list: &mut Vec<serde_json::Value>, cmd_idx: usize, translation: &str) {
         let code = match list
             .get(cmd_idx)
             .and_then(|c| c.get("code"))
@@ -1311,12 +1305,11 @@ impl RpgMakerMvPlugin {
             .to_string_lossy()
             .to_string();
         let stem = Self::strip_data_ext(&filename);
-        let (pack, lang) = Self::parse_iavra_pack_stem(stem).ok_or_else(|| {
-            LocustError::ParseError {
+        let (pack, lang) =
+            Self::parse_iavra_pack_stem(stem).ok_or_else(|| LocustError::ParseError {
                 file: file_path.display().to_string(),
                 message: format!("not an Iavra lang pack name: {filename}"),
-            }
-        })?;
+            })?;
 
         let json: serde_json::Value = serde_json::from_str(&content)?;
         let obj = json.as_object().ok_or_else(|| LocustError::ParseError {
@@ -1371,12 +1364,7 @@ impl RpgMakerMvPlugin {
             }
             match Self::extract_iavra_pack_file(&path) {
                 Ok(entries) => {
-                    tracing::info!(
-                        "Iavra pack {} ({}): {} strings",
-                        pack,
-                        lang,
-                        entries.len()
-                    );
+                    tracing::info!("Iavra pack {} ({}): {} strings", pack, lang, entries.len());
                     all.extend(entries);
                 }
                 Err(e) => {
@@ -1413,9 +1401,7 @@ pub(crate) fn visible_len(s: &str) -> usize {
                         break;
                     }
                 }
-            } else if !had_letters
-                && chars.peek().is_some_and(|c| "{}$.|!><^\\".contains(*c))
-            {
+            } else if !had_letters && chars.peek().is_some_and(|c| "{}$.|!><^\\".contains(*c)) {
                 chars.next();
             }
         } else {
@@ -1565,11 +1551,9 @@ impl FormatPlugin for RpgMakerMvPlugin {
             return Self::extract_file(path);
         }
 
-        let data_dir = Self::find_data_dir(path).ok_or_else(|| {
-            LocustError::ParseError {
-                file: path.display().to_string(),
-                message: "could not find data directory".to_string(),
-            }
+        let data_dir = Self::find_data_dir(path).ok_or_else(|| LocustError::ParseError {
+            file: path.display().to_string(),
+            message: "could not find data directory".to_string(),
         })?;
 
         // Fail loudly on encrypted games instead of silently extracting 0
@@ -1684,9 +1668,12 @@ impl FormatPlugin for RpgMakerMvPlugin {
         lang: &str,
         entries: &[StringEntry],
     ) -> Result<InjectionReport> {
-        let game_root = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
-        let data_dir = Self::find_data_dir(game_root)
-            .unwrap_or_else(|| game_root.join("data"));
+        let game_root = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let data_dir = Self::find_data_dir(game_root).unwrap_or_else(|| game_root.join("data"));
 
         // Multi-pack Iavra: write data/lang_{pack}_{lang}.jsono (not Languages/{lang}.json)
         let has_iavra = entries.iter().any(|e| {
@@ -1716,7 +1703,10 @@ impl FormatPlugin for RpgMakerMvPlugin {
                 let mut map = serde_json::Map::new();
                 for entry in entries {
                     if let Some(ref translation) = entry.translation {
-                        map.insert(entry.id.clone(), serde_json::Value::String(translation.clone()));
+                        map.insert(
+                            entry.id.clone(),
+                            serde_json::Value::String(translation.clone()),
+                        );
                         strings_written += 1;
                     } else {
                         strings_skipped += 1;
@@ -2025,8 +2015,11 @@ mod tests {
         let hello = entries
             .iter()
             .find(|e| e.source == "Hello, traveler!\nWelcome to our town.");
-        assert!(hello.is_some(), "block entry missing: {:?}",
-            entries.iter().map(|e| &e.source).collect::<Vec<_>>());
+        assert!(
+            hello.is_some(),
+            "block entry missing: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
         let hello = hello.unwrap();
         assert!(hello.tags.contains(&"dialogue".to_string()));
         assert!(hello.id.ends_with("#msg"));
@@ -2044,7 +2037,10 @@ mod tests {
 
     #[test]
     fn test_split_name_tag() {
-        assert_eq!(split_name_tag("\\n<Demon Girl>Hola"), ("\\n<Demon Girl>", "Hola"));
+        assert_eq!(
+            split_name_tag("\\n<Demon Girl>Hola"),
+            ("\\n<Demon Girl>", "Hola")
+        );
         assert_eq!(split_name_tag("Hola"), ("", "Hola"));
         assert_eq!(split_name_tag("\\C[6]Hola"), ("", "\\C[6]Hola"));
     }
@@ -2070,7 +2066,11 @@ mod tests {
         let list = json["events"][1]["pages"][0]["list"].as_array().unwrap();
         let first_line = list[1]["parameters"][0].as_str().unwrap();
         // Tag intact at the start of the first line despite containing a space
-        assert!(first_line.starts_with("\\n<Chica Demonio>"), "{}", first_line);
+        assert!(
+            first_line.starts_with("\\n<Chica Demonio>"),
+            "{}",
+            first_line
+        );
         // No other line contains a fragment of the tag
         let mut i = 2;
         while list[i]["code"].as_i64() == Some(401) {
@@ -2092,7 +2092,8 @@ mod tests {
     fn test_rewrap_to_source_width_restores_source_line_width() {
         // Provider flattened a hand-wrapped message: re-wrap to the source width.
         let src = "Hey, I heard your little brother\nand sister have no food to eat?";
-        let flat = "Oye, escuché que tu hermanito y tu hermanita no tienen nada de comida, ¿verdad?";
+        let flat =
+            "Oye, escuché que tu hermanito y tu hermanita no tienen nada de comida, ¿verdad?";
         let out = rewrap_to_source_width(src, flat);
         let width = src.lines().map(visible_len).max().unwrap();
         assert!(out.contains('\n'), "should have been re-wrapped: {out:?}");
@@ -2186,8 +2187,16 @@ mod tests {
             msg_lines.push(list[i]["parameters"][0].as_str().unwrap().to_string());
             i += 1;
         }
-        assert!(msg_lines.len() >= 2, "expected rewrapped lines: {:?}", msg_lines);
-        assert!(msg_lines.iter().all(|l| visible_len(l) <= 40), "{:?}", msg_lines);
+        assert!(
+            msg_lines.len() >= 2,
+            "expected rewrapped lines: {:?}",
+            msg_lines
+        );
+        assert!(
+            msg_lines.iter().all(|l| visible_len(l) <= 40),
+            "{:?}",
+            msg_lines
+        );
         assert_eq!(
             msg_lines.join(" "),
             "¡Hola, viajero cansado de tantos caminos! Bienvenido a nuestro humilde pueblo, espero que disfrutes tu estadía aquí."
@@ -2229,8 +2238,7 @@ mod tests {
 
         plugin.inject(&game_dir, &entries).unwrap();
 
-        let content =
-            fs::read_to_string(game_dir.join("data").join("Actors.json")).unwrap();
+        let content = fs::read_to_string(game_dir.join("data").join("Actors.json")).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         let name = json[1]["name"].as_str().unwrap();
         assert_eq!(name, "Héroe");
@@ -2250,8 +2258,7 @@ mod tests {
 
         plugin.inject(&game_dir, &entries).unwrap();
 
-        let content =
-            fs::read_to_string(game_dir.join("data").join("Actors.json")).unwrap();
+        let content = fs::read_to_string(game_dir.join("data").join("Actors.json")).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(json[1]["characterIndex"].as_i64().unwrap(), 0);
         assert_eq!(json[1]["classId"].as_i64().unwrap(), 1);
@@ -2329,7 +2336,10 @@ mod tests {
             &data.join("System.jsono"),
             r#"{"gameTitle":"POR Game","terms":{"commands":["Fight"]}}"#,
         );
-        write_jsono(&data.join("Map001.jsono"), r#"{"displayName":"Town","events":[]}"#);
+        write_jsono(
+            &data.join("Map001.jsono"),
+            r#"{"displayName":"Town","events":[]}"#,
+        );
 
         let plugin = RpgMakerMvPlugin::new();
         assert!(plugin.detect(&dir), "should detect POR-only MZ deploy");
@@ -2472,7 +2482,10 @@ mod tests {
 
         // Round-trip still LZString
         let raw = fs::read_to_string(data.join("lang_g_es.jsono")).unwrap();
-        assert!(!raw.trim_start().starts_with('{'), "should stay encoded jsono");
+        assert!(
+            !raw.trim_start().starts_with('{'),
+            "should stay encoded jsono"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

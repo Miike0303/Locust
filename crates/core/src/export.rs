@@ -10,7 +10,10 @@ pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) 
 
     // Header
     lines.push("# Project Locust export".to_string());
-    lines.push(format!("# Source: {}, Target: {}", source_lang, target_lang));
+    lines.push(format!(
+        "# Source: {}, Target: {}",
+        source_lang, target_lang
+    ));
     lines.push(String::new());
     lines.push("msgid \"\"".to_string());
     lines.push("msgstr \"\"".to_string());
@@ -236,24 +239,22 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                match e.name().as_ref() {
-                    b"trans-unit" => {
-                        in_trans_unit = true;
-                        current_id = String::new();
-                        current_source = String::new();
-                        current_target = String::new();
-                        for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"id" {
-                                current_id = String::from_utf8_lossy(&attr.value).to_string();
-                            }
+            Ok(Event::Start(ref e)) => match e.name().as_ref() {
+                b"trans-unit" => {
+                    in_trans_unit = true;
+                    current_id = String::new();
+                    current_source = String::new();
+                    current_target = String::new();
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"id" {
+                            current_id = String::from_utf8_lossy(&attr.value).to_string();
                         }
                     }
-                    b"source" if in_trans_unit => in_source = true,
-                    b"target" if in_trans_unit => in_target = true,
-                    _ => {}
                 }
-            }
+                b"source" if in_trans_unit => in_source = true,
+                b"target" if in_trans_unit => in_target = true,
+                _ => {}
+            },
             Ok(Event::Text(ref e)) => {
                 let text = e.unescape().unwrap_or_default().to_string();
                 if in_source {
@@ -262,21 +263,19 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                     current_target.push_str(&text);
                 }
             }
-            Ok(Event::End(ref e)) => {
-                match e.name().as_ref() {
-                    b"source" => in_source = false,
-                    b"target" => in_target = false,
-                    b"trans-unit" => {
-                        in_trans_unit = false;
-                        units.push(XliffUnit {
-                            id: current_id.clone(),
-                            source: current_source.clone(),
-                            target: current_target.clone(),
-                        });
-                    }
-                    _ => {}
+            Ok(Event::End(ref e)) => match e.name().as_ref() {
+                b"source" => in_source = false,
+                b"target" => in_target = false,
+                b"trans-unit" => {
+                    in_trans_unit = false;
+                    units.push(XliffUnit {
+                        id: current_id.clone(),
+                        source: current_source.clone(),
+                        target: current_target.clone(),
+                    });
                 }
-            }
+                _ => {}
+            },
             Ok(Event::Eof) => break,
             Err(e) => {
                 return Err(LocustError::ParseError {
@@ -361,7 +360,10 @@ mod tests {
         assert_eq!(imported[1].translation, "Mundo");
         assert_eq!(imported[2].source, "Untranslated");
         assert_eq!(imported[2].translation, "");
-        assert!(po.contains("msgctxt \"e1\""), "export must write msgctxt ids");
+        assert!(
+            po.contains("msgctxt \"e1\""),
+            "export must write msgctxt ids"
+        );
     }
 
     #[test]

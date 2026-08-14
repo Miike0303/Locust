@@ -427,11 +427,7 @@ fn rebuild_speaker_line(original: &str, new_name: &str) -> String {
 }
 
 /// Extract string entries from one UTF-8 scenario payload.
-fn entries_from_ks_bytes(
-    bytes: &[u8],
-    rel: &str,
-    file_path: PathBuf,
-) -> Result<Vec<StringEntry>> {
+fn entries_from_ks_bytes(bytes: &[u8], rel: &str, file_path: PathBuf) -> Result<Vec<StringEntry>> {
     let decoded = decode_ks_utf8(bytes, rel)?;
     let kinds = classify_lines(&decoded.text);
     let mut all = Vec::new();
@@ -1179,11 +1175,17 @@ block comment body\r\n\
     fn test_classify_filters_structural() {
         let text = sample_scenario();
         let kinds = classify_lines(text);
-        let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+        let lines: Vec<&str> = text
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l))
+            .collect();
         assert_eq!(lines.len(), kinds.len());
         for (line, kind) in lines.iter().zip(kinds.iter()) {
             let t = line.trim();
-            if t.starts_with(';') || t.starts_with('*') || t.starts_with('@') || t == "[wait time=50]"
+            if t.starts_with(';')
+                || t.starts_with('*')
+                || t.starts_with('@')
+                || t == "[wait time=50]"
                 || t == "[chara_show name=\"akane\"]"
                 || t == "/*"
                 || t == "*/"
@@ -1253,10 +1255,7 @@ block comment body\r\n\
 
         // default_registry must also order tyrano before kirikiri.
         let def = crate::default_registry();
-        assert_eq!(
-            def.detect(&tyrano_dir).map(|p| p.id()),
-            Some("tyrano")
-        );
+        assert_eq!(def.detect(&tyrano_dir).map(|p| p.id()), Some("tyrano"));
         assert_eq!(def.detect(&bare_ks).map(|p| p.id()), Some("kirikiri"));
     }
 
@@ -1361,7 +1360,10 @@ block comment body\r\n\
         let report = plugin.inject(&dir, &entries).unwrap();
         assert!(report.files_modified >= 1, "{report:?}");
         let text = fs::read_to_string(dir.join("data/scenario/scene1.ks")).unwrap();
-        assert!(text.contains("#Nombre\r\n") || text.contains("#Nombre\n"), "rewritten speaker: {text}");
+        assert!(
+            text.contains("#Nombre\r\n") || text.contains("#Nombre\n"),
+            "rewritten speaker: {text}"
+        );
         assert!(
             text.contains("#Nombre:happy"),
             "face suffix preserved: {text}"
@@ -1440,12 +1442,16 @@ block comment body\r\n\
         assert!(plugin.detect(&dir));
         let mut entries = plugin.extract(&dir).unwrap();
         assert!(
-            entries.iter().any(|e| e.source.contains("This is narration")),
+            entries
+                .iter()
+                .any(|e| e.source.contains("This is narration")),
             "missing dialogue: {:?}",
             entries.iter().map(|e| &e.source).collect::<Vec<_>>()
         );
         assert!(
-            entries.iter().any(|e| e.id.starts_with("resources/app.asar/data/scenario/scene1.ks#")),
+            entries.iter().any(|e| e
+                .id
+                .starts_with("resources/app.asar/data/scenario/scene1.ks#")),
             "ids: {:?}",
             entries.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
@@ -1614,10 +1620,7 @@ block comment body\r\n\
     #[test]
     fn test_rebuild_speaker_line() {
         assert_eq!(rebuild_speaker_line("#表示名", "Name"), "#Name");
-        assert_eq!(
-            rebuild_speaker_line("#表示名:happy", "Name"),
-            "#Name:happy"
-        );
+        assert_eq!(rebuild_speaker_line("#表示名:happy", "Name"), "#Name:happy");
         assert_eq!(
             rebuild_speaker_line("  #表示名:happy", "Name"),
             "  #Name:happy"

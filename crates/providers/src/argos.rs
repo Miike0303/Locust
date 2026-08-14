@@ -153,10 +153,9 @@ mod tests {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(POST).path("/translate");
-            then.status(200)
-                .json_body(serde_json::json!({
-                    "translatedText": ["Hola"]
-                }));
+            then.status(200).json_body(serde_json::json!({
+                "translatedText": ["Hola"]
+            }));
         });
 
         let provider = ArgosProvider::new(server.base_url());
@@ -180,10 +179,9 @@ mod tests {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(POST).path("/translate");
-            then.status(200)
-                .json_body(serde_json::json!({
-                    "translatedText": ["Hola", "Mundo", "Prueba"]
-                }));
+            then.status(200).json_body(serde_json::json!({
+                "translatedText": ["Hola", "Mundo", "Prueba"]
+            }));
         });
 
         let provider = ArgosProvider::new(server.base_url());

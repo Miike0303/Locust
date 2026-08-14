@@ -13,7 +13,9 @@ fn test_rpgmaker_xp_detect_and_extract() {
 
     let registry = locust_formats::default_registry();
 
-    let plugin = registry.detect(game_dir).expect("Should detect RPG Maker XP");
+    let plugin = registry
+        .detect(game_dir)
+        .expect("Should detect RPG Maker XP");
     assert_eq!(plugin.id(), "rpgmaker-vxa");
     println!("Detected as: {}", plugin.name());
 
@@ -84,7 +86,10 @@ fn test_renpy_rpa_detect_and_extract() {
 
     let entries = plugin.extract(game_dir).expect("Should extract strings");
     println!("Ren'Py: {} strings extracted", entries.len());
-    assert!(!entries.is_empty(), "Should have extracted strings from RPA");
+    assert!(
+        !entries.is_empty(),
+        "Should have extracted strings from RPA"
+    );
 
     for e in entries.iter().take(10) {
         let preview = &e.source[..e.source.len().min(80)];

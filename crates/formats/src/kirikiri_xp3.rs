@@ -210,9 +210,8 @@ pub fn decode_index_blob(data: &[u8], index_offset: u64, label: &str) -> Result<
                 return Err(err(label, "zlib index size exceeds file"));
             }
             let compressed = &data[start..start + comp_size];
-            let plain = miniz_oxide::inflate::decompress_to_vec_zlib(compressed).map_err(|e| {
-                err(label, format!("failed to inflate zlib index: {e:?}"))
-            })?;
+            let plain = miniz_oxide::inflate::decompress_to_vec_zlib(compressed)
+                .map_err(|e| err(label, format!("failed to inflate zlib index: {e:?}")))?;
             if uncomp_size != 0 && plain.len() != uncomp_size {
                 warn!(
                     file = label,
@@ -293,10 +292,7 @@ fn parse_file_chunk(body: &[u8], label: &str) -> Result<Xp3Entry, Xp3Error> {
                 if !sub.len().is_multiple_of(SEGM_ENTRY_SIZE) {
                     return Err(err(
                         label,
-                        format!(
-                            "segm size {} not multiple of {SEGM_ENTRY_SIZE}",
-                            sub.len()
-                        ),
+                        format!("segm size {} not multiple of {SEGM_ENTRY_SIZE}", sub.len()),
                     ));
                 }
                 for chunk in sub.chunks_exact(SEGM_ENTRY_SIZE) {
@@ -370,7 +366,10 @@ impl Xp3Archive {
         for seg in &entry.segments {
             let start = seg.offset as usize;
             let packed = seg.packed_size as usize;
-            if start.checked_add(packed).is_none_or(|e| e > self.data.len()) {
+            if start
+                .checked_add(packed)
+                .is_none_or(|e| e > self.data.len())
+            {
                 return Err(err(
                     &label,
                     format!("segment for {} out of range", entry.name),
@@ -789,11 +788,8 @@ mod tests {
             write_xp3_custom(&files_raw).unwrap(),
         )
         .unwrap();
-        let b = Xp3Archive::from_bytes(
-            PathBuf::from("z.xp3"),
-            write_xp3_custom(&files_z).unwrap(),
-        )
-        .unwrap();
+        let b = Xp3Archive::from_bytes(PathBuf::from("z.xp3"), write_xp3_custom(&files_z).unwrap())
+            .unwrap();
         assert!(!a.entries[0].segments[0].is_zlib());
         assert!(b.entries[0].segments[0].is_zlib());
         assert_eq!(a.read_entry(&a.entries[0]).unwrap(), b"RAWSEG");

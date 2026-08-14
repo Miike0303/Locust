@@ -260,7 +260,12 @@ fn decode_container(bytes: &[u8], kind: ContainerKind, file_label: &str) -> Resu
     Ok((text, crlf))
 }
 
-fn encode_container(text: &str, kind: ContainerKind, crlf: bool, file_label: &str) -> Result<Vec<u8>> {
+fn encode_container(
+    text: &str,
+    kind: ContainerKind,
+    crlf: bool,
+    file_label: &str,
+) -> Result<Vec<u8>> {
     let normalized = if crlf {
         text.replace("\r\n", "\n")
             .replace('\r', "\n")
@@ -661,7 +666,9 @@ click"
         );
         // Wait markers stay inside the string
         assert!(
-            sources.iter().any(|s| s.ends_with('@') || s.contains("。@")),
+            sources
+                .iter()
+                .any(|s| s.ends_with('@') || s.contains("。@")),
             "expected @ wait marker kept: {sources:?}"
         );
         assert!(
@@ -819,7 +826,10 @@ click"
     fn test_unsupported_only_nscript_underscore_errors_loudly() {
         let dir = tempdir();
         fs::write(dir.join("nscript.___"), b"\0\0\0").unwrap();
-        let err = NScripterPlugin::new().extract(&dir).unwrap_err().to_string();
+        let err = NScripterPlugin::new()
+            .extract(&dir)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("nscript.___") || err.contains("unsupported"),
             "expected unsupported container message, got: {err}"
@@ -833,7 +843,10 @@ click"
         let dir = tempdir();
         fs::write(dir.join("nscript.___"), b"\0\0\0").unwrap();
         write_nscript_dat(&dir, "`ignored by engine\n");
-        let err = NScripterPlugin::new().extract(&dir).unwrap_err().to_string();
+        let err = NScripterPlugin::new()
+            .extract(&dir)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("nscript.___"),
             "expected engine-priority unsupported error, got: {err}"
@@ -848,7 +861,10 @@ click"
     fn test_nsa_only_extract_reports_loudly() {
         let dir = tempdir();
         fs::write(dir.join("arc.nsa"), b"NSA\0fake").unwrap();
-        let err = NScripterPlugin::new().extract(&dir).unwrap_err().to_string();
+        let err = NScripterPlugin::new()
+            .extract(&dir)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("nsa") || err.contains("archive"),
             "expected nsa-only message, got: {err}"
@@ -870,7 +886,10 @@ click"
         let original_id = target.id.clone();
         let report = plugin.inject(&dir, &entries).unwrap();
         assert!(
-            report.warnings.iter().any(|w| w.contains("Shift-JIS") || w.contains("encodable")),
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("Shift-JIS") || w.contains("encodable")),
             "expected SJIS warning: {:?}",
             report.warnings
         );
@@ -878,7 +897,9 @@ click"
         // Original line must remain
         let again = plugin.extract(&dir).unwrap();
         assert!(
-            again.iter().any(|e| e.id == original_id && e.source.contains("Hello, world")),
+            again
+                .iter()
+                .any(|e| e.id == original_id && e.source.contains("Hello, world")),
             "original corrupted: {:?}",
             again.iter().map(|e| &e.source).collect::<Vec<_>>()
         );

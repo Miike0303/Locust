@@ -33,8 +33,7 @@ use std::path::Path;
 
 /// LocRes magic GUID (UnrealLocres byte order).
 pub const LOCRES_MAGIC: [u8; 16] = [
-    0x0E, 0x14, 0x74, 0x75, 0x67, 0x4A, 0x03, 0xFC, 0x4A, 0x15, 0x90, 0x9D, 0xC3, 0x37, 0x7F,
-    0x1B,
+    0x0E, 0x14, 0x74, 0x75, 0x67, 0x4A, 0x03, 0xFC, 0x4A, 0x15, 0x90, 0x9D, 0xC3, 0x37, 0x7F, 0x1B,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,12 +236,8 @@ impl<'a> Reader<'a> {
             if u16s.last() == Some(&0) {
                 u16s.pop();
             }
-            String::from_utf16(&u16s).map_err(|_| {
-                err(
-                    self.file,
-                    format!("invalid UTF-16 FString at {}", self.pos),
-                )
-            })
+            String::from_utf16(&u16s)
+                .map_err(|_| err(self.file, format!("invalid UTF-16 FString at {}", self.pos)))
         }
     }
 }
@@ -323,9 +318,8 @@ impl LocresFile {
         let version = if data.len() >= 16 && data[..16] == LOCRES_MAGIC {
             r.read_exact(16)?;
             let v = r.u8()?;
-            LocresVersion::from_u8(v).ok_or_else(|| {
-                err(file_label, format!("unsupported locres version byte {v}"))
-            })?
+            LocresVersion::from_u8(v)
+                .ok_or_else(|| err(file_label, format!("unsupported locres version byte {v}")))?
         } else {
             LocresVersion::Legacy
         };
@@ -380,11 +374,7 @@ impl LocresFile {
 
         let mut namespaces = Vec::with_capacity(namespace_count);
         for _ in 0..namespace_count {
-            let name_hash = if version.is_optimized() {
-                r.u32()?
-            } else {
-                0
-            };
+            let name_hash = if version.is_optimized() { r.u32()? } else { 0 };
             let name = r.fstring()?;
             let key_count = r.i32()?;
             if key_count < 0 {
@@ -396,11 +386,7 @@ impl LocresFile {
             let key_count = key_count as usize;
             let mut strings = Vec::with_capacity(key_count);
             for _ in 0..key_count {
-                let key_hash = if version.is_optimized() {
-                    r.u32()?
-                } else {
-                    0
-                };
+                let key_hash = if version.is_optimized() { r.u32()? } else { 0 };
                 let key = r.fstring()?;
                 let source_string_hash = r.u32()?;
                 let value = if version as u8 >= LocresVersion::Compact as u8 {
@@ -624,7 +610,13 @@ mod tests {
     fn sample_file(version: LocresVersion) -> LocresFile {
         // Name/key hashes are only persisted by Optimized+ — Compact fixtures
         // must carry 0 there, matching what parse() reconstructs.
-        let h = |s: &str| if version.is_optimized() { str_crc32_ue(s) } else { 0 };
+        let h = |s: &str| {
+            if version.is_optimized() {
+                str_crc32_ue(s)
+            } else {
+                0
+            }
+        };
         LocresFile {
             version,
             namespaces: vec![
@@ -668,7 +660,10 @@ mod tests {
         let parsed = LocresFile::parse(&bytes, "test.locres").unwrap();
         assert!(f.semantic_eq(&parsed));
         let again = parsed.serialize().unwrap();
-        assert_eq!(bytes, again, "self-serialized Compact should be byte-stable");
+        assert_eq!(
+            bytes, again,
+            "self-serialized Compact should be byte-stable"
+        );
     }
 
     #[test]

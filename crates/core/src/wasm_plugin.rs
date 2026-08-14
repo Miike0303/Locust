@@ -39,18 +39,24 @@ mod inner {
 
             // Provide host import: locust_log
             linker
-                .func_wrap("env", "locust_log", |mut caller: Caller<'_, ()>, ptr: i32, len: i32| {
-                    if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-                        let data = memory.data(&caller);
-                        let start = ptr as usize;
-                        let end = start + len as usize;
-                        if end <= data.len() {
-                            if let Ok(msg) = std::str::from_utf8(&data[start..end]) {
-                                tracing::info!("[wasm-plugin] {}", msg);
+                .func_wrap(
+                    "env",
+                    "locust_log",
+                    |mut caller: Caller<'_, ()>, ptr: i32, len: i32| {
+                        if let Some(memory) =
+                            caller.get_export("memory").and_then(|e| e.into_memory())
+                        {
+                            let data = memory.data(&caller);
+                            let start = ptr as usize;
+                            let end = start + len as usize;
+                            if end <= data.len() {
+                                if let Ok(msg) = std::str::from_utf8(&data[start..end]) {
+                                    tracing::info!("[wasm-plugin] {}", msg);
+                                }
                             }
                         }
-                    }
-                })
+                    },
+                )
                 .map_err(|e| LocustError::Other(e.into()))?;
 
             let instance = linker
@@ -66,7 +72,9 @@ mod inner {
 
             // Read length prefix (first 4 bytes, little-endian)
             if start + 4 > data.len() {
-                return Err(LocustError::Other(anyhow::anyhow!("invalid WASM string pointer")));
+                return Err(LocustError::Other(anyhow::anyhow!(
+                    "invalid WASM string pointer"
+                )));
             }
             let len = u32::from_le_bytes([
                 data[start],
@@ -78,7 +86,9 @@ mod inner {
             let str_start = start + 4;
             let str_end = str_start + len;
             if str_end > data.len() {
-                return Err(LocustError::Other(anyhow::anyhow!("WASM string out of bounds")));
+                return Err(LocustError::Other(anyhow::anyhow!(
+                    "WASM string out of bounds"
+                )));
             }
 
             String::from_utf8(data[str_start..str_end].to_vec())
@@ -200,8 +210,9 @@ mod inner {
 
     pub fn load_wasm_plugin(path: &Path) -> Result<WasmPlugin> {
         let engine = Engine::default();
-        let module = Module::from_file(&engine, path)
-            .map_err(|e| LocustError::Other(anyhow::anyhow!("failed to load WASM module: {}", e)))?;
+        let module = Module::from_file(&engine, path).map_err(|e| {
+            LocustError::Other(anyhow::anyhow!("failed to load WASM module: {}", e))
+        })?;
 
         // Create a temporary instance to read metadata
         let mut store = Store::new(&engine, ());
@@ -210,13 +221,15 @@ mod inner {
             .func_wrap("env", "locust_log", |_: Caller<'_, ()>, _: i32, _: i32| {})
             .map_err(|e| LocustError::Other(e.into()))?;
 
-        let instance = linker
-            .instantiate(&mut store, &module)
-            .map_err(|e| LocustError::Other(anyhow::anyhow!("failed to instantiate WASM: {}", e)))?;
+        let instance = linker.instantiate(&mut store, &module).map_err(|e| {
+            LocustError::Other(anyhow::anyhow!("failed to instantiate WASM: {}", e))
+        })?;
 
         let metadata_fn = instance
             .get_typed_func::<(), i32>(&mut store, "locust_plugin_metadata")
-            .map_err(|e| LocustError::Other(anyhow::anyhow!("missing locust_plugin_metadata: {}", e)))?;
+            .map_err(|e| {
+                LocustError::Other(anyhow::anyhow!("missing locust_plugin_metadata: {}", e))
+            })?;
 
         let meta_ptr = metadata_fn
             .call(&mut store, ())
@@ -229,7 +242,11 @@ mod inner {
         let meta_json = WasmPlugin::read_wasm_string(&store, &memory, meta_ptr)?;
         let metadata: WasmPluginMetadata = serde_json::from_str(&meta_json)?;
 
-        tracing::info!("Loaded WASM plugin: {} v{}", metadata.name, metadata.version);
+        tracing::info!(
+            "Loaded WASM plugin: {} v{}",
+            metadata.name,
+            metadata.version
+        );
 
         Ok(WasmPlugin {
             engine,
@@ -255,11 +272,7 @@ mod inner {
                         plugins.push(plugin);
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to load WASM plugin {}: {}",
-                            path.display(),
-                            e
-                        );
+                        tracing::warn!("Failed to load WASM plugin {}: {}", path.display(), e);
                     }
                 }
             }
@@ -275,8 +288,8 @@ pub use inner::*;
 // Stubs when wasm-plugins feature is not enabled
 #[cfg(not(feature = "wasm-plugins"))]
 mod stubs {
-    use std::path::Path;
     use crate::error::Result;
+    use std::path::Path;
 
     pub fn scan_plugin_dir(_dir: &Path) -> Result<Vec<()>> {
         Ok(Vec::new())

@@ -9,9 +9,8 @@ use crate::error::{LocustError, Result};
 
 /// Windows reserved device names (case-insensitive), with or without extension.
 const RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
-    "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
-    "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Normalize a zip entry name before any security or extraction work.
@@ -197,7 +196,12 @@ pub fn check_entry_budget(
     uncompressed_size: u64,
     total_so_far: u64,
 ) -> Result<u64> {
-    check_entry_budget_with(entry_name, uncompressed_size, total_so_far, max_zip_total_bytes())
+    check_entry_budget_with(
+        entry_name,
+        uncompressed_size,
+        total_so_far,
+        max_zip_total_bytes(),
+    )
 }
 
 /// Same as [`check_entry_budget`] with an explicit total ceiling (tests).
@@ -241,7 +245,10 @@ mod budget_tests {
         let ceiling = 1024u64;
         let err = check_entry_budget_with("huge.bin", ceiling + 1, 0, ceiling).unwrap_err();
         let s = err.to_string();
-        assert!(s.contains("limit") || s.contains("expand") || s.contains("declares"), "{s}");
+        assert!(
+            s.contains("limit") || s.contains("expand") || s.contains("declares"),
+            "{s}"
+        );
     }
 
     #[test]

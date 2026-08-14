@@ -1,7 +1,7 @@
+use locust_core::extraction::FormatPlugin;
 /// Direct inject test for Ren'Py RPA games.
 /// Run: cargo test -p locust-formats --test inject_renpy_real -- --ignored --nocapture
 use std::path::Path;
-use locust_core::extraction::FormatPlugin;
 
 #[test]
 #[ignore]
@@ -19,7 +19,9 @@ fn test_inject_renpy_rpa_replace() {
     }
 
     let db = locust_core::database::Database::open(db_path).expect("Failed to open DB");
-    let entries = db.get_entries(&locust_core::database::EntryFilter::default()).expect("Failed to get entries");
+    let entries = db
+        .get_entries(&locust_core::database::EntryFilter::default())
+        .expect("Failed to get entries");
     println!("Loaded {} entries from DB", entries.len());
 
     let translated = entries.iter().filter(|e| e.translation.is_some()).count();

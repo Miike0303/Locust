@@ -114,9 +114,10 @@ impl TranslationProvider for ClaudeProvider {
             )));
         }
 
-        let claude_resp: ClaudeResponse = resp.json().await.map_err(|e| {
-            LocustError::ProviderError(format!("Claude malformed response: {}", e))
-        })?;
+        let claude_resp: ClaudeResponse = resp
+            .json()
+            .await
+            .map_err(|e| LocustError::ProviderError(format!("Claude malformed response: {}", e)))?;
 
         let content = claude_resp
             .content
@@ -124,8 +125,7 @@ impl TranslationProvider for ClaudeProvider {
             .map(|c| c.text.as_str())
             .unwrap_or("[]");
 
-        let translations =
-            parse_json_array(content).map_err(LocustError::ProviderError)?;
+        let translations = parse_json_array(content).map_err(LocustError::ProviderError)?;
 
         // A count mismatch would silently shift every translation onto the
         // wrong entry via zip; discard the whole batch instead.
@@ -141,9 +141,8 @@ impl TranslationProvider for ClaudeProvider {
         let tokens_used = usage.map(|u| u.input_tokens + u.output_tokens);
         let input_tokens = usage.map(|u| u.input_tokens);
         let output_tokens = usage.map(|u| u.output_tokens);
-        let cost_usd = usage.map(|u| {
-            (u.input_tokens as f64 * 0.00025 + u.output_tokens as f64 * 0.00125) / 1000.0
-        });
+        let cost_usd = usage
+            .map(|u| (u.input_tokens as f64 * 0.00025 + u.output_tokens as f64 * 0.00125) / 1000.0);
 
         // Usage is batch-level; attach it to the first result only so that
         // summing across results yields the true totals.
@@ -210,11 +209,7 @@ mod tests {
     use httpmock::prelude::*;
 
     fn make_provider(server: &MockServer) -> ClaudeProvider {
-        ClaudeProvider::new(
-            "test-key".to_string(),
-            None,
-            Some(server.base_url()),
-        )
+        ClaudeProvider::new("test-key".to_string(), None, Some(server.base_url()))
     }
 
     #[tokio::test]
@@ -307,6 +302,11 @@ mod tests {
         let c = cost.unwrap();
         // 1300 input tokens * 0.00025/1k + 1300 output tokens * 0.00125/1k
         let expected = (1300.0 * 0.00025 + 1300.0 * 0.00125) / 1000.0;
-        assert!((c - expected).abs() < 0.0001, "cost={}, expected={}", c, expected);
+        assert!(
+            (c - expected).abs() < 0.0001,
+            "cost={}, expected={}",
+            c,
+            expected
+        );
     }
 }

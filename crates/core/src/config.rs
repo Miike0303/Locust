@@ -301,7 +301,11 @@ mod tests {
     #[test]
     fn test_save_creates_parent_dirs() {
         let tmp = tempdir();
-        let path = tmp.join("deep").join("nested").join("dir").join("config.json");
+        let path = tmp
+            .join("deep")
+            .join("nested")
+            .join("dir")
+            .join("config.json");
         let cfg = AppConfig::default();
         cfg.save(&path).unwrap();
         assert!(path.exists());

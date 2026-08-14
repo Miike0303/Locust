@@ -126,7 +126,11 @@ fn build_rpa(files: &[(&str, &[u8])]) -> Vec<u8> {
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&pickle, 6);
 
     let header = format!("RPA-3.0 {:016x} {:08x}\n", index_offset, RPA_KEY as u32);
-    assert_eq!(header.len(), header_len, "header length must match placeholder");
+    assert_eq!(
+        header.len(),
+        header_len,
+        "header length must match placeholder"
+    );
 
     let mut out = Vec::new();
     out.extend_from_slice(header.as_bytes());
@@ -156,7 +160,12 @@ fn test_loose_rpy_translation_survives_inject_alongside_rpa() {
     let mut entries = plugin.extract(&dir).expect("extract failed");
     println!("extract() returned {} entries:", entries.len());
     for e in &entries {
-        println!("  file_path={} id={} source={:?}", e.file_path.display(), e.id, e.source);
+        println!(
+            "  file_path={} id={} source={:?}",
+            e.file_path.display(),
+            e.id,
+            e.source
+        );
     }
 
     let archive_entry = entries
@@ -166,8 +175,14 @@ fn test_loose_rpy_translation_survives_inject_alongside_rpa() {
         .iter()
         .find(|e| e.source.contains("Hello from the loose file"));
 
-    assert!(archive_entry.is_some(), "archive dialogue line was not extracted at all");
-    assert!(loose_entry.is_some(), "loose dialogue line was not extracted at all");
+    assert!(
+        archive_entry.is_some(),
+        "archive dialogue line was not extracted at all"
+    );
+    assert!(
+        loose_entry.is_some(),
+        "loose dialogue line was not extracted at all"
+    );
 
     // Confirm the entries are indeed a MIX of .rpa- and .rpy-sourced file_paths,
     // which is the precondition for the alleged bug.
@@ -178,7 +193,10 @@ fn test_loose_rpy_translation_survives_inject_alongside_rpa() {
         .iter()
         .any(|e| e.file_path.extension().is_some_and(|ext| ext == "rpy"));
     println!("mixed entries present: has_rpa_entry={has_rpa_entry} has_rpy_entry={has_rpy_entry}");
-    assert!(has_rpa_entry && has_rpy_entry, "precondition failed: entries are not mixed rpa+rpy");
+    assert!(
+        has_rpa_entry && has_rpy_entry,
+        "precondition failed: entries are not mixed rpa+rpy"
+    );
 
     // --- ASSIGN TRANSLATIONS to every entry ---
     for e in &mut entries {
@@ -235,11 +253,15 @@ fn test_colliding_filename_loose_translation_survives_and_report_reconciles() {
     let mut entries = plugin.extract(&dir).expect("extract failed");
     let total_entries = entries.len();
     assert!(
-        entries.iter().any(|e| e.source.contains("Hello from the archive copy")),
+        entries
+            .iter()
+            .any(|e| e.source.contains("Hello from the archive copy")),
         "archive dialogue line was not extracted"
     );
     assert!(
-        entries.iter().any(|e| e.source.contains("Hello from the loose override")),
+        entries
+            .iter()
+            .any(|e| e.source.contains("Hello from the loose override")),
         "loose dialogue line was not extracted"
     );
 
@@ -308,11 +330,15 @@ fn test_archive_member_in_subdirectory_does_not_collide_with_same_basename_loose
 
     let mut entries = plugin.extract(&dir).expect("extract failed");
     assert!(
-        entries.iter().any(|e| e.source.contains("Hello from the archive subdir")),
+        entries
+            .iter()
+            .any(|e| e.source.contains("Hello from the archive subdir")),
         "archive dialogue line was not extracted"
     );
     assert!(
-        entries.iter().any(|e| e.source.contains("Hello from the loose day1")),
+        entries
+            .iter()
+            .any(|e| e.source.contains("Hello from the loose day1")),
         "loose dialogue line was not extracted"
     );
 
@@ -364,11 +390,7 @@ fn test_stale_line_number_counted_as_skipped_not_written() {
     fs::write(game_dir.join("loose.rpy"), original_content).unwrap();
 
     // Line 99 does not exist in this two-line file — a stale line number.
-    let mut entry = StringEntry::new(
-        "loose.rpy#99",
-        "Hello there!",
-        game_dir.join("loose.rpy"),
-    );
+    let mut entry = StringEntry::new("loose.rpy#99", "Hello there!", game_dir.join("loose.rpy"));
     entry.translation = Some("[ES] Hello there!".to_string());
     entry.tags = vec!["dialogue".to_string()];
 
@@ -512,7 +534,10 @@ fn test_stale_filter_removal_warning_reaches_caller_in_mixed_batch() {
 /// it emits. Panics on any opcode outside the 15 a real archive uses, so the
 /// fixture can never silently drift back to an unrepresentative shape.
 fn index_opcode_set(rpa: &[u8]) -> std::collections::BTreeSet<u8> {
-    let newline = rpa.iter().position(|&b| b == b'\n').expect("no header line");
+    let newline = rpa
+        .iter()
+        .position(|&b| b == b'\n')
+        .expect("no header line");
     let header = std::str::from_utf8(&rpa[..newline]).expect("header not utf-8");
     let mut parts = header.split_whitespace();
     parts.next(); // "RPA-3.0"
@@ -568,8 +593,10 @@ fn test_fixture_index_opcode_set_matches_real_archive() {
             )
         })
         .collect();
-    let files: Vec<(&str, &[u8])> =
-        contents.iter().map(|(n, c)| (n.as_str(), c.as_slice())).collect();
+    let files: Vec<(&str, &[u8])> = contents
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_slice()))
+        .collect();
     let rpa_bytes = build_rpa(&files);
 
     let expected: std::collections::BTreeSet<u8> = [
@@ -617,8 +644,10 @@ fn test_real_shape_152_member_archive_extracts_every_member() {
             )
         })
         .collect();
-    let files: Vec<(&str, &[u8])> =
-        contents.iter().map(|(n, c)| (n.as_str(), c.as_slice())).collect();
+    let files: Vec<(&str, &[u8])> = contents
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_slice()))
+        .collect();
     let rpa_path = game_dir.join("scripts.rpa");
     fs::write(&rpa_path, build_rpa(&files)).unwrap();
 
@@ -646,8 +675,15 @@ fn wrap_index_pickle(pickle: &[u8], body: &[u8]) -> Vec<u8> {
     let header_len = format!("RPA-3.0 {:016x} {:08x}\n", 0u64, 0u32).len();
     let index_offset = header_len + body.len();
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(pickle, 6);
-    let header = format!("RPA-3.0 {:016x} {:08x}\n", index_offset as u64, RPA_KEY as u32);
-    assert_eq!(header.len(), header_len, "header length must match placeholder");
+    let header = format!(
+        "RPA-3.0 {:016x} {:08x}\n",
+        index_offset as u64, RPA_KEY as u32
+    );
+    assert_eq!(
+        header.len(),
+        header_len,
+        "header length must match placeholder"
+    );
     let mut out = header.into_bytes();
     out.extend_from_slice(body);
     out.extend_from_slice(&compressed);
@@ -734,10 +770,22 @@ fn test_unknown_argumented_opcode_after_harvested_members_is_a_hard_error() {
     let mut memo: u32 = 0;
     emit_put(&mut pickle, &mut memo);
 
-    emit_member(&mut pickle, &mut memo, "a.rpy", a_off, member_a.len() as i64);
+    emit_member(
+        &mut pickle,
+        &mut memo,
+        "a.rpy",
+        a_off,
+        member_a.len() as i64,
+    );
     pickle.push(0x75); // SETITEMS — member a is harvested; the index is non-empty
 
-    emit_member(&mut pickle, &mut memo, "b.rpy", b_off, member_b.len() as i64);
+    emit_member(
+        &mut pickle,
+        &mut memo,
+        "b.rpy",
+        b_off,
+        member_b.len() as i64,
+    );
     // BINFLOAT: opcode byte + 8-byte big-endian float argument. Skipping only
     // the opcode byte would feed those 8 argument bytes back into the opcode
     // loop and derail the stream past member b.
@@ -894,7 +942,11 @@ fn test_translations_only_archive_does_not_warn_about_no_strings() {
 
     let tl_script = b"translate spanish start_x1:\n    e \"Hola desde tl!\"\n";
     let rpa_path = dir.join("scripts.rpa");
-    fs::write(&rpa_path, build_rpa(&[("tl/spanish/script.rpy", tl_script)])).unwrap();
+    fs::write(
+        &rpa_path,
+        build_rpa(&[("tl/spanish/script.rpy", tl_script)]),
+    )
+    .unwrap();
 
     let buf = LogBuffer::default();
     let subscriber = tracing_subscriber::fmt()

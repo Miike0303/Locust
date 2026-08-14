@@ -76,8 +76,7 @@ impl HtmlGamePlugin {
                                     attr,
                                     entries.len()
                                 );
-                                let mut entry =
-                                    StringEntry::new(id, val, file_path.to_path_buf());
+                                let mut entry = StringEntry::new(id, val, file_path.to_path_buf());
                                 entry.context = Some(format!("HTML attribute: {}", attr));
                                 entry.tags = vec!["html-attr".to_string()];
                                 entries.push(entry);
@@ -293,19 +292,40 @@ fn extract_tag_name(tag: &str) -> String {
 }
 
 fn is_skip_tag(tag: &str) -> bool {
-    matches!(
-        tag,
-        "script" | "style" | "svg" | "noscript" | "template"
-    )
+    matches!(tag, "script" | "style" | "svg" | "noscript" | "template")
 }
 
 fn is_text_tag(tag: &str) -> bool {
     matches!(
         tag,
-        "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "span" | "a" | "button"
-            | "label" | "li" | "td" | "th" | "option" | "caption" | "figcaption" | "blockquote"
-            | "cite" | "em" | "strong" | "b" | "i" | "small" | "title" | "legend" | "summary"
-            | "dt" | "dd"
+        "p" | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "span"
+            | "a"
+            | "button"
+            | "label"
+            | "li"
+            | "td"
+            | "th"
+            | "option"
+            | "caption"
+            | "figcaption"
+            | "blockquote"
+            | "cite"
+            | "em"
+            | "strong"
+            | "b"
+            | "i"
+            | "small"
+            | "title"
+            | "legend"
+            | "summary"
+            | "dt"
+            | "dd"
     )
 }
 

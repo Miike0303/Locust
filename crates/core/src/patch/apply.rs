@@ -16,9 +16,7 @@ use super::manifest::{
 use super::rollback::{rollback, RollbackOptions};
 use super::store::{PatchStatus, PatchStore};
 use super::stream::{charge_declared, stream_and_hash, stream_to_file, StagingDir};
-use super::verify::{
-    classify_files, verify, VerificationOutcome, VerificationReport,
-};
+use super::verify::{classify_files, verify, VerificationOutcome, VerificationReport};
 use super::zipsec::{normalize_entry_name, safe_entry_path};
 
 /// Staged zip content (on disk under `.locust/staging-*/`, same volume as game).
@@ -82,9 +80,7 @@ where
     // R3 routing when a receipt is present.
     if let Some(prior) = store.read_receipt()? {
         if let Some(ref m) = report.manifest {
-            if prior.patch_id == m.patch_id
-                && prior.patch_version == m.patch_version
-                && opts.force
+            if prior.patch_id == m.patch_id && prior.patch_version == m.patch_version && opts.force
             {
                 // Same id+version forced reapply — in-place if file set matches.
                 let prior_set: std::collections::HashSet<_> = prior
@@ -104,14 +100,7 @@ where
                         },
                     )?;
                     // After a full rollback the game is pristine → allow R2 discard.
-                    return apply_fresh(
-                        game_root,
-                        zip_path,
-                        &opts,
-                        &mut on_progress,
-                        None,
-                        true,
-                    );
+                    return apply_fresh(game_root, zip_path, &opts, &mut on_progress, None, true);
                 }
                 return apply_fresh(
                     game_root,
@@ -124,10 +113,8 @@ where
             }
             if prior.patch_id != m.patch_id || prior.patch_version != m.patch_version {
                 // Version or id change: upgrade always; downgrade only with force.
-                if matches!(
-                    report.outcome,
-                    VerificationOutcome::DowngradeBlocked { .. }
-                ) && !opts.force
+                if matches!(report.outcome, VerificationOutcome::DowngradeBlocked { .. })
+                    && !opts.force
                 {
                     return Err(LocustError::PatchDowngradeBlocked {
                         installed: prior.patch_version,
@@ -151,14 +138,7 @@ where
                             .into(),
                     ));
                 }
-                return apply_fresh(
-                    game_root,
-                    zip_path,
-                    &opts,
-                    &mut on_progress,
-                    None,
-                    true,
-                );
+                return apply_fresh(game_root, zip_path, &opts, &mut on_progress, None, true);
             }
         }
     }
@@ -276,8 +256,8 @@ where
     // Cleaned on drop (error, dry-run, or after successful renames).
     let staging = StagingDir::create(game_root)?;
     let file = File::open(zip_path)?;
-    let mut archive = ZipArchive::new(file)
-        .map_err(|e| LocustError::PatchError(format!("open zip: {e}")))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|e| LocustError::PatchError(format!("open zip: {e}")))?;
 
     // Stream each content entry to a staging file; hash while streaming.
     // Manifest is small and kept in RAM (same meta cap idea as verify).
@@ -314,9 +294,10 @@ where
                 &original,
                 Some(&mut data),
             )?;
-            manifest = Some(serde_json::from_slice(&data).map_err(|e| {
-                LocustError::PatchError(format!("manifest parse: {e}"))
-            })?);
+            manifest = Some(
+                serde_json::from_slice(&data)
+                    .map_err(|e| LocustError::PatchError(format!("manifest parse: {e}")))?,
+            );
             continue;
         }
         if normalized.eq_ignore_ascii_case("readme.txt") {
@@ -417,8 +398,7 @@ where
                 });
             } else {
                 if let Some(pa) = prior_added.get(&a.path) {
-                    let target =
-                        game_root.join(a.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    let target = game_root.join(a.path.replace('/', std::path::MAIN_SEPARATOR_STR));
                     if target.is_file() {
                         let h = sha256_hex(&fs::read(&target)?);
                         if h != pa.patched_sha256 {
@@ -587,9 +567,9 @@ where
             path: path.clone(),
             phase: "write",
         });
-        let staged = zip_files.get(&path).ok_or_else(|| {
-            LocustError::PatchError(format!("zip missing path {path}"))
-        })?;
+        let staged = zip_files
+            .get(&path)
+            .ok_or_else(|| LocustError::PatchError(format!("zip missing path {path}")))?;
         let dest = game_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;

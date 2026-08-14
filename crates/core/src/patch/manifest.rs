@@ -46,9 +46,7 @@ impl PatchManifest {
     /// Without original hashes we still treat all existing targets as replaced
     /// at structural tier; this helper is for plan-time when originals exist.
     pub fn replaced_paths(&self) -> impl Iterator<Item = &PatchFileEntry> {
-        self.files
-            .iter()
-            .filter(|f| f.original_sha256.is_some())
+        self.files.iter().filter(|f| f.original_sha256.is_some())
     }
 }
 

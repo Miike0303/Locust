@@ -75,8 +75,16 @@ impl TranslationProvider for DeepLProvider {
     }
 
     fn supported_languages(&self) -> Vec<LangPair> {
-        let sources = ["BG","CS","DA","DE","EL","EN","ES","ET","FI","FR","HU","ID","IT","JA","KO","LT","LV","NB","NL","PL","PT","RO","RU","SK","SL","SV","TR","UK","ZH"];
-        let targets = ["BG","CS","DA","DE","EL","EN-GB","EN-US","ES","ET","FI","FR","HU","ID","IT","JA","KO","LT","LV","NB","NL","PL","PT-BR","PT-PT","RO","RU","SK","SL","SV","TR","UK","ZH-HANS","ZH-HANT"];
+        let sources = [
+            "BG", "CS", "DA", "DE", "EL", "EN", "ES", "ET", "FI", "FR", "HU", "ID", "IT", "JA",
+            "KO", "LT", "LV", "NB", "NL", "PL", "PT", "RO", "RU", "SK", "SL", "SV", "TR", "UK",
+            "ZH",
+        ];
+        let targets = [
+            "BG", "CS", "DA", "DE", "EL", "EN-GB", "EN-US", "ES", "ET", "FI", "FR", "HU", "ID",
+            "IT", "JA", "KO", "LT", "LV", "NB", "NL", "PL", "PT-BR", "PT-PT", "RO", "RU", "SK",
+            "SL", "SV", "TR", "UK", "ZH-HANS", "ZH-HANT",
+        ];
         let mut pairs = Vec::new();
         for &s in &sources {
             for &t in &targets {

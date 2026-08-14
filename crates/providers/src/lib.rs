@@ -1,10 +1,10 @@
 pub mod argos;
+pub mod claude;
 pub mod deepl;
 pub mod google;
-pub mod openai;
-pub mod claude;
-pub mod ollama;
 pub mod mock;
+pub mod ollama;
+pub mod openai;
 pub mod retry;
 pub mod xai_oauth;
 
@@ -117,7 +117,10 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
 
     // Register Argos if configured or use defaults
     if let Some(pc) = config.get_provider_config("argos") {
-        let base_url = pc.base_url.clone().unwrap_or_else(|| "http://localhost:5000".to_string());
+        let base_url = pc
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "http://localhost:5000".to_string());
         reg.register(Arc::new(argos::ArgosProvider::new(base_url)));
     } else {
         reg.register(Arc::new(argos::ArgosProvider::default()));
@@ -189,8 +192,8 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
     // Any other config entry with a base_url is treated as a custom
     // OpenAI-compatible endpoint (vLLM, OpenRouter, self-hosted, ...).
     const KNOWN_IDS: [&str; 11] = [
-        "google", "argos", "deepl", "openai", "claude", "lmstudio", "ollama", "deepseek",
-        "grok", "gemini", "grok-sub",
+        "google", "argos", "deepl", "openai", "claude", "lmstudio", "ollama", "deepseek", "grok",
+        "gemini", "grok-sub",
     ];
     for (id, pc) in &config.providers {
         if KNOWN_IDS.contains(&id.as_str()) {

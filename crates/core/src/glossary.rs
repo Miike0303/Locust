@@ -130,8 +130,7 @@ impl Glossary {
                 e.term == trimmed || e.term == source
             } else {
                 e.term.eq_ignore_ascii_case(trimmed)
-                    || (!trimmed.is_ascii()
-                        && e.term.to_lowercase() == trimmed.to_lowercase())
+                    || (!trimmed.is_ascii() && e.term.to_lowercase() == trimmed.to_lowercase())
             };
             if hit {
                 return Some(e.translation.clone());
@@ -242,7 +241,9 @@ mod tests {
         let (_db, glossary) = setup();
         glossary.add("HP", "PV", "en-es", None).unwrap();
         glossary.add("Options", "Opcns", "en-es", None).unwrap();
-        glossary.add("Load Game", "Cargar J", "en-es", None).unwrap();
+        glossary
+            .add("Load Game", "Cargar J", "en-es", None)
+            .unwrap();
 
         let only_hp = glossary
             .build_hint_for_text("en", "es", "Current HP: 12")
@@ -272,9 +273,7 @@ mod tests {
     fn test_build_hint_budgeted_drops_oversize_translation() {
         let (_db, glossary) = setup();
         // "Options" is 7 utf8 bytes; "Opciones" is 8 → oversize for that slot.
-        glossary
-            .add("Options", "Opciones", "en-es", None)
-            .unwrap();
+        glossary.add("Options", "Opciones", "en-es", None).unwrap();
         glossary.add("OK", "Si", "en-es", None).unwrap();
 
         assert!(

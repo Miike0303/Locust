@@ -203,9 +203,10 @@ async fn refresh(tokens: &TokenStore) -> Result<TokenStore> {
         ));
     }
 
-    let tr: TokenResponse = resp.json().await.map_err(|e| {
-        LocustError::ProviderError(format!("malformed refresh response: {}", e))
-    })?;
+    let tr: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| LocustError::ProviderError(format!("malformed refresh response: {}", e)))?;
     let store = TokenStore {
         access_token: tr.access_token,
         refresh_token: tr

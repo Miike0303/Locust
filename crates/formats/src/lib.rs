@@ -1,27 +1,27 @@
 pub mod binary_search;
-pub mod rpgmaker_mv;
-pub mod rpgmaker_lang;
-pub mod rpgmaker_vxa;
+pub mod html_game;
+pub mod qsp;
 pub mod renpy;
-pub mod wolf_rpg;
+pub mod rpgmaker_lang;
+pub mod rpgmaker_mv;
+pub mod rpgmaker_vxa;
 pub mod sugarcube;
+pub mod unity;
+pub mod unity_serialized;
 pub mod unreal;
 pub mod unreal_locres;
 pub mod unreal_pak;
-pub mod unity;
-pub mod unity_serialized;
-pub mod html_game;
 pub mod vntextpatch;
-pub mod qsp;
+pub mod wolf_rpg;
 // tyrano before kirikiri: both may see loose .ks; Tyrano claims data/scenario/ + tyrano/ trees.
+pub mod kirikiri;
+pub mod kirikiri_xp3;
+pub mod nscripter;
 pub mod tyrano;
 pub mod tyrano_asar;
 pub mod tyrano_nw;
-pub mod kirikiri;
-pub mod kirikiri_xp3;
 pub mod yuris;
 pub mod yuris_ypf;
-pub mod nscripter;
 
 use locust_core::extraction::FormatRegistry;
 

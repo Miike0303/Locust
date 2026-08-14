@@ -264,13 +264,11 @@ impl AsarArchive {
     pub fn read_entry(&self, entry: &AsarEntry) -> Result<Vec<u8>, AsarError> {
         let label = self.path.display().to_string();
         if entry.unpacked {
-            let disk = self.unpacked_dir().join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            return std::fs::read(&disk).map_err(|e| {
-                err(
-                    &label,
-                    format!("unpacked read {} failed: {e}", entry.path),
-                )
-            });
+            let disk = self
+                .unpacked_dir()
+                .join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            return std::fs::read(&disk)
+                .map_err(|e| err(&label, format!("unpacked read {} failed: {e}", entry.path)));
         }
         let start = self
             .base_offset
@@ -603,7 +601,10 @@ mod tests {
         assert_eq!(arch.entries.len(), 2);
         assert!(arch.base_offset >= 16);
         // Nested dirs present
-        assert!(arch.header.pointer("/files/data/files/scenario/files/a.ks").is_some());
+        assert!(arch
+            .header
+            .pointer("/files/data/files/scenario/files/a.ks")
+            .is_some());
     }
 
     #[test]

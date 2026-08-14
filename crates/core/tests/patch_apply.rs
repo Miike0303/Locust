@@ -35,12 +35,7 @@ fn write_file(root: &Path, rel: &str, contents: &[u8]) {
 /// Relative path, patched bytes, optional original bytes (for original_sha256).
 type PatchZipFile<'a> = (&'a str, &'a [u8], Option<&'a [u8]>);
 
-fn build_patch_zip(
-    path: &Path,
-    files: &[PatchZipFile<'_>],
-    version: &str,
-    patch_id: &str,
-) {
+fn build_patch_zip(path: &Path, files: &[PatchZipFile<'_>], version: &str, patch_id: &str) {
     let manifest = PatchManifest {
         schema_version: 1,
         patch_id: patch_id.into(),
@@ -213,7 +208,10 @@ fn critical_b_receipt_present_manifest_less_backup_hard_errors() {
     fs::remove_file(game.join(".locust").join("backup").join("manifest.json")).unwrap();
     // Leave a decoy so backup/ still exists.
     fs::write(
-        game.join(".locust").join("backup").join("files").join("keep"),
+        game.join(".locust")
+            .join("backup")
+            .join("files")
+            .join("keep"),
         b"x",
     )
     .unwrap();
@@ -354,7 +352,11 @@ fn r1_deletion_set_never_includes_backup_manifest_paths() {
         "patched_sha256": sha256_hex(b"NEW"),
     }]);
     receipt["replaced"] = serde_json::json!([]);
-    fs::write(&receipt_path, serde_json::to_string_pretty(&receipt).unwrap()).unwrap();
+    fs::write(
+        &receipt_path,
+        serde_json::to_string_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
 
     rollback(&game, RollbackOptions::default()).unwrap();
     assert_eq!(
@@ -393,7 +395,10 @@ fn understate_uncompressed_sizes(zip_path: &Path, new_declared: u32) {
             patched += 1;
         }
     }
-    assert!(patched >= 2, "expected local+central headers to patch, got {patched}");
+    assert!(
+        patched >= 2,
+        "expected local+central headers to patch, got {patched}"
+    );
     fs::write(zip_path, bytes).unwrap();
 }
 
@@ -423,8 +428,14 @@ fn streaming_apply_multi_entry_byte_identical() {
     let report = apply(&game, &zip, ApplyOptions::default(), |_| {}).unwrap();
     assert_eq!(report.replaced, 2);
     assert_eq!(report.added, 1);
-    assert_eq!(fs::read(game.join("data").join("big_a.bin")).unwrap(), chunk_a);
-    assert_eq!(fs::read(game.join("data").join("big_b.bin")).unwrap(), chunk_b);
+    assert_eq!(
+        fs::read(game.join("data").join("big_a.bin")).unwrap(),
+        chunk_a
+    );
+    assert_eq!(
+        fs::read(game.join("data").join("big_b.bin")).unwrap(),
+        chunk_b
+    );
     assert_eq!(
         fs::read(game.join("data").join("small.txt")).unwrap(),
         b"hello-stream"
@@ -526,17 +537,13 @@ fn dry_run_does_not_leave_locust_dir_on_clean_game() {
     )
     .unwrap();
     assert!(report.dry_run);
-    assert_eq!(
-        fs::read(game.join("data").join("a.json")).unwrap(),
-        b"ORIG"
-    );
+    assert_eq!(fs::read(game.join("data").join("a.json")).unwrap(), b"ORIG");
     assert!(
         !game.join(".locust").exists(),
         "dry-run must not leave .locust/ on a previously clean game"
     );
     let _ = fs::remove_dir_all(&game);
 }
-
 
 #[test]
 fn upgrade_aborts_when_rollback_soft_fails_on_edited_added_file() {
@@ -571,8 +578,14 @@ fn upgrade_aborts_when_rollback_soft_fails_on_edited_added_file() {
         matches!(err, LocustError::PatchVerificationFailed(_)),
         "upgrade must hard-fail when rollback aborts, got {err:?}"
     );
-    assert_eq!(fs::read(game.join("data").join("base.json")).unwrap(), b"BASE_V1");
-    assert_eq!(fs::read(game.join("data").join("extra.json")).unwrap(), b"USER_EDIT");
+    assert_eq!(
+        fs::read(game.join("data").join("base.json")).unwrap(),
+        b"BASE_V1"
+    );
+    assert_eq!(
+        fs::read(game.join("data").join("extra.json")).unwrap(),
+        b"USER_EDIT"
+    );
     let _ = fs::remove_dir_all(&game);
 }
 
@@ -598,7 +611,11 @@ fn r2_discards_manifest_less_backup_when_strict_clean() {
     assert_eq!(report.replaced, 1);
     assert_eq!(fs::read(game.join("data").join("a.json")).unwrap(), b"NEW");
     // Junk was discarded and a real backup commit marker exists.
-    assert!(game.join(".locust").join("backup").join("manifest.json").is_file());
+    assert!(game
+        .join(".locust")
+        .join("backup")
+        .join("manifest.json")
+        .is_file());
     assert!(!junk.join("junk.bin").exists());
     let _ = fs::remove_dir_all(&game);
 }
@@ -662,4 +679,3 @@ fn identity_patch_on_pristine_game_is_clean_not_unknown() {
     assert_eq!(report.replaced, 1);
     let _ = fs::remove_dir_all(&game);
 }
-

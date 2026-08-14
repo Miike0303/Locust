@@ -85,11 +85,12 @@ impl FormatPlugin for VnTextPatchPlugin {
 
     fn detect(&self, path: &Path) -> bool {
         if path.is_file() {
-            return path.extension().is_some_and(|e| e == "json")
-                && Self::looks_like_vntp(path);
+            return path.extension().is_some_and(|e| e == "json") && Self::looks_like_vntp(path);
         }
         if path.is_dir() {
-            return Self::json_files(path).iter().any(|f| Self::looks_like_vntp(f));
+            return Self::json_files(path)
+                .iter()
+                .any(|f| Self::looks_like_vntp(f));
         }
         false
     }
@@ -124,11 +125,8 @@ impl FormatPlugin for VnTextPatchPlugin {
                     if val.trim().is_empty() {
                         continue;
                     }
-                    let mut entry = StringEntry::new(
-                        format!("{}#{}#{}", fname, idx, key),
-                        val,
-                        file.clone(),
-                    );
+                    let mut entry =
+                        StringEntry::new(format!("{}#{}#{}", fname, idx, key), val, file.clone());
                     entry.tags = vec![if key == "name" { "name" } else { "dialogue" }.to_string()];
                     if key == "message" {
                         entry.context = speaker.map(|s| s.to_string());
@@ -146,12 +144,7 @@ impl FormatPlugin for VnTextPatchPlugin {
         // Group translations by (filename, index, key)
         let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
         for e in entries {
-            let fname = e
-                .id
-                .split('#')
-                .next()
-                .unwrap_or_default()
-                .to_string();
+            let fname = e.id.split('#').next().unwrap_or_default().to_string();
             by_file.entry(fname).or_default().push(e);
         }
 
@@ -255,13 +248,16 @@ mod tests {
         assert_eq!(msg.context.as_deref(), Some("太郎"));
 
         for e in &mut entries {
-            e.translation = Some(match e.source.as_str() {
-                "太郎" => "Taro",
-                "こんにちは。" => "Hello.",
-                "元気ですか？" => "How are you?",
-                "…" => "...",
-                _ => "",
-            }.to_string());
+            e.translation = Some(
+                match e.source.as_str() {
+                    "太郎" => "Taro",
+                    "こんにちは。" => "Hello.",
+                    "元気ですか？" => "How are you?",
+                    "…" => "...",
+                    _ => "",
+                }
+                .to_string(),
+            );
         }
         let report = plugin.inject(&dir, &entries).unwrap();
         assert_eq!(report.strings_written, 4);

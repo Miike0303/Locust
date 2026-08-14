@@ -215,7 +215,11 @@ fn str_from_utf16le_bytes(data: &[u8]) -> String {
 
 fn decode_ks_bytes(bytes: &[u8], file_label: &str) -> Result<DecodedKs> {
     // Cipher header: FE FE mode FF FE
-    if bytes.len() >= 5 && bytes[0] == 0xFE && bytes[1] == 0xFE && bytes[3] == 0xFF && bytes[4] == 0xFE
+    if bytes.len() >= 5
+        && bytes[0] == 0xFE
+        && bytes[1] == 0xFE
+        && bytes[3] == 0xFF
+        && bytes[4] == 0xFE
     {
         let mode = bytes[2];
         let body = &bytes[5..];
@@ -276,10 +280,7 @@ fn decode_ks_bytes(bytes: &[u8], file_label: &str) -> Result<DecodedKs> {
                     })?;
                 let zlib = &body[zlib_start..zlib_end];
                 let plain = miniz_oxide::inflate::decompress_to_vec_zlib(zlib).map_err(|e| {
-                    parse_err(
-                        file_label,
-                        &format!("mode-2 zlib inflate failed: {e:?}"),
-                    )
+                    parse_err(file_label, &format!("mode-2 zlib inflate failed: {e:?}"))
                 })?;
                 if uncompressed_size != 0 && plain.len() != uncompressed_size {
                     // Prefer exact match (Descrambler allocates uncompressed_size).
@@ -523,11 +524,9 @@ fn is_tjs_or_brace_noise(t: &str) -> bool {
     }
     // Engine storage assignments: `tf.con_vol=[];`, `sf.masked[i]=0;`
     // (no dialogue quotes / fullwidth brackets).
-    let has_dialogue_mark = t.chars().any(|c| {
-        matches!(c, '「' | '」' | '『' | '』' | '（' | '）')
-            || c == '"'
-            || c == '\''
-    });
+    let has_dialogue_mark = t
+        .chars()
+        .any(|c| matches!(c, '「' | '」' | '『' | '』' | '（' | '）') || c == '"' || c == '\'');
     if !has_dialogue_mark
         && (low.starts_with("tf.")
             || low.starts_with("sf.")
@@ -607,11 +606,7 @@ fn is_player_text_line(line: &str) -> bool {
 /// Extract dialogue lines from decoded `.ks` text. `rel` is the id/source path
 /// prefix (loose relative path or `archive.xp3/inner.ks`). `file_path` is stored
 /// on each entry for inject routing.
-fn extract_lines_from_text(
-    text: &str,
-    rel: &str,
-    file_path: PathBuf,
-) -> Vec<StringEntry> {
+fn extract_lines_from_text(text: &str, rel: &str, file_path: PathBuf) -> Vec<StringEntry> {
     let mut all = Vec::new();
     for (idx, line) in text.split('\n').enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -884,11 +879,9 @@ impl FormatPlugin for KirikiriPlugin {
             let Some(archive) = open_archives.get(arch_path) else {
                 continue;
             };
-            let Some(entry) = archive
-                .entries
-                .iter()
-                .find(|e| e.name == *entry_name || e.name.replace('\\', "/") == entry_name.replace('\\', "/"))
-            else {
+            let Some(entry) = archive.entries.iter().find(|e| {
+                e.name == *entry_name || e.name.replace('\\', "/") == entry_name.replace('\\', "/")
+            }) else {
                 continue;
             };
             let arch_name = arch_path
@@ -1005,14 +998,14 @@ impl FormatPlugin for KirikiriPlugin {
                 }
                 let arch = archive_cache.get(&archive_name).unwrap();
 
-                let entry = match arch.entries.iter().find(|e| {
-                    e.name.replace('\\', "/") == inner.replace('\\', "/")
-                }) {
+                let entry = match arch
+                    .entries
+                    .iter()
+                    .find(|e| e.name.replace('\\', "/") == inner.replace('\\', "/"))
+                {
                     Some(e) => e.clone(),
                     None => {
-                        warnings.push(format!(
-                            "entry {inner} not found in {archive_name}"
-                        ));
+                        warnings.push(format!("entry {inner} not found in {archive_name}"));
                         strings_skipped += file_entries.len();
                         continue;
                     }
@@ -1385,9 +1378,9 @@ This is narration.\r\n\
             "mode-2 missing narration: {sources:?}"
         );
         assert!(
-            sources.iter().all(|s| !s.starts_with(';')
-                && !s.starts_with('*')
-                && !s.starts_with('@')),
+            sources
+                .iter()
+                .all(|s| !s.starts_with(';') && !s.starts_with('*') && !s.starts_with('@')),
             "mode-2 non-text leaked: {sources:?}"
         );
     }
@@ -1420,7 +1413,10 @@ This is narration.\r\n\
         fs::write(dir.join("data.xp3"), b"XP3\r\n").unwrap();
         let err = KirikiriPlugin::new().extract(&dir).unwrap_err().to_string();
         assert!(
-            err.contains("xp3") || err.contains("XP3") || err.contains("magic") || err.contains("parse"),
+            err.contains("xp3")
+                || err.contains("XP3")
+                || err.contains("magic")
+                || err.contains("parse"),
             "expected XP3 parse error, got: {err}"
         );
     }
@@ -1462,7 +1458,9 @@ This is narration.\r\n\
 
     #[test]
     fn test_looks_like_readable_ks_rejects_control_soup() {
-        assert!(looks_like_readable_ks("; comment\n*start\n[tag]\nHola\r\n\t"));
+        assert!(looks_like_readable_ks(
+            "; comment\n*start\n[tag]\nHola\r\n\t"
+        ));
         assert!(looks_like_readable_ks(""));
         let soup: String = (0..300)
             .map(|i| if i % 3 == 0 { '\u{3}' } else { 'j' })
@@ -1482,8 +1480,7 @@ This is narration.\r\n\
             .collect();
         let mut ks_cipher = vec![0xFF, 0xFE];
         ks_cipher.extend_from_slice(&utf16le_bytes_from_str(&cipher));
-        let data =
-            crate::kirikiri_xp3::write_xp3(&[("scenario/a.ks".into(), ks_cipher)]).unwrap();
+        let data = crate::kirikiri_xp3::write_xp3(&[("scenario/a.ks".into(), ks_cipher)]).unwrap();
         fs::write(dir.join("data.xp3"), &data).unwrap();
         let unenc = dir.join("unencrypted");
         fs::create_dir_all(&unenc).unwrap();
@@ -1535,9 +1532,8 @@ This is narration.\r\n\
             "drop unencrypted copy: {sources:?}"
         );
         assert!(
-            entries
-                .iter()
-                .all(|e| e.id.starts_with("patch2.xp3/") || e.file_path.to_string_lossy().contains("patch2")),
+            entries.iter().all(|e| e.id.starts_with("patch2.xp3/")
+                || e.file_path.to_string_lossy().contains("patch2")),
             "ids/paths should be patch2: {:?}",
             entries.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
@@ -1561,7 +1557,9 @@ This is narration.\r\n\
             entries.iter().map(|e| &e.source).collect::<Vec<_>>()
         );
         assert!(
-            entries.iter().any(|e| e.id.starts_with("data.xp3/scenario/first.ks#")),
+            entries
+                .iter()
+                .any(|e| e.id.starts_with("data.xp3/scenario/first.ks#")),
             "ids: {:?}",
             entries.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
@@ -1574,7 +1572,11 @@ This is narration.\r\n\
         let report = plugin.inject(&dir, &entries).unwrap();
         assert!(report.files_modified >= 1, "{report:?}");
         let patch = dir.join("patch.xp3");
-        assert!(patch.is_file(), "expected patch.xp3, written: {:?}", report.files_written);
+        assert!(
+            patch.is_file(),
+            "expected patch.xp3, written: {:?}",
+            report.files_written
+        );
 
         // Re-read patch and confirm translation payload
         let patch_arch = Xp3Archive::open(&patch).unwrap();
@@ -1596,8 +1598,7 @@ This is narration.\r\n\
         let dir = tempdir();
         // Mode-2 cipher header: existing decoder rejects (not plausible text / unsupported).
         let garbage = vec![0xFE, 0xFE, 0x02, 0xFF, 0xFE, 0x00, 0x00];
-        let arch =
-            crate::kirikiri_xp3::write_xp3(&[("foo.ks".into(), garbage)]).unwrap();
+        let arch = crate::kirikiri_xp3::write_xp3(&[("foo.ks".into(), garbage)]).unwrap();
         fs::write(dir.join("data.xp3"), arch).unwrap();
         let plugin = KirikiriPlugin::new();
         // Must not panic; skip with warn → empty Ok or soft error

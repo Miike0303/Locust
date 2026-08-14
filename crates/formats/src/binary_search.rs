@@ -308,11 +308,11 @@ mod tests {
         let mut multi = b"AA--BB--AA--ABC--ZZ".to_vec();
         let mut legacy = multi.clone();
         let ops = vec![
-            op("AA", "aa"),  // first AA
-            op("AA", "aa"),  // second AA
-            op("BB", "bb"),  // BB
+            op("AA", "aa"),   // first AA
+            op("AA", "aa"),   // second AA
+            op("BB", "bb"),   // BB
             op("ABC", "!!!"), // ABC
-            op("NO", "xx"),  // miss
+            op("NO", "xx"),   // miss
         ];
         let r_m = apply_fixed_slot_replacements(&mut multi, &ops);
         let r_l = apply_fixed_slot_replacements_legacy(&mut legacy, &ops);

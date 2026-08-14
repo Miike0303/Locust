@@ -159,9 +159,16 @@ pub struct ValidationIssue {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ValidationKind {
-    MissingPlaceholder { placeholder: String },
-    ExtraPlaceholder { placeholder: String },
-    ExceedsCharLimit { limit: usize, actual: usize },
+    MissingPlaceholder {
+        placeholder: String,
+    },
+    ExtraPlaceholder {
+        placeholder: String,
+    },
+    ExceedsCharLimit {
+        limit: usize,
+        actual: usize,
+    },
     /// Binary inject slot overflow (Unity UTF-8 / Unreal UTF-16LE / Wolf Shift-JIS).
     ExceedsBinarySlot {
         encoding: String,
@@ -283,8 +290,7 @@ mod tests {
 
     #[test]
     fn test_translation_exceeds_limit() {
-        let mut entry = StringEntry::new("id", "Hi", PathBuf::from("f.json"))
-            .with_char_limit(10);
+        let mut entry = StringEntry::new("id", "Hi", PathBuf::from("f.json")).with_char_limit(10);
         entry.translation = Some("hello world".to_string()); // 11 chars
         assert!(entry.translation_exceeds_limit());
     }

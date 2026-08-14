@@ -126,9 +126,10 @@ impl TranslationProvider for OllamaProvider {
             )));
         }
 
-        let ollama_resp: OllamaResponse = resp.json().await.map_err(|e| {
-            LocustError::ProviderError(format!("Ollama malformed response: {}", e))
-        })?;
+        let ollama_resp: OllamaResponse = resp
+            .json()
+            .await
+            .map_err(|e| LocustError::ProviderError(format!("Ollama malformed response: {}", e)))?;
 
         let translations =
             parse_json_array(&ollama_resp.message.content).map_err(LocustError::ProviderError)?;
@@ -193,9 +194,10 @@ impl TranslationProvider for OllamaProvider {
             )));
         }
 
-        let tags: OllamaTagsResponse = resp.json().await.map_err(|e| {
-            LocustError::ProviderError(format!("Ollama tags malformed: {}", e))
-        })?;
+        let tags: OllamaTagsResponse = resp
+            .json()
+            .await
+            .map_err(|e| LocustError::ProviderError(format!("Ollama tags malformed: {}", e)))?;
 
         let model_found = tags
             .models

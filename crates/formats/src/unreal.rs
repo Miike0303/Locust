@@ -7,8 +7,8 @@ use locust_core::models::{OutputMode, StringEntry};
 
 use crate::unreal_locres::{self, LocresFile};
 use crate::unreal_pak::{
-    self, payload_offset, read_footer, read_index, record_containing_offset, write_pak,
-    writable_version, PakWriteFile, DEFAULT_MOUNT_POINT,
+    self, payload_offset, read_footer, read_index, record_containing_offset, writable_version,
+    write_pak, PakWriteFile, DEFAULT_MOUNT_POINT,
 };
 
 /// Plugin for Unreal Engine games.
@@ -81,9 +81,7 @@ impl UnrealPlugin {
         let magic = unreal_pak::PAK_MAGIC.to_le_bytes();
         let window = data.len().min(1024 * 1024);
         let start = data.len() - window;
-        data[start..]
-            .windows(4)
-            .any(|w| w == magic)
+        data[start..].windows(4).any(|w| w == magic)
     }
 
     fn has_unreal_structure(path: &Path) -> bool {
@@ -95,12 +93,13 @@ impl UnrealPlugin {
         let game_name = path
             .read_dir()
             .ok()
-            .and_then(|mut d| d.find(|e| {
-                e.as_ref().ok().is_some_and(|e| {
-                    e.path().is_dir()
-                        && e.path().join("Content").is_dir()
+            .and_then(|mut d| {
+                d.find(|e| {
+                    e.as_ref()
+                        .ok()
+                        .is_some_and(|e| e.path().is_dir() && e.path().join("Content").is_dir())
                 })
-            }))
+            })
             .is_some();
         // Only count paks that pass Unreal magic / name filters — not NW.js chrome paks.
         let has_content_paks = !Self::find_pak_files(path).is_empty();
@@ -170,14 +169,10 @@ impl UnrealPlugin {
                         // namespace/key sets — the blob offset keeps ids unique so
                         // cultures don't silently overwrite each other in the DB.
                         e.id = format!("locres@{off}/{}", e.id);
-                        e.metadata.insert(
-                            "locres_embedded".to_string(),
-                            serde_json::Value::Bool(true),
-                        );
-                        e.metadata.insert(
-                            "locres_offset".to_string(),
-                            serde_json::json!(off),
-                        );
+                        e.metadata
+                            .insert("locres_embedded".to_string(), serde_json::Value::Bool(true));
+                        e.metadata
+                            .insert("locres_offset".to_string(), serde_json::json!(off));
                     }
                     entries.extend(loc_entries);
                 }
@@ -297,7 +292,12 @@ fn inject_embedded_locres_patch_pak(
             .metadata
             .get("locres_offset")
             .and_then(|v| v.as_u64())
-            .or_else(|| e.metadata.get("locres_offset").and_then(|v| v.as_i64()).map(|i| i as u64))
+            .or_else(|| {
+                e.metadata
+                    .get("locres_offset")
+                    .and_then(|v| v.as_i64())
+                    .map(|i| i as u64)
+            })
         else {
             warnings.push(format!("entry '{}' missing locres_offset", e.id));
             skipped += 1;
@@ -315,15 +315,15 @@ fn inject_embedded_locres_patch_pak(
             skipped += group.len();
             continue;
         }
-        let mut loc = match LocresFile::parse(&pak_bytes[off as usize..], &format!("{label}+@{off}"))
-        {
-            Ok(l) => l,
-            Err(e) => {
-                warnings.push(format!("parse locres @{off}: {e}"));
-                skipped += group.len();
-                continue;
-            }
-        };
+        let mut loc =
+            match LocresFile::parse(&pak_bytes[off as usize..], &format!("{label}+@{off}")) {
+                Ok(l) => l,
+                Err(e) => {
+                    warnings.push(format!("parse locres @{off}: {e}"));
+                    skipped += group.len();
+                    continue;
+                }
+            };
 
         let mut map = HashMap::new();
         let mut pending = 0usize;
@@ -337,10 +337,9 @@ fn inject_embedded_locres_patch_pak(
                 continue;
             }
             // Strip "locres@<off>/" prefix from id for key lookup.
-            let key_id = e
-                .id
-                .strip_prefix(&format!("locres@{off}/"))
-                .unwrap_or(e.id.as_str());
+            let key_id =
+                e.id.strip_prefix(&format!("locres@{off}/"))
+                    .unwrap_or(e.id.as_str());
             map.insert(key_id.to_string(), t.clone());
             pending += 1;
         }
@@ -369,9 +368,7 @@ fn inject_embedded_locres_patch_pak(
         let inner_name = if let Some(ref idx) = index {
             find_record_for_locres_offset(idx, off)
                 .map(|r| r.name.clone())
-                .unwrap_or_else(|| {
-                    format!("TestGame/Content/Localization/locres_{off}.locres")
-                })
+                .unwrap_or_else(|| format!("TestGame/Content/Localization/locres_{off}.locres"))
         } else {
             format!("TestGame/Content/Localization/locres_{off}.locres")
         };
@@ -386,12 +383,11 @@ fn inject_embedded_locres_patch_pak(
         return Ok((written, skipped, None));
     }
 
-    let patch_bytes = write_pak(&mount, write_ver, &pak_files, &label).map_err(|e| {
-        LocustError::ParseError {
+    let patch_bytes =
+        write_pak(&mount, write_ver, &pak_files, &label).map_err(|e| LocustError::ParseError {
             file: label.clone(),
             message: e.message,
-        }
-    })?;
+        })?;
 
     let out_path = unreal_pak::patch_pak_path(pak_path);
     if out_path.exists() {
@@ -488,7 +484,8 @@ fn find_utf16le_strings(bytes: &[u8]) -> Vec<(usize, String)> {
                     // Higher Unicode (CJK, etc.)
                     let codepoint = (hi as u16) << 8 | lo as u16;
                     if let Some(ch) = char::from_u32(codepoint as u32) {
-                        if ch.is_alphanumeric() || ch.is_whitespace() || ".,!?;:'\"()-".contains(ch) {
+                        if ch.is_alphanumeric() || ch.is_whitespace() || ".,!?;:'\"()-".contains(ch)
+                        {
                             chars.push(ch);
                             i += 2;
                             continue;
@@ -520,7 +517,10 @@ fn has_natural_language(text: &str) -> bool {
 
     // Count ASCII letters vs total chars — real text should be mostly ASCII or CJK
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    let ascii_printable = text.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).count();
+    let ascii_printable = text
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+        .count();
 
     // For ASCII-heavy text: require high ratio of ASCII printable chars
     let ascii_ratio = ascii_printable as f64 / char_count as f64;
@@ -540,7 +540,9 @@ fn has_natural_language(text: &str) -> bool {
     }
 
     // Filter out camelCase/PascalCase identifiers
-    let upper_lower_transitions = text.as_bytes().windows(2)
+    let upper_lower_transitions = text
+        .as_bytes()
+        .windows(2)
         .filter(|w| w[0].is_ascii_uppercase() && w[1].is_ascii_lowercase())
         .count();
     if !has_space && upper_lower_transitions >= 3 {
@@ -548,7 +550,8 @@ fn has_natural_language(text: &str) -> bool {
     }
 
     // All chars should be printable ASCII or common Unicode
-    text.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace() || c.is_alphabetic())
+    text.chars()
+        .all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace() || c.is_alphabetic())
 }
 
 impl Default for UnrealPlugin {
@@ -585,9 +588,9 @@ impl FormatPlugin for UnrealPlugin {
 
     fn detect(&self, path: &Path) -> bool {
         if path.is_file() {
-            return path.extension().is_some_and(|e| {
-                e == "pak" || e.eq_ignore_ascii_case("locres")
-            });
+            return path
+                .extension()
+                .is_some_and(|e| e == "pak" || e.eq_ignore_ascii_case("locres"));
         }
         Self::has_unreal_structure(path) || !Self::find_loose_locres(path).is_empty()
     }
@@ -641,9 +644,7 @@ impl FormatPlugin for UnrealPlugin {
             let mut from_pak = Self::extract_strings_from_pak(&bytes, &filename, pak);
             // Prefer loose locres for the same string values (better inject path).
             from_pak.retain(|e| {
-                if e.metadata.get("extraction_method").and_then(|v| v.as_str())
-                    == Some("locres")
-                {
+                if e.metadata.get("extraction_method").and_then(|v| v.as_str()) == Some("locres") {
                     return true;
                 }
                 !loose_locres_values.contains(&e.source)
@@ -750,11 +751,7 @@ impl FormatPlugin for UnrealPlugin {
                     })
                     .collect();
                 if !embedded.is_empty() {
-                    match inject_embedded_locres_patch_pak(
-                        file_path,
-                        &embedded,
-                        &mut warnings,
-                    ) {
+                    match inject_embedded_locres_patch_pak(file_path, &embedded, &mut warnings) {
                         Ok((written, skipped, patch_path)) => {
                             strings_written += written;
                             strings_skipped += skipped;
@@ -904,20 +901,20 @@ mod tests {
 
         // Create a fake PAK with embedded UTF-16LE strings
         let mut data: Vec<u8> = vec![0; 32]; // padding
-        // "Hello World" in UTF-16LE
+                                             // "Hello World" in UTF-16LE
         for ch in "Hello World".encode_utf16() {
             data.extend_from_slice(&ch.to_le_bytes());
         }
         data.extend_from_slice(&[0, 0]); // null terminator
         data.extend_from_slice(&[0xFF; 16]); // padding
-        // "Press Start" in UTF-16LE
+                                             // "Press Start" in UTF-16LE
         for ch in "Press Start".encode_utf16() {
             data.extend_from_slice(&ch.to_le_bytes());
         }
         data.extend_from_slice(&[0, 0]);
         data.extend_from_slice(&[0; 32]); // trailing
-        // Footer magic — `looks_like_unreal_pak` requires it to tell real paks
-        // apart from Chromium/NW.js packs.
+                                          // Footer magic — `looks_like_unreal_pak` requires it to tell real paks
+                                          // apart from Chromium/NW.js packs.
         data.extend_from_slice(&unreal_pak::PAK_MAGIC.to_le_bytes());
         data.extend_from_slice(&[0; 40]);
 
@@ -1000,9 +997,8 @@ mod tests {
 
         for entry in &mut entries {
             if entry.source == "Hello World" {
-                entry.translation = Some(
-                    "This is a much longer translation that exceeds the original".to_string(),
-                );
+                entry.translation =
+                    Some("This is a much longer translation that exceeds the original".to_string());
             }
         }
 
@@ -1073,16 +1069,16 @@ mod tests {
         assert_eq!(
             report.strings_written, 2,
             "both AlphaStr occurrences: written={} skipped={} {:?}",
-            report.strings_written,
-            report.strings_skipped,
-            report.warnings
+            report.strings_written, report.strings_skipped, report.warnings
         );
         assert_eq!(report.strings_skipped, 2, "identity + oversize");
 
         let out = fs::read(&pak).unwrap();
         let alfa = utf16("AlfaStr!");
         assert_eq!(
-            out.windows(alfa.len()).filter(|w| *w == alfa.as_slice()).count(),
+            out.windows(alfa.len())
+                .filter(|w| *w == alfa.as_slice())
+                .count(),
             2
         );
         let beta = utf16("BetaStr!");
@@ -1217,7 +1213,7 @@ mod tests {
         let loc = dir.join("broken.locres");
         let mut bad = crate::unreal_locres::LOCRES_MAGIC.to_vec();
         bad.push(1); // Compact
-        // truncated — no offset / tables
+                     // truncated — no offset / tables
         fs::write(&loc, &bad).unwrap();
         let plugin = UnrealPlugin::new();
         let err = plugin.extract(&loc).unwrap_err();
@@ -1233,8 +1229,8 @@ mod tests {
         use crate::unreal_locres::LocresVersion;
         let dir = tempdir();
         create_pak_fixture(&dir); // contains "Hello World"
-        // Locres with the same string — extract should prefer locres for that value
-        // when both exist; at least not double-count as two independent heuristics.
+                                  // Locres with the same string — extract should prefer locres for that value
+                                  // when both exist; at least not double-count as two independent heuristics.
         write_loose_locres(&dir, LocresVersion::Compact);
         // Force a locres string equal to a pak string
         let loc_dir = dir
@@ -1273,10 +1269,7 @@ mod tests {
             "expected de-duped Hello World, got {:?}",
             hello_hits
                 .iter()
-                .map(|e| (
-                    &e.id,
-                    e.metadata.get("extraction_method")
-                ))
+                .map(|e| (&e.id, e.metadata.get("extraction_method")))
                 .collect::<Vec<_>>()
         );
         assert_eq!(
@@ -1332,9 +1325,7 @@ mod tests {
         let mut entries = plugin.extract(&dir).unwrap();
         let loc_entries: Vec<_> = entries
             .iter()
-            .filter(|e| {
-                e.metadata.get("locres_embedded") == Some(&serde_json::Value::Bool(true))
-            })
+            .filter(|e| e.metadata.get("locres_embedded") == Some(&serde_json::Value::Bool(true)))
             .cloned()
             .collect();
         assert!(

@@ -113,14 +113,10 @@ pub fn read_footer(data: &[u8], file_label: &str) -> Result<PakFooter, PakError>
         }
         i -= 1;
     }
-    let magic_offset = magic_pos
-        .ok_or_else(|| err(file_label, "pak magic 0x5A6F12E1 not found near EOF"))?;
+    let magic_offset =
+        magic_pos.ok_or_else(|| err(file_label, "pak magic 0x5A6F12E1 not found near EOF"))?;
 
-    let version = u32::from_le_bytes(
-        data[magic_offset + 4..magic_offset + 8]
-            .try_into()
-            .unwrap(),
-    );
+    let version = u32::from_le_bytes(data[magic_offset + 4..magic_offset + 8].try_into().unwrap());
     if version == 0 || version > 11 {
         return Err(err(
             file_label,
@@ -242,8 +238,8 @@ impl<'a> R<'a> {
         if length > 0 {
             let n = length as usize;
             let bytes = self.take(n)?;
-            let s = std::str::from_utf8(bytes)
-                .map_err(|_| err(self.file, "invalid FString UTF-8"))?;
+            let s =
+                std::str::from_utf8(bytes).map_err(|_| err(self.file, "invalid FString UTF-8"))?;
             Ok(s.trim_end_matches('\0').to_string())
         } else {
             let units = (-length) as usize;
@@ -387,10 +383,7 @@ pub fn read_index(data: &[u8], file_label: &str) -> Result<PakIndex, PakError> {
 
 /// Find the index record whose data span contains absolute file offset `abs`.
 /// Data span is `[offset, offset + entry_header_size + size)`.
-pub fn record_containing_offset(
-    index: &PakIndex,
-    abs: u64,
-) -> Option<&PakRecord> {
+pub fn record_containing_offset(index: &PakIndex, abs: u64) -> Option<&PakRecord> {
     let hdr = entry_header_size(index.footer.version) as u64;
     index.records.iter().find(|r| {
         let start = r.offset;
@@ -401,7 +394,9 @@ pub fn record_containing_offset(
 
 /// Absolute offset of payload bytes (after the on-disk entry header).
 pub fn payload_offset(record: &PakRecord, version: u32) -> u64 {
-    record.offset.saturating_add(entry_header_size(version) as u64)
+    record
+        .offset
+        .saturating_add(entry_header_size(version) as u64)
 }
 
 // ─── Writer ────────────────────────────────────────────────────────────────
@@ -444,13 +439,7 @@ impl W {
     }
 }
 
-fn write_entry_body(
-    w: &mut W,
-    version: u32,
-    offset: u64,
-    size: u64,
-    sha1: &[u8; 20],
-) {
+fn write_entry_body(w: &mut W, version: u32, offset: u64, size: u64, sha1: &[u8; 20]) {
     w.u64(offset);
     w.u64(size);
     w.u64(size); // uncompressed == size
@@ -484,9 +473,7 @@ pub fn writable_version(base_version: u32) -> Result<u32, PakError> {
         9..=11 => Ok(WRITE_VERSION_MODERN),
         v => Err(err(
             "pak",
-            format!(
-                "unsupported pak version {v} for writing (supported base 1–11 → write 3/7/8)"
-            ),
+            format!("unsupported pak version {v} for writing (supported base 1–11 → write 3/7/8)"),
         )),
     }
 }
@@ -611,8 +598,8 @@ mod tests {
         assert_eq!(
             h,
             [
-                0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95,
-                0x60, 0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09
+                0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60,
+                0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09
             ]
         );
     }
@@ -624,8 +611,8 @@ mod tests {
         assert_eq!(
             h,
             [
-                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78,
-                0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
+                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
+                0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
             ]
         );
     }
@@ -652,7 +639,10 @@ mod tests {
         let index = read_index(&bytes, "t.pak").unwrap();
         assert_eq!(index.mount_point, DEFAULT_MOUNT_POINT);
         assert_eq!(index.records.len(), 2);
-        assert!(index.records.iter().any(|r| r.name.contains("es/Game.locres")));
+        assert!(index
+            .records
+            .iter()
+            .any(|r| r.name.contains("es/Game.locres")));
         // Payload round-trip
         for f in &files {
             let rec = index.records.iter().find(|r| r.name == f.name).unwrap();
@@ -682,10 +672,12 @@ mod tests {
         let inside = payload_offset(rec0, 3) + 1;
         let found = record_containing_offset(&index, inside).unwrap();
         assert_eq!(found.name, rec0.name);
-        assert!(record_containing_offset(&index, 0).is_none() || {
-            // offset 0 might be first header
-            true
-        });
+        assert!(
+            record_containing_offset(&index, 0).is_none() || {
+                // offset 0 might be first header
+                true
+            }
+        );
     }
 
     #[test]
@@ -721,13 +713,9 @@ mod tests {
     #[test]
     fn matching_base_footer() {
         let base = write_pak(DEFAULT_MOUNT_POINT, 8, &sample_files(), "base.pak").unwrap();
-        let (patch, ver) = write_patch_pak_matching(
-            &base,
-            "base.pak",
-            DEFAULT_MOUNT_POINT,
-            &sample_files()[..1],
-        )
-        .unwrap();
+        let (patch, ver) =
+            write_patch_pak_matching(&base, "base.pak", DEFAULT_MOUNT_POINT, &sample_files()[..1])
+                .unwrap();
         assert_eq!(ver, 8);
         let idx = read_index(&patch, "patch.pak").unwrap();
         assert_eq!(idx.records.len(), 1);

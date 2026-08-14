@@ -4,7 +4,6 @@
 #[cfg(not(debug_assertions))]
 use human_panic::setup_panic;
 
-
 mod commands;
 
 fn main() {

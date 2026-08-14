@@ -47,7 +47,12 @@ impl EncodingDetector {
 
         // Fallback: try common Japanese/CJK encodings
         let fallback_encodings = [
-            "Shift_JIS", "EUC-JP", "gb18030", "Big5", "windows-1252", "windows-1251",
+            "Shift_JIS",
+            "EUC-JP",
+            "gb18030",
+            "Big5",
+            "windows-1252",
+            "windows-1251",
         ];
         for enc_label in &fallback_encodings {
             if let Some(encoding) = encoding_rs::Encoding::for_label(enc_label.as_bytes()) {

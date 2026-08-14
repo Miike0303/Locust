@@ -222,9 +222,7 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
             store.remove_all()?;
 
             let msg = match baseline {
-                BackupBaseline::Pristine => {
-                    "restored to verified pristine".to_string()
-                }
+                BackupBaseline::Pristine => "restored to verified pristine".to_string(),
                 BackupBaseline::Unverified => {
                     "restored to pre-apply state, NOT verified pristine".to_string()
                 }

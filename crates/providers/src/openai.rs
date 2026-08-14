@@ -110,7 +110,10 @@ pub(crate) fn parse_json_array(text: &str) -> std::result::Result<Vec<String>, S
             return Ok(arr);
         }
     }
-    Err(format!("could not parse JSON array from response: {}", text))
+    Err(format!(
+        "could not parse JSON array from response: {}",
+        text
+    ))
 }
 
 #[derive(Serialize)]
@@ -208,9 +211,10 @@ impl TranslationProvider for OpenAiProvider {
             )));
         }
 
-        let chat_resp: ChatResponse = resp.json().await.map_err(|e| {
-            LocustError::ProviderError(format!("OpenAI malformed response: {}", e))
-        })?;
+        let chat_resp: ChatResponse = resp
+            .json()
+            .await
+            .map_err(|e| LocustError::ProviderError(format!("OpenAI malformed response: {}", e)))?;
 
         let content = chat_resp
             .choices
@@ -274,7 +278,9 @@ impl TranslationProvider for OpenAiProvider {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await
-            .map_err(|e| LocustError::ProviderError(format!("OpenAI health check failed: {}", e)))?;
+            .map_err(|e| {
+                LocustError::ProviderError(format!("OpenAI health check failed: {}", e))
+            })?;
 
         if !resp.status().is_success() {
             return Err(LocustError::ProviderError(format!(
@@ -293,11 +299,7 @@ mod tests {
     use httpmock::prelude::*;
 
     fn make_provider(server: &MockServer) -> OpenAiProvider {
-        OpenAiProvider::new(
-            "test-key".to_string(),
-            None,
-            Some(server.base_url()),
-        )
+        OpenAiProvider::new("test-key".to_string(), None, Some(server.base_url()))
     }
 
     fn make_request(ctx: Option<&str>, hint: Option<&str>) -> TranslationRequest {
@@ -474,7 +476,10 @@ mod tests {
         assert!(!provider.requires_api_key());
         assert_eq!(provider.estimate_cost(1000, "en").await, None);
 
-        let results = provider.translate(&[make_request(None, None)]).await.unwrap();
+        let results = provider
+            .translate(&[make_request(None, None)])
+            .await
+            .unwrap();
         assert_eq!(results[0].translation, "Hola");
         assert_eq!(results[0].provider, "lmstudio");
         assert_eq!(results[0].cost_usd, None);

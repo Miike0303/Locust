@@ -57,9 +57,7 @@ pub fn stream_and_hash(
         hasher.update(&buf[..n]);
         if let Some(ref mut w) = out {
             w.write_all(&buf[..n]).map_err(|e| {
-                LocustError::PatchError(format!(
-                    "write staged zip entry \"{entry_name}\": {e}"
-                ))
+                LocustError::PatchError(format!("write staged zip entry \"{entry_name}\": {e}"))
             })?;
         }
     }
@@ -118,11 +116,7 @@ pub fn stream_to_file(
 }
 
 /// Charge `declared` against the running total ceiling **before** streaming.
-pub fn charge_declared(
-    entry_name: &str,
-    declared: u64,
-    total_so_far: u64,
-) -> Result<u64> {
+pub fn charge_declared(entry_name: &str, declared: u64, total_so_far: u64) -> Result<u64> {
     check_entry_budget(entry_name, declared, total_so_far)
 }
 

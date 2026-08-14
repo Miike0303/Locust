@@ -234,9 +234,7 @@ impl PlaceholderProcessor {
                 if next == b'(' {
                     if let Some(close) = source[i + 2..].find(')') {
                         let after_paren = i + 2 + close + 1;
-                        if after_paren < len
-                            && b"sdifg".contains(&bytes[after_paren])
-                        {
+                        if after_paren < len && b"sdifg".contains(&bytes[after_paren]) {
                             let end = after_paren + 1;
                             matches.push(PatternMatch {
                                 start: i,
@@ -334,9 +332,7 @@ impl PlaceholderProcessor {
                     let inner = &source[i + 1..end - 1];
                     // Must be alpha/underscore identifier, not numbers (those are RPG Maker)
                     if !inner.is_empty()
-                        && inner
-                            .chars()
-                            .all(|c| c.is_ascii_alphabetic() || c == '_')
+                        && inner.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
                     {
                         matches.push(PatternMatch {
                             start: i,
@@ -389,10 +385,7 @@ fn is_rust_format_inner(inner: &str) -> bool {
 
 /// Identifier body for open tags / names: `{name}`, `{i}`, not `{P}`.
 fn is_rust_format_name(name: &str) -> bool {
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return false;
     }
     let n = name.chars().count();
@@ -400,9 +393,7 @@ fn is_rust_format_name(name: &str) -> bool {
         return true;
     }
     // n == 1: lowercase Ren'Py-style only
-    name.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase())
+    name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
 }
 
 #[cfg(test)]

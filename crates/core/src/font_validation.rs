@@ -9,10 +9,7 @@ use crate::error::Result;
 pub struct FontValidator;
 
 impl FontValidator {
-    pub fn check_coverage(
-        font_path: &Path,
-        translations: &[&str],
-    ) -> Result<FontCoverageReport> {
+    pub fn check_coverage(font_path: &Path, translations: &[&str]) -> Result<FontCoverageReport> {
         let font_data = std::fs::read(font_path)?;
         let face = ttf_parser::Face::parse(&font_data, 0).map_err(|e| {
             crate::error::LocustError::Other(anyhow::anyhow!("failed to parse font: {}", e))
@@ -130,7 +127,9 @@ pub fn suggest_replacement_font(missing_chars: &[char]) -> Vec<FontSuggestion> {
             '\u{0400}'..='\u{04FF}' => {
                 needed_scripts.insert("Cyrillic");
             }
-            '\u{4E00}'..='\u{9FFF}' | '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}'
+            '\u{4E00}'..='\u{9FFF}'
+            | '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
             | '\u{AC00}'..='\u{D7AF}' => {
                 needed_scripts.insert("CJK");
             }
@@ -348,7 +347,7 @@ fn build_head_table() -> Vec<u8> {
 fn build_hhea_table() -> Vec<u8> {
     let mut buf = vec![0u8; 36];
     buf[0..2].copy_from_slice(&1u16.to_be_bytes()); // majorVersion
-    // ascender at offset 4
+                                                    // ascender at offset 4
     buf[4..6].copy_from_slice(&800u16.to_be_bytes());
     // descender at offset 6
     buf[6..8].copy_from_slice(&(-200i16).to_be_bytes());
@@ -498,9 +497,7 @@ mod tests {
         let missing = vec!['漢', '字'];
         let suggestions = suggest_replacement_font(&missing);
         assert!(!suggestions.is_empty());
-        let has_cjk = suggestions
-            .iter()
-            .any(|s| s.font_name.contains("CJK"));
+        let has_cjk = suggestions.iter().any(|s| s.font_name.contains("CJK"));
         assert!(has_cjk);
     }
 }

@@ -96,7 +96,9 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
     let translated = entries
         .iter()
         .filter(|e| {
-            e.translation.as_deref().is_some_and(|t| !t.trim().is_empty())
+            e.translation
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty())
                 && matches!(
                     e.status,
                     StringStatus::Translated | StringStatus::Reviewed | StringStatus::Approved
@@ -365,9 +367,7 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
         )));
     }
 
-    let engine = opts
-        .engine
-        .unwrap_or_else(|| "unknown".into());
+    let engine = opts.engine.unwrap_or_else(|| "unknown".into());
     let language = lang
         .clone()
         .or(recording.lang.clone())
@@ -490,7 +490,10 @@ mod tests {
             let mut g = TempFileGuard::new(&kept);
             g.disarm();
         }
-        assert!(kept.exists(), "disarmed guard must leave the destination alone");
+        assert!(
+            kept.exists(),
+            "disarmed guard must leave the destination alone"
+        );
     }
 
     #[test]
@@ -601,7 +604,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp-"))
             .collect();
-        assert!(leftovers.is_empty(), "scratch files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "scratch files left behind: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -629,7 +635,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("no injection") || err.contains("recorded"), "{err}");
+        assert!(
+            err.contains("no injection") || err.contains("recorded"),
+            "{err}"
+        );
     }
 
     #[test]

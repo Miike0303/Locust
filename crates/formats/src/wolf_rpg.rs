@@ -47,7 +47,10 @@ impl WolfRpgPlugin {
                 continue;
             }
             // Skip strings that look like binary artifacts
-            if text.chars().all(|c| c.is_ascii_punctuation() || c.is_ascii_digit()) {
+            if text
+                .chars()
+                .all(|c| c.is_ascii_punctuation() || c.is_ascii_digit())
+            {
                 continue;
             }
 
@@ -196,9 +199,7 @@ impl FormatPlugin for WolfRpgPlugin {
                     .map(|entries| {
                         entries
                             .filter_map(|e| e.ok())
-                            .any(|e| {
-                                e.path().extension().is_some_and(|ext| ext == "wolf")
-                            })
+                            .any(|e| e.path().extension().is_some_and(|ext| ext == "wolf"))
                     })
                     .unwrap_or(false);
             }
@@ -523,11 +524,7 @@ mod tests {
             "expected テストデータ in {:?}",
             sources
         );
-        assert!(
-            sources.contains(&"勇者"),
-            "expected 勇者 in {:?}",
-            sources
-        );
+        assert!(sources.contains(&"勇者"), "expected 勇者 in {:?}", sources);
         assert!(
             sources.contains(&"魔法使い"),
             "expected 魔法使い in {:?}",
