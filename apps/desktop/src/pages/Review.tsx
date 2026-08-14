@@ -1,69 +1,180 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, SkipForward, X } from "lucide-react";
-import { getStrings, patchString } from "../lib/api";
+import { getStrings, patchString, type StringEntry } from "../lib/api";
 import DiffView from "../components/DiffView";
 import EmptyState from "../components/EmptyState";
 import { shouldHandleEscape, shouldRunActionHotkey } from "../lib/hotkeyPolicy";
 import { useProjectStore } from "../stores/projectStore";
 import { useT } from "../lib/i18n";
+import {
+  applyBootstrap,
+  applyFetchedPage,
+  approveCurrent,
+  createReviewQueue,
+  mergeEntriesById,
+  nextFetchPlan,
+  pageMatchesPlan,
+  prevCurrent,
+  REVIEW_PAGE_SIZE,
+  reviewProgress,
+  shouldLoadMore,
+  skipCurrent,
+  type ReviewQueueState,
+} from "../lib/reviewQueue";
 
 export default function Review() {
   const t = useT();
   const navigate = useNavigate();
   const qc = useQueryClient();
   const project = useProjectStore((s) => s.project);
-  const [index, setIndex] = useState(0);
+  const [queue, setQueue] = useState<ReviewQueueState>(createReviewQueue);
+  const [byId, setById] = useState<Record<string, StringEntry>>({});
   const [showDiff, setShowDiff] = useState(false);
   const [translation, setTranslation] = useState("");
-  const [approved, setApproved] = useState(0);
-  const [reviewComplete, setReviewComplete] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const fetchingRef = useRef(false);
+  const queueRef = useRef(queue);
+  const loadGenRef = useRef(0);
 
-  const { data, isLoading, isError, error, refetch } = useQuery({
-    queryKey: ["review-strings"],
-    queryFn: async () => {
-      const [translated, reviewed] = await Promise.all([
-        getStrings({ status: "translated", limit: 50000 }),
-        getStrings({ status: "reviewed", limit: 50000 }),
-      ]);
-      return { entries: [...translated.entries, ...reviewed.entries] };
-    },
-    enabled: !!project,
-  });
+  const projectPath = project?.path ?? null;
 
-  const entries = data?.entries || [];
-  const entry = entries[index];
-  const total = entries.length;
+  useEffect(() => {
+    loadGenRef.current += 1;
+    queueRef.current = createReviewQueue();
+    setQueue(queueRef.current);
+    setById({});
+    setShowDiff(false);
+    setTranslation("");
+    setLoadError(null);
+    setInitialLoading(true);
+    fetchingRef.current = false;
+  }, [projectPath]);
+
+  const loadMore = useCallback(async () => {
+    if (!projectPath || fetchingRef.current) return;
+    const state = queueRef.current;
+    if (!shouldLoadMore(state)) return;
+    const plan = nextFetchPlan(state);
+    if (plan.type === "none") return;
+
+    const gen = loadGenRef.current;
+    fetchingRef.current = true;
+    let failed = false;
+    try {
+      if (plan.type === "bootstrap") {
+        const [translated, reviewed] = await Promise.all([
+          getStrings({ status: "translated", limit: REVIEW_PAGE_SIZE, offset: 0 }),
+          getStrings({ status: "reviewed", limit: REVIEW_PAGE_SIZE, offset: 0 }),
+        ]);
+        if (gen !== loadGenRef.current) return;
+        const next = applyBootstrap(
+          queueRef.current,
+          { entries: translated.entries, total: translated.total },
+          { entries: reviewed.entries, total: reviewed.total },
+        );
+        queueRef.current = next;
+        setQueue(next);
+        const incoming = next.translatedExhausted
+          ? [...translated.entries, ...reviewed.entries]
+          : translated.entries;
+        setById((prev) => mergeEntriesById(prev, incoming));
+        setLoadError(null);
+        setInitialLoading(false);
+      } else {
+        const res = await getStrings({
+          status: plan.type,
+          limit: plan.limit,
+          offset: plan.offset,
+        });
+        if (gen !== loadGenRef.current) return;
+        const latest = queueRef.current;
+        if (pageMatchesPlan(latest, plan.type, plan.offset)) {
+          const next = applyFetchedPage(
+            latest,
+            plan.type,
+            { entries: res.entries, total: res.total },
+            plan.offset,
+          );
+          queueRef.current = next;
+          setQueue(next);
+          setById((prev) => mergeEntriesById(prev, res.entries));
+        }
+      }
+    } catch (err: unknown) {
+      if (gen !== loadGenRef.current) return;
+      failed = true;
+      const message = err instanceof Error ? err.message : String(err);
+      setLoadError(message);
+      setInitialLoading(false);
+    } finally {
+      if (gen === loadGenRef.current) fetchingRef.current = false;
+    }
+    if (
+      gen === loadGenRef.current &&
+      !failed &&
+      shouldLoadMore(queueRef.current) &&
+      nextFetchPlan(queueRef.current).type !== "none"
+    ) {
+      void loadMore();
+    }
+  }, [projectPath]);
+
+  useEffect(() => {
+    void loadMore();
+  }, [
+    loadMore,
+    queue.bootstrapped,
+    queue.index,
+    queue.items.length,
+    queue.pendingAdvance,
+    queue.translatedExhausted,
+    queue.reviewedExhausted,
+    queue.complete,
+  ]);
+
+  const entryId = queue.items[queue.index]?.id;
+  const entry = entryId ? byId[entryId] : undefined;
+  const progress = reviewProgress(queue);
 
   useEffect(() => {
     if (entry) setTranslation(entry.translation || "");
   }, [entry?.id]);
 
-  const advance = useCallback(() => {
-    if (index < total - 1) setIndex((i) => i + 1);
-  }, [index, total]);
-
   const handleApprove = useCallback(async () => {
-    if (!entry || reviewComplete) return;
-    if (translation !== (entry.translation || "")) {
-      await patchString(entry.id, { translation } as any);
+    const state = queueRef.current;
+    const id = state.items[state.index]?.id;
+    const current = id ? byId[id] : undefined;
+    if (!current || state.complete) return;
+    if (!state.approvedIds.includes(current.id)) {
+      if (translation !== (current.translation || "")) {
+        await patchString(current.id, { translation } as any);
+      }
+      await patchString(current.id, { status: "approved" } as any);
+      setById((prev) => ({
+        ...prev,
+        [current.id]: { ...current, translation, status: "approved" },
+      }));
     }
-    await patchString(entry.id, { status: "approved" } as any);
-    setApproved((a) => a + 1);
-    if (index >= total - 1) setReviewComplete(true);
-    else advance();
-
-    // Keep active review data stable while paging, but make both views refresh
-    // from the backend on the next navigation.
-    void qc.invalidateQueries({ queryKey: ["review-strings"], refetchType: "none" });
+    const next = approveCurrent(queueRef.current);
+    queueRef.current = next;
+    setQueue(next);
     void qc.invalidateQueries({ queryKey: ["stats"], refetchType: "none" });
-  }, [entry, reviewComplete, translation, index, total, advance, qc]);
+  }, [byId, translation, qc]);
 
-  const handleSkip = useCallback(() => advance(), [advance]);
+  const handleSkip = useCallback(() => {
+    const next = skipCurrent(queueRef.current);
+    queueRef.current = next;
+    setQueue(next);
+  }, []);
+
   const handlePrev = useCallback(() => {
-    if (index > 0) setIndex((i) => i - 1);
-  }, [index]);
+    const next = prevCurrent(queueRef.current);
+    queueRef.current = next;
+    setQueue(next);
+  }, []);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -77,7 +188,7 @@ export default function Review() {
         overlayOpen: !!document.querySelector("[data-hotkey-overlay]"),
         target: e.target as HTMLElement | null,
       })) return;
-      if (e.key === "a" || (e.ctrlKey && e.key === "Enter")) { e.preventDefault(); handleApprove(); }
+      if (e.key === "a" || (e.ctrlKey && e.key === "Enter")) { e.preventDefault(); void handleApprove(); }
       if (e.key === "s") handleSkip();
       if (e.key === "p") handlePrev();
       if (e.key === "e") document.querySelector<HTMLTextAreaElement>("#review-textarea")?.focus();
@@ -97,7 +208,7 @@ export default function Review() {
     );
   }
 
-  if (isLoading) {
+  if (initialLoading) {
     return (
       <div className="flex h-full items-center justify-center text-gray-500">
         {t("review.loading")}
@@ -105,15 +216,23 @@ export default function Review() {
     );
   }
 
-  if (isError) {
+  if (loadError && !queue.bootstrapped) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
         <h1 className="text-xl font-semibold text-red-600">{t("review.loadError")}</h1>
         <p className="text-sm text-gray-500">
-          {error instanceof Error ? error.message : t("common.tryAgain")}
+          {loadError || t("common.tryAgain")}
         </p>
         <button
-          onClick={() => { void refetch(); }}
+          onClick={() => {
+            setLoadError(null);
+            setInitialLoading(true);
+            fetchingRef.current = false;
+            const fresh = createReviewQueue();
+            queueRef.current = fresh;
+            setQueue(fresh);
+            void loadMore();
+          }}
           className="rounded bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700"
         >
           {t("common.retry")}
@@ -122,14 +241,17 @@ export default function Review() {
     );
   }
 
-  if (total === 0 || reviewComplete) {
+  const showComplete = queue.complete && progress.total > 0;
+  const showNothing = queue.bootstrapped && progress.total === 0;
+
+  if (showComplete || showNothing) {
     return (
       <div className="flex h-full flex-col items-center justify-center px-6 text-center">
         <h1 className="text-xl font-semibold">
-          {reviewComplete ? t("review.complete") : t("review.nothing")}
+          {showComplete ? t("review.complete") : t("review.nothing")}
         </h1>
         <p className="mt-2 mb-4 text-gray-500">
-          {reviewComplete
+          {showComplete
             ? t("review.completeHint")
             : t("review.nothingHint")}
         </p>
@@ -143,7 +265,7 @@ export default function Review() {
     );
   }
 
-  const progress = total > 0 ? ((index + 1) / total) * 100 : 0;
+  const bar = progress.total > 0 ? (progress.current / progress.total) * 100 : 0;
 
   return (
     <div className="flex flex-col h-full">
@@ -151,14 +273,18 @@ export default function Review() {
       <div className="p-4 border-b border-gray-200 dark:border-gray-700 space-y-2">
         <div className="flex justify-between items-center">
           <span className="text-sm font-medium">
-            {t("review.progress", { current: index + 1, total, approved })}
+            {t("review.progress", {
+              current: progress.current,
+              total: progress.total,
+              approved: progress.approved,
+            })}
           </span>
           <button onClick={() => navigate("/editor")} className="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1">
             <X size={14} /> {t("common.exit")}
           </button>
         </div>
         <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-          <div className="bg-emerald-500 h-2 rounded-full transition-all" style={{ width: `${progress}%` }} />
+          <div className="bg-emerald-500 h-2 rounded-full transition-all" style={{ width: `${bar}%` }} />
         </div>
       </div>
 
@@ -168,8 +294,8 @@ export default function Review() {
           <div className="text-xs text-gray-500 flex gap-3">
             <span>{entry.file_path.split(/[/\\]/).pop()}</span>
             {entry.context && <span>{t("review.context", { context: entry.context })}</span>}
-            {entry.tags.map((t) => (
-              <span key={t} className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded">{t}</span>
+            {entry.tags.map((tag) => (
+              <span key={tag} className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded">{tag}</span>
             ))}
           </div>
 
@@ -209,7 +335,7 @@ export default function Review() {
 
       {/* Bottom bar */}
       <div className="p-4 border-t border-gray-200 dark:border-gray-700 flex justify-center gap-3">
-        <button onClick={handlePrev} disabled={index === 0}
+        <button onClick={handlePrev} disabled={queue.index === 0}
           className="flex items-center gap-1.5 px-4 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium disabled:opacity-50">
           <ArrowLeft size={16} /> {t("review.previous")} <kbd className="text-xs text-gray-400 ml-1">P</kbd>
         </button>
@@ -217,7 +343,7 @@ export default function Review() {
           className="flex items-center gap-1.5 px-4 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium">
           <SkipForward size={16} /> {t("review.skip")} <kbd className="text-xs text-gray-400 ml-1">S</kbd>
         </button>
-        <button onClick={handleApprove}
+        <button onClick={() => { void handleApprove(); }}
           className="flex items-center gap-1.5 px-6 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium">
           <Check size={16} /> {t("review.approve")} <kbd className="text-xs text-white/70 ml-1">A</kbd>
         </button>

@@ -165,7 +165,7 @@ export default function InjectModal({
 				done.push({ lang: code, label, report });
 				addLog(
 					"info",
-					`register-lang ${code} (${label})`,
+					`Registered ${code} (${label}) in game UI`,
 					`plugins_js=${report.plugins_js} iavra=${report.iavra_languages} visumz=${report.visumz_options} maps=${report.maps_patched?.length ?? 0}` +
 						(report.notes?.length ? `\n${report.notes.join("\n")}` : ""),
 					"inject",
@@ -194,7 +194,7 @@ export default function InjectModal({
 			return anyChange;
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addLog("error", "register-lang failed", msg, "inject");
+			addLog("error", "Could not register language in game UI", msg, "inject");
 			addToast("error", t("inject.toast.registerFailed", { error: msg }));
 			return false;
 		} finally {
@@ -526,9 +526,12 @@ export default function InjectModal({
 									<div className="text-xs text-violet-700 dark:text-violet-300 space-y-0.5">
 										{regReports.map(({ lang, label, report }) => (
 											<p key={lang}>
-												{lang} ({label}): plugins=
-												{report.plugins_js ? t("common.yes") : t("common.no")}, maps=
-												{report.maps_patched?.length ?? 0}
+												{t("inject.regReport", {
+													lang,
+													label,
+													plugins: report.plugins_js ? t("common.yes") : t("common.no"),
+													maps: report.maps_patched?.length ?? 0,
+												})}
 											</p>
 										))}
 									</div>
@@ -669,10 +672,13 @@ export default function InjectModal({
 									<div className="text-xs text-violet-700 dark:text-violet-300 space-y-1">
 										{regReports.map(({ lang, label, report }) => (
 											<p key={lang}>
-												{lang} ({label}): plugins=
-												{report.plugins_js ? t("common.yes") : t("common.no")}, maps=
-												{report.maps_patched?.length ?? 0}, backups=
-												{report.backups?.length ?? 0}
+												{t("inject.regReportFull", {
+													lang,
+													label,
+													plugins: report.plugins_js ? t("common.yes") : t("common.no"),
+													maps: report.maps_patched?.length ?? 0,
+													backups: report.backups?.length ?? 0,
+												})}
 												{report.notes?.length
 													? ` — ${report.notes.slice(0, 2).join("; ")}`
 													: ""}

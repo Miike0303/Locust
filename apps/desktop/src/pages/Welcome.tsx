@@ -614,7 +614,7 @@ export default function Welcome() {
 											</span>
 											{experimental && (
 												<span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
-													{t("welcome.format.exp")}
+													{t("welcome.format.experimental")}
 												</span>
 											)}
 										</div>

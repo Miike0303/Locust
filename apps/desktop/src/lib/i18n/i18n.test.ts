@@ -14,7 +14,7 @@ assert.ok(enKeys.length > 0, "catalog is not empty");
 setLocale("en");
 assert.equal(
   t("api.unreachable", { base: "http://localhost:7842/api" }),
-  "Cannot reach Locust backend at http://localhost:7842/api — is locust server running?",
+  "Cannot reach Locust at http://localhost:7842/api. Make sure the app is running.",
 );
 
 assert.equal(

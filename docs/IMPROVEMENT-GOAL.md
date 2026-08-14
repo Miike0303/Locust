@@ -19,16 +19,15 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 ## Backlog
 
-- Queue runs `openProject` + `startTranslation` only (`apps/desktop/src/stores/queueStore.ts`). A batch user learns nothing is wrong until they inject, one game at a time.
-- `Review.tsx:23-29` fetches up to 50k translated + 50k reviewed rows and concatenates them, for a screen that shows one entry at a time. Real projects here reach 33,767 strings.
-- Copy that names internals at the user: `inject.toast.registerFailed` says `register-lang failed` (a CLI subcommand); the Welcome format badge uses two words for one idea.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 
 ## In flight
 
-Round dispatched: Review pagination, queue validation step, internal-leaking copy. Frontend lane.
+Nothing.
 
 ## Done
+
+- `pending` — Review pages instead of loading the project: it fetched up to 50k translated + 50k reviewed rows and concatenated them for a screen that shows one entry at a time. The queue now validates each item after translating, so a batch user finds breakage before injecting rather than one game at a time. Copy stopped naming internals at the user (`register-lang failed`, `locust server`, `plugins=` field dumps).
 
 - `602cd92` — project-wide filter facets, pivot workflow in the app, `open-db` without extraction, Astro stub pointed at `locust apply`, dead chrome removed. Filters had been built from one page of ≤100 rows.
 - `b6a8dc2` — patch apply streams progress over a job websocket, apply-only entry without a project, in-app grok-sub login, translation jobs survive closing their modal.

@@ -1,15 +1,19 @@
 import { create } from "zustand";
-import { openProject, startTranslation, cancelTranslation, type TranslationStartParams } from "../lib/api";
+import { openProject, startTranslation, cancelTranslation, validate, type TranslationStartParams } from "../lib/api";
 import { waitForJob } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
 import { addLog } from "./logStore";
 import { addToast } from "./toastStore";
 import { t } from "../lib/i18n";
 import { JOB_STREAM_LOST_MESSAGE } from "../lib/ws";
+import {
+  queueItemPatchAfterValidation,
+  validationIssueCount,
+} from "../lib/queueValidation";
 
 let activeJobId: string | null = null;
 
-export type QueueItemStatus = "pending" | "extracting" | "translating" | "done" | "error" | "cancelled";
+export type QueueItemStatus = "pending" | "extracting" | "translating" | "validating" | "done" | "error" | "cancelled";
 
 export interface QueueItem {
   id: string;
@@ -19,6 +23,10 @@ export interface QueueItem {
   status: QueueItemStatus;
   progress: { completed: number; total: number; costSoFar: number; startedAt: number | null };
   error: string | null;
+  /** Set after a successful validation run. Null if validation did not run. */
+  validationIssues: number | null;
+  /** Validation RPC failed; translation still succeeded. */
+  validationError: string | null;
 }
 
 export interface GlobalProgress {
@@ -68,6 +76,8 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       status: "pending",
       progress: { completed: 0, total: 0, costSoFar: 0, startedAt: null },
       error: null,
+      validationIssues: null,
+      validationError: null,
     };
     set((s) => ({ items: [...s.items, item] }));
   },
@@ -186,9 +196,44 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           activeJobId = null;
         }
 
-        updateItem({ status: "done" });
-        addLog("info", `Completed: ${result.project_name} (${result.total_strings} strings)`, undefined, "queue");
-        addToast("success", t("queue.toast.itemDone", { name: result.project_name }));
+        if (get().cancelRequested) {
+          updateItem({ status: "done" });
+          addLog("info", `Completed: ${result.project_name} (${result.total_strings} strings)`, undefined, "queue");
+          addToast("success", t("queue.toast.itemDone", { name: result.project_name }));
+          break;
+        }
+
+        updateItem({ status: "validating" });
+        try {
+          const report = await validate();
+          const issuesFound = validationIssueCount(report);
+          updateItem(queueItemPatchAfterValidation({ ok: true, issuesFound }));
+          if (issuesFound > 0) {
+            addLog(
+              "warning",
+              `Completed: ${result.project_name} (${result.total_strings} strings, ${issuesFound} validation issues)`,
+              undefined,
+              "queue",
+            );
+            addToast(
+              "warning",
+              t("queue.toast.itemIssues", { name: result.project_name, count: issuesFound }),
+            );
+          } else {
+            addLog("info", `Completed: ${result.project_name} (${result.total_strings} strings)`, undefined, "queue");
+            addToast("success", t("queue.toast.itemDone", { name: result.project_name }));
+          }
+        } catch (valErr: unknown) {
+          const raw = valErr instanceof Error ? valErr.message : String(valErr);
+          updateItem(queueItemPatchAfterValidation({ ok: false, error: raw }));
+          addLog(
+            "warning",
+            `Translated ${result.project_name}, but validation could not run`,
+            raw,
+            "queue",
+          );
+          addToast("warning", t("queue.toast.validationFailed", { name: result.project_name }));
+        }
       } catch (err: any) {
         if (get().cancelRequested) {
           updateItem({ status: "cancelled", error: null });

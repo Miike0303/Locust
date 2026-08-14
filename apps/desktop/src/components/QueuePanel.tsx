@@ -47,6 +47,7 @@ const statusIcons: Record<string, typeof Clock> = {
 	pending: Clock,
 	extracting: Loader2,
 	translating: Loader2,
+	validating: Loader2,
 	done: CheckCircle,
 	error: AlertCircle,
 	cancelled: Square,
@@ -56,6 +57,7 @@ const statusRowStyles: Record<string, string> = {
 	pending: "border-l-transparent",
 	extracting: "bg-blue-50/70 dark:bg-blue-950/30 border-l-blue-500",
 	translating: "bg-emerald-50/70 dark:bg-emerald-950/30 border-l-emerald-500",
+	validating: "bg-amber-50/70 dark:bg-amber-950/30 border-l-amber-500",
 	done: "bg-gray-50 dark:bg-gray-800/50 border-l-emerald-500/60",
 	error: "bg-red-50 dark:bg-red-950/30 border-l-red-500",
 	cancelled: "opacity-60 border-l-gray-400",
@@ -65,6 +67,7 @@ const STATUS_LABEL_KEYS: Record<string, string> = {
 	pending: "queue.status.pending",
 	extracting: "queue.status.extracting",
 	translating: "queue.status.translating",
+	validating: "queue.status.validating",
 	done: "queue.status.done",
 	error: "queue.status.error",
 	cancelled: "queue.status.cancelled",
@@ -74,6 +77,7 @@ const statusIconColors: Record<string, string> = {
 	pending: "text-gray-400 dark:text-gray-500",
 	extracting: "text-blue-500 dark:text-blue-400 animate-spin",
 	translating: "text-emerald-500 dark:text-emerald-400 animate-spin",
+	validating: "text-amber-500 dark:text-amber-400 animate-spin",
 	done: "text-emerald-600 dark:text-emerald-400",
 	error: "text-red-500 dark:text-red-400",
 	cancelled: "text-gray-500 dark:text-gray-500",
@@ -253,7 +257,7 @@ export default function QueuePanel() {
 	const pendingCount = items.filter((i) => i.status === "pending").length;
 	const doneCount = items.filter((i) => i.status === "done").length;
 	const activeCount = items.filter((i) =>
-		["extracting", "translating"].includes(i.status),
+		["extracting", "translating", "validating"].includes(i.status),
 	).length;
 	const totalCount = items.length;
 	const providerReadiness = resolveProviderReadiness(
@@ -489,7 +493,9 @@ function QueueItemRow({
 			? Math.round((item.progress.completed / item.progress.total) * 100)
 			: 0;
 	const isActive =
-		item.status === "extracting" || item.status === "translating";
+		item.status === "extracting" ||
+		item.status === "translating" ||
+		item.status === "validating";
 	const showProgress = isActive || item.status === "done";
 	const canDismiss = ["done", "error", "cancelled"].includes(item.status);
 
@@ -520,7 +526,11 @@ function QueueItemRow({
 					{item.projectPath}
 				</div>
 				<div className="mt-1 h-4 flex items-center gap-2">
-					{showProgress && item.progress.total > 0 ? (
+					{item.status === "validating" ? (
+						<span className="text-[11px] text-amber-600 dark:text-amber-400">
+							{t("queue.validatingTranslations")}
+						</span>
+					) : showProgress && item.progress.total > 0 ? (
 						<>
 							<div className="flex-1 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
 								<div
@@ -546,6 +556,29 @@ function QueueItemRow({
 						</span>
 					) : null}
 				</div>
+				{item.status === "done" && item.validationError && (
+					<div
+						className="text-xs text-amber-700 dark:text-amber-400 mt-0.5 truncate"
+						title={item.validationError}
+					>
+						{t("queue.validation.failed")}
+					</div>
+				)}
+				{item.status === "done" &&
+					item.validationError == null &&
+					item.validationIssues != null && (
+						<div
+							className={
+								item.validationIssues > 0
+									? "text-xs text-amber-700 dark:text-amber-400 mt-0.5"
+									: "text-xs text-gray-500 dark:text-gray-400 mt-0.5"
+							}
+						>
+							{item.validationIssues > 0
+								? t("queue.validation.issues", { count: item.validationIssues })
+								: t("queue.validation.clean")}
+						</div>
+					)}
 				{item.error && (
 					<div
 						className="text-xs text-red-600 dark:text-red-400 mt-0.5 truncate"
