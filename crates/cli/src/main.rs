@@ -381,20 +381,6 @@ fn writes_to_entry_tree(format_id: &str) -> bool {
     matches!(format_id, "unity" | "unreal" | "wolf-rpg")
 }
 
-/// Engines whose `inject` mutates the ORIGINAL game tree: the entry-tree
-/// writers, plus Ren'Py, whose loose scripts are rewritten in place (writes
-/// go to `entry.file_path`) even in Replace mode. Once such an inject has
-/// run, the original source text its injector scans for is gone: a bare
-/// re-run writes nothing (or, for a mixed Ren'Py game, only the
-/// archive-derived files) and the recording silently omits the rest — so
-/// EVERY remedy issued from a mutated (or possibly mutated) state must
-/// carry the restore step. `replace_containment_remedy` and
-/// `maybe_mutated_note` are the two renderers of that step; any new error
-/// branch that advises a re-run must go through one of them.
-fn mutates_original_tree(format_id: &str) -> bool {
-    locust_core::extraction::mutates_original_tree(format_id)
-}
-
 /// Central backup root for inject / direct-inject. `LOCUST_BACKUP_ROOT` isolates
 /// tests and lets operators put backups on a larger volume; default matches the
 /// historical `temp_dir()/locust_bak` path named in recovery messages.
@@ -412,25 +398,15 @@ const RESTORE_ORIGINAL_FIRST: &str =
     "Your original game was modified — restore it from the backup listed above \
      (or from a clean copy) first.";
 
-/// Appended to `patch`-side advice that names a `--direct` re-run, for
-/// engines that mutate the original tree. `patch` cannot know whether a
-/// prior inject already ran (a legacy database records nothing), so this
-/// note is conditional where the containment remedies are imperative —
-/// without it, a legacy database on an already-injected game loops on the
-/// identical error forever.
-fn maybe_mutated_note(game_path: &std::path::Path) -> &'static str {
-    let mutates = locust_formats::default_registry()
-        .detect(game_path)
-        .is_some_and(|p| mutates_original_tree(p.id()));
-    if mutates {
-        "\nThis engine writes translations into the ORIGINAL game files: if this \
-         game was already injected (for example through an older Locust that kept \
-         no recording), that command will report 0 files written and record \
-         nothing — restore the original game files from a backup or a clean copy \
-         first, then re-run it."
-    } else {
-        ""
-    }
+/// Appended to `patch`-side advice that names a `--direct` re-run. Every
+/// registered format writes in place, so a legacy database on an
+/// already-injected game loops on the identical error without this note.
+fn maybe_mutated_note() -> &'static str {
+    "\nThis engine writes translations into the ORIGINAL game files: if this \
+     game was already injected (for example through an older Locust that kept \
+     no recording), that command will report 0 files written and record \
+     nothing — restore the original game files from a backup or a clean copy \
+     first, then re-run it."
 }
 
 /// Remedy for a Replace-mode containment failure, per engine — advice that
@@ -509,7 +485,6 @@ fn print_record_outcome(
     label: &str,
     outcome: &locust_core::extraction::RecordOutcome,
     rep: &locust_core::extraction::InjectionReport,
-    format_id: &str,
 ) {
     use locust_core::extraction::RecordOutcome;
     match outcome {
@@ -530,14 +505,10 @@ fn print_record_outcome(
             } else {
                 String::new()
             };
-            let restore = if mutates_original_tree(format_id) {
-                " If this game was ALREADY injected, the original text this engine \
+            let restore = " If this game was ALREADY injected, the original text this engine \
                  scans for is gone and every re-run will keep writing 0 files — \
                  restore the original game files from a backup or a clean copy, \
-                 then re-run the inject."
-            } else {
-                ""
-            };
+                 then re-run the inject.";
             println!(
                 "{label}: 0 files written — nothing was recorded, and `locust patch` \
                  refuses to pack until an inject writes at least one file.{cause}{restore}"
@@ -586,7 +557,7 @@ fn cmd_patch(
         // Preserve CLI remedies that mention inject paths when useful.
         let mut msg = e.to_string();
         if msg.contains("no injection has been recorded") {
-            msg = format!("{msg}{}", maybe_mutated_note(&game_path));
+            msg = format!("{msg}{}", maybe_mutated_note());
         }
         anyhow::anyhow!(msg)
     })?;
@@ -1283,7 +1254,7 @@ async fn cmd_inject(
         })?;
     for (lang, outcome) in &outcomes {
         if let Some(rep) = report.reports.get(lang) {
-            print_record_outcome(lang, outcome, rep, &format_id);
+            print_record_outcome(lang, outcome, rep);
         }
     }
 
@@ -1358,14 +1329,12 @@ async fn cmd_inject_direct(
     );
     warn_binary_slot_oversize(&entries);
 
-    // Shared core path (HTTP + desktop): backup when the engine mutates
-    // originals, inject in place, record for `locust patch`.
+    // Shared core path (HTTP + desktop): backup, inject in place, record
+    // for `locust patch`. Direct inject always writes the original tree.
     let backup_root = locust_backup_root();
     std::fs::create_dir_all(&backup_root).ok();
     let mgr = BackupManager::new(backup_root);
-    if locust_core::extraction::mutates_original_tree(&format_id) {
-        println!("Creating backup (engine mutates the original game tree)...");
-    }
+    println!("Creating backup before writing the original game tree...");
     let report = locust_core::extraction::inject_direct(
         &registry, &db, &mgr, &game_path, &format_id, &languages,
     )?;
@@ -1374,7 +1343,7 @@ async fn cmd_inject_direct(
     // silent keeps / silent nothing-recorded are the stale-recording hazard.
     for (lang, outcome) in &report.outcomes {
         if let Some(rep) = report.reports.get(lang) {
-            print_record_outcome(lang, outcome, rep, &format_id);
+            print_record_outcome(lang, outcome, rep);
         }
         if matches!(
             outcome,
@@ -2313,8 +2282,8 @@ mod tests {
         // advises a bare `--direct` re-run, but for engines that mutate the
         // originals that re-run writes 0 files and records nothing — the
         // identical error forever. The advice must carry the restore-first
-        // note. `patch` cannot know whether a prior inject ran, so the note
-        // is conditional where the containment remedies are imperative.
+        // note. `patch` cannot know whether a prior inject ran, so every
+        // engine that writes in place carries the restore-first note.
         let base = patch_test_tempdir();
         let (game_dir, _wolf_file, db_path) = make_wolf_game(&base);
 
@@ -2335,11 +2304,10 @@ mod tests {
              out for an engine that mutates originals: {msg}"
         );
 
-        // Triangulate: a path-derived engine's advice stays unconditional.
+        // Every registered format writes in place, so the restore note is
+        // no longer gated on the stale four-engine list.
         let base2 = patch_test_tempdir();
         let (game2, _script, db2, _) = make_renpy_game(&base2);
-        // Ren'Py mutates loose scripts, so it gets the note too; an HTML game
-        // (pure path-derived writes) must not.
         let err2 = cmd_patch(game2, db2, Some("es".to_string()), None, None, None).unwrap_err();
         assert!(err2.to_string().contains("restore the original"), "{err2}");
 
@@ -2365,8 +2333,8 @@ mod tests {
         let msg3 = err3.to_string();
         assert!(msg3.contains("no injection has been recorded"), "{msg3}");
         assert!(
-            !msg3.contains("restore the original"),
-            "a non-mutating engine's advice must stay unconditional: {msg3}"
+            msg3.contains("restore the original"),
+            "html-game writes in place too, so the restore note must fire: {msg3}"
         );
     }
 

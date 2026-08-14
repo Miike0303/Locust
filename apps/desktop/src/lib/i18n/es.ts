@@ -460,7 +460,7 @@ export const es: Record<keyof typeof en, string> = {
   "inject.hint.direct": "Escribe las traducciones en la carpeta del juego (se crea una copia de seguridad primero). Obligatorio antes de empaquetar un parche en Parche → Empaquetar.",
   "inject.hint.noAdd": "Este formato solo admite Reemplazar/Directo (sin paquetes de idioma Añadir).",
   "inject.direct.warnTitle": "El modo directo modifica los archivos originales del juego",
-  "inject.direct.li1": "Se crea una copia de seguridad automática cuando el motor escribe en el sitio.",
+  "inject.direct.li1": "Se hace una copia de seguridad de la carpeta del juego antes de escribir nada. Puede restaurarla desde Ajustes → Datos.",
   "inject.direct.li2": "Locust registra lo que escribe, etiquetado con el idioma o idiomas seleccionados.",
   "inject.direct.li3": "Tras el éxito puede empaquetar ese registro en un zip de parche compartible (Parche → Empaquetar).",
   "inject.languages": "Idiomas",

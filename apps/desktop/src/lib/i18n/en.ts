@@ -480,7 +480,7 @@ export const en = {
   "inject.hint.direct": "Writes translations into the game folder in place (a backup is created first). Required before packing a patch in Patch → Pack.",
   "inject.hint.noAdd": "This format only supports Replace/Direct (no Add language packs).",
   "inject.direct.warnTitle": "Direct mode mutates original game files",
-  "inject.direct.li1": "An automatic backup is created when the engine writes in place.",
+  "inject.direct.li1": "The game folder is backed up before anything is written. Restore it from Settings → Data.",
   "inject.direct.li2": "Locust records what it writes, labeled by the selected language(s).",
   "inject.direct.li3": "After success you can pack that recording into a shareable patch zip (Patch → Pack).",
   "inject.languages": "Languages",

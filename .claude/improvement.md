@@ -28,11 +28,17 @@ Owned by no lane; Claude applies these after the writers finish.
 
 - `Cargo.toml`, `Cargo.lock`
 - `apps/desktop/package.json`, `apps/desktop/package-lock.json`
-- `apps/desktop/src/i18n/en.ts`, `apps/desktop/src/i18n/es.ts`
+- `apps/desktop/src/lib/i18n/en.ts`, `apps/desktop/src/lib/i18n/es.ts`
 - `.github/workflows/*`
 
 ## Writer traps
 
+- **Grok stops at the TDD red phase.** It writes the failing tests, then ends the
+  turn without implementing. Observed on single-task briefs too, so "one task per
+  dispatch" does not prevent it. Expect a second `-Continue` dispatch per change,
+  and check for a red suite before assuming the work is finished.
+- A writer that exits `0` may still have produced nothing — a lost connection ends
+  the process cleanly. Check the output size, not the exit code.
 - `httpmock`'s matcher is `body_contains`, not `body_includes`.
 - New user-facing strings need keys in BOTH `en.ts` and `es.ts`.
 - Never propose or accept an unattended write to the user's own game files —

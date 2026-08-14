@@ -116,12 +116,6 @@ pub struct InjectionReport {
     pub files_written: Vec<PathBuf>,
 }
 
-/// Engines whose inject writes into the **original** game tree (entry-tree
-/// scanners + Ren'Py loose scripts). Direct inject must back these up first.
-pub fn mutates_original_tree(format_id: &str) -> bool {
-    matches!(format_id, "unity" | "unreal" | "wolf-rpg" | "renpy")
-}
-
 /// Result of [`inject_direct`] — shape compatible with MultiLangReport UI fields
 /// plus backup path for the desktop/CLI tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,7 +125,8 @@ pub struct DirectInjectReport {
     pub languages_processed: Vec<String>,
     pub languages_failed: Vec<(String, String)>,
     pub backup_id: String,
-    /// Absolute path of the pre-inject backup when one was created.
+    /// Absolute path of the pre-inject backup. Always set: direct inject
+    /// refuses to run without one.
     pub backup_path: Option<String>,
     pub files_modified: usize,
     pub strings_written: usize,
@@ -154,8 +149,8 @@ const DIRECT_RECORD_REMEDY: &str =
      -P project and language(s).";
 
 /// Inject translated strings **into the game tree in place**, create a backup
-/// when the engine mutates originals, and record the injection for
-/// `locust patch` packing. Shared by CLI `--direct`, HTTP, and the desktop app.
+/// first, and record the injection for `locust patch` packing. Shared by CLI
+/// `--direct`, HTTP, and the desktop app.
 pub fn inject_direct(
     registry: &FormatRegistry,
     db: &Database,
@@ -176,27 +171,19 @@ pub fn inject_direct(
 
     let _ = backup_manager.delete_old_backups(3);
 
-    let (backup_id, backup_path) = if mutates_original_tree(format_id) {
-        let entry = backup_manager.create_backup(game_path).map_err(|e| {
-            LocustError::BackupError(format!(
-                "{e} — direct inject is refused without a backup: this engine \
-                 ({format_id}) writes into the ORIGINAL tree, and every recovery \
-                 path starts at this backup. Free disk space or fix the backup \
-                 directory, then re-run."
-            ))
-        })?;
-        (entry.id.clone(), Some(entry.path.display().to_string()))
-    } else {
-        ("none".to_string(), None)
-    };
+    let entry = backup_manager.create_backup(game_path).map_err(|e| {
+        LocustError::BackupError(format!(
+            "{e} — direct inject is refused without a backup: it writes into \
+             the original game tree, and every recovery path starts at this \
+             backup. Free disk space or fix the backup directory, then re-run."
+        ))
+    })?;
+    let backup_id = entry.id.clone();
+    let backup_path = Some(entry.path.display().to_string());
 
     let report = plugin.inject(game_path, &translated)?;
 
-    let backup_opt = if backup_id == "none" {
-        None
-    } else {
-        Some(backup_id.as_str())
-    };
+    let backup_opt = Some(backup_id.as_str());
 
     // Collect per-key outcomes: zero-write keeps/nothing-recorded MUST reach
     // the caller so no UI can swallow them silently (stale-recording hazard).
@@ -1654,5 +1641,215 @@ mod tests {
         // Every processed language carries the root its injection targeted.
         assert!(report.injected_roots.contains_key("es"));
         assert!(report.injected_roots.contains_key("fr"));
+    }
+
+    /// Writes the first translation over `target_rel` inside the game tree.
+    /// Stands in for the 10 plugins `mutates_original_tree` used to skip —
+    /// those all overwrite originals, same as this.
+    struct InPlaceWritePlugin {
+        id: &'static str,
+        target_rel: &'static str,
+    }
+
+    impl FormatPlugin for InPlaceWritePlugin {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn name(&self) -> &str {
+            self.id
+        }
+        fn supported_extensions(&self) -> &[&str] {
+            &[]
+        }
+        fn extract(&self, _: &Path) -> Result<Vec<StringEntry>> {
+            Ok(vec![])
+        }
+        fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+            let target = path.join(self.target_rel);
+            let Some(text) = entries.iter().find_map(|e| e.translation.as_deref()) else {
+                return Ok(InjectionReport {
+                    files_modified: 0,
+                    strings_written: 0,
+                    strings_skipped: 0,
+                    warnings: Vec::new(),
+                    files_written: Vec::new(),
+                });
+            };
+            fs::write(&target, text.as_bytes())?;
+            Ok(InjectionReport {
+                files_modified: 1,
+                strings_written: 1,
+                strings_skipped: 0,
+                warnings: Vec::new(),
+                files_written: vec![target],
+            })
+        }
+    }
+
+    fn copy_tree(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in WalkDir::new(src).follow_links(false) {
+            let entry = entry.unwrap();
+            let rel = entry.path().strip_prefix(src).unwrap();
+            let dest = dst.join(rel);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&dest).unwrap();
+            } else if entry.file_type().is_file() {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::copy(entry.path(), &dest).unwrap();
+            }
+        }
+    }
+
+    fn rpgmaker_mv_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("formats")
+            .join("tests")
+            .join("fixtures")
+            .join("rpgmaker_mv")
+    }
+
+    #[test]
+    fn test_inject_direct_backs_up_rpgmaker_mv_fixture_before_write() {
+        // rpgmaker-mv was not in the stale mutates_original_tree list, so
+        // direct inject used to write the fixture with backup_id "none".
+        let fixture = rpgmaker_mv_fixture_dir();
+        let actors_rel = Path::new("data").join("Actors.json");
+        assert!(
+            fixture.join(&actors_rel).is_file(),
+            "expected RPG Maker MV fixture at {}",
+            fixture.display()
+        );
+
+        let game_dir = tempdir().join("rpg");
+        copy_tree(&fixture, &game_dir);
+        let actors = game_dir.join(&actors_rel);
+        let original = fs::read(&actors).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = StringEntry::new("Actors.json#1#name", "Hero", actors.clone());
+        entry.translation = Some("Héroe".into());
+        db.save_entries(&[entry]).unwrap();
+
+        let mut registry = FormatRegistry::new();
+        registry.register(Box::new(InPlaceWritePlugin {
+            id: "rpgmaker-mv",
+            target_rel: "data/Actors.json",
+        }));
+        let mgr = BackupManager::new(tempdir().join("bak"));
+
+        let report = inject_direct(
+            &registry,
+            &db,
+            &mgr,
+            &game_dir,
+            "rpgmaker-mv",
+            &["es".into()],
+        )
+        .unwrap();
+
+        assert_ne!(report.backup_id, "none", "must be a real backup id");
+        assert!(!report.backup_id.is_empty());
+        let backup_path = report
+            .backup_path
+            .as_deref()
+            .expect("backup_path must be Some");
+        let backed = Path::new(backup_path).join(&actors_rel);
+        assert!(backed.is_file(), "backup must contain {actors_rel:?}");
+        let backed_bytes = fs::read(&backed).unwrap();
+        assert_eq!(
+            backed_bytes, original,
+            "backup must hold the pre-inject fixture bytes"
+        );
+        let after = fs::read(&actors).unwrap();
+        assert_eq!(after, "Héroe".as_bytes());
+        assert_ne!(
+            backed_bytes, after,
+            "backup taken before the write, not after"
+        );
+    }
+
+    #[test]
+    fn test_inject_direct_backs_up_kirikiri_before_write() {
+        // Same stale-list miss as RPG Maker — KiriKiri inject overwrites .ks.
+        let game_dir = tempdir().join("krkr");
+        fs::create_dir_all(&game_dir).unwrap();
+        let ks = game_dir.join("scenario.ks");
+        let original = b"; comment\n*start\nHello, world!\nThis is narration.\n";
+        fs::write(&ks, original).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = StringEntry::new("scenario.ks#3", "Hello, world!", ks.clone());
+        entry.translation = Some("Hola, mundo!".into());
+        db.save_entries(&[entry]).unwrap();
+
+        let mut registry = FormatRegistry::new();
+        registry.register(Box::new(InPlaceWritePlugin {
+            id: "kirikiri",
+            target_rel: "scenario.ks",
+        }));
+        let mgr = BackupManager::new(tempdir().join("bak"));
+
+        let report =
+            inject_direct(&registry, &db, &mgr, &game_dir, "kirikiri", &["es".into()]).unwrap();
+
+        assert_ne!(report.backup_id, "none");
+        let backup_path = report
+            .backup_path
+            .as_deref()
+            .expect("backup_path must be Some");
+        let backed = Path::new(backup_path).join("scenario.ks");
+        let backed_bytes = fs::read(&backed).unwrap();
+        assert_eq!(backed_bytes, original);
+        let after = fs::read(&ks).unwrap();
+        assert_eq!(after, b"Hola, mundo!");
+        assert_ne!(backed_bytes, after);
+    }
+
+    #[test]
+    fn test_inject_direct_backup_failure_refuses_and_does_not_write() {
+        // A previously excluded format used to skip backup entirely, so a
+        // broken backup root still let inject overwrite the game.
+        let game_dir = tempdir().join("rpg");
+        let data = game_dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let actors = data.join("Actors.json");
+        fs::write(&actors, b"ORIGINAL").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = StringEntry::new("Actors.json#1#name", "Hero", actors.clone());
+        entry.translation = Some("Héroe".into());
+        db.save_entries(&[entry]).unwrap();
+
+        let mut registry = FormatRegistry::new();
+        registry.register(Box::new(InPlaceWritePlugin {
+            id: "rpgmaker-mv",
+            target_rel: "data/Actors.json",
+        }));
+        let bad_root = tempdir().join("not_a_dir");
+        fs::write(&bad_root, b"occupied").unwrap();
+        let mgr = BackupManager::new(bad_root);
+
+        let err = inject_direct(
+            &registry,
+            &db,
+            &mgr,
+            &game_dir,
+            "rpgmaker-mv",
+            &["es".into()],
+        )
+        .expect_err("a failed backup must refuse the inject");
+        assert!(
+            err.to_string().contains("without a backup"),
+            "refusal must say why the backup matters: {err}"
+        );
+        assert_eq!(
+            fs::read(&actors).unwrap(),
+            b"ORIGINAL",
+            "inject must not write after a failed backup"
+        );
     }
 }

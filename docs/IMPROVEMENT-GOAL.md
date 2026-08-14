@@ -19,6 +19,10 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 ## Backlog
 
+- **Opening a project while a translation runs writes into the wrong database.** `Database::reopen` swaps the connection inside the shared object (`crates/core/src/database.rs:380-388`); the job holds that same `Arc` (`crates/server/src/lib.rs:796`); `project_open` never consults `state.active_jobs` (`crates/server/src/lib.rs:399-431`). Translations for game A land in game B. Reachable since jobs began surviving modal close. Found by Claude in cycle 1; lost the duel only because the winner destroyed files on disk rather than rows in a database.
+- Restore pours a backup into whichever project is open rather than the game it came from — `restore_backup` targets `current_project.path`, never `BackupEntry.source_path` (`crates/server/src/lib.rs:2088-2101`). Found by Grok, cycle 1.
+- Inject reports success when nothing usable was written: the toast fires on any HTTP 200, ignoring `languages_failed`, `strings_written == 0`, and `NothingRecorded` (`apps/desktop/src/components/InjectModal.tsx:275-280`, `crates/core/src/extraction.rs:143-144`). Found by Grok, cycle 1.
+- Patch apply: closing the socket without a terminal frame leaves the UI idle while the job keeps writing, and a second apply for the same folder is accepted. Found by Grok, cycle 1.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 
 ## In flight
@@ -26,6 +30,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 1 (defect).** Direct inject backed up only 4 of 14 formats while writing into the original tree for all of them, and the UI promised a backup that was never made. `mutates_original_tree` was not a design decision but a list that never grew with the plugins; it turned out to be universally true, so it collapsed and the fix removed code from three files. Researcher: Grok won; Cursor produced nothing (connection lost, exit 0).
 
 - `pending` — Review pages instead of loading the project: it fetched up to 50k translated + 50k reviewed rows and concatenated them for a screen that shows one entry at a time. The queue now validates each item after translating, so a batch user finds breakage before injecting rather than one game at a time. Copy stopped naming internals at the user (`register-lang failed`, `locust server`, `plugins=` field dumps).
 

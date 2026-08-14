@@ -61,18 +61,13 @@ fn pack_err(msg: impl Into<String>) -> LocustError {
     LocustError::PatchError(msg.into())
 }
 
-/// Engines whose `inject` mutates the ORIGINAL game tree (entry-tree writers
-/// plus Ren'Py, whose loose scripts are rewritten in place). Mirrors the CLI's
-/// `mutates_original_tree`, keyed on the engine id the caller detected.
-fn engine_mutates_original_tree(id: &str) -> bool {
-    matches!(id, "unity" | "unreal" | "wolf-rpg" | "renpy")
-}
-
-/// Appended to advice that names a `--direct` re-run, for engines that mutate
-/// the original tree: a legacy database on an already-injected game would loop
-/// on the identical error forever without it.
+/// Appended to advice that names a `--direct` re-run. Every registered
+/// format writes in place, so a legacy database on an already-injected
+/// game would loop on the identical error forever without this note.
+/// `None` means the caller does not know the engine — keep the old
+/// silence rather than guess.
 fn maybe_mutated_note(engine: Option<&str>) -> &'static str {
-    if engine.is_some_and(engine_mutates_original_tree) {
+    if engine.is_some() {
         "\nThis engine writes translations into the ORIGINAL game files: if this \
          game was already injected (for example through an older Locust that kept \
          no recording), that command will report 0 files written and record \
