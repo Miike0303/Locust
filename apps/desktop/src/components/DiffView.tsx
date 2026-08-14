@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { diff_match_patch, DIFF_DELETE, DIFF_INSERT, DIFF_EQUAL } from "diff-match-patch";
+import { useT } from "../lib/i18n";
 
 interface DiffViewProps {
   originalText: string;
@@ -8,6 +9,7 @@ interface DiffViewProps {
 }
 
 export default function DiffView({ originalText, translatedText, entryId }: DiffViewProps) {
+  const t = useT();
   const diffs = useMemo(() => {
     const dmp = new diff_match_patch();
     return dmp.diff_main(originalText, translatedText);
@@ -17,7 +19,7 @@ export default function DiffView({ originalText, translatedText, entryId }: Diff
     <div className="border border-gray-200 dark:border-gray-700 rounded p-3 space-y-3">
       <div className="grid grid-cols-2 gap-4">
         <div>
-          <h4 className="text-xs font-semibold text-gray-500 uppercase mb-1">Source</h4>
+          <h4 className="text-xs font-semibold text-gray-500 uppercase mb-1">{t("review.source")}</h4>
           <div className="font-mono text-sm whitespace-pre-wrap bg-gray-50 dark:bg-gray-800 p-2 rounded">
             {diffs.map(([op, text], i) => {
               if (op === DIFF_EQUAL) return <span key={i}>{text}</span>;
@@ -27,7 +29,7 @@ export default function DiffView({ originalText, translatedText, entryId }: Diff
           </div>
         </div>
         <div>
-          <h4 className="text-xs font-semibold text-gray-500 uppercase mb-1">Translation</h4>
+          <h4 className="text-xs font-semibold text-gray-500 uppercase mb-1">{t("review.translation")}</h4>
           <div className="font-mono text-sm whitespace-pre-wrap bg-gray-50 dark:bg-gray-800 p-2 rounded">
             {diffs.map(([op, text], i) => {
               if (op === DIFF_EQUAL) return <span key={i}>{text}</span>;

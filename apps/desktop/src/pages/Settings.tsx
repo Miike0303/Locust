@@ -20,10 +20,12 @@ import {
 } from "../lib/settingsNav";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { addToast } from "../stores/toastStore";
+import { useLocale, useT, type Locale } from "../lib/i18n";
 
 export default function Settings() {
   const location = useLocation();
   const navigate = useNavigate();
+  const t = useT();
   const section = parseSettingsSectionParam(location.search);
 
   useEffect(() => {
@@ -38,7 +40,7 @@ export default function Settings() {
   return (
     <div className="flex h-full">
       <nav className="w-48 border-r border-gray-200 dark:border-gray-700 p-4 space-y-1">
-        {SETTINGS_SECTIONS.map(({ id, label }) => (
+        {SETTINGS_SECTIONS.map(({ id }) => (
           <button
             key={id}
             onClick={() => selectSection(id)}
@@ -50,7 +52,7 @@ export default function Settings() {
                 : "text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800"
             )}
           >
-            {label}
+            {t(`settings.nav.${id}`)}
           </button>
         ))}
       </nav>
@@ -82,14 +84,25 @@ function formatRunDate(iso: string): string {
   return iso.length >= 16 ? iso.slice(0, 16) : iso;
 }
 
-function formatDuration(secs: number): string {
+function formatDuration(secs: number, t: (key: string, vars?: Record<string, string | number>) => string): string {
   const s = Math.max(0, Math.floor(secs));
-  if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-  if (s >= 60) return `${Math.floor(s / 60)}m ${s % 60}s`;
-  return `${s}s`;
+  if (s >= 3600) {
+    return t("settings.history.durationHoursMinutes", {
+      hours: Math.floor(s / 3600),
+      minutes: Math.floor((s % 3600) / 60),
+    });
+  }
+  if (s >= 60) {
+    return t("settings.history.durationMinutesSeconds", {
+      minutes: Math.floor(s / 60),
+      seconds: s % 60,
+    });
+  }
+  return t("settings.history.durationSeconds", { seconds: s });
 }
 
 function HistorySection() {
+  const t = useT();
   const { data: runs, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["translation-runs"],
     queryFn: getTranslationRuns,
@@ -115,9 +128,9 @@ function HistorySection() {
     <div className="space-y-4 max-w-5xl">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-xl font-bold">Translation history</h2>
+          <h2 className="text-xl font-bold">{t("settings.history.title")}</h2>
           <p className="text-sm text-gray-500 mt-1">
-            Every translation run recorded for this project — provider, cost, tokens and duration.
+            {t("settings.history.description")}
           </p>
         </div>
         <button
@@ -125,26 +138,27 @@ function HistorySection() {
           onClick={() => refetch()}
           className="text-sm text-emerald-700 hover:underline dark:text-emerald-400"
         >
-          Refresh
+          {t("common.refresh")}
         </button>
       </div>
 
       {isLoading && (
         <div className="flex items-center gap-2 text-sm text-gray-500">
-          <Loader size={16} className="animate-spin" /> Loading runs…
+          <Loader size={16} className="animate-spin" /> {t("settings.history.loading")}
         </div>
       )}
 
       {isError && (
         <div className="text-sm text-red-600 dark:text-red-400">
-          Failed to load runs: {(error as Error)?.message ?? "unknown error"}
+          {t("settings.history.loadFailed", {
+            error: (error as Error)?.message ?? t("settings.history.unknownError"),
+          })}
         </div>
       )}
 
       {!isLoading && !isError && (runs?.length ?? 0) === 0 && (
         <div className="border border-dashed border-gray-300 dark:border-gray-600 rounded-lg p-8 text-center text-sm text-gray-500">
-          No translation runs recorded yet. Run a translation from the Editor to populate this
-          history.
+          {t("settings.history.empty")}
         </div>
       )}
 
@@ -153,15 +167,15 @@ function HistorySection() {
           <table className="w-full text-sm">
             <thead>
               <tr className="bg-gray-50 dark:bg-gray-800/80 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
-                <th className="px-3 py-2">Date</th>
-                <th className="px-3 py-2">Provider</th>
-                <th className="px-3 py-2">Langs</th>
-                <th className="px-3 py-2 text-right">Strings</th>
-                <th className="px-3 py-2 text-right">Tokens</th>
-                <th className="px-3 py-2 text-right">In</th>
-                <th className="px-3 py-2 text-right">Out</th>
-                <th className="px-3 py-2 text-right">Cost (USD)</th>
-                <th className="px-3 py-2 text-right">Duration</th>
+                <th className="px-3 py-2">{t("settings.history.col.date")}</th>
+                <th className="px-3 py-2">{t("settings.history.col.provider")}</th>
+                <th className="px-3 py-2">{t("settings.history.col.langs")}</th>
+                <th className="px-3 py-2 text-right">{t("settings.history.col.strings")}</th>
+                <th className="px-3 py-2 text-right">{t("settings.history.col.tokens")}</th>
+                <th className="px-3 py-2 text-right">{t("settings.history.col.in")}</th>
+                <th className="px-3 py-2 text-right">{t("settings.history.col.out")}</th>
+                <th className="px-3 py-2 text-right">{t("settings.history.col.cost")}</th>
+                <th className="px-3 py-2 text-right">{t("settings.history.col.duration")}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
@@ -188,7 +202,7 @@ function HistorySection() {
                     {r.cost_usd.toFixed(4)}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums whitespace-nowrap">
-                    {formatDuration(r.duration_secs)}
+                    {formatDuration(r.duration_secs, t)}
                   </td>
                 </tr>
               ))}
@@ -196,7 +210,7 @@ function HistorySection() {
             <tfoot>
               <tr className="bg-gray-50 dark:bg-gray-800/80 font-semibold text-gray-800 dark:text-gray-200 border-t border-gray-200 dark:border-gray-700">
                 <td className="px-3 py-2" colSpan={3}>
-                  Total ({runs!.length} run{runs!.length === 1 ? "" : "s"})
+                  {t("settings.history.totalRuns", { count: runs!.length })}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums">{totals.strings}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{totals.tokens}</td>
@@ -210,7 +224,7 @@ function HistorySection() {
                   {totals.cost.toFixed(4)}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums whitespace-nowrap">
-                  {formatDuration(totals.secs)}
+                  {formatDuration(totals.secs, t)}
                 </td>
               </tr>
             </tfoot>
@@ -222,6 +236,7 @@ function HistorySection() {
 }
 
 function ProvidersSection() {
+  const t = useT();
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders });
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
   const qc = useQueryClient();
@@ -247,7 +262,7 @@ function ProvidersSection() {
 
   return (
     <div className="space-y-4">
-      <h2 className="text-xl font-bold">Providers</h2>
+      <h2 className="text-xl font-bold">{t("settings.providers.title")}</h2>
       {providers?.map((p) => {
         const readiness = resolveProviderReadiness(p.id, providers, config);
         return (
@@ -255,7 +270,7 @@ function ProvidersSection() {
           <div className="flex items-center gap-2 mb-3">
             <h3 className="font-semibold">{p.name}</h3>
             <span className={clsx("px-2 py-0.5 rounded-full text-xs", p.is_free ? "bg-green-100 text-green-700" : "bg-amber-100 text-amber-700")}>
-              {p.is_free ? "Free" : "Paid"}
+              {p.is_free ? t("settings.providers.free") : t("settings.providers.paid")}
             </span>
             {p.requires_api_key && (
               <span className={clsx(
@@ -264,19 +279,19 @@ function ProvidersSection() {
                   ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
                   : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
               )}>
-                {readiness.ready ? "Configured" : "Needs API key"}
+                {readiness.ready ? t("settings.providers.configured") : t("settings.providers.needsApiKey")}
               </span>
             )}
           </div>
 
           {p.requires_api_key && (
             <div className="mb-3">
-              <label className="text-sm text-gray-600">API Key</label>
+              <label className="text-sm text-gray-600">{t("settings.providers.apiKey")}</label>
               <input
                 type="password"
                 defaultValue={config?.providers?.[p.id]?.api_key === "***" ? "" : config?.providers?.[p.id]?.api_key || ""}
                 onBlur={(e) => saveKey(p.id, "api_key", e.target.value)}
-                placeholder="Enter API key..."
+                placeholder={t("settings.providers.enterApiKey")}
                 className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
               />
             </div>
@@ -284,7 +299,7 @@ function ProvidersSection() {
 
           {(p.id === "argos" || p.id === "ollama") && (
             <div className="mb-3">
-              <label className="text-sm text-gray-600">Base URL</label>
+              <label className="text-sm text-gray-600">{t("settings.providers.baseUrl")}</label>
               <input
                 defaultValue={config?.providers?.[p.id]?.base_url || (p.id === "argos" ? "http://localhost:5000" : "http://localhost:11434")}
                 onBlur={(e) => saveKey(p.id, "base_url", e.target.value)}
@@ -295,7 +310,7 @@ function ProvidersSection() {
 
           {p.id === "ollama" && (
             <div className="mb-3">
-              <label className="text-sm text-gray-600">Model</label>
+              <label className="text-sm text-gray-600">{t("settings.providers.model")}</label>
               <input
                 defaultValue={config?.providers?.[p.id]?.model || "llama3.2"}
                 onBlur={(e) => saveKey(p.id, "model", e.target.value)}
@@ -306,7 +321,7 @@ function ProvidersSection() {
 
           {(p.id === "openai" || p.id === "claude") && (
             <div className="mb-3">
-              <label className="text-sm text-gray-600">Model</label>
+              <label className="text-sm text-gray-600">{t("settings.providers.model")}</label>
               <select
                 defaultValue={config?.providers?.[p.id]?.model || ""}
                 onChange={(e) => saveKey(p.id, "model", e.target.value)}
@@ -329,12 +344,12 @@ function ProvidersSection() {
           <div className="flex items-center gap-3">
             <button onClick={() => handleTest(p.id)}
               className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium">
-              {testing[p.id] ? <Loader size={14} className="animate-spin" /> : "Test Connection"}
+              {testing[p.id] ? <Loader size={14} className="animate-spin" /> : t("settings.providers.testConnection")}
             </button>
             {results[p.id] && (
               <span className={clsx("flex items-center gap-1 text-sm", results[p.id].ok ? "text-green-600" : "text-red-600")}>
                 {results[p.id].ok ? <CheckCircle size={14} /> : <XCircle size={14} />}
-                {results[p.id].ok ? "Connected" : results[p.id].message.slice(0, 60)}
+                {results[p.id].ok ? t("settings.providers.connected") : results[p.id].message.slice(0, 60)}
               </span>
             )}
           </div>
@@ -346,6 +361,7 @@ function ProvidersSection() {
 }
 
 function DefaultsSection() {
+  const t = useT();
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders });
   const qc = useQueryClient();
@@ -359,38 +375,39 @@ function DefaultsSection() {
 
   return (
     <div className="space-y-6 max-w-md">
-      <h2 className="text-xl font-bold">Translation Defaults</h2>
+      <h2 className="text-xl font-bold">{t("settings.defaults.title")}</h2>
       <div>
-        <label className="text-sm font-medium">Default Provider</label>
+        <label className="text-sm font-medium">{t("settings.defaults.provider")}</label>
         <select value={config.default_provider || ""} onChange={(e) => save("default_provider", e.target.value || null)}
           className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600">
-          <option value="">None</option>
+          <option value="">{t("common.none")}</option>
           {providers?.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select>
       </div>
       <div className="grid grid-cols-2 gap-4">
         <div>
-          <label className="text-sm font-medium">Source Language</label>
+          <label className="text-sm font-medium">{t("settings.defaults.sourceLang")}</label>
           <input value={config.default_source_lang} onChange={(e) => save("default_source_lang", e.target.value)}
             className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
         </div>
         <div>
-          <label className="text-sm font-medium">Target Language</label>
+          <label className="text-sm font-medium">{t("settings.defaults.targetLang")}</label>
           <input value={config.default_target_lang} onChange={(e) => save("default_target_lang", e.target.value)}
             className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
         </div>
       </div>
+      <p className="text-xs text-gray-500 -mt-2">{t("settings.defaults.langHint")}</p>
       <div>
-        <label className="text-sm font-medium">Batch Size: {config.default_batch_size}</label>
+        <label className="text-sm font-medium">{t("settings.defaults.batchSize", { size: config.default_batch_size })}</label>
         <input type="range" min={10} max={100} value={config.default_batch_size}
           onChange={(e) => save("default_batch_size", +e.target.value)}
           className="mt-1 w-full" />
       </div>
       <div>
-        <label className="text-sm font-medium">Cost Limit ($)</label>
+        <label className="text-sm font-medium">{t("settings.defaults.costLimit")}</label>
         <input type="number" step="0.01" value={config.default_cost_limit ?? ""}
           onChange={(e) => save("default_cost_limit", e.target.value ? +e.target.value : null)}
-          placeholder="No limit"
+          placeholder={t("settings.defaults.noLimit")}
           className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
       </div>
     </div>
@@ -398,6 +415,8 @@ function DefaultsSection() {
 }
 
 function AppearanceSection() {
+  const t = useT();
+  const { locale, setLocale } = useLocale();
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
   const qc = useQueryClient();
 
@@ -419,29 +438,44 @@ function AppearanceSection() {
 
   return (
     <div className="space-y-6 max-w-md">
-      <h2 className="text-xl font-bold">Appearance</h2>
+      <h2 className="text-xl font-bold">{t("settings.appearance.title")}</h2>
       <div>
-        <label className="text-sm font-medium">Theme</label>
+        <label className="text-sm font-medium">{t("settings.appearance.theme")}</label>
         <div className="flex gap-3 mt-2">
-          {(["system", "light", "dark"] as const).map((t) => (
-            <label key={t} className="flex items-center gap-2 cursor-pointer">
-              <input type="radio" name="theme" checked={config.ui.theme === t} onChange={() => setTheme(t)} />
-              <span className="text-sm capitalize">{t}</span>
+          {(["system", "light", "dark"] as const).map((theme) => (
+            <label key={theme} className="flex items-center gap-2 cursor-pointer">
+              <input type="radio" name="theme" checked={config.ui.theme === theme} onChange={() => setTheme(theme)} />
+              <span className="text-sm">{t(`settings.appearance.theme.${theme}`)}</span>
             </label>
           ))}
         </div>
       </div>
       <div>
-        <label className="text-sm font-medium">Font Size: {config.ui.font_size}px</label>
+        <label className="text-sm font-medium">{t("settings.appearance.fontSize", { size: config.ui.font_size })}</label>
         <input type="range" min={12} max={18} value={config.ui.font_size}
           onChange={(e) => setFontSize(+e.target.value)}
           className="mt-1 w-full" />
+      </div>
+      <div>
+        <label className="text-sm font-medium" htmlFor="ui-language">
+          {t("settings.appearance.interfaceLanguage")}
+        </label>
+        <select
+          id="ui-language"
+          value={locale}
+          onChange={(e) => setLocale(e.target.value as Locale)}
+          className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+        >
+          <option value="en">{t("settings.appearance.locale.en")}</option>
+          <option value="es">{t("settings.appearance.locale.es")}</option>
+        </select>
       </div>
     </div>
   );
 }
 
 function GlossarySection() {
+  const t = useT();
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
   const qc = useQueryClient();
   const configPair = config
@@ -475,20 +509,20 @@ function GlossarySection() {
   }, [entries, filter]);
 
   const handleAdd = async () => {
-    const t = term.trim();
+    const termText = term.trim();
     const tr = translation.trim();
-    if (!t || !tr) {
-      addToast("error", "Term and translation are required.");
+    if (!termText || !tr) {
+      addToast("error", t("settings.glossary.toast.termRequired"));
       return;
     }
     if (!activePair.trim()) {
-      addToast("error", "Language pair is required (e.g. ja-en).");
+      addToast("error", t("settings.glossary.toast.pairRequired"));
       return;
     }
     setSaving(true);
     try {
       const entry: GlossaryEntry = {
-        term: t,
+        term: termText,
         translation: tr,
         lang_pair: activePair.trim(),
         context: null,
@@ -500,7 +534,7 @@ function GlossarySection() {
       refetch();
       qc.invalidateQueries({ queryKey: ["glossary"] });
     } catch (e: any) {
-      addToast("error", `Failed to add entry: ${e.message}`);
+      addToast("error", t("settings.glossary.toast.addFailed", { error: e.message }));
     } finally {
       setSaving(false);
     }
@@ -513,20 +547,20 @@ function GlossarySection() {
       refetch();
       qc.invalidateQueries({ queryKey: ["glossary"] });
     } catch (e: any) {
-      addToast("error", `Failed to delete: ${e.message}`);
+      addToast("error", t("settings.glossary.toast.deleteFailed", { error: e.message }));
     }
   };
 
   return (
     <div className="space-y-6 max-w-3xl">
-      <h2 className="text-xl font-bold">Glossary</h2>
+      <h2 className="text-xl font-bold">{t("settings.glossary.title")}</h2>
       <p className="text-sm text-gray-500">
-        Preferred term translations used when “Use glossary” is enabled in the translation dialog.
+        {t("settings.glossary.description")}
       </p>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
         <div>
-          <label className="text-sm font-medium">Language pair</label>
+          <label className="text-sm font-medium">{t("settings.glossary.langPair")}</label>
           <input
             value={langPairOverride ?? configPair}
             onChange={(e) => setLangPairOverride(e.target.value)}
@@ -535,13 +569,13 @@ function GlossarySection() {
           />
         </div>
         <div className="sm:col-span-2 relative">
-          <label className="text-sm font-medium">Filter</label>
+          <label className="text-sm font-medium">{t("settings.glossary.filter")}</label>
           <div className="relative mt-1">
             <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
             <input
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
-              placeholder="Search terms or translations..."
+              placeholder={t("settings.glossary.filterPlaceholder")}
               className="w-full pl-8 pr-3 py-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
             />
           </div>
@@ -549,25 +583,25 @@ function GlossarySection() {
       </div>
 
       <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 space-y-3">
-        <h3 className="text-sm font-semibold text-gray-500 uppercase">Add entry</h3>
+        <h3 className="text-sm font-semibold text-gray-500 uppercase">{t("settings.glossary.addEntry")}</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
-            <label className="text-sm text-gray-600">Term</label>
+            <label className="text-sm text-gray-600">{t("settings.glossary.term")}</label>
             <input
               value={term}
               onChange={(e) => setTerm(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-              placeholder="Source term"
+              placeholder={t("settings.glossary.sourceTerm")}
               className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
             />
           </div>
           <div>
-            <label className="text-sm text-gray-600">Translation</label>
+            <label className="text-sm text-gray-600">{t("settings.glossary.translation")}</label>
             <input
               value={translation}
               onChange={(e) => setTranslation(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-              placeholder="Preferred translation"
+              placeholder={t("settings.glossary.preferredTranslation")}
               className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
             />
           </div>
@@ -577,31 +611,31 @@ function GlossarySection() {
           disabled={saving}
           className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded text-sm font-medium"
         >
-          <Plus size={14} /> {saving ? "Adding..." : "Add entry"}
+          <Plus size={14} /> {saving ? t("settings.glossary.adding") : t("settings.glossary.addEntry")}
         </button>
       </div>
 
       <div>
         <h3 className="text-sm font-semibold text-gray-500 uppercase mb-2">
-          Entries {entries ? `(${filtered.length})` : ""}
+          {entries ? t("settings.glossary.entries", { count: filtered.length }) : t("settings.glossary.entriesBare")}
         </h3>
         {isLoading ? (
           <p className="text-sm text-gray-500 flex items-center gap-2">
-            <Loader size={14} className="animate-spin" /> Loading...
+            <Loader size={14} className="animate-spin" /> {t("common.loading")}
           </p>
         ) : filtered.length === 0 ? (
           <p className="text-sm text-gray-500">
             {filter
-              ? "No glossary entries match your filter."
-              : "No glossary entries for this language pair yet. Add a term above."}
+              ? t("settings.glossary.emptyFilter")
+              : t("settings.glossary.empty")}
           </p>
         ) : (
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-gray-500 text-xs uppercase">
-                <th className="pb-2">Term</th>
-                <th className="pb-2">Translation</th>
-                <th className="pb-2 w-24">Pair</th>
+                <th className="pb-2">{t("settings.glossary.col.term")}</th>
+                <th className="pb-2">{t("settings.glossary.col.translation")}</th>
+                <th className="pb-2 w-24">{t("settings.glossary.col.pair")}</th>
                 <th className="pb-2 w-12"></th>
               </tr>
             </thead>
@@ -622,7 +656,7 @@ function GlossarySection() {
                     <button
                       onClick={() => setEntryToDelete(e)}
                       className="text-red-500 hover:text-red-700"
-                      title="Delete entry"
+                      title={t("settings.glossary.deleteTitle")}
                     >
                       <Trash2 size={14} />
                     </button>
@@ -636,9 +670,9 @@ function GlossarySection() {
 
       <ConfirmDialog
         open={entryToDelete !== null}
-        title="Delete glossary term"
-        message={entryToDelete ? `Delete glossary term “${entryToDelete.term}”?` : ""}
-        confirmLabel="Delete"
+        title={t("settings.glossary.confirm.title")}
+        message={entryToDelete ? t("settings.glossary.confirm.message", { term: entryToDelete.term }) : ""}
+        confirmLabel={t("common.delete")}
         destructive
         onConfirm={() => entryToDelete && handleDeleteConfirmed(entryToDelete)}
         onCancel={() => setEntryToDelete(null)}
@@ -648,6 +682,7 @@ function GlossarySection() {
 }
 
 function DataSection() {
+  const t = useT();
   const { data: backups, refetch } = useQuery({ queryKey: ["backups"], queryFn: getBackups });
   const [pendingAction, setPendingAction] = useState<
     { kind: "restore" | "delete"; id: string } | null
@@ -660,32 +695,32 @@ function DataSection() {
     if (kind === "restore") {
       try {
         await restoreBackup(id);
-        addToast("success", `Backup ${id} restored`);
+        addToast("success", t("settings.data.toast.restored", { id }));
       } catch (e: any) {
-        addToast("error", `Restore failed: ${e.message}`);
+        addToast("error", t("settings.data.toast.restoreFailed", { error: e.message }));
       }
     } else {
       try {
         await deleteBackup(id);
         refetch();
       } catch (e: any) {
-        addToast("error", `Delete failed: ${e.message}`);
+        addToast("error", t("settings.data.toast.deleteFailed", { error: e.message }));
       }
     }
   };
 
   return (
     <div className="space-y-6">
-      <h2 className="text-xl font-bold">Data</h2>
+      <h2 className="text-xl font-bold">{t("settings.data.title")}</h2>
       <div>
-        <h3 className="text-sm font-semibold text-gray-500 uppercase mb-2">Backups</h3>
+        <h3 className="text-sm font-semibold text-gray-500 uppercase mb-2">{t("settings.data.backups")}</h3>
         {(!backups || backups.length === 0) ? (
-          <p className="text-sm text-gray-500">No backups found.</p>
+          <p className="text-sm text-gray-500">{t("settings.data.noBackups")}</p>
         ) : (
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-gray-500">
-                <th className="pb-2">ID</th><th className="pb-2">Created</th><th className="pb-2">Files</th><th className="pb-2">Actions</th>
+                <th className="pb-2">{t("settings.data.col.id")}</th><th className="pb-2">{t("settings.data.col.created")}</th><th className="pb-2">{t("settings.data.col.files")}</th><th className="pb-2">{t("settings.data.col.actions")}</th>
               </tr>
             </thead>
             <tbody>
@@ -695,8 +730,8 @@ function DataSection() {
                   <td className="py-2">{new Date(b.created_at).toLocaleString()}</td>
                   <td className="py-2">{b.file_count}</td>
                   <td className="py-2 flex gap-2">
-                    <button onClick={() => setPendingAction({ kind: "restore", id: b.id })} className="text-emerald-600 hover:text-emerald-800" title="Restore backup"><RotateCcw size={14} /></button>
-                    <button onClick={() => setPendingAction({ kind: "delete", id: b.id })} className="text-red-500 hover:text-red-700" title="Delete backup"><Trash2 size={14} /></button>
+                    <button onClick={() => setPendingAction({ kind: "restore", id: b.id })} className="text-emerald-600 hover:text-emerald-800" title={t("settings.data.restore")}><RotateCcw size={14} /></button>
+                    <button onClick={() => setPendingAction({ kind: "delete", id: b.id })} className="text-red-500 hover:text-red-700" title={t("settings.data.delete")}><Trash2 size={14} /></button>
                   </td>
                 </tr>
               ))}
@@ -707,13 +742,13 @@ function DataSection() {
 
       <ConfirmDialog
         open={pendingAction !== null}
-        title={pendingAction?.kind === "restore" ? "Restore backup" : "Delete backup"}
+        title={pendingAction?.kind === "restore" ? t("settings.data.confirm.restoreTitle") : t("settings.data.confirm.deleteTitle")}
         message={
           pendingAction?.kind === "restore"
-            ? `Restore backup ${pendingAction.id}? This will overwrite current project files.`
-            : `Delete backup ${pendingAction?.id ?? ""}?`
+            ? t("settings.data.confirm.restoreMessage", { id: pendingAction.id })
+            : t("settings.data.confirm.deleteMessage", { id: pendingAction?.id ?? "" })
         }
-        confirmLabel={pendingAction?.kind === "restore" ? "Restore" : "Delete"}
+        confirmLabel={pendingAction?.kind === "restore" ? t("settings.data.restore") : t("common.delete")}
         destructive
         onConfirm={runPendingAction}
         onCancel={() => setPendingAction(null)}

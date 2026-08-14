@@ -24,8 +24,8 @@ interface WaitOptions {
   onProgress?: (completed: number, total: number, costSoFar: number) => void;
 }
 
-export const JOB_STREAM_LOST_MESSAGE =
-  "connection to the translation job was lost";
+/** Catalog key — UI renders via `t()`, tests assert on the code. */
+export const JOB_STREAM_LOST_MESSAGE = "ws.jobStreamLost";
 
 export function waitForJob(jobId: string, opts?: WaitOptions): Promise<void> {
   return new Promise((resolve, reject) => {

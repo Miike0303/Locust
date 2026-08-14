@@ -1,5 +1,6 @@
 import { X } from "lucide-react";
 import { getGroupedHotkeys, formatKey, useHotkey } from "../lib/hotkeys";
+import { useT } from "../lib/i18n";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
@@ -14,6 +15,7 @@ interface Props {
 const GROUP_ORDER = ["Navigation", "Editor", "Review", "General"];
 
 export default function HotkeyHelp({ open, onClose }: Props) {
+	const t = useT();
 	useHotkey("closePanel", onClose, open, true, true);
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open,
@@ -33,7 +35,7 @@ export default function HotkeyHelp({ open, onClose }: Props) {
 			>
 				<div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
 					<h2 {...titleProps} className="text-lg font-bold">
-						Keyboard Shortcuts
+						{t("hotkeys.title")}
 					</h2>
 					<button
 						onClick={onClose}
@@ -50,7 +52,7 @@ export default function HotkeyHelp({ open, onClose }: Props) {
 						return (
 							<div key={group}>
 								<h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">
-									{group}
+									{t(`hotkeys.group.${group}`)}
 								</h3>
 								<div className="space-y-1">
 									{items.map(({ action, binding }) => (
@@ -59,7 +61,7 @@ export default function HotkeyHelp({ open, onClose }: Props) {
 											className="flex justify-between items-center py-1"
 										>
 											<span className="text-sm text-gray-700 dark:text-gray-300">
-												{binding.description}
+												{t(`hotkeys.${action}`)}
 											</span>
 											<kbd className="px-2 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs font-mono text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-700">
 												{formatKey(binding)}
@@ -74,11 +76,7 @@ export default function HotkeyHelp({ open, onClose }: Props) {
 
 				<div className="p-4 border-t border-gray-200 dark:border-gray-700 text-center">
 					<span className="text-xs text-gray-400">
-						Press{" "}
-						<kbd className="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">
-							Esc
-						</kbd>{" "}
-						to close
+						{t("hotkeys.closeHint")}
 					</span>
 				</div>
 			</div>

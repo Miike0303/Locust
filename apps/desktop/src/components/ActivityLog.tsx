@@ -2,6 +2,7 @@ import { useState } from "react";
 import { X, Trash2 } from "lucide-react";
 import clsx from "clsx";
 import { useLogStore, type LogLevel } from "../stores/logStore";
+import { useT } from "../lib/i18n";
 
 const levelColors: Record<LogLevel, string> = {
 	info: "bg-blue-500 dark:bg-blue-400",
@@ -17,16 +18,20 @@ const levelBg: Record<LogLevel, string> = {
 
 const filters: Array<LogLevel | "all"> = ["all", "info", "warning", "error"];
 
-function timeAgo(ts: number): string {
+function timeAgo(
+	ts: number,
+	t: (key: string, vars?: Record<string, string | number>) => string,
+): string {
 	const sec = Math.floor((Date.now() - ts) / 1000);
-	if (sec < 60) return `${sec}s ago`;
+	if (sec < 60) return t("log.timeSeconds", { count: sec });
 	const min = Math.floor(sec / 60);
-	if (min < 60) return `${min}m ago`;
+	if (min < 60) return t("log.timeMinutes", { count: min });
 	const hr = Math.floor(min / 60);
-	return `${hr}h ago`;
+	return t("log.timeHours", { count: hr });
 }
 
 export default function ActivityLog() {
+	const t = useT();
 	const { entries, filter, isOpen, setOpen, setFilter, clear } = useLogStore();
 	const [expandedId, setExpandedId] = useState<string | null>(null);
 
@@ -40,13 +45,13 @@ export default function ActivityLog() {
 			{/* Header */}
 			<div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
 				<h2 className="font-bold text-gray-900 dark:text-gray-100">
-					Activity Log
+					{t("log.title")}
 				</h2>
 				<div className="flex items-center gap-2">
 					<button
 						type="button"
 						onClick={clear}
-						aria-label="Clear activity log"
+						aria-label={t("log.clearAria")}
 						className="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded p-0.5"
 					>
 						<Trash2 size={16} />
@@ -54,7 +59,7 @@ export default function ActivityLog() {
 					<button
 						type="button"
 						onClick={() => setOpen(false)}
-						aria-label="Close activity log"
+						aria-label={t("log.closeAria")}
 						className="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded p-0.5"
 					>
 						<X size={18} />
@@ -76,7 +81,7 @@ export default function ActivityLog() {
 								: "text-gray-500 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800",
 						)}
 					>
-						{f}
+						{t(`log.${f}`)}
 						{f !== "all" && (
 							<span className="ml-1 opacity-60">
 								({entries.filter((e) => e.level === f).length})
@@ -90,7 +95,7 @@ export default function ActivityLog() {
 			<div className="flex-1 overflow-y-auto">
 				{filtered.length === 0 ? (
 					<div className="p-8 text-center text-sm text-gray-500 dark:text-gray-400">
-						No log entries
+						{t("log.empty")}
 					</div>
 				) : (
 					filtered.map((entry) => (
@@ -116,7 +121,7 @@ export default function ActivityLog() {
 										{entry.message}
 									</div>
 									<div className="flex gap-2 mt-0.5 text-xs text-gray-500 dark:text-gray-400">
-										<span>{timeAgo(entry.timestamp)}</span>
+										<span>{timeAgo(entry.timestamp, t)}</span>
 										{entry.source && (
 											<span className="text-gray-400 dark:text-gray-500">
 												· {entry.source}

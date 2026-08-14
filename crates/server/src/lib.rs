@@ -23,7 +23,10 @@ use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
 use locust_core::font_validation::{FontCoverageReport, FontValidator};
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
-use locust_core::translation::{run_fallback_chain, ProviderRegistry, TranslationOptions};
+use locust_core::project::{self, ProjectOpenOutcome};
+use locust_core::translation::{
+    run_fallback_chain, unique_provider_chain, ProviderRegistry, TranslationOptions,
+};
 use locust_core::validation::Validator;
 
 type ApiError = (StatusCode, String);
@@ -51,8 +54,6 @@ pub struct AppState {
     pub format_registry: Arc<FormatRegistry>,
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
     pub db: Arc<Database>,
-    /// On-disk path of `db` — used to render runnable CLI commands in errors.
-    pub db_path: PathBuf,
     pub glossary: Arc<Glossary>,
     pub config: Arc<RwLock<AppConfig>>,
     pub backup_manager: Arc<BackupManager>,
@@ -99,7 +100,6 @@ pub fn create_app_state() -> Arc<AppState> {
         format_registry: Arc::new(format_registry),
         provider_registry: Arc::new(RwLock::new(provider_registry)),
         db,
-        db_path,
         glossary,
         config: Arc::new(RwLock::new(config)),
         backup_manager: Arc::new(BackupManager::new(backup_root)),
@@ -111,10 +111,7 @@ pub fn create_app_state() -> Arc<AppState> {
 }
 
 pub fn create_test_state() -> Arc<AppState> {
-    create_test_state_inner(
-        Arc::new(Database::open_in_memory().unwrap()),
-        PathBuf::from(":memory:"),
-    )
+    create_test_state_inner(Arc::new(Database::open_in_memory().unwrap()))
 }
 
 /// Test state whose project database lives at `db_path` — for integration
@@ -122,13 +119,10 @@ pub fn create_test_state() -> Arc<AppState> {
 /// recording `locust patch` packs from) by reopening the same file after a
 /// request completes.
 pub fn create_test_state_with_db(db_path: &std::path::Path) -> Arc<AppState> {
-    create_test_state_inner(
-        Arc::new(Database::open(db_path).unwrap()),
-        db_path.to_path_buf(),
-    )
+    create_test_state_inner(Arc::new(Database::open(db_path).unwrap()))
 }
 
-fn create_test_state_inner(db: Arc<Database>, db_path: PathBuf) -> Arc<AppState> {
+fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
     let glossary = Arc::new(Glossary::new(db.clone()));
     let backup_root = std::env::temp_dir().join(format!("locust_srv_{}", uuid::Uuid::new_v4()));
     let format_registry = locust_formats::default_registry();
@@ -139,7 +133,6 @@ fn create_test_state_inner(db: Arc<Database>, db_path: PathBuf) -> Arc<AppState>
         format_registry: Arc::new(format_registry),
         provider_registry: Arc::new(RwLock::new(provider_registry)),
         db,
-        db_path,
         glossary,
         config: Arc::new(RwLock::new(config)),
         backup_manager: Arc::new(BackupManager::new(backup_root.clone())),
@@ -258,9 +251,7 @@ async fn get_format_modes(
     }))
 }
 
-async fn list_providers(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn list_providers(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let reg = state.provider_registry.read().await;
     Json(serde_json::to_value(locust_providers::list_providers_for_api(&reg)).unwrap_or_default())
 }
@@ -296,6 +287,43 @@ struct ProjectOpenResponse {
     project_path: String,
     project_name: String,
     supported_modes: Vec<OutputMode>,
+    database_path: String,
+    added: usize,
+    updated: usize,
+    stale_source_reset: usize,
+    removed: usize,
+    preserved_translations: usize,
+}
+
+impl From<ProjectOpenOutcome> for ProjectOpenResponse {
+    fn from(o: ProjectOpenOutcome) -> Self {
+        Self {
+            format_id: o.format_id,
+            format_name: o.format_name,
+            total_strings: o.total_strings,
+            project_path: o.project_path.to_string_lossy().into_owned(),
+            project_name: o.project_name,
+            supported_modes: o.supported_modes,
+            database_path: o.database_path.to_string_lossy().into_owned(),
+            added: o.added,
+            updated: o.updated,
+            stale_source_reset: o.stale_source_reset,
+            removed: o.removed,
+            preserved_translations: o.preserved_translations,
+        }
+    }
+}
+
+fn map_open_err(e: locust_core::error::LocustError) -> ApiError {
+    match e {
+        locust_core::error::LocustError::ProjectNotFound(_) => {
+            err(StatusCode::BAD_REQUEST, "path not found")
+        }
+        locust_core::error::LocustError::UnsupportedFormat(msg) => {
+            err(StatusCode::UNPROCESSABLE_ENTITY, msg)
+        }
+        other => err(StatusCode::INTERNAL_SERVER_ERROR, other),
+    }
 }
 
 async fn project_open(
@@ -303,65 +331,33 @@ async fn project_open(
     Json(req): Json<OpenProjectRequest>,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
     let raw_path = PathBuf::from(&req.path);
-    if !raw_path.exists() {
-        return Err(err(StatusCode::BAD_REQUEST, "path not found"));
-    }
-
-    // Resolve executable/file path to game root
-    let path = locust_core::extraction::resolve_game_root(&raw_path, &state.format_registry);
-
-    let plugin = if let Some(ref fid) = req.format_id {
-        state
-            .format_registry
-            .get(fid)
-            .ok_or_else(|| err(StatusCode::UNPROCESSABLE_ENTITY, format!("Unknown format: {}", fid)))?
-    } else {
-        state
-            .format_registry
-            .detect(&path)
-            .ok_or_else(|| err(StatusCode::UNPROCESSABLE_ENTITY, "format not detected"))?
-    };
-
-    let format_id = plugin.id().to_string();
-    let format_name = plugin.name().to_string();
-    let supported_modes = plugin.supported_modes();
-
-    let entries = plugin.extract(&path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    state.db.clear_entries().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let total_strings = state
-        .db
-        .save_entries(&entries)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    let project_name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let outcome = project::open_project(
+        &state.db,
+        &state.format_registry,
+        &raw_path,
+        req.format_id.as_deref(),
+    )
+    .map_err(map_open_err)?;
 
     {
         let mut proj = state.current_project.write().await;
         *proj = Some(ProjectInfo {
-            path: path.clone(),
-            format_id: format_id.clone(),
-            name: project_name.clone(),
+            path: outcome.project_path.clone(),
+            format_id: outcome.format_id.clone(),
+            name: outcome.project_name.clone(),
         });
     }
 
     {
         let mut config = state.config.write().await;
-        config.add_recent_project(path.clone(), project_name.clone(), format_id.clone());
+        config.add_recent_project(
+            outcome.project_path.clone(),
+            outcome.project_name.clone(),
+            outcome.format_id.clone(),
+        );
     }
 
-    Ok(Json(ProjectOpenResponse {
-        format_id,
-        format_name,
-        total_strings,
-        project_path: req.path,
-        project_name,
-        supported_modes,
-    }))
+    Ok(Json(ProjectOpenResponse::from(outcome)))
 }
 
 async fn project_current(
@@ -420,7 +416,10 @@ async fn get_strings(
         limit: None,
         offset: None,
     };
-    let total = state.db.count_entries(&count_filter).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let total = state
+        .db
+        .count_entries(&count_filter)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let filter = EntryFilter {
         status,
@@ -430,7 +429,10 @@ async fn get_strings(
         limit: Some(limit),
         offset: Some(offset),
     };
-    let entries = state.db.get_entries(&filter).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let entries = state
+        .db
+        .get_entries(&filter)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(StringsResponse {
         entries,
@@ -530,9 +532,7 @@ async fn batch_patch_strings(
     })))
 }
 
-async fn get_stats(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<ProjectStats>, ApiError> {
+async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<ProjectStats>, ApiError> {
     if state.current_project.read().await.is_none() {
         return Ok(Json(ProjectStats::default()));
     }
@@ -569,24 +569,19 @@ struct TranslateStartResponse {
     job_id: String,
 }
 
-async fn translate_start(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<TranslateStartRequest>,
-) -> Result<Json<TranslateStartResponse>, ApiError> {
+/// Shared by HTTP `POST /api/translate/start` and the Tauri command.
+pub async fn spawn_translation_job(
+    state: &AppState,
+    provider_id: String,
+    fallback_provider_ids: Option<Vec<String>>,
+    options: TranslationOptions,
+) -> std::result::Result<String, String> {
     let reg = state.provider_registry.read().await;
-    if reg.get(&req.provider_id).is_none() {
-        return Err(err(StatusCode::NOT_FOUND, "provider not found"));
+    if reg.get(&provider_id).is_none() {
+        return Err("provider not found".into());
     }
 
-    // Primary first, then unique fallbacks (skip duplicates of primary).
-    let mut chain = vec![req.provider_id.clone()];
-    if let Some(fallbacks) = &req.fallback_provider_ids {
-        for id in fallbacks {
-            if !chain.iter().any(|c| c == id) {
-                chain.push(id.clone());
-            }
-        }
-    }
+    let chain = unique_provider_chain(provider_id.as_str(), fallback_provider_ids.as_deref());
 
     let mut resolve_map: std::collections::HashMap<
         String,
@@ -614,8 +609,10 @@ async fn translate_start(
     let cleanup_job_id = job_id.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            let is_terminal =
-                matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
+            let is_terminal = matches!(
+                event,
+                ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. }
+            );
             let _ = broadcast_tx_clone.send(event);
             if is_terminal {
                 break;
@@ -646,7 +643,7 @@ async fn translate_start(
             &resolve,
             db,
             glossary,
-            req.options,
+            options,
             tx,
             job_id_clone,
             cancel_clone,
@@ -659,6 +656,21 @@ async fn translate_start(
         job.abort_handle = handle.abort_handle();
     }
 
+    Ok(job_id)
+}
+
+async fn translate_start(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TranslateStartRequest>,
+) -> Result<Json<TranslateStartResponse>, ApiError> {
+    let job_id = spawn_translation_job(
+        &state,
+        req.provider_id,
+        req.fallback_provider_ids,
+        req.options,
+    )
+    .await
+    .map_err(|m| err(StatusCode::NOT_FOUND, m))?;
     Ok(Json(TranslateStartResponse { job_id }))
 }
 
@@ -709,7 +721,10 @@ async fn handle_translate_ws(
     loop {
         match rx.recv().await {
             Ok(event) => {
-                let is_terminal = matches!(event, ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. });
+                let is_terminal = matches!(
+                    event,
+                    ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. }
+                );
                 let json = serde_json::to_string(&event).unwrap_or_default();
                 if socket.send(Message::Text(json)).await.is_err() {
                     break;
@@ -778,12 +793,7 @@ async fn inject(
         let backup = state.backup_manager.clone();
         let report = tokio::task::spawn_blocking(move || {
             locust_core::extraction::inject_direct(
-                &registry,
-                &db,
-                &backup,
-                &game_path,
-                &format_id,
-                &languages,
+                &registry, &db, &backup, &game_path, &format_id, &languages,
             )
         })
         .await
@@ -817,12 +827,9 @@ async fn inject(
     // Persist what each language's injection wrote — `locust patch` packs
     // exclusively from this recording, so an inject seam that skips it
     // produces projects that can never be packed.
-    locust_core::extraction::record_multilang_injection(
-        &state.db,
-        &report,
-        &languages,
-        &|_lang| INJECT_RECORD_REMEDY.to_string(),
-    )
+    locust_core::extraction::record_multilang_injection(&state.db, &report, &languages, &|_lang| {
+        INJECT_RECORD_REMEDY.to_string()
+    })
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
@@ -908,8 +915,8 @@ async fn resolve_patch_zip(
             Ok((path, None))
         }
         (None, Some(url)) => {
-            let dir = tempfile::TempDir::new()
-                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let dir =
+                tempfile::TempDir::new().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             let dest = dir.path().join("locust-patch.zip");
             download_patch_zip_async(&url, &dest).await?;
             Ok((dest, Some(dir)))
@@ -918,18 +925,14 @@ async fn resolve_patch_zip(
             StatusCode::BAD_REQUEST,
             "pass either zip_path or zip_url, not both",
         )),
-        (None, None) => Err(err(
-            StatusCode::BAD_REQUEST,
-            "zip_path or zip_url required",
-        )),
+        (None, None) => Err(err(StatusCode::BAD_REQUEST, "zip_path or zip_url required")),
     }
 }
 
 async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError> {
     let max_bytes = locust_core::patch::zipsec::max_download_bytes();
-    let parsed = reqwest::Url::parse(url).map_err(|e| {
-        err(StatusCode::BAD_REQUEST, format!("invalid zip_url: {e}"))
-    })?;
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid zip_url: {e}")))?;
     match parsed.scheme() {
         "http" | "https" => {}
         other => {
@@ -962,8 +965,7 @@ async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError
         }
     }
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        std::fs::create_dir_all(parent).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
 
     // Stream to disk with a running cap, like the CLI does. Buffering the whole
@@ -1016,10 +1018,12 @@ struct PatchPackRequest {
 fn map_patch_err(e: locust_core::error::LocustError) -> ApiError {
     use locust_core::error::LocustError::*;
     let status = match &e {
-        PatchAlreadyApplied(_) | PatchDowngradeBlocked { .. } | PatchInterrupted(_)
-        | PatchLegacyUnconfirmed(_) | PatchVerificationFailed(_) | PatchBackupIncomplete(_) => {
-            StatusCode::CONFLICT
-        }
+        PatchAlreadyApplied(_)
+        | PatchDowngradeBlocked { .. }
+        | PatchInterrupted(_)
+        | PatchLegacyUnconfirmed(_)
+        | PatchVerificationFailed(_)
+        | PatchBackupIncomplete(_) => StatusCode::CONFLICT,
         PatchUnsafeEntry(_) | GameDirNotWritable(_) | PatchError(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -1052,7 +1056,7 @@ async fn patch_pack(
         .map(|p| p.id().to_string());
 
     let db = state.db.clone();
-    let db_path_for_errors = state.db_path.clone();
+    let db_path_for_errors = db.path();
     let report = tokio::task::spawn_blocking(move || {
         locust_core::patch::pack_injection_recording(
             &db,
@@ -1078,11 +1082,8 @@ async fn patch_verify(
     Json(req): Json<PatchPathsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (zip, _guard) = resolve_patch_zip(req.zip_path, req.zip_url).await?;
-    let report = locust_core::patch::verify(
-        &PathBuf::from(&req.game_path),
-        &zip,
-    )
-    .map_err(map_patch_err)?;
+    let report =
+        locust_core::patch::verify(&PathBuf::from(&req.game_path), &zip).map_err(map_patch_err)?;
     Ok(Json(serde_json::json!({
         "outcome": format!("{:?}", report.outcome),
         "tier": report.tier.map(|t| format!("{:?}", t)),
@@ -1106,12 +1107,11 @@ async fn patch_apply(
     };
     // Apply is disk-bound and journaled; run off the async runtime.
     let game = PathBuf::from(&req.game_path);
-    let report = tokio::task::spawn_blocking(move || {
-        locust_core::patch::apply(&game, &zip, opts, |_| {})
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .map_err(map_patch_err)?;
+    let report =
+        tokio::task::spawn_blocking(move || locust_core::patch::apply(&game, &zip, opts, |_| {}))
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .map_err(map_patch_err)?;
     Ok(Json(serde_json::json!({
         "patch_id": report.patch_id,
         "patch_version": report.patch_version,
@@ -1184,11 +1184,14 @@ async fn patch_status(
     Ok(Json(body))
 }
 
-async fn validate(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let entries = state.db.get_entries(&EntryFilter::default()).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let validation = Validator::validate_and_save(&entries, &state.db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+async fn validate(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
+    let entries = state
+        .db
+        .get_entries(&EntryFilter::default())
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let validation = Validator::validate_and_save(&entries, &state.db)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let proj = state.current_project.read().await;
     let fonts: Vec<FontCoverageReport> = if let Some(ref p) = *proj {
@@ -1229,7 +1232,12 @@ async fn add_glossary(
 ) -> Result<StatusCode, ApiError> {
     state
         .glossary
-        .add(&entry.term, &entry.translation, &entry.lang_pair, entry.context.as_deref())
+        .add(
+            &entry.term,
+            &entry.translation,
+            &entry.lang_pair,
+            entry.context.as_deref(),
+        )
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(StatusCode::CREATED)
 }
@@ -1255,7 +1263,10 @@ async fn export_po(
     State(state): State<Arc<AppState>>,
     Query(q): Query<LangQuery>,
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
-    let entries = state.db.get_entries(&EntryFilter::default()).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let entries = state
+        .db
+        .get_entries(&EntryFilter::default())
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let config = state.config.read().await;
     let source = state
         .db
@@ -1265,8 +1276,14 @@ async fn export_po(
     Ok((
         StatusCode::OK,
         [
-            ("Content-Type".to_string(), "text/plain; charset=utf-8".to_string()),
-            ("Content-Disposition".to_string(), format!("attachment; filename=\"translation_{}.po\"", q.lang)),
+            (
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            (
+                "Content-Disposition".to_string(),
+                format!("attachment; filename=\"translation_{}.po\"", q.lang),
+            ),
         ],
         po,
     ))
@@ -1288,20 +1305,29 @@ async fn import_po(
             skipped += 1;
             continue;
         };
-        match state.db.save_translation(id, &pe.translation, "import").await {
+        match state
+            .db
+            .save_translation(id, &pe.translation, "import")
+            .await
+        {
             Ok(true) => imported += 1,
             Ok(false) => skipped += 1,
             Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     }
-    Ok(Json(serde_json::json!({"imported": imported, "skipped": skipped})))
+    Ok(Json(
+        serde_json::json!({"imported": imported, "skipped": skipped}),
+    ))
 }
 
 async fn export_xliff(
     State(state): State<Arc<AppState>>,
     Query(q): Query<LangQuery>,
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
-    let entries = state.db.get_entries(&EntryFilter::default()).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let entries = state
+        .db
+        .get_entries(&EntryFilter::default())
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let config = state.config.read().await;
     let source = state
         .db
@@ -1311,8 +1337,14 @@ async fn export_xliff(
     Ok((
         StatusCode::OK,
         [
-            ("Content-Type".to_string(), "application/xml; charset=utf-8".to_string()),
-            ("Content-Disposition".to_string(), format!("attachment; filename=\"translation_{}.xliff\"", q.lang)),
+            (
+                "Content-Type".to_string(),
+                "application/xml; charset=utf-8".to_string(),
+            ),
+            (
+                "Content-Disposition".to_string(),
+                format!("attachment; filename=\"translation_{}.xliff\"", q.lang),
+            ),
         ],
         xliff,
     ))
@@ -1330,13 +1362,19 @@ async fn import_xliff(
             skipped += 1;
             continue;
         }
-        match state.db.save_translation(&unit.id, &unit.target, "import").await {
+        match state
+            .db
+            .save_translation(&unit.id, &unit.target, "import")
+            .await
+        {
             Ok(true) => imported += 1,
             Ok(false) => skipped += 1,
             Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     }
-    Ok(Json(serde_json::json!({"imported": imported, "skipped": skipped})))
+    Ok(Json(
+        serde_json::json!({"imported": imported, "skipped": skipped}),
+    ))
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -1346,8 +1384,15 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     if let Some(providers) = val.get_mut("providers").and_then(|v| v.as_object_mut()) {
         for (_id, pc) in providers.iter_mut() {
             if let Some(obj) = pc.as_object_mut() {
-                if obj.get("api_key").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-                    obj.insert("api_key".to_string(), serde_json::Value::String("***".to_string()));
+                if obj
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    obj.insert(
+                        "api_key".to_string(),
+                        serde_json::Value::String("***".to_string()),
+                    );
                 }
             }
         }
@@ -1367,7 +1412,8 @@ async fn patch_config(
             cur_obj.insert(k.clone(), v.clone());
         }
     }
-    *config = serde_json::from_value(current.clone()).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    *config =
+        serde_json::from_value(current.clone()).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     // Persist to disk
     let _ = config.save(&AppConfig::default_path());
     Ok(Json(current))
@@ -1376,8 +1422,14 @@ async fn patch_config(
 async fn memory_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let project = state.db.memory_count().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let global = state.global_memory.memory_count().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let project = state
+        .db
+        .memory_count()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let global = state
+        .global_memory
+        .memory_count()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::json!({
         "project_entries": project,
         "global_entries": global,
@@ -1390,8 +1442,14 @@ async fn list_memory(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let search = params.get("search").map(|s| s.as_str());
     let lang_pair = params.get("lang_pair").map(|s| s.as_str());
-    let limit: usize = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
-    let offset: usize = params.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let limit: usize = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let offset: usize = params
+        .get("offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let (entries, total) = state
         .global_memory
@@ -1536,7 +1594,10 @@ mod download_guard_tests {
         // The body never ends, so only a running byte count can stop it.
         // Buffering the whole response first would read forever and time out.
         let cap = 64 * 1024;
-        std::env::set_var(locust_core::patch::zipsec::MAX_DOWNLOAD_ENV, cap.to_string());
+        std::env::set_var(
+            locust_core::patch::zipsec::MAX_DOWNLOAD_ENV,
+            cap.to_string(),
+        );
         let url = serve_chunked(usize::MAX).await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("p.zip");
@@ -1590,7 +1651,11 @@ mod tests {
     #[tokio::test]
     async fn test_health_returns_ok() {
         let (url, _h) = setup().await;
-        let resp = client().get(format!("{}/health", url)).send().await.unwrap();
+        let resp = client()
+            .get(format!("{}/health", url))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "ok");
@@ -1599,7 +1664,11 @@ mod tests {
     #[tokio::test]
     async fn test_list_formats_not_empty() {
         let (url, _h) = setup().await;
-        let resp = client().get(format!("{}/api/formats", url)).send().await.unwrap();
+        let resp = client()
+            .get(format!("{}/api/formats", url))
+            .send()
+            .await
+            .unwrap();
         let body: Vec<serde_json::Value> = resp.json().await.unwrap();
         assert!(!body.is_empty());
     }
@@ -1607,7 +1676,11 @@ mod tests {
     #[tokio::test]
     async fn test_list_providers_not_empty() {
         let (url, _h) = setup().await;
-        let resp = client().get(format!("{}/api/providers", url)).send().await.unwrap();
+        let resp = client()
+            .get(format!("{}/api/providers", url))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body: Vec<serde_json::Value> = resp.json().await.unwrap();
         assert!(!body.is_empty());
@@ -1679,7 +1752,8 @@ mod tests {
     #[tokio::test]
     async fn test_open_unknown_format_returns_422() {
         let (url, _h) = setup().await;
-        let dir = std::env::temp_dir().join(format!("locust_test_noformat_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("locust_test_noformat_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let resp = client()
             .post(format!("{}/api/project/open", url))

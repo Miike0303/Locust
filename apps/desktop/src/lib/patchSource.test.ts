@@ -3,6 +3,7 @@
  */
 import assert from "node:assert/strict";
 import {
+  PATCH_SOURCE_ERROR,
   isHttpPatchUrl,
   patchSourceReady,
   patchUrlLooksLikeZip,
@@ -37,14 +38,15 @@ assert.deepEqual(resolvePatchSource("", "  https://ex.com/a.zip  "), {
 
 const both = resolvePatchSource("a.zip", "https://x/a.zip");
 assert.ok(both && "error" in both);
-assert.match(both.error, /not both/i);
+assert.equal(both.error, PATCH_SOURCE_ERROR.both);
 
 const bad = resolvePatchSource("", "file:///tmp/a.zip");
 assert.ok(bad && "error" in bad);
-assert.match(bad.error, /http/i);
+assert.equal(bad.error, PATCH_SOURCE_ERROR.badUrl);
 
 const noHost = resolvePatchSource("", "https://");
 assert.ok(noHost && "error" in noHost);
+assert.equal(noHost.error, PATCH_SOURCE_ERROR.badUrl);
 
 assert.equal(patchSourceReady(null), false);
 assert.equal(patchSourceReady({ error: "x" }), false);

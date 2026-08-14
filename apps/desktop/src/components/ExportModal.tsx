@@ -16,6 +16,7 @@ import {
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
+import { useT } from "../lib/i18n";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -32,6 +33,7 @@ export default function ExportModal({
 	onClose,
 	onImported,
 }: ExportModalProps) {
+	const t = useT();
 	const { project } = useProjectStore();
 	const [mode, setMode] = useState<Mode>("export");
 	const [format, setFormat] = useState<ExportFormat>("po");
@@ -54,12 +56,12 @@ export default function ExportModal({
 			if (IS_TAURI) {
 				const { save } = await import("@tauri-apps/plugin-dialog");
 				const selected = await save({
-					title: "Export translations",
+					title: t("export.dialog.export"),
 					defaultPath: defaultName,
 					filters: [
 						format === "po"
-							? { name: "Gettext PO", extensions: ["po"] }
-							: { name: "XLIFF", extensions: ["xliff", "xlf"] },
+							? { name: t("export.filter.po"), extensions: ["po"] }
+							: { name: t("export.filter.xliff"), extensions: ["xliff", "xlf"] },
 					],
 				});
 				if (typeof selected !== "string" || !selected) {
@@ -70,7 +72,7 @@ export default function ExportModal({
 			}
 
 			const result = await exportTranslations(format, lang, path);
-			addToast("success", `Exported ${format.toUpperCase()} → ${result.path}`);
+			addToast("success", t("export.toast.exported", { format: format.toUpperCase(), path: result.path }));
 			addLog(
 				"info",
 				`Export ${format} (${lang}): ${result.bytes} bytes`,
@@ -80,7 +82,7 @@ export default function ExportModal({
 			onClose();
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addToast("error", `Export failed: ${msg}`);
+			addToast("error", t("export.toast.exportFailed", { error: msg }));
 			addLog("error", "Export failed", msg, "export");
 		} finally {
 			setLoading(false);
@@ -93,9 +95,12 @@ export default function ExportModal({
 			const result = await importTranslations(format, path);
 			addToast(
 				"success",
-				`Imported ${result.imported} translation(s)${
-					result.skipped ? ` (${result.skipped} skipped)` : ""
-				}`,
+				result.skipped
+					? t("export.toast.importedSkipped", {
+							count: result.imported,
+							skipped: result.skipped,
+						})
+					: t("export.toast.imported", { count: result.imported }),
 			);
 			addLog(
 				"info",
@@ -107,7 +112,7 @@ export default function ExportModal({
 			onClose();
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addToast("error", `Import failed: ${msg}`);
+			addToast("error", t("export.toast.importFailed", { error: msg }));
 			addLog("error", "Import failed", msg, "import");
 		} finally {
 			setLoading(false);
@@ -118,12 +123,12 @@ export default function ExportModal({
 		if (IS_TAURI) {
 			const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
 			const selected = await openDialog({
-				title: "Import translations",
+				title: t("export.dialog.import"),
 				multiple: false,
 				filters: [
 					format === "po"
-						? { name: "Gettext PO", extensions: ["po"] }
-						: { name: "XLIFF", extensions: ["xliff", "xlf", "xml"] },
+						? { name: t("export.filter.po"), extensions: ["po"] }
+						: { name: t("export.filter.xliff"), extensions: ["xliff", "xlf", "xml"] },
 				],
 			});
 			if (typeof selected !== "string" || !selected) return;
@@ -139,7 +144,7 @@ export default function ExportModal({
 		setLoading(true);
 		try {
 			const result = await importTranslations(format, text);
-			addToast("success", `Imported ${result.imported} translation(s)`);
+			addToast("success", t("export.toast.imported", { count: result.imported }));
 			addLog(
 				"info",
 				`Import ${format}: ${result.imported} applied`,
@@ -150,7 +155,7 @@ export default function ExportModal({
 			onClose();
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addToast("error", `Import failed: ${msg}`);
+			addToast("error", t("export.toast.importFailed", { error: msg }));
 			addLog("error", "Import failed", msg, "import");
 		} finally {
 			setLoading(false);
@@ -170,7 +175,7 @@ export default function ExportModal({
 						className="text-lg font-bold flex items-center gap-2"
 					>
 						{mode === "export" ? <Download size={18} /> : <Upload size={18} />}
-						{mode === "export" ? "Export Translations" : "Import Translations"}
+						{mode === "export" ? t("export.exportTitle") : t("export.importTitle")}
 					</h2>
 					<button
 						onClick={onClose}
@@ -190,7 +195,7 @@ export default function ExportModal({
 								: "text-gray-500 hover:text-gray-700"
 						}`}
 					>
-						Export
+						{t("export.export")}
 					</button>
 					<button
 						type="button"
@@ -201,13 +206,13 @@ export default function ExportModal({
 								: "text-gray-500 hover:text-gray-700"
 						}`}
 					>
-						Import
+						{t("export.import")}
 					</button>
 				</div>
 
 				<div className="space-y-4">
 					<div>
-						<label className="text-sm font-medium">Format</label>
+						<label className="text-sm font-medium">{t("export.format")}</label>
 						<select
 							value={format}
 							onChange={(e) => setFormat(e.target.value as ExportFormat)}
@@ -220,7 +225,7 @@ export default function ExportModal({
 
 					{mode === "export" && (
 						<div>
-							<label className="text-sm font-medium">Target language</label>
+							<label className="text-sm font-medium">{t("export.targetLang")}</label>
 							<select
 								value={lang}
 								onChange={(e) => setLang(e.target.value)}
@@ -237,9 +242,7 @@ export default function ExportModal({
 
 					{mode === "import" && (
 						<p className="text-xs text-gray-500">
-							Matches entries by Locust string id embedded in the file. Empty
-							translations are skipped. Re-open strings in the editor after
-							import.
+							{t("export.importHint")}
 						</p>
 					)}
 
@@ -263,7 +266,7 @@ export default function ExportModal({
 							onClick={onClose}
 							className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
 						>
-							Cancel
+							{t("common.cancel")}
 						</button>
 						<button
 							onClick={() => {
@@ -274,19 +277,19 @@ export default function ExportModal({
 						>
 							{loading ? (
 								mode === "export" ? (
-									"Exporting..."
+									t("export.exporting")
 								) : (
-									"Importing..."
+									t("export.importing")
 								)
 							) : mode === "export" ? (
 								<>
 									<FolderOpen size={16} />
-									{IS_TAURI ? "Save as…" : "Download"}
+									{IS_TAURI ? t("common.saveAs") : t("export.download")}
 								</>
 							) : (
 								<>
 									<Upload size={16} />
-									{IS_TAURI ? "Choose file…" : "Upload file"}
+									{IS_TAURI ? t("export.chooseFile") : t("export.uploadFile")}
 								</>
 							)}
 						</button>

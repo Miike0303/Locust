@@ -28,6 +28,7 @@ import {
 	modalPanelClass,
 } from "../lib/modalA11y";
 import { operationalShortcutTarget } from "../lib/settingsNav";
+import { useT } from "../lib/i18n";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -45,6 +46,7 @@ export default function InjectModal({
 	onClose,
 	onOpenPack,
 }: InjectModalProps) {
+	const t = useT();
 	const navigate = useNavigate();
 	const { project } = useProjectStore();
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
@@ -122,12 +124,12 @@ export default function InjectModal({
 		if (IS_TAURI) {
 			const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
 			const selected = await openDialog({
-				title: "Select output folder for injected game copies",
+				title: t("inject.dialog.outputFolder"),
 				directory: true,
 			});
 			if (typeof selected === "string") setOutputDir(selected);
 		} else {
-			const path = prompt("Enter output folder path:");
+			const path = prompt(t("inject.prompt.outputFolder"));
 			if (path) setOutputDir(path);
 		}
 	};
@@ -145,7 +147,7 @@ export default function InjectModal({
 
 	const runRegisterLang = async (quiet = false): Promise<boolean> => {
 		if (selectedLangs.length === 0) {
-			if (!quiet) addToast("error", "Select at least one language to register");
+			if (!quiet) addToast("error", t("inject.toast.selectLangRegister"));
 			return false;
 		}
 		setRegLoading(true);
@@ -180,12 +182,12 @@ export default function InjectModal({
 			if (anyChange) {
 				addToast(
 					"success",
-					`Registered ${done.length} language(s) in game UI (backups *.bak-locust)`,
+					t("inject.toast.registered", { count: done.length }),
 				);
 			} else {
 				addToast(
 					"warning",
-					"No Iavra/VisuMZ language patterns or Map boot choices matched — game may not use multi-lang UI plugins",
+					t("inject.toast.noPatterns"),
 					8000,
 				);
 			}
@@ -193,7 +195,7 @@ export default function InjectModal({
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addLog("error", "register-lang failed", msg, "inject");
-			addToast("error", `register-lang failed: ${msg}`);
+			addToast("error", t("inject.toast.registerFailed", { error: msg }));
 			return false;
 		} finally {
 			setRegLoading(false);
@@ -206,11 +208,11 @@ export default function InjectModal({
 
 	const handleInject = async () => {
 		if (mode === "replace" && !outputDir.trim()) {
-			addToast("error", "Select an output folder for Replace mode");
+			addToast("error", t("inject.toast.selectOutput"));
 			return;
 		}
 		if (selectedLangs.length === 0) {
-			addToast("error", "Select at least one language");
+			addToast("error", t("inject.toast.selectLang"));
 			return;
 		}
 		try {
@@ -228,7 +230,7 @@ export default function InjectModal({
 				if (binary > 0) {
 					addToast(
 						"warning",
-						`${binary} translation(s) exceed binary inject slots and will be skipped — shorten them or re-run Validate`,
+						t("inject.toast.binarySlots", { count: binary }),
 						8000,
 					);
 					addLog(
@@ -273,8 +275,8 @@ export default function InjectModal({
 			addToast(
 				"success",
 				isDirect
-					? `Direct inject: ${report.strings_written ?? 0} string(s) written`
-					: `Injected ${report.languages_processed.length} language(s)`,
+					? t("inject.toast.direct", { count: report.strings_written ?? 0 })
+					: t("inject.toast.injected", { count: report.languages_processed.length }),
 			);
 
 			// Optional: register selected lang(s) in RM multi-lang UI after inject.
@@ -284,7 +286,7 @@ export default function InjectModal({
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addLog("error", "Inject failed", msg, "inject");
-			addToast("error", `Inject failed: ${msg}`);
+			addToast("error", t("inject.toast.failed", { error: msg }));
 		} finally {
 			setLoading(false);
 		}
@@ -303,7 +305,7 @@ export default function InjectModal({
 			>
 				<div className="flex justify-between items-center mb-4">
 					<h2 {...titleProps} className="text-lg font-bold">
-						Inject Translations
+						{t("inject.title")}
 					</h2>
 					<button
 						onClick={onClose}
@@ -316,7 +318,7 @@ export default function InjectModal({
 				{!result ? (
 					<div className="space-y-4">
 						<div>
-							<label className="text-sm font-medium">Mode</label>
+							<label className="text-sm font-medium">{t("inject.mode")}</label>
 							<select
 								value={mode}
 								onChange={(e) => setMode(e.target.value as InjectUiMode)}
@@ -324,31 +326,28 @@ export default function InjectModal({
 							>
 								{injectModes.includes("replace") && (
 									<option value="replace">
-										Replace — copy game to output folder with translations
+										{t("inject.mode.replace")}
 									</option>
 								)}
 								{injectModes.includes("add") && (
 									<option value="add">
-										Add — create translation folders inside original game
+										{t("inject.mode.add")}
 									</option>
 								)}
 								{injectModes.includes("direct") && (
 									<option value="direct">
-										Direct — write into the game folder (backup created first)
+										{t("inject.mode.direct")}
 									</option>
 								)}
 							</select>
 							<p className="text-xs text-gray-500 mt-1">
 								{mode === "replace" &&
-									`Copies the game to a new folder with translations applied — your original stays untouched. Creates: [output]/${gameName}-[lang]/`}
-								{mode === "add" &&
-									"Adds the translation as an extra language the game can switch to (a tl/[lang]/ folder inside the game)"}
-								{mode === "direct" &&
-									"Writes translations into the game folder in place (a backup is created first). Required before packing a patch in Patch → Pack."}
+									t("inject.hint.replace", { gameName })}
+								{mode === "add" && t("inject.hint.add")}
+								{mode === "direct" && t("inject.hint.direct")}
 								{!injectModes.includes("add") && (
 									<span className="block mt-0.5">
-										This format only supports Replace/Direct (no Add language
-										packs).
+										{t("inject.hint.noAdd")}
 									</span>
 								)}
 							</p>
@@ -357,21 +356,17 @@ export default function InjectModal({
 						{mode === "direct" && (
 							<div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded text-sm text-amber-900 dark:text-amber-100 space-y-1">
 								<p className="font-medium flex items-center gap-1.5">
-									<AlertCircle size={16} /> Direct mode mutates original game
-									files
+									<AlertCircle size={16} /> {t("inject.direct.warnTitle")}
 								</p>
 								<ul className="list-disc pl-5 text-xs space-y-0.5">
 									<li>
-										An automatic backup is created when the engine writes in
-										place.
+										{t("inject.direct.li1")}
 									</li>
 									<li>
-										Locust records what it writes, labeled by the selected
-										language(s).
+										{t("inject.direct.li2")}
 									</li>
 									<li>
-										After success you can pack that recording into a shareable
-										patch zip (Patch → Pack).
+										{t("inject.direct.li3")}
 									</li>
 								</ul>
 							</div>
@@ -379,11 +374,11 @@ export default function InjectModal({
 
 						<div>
 							<label className="text-sm font-medium">
-								Languages
+								{t("inject.languages")}
 								{mode === "direct" && (
 									<span className="font-normal text-gray-500">
 										{" "}
-										(recording key)
+										{t("inject.recordingKey")}
 									</span>
 								)}
 							</label>
@@ -403,11 +398,15 @@ export default function InjectModal({
 								))}
 							</div>
 							<p className="text-xs text-gray-500 mt-1">
-								Selected:{" "}
-								{selectedLangs.length === 0 ? "none" : selectedLangs.join(", ")}
+								{t("inject.selected", {
+									langs:
+										selectedLangs.length === 0
+											? t("inject.selectedNone")
+											: selectedLangs.join(", "),
+								})}
 								{mode === "direct" && selectedLangs.length > 1 && (
 									<span className="block mt-0.5">
-										Each language gets its own recording for patch packing.
+										{t("inject.multiRecording")}
 									</span>
 								)}
 							</p>
@@ -416,19 +415,19 @@ export default function InjectModal({
 						{mode === "replace" && (
 							<div>
 								<label className="text-sm font-medium">
-									Output folder <span className="text-red-500">*</span>
+									{t("inject.outputFolder")} <span className="text-red-500">*</span>
 								</label>
 								<div className="flex gap-2 mt-1">
 									<input
 										value={outputDir}
 										onChange={(e) => setOutputDir(e.target.value)}
-										placeholder="Choose where to save translated copies..."
+										placeholder={t("inject.outputPlaceholder")}
 										className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 									/>
 									<button
 										onClick={handlePickFolder}
 										className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm transition-colors"
-										title="Browse folders"
+										title={t("inject.browseTitle")}
 									>
 										<FolderOpen size={16} />
 									</button>
@@ -436,13 +435,14 @@ export default function InjectModal({
 								{!outputDir.trim() && (
 									<p className="flex items-center gap-1 text-xs text-amber-500 mt-1">
 										<AlertCircle size={12} />
-										Required — select a folder to save the translated game copy
+										{t("inject.outputRequired")}
 									</p>
 								)}
 								{outputDir.trim() && (
 									<p className="text-xs text-gray-500 mt-1">
-										Will create: {outputDir}/{gameName}-
-										{selectedLangs[0] || "lang"}/
+										{t("inject.willCreate", {
+											path: `${outputDir}/${gameName}-${selectedLangs[0] || "lang"}/`,
+										})}
 									</p>
 								)}
 							</div>
@@ -451,7 +451,7 @@ export default function InjectModal({
 						<div className="pt-2 flex items-center gap-3 text-xs text-gray-500">
 							<FileCheck size={14} />
 							<span>
-								Source: <strong>{project.name}</strong> ({project.format_id})
+								{t("inject.source", { name: project.name, format: project.format_id })}
 							</span>
 						</div>
 
@@ -461,18 +461,16 @@ export default function InjectModal({
 							className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
 						>
 							{loading
-								? "Injecting..."
+								? t("inject.injecting")
 								: mode === "direct"
-									? "Direct inject & record"
-									: "Inject Translations"}
+									? t("inject.directAction")
+									: t("inject.injectAction")}
 						</button>
 
 						{isRpgMaker && (
 							<div className="pt-1 border-t dark:border-gray-700 space-y-2">
 								<p className="text-xs text-gray-500">
-									For RPG Maker games with an in-game language menu: add the
-									selected language(s) to that menu without writing any
-									translations.
+									{t("inject.rpgHint")}
 								</p>
 								<label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400 cursor-pointer">
 									<input
@@ -491,12 +489,12 @@ export default function InjectModal({
 											}
 										}}
 									/>
-									After inject, also register language(s) in game UI
+									{t("inject.autoRegister")}
 								</label>
 								{selectedLangs.length === 1 && (
 									<div>
 										<label className="text-xs font-medium text-gray-600 dark:text-gray-400">
-											Menu label (optional)
+											{t("inject.menuLabel")}
 										</label>
 										<input
 											type="text"
@@ -506,9 +504,9 @@ export default function InjectModal({
 											className="w-full mt-0.5 p-1.5 text-sm border rounded dark:bg-gray-800 dark:border-gray-600"
 										/>
 										<p className="text-[11px] text-gray-500 mt-0.5">
-											Name shown in the game&apos;s language menu. Leave empty
-											for “{defaultLabelFor(selectedLangs[0])}”. Remembered
-											across sessions.
+											{t("inject.menuLabelHint", {
+												label: defaultLabelFor(selectedLangs[0]),
+											})}
 										</p>
 									</div>
 								)}
@@ -519,15 +517,17 @@ export default function InjectModal({
 									className="w-full py-1.5 text-sm border border-violet-300 dark:border-violet-700 text-violet-800 dark:text-violet-200 hover:bg-violet-50 dark:hover:bg-violet-950/40 disabled:opacity-50 rounded font-medium"
 								>
 									{regLoading
-										? "Registering…"
-										: `Register ${selectedLangs.join(", ") || "lang"} in game UI only`}
+										? t("inject.registering")
+										: t("inject.registerOnly", {
+												langs: selectedLangs.join(", ") || "lang",
+											})}
 								</button>
 								{regReports.length > 0 && (
 									<div className="text-xs text-violet-700 dark:text-violet-300 space-y-0.5">
 										{regReports.map(({ lang, label, report }) => (
 											<p key={lang}>
 												{lang} ({label}): plugins=
-												{report.plugins_js ? "yes" : "no"}, maps=
+												{report.plugins_js ? t("common.yes") : t("common.no")}, maps=
 												{report.maps_patched?.length ?? 0}
 											</p>
 										))}
@@ -540,44 +540,50 @@ export default function InjectModal({
 					<div className="space-y-4">
 						<div className="p-3 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 rounded text-sm">
 							<p className="font-medium text-emerald-700 dark:text-emerald-300">
-								Injection complete
+								{t("inject.injectionComplete")}
 							</p>
 							<p className="text-emerald-600 dark:text-emerald-400 mt-1">
-								Languages: {result.languages_processed.join(", ")}
+								{t("inject.languagesLine", {
+									langs: result.languages_processed.join(", "),
+								})}
 							</p>
 							<p className="text-emerald-600 dark:text-emerald-400">
-								Mode: {result.mode}
+								{t("inject.modeLine", { mode: result.mode })}
 							</p>
 							{isDirectResult && (
 								<>
 									<p className="text-emerald-600 dark:text-emerald-400">
-										Strings written: {result.strings_written ?? 0}, files
-										modified: {result.files_modified ?? 0}, skipped:{" "}
-										{result.strings_skipped ?? 0}
+										{t("inject.stringsWritten", {
+											written: result.strings_written ?? 0,
+											files: result.files_modified ?? 0,
+											skipped: result.strings_skipped ?? 0,
+										})}
 									</p>
 									{result.backup_path && (
 										<p className="text-xs text-emerald-700 dark:text-emerald-300 mt-1 break-all">
-											Backup: {result.backup_path}
+											{t("inject.backup", { path: result.backup_path })}
 										</p>
 									)}
 								</>
 							)}
 							{!isDirectResult && mode === "replace" && outputDir && (
 								<p className="text-emerald-600 dark:text-emerald-400">
-									Output: {outputDir}/
+									{t("inject.output", { path: outputDir })}
 								</p>
 							)}
 							{result.reports && Object.keys(result.reports).length > 0 && (
 								<div className="mt-2 space-y-1">
 									{Object.entries(result.reports).map(([lang, report]) => (
 										<p key={lang} className="text-xs text-emerald-500">
-											{lang}:{" "}
-											{(report as { strings_written?: number })
-												.strings_written ?? 0}{" "}
-											strings written,{" "}
-											{(report as { files_modified?: number }).files_modified ??
-												0}{" "}
-											files modified
+											{t("inject.langReport", {
+												lang,
+												written:
+													(report as { strings_written?: number })
+														.strings_written ?? 0,
+												files:
+													(report as { files_modified?: number })
+														.files_modified ?? 0,
+											})}
 										</p>
 									))}
 								</div>
@@ -587,12 +593,10 @@ export default function InjectModal({
 						{isDirectResult && (
 							<div className="p-3 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 rounded text-sm text-sky-900 dark:text-sky-100">
 								<p className="font-medium flex items-center gap-1.5">
-									<Package size={16} /> Recording saved
+									<Package size={16} /> {t("inject.recordingSaved")}
 								</p>
 								<p className="text-xs mt-1">
-									You can now pack a patch zip from this recording (Patch modal
-									→ Pack tab). Point the game folder at this project path for
-									direct inject.
+									{t("inject.recordingHint")}
 								</p>
 								{onOpenPack && (
 									<button
@@ -603,7 +607,7 @@ export default function InjectModal({
 										}}
 										className="mt-2 text-xs font-medium text-sky-700 dark:text-sky-300 hover:underline"
 									>
-										Open Patch → Pack
+										{t("inject.openPack")}
 									</button>
 								)}
 							</div>
@@ -611,7 +615,7 @@ export default function InjectModal({
 
 						{result.languages_failed?.length > 0 && (
 							<div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 rounded text-sm">
-								<p className="font-medium text-red-700">Failed languages:</p>
+								<p className="font-medium text-red-700">{t("inject.failedLanguages")}</p>
 								{result.languages_failed.map(([lang, err]) => (
 									<p key={lang} className="text-red-600 text-xs mt-1">
 										{lang}: {err}
@@ -623,18 +627,17 @@ export default function InjectModal({
 						{isRpgMaker && (
 							<div className="p-3 bg-violet-50 dark:bg-violet-950/30 border border-violet-200 dark:border-violet-800 rounded text-sm space-y-2">
 								<p className="font-medium text-violet-900 dark:text-violet-100">
-									Register language in game UI
+									{t("inject.registerInUi")}
 								</p>
 								<p className="text-xs text-violet-800 dark:text-violet-200">
-									For games with a built-in language menu (Iavra / VisuMZ): adds
-									the selected language(s) to that menu. Every changed file is
-									backed up first (<code className="px-0.5">*.bak-locust</code>
+									{t("inject.registerInUiHint")}
+									<code className="px-0.5">*.bak-locust</code>
 									).
 								</p>
 								{selectedLangs.length === 1 && (
 									<div>
 										<label className="text-xs font-medium text-violet-900 dark:text-violet-100">
-											Menu label (optional)
+											{t("inject.menuLabel")}
 										</label>
 										<input
 											type="text"
@@ -644,8 +647,9 @@ export default function InjectModal({
 											className="w-full mt-0.5 p-1.5 text-sm border border-violet-200 dark:border-violet-700 rounded dark:bg-gray-900"
 										/>
 										<p className="text-[11px] text-violet-700 dark:text-violet-300 mt-0.5">
-											Name shown in the game&apos;s language menu. Leave empty
-											for “{defaultLabelFor(selectedLangs[0])}”.
+											{t("inject.menuLabelHintShort", {
+												label: defaultLabelFor(selectedLangs[0]),
+											})}
 										</p>
 									</div>
 								)}
@@ -656,15 +660,17 @@ export default function InjectModal({
 									className="w-full py-1.5 text-sm bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded font-medium"
 								>
 									{regLoading
-										? "Registering…"
-										: `Register ${selectedLangs.join(", ") || "lang"} in UI`}
+										? t("inject.registering")
+										: t("inject.registerUi", {
+												langs: selectedLangs.join(", ") || "lang",
+											})}
 								</button>
 								{regReports.length > 0 && (
 									<div className="text-xs text-violet-700 dark:text-violet-300 space-y-1">
 										{regReports.map(({ lang, label, report }) => (
 											<p key={lang}>
 												{lang} ({label}): plugins=
-												{report.plugins_js ? "yes" : "no"}, maps=
+												{report.plugins_js ? t("common.yes") : t("common.no")}, maps=
 												{report.maps_patched?.length ?? 0}, backups=
 												{report.backups?.length ?? 0}
 												{report.notes?.length
@@ -685,13 +691,13 @@ export default function InjectModal({
 							}}
 							className="text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
 						>
-							Manage backups
+							{t("inject.manageBackups")}
 						</button>
 						<button
 							onClick={onClose}
 							className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
 						>
-							Close
+							{t("common.close")}
 						</button>
 					</div>
 				)}

@@ -47,7 +47,8 @@ fn create_renpy_fixture(dir: &Path) {
         "Not great":
             jump bad
 "#,
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 fn client() -> reqwest::Client {
@@ -110,7 +111,11 @@ async fn test_full_rpgmaker_mv_flow() {
         .unwrap();
 
     assert_eq!(resp.format_id, "rpgmaker-mv");
-    assert!(resp.total_strings >= 6, "got {} strings", resp.total_strings);
+    assert!(
+        resp.total_strings >= 6,
+        "got {} strings",
+        resp.total_strings
+    );
     let total = resp.total_strings;
 
     // 2. Get strings — all pending
@@ -199,7 +204,11 @@ async fn test_full_rpgmaker_mv_flow() {
         .iter()
         .filter(|e| e["status"] == "translated")
         .count();
-    assert_eq!(translated_count, total, "expected {} translated, got {}", total, translated_count);
+    assert_eq!(
+        translated_count, total,
+        "expected {} translated, got {}",
+        total, translated_count
+    );
     for e in &strings.entries {
         let t = e["translation"].as_str().unwrap_or("");
         let src = e["source"].as_str().unwrap_or("");
@@ -253,10 +262,20 @@ async fn test_full_rpgmaker_mv_flow() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let report: MultiLangReport = serde_json::from_value(body.clone())
         .unwrap_or_else(|_| panic!("failed to parse inject response: {:?}", body));
-    assert_eq!(report.languages_processed, vec!["es"], "inject report: {:?}", body);
+    assert_eq!(
+        report.languages_processed,
+        vec!["es"],
+        "inject report: {:?}",
+        body
+    );
 
     // 11. Verify output files
-    let game_name = tmpdir.path().file_name().unwrap().to_string_lossy().to_string();
+    let game_name = tmpdir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let output_actors = output_dir
         .join(format!("{}-es", game_name))
         .join("data")
@@ -342,12 +361,18 @@ async fn test_inject_records_the_injection_for_patch() {
     // The load-bearing side effect, read back from the SAME database file
     // the server wrote: a recording for "es" whose root is the per-language
     // copy the injection reported writing into.
-    let db = locust_core::database::Database::open(&db_path).unwrap();
+    let project_db = locust_core::project::resolve_project_db_path(tmpdir.path());
+    let db = locust_core::database::Database::open(&project_db).unwrap();
     let rec = db
         .get_injection(Some("es"))
         .unwrap()
         .expect("the HTTP inject seam must record the injection for `locust patch`");
-    let game_name = tmpdir.path().file_name().unwrap().to_string_lossy().to_string();
+    let game_name = tmpdir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let expected_root = output_dir.path().join(format!("{}-es", game_name));
     assert!(
         locust_core::database::paths_identical(&rec.root, &expected_root),
@@ -434,7 +459,8 @@ async fn test_inject_direct_records_on_game_root() {
     // RPG Maker MV replace-style plugin still reports via inject; strings may be written.
     assert!(v.get("backup_id").is_some(), "backup_id present: {body}");
 
-    let db = locust_core::database::Database::open(&db_path).unwrap();
+    let project_db = locust_core::project::resolve_project_db_path(tmpdir.path());
+    let db = locust_core::database::Database::open(&project_db).unwrap();
     let rec = db
         .get_injection(Some("es"))
         .unwrap()
@@ -505,7 +531,12 @@ async fn test_patch_pack_from_injection_recording() {
         .unwrap();
     assert_eq!(inject_resp.status(), 200, "inject must succeed before pack");
 
-    let game_name = tmpdir.path().file_name().unwrap().to_string_lossy().to_string();
+    let game_name = tmpdir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let recorded_root = output_dir.path().join(format!("{}-es", game_name));
     let pack_out = TempDir::new().unwrap();
     let zip_path = pack_out.path().join("locust-test-patch.zip");
@@ -544,7 +575,11 @@ async fn test_patch_pack_from_injection_recording() {
     assert_eq!(report.tier, "structural");
     assert_eq!(report.language, "es");
     assert!(report.size_bytes > 0);
-    assert!(zip_path.is_file(), "zip must exist at {}", report.output_path);
+    assert!(
+        zip_path.is_file(),
+        "zip must exist at {}",
+        report.output_path
+    );
     // Engine comes from format detect on the recorded tree (rpgmaker-mv).
     assert!(
         report.engine.contains("rpgmaker") || report.engine == "unknown",
@@ -663,7 +698,10 @@ async fn test_renpy_add_mode_flow() {
         .collect();
     assert!(!rpy_files.is_empty(), "should have .rpy files in tl/es/");
     let content = std::fs::read_to_string(rpy_files[0].path()).unwrap();
-    assert!(content.contains("translate es"), "should have translate es blocks");
+    assert!(
+        content.contains("translate es"),
+        "should have translate es blocks"
+    );
 }
 
 // ─── Validation catches placeholder issues ─────────────────────────────────
@@ -679,7 +717,11 @@ async fn test_validation_catches_placeholder_issues() {
         data.join("Actors.json"),
         r#"[null,{"id":1,"name":"\\c[2]Hero","description":"Desc","profile":"","note":"","battlerName":"","characterIndex":0,"characterName":"","classId":1,"equips":[],"faceIndex":0,"faceName":"","initialLevel":1,"maxLevel":99,"nickname":"","traits":[]}]"#,
     ).unwrap();
-    std::fs::write(data.join("System.json"), r#"{"gameTitle":"Test","terms":{"basic":[],"commands":[],"params":[],"messages":{}}}"#).unwrap();
+    std::fs::write(
+        data.join("System.json"),
+        r#"{"gameTitle":"Test","terms":{"basic":[],"commands":[],"params":[],"messages":{}}}"#,
+    )
+    .unwrap();
 
     let state = locust_server::create_test_state();
     let (base_url, _handle) = locust_server::start_test_server(state).await;
@@ -702,9 +744,10 @@ async fn test_validation_catches_placeholder_issues() {
         .await
         .unwrap();
 
-    let actor_entry = strings.entries.iter().find(|e| {
-        e["source"].as_str().unwrap_or("").contains("Hero")
-    });
+    let actor_entry = strings
+        .entries
+        .iter()
+        .find(|e| e["source"].as_str().unwrap_or("").contains("Hero"));
 
     if let Some(entry) = actor_entry {
         let id = entry["id"].as_str().unwrap();
@@ -880,9 +923,11 @@ async fn test_backup_restore() {
     // Verify restored
     let restored = std::fs::read_to_string(&actors).unwrap();
     assert_ne!(restored, "CORRUPTED");
-    assert!(restored.contains("Hero"), "original content should be restored");
+    assert!(
+        restored.contains("Hero"),
+        "original content should be restored"
+    );
 }
-
 
 // ─── Register language (RM multi-lang UI) ───────────────────────────────────
 
@@ -923,14 +968,22 @@ const langs = ['jp', 'en', 'zh'];
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(status, 200, "body: {body}");
     assert!(
-        body.get("plugins_js").and_then(|v| v.as_bool()).unwrap_or(false)
-            || body.get("iavra_languages").and_then(|v| v.as_bool()).unwrap_or(false),
+        body.get("plugins_js")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || body
+                .get("iavra_languages")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         "expected plugins patch: {body}"
     );
 
     let plugins = std::fs::read_to_string(root.join("js").join("plugins.js")).unwrap();
     assert!(plugins.contains("es"), "{plugins}");
-    assert!(plugins.contains("Español") || plugins.contains("'es'"), "{plugins}");
+    assert!(
+        plugins.contains("Español") || plugins.contains("'es'"),
+        "{plugins}"
+    );
     assert!(root.join("js").join("plugins.js.bak-locust").is_file());
 }
 
@@ -952,7 +1005,6 @@ async fn test_register_lang_rejects_bad_lang() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
-
 
 /// Recursively copy `src` into `dst` (created if missing).
 fn copy_tree(src: &Path, dst: &Path) {
@@ -1049,7 +1101,12 @@ async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
         .unwrap();
     assert_eq!(inject_resp.status(), 200, "inject must succeed before pack");
 
-    let game_name = tmpdir.path().file_name().unwrap().to_string_lossy().to_string();
+    let game_name = tmpdir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let recorded_root = output_dir.path().join(format!("{}-es", game_name));
     let pack_out = TempDir::new().unwrap();
     let zip_path = pack_out.path().join("lifecycle.zip");
@@ -1068,7 +1125,12 @@ async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
         .send()
         .await
         .unwrap();
-    assert_eq!(pack_resp.status(), 200, "pack: {}", pack_resp.text().await.unwrap());
+    assert_eq!(
+        pack_resp.status(),
+        200,
+        "pack: {}",
+        pack_resp.text().await.unwrap()
+    );
 
     // Target a pristine copy of the game, so rollback has something to prove.
     let target = TempDir::new().unwrap();
@@ -1106,9 +1168,15 @@ async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
     assert_eq!(vs, 200, "verify: {vbody}");
     let vjson: serde_json::Value = serde_json::from_str(&vbody).unwrap();
     assert_eq!(vjson["outcome"], "Clean", "verify outcome: {vbody}");
-    assert_eq!(vjson["tier"], "Strict", "pristine pack must verify strict: {vbody}");
+    assert_eq!(
+        vjson["tier"], "Strict",
+        "pristine pack must verify strict: {vbody}"
+    );
     assert!(
-        !vjson["replaced"].as_array().expect("replaced is a path list").is_empty(),
+        !vjson["replaced"]
+            .as_array()
+            .expect("replaced is a path list")
+            .is_empty(),
         "verify should plan replacements: {vbody}"
     );
     assert!(
@@ -1225,4 +1293,172 @@ async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
         before,
         "a refused apply must leave the game untouched"
     );
+}
+
+#[derive(Deserialize)]
+struct ProjectOpenMergeResponse {
+    format_id: String,
+    total_strings: usize,
+    added: usize,
+    updated: usize,
+    stale_source_reset: usize,
+    removed: usize,
+    preserved_translations: usize,
+    database_path: String,
+}
+
+#[tokio::test]
+async fn test_http_reopen_same_game_preserves_translations() {
+    let tmpdir = TempDir::new().unwrap();
+    create_rpgmaker_mv_fixture(tmpdir.path());
+
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state.clone()).await;
+
+    let first: ProjectOpenMergeResponse = client()
+        .post(format!("{}/api/project/open", base_url))
+        .json(&serde_json::json!({"path": tmpdir.path().to_string_lossy()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first.format_id, "rpgmaker-mv");
+    assert!(first.added >= 6);
+    assert_eq!(first.preserved_translations, 0);
+    assert!(first.database_path.ends_with(".locust.db"));
+
+    let strings: StringsResponse = client()
+        .get(format!("{}/api/strings?limit=1000", base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = strings.entries[0]["id"].as_str().unwrap().to_string();
+    // Ids carry `#` (and `[`/`]`), which a raw URL would read as a fragment —
+    // the PATCH would then miss the row and this test would fail later, at the
+    // preserved-translations assert, far from the cause.
+    let patched = client()
+        .patch(format!("{}/api/strings/{}", base_url, urlencoding(&id)))
+        .json(&serde_json::json!({"translation": "Hola", "status": "approved"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        patched.status().is_success(),
+        "PATCH must land before reopen can preserve anything, got {}",
+        patched.status()
+    );
+
+    let second: ProjectOpenMergeResponse = client()
+        .post(format!("{}/api/project/open", base_url))
+        .json(&serde_json::json!({"path": tmpdir.path().to_string_lossy()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(second.preserved_translations > 0);
+    assert_eq!(second.added, 0);
+    assert!(second.updated >= 1);
+
+    let after: StringsResponse = client()
+        .get(format!("{}/api/strings?limit=1000", base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let kept = after
+        .entries
+        .iter()
+        .find(|e| e["id"] == id)
+        .expect("translated id still present");
+    assert_eq!(kept["translation"], "Hola");
+    assert_eq!(kept["status"], "approved");
+}
+
+#[tokio::test]
+async fn test_http_and_core_open_produce_the_same_merge() {
+    let http_game = TempDir::new().unwrap();
+    let core_game = TempDir::new().unwrap();
+    create_rpgmaker_mv_fixture(http_game.path());
+    create_rpgmaker_mv_fixture(core_game.path());
+
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let http: ProjectOpenMergeResponse = client()
+        .post(format!("{}/api/project/open", base_url))
+        .json(&serde_json::json!({"path": http_game.path().to_string_lossy()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Tauri calls the same `project::open_project` the HTTP handler uses.
+    let db = locust_core::database::Database::open_in_memory().unwrap();
+    let reg = locust_formats::default_registry();
+    let core = locust_core::project::open_project(&db, &reg, core_game.path(), None).unwrap();
+
+    assert_eq!(http.added, core.added);
+    assert_eq!(http.updated, core.updated);
+    assert_eq!(http.stale_source_reset, core.stale_source_reset);
+    assert_eq!(http.removed, core.removed);
+    assert_eq!(http.preserved_translations, core.preserved_translations);
+    assert_eq!(http.total_strings, core.total_strings);
+}
+
+#[tokio::test]
+async fn test_spawn_translation_job_falls_back_to_second_provider() {
+    use locust_core::models::{StringEntry, StringStatus};
+    use locust_core::translation::TranslationOptions;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let state = locust_server::create_test_state();
+    {
+        let mut reg = state.provider_registry.write().await;
+        reg.register(Arc::new(locust_providers::mock::AlwaysErrorProvider));
+    }
+    state
+        .db
+        .save_entries(&[StringEntry::new(
+            "e1",
+            "Hello world",
+            PathBuf::from("a.json"),
+        )])
+        .unwrap();
+
+    locust_server::spawn_translation_job(
+        &state,
+        "always-error".into(),
+        Some(vec!["mock".into()]),
+        TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got = state.db.get_entry("e1").unwrap().unwrap();
+        if got.status == StringStatus::Translated {
+            assert_eq!(got.provider_used.as_deref(), Some("mock"));
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("fallback did not finish: {:?}", got.provider_used);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }

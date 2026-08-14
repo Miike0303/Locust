@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # `apps/desktop/src-tauri` is a workspace member, so `cargo test --workspace`
+      # links against webkit2gtk. Same dependency list the release build uses.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Install frontend deps
+        working-directory: apps/desktop
+        run: npm ci
+
+      # tauri-build reads tauri.conf.json > frontendDist (apps/desktop/dist),
+      # so the frontend must be built before any cargo command touches the
+      # desktop crate. This also type-checks the frontend (build runs tsc).
+      - name: Build frontend
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Frontend unit tests
+        working-directory: apps/desktop
+        run: npm run test:unit
+
+      - name: Rust format
+        run: cargo fmt --all --check
+
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace

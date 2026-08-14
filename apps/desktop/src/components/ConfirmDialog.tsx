@@ -6,6 +6,7 @@ import {
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
+import { useT } from "../lib/i18n";
 
 interface ConfirmDialogProps {
 	open: boolean;
@@ -27,12 +28,15 @@ export default function ConfirmDialog({
 	open,
 	title,
 	message,
-	confirmLabel = "Confirm",
-	cancelLabel = "Cancel",
+	confirmLabel,
+	cancelLabel,
 	destructive = false,
 	onConfirm,
 	onCancel,
 }: ConfirmDialogProps) {
+	const t = useT();
+	const resolvedConfirm = confirmLabel ?? t("common.confirm");
+	const resolvedCancel = cancelLabel ?? t("common.cancel");
 	const confirmRef = useRef<HTMLButtonElement>(null);
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open,
@@ -63,7 +67,7 @@ export default function ConfirmDialog({
 						onClick={onCancel}
 						className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
 					>
-						{cancelLabel}
+						{resolvedCancel}
 					</button>
 					<button
 						ref={confirmRef}
@@ -75,7 +79,7 @@ export default function ConfirmDialog({
 								: "bg-emerald-600 hover:bg-emerald-700"
 						}`}
 					>
-						{confirmLabel}
+						{resolvedConfirm}
 					</button>
 				</div>
 			</div>

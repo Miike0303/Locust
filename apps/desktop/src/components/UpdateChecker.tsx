@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Download, CheckCircle, AlertCircle } from "lucide-react";
+import { t as translateStandalone, useT } from "../lib/i18n";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -13,11 +14,12 @@ type UpdateState =
   | { kind: "error"; message: string };
 
 export default function UpdateChecker() {
+  const t = useT();
   const [state, setState] = useState<UpdateState>({ kind: "idle" });
 
   const checkForUpdate = async (silent = false) => {
     if (!IS_TAURI) {
-      if (!silent) setState({ kind: "error", message: "Updates only available in desktop app" });
+      if (!silent) setState({ kind: "error", message: t("update.desktopOnly") });
       return;
     }
     setState({ kind: "checking" });
@@ -82,14 +84,14 @@ export default function UpdateChecker() {
       {state.kind === "checking" && (
         <div className="bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-lg shadow-lg p-3 flex items-center gap-2 text-sm">
           <div className="animate-spin h-4 w-4 border-2 border-blue-500 border-t-transparent rounded-full" />
-          <span>Checking for updates...</span>
+          <span>{t("update.checking")}</span>
         </div>
       )}
 
       {state.kind === "upToDate" && (
         <div className="bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-800 rounded-lg shadow-lg p-3 flex items-center gap-2 text-sm">
           <CheckCircle size={16} className="text-green-600" />
-          <span>You're on the latest version</span>
+          <span>{t("update.upToDate")}</span>
         </div>
       )}
 
@@ -99,7 +101,7 @@ export default function UpdateChecker() {
             <Download className="text-emerald-500 flex-shrink-0 mt-0.5" size={20} />
             <div className="flex-1">
               <div className="font-semibold text-sm">
-                Update available: v{state.version}
+                {t("update.available", { version: state.version })}
               </div>
               {state.notes && (
                 <div className="text-xs text-gray-600 dark:text-gray-400 mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap">
@@ -111,13 +113,13 @@ export default function UpdateChecker() {
                   onClick={downloadAndInstall}
                   className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium"
                 >
-                  Download & install
+                  {t("update.download")}
                 </button>
                 <button
                   onClick={() => setState({ kind: "idle" })}
                   className="px-3 py-1.5 bg-gray-200 dark:bg-gray-700 rounded text-sm"
                 >
-                  Later
+                  {t("common.later")}
                 </button>
               </div>
             </div>
@@ -127,7 +129,7 @@ export default function UpdateChecker() {
 
       {state.kind === "downloading" && (
         <div className="bg-white dark:bg-gray-800 border rounded-lg shadow-xl p-4">
-          <div className="text-sm font-semibold mb-2">Downloading update...</div>
+          <div className="text-sm font-semibold mb-2">{t("update.downloading")}</div>
           <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
             <div
               className="bg-emerald-500 h-2 rounded-full transition-all"
@@ -143,7 +145,7 @@ export default function UpdateChecker() {
       {state.kind === "ready" && (
         <div className="bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-500 rounded-lg shadow-lg p-3 flex items-center gap-2 text-sm">
           <CheckCircle size={16} className="text-emerald-600" />
-          <span>Update installed — restarting...</span>
+          <span>{t("update.installed")}</span>
         </div>
       )}
 
@@ -151,7 +153,7 @@ export default function UpdateChecker() {
         <div className="bg-red-50 dark:bg-red-900/30 border border-red-300 rounded-lg shadow-lg p-3 flex items-center gap-2 text-sm">
           <AlertCircle size={16} className="text-red-600 flex-shrink-0" />
           <div className="flex-1">
-            <div className="font-semibold">Update check failed</div>
+            <div className="font-semibold">{t("update.checkFailed")}</div>
             <div className="text-xs text-gray-600 dark:text-gray-400">{state.message}</div>
           </div>
           <button
@@ -169,7 +171,7 @@ export default function UpdateChecker() {
 /** Manual "check for updates" trigger — can be used from a menu button */
 export async function triggerUpdateCheck(): Promise<UpdateState> {
   if (!IS_TAURI) {
-    return { kind: "error", message: "Updates only available in desktop app" };
+    return { kind: "error", message: translateStandalone("update.desktopOnly") };
   }
   try {
     const { check } = await import("@tauri-apps/plugin-updater");

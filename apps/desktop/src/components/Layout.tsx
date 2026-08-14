@@ -21,16 +21,18 @@ import QueuePanel from "./QueuePanel";
 import { useLogStore } from "../stores/logStore";
 import { useQueueStore } from "../stores/queueStore";
 import { APP_VERSION } from "../lib/appVersion";
+import { useT } from "../lib/i18n";
 
 const navItems = [
-	{ to: "/", icon: Home, label: "Home", shortcut: "Alt+1" },
-	{ to: "/editor", icon: FileText, label: "Editor", shortcut: "Alt+2" },
-	{ to: "/review", icon: BookCheck, label: "Review", shortcut: "Alt+3" },
-	{ to: "/memory", icon: Database, label: "Memory", shortcut: "Alt+4" },
-	{ to: "/settings", icon: Settings, label: "Settings", shortcut: "Alt+5" },
-];
+	{ to: "/", icon: Home, labelKey: "nav.home", shortcut: "Alt+1" },
+	{ to: "/editor", icon: FileText, labelKey: "nav.editor", shortcut: "Alt+2" },
+	{ to: "/review", icon: BookCheck, labelKey: "nav.review", shortcut: "Alt+3" },
+	{ to: "/memory", icon: Database, labelKey: "nav.memory", shortcut: "Alt+4" },
+	{ to: "/settings", icon: Settings, labelKey: "nav.settings", shortcut: "Alt+5" },
+] as const;
 
 export default function Layout() {
+	const t = useT();
 	const [showHelp, setShowHelp] = useState(false);
 	useGlobalHotkeys(() => setShowHelp(true));
 
@@ -53,14 +55,14 @@ export default function Layout() {
 		<div className="flex h-screen">
 			<aside className="w-60 flex flex-col bg-gray-50 dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
 				<div className="p-4">
-					<h1 className="text-lg font-bold text-emerald-600">Project Locust</h1>
+					<h1 className="text-lg font-bold text-emerald-600">{t("nav.appName")}</h1>
 					<p className="text-xs text-gray-500 dark:text-gray-400">
 						v{APP_VERSION}
 					</p>
 				</div>
 
 				<nav className="flex-1 px-2 space-y-1">
-					{navItems.map(({ to, icon: Icon, label, shortcut }) => (
+					{navItems.map(({ to, icon: Icon, labelKey, shortcut }) => (
 						<NavLink
 							key={to}
 							to={to}
@@ -75,7 +77,7 @@ export default function Layout() {
 							}
 						>
 							<Icon size={18} />
-							<span className="flex-1">{label}</span>
+							<span className="flex-1">{t(labelKey)}</span>
 							<kbd className="text-[10px] text-gray-400 dark:text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity">
 								{shortcut}
 							</kbd>
@@ -94,7 +96,7 @@ export default function Layout() {
 						)}
 					>
 						<ListOrdered size={14} />
-						Queue
+						{t("nav.queue")}
 						{queueCount > 0 && (
 							<span className="ml-auto px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300">
 								{queueCount}
@@ -106,7 +108,7 @@ export default function Layout() {
 						className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 w-full focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1 py-0.5"
 					>
 						<ScrollText size={14} />
-						Activity Log
+						{t("nav.activityLog")}
 						{unreadErrors > 0 && (
 							<span className="ml-auto px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300">
 								{unreadErrors}
@@ -118,7 +120,7 @@ export default function Layout() {
 						className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 w-full focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1 py-0.5"
 					>
 						<Keyboard size={14} />
-						Shortcuts
+						{t("nav.shortcuts")}
 						<kbd className="ml-auto text-[10px] text-gray-400 dark:text-gray-500">
 							?
 						</kbd>
@@ -130,7 +132,7 @@ export default function Layout() {
 						className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1 py-0.5"
 					>
 						<Github size={14} />
-						GitHub
+						{t("nav.github")}
 					</a>
 				</div>
 			</aside>

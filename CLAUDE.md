@@ -5,12 +5,18 @@ Universal open-source game translation tool built in Rust.
 ## Architecture
 
 Cargo workspace with 6 crates:
-- `crates/core` — error types, models, database (SQLite), extraction traits, translation engine, config, encoding, placeholders, validation, backup, glossary, font validation, export (PO/XLIFF), WASM plugins
-- `crates/formats` — game format plugins: RPG Maker MV/MZ, VX Ace, Ren'Py, Wolf RPG, QSP, TyranoBuilder, KiriKiri, YU-RIS, NScripter
-- `crates/providers` — translation providers: Mock, Argos, DeepL, OpenAI, Claude, Ollama + retry/rate limiting
-- `crates/server` — Axum HTTP server with 25+ REST endpoints, WebSocket for progress
-- `crates/cli` — clap CLI with extract/translate/inject/validate/export/import/server commands
-- `apps/desktop/src-tauri` — Tauri desktop app (React + Vite + TypeScript frontend in apps/desktop/)
+- `crates/core` — error types, models, database (SQLite), extraction traits, translation engine, config, encoding, placeholders, validation, backup, glossary, font validation, export (PO/XLIFF). WASM plugins exist but are gated behind the non-default `wasm-plugins` Cargo feature; no shipped build enables it, so plugin loading is inert by default.
+- `crates/formats` — 14 plugins, all with real inject. Stable (inherit `FormatPlugin::stability` default, not an explicit declaration): `rpgmaker-mv`, `rpgmaker-vxa`, `renpy`. Experimental (explicit): Wolf RPG, SugarCube, HTML, Unity, Unreal, QSP, TyranoBuilder, KiriKiri, YU-RIS, NScripter, VNTextPatch. No registered plugin is `ComingSoon`.
+- `crates/providers` — always registered: Google (free, no key), Mock, Argos, LM Studio, Ollama. Key-gated (registered when `api_key` is set): DeepL, OpenAI, Claude, DeepSeek, Grok, Gemini. `grok-sub` when an OAuth token exists (`locust auth grok`). Retry + per-provider rate limiting are wired at the single call site in `locust-core::translation` (not dead code): retries transient failures only (429/5xx/timeout/network), never auth errors; exponential backoff with jitter; overall deadline; cancellation wins during backoff; per-provider-id RPM defaults.
+- `crates/server` — Axum, 37 routes, loopback (`127.0.0.1`) by default. JSON REST + one WebSocket (`/api/translate/ws/:job_id`). Does **not** serve a static UI.
+- `crates/cli` — clap CLI, 19 subcommands (see below). `locust server` default port is **3000**; the desktop app uses **7842**.
+- `apps/desktop/src-tauri` — Tauri desktop app (React + Vite + TypeScript in `apps/desktop/`). UI chrome is English/Spanish via Settings → Appearance → Interface language (`localStorage` `locust.ui.language`); that is not the translation target language.
+
+## Project database
+
+Desktop and HTTP `POST /api/project/open` use `resolve_project_db_path`: `<game-parent>/<game-name>.locust.db`. If the parent is not writable: `config_dir/projects/<stem>-<hash>.locust.db`. Opening **merges** (never `DELETE FROM strings`): existing translations, statuses, and provider attribution survive; if extracted source text for an id changed, the translation is kept but status is reset to pending (`stale_source_reset`); ids gone from the game are removed. Open response: `added` / `updated` / `stale_source_reset` / `removed` / `preserved_translations`.
+
+CLI `extract` without `-o` writes `{game-folder-name}.locust.db` in the **current working directory**. Pass `-o <game-parent>/<game-name>.locust.db` to share the desktop file.
 
 ## Build
 
@@ -25,17 +31,32 @@ cd apps/desktop
 npm run build
 ```
 
+~730 tests across the workspace; 13 frontend unit test files (`npm run test:unit` in `apps/desktop`).
+
 ## Key Commands
 
+19 subcommands:
+
 ```bash
-locust extract <game_path>          # Auto-detect format and extract strings
-locust translate <db> -p mock       # Translate with provider
-locust inject <game> -P <db> -l es  # Inject translations
-locust validate <db>                # Placeholders + binary slot length (Unity/Unreal/Wolf)
-locust patch … / apply …            # Package + apply patch zip (see docs/VN_RPG_TRANSLATION.md)
-locust server --port 7842           # Start web server
-locust formats                      # List supported formats (+ stability)
-locust providers                    # List translation providers
+locust extract <game_path>              # Auto-detect format and extract strings
+locust translate <db> -p mock           # Translate with provider
+locust inject <game> -P <db> -l es      # Inject translations
+locust validate <db>                    # Placeholders + binary slot length (Unity/Unreal/Wolf)
+locust replace <db> --find X --replace Y  # Find/replace inside translations (--dry-run)
+locust stats <db>                       # Tokens / time / cost per translation run
+locust pivot <src.db> -o <new.db>       # New project whose SOURCE is another's translations
+locust patch <injected> -P <db> -l es -o patch.zip   # Package patch zip
+locust apply <game> <patch.zip>         # Apply local zip (or --url https://…)
+locust patch-rollback <game>            # Restore .locust/backup
+locust patch-status <game>              # Whether a Locust patch is applied
+locust auth grok                        # xAI OAuth → grok-sub provider
+locust providers                        # List translation providers
+locust formats                          # List supported formats (+ stability)
+locust register-lang <game> -l es --label Español   # RPG Maker MV/MZ UI language
+locust glossary add|list|delete …       # Glossary terms
+locust export <db> -f po|xliff -l es -o out
+locust import <db> -f po|xliff -l es -i in
+locust server --port 7842               # JSON+WS API, loopback, no static UI
 ```
 
 ## Pending Work

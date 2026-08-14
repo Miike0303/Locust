@@ -39,6 +39,7 @@ import {
 } from "../lib/providerReadiness";
 import { buildSettingsPath } from "../lib/settingsNav";
 import EmptyState from "./EmptyState";
+import { useT } from "../lib/i18n";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -60,13 +61,13 @@ const statusRowStyles: Record<string, string> = {
 	cancelled: "opacity-60 border-l-gray-400",
 };
 
-const statusLabels: Record<string, string> = {
-	pending: "Waiting",
-	extracting: "Extracting",
-	translating: "Translating",
-	done: "Done",
-	error: "Failed",
-	cancelled: "Cancelled",
+const STATUS_LABEL_KEYS: Record<string, string> = {
+	pending: "queue.status.pending",
+	extracting: "queue.status.extracting",
+	translating: "queue.status.translating",
+	done: "queue.status.done",
+	error: "queue.status.error",
+	cancelled: "queue.status.cancelled",
 };
 
 const statusIconColors: Record<string, string> = {
@@ -84,6 +85,7 @@ const settingsLabelClass =
 	"text-xs font-medium text-gray-500 dark:text-gray-400";
 
 export default function QueuePanel() {
+	const t = useT();
 	const navigate = useNavigate();
 	const {
 		items,
@@ -181,11 +183,11 @@ export default function QueuePanel() {
 		if (IS_TAURI) {
 			const { open } = await import("@tauri-apps/plugin-dialog");
 			const selected = await open({
-				title: "Select game file(s) to queue",
+				title: t("queue.dialog.addFiles"),
 				multiple: true,
 				filters: [
 					{
-						name: "Game files",
+						name: t("queue.dialog.gameFiles"),
 						extensions: [
 							"exe",
 							"html",
@@ -196,13 +198,13 @@ export default function QueuePanel() {
 							"rvproj2",
 						],
 					},
-					{ name: "All files", extensions: ["*"] },
+					{ name: t("queue.dialog.allFiles"), extensions: ["*"] },
 				],
 			});
 			if (Array.isArray(selected)) selected.forEach((p) => addItem(p));
 			else if (typeof selected === "string") addItem(selected);
 		} else {
-			const path = prompt("Enter game file path:");
+			const path = prompt(t("queue.prompt.filePath"));
 			if (path) addItem(path);
 		}
 	};
@@ -211,12 +213,12 @@ export default function QueuePanel() {
 		if (IS_TAURI) {
 			const { open } = await import("@tauri-apps/plugin-dialog");
 			const selected = await open({
-				title: "Select game folder",
+				title: t("queue.dialog.addFolder"),
 				directory: true,
 			});
 			if (typeof selected === "string") addItem(selected);
 		} else {
-			const path = prompt("Enter game folder path:");
+			const path = prompt(t("queue.prompt.folderPath"));
 			if (path) addItem(path);
 		}
 	};
@@ -270,7 +272,7 @@ export default function QueuePanel() {
 				{/* Header */}
 				<div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
 					<h2 {...titleProps} className="font-bold text-lg">
-						Project Queue
+						{t("queue.title")}
 					</h2>
 					<div className="flex items-center gap-2">
 						{doneCount > 0 && (
@@ -279,13 +281,13 @@ export default function QueuePanel() {
 								onClick={clearCompleted}
 								className="text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1"
 							>
-								Clear completed ({doneCount})
+								{t("queue.clearCompleted", { count: doneCount })}
 							</button>
 						)}
 						<button
 							type="button"
 							onClick={() => setPanelOpen(false)}
-							aria-label="Close queue panel"
+							aria-label={t("queue.closeAria")}
 							className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded p-0.5"
 						>
 							<X size={20} />
@@ -297,8 +299,8 @@ export default function QueuePanel() {
 					{/* Queue list */}
 					{items.length === 0 ? (
 						<EmptyState
-							title="Queue is empty"
-							description="Add game files or folders below to translate multiple projects in batch."
+							title={t("queue.empty.title")}
+							description={t("queue.empty.description")}
 						/>
 					) : (
 						<div className="divide-y divide-gray-100 dark:divide-gray-800 border-b border-gray-100 dark:border-gray-800">
@@ -325,14 +327,14 @@ export default function QueuePanel() {
 								className="flex items-center gap-2 px-3 py-2 text-sm border border-dashed border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
 							>
 								<File size={14} />
-								Add File
+								{t("queue.addFile")}
 							</button>
 							<button
 								onClick={handleAddFolder}
 								className="flex items-center gap-2 px-3 py-2 text-sm border border-dashed border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
 							>
 								<FolderOpen size={14} />
-								Add Folder
+								{t("queue.addFolder")}
 							</button>
 						</div>
 					)}
@@ -341,11 +343,11 @@ export default function QueuePanel() {
 					{!isRunning && items.length > 0 && (
 						<div className="p-4 border-t border-gray-200 dark:border-gray-700 space-y-3 bg-gray-50/50 dark:bg-gray-800/30">
 							<h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">
-								Translation Settings
+								{t("queue.settings")}
 							</h3>
 							<div className="grid grid-cols-3 gap-3">
 								<div>
-									<label className={settingsLabelClass}>Provider</label>
+									<label className={settingsLabelClass}>{t("queue.provider")}</label>
 									<select
 										value={providerId}
 										onChange={(e) => setProviderId(e.target.value)}
@@ -359,7 +361,7 @@ export default function QueuePanel() {
 									</select>
 								</div>
 								<div>
-									<label className={settingsLabelClass}>Source</label>
+									<label className={settingsLabelClass}>{t("queue.source")}</label>
 									<input
 										value={sourceLang}
 										onChange={(e) => setSourceLang(e.target.value)}
@@ -367,7 +369,7 @@ export default function QueuePanel() {
 									/>
 								</div>
 								<div>
-									<label className={settingsLabelClass}>Target</label>
+									<label className={settingsLabelClass}>{t("queue.target")}</label>
 									<input
 										value={targetLang}
 										onChange={(e) => setTargetLang(e.target.value)}
@@ -377,7 +379,7 @@ export default function QueuePanel() {
 							</div>
 							<div className="grid grid-cols-2 gap-3">
 								<div>
-									<label className={settingsLabelClass}>Batch size</label>
+									<label className={settingsLabelClass}>{t("queue.batchSize")}</label>
 									<input
 										type="number"
 										value={batchSize}
@@ -388,11 +390,11 @@ export default function QueuePanel() {
 									/>
 								</div>
 								<div>
-									<label className={settingsLabelClass}>Game context</label>
+									<label className={settingsLabelClass}>{t("queue.gameContext")}</label>
 									<input
 										value={gameContext}
 										onChange={(e) => setGameContext(e.target.value)}
-										placeholder="Optional"
+										placeholder={t("common.optional")}
 										className={settingsInputClass}
 									/>
 								</div>
@@ -408,7 +410,7 @@ export default function QueuePanel() {
 						!isRunning &&
 						pendingCount > 0 && (
 							<div className="mb-3 p-2 rounded border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20 text-sm text-amber-800 dark:text-amber-200">
-								This provider needs an API key — add it in Settings.{" "}
+								{t("queue.needsKey")}{" "}
 								<button
 									type="button"
 									onClick={() => {
@@ -417,7 +419,7 @@ export default function QueuePanel() {
 									}}
 									className="font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
 								>
-									Open Settings
+									{t("queue.openSettings")}
 								</button>
 							</div>
 						)}
@@ -425,12 +427,14 @@ export default function QueuePanel() {
 						<div className="text-sm text-gray-600 dark:text-gray-300 tabular-nums">
 							{isRunning ? (
 								<span>
-									{activeCount > 0 ? "Running" : "Starting"} · {doneCount}/
-									{totalCount} done
+									{t(activeCount > 0 ? "queue.running" : "queue.starting", {
+										done: doneCount,
+										total: totalCount,
+									})}
 								</span>
 							) : (
 								<span>
-									{pendingCount} waiting · {doneCount} done
+									{t("queue.waiting", { pending: pendingCount, done: doneCount })}
 								</span>
 							)}
 						</div>
@@ -441,7 +445,7 @@ export default function QueuePanel() {
 								className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-red-400 focus:ring-offset-2 dark:focus:ring-offset-gray-900"
 							>
 								<Square size={14} aria-hidden="true" />
-								Cancel queue
+								{t("queue.cancel")}
 							</button>
 						) : (
 							<button
@@ -451,7 +455,7 @@ export default function QueuePanel() {
 								className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 dark:focus:ring-offset-gray-900"
 							>
 								<Play size={14} aria-hidden="true" />
-								Start queue ({pendingCount})
+								{t("queue.start", { count: pendingCount })}
 							</button>
 						)}
 					</div>
@@ -478,6 +482,7 @@ function QueueItemRow({
 	onMoveDown: () => void;
 	disabled: boolean;
 }) {
+	const t = useT();
 	const Icon = statusIcons[item.status] ?? Clock;
 	const percent =
 		item.progress.total > 0
@@ -506,7 +511,9 @@ function QueueItemRow({
 						{item.projectName}
 					</div>
 					<span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-						{statusLabels[item.status] ?? item.status}
+						{STATUS_LABEL_KEYS[item.status]
+							? t(STATUS_LABEL_KEYS[item.status])
+							: item.status}
 					</span>
 				</div>
 				<div className="text-xs text-gray-500 dark:text-gray-400 truncate">
@@ -535,7 +542,7 @@ function QueueItemRow({
 						</>
 					) : item.status === "extracting" ? (
 						<span className="text-[11px] text-blue-600 dark:text-blue-400">
-							Extracting strings…
+							{t("queue.extractingStrings")}
 						</span>
 					) : null}
 				</div>
@@ -554,7 +561,7 @@ function QueueItemRow({
 						type="button"
 						onClick={onMoveUp}
 						disabled={index === 0}
-						aria-label="Move up"
+						aria-label={t("queue.moveUp")}
 						className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded"
 					>
 						<ChevronUp size={14} />
@@ -563,7 +570,7 @@ function QueueItemRow({
 						type="button"
 						onClick={onMoveDown}
 						disabled={index === total - 1}
-						aria-label="Move down"
+						aria-label={t("queue.moveDown")}
 						className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded"
 					>
 						<ChevronDown size={14} />
@@ -571,7 +578,7 @@ function QueueItemRow({
 					<button
 						type="button"
 						onClick={onRemove}
-						aria-label="Remove from queue"
+						aria-label={t("queue.remove")}
 						className="p-1 text-gray-400 hover:text-red-500 dark:hover:text-red-400 focus:outline-none focus:ring-2 focus:ring-red-400 rounded"
 					>
 						<Trash2 size={14} />
@@ -582,10 +589,10 @@ function QueueItemRow({
 				<button
 					type="button"
 					onClick={onRemove}
-					aria-label="Dismiss from queue"
+					aria-label={t("queue.dismiss")}
 					className="shrink-0 px-2 py-1 text-[11px] font-medium text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 border border-gray-200 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-emerald-500"
 				>
-					Dismiss
+					{t("common.dismiss")}
 				</button>
 			)}
 		</div>

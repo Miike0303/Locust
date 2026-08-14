@@ -11,6 +11,7 @@ import clsx from "clsx";
 import type { StringEntry } from "../lib/api";
 import { patchString } from "../lib/api";
 import { useEditorStore } from "../stores/editorStore";
+import { useT } from "../lib/i18n";
 
 const statusBadge: Record<string, string> = {
 	pending: "bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200",
@@ -32,6 +33,7 @@ function InlineEdit({
 }) {
 	const [editing, setEditing] = useState(false);
 	const [value, setValue] = useState(entry.translation || "");
+	const t = useT();
 	const ref = useRef<HTMLTextAreaElement>(null);
 
 	const handleBlur = async () => {
@@ -74,7 +76,7 @@ function InlineEdit({
 		>
 			{entry.translation || (
 				<span className="text-gray-400 dark:text-gray-500 italic">
-					Click to edit…
+					{t("table.clickToEdit")}
 				</span>
 			)}
 		</div>
@@ -92,6 +94,7 @@ export default function StringTable({
 	onRefetch,
 	hasActiveFilters = false,
 }: StringTableProps) {
+	const t = useT();
 	const { selectedEntryId, setSelected } = useEditorStore();
 	const [sorting, setSorting] = useState<SortingState>([]);
 
@@ -99,7 +102,7 @@ export default function StringTable({
 		() => [
 			{
 				accessorKey: "status",
-				header: "Status",
+				header: t("table.status"),
 				size: 90,
 				cell: ({ getValue }) => {
 					const status = getValue() as string;
@@ -118,7 +121,7 @@ export default function StringTable({
 			},
 			{
 				accessorKey: "source",
-				header: "Source",
+				header: t("table.source"),
 				size: 300,
 				cell: ({ getValue }) => (
 					<div
@@ -131,7 +134,7 @@ export default function StringTable({
 			},
 			{
 				accessorKey: "translation",
-				header: "Translation",
+				header: t("table.translation"),
 				size: 300,
 				cell: ({ row }) => (
 					<InlineEdit entry={row.original} onSave={onRefetch} />
@@ -139,7 +142,7 @@ export default function StringTable({
 			},
 			{
 				accessorKey: "file_path",
-				header: "File",
+				header: t("table.file"),
 				size: 140,
 				cell: ({ getValue }) => {
 					const full = getValue() as string;
@@ -156,7 +159,7 @@ export default function StringTable({
 			},
 			{
 				accessorKey: "tags",
-				header: "Tags",
+				header: t("table.tags"),
 				size: 110,
 				cell: ({ getValue }) => (
 					<div className="flex gap-0.5 flex-wrap">
@@ -172,7 +175,7 @@ export default function StringTable({
 				),
 			},
 		],
-		[onRefetch],
+		[onRefetch, t],
 	);
 
 	const table = useReactTable({
@@ -238,12 +241,12 @@ export default function StringTable({
 				<div className="flex flex-col items-center justify-center h-40 gap-1 text-sm text-gray-500 dark:text-gray-400">
 					<p className="font-medium text-gray-600 dark:text-gray-300">
 						{hasActiveFilters
-							? "No strings match your filters"
-							: "No strings in this project"}
+							? t("table.noMatch")
+							: t("table.noStrings")}
 					</p>
 					{hasActiveFilters && (
 						<p className="text-xs">
-							Try clearing filters or broadening your search.
+							{t("table.clearHint")}
 						</p>
 					)}
 				</div>

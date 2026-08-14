@@ -5,7 +5,19 @@
 
 export type PatchSourceOk = { zip_path: string } | { zip_url: string };
 
-export type PatchSourceResult = PatchSourceOk | { error: string } | null;
+/** Stable catalog keys — UI renders via `t()`, tests assert on the code. */
+export const PATCH_SOURCE_ERROR = {
+  both: "patch.source.both",
+  badUrl: "patch.source.badUrl",
+} as const;
+
+export type PatchSourceErrorCode =
+  (typeof PATCH_SOURCE_ERROR)[keyof typeof PATCH_SOURCE_ERROR];
+
+export type PatchSourceResult =
+  | PatchSourceOk
+  | { error: PatchSourceErrorCode }
+  | null;
 
 /**
  * True when `url` is a non-empty absolute http(s) URL with a host (no fetch).
@@ -49,14 +61,12 @@ export function resolvePatchSource(
   const path = zipPath.trim();
   const url = zipUrl.trim();
   if (path && url) {
-    return { error: "Use either a local zip path or a URL, not both" };
+    return { error: PATCH_SOURCE_ERROR.both };
   }
   if (path) return { zip_path: path };
   if (url) {
     if (!isHttpPatchUrl(url)) {
-      return {
-        error: "Patch URL must be a valid http:// or https:// address with a host",
-      };
+      return { error: PATCH_SOURCE_ERROR.badUrl };
     }
     return { zip_url: url };
   }

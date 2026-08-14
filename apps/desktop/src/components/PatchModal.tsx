@@ -36,6 +36,7 @@ import {
 	MODAL_BACKDROP_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
+import { useT } from "../lib/i18n";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -59,6 +60,7 @@ export default function PatchModal({
 	initialTab = "apply",
 	onPatchStateChanged,
 }: PatchModalProps) {
+	const t = useT();
 	const remembered = (() => {
 		try {
 			return loadRememberedPatchSource();
@@ -111,9 +113,9 @@ export default function PatchModal({
 	const canVerifyApply = Boolean(gamePath.trim()) && sourceOk;
 	const urlFieldError =
 		zipUrl.trim() && !isHttpPatchUrl(zipUrl)
-			? "Enter a full http:// or https:// URL with a host"
+			? t("patch.urlError")
 			: resolvedSource && "error" in resolvedSource
-				? resolvedSource.error
+				? t(resolvedSource.error)
 				: null;
 	// Soft hint only — signed CDN links may omit `.zip` in the path.
 	const urlZipHint =
@@ -121,7 +123,7 @@ export default function PatchModal({
 		zipUrl.trim() &&
 		isHttpPatchUrl(zipUrl) &&
 		!patchUrlLooksLikeZip(zipUrl)
-			? "URL path does not end in .zip — downloads still work if the server returns a zip"
+			? t("patch.urlHint")
 			: null;
 
 	if (!open) return null;
@@ -132,13 +134,13 @@ export default function PatchModal({
 			const selected = await openDialog({
 				title:
 					tab === "pack"
-						? "Select recorded game folder to pack"
-						: "Select game folder to patch",
+						? t("patch.dialog.packFolder")
+						: t("patch.dialog.applyFolder"),
 				directory: true,
 			});
 			if (typeof selected === "string") setGamePath(selected);
 		} else {
-			const path = prompt("Game folder path:");
+			const path = prompt(t("patch.prompt.gameFolder"));
 			if (path) setGamePath(path);
 		}
 	};
@@ -147,16 +149,16 @@ export default function PatchModal({
 		if (IS_TAURI) {
 			const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
 			const selected = await openDialog({
-				title: "Select patch zip",
+				title: t("patch.dialog.selectZip"),
 				multiple: false,
-				filters: [{ name: "Patch zip", extensions: ["zip"] }],
+				filters: [{ name: t("patch.filter.patchZip"), extensions: ["zip"] }],
 			});
 			if (typeof selected === "string") {
 				setZipPath(selected);
 				setZipUrl(""); // mutual exclusion with URL field
 			}
 		} else {
-			const path = prompt("Patch zip path:");
+			const path = prompt(t("patch.prompt.zipPath"));
 			if (path) {
 				setZipPath(path);
 				setZipUrl("");
@@ -168,14 +170,14 @@ export default function PatchModal({
 		if (IS_TAURI) {
 			const { save } = await import("@tauri-apps/plugin-dialog");
 			const selected = await save({
-				title: "Save patch zip",
+				title: t("patch.dialog.saveZip"),
 				defaultPath: "locust-patch.zip",
-				filters: [{ name: "Patch zip", extensions: ["zip"] }],
+				filters: [{ name: t("patch.filter.patchZip"), extensions: ["zip"] }],
 			});
 			if (typeof selected === "string" && selected) setOutputPath(selected);
 		} else {
 			const path = prompt(
-				"Output patch zip path:",
+				t("patch.prompt.outputZip"),
 				outputPath || "locust-patch.zip",
 			);
 			if (path) setOutputPath(path);
@@ -196,15 +198,15 @@ export default function PatchModal({
 
 	const handleVerify = async () => {
 		if (!gamePath.trim()) {
-			addToast("error", "Select a game folder");
+			addToast("error", t("patch.toast.selectGame"));
 			return;
 		}
 		if (!resolvedSource) {
-			addToast("error", "Select a local zip or a patch zip URL");
+			addToast("error", t("patch.toast.selectSource"));
 			return;
 		}
 		if ("error" in resolvedSource) {
-			addToast("error", resolvedSource.error);
+			addToast("error", t(resolvedSource.error));
 			return;
 		}
 		setLoading(true);
@@ -225,11 +227,11 @@ export default function PatchModal({
 				report.messages?.join("\n") || "",
 				"patch",
 			);
-			addToast("success", `Verify: ${report.outcome}`);
+			addToast("success", t("patch.toast.verify", { outcome: report.outcome }));
 		} catch (err: any) {
 			setError(err.message);
 			addLog("error", "Patch verify failed", err.message, "patch");
-			addToast("error", `Verify failed: ${err.message}`);
+			addToast("error", t("patch.toast.verifyFailed", { error: err.message }));
 		} finally {
 			setLoading(false);
 		}
@@ -237,15 +239,15 @@ export default function PatchModal({
 
 	const handleApply = async () => {
 		if (!gamePath.trim()) {
-			addToast("error", "Select a game folder");
+			addToast("error", t("patch.toast.selectGame"));
 			return;
 		}
 		if (!resolvedSource) {
-			addToast("error", "Select a local zip or a patch zip URL");
+			addToast("error", t("patch.toast.selectSource"));
 			return;
 		}
 		if ("error" in resolvedSource) {
-			addToast("error", resolvedSource.error);
+			addToast("error", t(resolvedSource.error));
 			return;
 		}
 		setLoading(true);
@@ -273,13 +275,13 @@ export default function PatchModal({
 			addToast(
 				"success",
 				dryRun
-					? `Planned ${report.replaced + report.added} file(s)`
-					: `Applied ${report.replaced + report.added} file(s)`,
+					? t("patch.toast.planned", { count: report.replaced + report.added })
+					: t("patch.toast.applied", { count: report.replaced + report.added }),
 			);
 		} catch (err: any) {
 			setError(err.message);
 			addLog("error", "Patch apply failed", err.message, "patch");
-			addToast("error", `Apply failed: ${err.message}`);
+			addToast("error", t("patch.toast.applyFailed", { error: err.message }));
 		} finally {
 			setLoading(false);
 		}
@@ -287,7 +289,7 @@ export default function PatchModal({
 
 	const handleRollback = async () => {
 		if (!gamePath.trim()) {
-			addToast("error", "Select a game folder");
+			addToast("error", t("patch.toast.selectGame"));
 			return;
 		}
 		setLoading(true);
@@ -300,12 +302,15 @@ export default function PatchModal({
 			if (report.aborted_edited?.length) {
 				addToast(
 					"error",
-					`Rollback aborted: ${report.aborted_edited.length} edited file(s) need Force`,
+					t("patch.toast.rollbackForce", { count: report.aborted_edited.length }),
 				);
 			} else {
 				addToast(
 					"success",
-					`Rollback: restored ${report.restored}, deleted ${report.deleted}`,
+					t("patch.toast.rollback", {
+						restored: report.restored,
+						deleted: report.deleted,
+					}),
 				);
 			}
 			addLog(
@@ -321,7 +326,7 @@ export default function PatchModal({
 		} catch (err: any) {
 			setError(err.message);
 			addLog("error", "Patch rollback failed", err.message, "patch");
-			addToast("error", `Rollback failed: ${err.message}`);
+			addToast("error", t("patch.toast.rollbackFailed", { error: err.message }));
 		} finally {
 			setLoading(false);
 		}
@@ -329,11 +334,11 @@ export default function PatchModal({
 
 	const handlePack = async () => {
 		if (!gamePath.trim()) {
-			addToast("error", "Select the recorded game folder to pack");
+			addToast("error", t("patch.toast.selectRecorded"));
 			return;
 		}
 		if (!outputPath.trim()) {
-			addToast("error", "Choose an output zip path");
+			addToast("error", t("patch.toast.chooseOutput"));
 			return;
 		}
 		setLoading(true);
@@ -359,12 +364,12 @@ export default function PatchModal({
 			);
 			addToast(
 				"success",
-				`Packed ${report.files_packed} file(s) → ${report.tier}`,
+				t("patch.toast.packed", { count: report.files_packed, tier: report.tier }),
 			);
 		} catch (err: any) {
 			setError(err.message);
 			addLog("error", "Patch pack failed", err.message, "patch");
-			addToast("error", `Pack failed: ${err.message}`);
+			addToast("error", t("patch.toast.packFailed", { error: err.message }));
 		} finally {
 			setLoading(false);
 		}
@@ -399,7 +404,7 @@ export default function PatchModal({
 						{...titleProps}
 						className="text-lg font-bold flex items-center gap-2"
 					>
-						<Package size={20} /> Patch
+						<Package size={20} /> {t("patch.title")}
 					</h2>
 					<button
 						onClick={onClose}
@@ -410,14 +415,14 @@ export default function PatchModal({
 				</div>
 
 				<div className="flex gap-1 border-b dark:border-gray-700 mb-4">
-					{tabBtn("apply", "Apply")}
-					{tabBtn("pack", "Pack")}
+					{tabBtn("apply", t("patch.apply"))}
+					{tabBtn("pack", t("patch.pack"))}
 				</div>
 
 				<div className="space-y-4">
 					<div>
 						<label className="text-sm font-medium">
-							{tab === "pack" ? "Recorded game folder" : "Game folder"}
+							{tab === "pack" ? t("patch.recordedFolder") : t("patch.gameFolder")}
 						</label>
 						<div className="flex gap-2 mt-1">
 							<input
@@ -425,15 +430,15 @@ export default function PatchModal({
 								onChange={(e) => setGamePath(e.target.value)}
 								placeholder={
 									tab === "pack"
-										? "Root of the inject recording (game or *-lang copy)..."
-										: "Path to the game to patch..."
+										? t("patch.placeholder.recorded")
+										: t("patch.placeholder.game")
 								}
 								className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 							/>
 							<button
 								onClick={pickGame}
 								className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"
-								title="Browse"
+								title={t("common.browse")}
 							>
 								<FolderOpen size={16} />
 							</button>
@@ -443,7 +448,7 @@ export default function PatchModal({
 					{tab === "apply" && (
 						<>
 							<div>
-								<label className="text-sm font-medium">Patch zip (local)</label>
+								<label className="text-sm font-medium">{t("patch.zipLocal")}</label>
 								<div className="flex gap-2 mt-1">
 									<input
 										value={zipPath}
@@ -451,13 +456,13 @@ export default function PatchModal({
 											setZipPath(e.target.value);
 											if (e.target.value.trim()) setZipUrl("");
 										}}
-										placeholder="locust-*-patch.zip..."
+										placeholder={t("patch.zipPlaceholder")}
 										className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 									/>
 									<button
 										onClick={pickZip}
 										className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"
-										title="Browse"
+										title={t("common.browse")}
 									>
 										<FileArchive size={16} />
 									</button>
@@ -465,14 +470,14 @@ export default function PatchModal({
 							</div>
 
 							<div>
-								<label className="text-sm font-medium">Or patch zip URL</label>
+								<label className="text-sm font-medium">{t("patch.orUrl")}</label>
 								<input
 									value={zipUrl}
 									onChange={(e) => {
 										setZipUrl(e.target.value);
 										if (e.target.value.trim()) setZipPath("");
 									}}
-									placeholder="https://…/game-es-patch.zip"
+									placeholder={t("patch.urlPlaceholder")}
 									className={`w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm ${
 										urlFieldError
 											? "border-red-400 dark:border-red-600"
@@ -491,18 +496,18 @@ export default function PatchModal({
 									</p>
 								) : (
 									<p className="text-xs text-gray-500 mt-1">
-										Downloads over http(s), then verify/apply. Last successful
-										source is remembered. Use either local path or URL.
+										{t("patch.urlHelp")}
 									</p>
 								)}
 								{patchSourceReady(resolvedSource) && (
 									<p className="text-xs text-emerald-700 dark:text-emerald-400 mt-0.5">
-										Active source:{" "}
 										{"zip_url" in resolvedSource
-											? `URL (${resolvedSource.zip_url.slice(0, 48)}${
-													resolvedSource.zip_url.length > 48 ? "…" : ""
-												})`
-											: "local file"}
+											? t("patch.activeUrl", {
+													url: `${resolvedSource.zip_url.slice(0, 48)}${
+														resolvedSource.zip_url.length > 48 ? "…" : ""
+													}`,
+												})
+											: t("patch.activeLocal")}
 									</p>
 								)}
 							</div>
@@ -516,11 +521,9 @@ export default function PatchModal({
 										onChange={(e) => setForce(e.target.checked)}
 									/>
 									<span>
-										<span className="font-medium">Force</span>
+										<span className="font-medium">{t("patch.force")}</span>
 										<span className="block text-xs text-gray-500 mt-0.5">
-											Apply even when checks fail — use when the game files were
-											modified or a patch is already applied and you accept
-											overwriting them.
+											{t("patch.forceHint")}
 										</span>
 									</span>
 								</label>
@@ -532,11 +535,9 @@ export default function PatchModal({
 										onChange={(e) => setConfirmLegacy(e.target.checked)}
 									/>
 									<span>
-										<span className="font-medium">Confirm legacy patch</span>
+										<span className="font-medium">{t("patch.legacy")}</span>
 										<span className="block text-xs text-gray-500 mt-0.5">
-											Needed for older patches that carry no fingerprints of the
-											original files — check it to confirm you trust where the
-											patch came from.
+											{t("patch.legacyHint")}
 										</span>
 									</span>
 								</label>
@@ -548,10 +549,9 @@ export default function PatchModal({
 										onChange={(e) => setDryRun(e.target.checked)}
 									/>
 									<span>
-										<span className="font-medium">Dry run</span>
+										<span className="font-medium">{t("patch.dryRun")}</span>
 										<span className="block text-xs text-gray-500 mt-0.5">
-											Preview what the patch would change without writing
-											anything.
+											{t("patch.dryRunHint")}
 										</span>
 									</span>
 								</label>
@@ -563,58 +563,64 @@ export default function PatchModal({
 									disabled={loading || !canVerifyApply}
 									title={
 										!gamePath.trim()
-											? "Select a game folder"
+											? t("patch.selectGame")
 											: !sourceOk
-												? "Select a local zip or a valid http(s) URL"
+												? t("patch.selectSource")
 												: undefined
 									}
 									className="flex items-center gap-1.5 px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium disabled:opacity-50"
 								>
-									<ShieldCheck size={16} /> Verify
+									<ShieldCheck size={16} /> {t("patch.verify")}
 								</button>
 								<button
 									onClick={handleApply}
 									disabled={loading || !canVerifyApply}
 									title={
 										!gamePath.trim()
-											? "Select a game folder"
+											? t("patch.selectGame")
 											: !sourceOk
-												? "Select a local zip or a valid http(s) URL"
+												? t("patch.selectSource")
 												: undefined
 									}
 									className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium disabled:opacity-50"
 								>
-									<Package size={16} /> {dryRun ? "Plan apply" : "Apply"}
+									<Package size={16} /> {dryRun ? t("patch.planApply") : t("patch.applyBtn")}
 								</button>
 								<button
 									onClick={handleRollback}
 									disabled={loading}
 									className="flex items-center gap-1.5 px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100 dark:hover:bg-amber-900/60 rounded text-sm font-medium disabled:opacity-50"
 								>
-									<RotateCcw size={16} /> Rollback
+									<RotateCcw size={16} /> {t("patch.rollback")}
 								</button>
 								<button
 									onClick={refreshStatus}
 									disabled={loading || !gamePath.trim()}
 									className="px-3 py-2 text-sm text-gray-600 hover:underline disabled:opacity-50"
 								>
-									Refresh status
+									{t("patch.refreshStatus")}
 								</button>
 							</div>
 
 							{status && (
 								<div className="p-3 bg-gray-50 dark:bg-gray-800/60 rounded text-sm space-y-1">
-									<div className="font-medium">Status: {status.status}</div>
+									<div className="font-medium">{t("patch.status", { status: status.status })}</div>
 									{status.status === "patched" && (
 										<div className="text-xs text-gray-600 dark:text-gray-400">
-											{status.patch_id}@{status.patch_version} · {status.engine}{" "}
-											· {status.language} · baseline {status.baseline} ·
-											replaced {status.replaced} · added {status.added}
+											{t("patch.statusDetail", {
+												id: status.patch_id ?? "",
+												version: status.patch_version ?? "",
+												engine: status.engine ?? "",
+												language: status.language ?? "",
+												baseline: status.baseline ?? "",
+												replaced: status.replaced ?? 0,
+												added: status.added ?? 0,
+											})}
 										</div>
 									)}
 									{status.status === "interrupted" && (
 										<div className="text-xs text-amber-600">
-											Interrupted apply of {status.patch_id} — run rollback
+											{t("patch.interrupted", { id: status.patch_id ?? "" })}
 										</div>
 									)}
 								</div>
@@ -622,19 +628,21 @@ export default function PatchModal({
 
 							{verify && (
 								<div className="p-3 border rounded dark:border-gray-700 text-sm space-y-1">
-									<div className="font-medium">Verify: {verify.outcome}</div>
+									<div className="font-medium">{t("patch.verifyLine", { outcome: verify.outcome })}</div>
 									{verify.tier && (
-										<div className="text-xs">Tier: {verify.tier}</div>
+										<div className="text-xs">{t("patch.tier", { tier: verify.tier })}</div>
 									)}
 									<div className="text-xs text-gray-600 dark:text-gray-400">
-										plan: {verify.replaced?.length ?? 0} replace,{" "}
-										{verify.added?.length ?? 0} add
+										{t("patch.plan", {
+											replace: verify.replaced?.length ?? 0,
+											add: verify.added?.length ?? 0,
+										})}
 										{(verify.conflicts?.length ?? 0) > 0 &&
-											`, ${verify.conflicts.length} conflict(s)`}
+											t("patch.conflicts", { count: verify.conflicts.length })}
 									</div>
 									{verify.backup_compromised && (
 										<div className="text-xs text-amber-600">
-											Backup compromised warning
+											{t("patch.backupCompromised")}
 										</div>
 									)}
 									{verify.messages?.map((m, i) => (
@@ -648,27 +656,33 @@ export default function PatchModal({
 							{applyResult && (
 								<div className="p-3 border border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 rounded text-sm space-y-1">
 									<div className="font-medium">
-										{applyResult.dry_run ? "Planned" : "Applied"}{" "}
-										{applyResult.patch_id}@{applyResult.patch_version}
+										{t(
+											applyResult.dry_run ? "patch.planned" : "patch.applied",
+											{
+												id: applyResult.patch_id,
+												version: applyResult.patch_version,
+											},
+										)}
 									</div>
 									<div className="text-xs">
-										replaced {applyResult.replaced}, added {applyResult.added},
-										baseline {applyResult.baseline}
+										{t("patch.applyDetail", {
+											replaced: applyResult.replaced,
+											added: applyResult.added,
+											baseline: applyResult.baseline,
+										})}
 									</div>
 									{applyResult.user_edits_overwritten?.length > 0 && (
 										<div className="text-xs text-amber-700">
-											Overwrote user edits:{" "}
-											{applyResult.user_edits_overwritten.join(", ")}
+											{t("patch.overwrote", {
+												files: applyResult.user_edits_overwritten.join(", "),
+											})}
 										</div>
 									)}
 								</div>
 							)}
 
 							<p className="text-xs text-gray-500">
-								Verify only checks — it never changes files. Apply first saves
-								Locust&apos;s backup of the original files inside the game
-								folder, so Rollback can restore them exactly. Patches packed
-								with pristine hashes get the strictest safety checks.
+								{t("patch.applyHelp")}
 							</p>
 						</>
 					)}
@@ -676,18 +690,18 @@ export default function PatchModal({
 					{tab === "pack" && (
 						<>
 							<div>
-								<label className="text-sm font-medium">Output zip</label>
+								<label className="text-sm font-medium">{t("patch.outputZip")}</label>
 								<div className="flex gap-2 mt-1">
 									<input
 										value={outputPath}
 										onChange={(e) => setOutputPath(e.target.value)}
-										placeholder="Where to write the patch zip..."
+										placeholder={t("patch.outputPlaceholder")}
 										className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 									/>
 									<button
 										onClick={pickOutputZip}
 										className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"
-										title="Save as"
+										title={t("common.saveAs")}
 									>
 										<FileArchive size={16} />
 									</button>
@@ -695,16 +709,15 @@ export default function PatchModal({
 							</div>
 
 							<div>
-								<label className="text-sm font-medium">Language(s)</label>
+								<label className="text-sm font-medium">{t("patch.languages")}</label>
 								<input
 									value={languages}
 									onChange={(e) => setLanguages(e.target.value)}
-									placeholder="e.g. es (one language per zip; empty = auto)"
+									placeholder={t("patch.languagesPlaceholder")}
 									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 								/>
 								<p className="text-xs text-gray-500 mt-1">
-									One recording per zip. Leave empty when a single injection
-									language was recorded.
+									{t("patch.languagesHint")}
 								</p>
 							</div>
 
@@ -716,12 +729,9 @@ export default function PatchModal({
 									onChange={(e) => setPristine(e.target.checked)}
 								/>
 								<span>
-									<span className="font-medium">Pristine hashes</span>
+									<span className="font-medium">{t("patch.pristine")}</span>
 									<span className="block text-xs text-gray-500 mt-0.5">
-										Include fingerprints of the original files (from
-										Locust&apos;s backup of this game) so anyone applying the
-										patch gets the strictest safety checks. Fails when Locust
-										has no backup of the original files.
+										{t("patch.pristineHint")}
 									</span>
 								</span>
 							</label>
@@ -731,25 +741,34 @@ export default function PatchModal({
 								disabled={loading}
 								className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium disabled:opacity-50"
 							>
-								<Archive size={16} /> Pack
+								<Archive size={16} /> {t("patch.packBtn")}
 							</button>
 
 							{packResult && (
 								<div className="p-3 border border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 rounded text-sm space-y-1">
 									<div className="font-medium">
-										Packed {packResult.patch_id}@{packResult.patch_version}
+										{t("patch.packed", {
+											id: packResult.patch_id,
+											version: packResult.patch_version,
+										})}
 									</div>
 									<div className="text-xs text-gray-600 dark:text-gray-400 space-y-0.5">
 										<div>
-											{packResult.files_packed} file(s) ·{" "}
-											{packResult.size_bytes} bytes · tier{" "}
-											<span className="font-medium">{packResult.tier}</span>
+											{t("patch.packedStats", {
+												files: packResult.files_packed,
+												bytes: packResult.size_bytes,
+												tier: packResult.tier,
+											})}
 										</div>
 										<div>
-											engine {packResult.engine} · language{" "}
-											{packResult.language}
+											{t("patch.packedMeta", {
+												engine: packResult.engine,
+												language: packResult.language,
+											})}
 											{packResult.translated_strings != null &&
-												` · ${packResult.translated_strings} translated string(s)`}
+												t("patch.packedStrings", {
+													count: packResult.translated_strings,
+												})}
 										</div>
 										<div className="break-all">{packResult.output_path}</div>
 									</div>
@@ -765,11 +784,7 @@ export default function PatchModal({
 							)}
 
 							<p className="text-xs text-gray-500">
-								Packs exactly the files a previous inject wrote into a shareable
-								patch zip. Run Inject first, then point the folder above at
-								where those files were written — the game folder itself for
-								Direct inject, or the translated copy when Replace inject used
-								an output folder.
+								{t("patch.packHelp")}
 							</p>
 						</>
 					)}

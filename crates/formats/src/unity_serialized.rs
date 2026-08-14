@@ -225,12 +225,8 @@ impl<'a> R<'a> {
     fn u64(&mut self) -> Result<u64, SerializedError> {
         let b = self.take(8)?;
         Ok(match self.endian {
-            Endian::Little => u64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ]),
-            Endian::Big => u64::from_be_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ]),
+            Endian::Little => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+            Endian::Big => u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
         })
     }
 
@@ -278,7 +274,10 @@ impl<'a> R<'a> {
 }
 
 impl SerializedFile {
-    pub fn parse(data: Vec<u8>, path: impl Into<std::path::PathBuf>) -> Result<Self, SerializedError> {
+    pub fn parse(
+        data: Vec<u8>,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, SerializedError> {
         let path = path.into();
         let label = path.display().to_string();
         if data.len() < 20 {
@@ -345,10 +344,7 @@ impl SerializedFile {
 
         let type_count = r.i32()?;
         if !(0..=100_000).contains(&type_count) {
-            return Err(err(
-                &label,
-                format!("implausible type count {type_count}"),
-            ));
+            return Err(err(&label, format!("implausible type count {type_count}")));
         }
         let mut types = Vec::with_capacity(type_count as usize);
         for _ in 0..type_count {
@@ -395,7 +391,10 @@ impl SerializedFile {
             if type_id < 0 || type_id as usize >= types.len() {
                 return Err(err(
                     &label,
-                    format!("object type_id {type_id} out of bounds ({} types)", types.len()),
+                    format!(
+                        "object type_id {type_id} out of bounds ({} types)",
+                        types.len()
+                    ),
                 ));
             }
             let class_id = types[type_id as usize].class_id;
@@ -495,12 +494,7 @@ impl SerializedFile {
             .objects
             .iter()
             .find(|o| o.path_id == path_id && is_monobehaviour_class(o.class_id))
-            .ok_or_else(|| {
-                err(
-                    &label,
-                    format!("no MonoBehaviour with path_id={path_id}"),
-                )
-            })?;
+            .ok_or_else(|| err(&label, format!("no MonoBehaviour with path_id={path_id}")))?;
 
         let start = obj.data_abs as usize;
         let end = (start + obj.byte_size as usize).min(self.data.len());
@@ -571,9 +565,7 @@ impl SerializedFile {
 
             // Prefer string-array when the u32 looks like a small element count.
             if (1..=MAX_MONO_STRING_ARRAY_LEN).contains(&len_peek) {
-                if let Some(items) =
-                    try_read_mono_string_array(&mut r, end, len_peek as usize)
-                {
+                if let Some(items) = try_read_mono_string_array(&mut r, end, len_peek as usize) {
                     non_string_skips = 0;
                     for (text, len_offset, byte_len) in items {
                         if mono_script_field_worth_extracting(&text) {
@@ -906,8 +898,7 @@ fn is_mono_engine_noise(t: &str) -> bool {
         return true;
     }
     // Pure template / variable tokens: `{g_saveslot}`.
-    if t.starts_with('{') && t.ends_with('}') && t.len() >= 3 && !t[1..t.len() - 1].contains(' ')
-    {
+    if t.starts_with('{') && t.ends_with('}') && t.len() >= 3 && !t[1..t.len() - 1].contains(' ') {
         return true;
     }
     // Mixer / resource path fragments without sentence whitespace: `Master/HFX`.
@@ -1015,9 +1006,11 @@ fn looks_like_dev_separator_banner(t: &str) -> bool {
     }
     let upper = letters.iter().filter(|c| c.is_ascii_uppercase()).count();
     upper * 100 / letters.len() >= 70
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace() || matches!(c, '/' | '_' | '-' | ':' | '.'))
+        && rest.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c.is_ascii_whitespace()
+                || matches!(c, '/' | '_' | '-' | ':' | '.')
+        })
 }
 
 /// Naninovel (and similar) scenario commands: every non-empty line is an `@cmd…`.
@@ -1032,11 +1025,7 @@ pub(crate) fn looks_like_naninovel_script(t: &str) -> bool {
         return true;
     }
     // Multi-line block where every non-empty line is a command.
-    let lines: Vec<&str> = t
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
+    let lines: Vec<&str> = t.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     lines.len() >= 2 && lines.iter().all(|l| l.starts_with('@'))
 }
 
@@ -1101,9 +1090,7 @@ pub(crate) fn looks_like_assembly_qualified_type(t: &str) -> bool {
         return false;
     }
     // Canonical full AQN markers.
-    if t.contains("Version=")
-        && (t.contains("PublicKeyToken=") || t.contains("Culture="))
-    {
+    if t.contains("Version=") && (t.contains("PublicKeyToken=") || t.contains("Culture=")) {
         return true;
     }
     // Common short assembly suffixes after the type name.
@@ -1189,12 +1176,7 @@ fn mono_script_field_worth_extracting(s: &str) -> bool {
     // Engine API / serialized method tokens (not player-facing).
     if matches!(
         t,
-        "set_text"
-            | "get_text"
-            | "set_enabled"
-            | "get_enabled"
-            | "set_active"
-            | "get_active"
+        "set_text" | "get_text" | "set_enabled" | "get_enabled" | "set_active" | "get_active"
     ) {
         return false;
     }
@@ -1344,7 +1326,11 @@ pub fn rewrite_text_asset_script_inplace(
 /// Build a minimal v17 SerializedFile with one TextAsset and one dummy object.
 #[cfg(test)]
 pub fn write_v17_fixture(text_name: &str, text_script: &str) -> Vec<u8> {
-    write_v17_fixture_ex(text_name, text_script, Some(("Dummy", "not a text asset body")))
+    write_v17_fixture_ex(
+        text_name,
+        text_script,
+        Some(("Dummy", "not a text asset body")),
+    )
 }
 
 #[cfg(test)]
@@ -1395,7 +1381,7 @@ pub fn write_v17_fixture_ex(
     meta.push(0); // stripped
     meta.extend_from_slice(&(-1i16).to_le_bytes()); // script_type_index
     meta.extend_from_slice(&[0u8; 16]); // old_type_hash
-    // type 1: GameObject class 1
+                                        // type 1: GameObject class 1
     meta.extend_from_slice(&1i32.to_le_bytes());
     meta.push(0);
     meta.extend_from_slice(&(-1i16).to_le_bytes());
@@ -1451,6 +1437,10 @@ pub fn write_v17_fixture_ex(
     out
 }
 
+// The `write_*_fixture` builders below this module are themselves `#[cfg(test)]`
+// and are deliberately grouped at the end of the file, out of the way of the
+// parser code. Moving ~700 lines to satisfy a layout lint buys nothing.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1478,7 +1468,10 @@ mod tests {
         let bytes = write_v22_textasset_fixture("Dlg", "Hello from v22 assets");
         let sf = SerializedFile::parse(bytes, "v22.assets").unwrap();
         assert_eq!(sf.header.version, 22);
-        assert!(sf.header.data_offset >= 48, "extended header pushes metadata past 20");
+        assert!(
+            sf.header.data_offset >= 48,
+            "extended header pushes metadata past 20"
+        );
         let texts: Vec<_> = sf.text_asset_objects().collect();
         assert_eq!(texts.len(), 1);
         assert_eq!(texts[0].path_id, 1);
@@ -1716,10 +1709,7 @@ mod tests {
 
     #[test]
     fn parse_v17_mono_behaviour_strings() {
-        let bytes = write_v17_mono_fixture(
-            "DialogBox",
-            &["Welcome, traveler!", "See you later."],
-        );
+        let bytes = write_v17_mono_fixture("DialogBox", &["Welcome, traveler!", "See you later."]);
         let sf = SerializedFile::parse(bytes, "mono.assets").unwrap();
         let monos: Vec<_> = sf.mono_behaviour_objects().collect();
         assert_eq!(monos.len(), 1);
@@ -1819,11 +1809,7 @@ mod tests {
     /// SerializedFiles — must extract sequential strings like class 114.
     #[test]
     fn parse_v17_negative_class_id_monobehaviour() {
-        let bytes = write_v17_mono_fixture_with_class(
-            -42,
-            "DialogBox",
-            &["Welcome, traveler!"],
-        );
+        let bytes = write_v17_mono_fixture_with_class(-42, "DialogBox", &["Welcome, traveler!"]);
         let sf = SerializedFile::parse(bytes, "neg.assets").unwrap();
         let monos: Vec<_> = sf.mono_behaviour_objects().collect();
         assert_eq!(monos.len(), 1, "negative class_id must count as mono");
@@ -1887,16 +1873,12 @@ mod tests {
         let again = SerializedFile::parse(file, "gap.assets").unwrap();
         let fields2 = again.read_mono_strings(10).unwrap();
         assert!(
-            fields2
-                .iter()
-                .any(|f| f.text.starts_with("Hola linea dos")),
+            fields2.iter().any(|f| f.text.starts_with("Hola linea dos")),
             "post-gap inject must land on second string: {fields2:?}"
         );
         // Gap must not have destroyed the first string.
         assert!(
-            fields2
-                .iter()
-                .any(|f| f.text == "First line of dialogue"),
+            fields2.iter().any(|f| f.text == "First line of dialogue"),
             "first string must remain: {fields2:?}"
         );
     }
@@ -2001,26 +1983,24 @@ mod tests {
             texts.contains(&"Portable Speaker"),
             "keep dialogue-ish: {texts:?}"
         );
-        assert!(
-            texts.contains(&"Welcome home"),
-            "keep sentence: {texts:?}"
-        );
+        assert!(texts.contains(&"Welcome home"), "keep sentence: {texts:?}");
         assert!(
             !texts.iter().any(|t| t.contains("UnityEngine")),
             "drop assembly type: {texts:?}"
         );
         assert!(
-            !texts.iter().any(|t| t.contains("Version=") || t.contains("PublicKeyToken=")),
+            !texts
+                .iter()
+                .any(|t| t.contains("Version=") || t.contains("PublicKeyToken=")),
             "drop full AQN: {texts:?}"
         );
         assert!(
-            !texts.iter().any(|t| t.contains("Naninovel.Script") || t.contains("TMP_FontAsset")),
+            !texts
+                .iter()
+                .any(|t| t.contains("Naninovel.Script") || t.contains("TMP_FontAsset")),
             "drop Naninovel/TMPro AQN: {texts:?}"
         );
-        assert!(
-            !texts.contains(&"set_text"),
-            "drop API token: {texts:?}"
-        );
+        assert!(!texts.contains(&"set_text"), "drop API token: {texts:?}");
     }
 
     /// BOXMAN-class flood: namespaces, Assembly-CSharp, Selectable color states,
@@ -2064,23 +2044,11 @@ mod tests {
             "ControlPanel.Config",
             "Master/HFX",
         ] {
-            assert!(
-                !texts.contains(&drop),
-                "expected drop {drop}: {texts:?}"
-            );
+            assert!(!texts.contains(&drop), "expected drop {drop}: {texts:?}");
         }
-        assert!(
-            texts.contains(&"Q.SAVE"),
-            "keep quick-save UI: {texts:?}"
-        );
-        assert!(
-            texts.contains(&"Play"),
-            "keep short UI verb: {texts:?}"
-        );
-        assert!(
-            texts.contains(&"Save game now"),
-            "keep sentence: {texts:?}"
-        );
+        assert!(texts.contains(&"Q.SAVE"), "keep quick-save UI: {texts:?}");
+        assert!(texts.contains(&"Play"), "keep short UI verb: {texts:?}");
+        assert!(texts.contains(&"Save game now"), "keep sentence: {texts:?}");
         assert!(
             texts.iter().any(|t| t.contains("replacement")),
             "keep dialogue: {texts:?}"
@@ -2105,18 +2073,9 @@ mod tests {
         let sf = SerializedFile::parse(bytes, "nani.assets").unwrap();
         let fields = sf.read_mono_strings(10).unwrap();
         let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
-        assert!(
-            texts.contains(&"Play"),
-            "keep UI: {texts:?}"
-        );
-        assert!(
-            texts.contains(&"Emily"),
-            "keep name: {texts:?}"
-        );
-        assert!(
-            texts.contains(&"Save game"),
-            "keep sentence: {texts:?}"
-        );
+        assert!(texts.contains(&"Play"), "keep UI: {texts:?}");
+        assert!(texts.contains(&"Emily"), "keep name: {texts:?}");
+        assert!(texts.contains(&"Save game"), "keep sentence: {texts:?}");
         for drop_sub in ["@novel", "@hideUI", "@else", "@moveMode", "Lorem ipsum"] {
             assert!(
                 !texts.iter().any(|t| t.contains(drop_sub)),
@@ -2161,16 +2120,10 @@ mod tests {
             "Author Name",
             "v'",
         ] {
-            assert!(
-                !texts.contains(&drop),
-                "expected drop {drop}: {texts:?}"
-            );
+            assert!(!texts.contains(&drop), "expected drop {drop}: {texts:?}");
         }
         for keep in ["Play", "Emily", "Q.SAVE", "Message speed:"] {
-            assert!(
-                texts.contains(&keep),
-                "expected keep {keep}: {texts:?}"
-            );
+            assert!(texts.contains(&keep), "expected keep {keep}: {texts:?}");
         }
     }
 
@@ -2216,16 +2169,10 @@ mod tests {
             "Sprites/Floor Sprite",
             "Day/2 Standard",
         ] {
-            assert!(
-                !texts.contains(&drop),
-                "expected drop {drop}: {texts:?}"
-            );
+            assert!(!texts.contains(&drop), "expected drop {drop}: {texts:?}");
         }
         for keep in ["START / LOAD", "Fridge / Microwave", "Play", "Emily"] {
-            assert!(
-                texts.contains(&keep),
-                "expected keep {keep}: {texts:?}"
-            );
+            assert!(texts.contains(&keep), "expected keep {keep}: {texts:?}");
         }
     }
 
@@ -2267,10 +2214,7 @@ mod tests {
             "drop spawn banner: {texts:?}"
         );
         for keep in ["Play", "Emily", "Option A"] {
-            assert!(
-                texts.contains(&keep),
-                "expected keep {keep}: {texts:?}"
-            );
+            assert!(texts.contains(&keep), "expected keep {keep}: {texts:?}");
         }
     }
 
@@ -2318,10 +2262,7 @@ mod tests {
             "Breath",
             "{g_saveslot}",
         ] {
-            assert!(
-                !texts.contains(&drop),
-                "expected drop {drop}: {texts:?}"
-            );
+            assert!(!texts.contains(&drop), "expected drop {drop}: {texts:?}");
         }
         for keep in [
             "Play",
@@ -2331,10 +2272,7 @@ mod tests {
             "Q.LOAD",
             "Message speed:",
         ] {
-            assert!(
-                texts.contains(&keep),
-                "expected keep {keep}: {texts:?}"
-            );
+            assert!(texts.contains(&keep), "expected keep {keep}: {texts:?}");
         }
     }
 
@@ -2348,21 +2286,14 @@ mod tests {
         let sf = SerializedFile::parse(bytes, "arr.assets").unwrap();
         let fields = sf.read_mono_strings(10).unwrap();
         let texts: Vec<&str> = fields.iter().map(|f| f.text.as_str()).collect();
-        assert!(
-            texts.contains(&"New Game"),
-            "fields: {texts:?}"
-        );
-        assert!(
-            texts.contains(&"Load Game"),
-            "fields: {texts:?}"
-        );
-        assert!(
-            texts.contains(&"Options"),
-            "fields: {texts:?}"
-        );
+        assert!(texts.contains(&"New Game"), "fields: {texts:?}");
+        assert!(texts.contains(&"Load Game"), "fields: {texts:?}");
+        assert!(texts.contains(&"Options"), "fields: {texts:?}");
         // Count u32 must not appear as a garbage 3-byte "string".
         assert!(
-            !texts.iter().any(|t| t.len() == 3 && t.as_bytes().iter().all(|b| *b < 0x20)),
+            !texts
+                .iter()
+                .any(|t| t.len() == 3 && t.as_bytes().iter().all(|b| *b < 0x20)),
             "array count must not be consumed as a short string: {texts:?}"
         );
     }
@@ -2848,7 +2779,7 @@ fn write_typed_textasset_with_type_tree(
     meta.extend_from_slice(&[0u8; 16]); // old_type_hash
     if enable_tt {
         write_i32(&mut meta, 1, data_endian); // node count
-        // Non-empty string buffer exercises skip of both nodes and buffer.
+                                              // Non-empty string buffer exercises skip of both nodes and buffer.
         let str_buf = b"m_Name\0m_Script\0";
         write_i32(&mut meta, str_buf.len() as i32, data_endian);
         meta.extend(std::iter::repeat_n(0u8, type_tree_node_size));
@@ -2937,7 +2868,7 @@ pub fn write_v17_mono_fixture_with_class(
     meta.extend_from_slice(&class_id.to_le_bytes());
     meta.push(0);
     meta.extend_from_slice(&0i16.to_le_bytes()); // script_type_index
-    // script_id present for mono 114 and negative script-type ids
+                                                 // script_id present for mono 114 and negative script-type ids
     if is_monobehaviour_class(class_id) {
         meta.extend_from_slice(&[0u8; 16]);
     }
@@ -3075,7 +3006,7 @@ pub fn write_v17_monoscript_noise_fixture() -> Vec<u8> {
     meta.extend_from_slice(&1u32.to_le_bytes());
     meta.push(0); // enable_type_tree
     meta.extend_from_slice(&2i32.to_le_bytes()); // types
-    // type 0: TextAsset
+                                                 // type 0: TextAsset
     meta.extend_from_slice(&CLASS_ID_TEXT_ASSET.to_le_bytes());
     meta.push(0);
     meta.extend_from_slice(&(-1i16).to_le_bytes());
@@ -3123,4 +3054,3 @@ pub fn write_v17_monoscript_noise_fixture() -> Vec<u8> {
     out.extend_from_slice(&ms_payload);
     out
 }
-

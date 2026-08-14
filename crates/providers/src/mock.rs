@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use locust_core::error::Result;
+use locust_core::error::{LocustError, Result};
 use locust_core::models::{TranslationRequest, TranslationResult};
 use locust_core::translation::TranslationProvider;
 
@@ -30,12 +30,7 @@ fn mock_fit(source: &str, target_lang: &str) -> String {
     if source.contains("{PL_") {
         return mock_fit_preserving_pl(source, target_lang);
     }
-    mock_fit_plain(
-        source,
-        target_lang,
-        source.len(),
-        utf16_byte_len(source),
-    )
+    mock_fit_plain(source, target_lang, source.len(), utf16_byte_len(source))
 }
 
 fn utf16_byte_len(s: &str) -> usize {
@@ -166,7 +161,11 @@ fn split_pl_segments(source: &str) -> Vec<PlSeg> {
             continue;
         }
         // Advance one Unicode scalar so free slices stay on char boundaries.
-        let ch_len = source[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let ch_len = source[i..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
         i += ch_len;
     }
     if free_start < source.len() {
@@ -235,6 +234,42 @@ impl TranslationProvider for MockProvider {
                 cost_usd: None,
             })
             .collect())
+    }
+
+    async fn estimate_cost(&self, _char_count: usize, _target_lang: &str) -> Option<f64> {
+        None
+    }
+
+    async fn health_check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Test/dev provider that always fails. Used to exercise fallback chains.
+pub struct AlwaysErrorProvider;
+
+#[async_trait]
+impl TranslationProvider for AlwaysErrorProvider {
+    fn id(&self) -> &str {
+        "always-error"
+    }
+
+    fn name(&self) -> &str {
+        "Always Error"
+    }
+
+    fn is_free(&self) -> bool {
+        true
+    }
+
+    fn requires_api_key(&self) -> bool {
+        false
+    }
+
+    async fn translate(&self, _requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
+        Err(LocustError::ProviderError(
+            "primary provider refused".into(),
+        ))
     }
 
     async fn estimate_cost(&self, _char_count: usize, _target_lang: &str) -> Option<f64> {

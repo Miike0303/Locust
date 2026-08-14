@@ -12,6 +12,7 @@ use crate::models::{StringEntry, StringStatus, ValidationIssue, ValidationKind};
 
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    path: Mutex<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -42,6 +43,16 @@ pub struct TranslationRun {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+}
+
+/// Result of [`Database::merge_entries`] — counts for the open-project UI.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeStats {
+    pub added: usize,
+    pub updated: usize,
+    pub stale_source_reset: usize,
+    pub removed: usize,
+    pub preserved_translations: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -207,138 +218,160 @@ fn path_identity_key(p: &Path) -> String {
         .join("/")
 }
 
+/// Shared schema + migration used by [`Database::open`] and [`Database::reopen`].
+fn init_schema(conn: &Connection) -> Result<()> {
+    // The injected_files table was rebuilt (lang/root/rel/hash/size) when
+    // `locust patch` moved to packing exclusively from recordings. Any
+    // table missing part of that column set — the legacy file_path
+    // schema, or an intermediate one — cannot serve the new contract and
+    // would fail at runtime with a raw SQL error the first time a
+    // recording is read or written, so it is dropped whole. Recordings
+    // are reproducible caches: the next `locust inject` rebuilds one,
+    // and `locust patch` on a missing recording names that exact
+    // command.
+    let legacy: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'injected_files'
+           AND (SELECT COUNT(*) FROM pragma_table_info('injected_files')
+                WHERE name IN ('lang', 'root', 'rel', 'hash', 'size',
+                               'recorded_at')) < 6",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy > 0 {
+        conn.execute("DROP TABLE injected_files", [])?;
+    }
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE IF NOT EXISTS strings (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            translation TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            file_path TEXT NOT NULL,
+            context TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            metadata TEXT NOT NULL DEFAULT '{}',
+            char_limit INTEGER,
+            provider_used TEXT,
+            created_at TEXT NOT NULL,
+            translated_at TEXT,
+            reviewed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_strings_status ON strings(status);
+        CREATE INDEX IF NOT EXISTS idx_strings_file ON strings(file_path);
+
+        CREATE TABLE IF NOT EXISTS glossary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            term TEXT NOT NULL,
+            translation TEXT NOT NULL,
+            lang_pair TEXT NOT NULL,
+            context TEXT,
+            case_sensitive INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(term, lang_pair)
+        );
+
+        CREATE TABLE IF NOT EXISTS translation_memory (
+            source_hash TEXT NOT NULL,
+            lang_pair TEXT NOT NULL,
+            source TEXT NOT NULL,
+            translation TEXT NOT NULL,
+            uses INTEGER NOT NULL DEFAULT 1,
+            last_used TEXT NOT NULL,
+            PRIMARY KEY (source_hash, lang_pair)
+        );
+
+        CREATE TABLE IF NOT EXISTS validation_issues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            message TEXT NOT NULL,
+            resolved INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS translation_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            duration_secs REAL NOT NULL,
+            provider TEXT NOT NULL,
+            source_lang TEXT NOT NULL,
+            target_lang TEXT NOT NULL,
+            strings_translated INTEGER NOT NULL,
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS injected_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lang TEXT,
+            root TEXT NOT NULL,
+            rel TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        ",
+    )?;
+    // Migrate older DBs that predate the input/output token columns.
+    // ADD COLUMN errors if the column already exists — ignore that.
+    let _ = conn.execute(
+        "ALTER TABLE translation_runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE translation_runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    Ok(())
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
         let conn = Connection::open(path)?;
-        let db = Self {
+        init_schema(&conn)?;
+        Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-        };
-        db.migrate()?;
-        Ok(db)
+            path: Mutex::new(path.to_path_buf()),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = Self {
+        init_schema(&conn)?;
+        Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-        };
-        db.migrate()?;
-        Ok(db)
+            path: Mutex::new(PathBuf::from(":memory:")),
+        })
     }
 
-    fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        // The injected_files table was rebuilt (lang/root/rel/hash/size) when
-        // `locust patch` moved to packing exclusively from recordings. Any
-        // table missing part of that column set — the legacy file_path
-        // schema, or an intermediate one — cannot serve the new contract and
-        // would fail at runtime with a raw SQL error the first time a
-        // recording is read or written, so it is dropped whole. Recordings
-        // are reproducible caches: the next `locust inject` rebuilds one,
-        // and `locust patch` on a missing recording names that exact
-        // command.
-        let legacy: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE type = 'table' AND name = 'injected_files'
-               AND (SELECT COUNT(*) FROM pragma_table_info('injected_files')
-                    WHERE name IN ('lang', 'root', 'rel', 'hash', 'size',
-                                   'recorded_at')) < 6",
-            [],
-            |row| row.get(0),
-        )?;
-        if legacy > 0 {
-            conn.execute("DROP TABLE injected_files", [])?;
+    /// On-disk path of the live connection (`:memory:` for an in-memory DB).
+    pub fn path(&self) -> PathBuf {
+        self.path.lock().unwrap().clone()
+    }
+
+    /// Swap the live connection to `path` in place and run the same schema
+    /// init as [`Database::open`]. Shared `Arc<Database>` handlers keep working.
+    pub fn reopen(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE IF NOT EXISTS strings (
-                id TEXT PRIMARY KEY,
-                source TEXT NOT NULL,
-                translation TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                file_path TEXT NOT NULL,
-                context TEXT,
-                tags TEXT NOT NULL DEFAULT '[]',
-                metadata TEXT NOT NULL DEFAULT '{}',
-                char_limit INTEGER,
-                provider_used TEXT,
-                created_at TEXT NOT NULL,
-                translated_at TEXT,
-                reviewed_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_strings_status ON strings(status);
-            CREATE INDEX IF NOT EXISTS idx_strings_file ON strings(file_path);
-
-            CREATE TABLE IF NOT EXISTS glossary (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                term TEXT NOT NULL,
-                translation TEXT NOT NULL,
-                lang_pair TEXT NOT NULL,
-                context TEXT,
-                case_sensitive INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(term, lang_pair)
-            );
-
-            CREATE TABLE IF NOT EXISTS translation_memory (
-                source_hash TEXT NOT NULL,
-                lang_pair TEXT NOT NULL,
-                source TEXT NOT NULL,
-                translation TEXT NOT NULL,
-                uses INTEGER NOT NULL DEFAULT 1,
-                last_used TEXT NOT NULL,
-                PRIMARY KEY (source_hash, lang_pair)
-            );
-
-            CREATE TABLE IF NOT EXISTS validation_issues (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry_id TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                message TEXT NOT NULL,
-                resolved INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS translation_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_at TEXT NOT NULL,
-                duration_secs REAL NOT NULL,
-                provider TEXT NOT NULL,
-                source_lang TEXT NOT NULL,
-                target_lang TEXT NOT NULL,
-                strings_translated INTEGER NOT NULL,
-                tokens_used INTEGER NOT NULL DEFAULT 0,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                cost_usd REAL NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS injected_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lang TEXT,
-                root TEXT NOT NULL,
-                rel TEXT NOT NULL,
-                hash TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                recorded_at TEXT NOT NULL
-            );
-            ",
-        )?;
-        // Migrate older DBs that predate the input/output token columns.
-        // ADD COLUMN errors if the column already exists — ignore that.
-        let _ = conn.execute(
-            "ALTER TABLE translation_runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE translation_runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+        let new_conn = Connection::open(path)?;
+        init_schema(&new_conn)?;
+        *self.conn.lock().unwrap() = new_conn;
+        *self.path.lock().unwrap() = path.to_path_buf();
         Ok(())
     }
 
@@ -800,9 +833,8 @@ impl Database {
     /// exact inject command, never fall back to guessing from entries.
     pub fn list_recorded_langs(&self) -> Result<Vec<Option<String>>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT lang FROM injected_files ORDER BY (lang IS NULL), lang",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT lang FROM injected_files ORDER BY (lang IS NULL), lang")?;
         let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
         let mut langs = Vec::new();
         for row in rows {
@@ -845,11 +877,7 @@ impl Database {
     /// Source language for export headers: prefer the latest run that targeted
     /// `target_lang`, else the latest run of any target, else `fallback`.
     /// Config defaults are not project ground truth once a run exists.
-    pub fn resolve_export_source_lang(
-        &self,
-        target_lang: &str,
-        fallback: &str,
-    ) -> Result<String> {
+    pub fn resolve_export_source_lang(&self, target_lang: &str, fallback: &str) -> Result<String> {
         let runs = self.get_translation_runs()?;
         if let Some(run) = runs
             .iter()
@@ -866,8 +894,7 @@ impl Database {
 
     pub fn get_stats(&self) -> Result<ProjectStats> {
         let conn = self.conn.lock().unwrap();
-        let total: usize =
-            conn.query_row("SELECT COUNT(*) FROM strings", [], |row| row.get(0))?;
+        let total: usize = conn.query_row("SELECT COUNT(*) FROM strings", [], |row| row.get(0))?;
         let pending: usize = conn.query_row(
             "SELECT COUNT(*) FROM strings WHERE status = 'pending'",
             [],
@@ -961,8 +988,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             for issue in &issues {
-                let kind_json = serde_json::to_string(&issue.kind)
-                    .unwrap_or_else(|_| "unknown".to_string());
+                let kind_json =
+                    serde_json::to_string(&issue.kind).unwrap_or_else(|_| "unknown".to_string());
                 conn.execute(
                     "INSERT INTO validation_issues (entry_id, kind, message) VALUES (?1, ?2, ?3)",
                     params![issue.entry_id, kind_json, issue.message],
@@ -1014,13 +1041,146 @@ impl Database {
         Ok(())
     }
 
+    /// Merge a fresh extract into the live `strings` table without wiping
+    /// translations. Existing ids keep translation / status / timestamps /
+    /// provider; a changed `source` keeps the translation but forces
+    /// `pending`. Ids missing from `entries` are deleted. One transaction.
+    pub fn merge_entries(&self, entries: &[StringEntry]) -> Result<MergeStats> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        struct Stored {
+            source: String,
+            translation: Option<String>,
+            status: String,
+            provider_used: Option<String>,
+            created_at: String,
+            translated_at: Option<String>,
+            reviewed_at: Option<String>,
+        }
+
+        let mut existing: HashMap<String, Stored> = HashMap::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, source, translation, status, provider_used,
+                        created_at, translated_at, reviewed_at
+                 FROM strings",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Stored {
+                        source: row.get(1)?,
+                        translation: row.get(2)?,
+                        status: row.get(3)?,
+                        provider_used: row.get(4)?,
+                        created_at: row.get(5)?,
+                        translated_at: row.get(6)?,
+                        reviewed_at: row.get(7)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (id, stored) = row?;
+                existing.insert(id, stored);
+            }
+        }
+
+        let mut incoming: HashMap<&str, &StringEntry> = HashMap::new();
+        for entry in entries {
+            incoming.insert(entry.id.as_str(), entry);
+        }
+
+        let mut stats = MergeStats::default();
+
+        for id in existing.keys() {
+            if !incoming.contains_key(id.as_str()) {
+                tx.execute("DELETE FROM strings WHERE id = ?1", params![id])?;
+                stats.removed += 1;
+            }
+        }
+
+        for (id, entry) in incoming {
+            let tags_json = serde_json::to_string(&entry.tags)?;
+            let metadata_json = serde_json::to_string(&entry.metadata)?;
+            let file_path_str = entry.file_path.to_string_lossy().to_string();
+            let char_limit = entry.char_limit.map(|l| l as i64);
+
+            if let Some(old) = existing.get(id) {
+                let source_changed = old.source != entry.source;
+                let status = if source_changed {
+                    stats.stale_source_reset += 1;
+                    StringStatus::Pending.to_string()
+                } else {
+                    old.status.clone()
+                };
+                if old.translation.as_ref().is_some_and(|t| !t.is_empty()) {
+                    stats.preserved_translations += 1;
+                }
+                stats.updated += 1;
+                tx.execute(
+                    "UPDATE strings SET
+                        source = ?1,
+                        file_path = ?2,
+                        context = ?3,
+                        tags = ?4,
+                        metadata = ?5,
+                        char_limit = ?6,
+                        translation = ?7,
+                        status = ?8,
+                        provider_used = ?9,
+                        created_at = ?10,
+                        translated_at = ?11,
+                        reviewed_at = ?12
+                     WHERE id = ?13",
+                    params![
+                        entry.source,
+                        file_path_str,
+                        entry.context,
+                        tags_json,
+                        metadata_json,
+                        char_limit,
+                        old.translation,
+                        status,
+                        old.provider_used,
+                        old.created_at,
+                        old.translated_at,
+                        old.reviewed_at,
+                        entry.id,
+                    ],
+                )?;
+            } else {
+                stats.added += 1;
+                let created_at = entry.created_at.to_rfc3339();
+                tx.execute(
+                    "INSERT INTO strings
+                     (id, source, translation, status, file_path, context, tags, metadata,
+                      char_limit, provider_used, created_at, translated_at, reviewed_at)
+                     VALUES (?1, ?2, NULL, 'pending', ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL)",
+                    params![
+                        entry.id,
+                        entry.source,
+                        file_path_str,
+                        entry.context,
+                        tags_json,
+                        metadata_json,
+                        char_limit,
+                        created_at,
+                    ],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(stats)
+    }
+
     pub fn memory_count(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let count: usize = conn.query_row(
-            "SELECT COUNT(*) FROM translation_memory",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: usize =
+            conn.query_row("SELECT COUNT(*) FROM translation_memory", [], |row| {
+                row.get(0)
+            })?;
         Ok(count)
     }
 
@@ -1106,9 +1266,8 @@ impl Database {
 
     pub fn memory_lang_pairs(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT lang_pair FROM translation_memory ORDER BY lang_pair",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT lang_pair FROM translation_memory ORDER BY lang_pair")?;
         let pairs = stmt
             .query_map([], |row| row.get(0))?
             .collect::<std::result::Result<Vec<String>, _>>()?;
@@ -1149,7 +1308,9 @@ impl GlobalMemoryDb {
         translation: &str,
         lang_pair: &str,
     ) -> Result<()> {
-        self.db.save_memory(hash, source, translation, lang_pair).await
+        self.db
+            .save_memory(hash, source, translation, lang_pair)
+            .await
     }
 
     pub fn memory_count(&self) -> Result<usize> {
@@ -1196,12 +1357,8 @@ struct RawEntry {
 }
 
 fn raw_to_entry(raw: RawEntry) -> Result<StringEntry> {
-    let status: StringStatus = raw
-        .status
-        .parse()
-        .unwrap_or(StringStatus::Pending);
-    let tags: Vec<String> =
-        serde_json::from_str(&raw.tags).unwrap_or_default();
+    let status: StringStatus = raw.status.parse().unwrap_or(StringStatus::Pending);
+    let tags: Vec<String> = serde_json::from_str(&raw.tags).unwrap_or_default();
     let metadata: HashMap<String, serde_json::Value> =
         serde_json::from_str(&raw.metadata).unwrap_or_default();
     let created_at: DateTime<Utc> = DateTime::parse_from_rfc3339(&raw.created_at)
@@ -1284,7 +1441,10 @@ mod tests {
             rec.root.display(),
             root.display()
         );
-        assert!(rec.root.is_absolute(), "the root must be absolutized at record time");
+        assert!(
+            rec.root.is_absolute(),
+            "the root must be absolutized at record time"
+        );
         assert_eq!(rec.files.len(), 1);
         assert_eq!(
             rec.files[0].rel, "game/script.rpy",
@@ -1423,7 +1583,11 @@ mod tests {
             .unwrap();
 
         let rec = db.get_injection(Some("es")).unwrap().unwrap();
-        assert_eq!(rec.files.len(), 1, "one physical file must be recorded once");
+        assert_eq!(
+            rec.files.len(),
+            1,
+            "one physical file must be recorded once"
+        );
     }
 
     #[test]
@@ -1568,6 +1732,126 @@ mod tests {
         assert!(!paths_identical(&root, &base));
     }
 
+    fn schema_tables(db: &Database) -> Vec<String> {
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_reopen_swaps_connection_and_preserves_original() {
+        let base = recording_tempdir();
+        let path_a = base.join("a.locust.db");
+        let path_b = base.join("b.locust.db");
+
+        let db = Database::open(&path_a).unwrap();
+        assert_eq!(db.path(), path_a);
+        db.save_entries(&[make_entry("keep-me", "Hello")]).unwrap();
+
+        db.reopen(&path_b).unwrap();
+        assert_eq!(db.path(), path_b);
+        assert!(
+            db.get_entries(&EntryFilter::default()).unwrap().is_empty(),
+            "reopened path B must start empty"
+        );
+        let tables = schema_tables(&db);
+        for required in [
+            "strings",
+            "glossary",
+            "translation_memory",
+            "validation_issues",
+            "translation_runs",
+            "injected_files",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == required),
+                "reopened DB missing table {required}, have {tables:?}"
+            );
+        }
+
+        db.reopen(&path_a).unwrap();
+        assert_eq!(db.path(), path_a);
+        let entries = db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "keep-me");
+        assert_eq!(entries[0].source, "Hello");
+    }
+
+    #[tokio::test]
+    async fn test_merge_entries_preserves_translations_and_status() {
+        let db = Database::open_in_memory().unwrap();
+        let mut first = make_entry("hero", "Hello");
+        first.context = Some("old-ctx".into());
+        db.save_entries(&[first, make_entry("gone", "Disappears")])
+            .unwrap();
+        assert!(db.save_translation("hero", "Hola", "mock").await.unwrap());
+        db.update_entry_status("hero", StringStatus::Approved)
+            .await
+            .unwrap();
+
+        let mut refreshed = make_entry("hero", "Hello");
+        refreshed.context = Some("new-ctx".into());
+        refreshed.file_path = PathBuf::from("data/Actors.json");
+        refreshed.tags = vec!["ui".into()];
+        let fresh = make_entry("mage", "Spell");
+        let stats = db.merge_entries(&[refreshed, fresh]).unwrap();
+
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.updated, 1);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.stale_source_reset, 0);
+        assert_eq!(stats.preserved_translations, 1);
+
+        let hero = db.get_entry("hero").unwrap().unwrap();
+        assert_eq!(hero.translation.as_deref(), Some("Hola"));
+        assert_eq!(hero.status, StringStatus::Approved);
+        assert_eq!(hero.provider_used.as_deref(), Some("mock"));
+        assert_eq!(hero.context.as_deref(), Some("new-ctx"));
+        assert_eq!(hero.file_path, PathBuf::from("data/Actors.json"));
+        assert_eq!(hero.tags, vec!["ui".to_string()]);
+        assert!(hero.translated_at.is_some());
+
+        assert!(db.get_entry("gone").unwrap().is_none());
+        let mage = db.get_entry("mage").unwrap().unwrap();
+        assert_eq!(mage.status, StringStatus::Pending);
+        assert!(mage.translation.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_merge_entries_stale_source_keeps_translation_resets_status() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[make_entry("npc", "Welcome")]).unwrap();
+        assert!(db
+            .save_translation("npc", "Bienvenido", "mock")
+            .await
+            .unwrap());
+        db.update_entry_status("npc", StringStatus::Approved)
+            .await
+            .unwrap();
+
+        let stats = db
+            .merge_entries(&[make_entry("npc", "Welcome, traveler")])
+            .unwrap();
+        assert_eq!(stats.stale_source_reset, 1);
+        assert_eq!(stats.updated, 1);
+        assert_eq!(stats.preserved_translations, 1);
+        assert_eq!(stats.added, 0);
+        assert_eq!(stats.removed, 0);
+
+        let npc = db.get_entry("npc").unwrap().unwrap();
+        assert_eq!(npc.source, "Welcome, traveler");
+        assert_eq!(npc.translation.as_deref(), Some("Bienvenido"));
+        assert_eq!(npc.status, StringStatus::Pending);
+        assert_eq!(npc.provider_used.as_deref(), Some("mock"));
+    }
+
     #[test]
     fn test_save_and_get_entries() {
         let db = Database::open_in_memory().unwrap();
@@ -1614,11 +1898,8 @@ mod tests {
     #[test]
     fn test_filter_by_search() {
         let db = Database::open_in_memory().unwrap();
-        db.save_entries(&[
-            make_entry("s1", "hello world"),
-            make_entry("s2", "goodbye"),
-        ])
-        .unwrap();
+        db.save_entries(&[make_entry("s1", "hello world"), make_entry("s2", "goodbye")])
+            .unwrap();
         let filter = EntryFilter {
             search: Some("hello".to_string()),
             ..Default::default()
@@ -1650,11 +1931,10 @@ mod tests {
     async fn test_save_translation_updates_status() {
         let db = Database::open_in_memory().unwrap();
         db.save_entries(&[make_entry("tr1", "Hello")]).unwrap();
-        assert!(
-            db.save_translation("tr1", "Hola", "test-provider")
-                .await
-                .unwrap()
-        );
+        assert!(db
+            .save_translation("tr1", "Hola", "test-provider")
+            .await
+            .unwrap());
         let entry = db.get_entry("tr1").unwrap().unwrap();
         assert_eq!(entry.translation, Some("Hola".to_string()));
         assert_eq!(entry.status, StringStatus::Translated);
@@ -1664,21 +1944,17 @@ mod tests {
     #[tokio::test]
     async fn test_save_translation_unknown_id_returns_false() {
         let db = Database::open_in_memory().unwrap();
-        assert!(
-            !db.save_translation("missing", "Hola", "import")
-                .await
-                .unwrap()
-        );
+        assert!(!db
+            .save_translation("missing", "Hola", "import")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
     async fn test_save_translations_batch_applies_known_skips_unknown() {
         let db = Database::open_in_memory().unwrap();
-        db.save_entries(&[
-            make_entry("a", "Hello"),
-            make_entry("b", "World"),
-        ])
-        .unwrap();
+        db.save_entries(&[make_entry("a", "Hello"), make_entry("b", "World")])
+            .unwrap();
         let applied = db
             .save_translations_batch(
                 vec![
@@ -1710,7 +1986,8 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         let id = "S004b.ks.json#0#message";
-        let mut entry = StringEntry::new(id, "Hello there", PathBuf::from(r"C:\work\S004b.ks.json"));
+        let mut entry =
+            StringEntry::new(id, "Hello there", PathBuf::from(r"C:\work\S004b.ks.json"));
         entry.translation = Some("PLACEHOLDER".to_string());
         db.save_entries(&[entry]).unwrap();
 
@@ -1930,10 +2207,7 @@ mod tests {
             .await
             .unwrap();
         });
-        assert_eq!(
-            db.resolve_export_source_lang("es", "ja").unwrap(),
-            "en"
-        );
+        assert_eq!(db.resolve_export_source_lang("es", "ja").unwrap(), "en");
         assert_eq!(
             db.resolve_export_source_lang("fr", "xx").unwrap(),
             "en",

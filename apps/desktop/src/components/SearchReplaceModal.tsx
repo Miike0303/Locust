@@ -10,6 +10,7 @@ import {
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
+import { useT } from "../lib/i18n";
 
 interface SearchReplaceModalProps {
 	open: boolean;
@@ -64,6 +65,7 @@ export default function SearchReplaceModal({
 	onClose,
 	onDone,
 }: SearchReplaceModalProps) {
+	const t = useT();
 	const [find, setFind] = useState("");
 	const [replace, setReplace] = useState("");
 	const [caseSensitive, setCaseSensitive] = useState(false);
@@ -82,7 +84,7 @@ export default function SearchReplaceModal({
 
 	const runPreview = async () => {
 		if (!find) {
-			addToast("error", "Enter text to find");
+			addToast("error", t("replace.toast.enterFind"));
 			return;
 		}
 		setLoading(true);
@@ -112,11 +114,11 @@ export default function SearchReplaceModal({
 			}
 			setPreview({ entries: entriesHit, occurrences, samples });
 			if (entriesHit === 0) {
-				addToast("info", "No translation matches");
+				addToast("info", t("replace.toast.noMatches"));
 			}
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addToast("error", `Preview failed: ${msg}`);
+			addToast("error", t("replace.toast.previewFailed", { error: msg }));
 		} finally {
 			setLoading(false);
 		}
@@ -124,7 +126,7 @@ export default function SearchReplaceModal({
 
 	const runReplace = async () => {
 		if (!find) {
-			addToast("error", "Enter text to find");
+			addToast("error", t("replace.toast.enterFind"));
 			return;
 		}
 		setLoading(true);
@@ -142,14 +144,22 @@ export default function SearchReplaceModal({
 				occurrences += n;
 			}
 			if (updates.length === 0) {
-				addToast("info", "Nothing to replace");
+				addToast("info", t("replace.toast.nothing"));
 				return;
 			}
 			const result = await batchPatchStrings(updates, "search-replace");
 			addToast(
 				result.skipped ? "warning" : "success",
-				`Replaced in ${result.applied} string(s) (${occurrences} occurrence(s))` +
-					(result.skipped ? ` — ${result.skipped} skipped` : ""),
+				result.skipped
+					? t("replace.toast.replacedSkipped", {
+							applied: result.applied,
+							occurrences,
+							skipped: result.skipped,
+						})
+					: t("replace.toast.replaced", {
+							applied: result.applied,
+							occurrences,
+						}),
 			);
 			addLog(
 				"info",
@@ -161,7 +171,7 @@ export default function SearchReplaceModal({
 			onClose();
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addToast("error", `Replace failed: ${msg}`);
+			addToast("error", t("replace.toast.replaceFailed", { error: msg }));
 			addLog("error", "Search-replace failed", msg, "replace");
 		} finally {
 			setLoading(false);
@@ -180,7 +190,7 @@ export default function SearchReplaceModal({
 						{...titleProps}
 						className="text-lg font-bold flex items-center gap-2"
 					>
-						<Replace size={18} /> Search &amp; Replace
+						<Replace size={18} /> {t("replace.title")}
 					</h2>
 					<button
 						onClick={onClose}
@@ -192,7 +202,7 @@ export default function SearchReplaceModal({
 
 				<div className="space-y-3">
 					<div>
-						<label className="text-sm font-medium">Find in translations</label>
+						<label className="text-sm font-medium">{t("replace.find")}</label>
 						<input
 							value={find}
 							onChange={(e) => {
@@ -200,12 +210,12 @@ export default function SearchReplaceModal({
 								setPreview(null);
 							}}
 							className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm font-mono"
-							placeholder="text to find"
+							placeholder={t("replace.findPlaceholder")}
 							autoFocus
 						/>
 					</div>
 					<div>
-						<label className="text-sm font-medium">Replace with</label>
+						<label className="text-sm font-medium">{t("replace.replaceWith")}</label>
 						<input
 							value={replace}
 							onChange={(e) => {
@@ -213,7 +223,7 @@ export default function SearchReplaceModal({
 								setPreview(null);
 							}}
 							className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm font-mono"
-							placeholder="replacement (can be empty)"
+							placeholder={t("replace.replacePlaceholder")}
 						/>
 					</div>
 
@@ -226,21 +236,21 @@ export default function SearchReplaceModal({
 								setPreview(null);
 							}}
 						/>
-						Case sensitive
+						{t("replace.caseSensitive")}
 					</label>
 
 					<p className="text-xs text-gray-500 flex items-start gap-1">
 						<AlertCircle size={12} className="mt-0.5 shrink-0" />
-						Only <strong>translations</strong> are modified (sources stay
-						fixed). Scope is the open project; uses server search then exact
-						replace.
+						{t("replace.hint")}
 					</p>
 
 					{preview && (
 						<div className="text-sm border rounded p-3 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
 							<p>
-								<strong>{preview.entries}</strong> string(s),{" "}
-								<strong>{preview.occurrences}</strong> occurrence(s)
+								{t("replace.preview", {
+									entries: preview.entries,
+									occurrences: preview.occurrences,
+								})}
 							</p>
 							{preview.samples.length > 0 && (
 								<ul className="mt-2 space-y-2 text-xs font-mono max-h-32 overflow-y-auto">
@@ -268,7 +278,7 @@ export default function SearchReplaceModal({
 							onClick={onClose}
 							className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
 						>
-							Cancel
+							{t("common.cancel")}
 						</button>
 						<button
 							onClick={() => {
@@ -277,7 +287,7 @@ export default function SearchReplaceModal({
 							disabled={loading || !find}
 							className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50"
 						>
-							{loading ? "…" : "Preview"}
+							{loading ? "…" : t("replace.previewBtn")}
 						</button>
 						<button
 							onClick={() => {
@@ -286,7 +296,7 @@ export default function SearchReplaceModal({
 							disabled={loading || !find}
 							className="px-4 py-2 text-sm font-medium rounded bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white"
 						>
-							{loading ? "Replacing…" : "Replace all"}
+							{loading ? t("replace.replacing") : t("replace.replaceAll")}
 						</button>
 					</div>
 				</div>

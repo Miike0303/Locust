@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { addLog } from "../stores/logStore";
+import { t } from "./i18n";
 
 // ─── Runtime detection ────────────────────────────────────────────────────
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
@@ -28,7 +29,7 @@ function baseUrl(): Promise<string> {
 }
 
 function unreachableBackend(base: string, path: string): Error {
-  const msg = `Cannot reach Locust backend at ${base} — is locust server running?`;
+  const msg = t("api.unreachable", { base });
   addLog("error", `API unreachable: ${path}`, msg, "api");
   return new Error(msg);
 }

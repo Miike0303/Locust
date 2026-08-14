@@ -18,15 +18,18 @@ Locust extracts translatable text from game files, runs it through a translation
 ```
 
 You can stop at any stage, review/edit translations in the built-in editor, then continue.
-Progress is saved in the project database. Prefer **patch → apply** on a *copy* of the game
-(never the only original without backup).
+Progress is saved in the project database (one file per game; reopening merges, it does not wipe).
+Prefer **patch → apply** on a *copy* of the game (never the only original without backup).
+
+The desktop interface itself is available in **English and Spanish** (Settings → Appearance →
+Interface language). That setting is separate from the language you translate the game into.
 
 ---
 
 ## Supported game engines
 
 Stability matches `locust formats` / the desktop Welcome screen
-(`stable` | `experimental` | `coming soon`).
+(`stable` | `experimental`). The API still has a `coming soon` label; no registered plugin uses it.
 
 ### Stable
 
@@ -58,15 +61,15 @@ Not seeing your engine? [Open an issue](https://github.com/Miike0303/Locust/issu
 
 ## Supported translation providers
 
-Always available in the CLI (`locust providers`):
+Always registered (`locust providers`):
 
 - **Google Translate** (free web endpoint) — no API key
 - **Argos Translate** — free offline
 - **Ollama** / **LM Studio** — free local models
-- **Grok SuperGrok** (`grok-sub`) — subscription OAuth (`locust auth`)
 - **Mock** — length-safe for binary-engine inject tests
 
-When API keys are configured: **DeepL**, **OpenAI-compatible**, **Anthropic Claude**, etc.
+When API keys are configured: **DeepL**, **OpenAI**, **Anthropic Claude**, **DeepSeek**, **Grok** (xAI), **Google Gemini**.
+**Grok SuperGrok** (`grok-sub`) appears after `locust auth grok`.
 
 ---
 
@@ -81,6 +84,19 @@ Download the latest release for your OS from the [Releases page](https://github.
 - **Linux**: `project-locust_<ver>_amd64.AppImage` — `chmod +x` then run
 
 The app checks for updates on launch and offers to install them one-click.
+
+### CLI (apply a patch without the desktop app)
+
+The same release also ships `locust` binaries: `locust-x86_64-windows.exe`,
+`locust-aarch64-macos`, `locust-x86_64-macos`, `locust-x86_64-linux`.
+
+Players who only need to apply a translation patch:
+
+```bash
+locust apply "<game-copy>" game-es-patch.zip
+# or:
+locust apply "<game-copy>" --url "https://example.com/game-es-patch.zip"
+```
 
 ### Build from source
 
@@ -159,9 +175,8 @@ Every project is saved as a `<game-name>.locust.db` file next to your game folde
 - Translation status (pending, translated, reviewed, approved)
 - Translation memory (for reusing translations across projects)
 - Glossary (for consistent terminology)
-- Backups (before each inject, so you can roll back)
 
-You can close Locust and reopen the same project later — your progress persists. Use the **Review** tab to audit translations before finalizing.
+You can close Locust and reopen the same project later — your progress persists. Reopening a game merges newly extracted strings; existing translations stay. If the original text for a line changed, Locust keeps the translation but marks it pending so a stale line cannot ship as approved. Use the **Review** tab to audit translations before finalizing.
 
 ---
 

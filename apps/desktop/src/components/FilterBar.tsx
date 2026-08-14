@@ -10,14 +10,15 @@ import {
 	uniqueSortedFilePaths,
 	uniqueSortedTags,
 } from "../lib/stringFilterFacets";
+import { useT } from "../lib/i18n";
 
-const STATUSES: { label: string; value: StringStatus | undefined }[] = [
-	{ label: "All", value: undefined },
-	{ label: "Pending", value: "pending" },
-	{ label: "Translated", value: "translated" },
-	{ label: "Reviewed", value: "reviewed" },
-	{ label: "Approved", value: "approved" },
-	{ label: "Error", value: "error" },
+const STATUSES: { labelKey: string; value: StringStatus | undefined }[] = [
+	{ labelKey: "filter.all", value: undefined },
+	{ labelKey: "filter.pending", value: "pending" },
+	{ labelKey: "filter.translated", value: "translated" },
+	{ labelKey: "filter.reviewed", value: "reviewed" },
+	{ labelKey: "filter.approved", value: "approved" },
+	{ labelKey: "filter.error", value: "error" },
 ];
 
 const statusColors: Record<string, string> = {
@@ -35,6 +36,7 @@ interface FilterBarProps {
 }
 
 export default function FilterBar({ total, showing, entries }: FilterBarProps) {
+	const t = useT();
 	const { filter, setFilter } = useEditorStore();
 	const [searchInput, setSearchInput] = useState(filter.search || "");
 	const [filePathDraft, setFilePathDraft] = useState(filter.file_path || "");
@@ -81,9 +83,9 @@ export default function FilterBar({ total, showing, entries }: FilterBarProps) {
 	return (
 		<div className="flex items-center gap-2 p-2 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
 			<div className="flex gap-0.5">
-				{STATUSES.map(({ label, value }) => (
+				{STATUSES.map(({ labelKey, value }) => (
 					<button
-						key={label}
+						key={labelKey}
 						onClick={() => setFilter({ status: value, offset: 0 })}
 						className={clsx(
 							"px-2.5 py-0.5 rounded-full text-[11px] font-medium transition-colors",
@@ -94,7 +96,7 @@ export default function FilterBar({ total, showing, entries }: FilterBarProps) {
 								: "bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700",
 						)}
 					>
-						{label}
+						{t(labelKey)}
 					</button>
 				))}
 			</div>
@@ -109,7 +111,7 @@ export default function FilterBar({ total, showing, entries }: FilterBarProps) {
 					type="text"
 					value={searchInput}
 					onChange={(e) => setSearchInput(e.target.value)}
-					placeholder="Search strings..."
+					placeholder={t("filter.searchPlaceholder")}
 					className="w-full pl-9 pr-3 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
 				/>
 			</div>
@@ -119,7 +121,7 @@ export default function FilterBar({ total, showing, entries }: FilterBarProps) {
 					htmlFor="file-path-filter"
 					className="text-[11px] text-gray-500 dark:text-gray-400"
 				>
-					File
+					{t("filter.file")}
 				</label>
 				<input
 					id="file-path-filter"
@@ -140,7 +142,7 @@ export default function FilterBar({ total, showing, entries }: FilterBarProps) {
 							commitFilePath,
 						)
 					}
-					placeholder="Any file"
+					placeholder={t("filter.anyFile")}
 					className="w-32 rounded border border-gray-300 bg-white px-2 py-0.5 text-[11px] text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
 				/>
 				<datalist id="file-path-filter-options">
@@ -155,7 +157,7 @@ export default function FilterBar({ total, showing, entries }: FilterBarProps) {
 					htmlFor="tag-filter"
 					className="text-[11px] text-gray-500 dark:text-gray-400"
 				>
-					Tag
+					{t("filter.tag")}
 				</label>
 				<input
 					id="tag-filter"
@@ -170,7 +172,7 @@ export default function FilterBar({ total, showing, entries }: FilterBarProps) {
 					onKeyDown={(event) =>
 						handleFacetKeyDown(event, filter.tag || "", setTagDraft, commitTag)
 					}
-					placeholder="Any tag"
+					placeholder={t("filter.anyTag")}
 					className="w-24 rounded border border-gray-300 bg-white px-2 py-0.5 text-[11px] text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
 				/>
 				<datalist id="tag-filter-options">
@@ -194,15 +196,19 @@ export default function FilterBar({ total, showing, entries }: FilterBarProps) {
 					}}
 					className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
 				>
-					<X size={14} /> Clear
+					<X size={14} /> {t("common.clear")}
 				</button>
 			)}
 
 			<div className="flex items-center gap-2 ml-auto">
 				<span className="text-[11px] text-gray-500 dark:text-gray-400">
 					{total > 0
-						? `${(filter.offset ?? 0) + 1}–${Math.min((filter.offset ?? 0) + showing, total)} of ${total}`
-						: "0 results"}
+						? t("filter.results", {
+								from: (filter.offset ?? 0) + 1,
+								to: Math.min((filter.offset ?? 0) + showing, total),
+								total,
+							})
+						: t("filter.zeroResults")}
 				</span>
 				{total > (filter.limit ?? 100) && (
 					<div className="flex items-center gap-0.5">

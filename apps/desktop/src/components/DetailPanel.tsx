@@ -3,22 +3,23 @@ import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import clsx from "clsx";
 import type { StringEntry, StringStatus } from "../lib/api";
 import { binarySlotOf, encodedByteLen, patchString } from "../lib/api";
+import { useT } from "../lib/i18n";
 
-const statusButtons: { value: StringStatus; label: string; color: string }[] = [
+const statusButtons: { value: StringStatus; labelKey: string; color: string }[] = [
 	{
 		value: "pending",
-		label: "Pending",
+		labelKey: "detail.status.pending",
 		color: "bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200",
 	},
 	{
 		value: "reviewed",
-		label: "Reviewed",
+		labelKey: "detail.status.reviewed",
 		color:
 			"bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200",
 	},
 	{
 		value: "approved",
-		label: "Approved",
+		labelKey: "detail.status.approved",
 		color:
 			"bg-green-100 text-green-800 dark:bg-green-900/60 dark:text-green-200",
 	},
@@ -35,6 +36,7 @@ export default function DetailPanel({
 	onRefetch,
 	onClose,
 }: DetailPanelProps) {
+	const t = useT();
 	const [translation, setTranslation] = useState(entry.translation || "");
 	const [showMeta, setShowMeta] = useState(false);
 
@@ -69,12 +71,12 @@ export default function DetailPanel({
 		<aside className="w-[340px] border-l border-gray-200 dark:border-gray-700 overflow-y-auto bg-white dark:bg-gray-900 flex flex-col">
 			<div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
 				<h3 className="text-xs font-semibold text-gray-700 dark:text-gray-200">
-					Entry Detail
+					{t("detail.title")}
 				</h3>
 				<button
 					onClick={onClose}
 					className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-lg"
-					aria-label="Close detail panel"
+					aria-label={t("detail.closeAria")}
 				>
 					&times;
 				</button>
@@ -84,7 +86,7 @@ export default function DetailPanel({
 				{/* Source */}
 				<div>
 					<label className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase">
-						Source
+						{t("detail.source")}
 					</label>
 					<div className="mt-1 p-2 bg-gray-50 dark:bg-gray-800 rounded font-mono text-xs text-gray-800 dark:text-gray-200 select-all whitespace-pre-wrap">
 						{entry.source}
@@ -94,7 +96,7 @@ export default function DetailPanel({
 				{/* Translation */}
 				<div>
 					<label className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase">
-						Translation
+						{t("detail.translation")}
 					</label>
 					<textarea
 						value={translation}
@@ -114,8 +116,8 @@ export default function DetailPanel({
 								: "text-gray-400 dark:text-gray-500",
 						)}
 					>
-						{charCount} chars
-						{entry.char_limit != null && ` / ${entry.char_limit} limit`}
+						{t("detail.chars", { count: charCount })}
+						{entry.char_limit != null && t("detail.charsLimit", { limit: entry.char_limit })}
 						{binarySlot && srcSlotBytes != null && trSlotBytes != null && (
 							<span className="ml-2">
 								· {binarySlot} {trSlotBytes}/{srcSlotBytes} B
@@ -123,7 +125,7 @@ export default function DetailPanel({
 						)}
 						{binarySlot === "sjis" && (
 							<span className="ml-2 text-gray-400 font-normal">
-								· SJIS checked on Validate
+								{t("detail.sjisNote")}
 							</span>
 						)}
 					</div>
@@ -132,10 +134,10 @@ export default function DetailPanel({
 				{/* Status */}
 				<div>
 					<label className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase">
-						Status
+						{t("detail.status")}
 					</label>
 					<div className="flex gap-1.5 mt-1">
-						{statusButtons.map(({ value, label, color }) => (
+						{statusButtons.map(({ value, labelKey, color }) => (
 							<button
 								key={value}
 								onClick={() => handleStatusChange(value)}
@@ -146,7 +148,7 @@ export default function DetailPanel({
 										: "bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700",
 								)}
 							>
-								{label}
+								{t(labelKey)}
 							</button>
 						))}
 					</div>
@@ -156,14 +158,17 @@ export default function DetailPanel({
 				{limitExceeded && (
 					<div className="flex items-center gap-2 p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm text-red-700 dark:text-red-400">
 						<AlertTriangle size={16} />
-						Translation exceeds character limit
+						{t("detail.exceedsLimit")}
 					</div>
 				)}
 				{binarySlotExceeded && (
 					<div className="flex items-center gap-2 p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm text-red-700 dark:text-red-400">
 						<AlertTriangle size={16} />
-						Exceeds binary inject slot ({binarySlot}: {trSlotBytes} &gt;{" "}
-						{srcSlotBytes} bytes) — inject will skip
+						{t("detail.exceedsSlot", {
+							slot: binarySlot ?? "",
+							actual: trSlotBytes ?? 0,
+							source: srcSlotBytes ?? 0,
+						})}
 					</div>
 				)}
 
@@ -174,23 +179,23 @@ export default function DetailPanel({
 						className="flex items-center gap-1 text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase hover:text-gray-700 dark:hover:text-gray-200"
 					>
 						{showMeta ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-						Metadata
+						{t("detail.metadata")}
 					</button>
 					{showMeta && (
 						<dl className="mt-2 space-y-1 text-[11px] text-gray-700 dark:text-gray-300">
 							{entry.context && (
 								<>
-									<dt className="text-gray-500 dark:text-gray-400">Context</dt>
+									<dt className="text-gray-500 dark:text-gray-400">{t("detail.context")}</dt>
 									<dd>{entry.context}</dd>
 								</>
 							)}
-							<dt className="text-gray-500 dark:text-gray-400">File</dt>
+							<dt className="text-gray-500 dark:text-gray-400">{t("detail.file")}</dt>
 							<dd className="break-all">{entry.file_path}</dd>
-							<dt className="text-gray-500 dark:text-gray-400">Entry ID</dt>
+							<dt className="text-gray-500 dark:text-gray-400">{t("detail.entryId")}</dt>
 							<dd className="font-mono break-all">{entry.id}</dd>
 							{entry.tags.length > 0 && (
 								<>
-									<dt className="text-gray-500 dark:text-gray-400">Tags</dt>
+									<dt className="text-gray-500 dark:text-gray-400">{t("detail.tags")}</dt>
 									<dd className="flex gap-1 flex-wrap">
 										{entry.tags.map((t) => (
 											<span
@@ -205,16 +210,16 @@ export default function DetailPanel({
 							)}
 							{entry.provider_used && (
 								<>
-									<dt className="text-gray-500 dark:text-gray-400">Provider</dt>
+									<dt className="text-gray-500 dark:text-gray-400">{t("detail.provider")}</dt>
 									<dd>{entry.provider_used}</dd>
 								</>
 							)}
-							<dt className="text-gray-500 dark:text-gray-400">Created</dt>
+							<dt className="text-gray-500 dark:text-gray-400">{t("detail.created")}</dt>
 							<dd>{new Date(entry.created_at).toLocaleString()}</dd>
 							{entry.translated_at && (
 								<>
 									<dt className="text-gray-500 dark:text-gray-400">
-										Translated
+										{t("detail.translated")}
 									</dt>
 									<dd>{new Date(entry.translated_at).toLocaleString()}</dd>
 								</>

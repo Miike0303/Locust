@@ -1,26 +1,29 @@
 import { useQueueStore } from "../stores/queueStore";
 import { Loader2 } from "lucide-react";
+import { useT } from "../lib/i18n";
 
 function formatEta(
 	startedAt: number | null,
 	completed: number,
 	total: number,
+	t: (key: string, vars?: Record<string, string | number>) => string,
 ): string {
 	if (!startedAt || completed === 0 || total === 0) return "";
 	const elapsed = (Date.now() - startedAt) / 1000;
 	const rate = completed / elapsed;
 	const remaining = Math.ceil((total - completed) / rate);
-	if (remaining < 60) return `~${remaining}s left`;
-	return `~${Math.ceil(remaining / 60)}m left`;
+	if (remaining < 60) return t("bottom.etaSeconds", { count: remaining });
+	return t("bottom.etaMinutes", { count: Math.ceil(remaining / 60) });
 }
 
 export default function BottomBar() {
+	const t = useT();
 	const progress = useQueueStore((s) => s.globalProgress);
 
 	if (!progress || progress.total === 0) return null;
 
 	const percent = Math.round((progress.completed / progress.total) * 100);
-	const eta = formatEta(progress.startedAt, progress.completed, progress.total);
+	const eta = formatEta(progress.startedAt, progress.completed, progress.total, t);
 
 	return (
 		<div className="h-9 flex items-center gap-3 px-4 bg-gray-50 dark:bg-gray-900 border-t border-gray-200 dark:border-gray-700 text-xs shrink-0">
@@ -55,7 +58,10 @@ export default function BottomBar() {
 				progress.queueTotal != null &&
 				progress.queueTotal > 1 && (
 					<span className="text-gray-500 dark:text-gray-400 ml-auto">
-						Project {progress.queuePosition}/{progress.queueTotal}
+						{t("bottom.project", {
+							position: progress.queuePosition,
+							total: progress.queueTotal,
+						})}
 					</span>
 				)}
 		</div>

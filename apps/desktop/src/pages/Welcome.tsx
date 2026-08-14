@@ -40,6 +40,7 @@ import {
 	saveWelcomeGuideDismissed,
 	WELCOME_WORKFLOW_STEPS,
 } from "../lib/workflowGuide";
+import { useT } from "../lib/i18n";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -72,6 +73,7 @@ const FORMAT_COLORS: Record<string, string> = {
 };
 
 export default function Welcome() {
+	const t = useT();
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const setProject = useProjectStore((s) => s.setProject);
@@ -149,7 +151,7 @@ export default function Welcome() {
 				setPicker({ path, reason: "detect-failed" });
 			} else {
 				addLog("error", `Failed to open project`, msg, "project");
-				addToast("error", `Failed to open: ${msg}`);
+				addToast("error", t("welcome.toast.failedOpen", { error: msg }));
 			}
 		} finally {
 			setOpening(false);
@@ -160,12 +162,12 @@ export default function Welcome() {
 		if (IS_TAURI) {
 			const { open } = await import("@tauri-apps/plugin-dialog");
 			const selected = await open({
-				title: "Select game folder",
+				title: t("welcome.dialog.selectFolder"),
 				directory: true,
 			});
 			return typeof selected === "string" ? selected : null;
 		}
-		return prompt("Enter game folder path:");
+		return prompt(t("welcome.prompt.folderPath"));
 	};
 
 	const handleConfirmFormat = async () => {
@@ -183,7 +185,7 @@ export default function Welcome() {
 	const handleAddToQueue = (path: string) => {
 		addToQueue(path);
 		setQueueOpen(true);
-		addToast("info", "Added to queue");
+		addToast("info", t("welcome.toast.addedToQueue"));
 	};
 
 	const handleOpenFile = async () => {
@@ -191,10 +193,10 @@ export default function Welcome() {
 		if (IS_TAURI) {
 			const { open } = await import("@tauri-apps/plugin-dialog");
 			const selected = await open({
-				title: "Select game executable or main file",
+				title: t("welcome.dialog.selectFile"),
 				filters: [
 					{
-						name: "Game files",
+						name: t("welcome.dialog.gameFiles"),
 						extensions: [
 							"exe",
 							"html",
@@ -205,12 +207,12 @@ export default function Welcome() {
 							"rvproj2",
 						],
 					},
-					{ name: "All files", extensions: ["*"] },
+					{ name: t("welcome.dialog.allFiles"), extensions: ["*"] },
 				],
 			});
 			if (typeof selected === "string") path = selected;
 		} else {
-			path = prompt("Enter game executable or file path:");
+			path = prompt(t("welcome.prompt.filePath"));
 		}
 		if (path) await openWithPath(path);
 	};
@@ -248,30 +250,30 @@ export default function Welcome() {
 			{/* Hero */}
 			<div className="text-center mb-8">
 				<Globe size={48} className="mx-auto mb-3 text-emerald-500" />
-				<h1 className="text-3xl font-bold mb-1">Project Locust</h1>
+				<h1 className="text-3xl font-bold mb-1">{t("nav.appName")}</h1>
 				<p className="text-gray-500 dark:text-gray-400">
-					LOCalization Universal Scripting Tool
+					{t("welcome.tagline")}
 				</p>
 			</div>
 
 			{showWelcomeGuide && (
 				<section
-					aria-label="Getting started guide"
+					aria-label={t("welcome.guide.aria")}
 					className="mb-8 rounded-lg border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 p-4"
 				>
 					<div className="flex items-start justify-between gap-3 mb-3">
 						<div>
 							<h2 className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">
-								New to Locust?
+								{t("welcome.guide.title")}
 							</h2>
 							<p className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">
-								Three steps to localize your first game.
+								{t("welcome.guide.subtitle")}
 							</p>
 						</div>
 						<button
 							type="button"
 							onClick={dismissWelcomeGuide}
-							aria-label="Dismiss getting started guide"
+							aria-label={t("welcome.guide.dismiss")}
 							className="shrink-0 text-emerald-700 hover:text-emerald-900 dark:text-emerald-300 dark:hover:text-emerald-100 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded p-0.5"
 						>
 							<X size={16} />
@@ -300,10 +302,10 @@ export default function Welcome() {
 												className="text-emerald-600 dark:text-emerald-400"
 												aria-hidden="true"
 											/>
-											{step.label}
+											{t(`welcome.guide.${step.id}.label`)}
 										</div>
 										<p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-											{step.description}
+											{t(`welcome.guide.${step.id}.description`)}
 										</p>
 									</div>
 								</li>
@@ -326,7 +328,7 @@ export default function Welcome() {
 						) : (
 							<FolderOpen size={18} />
 						)}
-						{opening ? "Opening…" : "Open Game Folder"}
+						{opening ? t("welcome.opening") : t("welcome.openFolder")}
 					</button>
 					<button
 						onClick={handleOpenFile}
@@ -338,7 +340,7 @@ export default function Welcome() {
 						) : (
 							<File size={18} />
 						)}
-						{opening ? "Opening…" : "Open Game File"}
+						{opening ? t("welcome.opening") : t("welcome.openFile")}
 					</button>
 				</div>
 				<div className="flex justify-center mt-2">
@@ -348,12 +350,12 @@ export default function Welcome() {
 						className="flex items-center gap-1 text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-50"
 					>
 						<Settings2 size={12} />
-						Choose format manually
+						{t("welcome.chooseFormat")}
 					</button>
 				</div>
 				{opening && (
 					<p className="text-center text-xs text-gray-400 mt-2">
-						Extracting strings — large games can take a while…
+						{t("welcome.extracting")}
 					</p>
 				)}
 			</div>
@@ -362,20 +364,20 @@ export default function Welcome() {
 				<div className="mb-8 p-4 rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20">
 					<div className="flex items-start justify-between gap-3">
 						<p className="text-sm text-amber-900 dark:text-amber-100">
-							To translate you&apos;ll need a translation provider —{" "}
+							{t("welcome.providerHint")}{" "}
 							<button
 								type="button"
 								onClick={() => navigate(buildSettingsPath("providers"))}
 								className="font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
 							>
-								configure one in Settings
+								{t("welcome.providerHintLink")}
 							</button>
 							.
 						</p>
 						<button
 							type="button"
 							onClick={dismissProviderHint}
-							aria-label="Dismiss provider setup hint"
+							aria-label={t("welcome.providerHintDismiss")}
 							className="shrink-0 text-amber-700 dark:text-amber-300 hover:text-amber-900 dark:hover:text-amber-100"
 						>
 							<X size={16} />
@@ -394,7 +396,7 @@ export default function Welcome() {
 					>
 						<div className="flex justify-between items-center mb-4">
 							<h2 {...titleProps} className="text-lg font-bold">
-								Select Format
+								{t("welcome.format.title")}
 							</h2>
 							<button
 								onClick={() => setPicker(null)}
@@ -411,11 +413,11 @@ export default function Welcome() {
 						)}
 						{picker.reason === "detect-failed" ? (
 							<p className="text-xs text-amber-600 dark:text-amber-400 mb-4">
-								Couldn&apos;t detect the game engine automatically — pick one:
+								{t("welcome.format.detectFailed")}
 							</p>
 						) : (
 							<p className="text-xs text-gray-400 mb-4">
-								Choose the game engine format first, then pick the game folder.
+								{t("welcome.format.manualHint")}
 							</p>
 						)}
 
@@ -433,9 +435,9 @@ export default function Welcome() {
 										<Wand2 size={16} />
 									</div>
 									<div>
-										<div className="text-sm font-medium">Auto-detect</div>
+										<div className="text-sm font-medium">{t("welcome.format.auto")}</div>
 										<div className="text-xs text-gray-500">
-											Let Locust detect the format automatically
+											{t("welcome.format.autoHint")}
 										</div>
 									</div>
 								</button>
@@ -467,7 +469,7 @@ export default function Welcome() {
 													<span className="truncate">{f.name}</span>
 													{experimental && (
 														<span className="shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
-															experimental
+															{t("welcome.format.experimental")}
 														</span>
 													)}
 												</div>
@@ -486,10 +488,10 @@ export default function Welcome() {
 							className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg font-medium transition-colors"
 						>
 							{opening
-								? "Opening..."
+								? t("welcome.openingDots")
 								: picker.path
-									? "Open Project"
-									: "Choose Game Folder…"}
+									? t("welcome.format.openProject")
+									: t("welcome.format.chooseFolder")}
 						</button>
 					</div>
 				</div>
@@ -499,7 +501,7 @@ export default function Welcome() {
 			{recentProjects.length > 0 && (
 				<div className="mb-10">
 					<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
-						Recent Projects
+						{t("welcome.recent")}
 					</h2>
 					<div className="space-y-2">
 						{recentProjects.map((p, i) => {
@@ -545,7 +547,7 @@ export default function Welcome() {
 												handleAddToQueue(p.path);
 											}}
 											className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-400 hover:text-emerald-500"
-											title="Add to queue"
+											title={t("welcome.addToQueue")}
 										>
 											<Plus size={14} />
 										</button>
@@ -569,7 +571,7 @@ export default function Welcome() {
 						<>
 							<div>
 								<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
-									Available Formats
+									{t("welcome.availableFormats")}
 								</h2>
 								<div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
 									{available.map((f) => {
@@ -592,7 +594,7 @@ export default function Welcome() {
 													</span>
 													{experimental && (
 														<span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
-															exp
+															{t("welcome.format.exp")}
 														</span>
 													)}
 												</div>
@@ -620,7 +622,7 @@ export default function Welcome() {
 							{comingSoon.length > 0 && (
 								<div className="mt-8">
 									<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
-										Coming Soon
+										{t("welcome.comingSoon")}
 									</h2>
 									<div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
 										{comingSoon.map((f) => {
@@ -638,7 +640,7 @@ export default function Welcome() {
 															{f.name}
 														</span>
 														<span className="ml-auto text-xs px-1.5 py-0.5 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 rounded">
-															soon
+															{t("welcome.soon")}
 														</span>
 													</div>
 													{f.description && (
@@ -659,10 +661,11 @@ export default function Welcome() {
 			{/* Footer stats */}
 			<div className="mt-auto pt-8 flex justify-center gap-6 text-xs text-gray-400">
 				<span>
-					{formats?.filter((f) => f.stability !== "comingsoon").length ?? 0}{" "}
-					formats available
+					{t("welcome.formatsAvailable", {
+						count: formats?.filter((f) => f.stability !== "comingsoon").length ?? 0,
+					})}
 				</span>
-				<span>{recentProjects.length} recent projects</span>
+				<span>{t("welcome.recentCount", { count: recentProjects.length })}</span>
 				<span>
 					<a
 						href="https://github.com/Miike0303/Locust"

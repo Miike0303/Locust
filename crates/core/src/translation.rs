@@ -1,5 +1,6 @@
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -111,8 +112,7 @@ fn binary_slot_length_hint(slot: &str, budget: usize, source: &str) -> String {
     } else {
         source.to_string()
     };
-    let accent_note = if slot == "utf8" && source.is_ascii() && budget <= TIGHT_BINARY_SLOT_BYTES
-    {
+    let accent_note = if slot == "utf8" && source.is_ascii() && budget <= TIGHT_BINARY_SLOT_BYTES {
         " Prefer ASCII when needed: accented letters cost 2 UTF-8 bytes each (ó/ñ/ü)."
     } else {
         ""
@@ -155,10 +155,284 @@ fn binary_slot_retry_correction(
     )
 }
 
+#[derive(Clone, Debug)]
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub backoff_multiplier: f64,
+    pub overall_deadline: Option<Duration>,
+    pub cancel: Option<CancellationToken>,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_delay_ms: 1000,
+            max_delay_ms: 30000,
+            backoff_multiplier: 2.0,
+            overall_deadline: Some(Duration::from_secs(60)),
+            cancel: None,
+        }
+    }
+}
+
+pub async fn with_retry<F, Fut, T>(config: &RetryConfig, operation: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let deadline = config
+        .overall_deadline
+        .map(|d| tokio::time::Instant::now() + d);
+    let mut last_err = None;
+
+    for attempt in 0..config.max_attempts {
+        if let Some(cancel) = &config.cancel {
+            if cancel.is_cancelled() {
+                return Err(LocustError::ProviderError("cancelled".into()));
+            }
+        }
+        if let Some(dl) = deadline {
+            if tokio::time::Instant::now() >= dl {
+                return Err(last_err.unwrap_or_else(|| {
+                    LocustError::ProviderError("retry deadline exceeded".into())
+                }));
+            }
+        }
+
+        match operation().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if is_retryable(&e) && attempt < config.max_attempts - 1 {
+                    let mut delay_ms = jitter_delay(compute_delay(config, attempt));
+                    if let Some(dl) = deadline {
+                        let remaining = dl
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis() as u64;
+                        if remaining == 0 {
+                            return Err(e);
+                        }
+                        delay_ms = delay_ms.min(remaining);
+                    }
+                    tracing::warn!(
+                        "Retryable error on attempt {}/{}: {}. Retrying in {}ms",
+                        attempt + 1,
+                        config.max_attempts,
+                        e,
+                        delay_ms
+                    );
+                    let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                    if let Some(cancel) = &config.cancel {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                return Err(LocustError::ProviderError("cancelled".into()));
+                            }
+                            _ = sleep => {}
+                        }
+                    } else {
+                        sleep.await;
+                    }
+                    last_err = Some(e);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| LocustError::ProviderError("retry exhausted with no error".to_string())))
+}
+
+fn compute_delay(config: &RetryConfig, attempt: u32) -> u64 {
+    let delay = config.initial_delay_ms as f64 * config.backoff_multiplier.powi(attempt as i32);
+    (delay as u64).min(config.max_delay_ms)
+}
+
+fn jitter_delay(base_ms: u64) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let factor = 0.5 + (nanos % 1000) as f64 / 1000.0;
+    ((base_ms as f64) * factor) as u64
+}
+
+pub fn is_retryable(e: &LocustError) -> bool {
+    match e {
+        LocustError::ProviderError(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("cancelled")
+                || lower.contains("401")
+                || lower.contains("403")
+                || lower.contains("unauthorized")
+                || lower.contains("forbidden")
+            {
+                return false;
+            }
+            lower.contains("429")
+                || lower.contains("rate limit")
+                || lower.contains("timeout")
+                || lower.contains("timed out")
+                || lower.contains("500")
+                || lower.contains("502")
+                || lower.contains("503")
+                || lower.contains("504")
+                || lower.contains("connection")
+                || lower.contains("network")
+                || lower.contains("dns")
+        }
+        LocustError::IoError(_) => true,
+        _ => false,
+    }
+}
+
+pub struct RateLimiter {
+    requests_per_minute: u32,
+    last_requests: Mutex<VecDeque<tokio::time::Instant>>,
+}
+
+impl RateLimiter {
+    pub fn new(requests_per_minute: u32) -> Self {
+        Self {
+            requests_per_minute,
+            last_requests: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub fn unlimited() -> Self {
+        Self::new(u32::MAX)
+    }
+
+    pub fn requests_per_minute(&self) -> u32 {
+        self.requests_per_minute
+    }
+
+    pub fn is_unlimited(&self) -> bool {
+        self.requests_per_minute == u32::MAX
+    }
+
+    pub async fn acquire(&self) {
+        loop {
+            let should_wait = {
+                let mut requests = self.last_requests.lock().unwrap();
+                let now = tokio::time::Instant::now();
+                let window = Duration::from_secs(60);
+
+                while let Some(&front) = requests.front() {
+                    if now.duration_since(front) > window {
+                        requests.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+
+                if (requests.len() as u32) < self.requests_per_minute {
+                    requests.push_back(now);
+                    None
+                } else {
+                    requests.front().map(|&oldest| {
+                        let elapsed = now.duration_since(oldest);
+                        if elapsed < window {
+                            window - elapsed + Duration::from_millis(10)
+                        } else {
+                            Duration::from_millis(10)
+                        }
+                    })
+                }
+            };
+
+            match should_wait {
+                None => return,
+                Some(dur) => tokio::time::sleep(dur).await,
+            }
+        }
+    }
+}
+
+/// Built-in requests/minute when `ProviderConfig.extra` has no override.
+/// Local engines stay unlimited; the unofficial Google web endpoint is tight.
+pub fn default_requests_per_minute(provider_id: &str) -> u32 {
+    match provider_id {
+        "ollama" | "lmstudio" | "argos" | "mock" => u32::MAX,
+        // Free translate.googleapis.com endpoint — conservative to avoid blocks.
+        "google" => 8,
+        "deepl" => 120,
+        "openai" | "claude" | "grok" | "grok-sub" | "deepseek" | "gemini" => 90,
+        _ => 60,
+    }
+}
+
+fn rpm_from_provider_extra(extra: &HashMap<String, String>) -> Option<u32> {
+    extra
+        .get("requests_per_minute")
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Resolve rpm from existing `ProviderConfig.extra["requests_per_minute"]`,
+/// else the built-in table. No new config field.
+pub fn requests_per_minute_for(provider_id: &str, extra: Option<&HashMap<String, String>>) -> u32 {
+    extra
+        .and_then(rpm_from_provider_extra)
+        .unwrap_or_else(|| default_requests_per_minute(provider_id))
+}
+
+/// Per-provider-id limiter so one chatty engine does not stall the others.
+pub fn rate_limiter_for(provider_id: &str) -> Arc<RateLimiter> {
+    static LIMITERS: OnceLock<Mutex<HashMap<String, Arc<RateLimiter>>>> = OnceLock::new();
+    let map = LIMITERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    guard
+        .entry(provider_id.to_string())
+        .or_insert_with(|| {
+            let extra = crate::config::AppConfig::load(&crate::config::AppConfig::default_path())
+                .ok()
+                .and_then(|cfg| cfg.get_provider_config(provider_id).cloned())
+                .map(|pc| pc.extra);
+            let rpm = requests_per_minute_for(provider_id, extra.as_ref());
+            Arc::new(RateLimiter::new(rpm))
+        })
+        .clone()
+}
+
+async fn call_provider(
+    provider: Arc<dyn TranslationProvider>,
+    requests: &[TranslationRequest],
+    retry: &RetryConfig,
+    cancel: &CancellationToken,
+) -> Result<Vec<TranslationResult>> {
+    if cancel.is_cancelled() {
+        return Err(LocustError::ProviderError("cancelled".into()));
+    }
+    let limiter = rate_limiter_for(provider.id());
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return Err(LocustError::ProviderError("cancelled".into()));
+        }
+        _ = limiter.acquire() => {}
+    }
+    let mut cfg = retry.clone();
+    cfg.cancel = Some(cancel.clone());
+    let provider = provider.clone();
+    let requests = requests.to_vec();
+    with_retry(&cfg, move || {
+        let provider = provider.clone();
+        let requests = requests.clone();
+        async move { provider.translate(&requests).await }
+    })
+    .await
+}
+
 pub struct TranslationManager {
     provider: Arc<dyn TranslationProvider>,
     db: Arc<Database>,
     glossary: Arc<Glossary>,
+    retry: RetryConfig,
 }
 
 impl TranslationManager {
@@ -171,7 +445,13 @@ impl TranslationManager {
             provider,
             db,
             glossary,
+            retry: RetryConfig::default(),
         }
+    }
+
+    pub fn with_retry_config(mut self, retry: RetryConfig) -> Self {
+        self.retry = retry;
+        self
     }
 
     pub async fn translate_entries(
@@ -260,23 +540,16 @@ impl TranslationManager {
         if opts.use_glossary && !remaining.is_empty() {
             let mut still = Vec::with_capacity(remaining.len());
             for entry in remaining.drain(..) {
-                let Some(term) = self.glossary.lookup_exact(
-                    &entry.source,
-                    &opts.source_lang,
-                    &opts.target_lang,
-                ) else {
+                let Some(term) =
+                    self.glossary
+                        .lookup_exact(&entry.source, &opts.source_lang, &opts.target_lang)
+                else {
                     still.push(entry);
                     continue;
                 };
                 // Binary-slot: only apply when the glossary form fits the budget.
-                if let Some(slot) = entry
-                    .metadata
-                    .get("binary_slot")
-                    .and_then(|v| v.as_str())
-                {
-                    if let Some(budget) =
-                        crate::validation::encoded_byte_len(slot, &entry.source)
-                    {
+                if let Some(slot) = entry.metadata.get("binary_slot").and_then(|v| v.as_str()) {
+                    if let Some(budget) = crate::validation::encoded_byte_len(slot, &entry.source) {
                         if crate::validation::encoded_byte_len(slot, &term)
                             .map(|n| n > budget)
                             .unwrap_or(true)
@@ -330,7 +603,9 @@ impl TranslationManager {
                     break;
                 }
 
-                let Some(chunk) = chunk_iter.next() else { break };
+                let Some(chunk) = chunk_iter.next() else {
+                    break;
+                };
 
                 // 5b. Check cost limit
                 if let Some(limit) = opts.cost_limit_usd {
@@ -367,19 +642,15 @@ impl TranslationManager {
                         // Binary-slot engines (Unity/Unreal/Wolf): hint the model to stay
                         // within the inject byte budget for this string.
                         let mut slot_budget: Option<(&str, usize)> = None;
-                        if let Some(slot) = entry
-                            .metadata
-                            .get("binary_slot")
-                            .and_then(|v| v.as_str())
+                        if let Some(slot) =
+                            entry.metadata.get("binary_slot").and_then(|v| v.as_str())
                         {
                             if let Some(budget) =
                                 crate::validation::encoded_byte_len(slot, &entry.source)
                             {
-                                budgets_by_id
-                                    .insert(entry.id.clone(), (slot.to_string(), budget));
+                                budgets_by_id.insert(entry.id.clone(), (slot.to_string(), budget));
                                 slot_budget = Some((slot, budget));
-                                let hint =
-                                    binary_slot_length_hint(slot, budget, &entry.source);
+                                let hint = binary_slot_length_hint(slot, budget, &entry.source);
                                 context = Some(match context {
                                     Some(c) => format!("{c} | {hint}"),
                                     None => hint,
@@ -413,8 +684,10 @@ impl TranslationManager {
 
                 // 5d. Dispatch provider call to the in-flight window
                 let provider = self.provider.clone();
+                let retry = self.retry.clone();
+                let cancel_batch = cancel.clone();
                 in_flight.spawn(async move {
-                    let result = provider.translate(&requests).await;
+                    let result = call_provider(provider, &requests, &retry, &cancel_batch).await;
                     (requests, placeholders_by_id, budgets_by_id, result)
                 });
             }
@@ -463,22 +736,21 @@ impl TranslationManager {
                         for attempt in 1..=MAX_BINARY_SLOT_LENGTH_RETRIES {
                             let prev_text = result.translation.clone();
                             let prev_len = best_len;
-                            let correction = binary_slot_retry_correction(
-                                slot,
-                                *budget,
-                                prev_len,
-                                &prev_text,
-                            );
+                            let correction =
+                                binary_slot_retry_correction(slot, *budget, prev_len, &prev_text);
                             let mut retry_req = orig_req.clone();
                             retry_req.context = Some(match &orig_req.context {
                                 Some(c) => format!("{c} | {correction}"),
                                 None => correction,
                             });
 
-                            match self
-                                .provider
-                                .translate(std::slice::from_ref(&retry_req))
-                                .await
+                            match call_provider(
+                                self.provider.clone(),
+                                std::slice::from_ref(&retry_req),
+                                &self.retry,
+                                &cancel,
+                            )
+                            .await
                             {
                                 Ok(mut retry_batch) => {
                                     let mut retry_result = match retry_batch
@@ -509,8 +781,7 @@ impl TranslationManager {
                                     .unwrap_or(usize::MAX);
 
                                     if let Some(c) = retry_result.cost_usd {
-                                        result.cost_usd =
-                                            Some(result.cost_usd.unwrap_or(0.0) + c);
+                                        result.cost_usd = Some(result.cost_usd.unwrap_or(0.0) + c);
                                     }
                                     if let Some(t) = retry_result.tokens_used {
                                         result.tokens_used =
@@ -572,11 +843,9 @@ impl TranslationManager {
                                 *budget,
                                 &result.translation,
                             ) {
-                                let new_len = crate::validation::encoded_byte_len(
-                                    slot,
-                                    &fitted_text,
-                                )
-                                .unwrap_or(usize::MAX);
+                                let new_len =
+                                    crate::validation::encoded_byte_len(slot, &fitted_text)
+                                        .unwrap_or(usize::MAX);
                                 if new_len <= *budget {
                                     tracing::info!(
                                         entry_id = %result.entry_id,
@@ -622,8 +891,7 @@ impl TranslationManager {
                                 requests.iter().find(|r| r.entry_id == result.entry_id)
                             {
                                 use sha2::{Digest, Sha256};
-                                let hash =
-                                    hex::encode(Sha256::digest(req.source.as_bytes()));
+                                let hash = hex::encode(Sha256::digest(req.source.as_bytes()));
                                 let _ = self
                                     .db
                                     .save_memory(
@@ -752,6 +1020,19 @@ pub fn load_pending_entries(db: &Database) -> Result<Vec<StringEntry>> {
         .collect())
 }
 
+/// Primary first, then unique fallbacks (duplicates of the primary skipped).
+pub fn unique_provider_chain(primary: &str, fallbacks: Option<&[String]>) -> Vec<String> {
+    let mut chain = vec![primary.to_string()];
+    if let Some(ids) = fallbacks {
+        for id in ids {
+            if !chain.iter().any(|c| c == id) {
+                chain.push(id.clone());
+            }
+        }
+    }
+    chain
+}
+
 /// Run primary then fallbacks: each provider gets one full pass over remaining
 /// pending entries. A provider is abandoned for the next when its pass finishes
 /// with work still pending (or if the provider id is missing). Emits a single
@@ -852,7 +1133,9 @@ pub async fn run_fallback_chain(
     }
 
     let remaining = load_pending_entries(&db)?.len();
-    let total_translated = initial_total.saturating_sub(remaining).max(cumulative_completed);
+    let total_translated = initial_total
+        .saturating_sub(remaining)
+        .max(cumulative_completed);
 
     let _ = tx
         .send(ProgressEvent::Completed {
@@ -919,6 +1202,77 @@ mod tests {
     use crate::models::StringStatus;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn google_rate_limit_is_finite_and_local_is_unlimited() {
+        let google = rate_limiter_for("google");
+        assert!(
+            google.requests_per_minute() < u32::MAX,
+            "google must have a real rpm, got {}",
+            google.requests_per_minute()
+        );
+        assert!(google.requests_per_minute() > 0);
+        assert!(!google.is_unlimited());
+
+        for id in ["ollama", "lmstudio", "argos", "mock"] {
+            let lim = rate_limiter_for(id);
+            assert!(
+                lim.is_unlimited(),
+                "{id} should be unlimited, got {}",
+                lim.requests_per_minute()
+            );
+        }
+    }
+
+    #[test]
+    fn extra_requests_per_minute_overrides_table() {
+        let mut extra = HashMap::new();
+        extra.insert("requests_per_minute".into(), "12".into());
+        assert_eq!(requests_per_minute_for("google", Some(&extra)), 12);
+        assert_eq!(requests_per_minute_for("ollama", None), u32::MAX);
+        extra.insert("requests_per_minute".into(), "0".into());
+        assert_eq!(
+            requests_per_minute_for("google", Some(&extra)),
+            default_requests_per_minute("google")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_rate_limiter_never_waits() {
+        let limiter = rate_limiter_for("mock");
+        let start = Instant::now();
+        for _ in 0..40 {
+            limiter.acquire().await;
+        }
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "local/unlimited limiter must not sleep"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn google_default_rpm_throttles_on_fresh_limiter() {
+        let rpm = default_requests_per_minute("google");
+        assert!(rpm < u32::MAX);
+        let limiter = RateLimiter::new(rpm);
+        for _ in 0..rpm {
+            limiter.acquire().await;
+        }
+        let start = Instant::now();
+        limiter.acquire().await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_secs(60),
+            "google default must wait out the window, waited {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(61),
+            "wait must be the window, waited {waited:?}"
+        );
+    }
 
     struct MockProvider {
         call_count: AtomicUsize,
@@ -1198,10 +1552,7 @@ mod tests {
         rx.close();
         while rx.recv().await.is_some() {}
 
-        assert!(matches!(
-            result,
-            Err(LocustError::CostLimitExceeded { .. })
-        ));
+        assert!(matches!(result, Err(LocustError::CostLimitExceeded { .. })));
     }
 
     #[tokio::test]
@@ -1453,9 +1804,7 @@ mod tests {
     #[tokio::test]
     async fn test_glossary_exact_short_circuits_provider() {
         let (db, glossary) = setup();
-        glossary
-            .add("Options", "Opcns", "en-es", None)
-            .unwrap();
+        glossary.add("Options", "Opcns", "en-es", None).unwrap();
         let entry = StringEntry::new("ui-opt", "Options", PathBuf::from("ui.assets"));
         db.save_entries(std::slice::from_ref(&entry)).unwrap();
 
@@ -1502,9 +1851,7 @@ mod tests {
     async fn test_glossary_exact_oversize_binary_slot_falls_through() {
         let (db, glossary) = setup();
         // Budget for "Options" is 7; glossary form is 9 → must not short-circuit.
-        glossary
-            .add("Options", "Opciones", "en-es", None)
-            .unwrap();
+        glossary.add("Options", "Opciones", "en-es", None).unwrap();
         let mut entry = StringEntry::new("ui-opt2", "Options", PathBuf::from("ui.assets"));
         entry.metadata.insert(
             "binary_slot".to_string(),
@@ -1702,7 +2049,13 @@ mod tests {
             ..Default::default()
         };
         manager
-            .translate_entries(vec![entry], opts, tx, "job-u16".into(), CancellationToken::new())
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-u16".into(),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         rx.close();
@@ -1732,10 +2085,7 @@ mod tests {
             "tight hint must quote source: {tight}"
         );
         let loose = binary_slot_length_hint("utf8", 40, "Longer dialogue line here");
-        assert!(
-            loose.contains("40 bytes when encoded as utf8"),
-            "{loose}"
-        );
+        assert!(loose.contains("40 bytes when encoded as utf8"), "{loose}");
         assert!(!loose.contains("HARD MAX"), "{loose}");
         assert!(
             !loose.contains("Source:"),
@@ -2229,7 +2579,8 @@ mod tests {
         let p_calls = Arc::clone(&primary);
         let f_calls = Arc::clone(&fallback);
 
-        let mut map: std::collections::HashMap<String, Arc<dyn TranslationProvider>> = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, Arc<dyn TranslationProvider>> =
+            std::collections::HashMap::new();
         map.insert(
             "primary".into(),
             Arc::clone(&primary) as Arc<dyn TranslationProvider>,
@@ -2279,7 +2630,9 @@ mod tests {
                     assert!(remaining_pending >= 1);
                     switched += 1;
                 }
-                ProgressEvent::Completed { total_translated, .. } => {
+                ProgressEvent::Completed {
+                    total_translated, ..
+                } => {
                     assert_eq!(total_translated, 3);
                     completed_evt = true;
                 }
@@ -2306,7 +2659,8 @@ mod tests {
         db.save_entries(&entries).unwrap();
 
         let only = Arc::new(LimitProvider::new("only", "Only", 100));
-        let mut map: std::collections::HashMap<String, Arc<dyn TranslationProvider>> = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, Arc<dyn TranslationProvider>> =
+            std::collections::HashMap::new();
         map.insert("only".into(), only as Arc<dyn TranslationProvider>);
         let map = Arc::new(map);
 
@@ -2343,5 +2697,278 @@ mod tests {
         job.await.unwrap().unwrap();
         assert_eq!(switched, 0, "no fallback → no ProviderSwitched");
         assert_eq!(load_pending_entries(&db).unwrap().len(), 0);
+    }
+
+    struct AlwaysErrorProvider {
+        calls: AtomicUsize,
+    }
+
+    impl AlwaysErrorProvider {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranslationProvider for AlwaysErrorProvider {
+        fn id(&self) -> &str {
+            "always-error"
+        }
+        fn name(&self) -> &str {
+            "Always Error"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            _requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(LocustError::ProviderError(
+                "primary provider refused".into(),
+            ))
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tauri_path_fallback_sets_provider_used() {
+        // Same helper the Tauri command uses: unique_provider_chain + run_fallback_chain.
+        let (db, glossary) = setup();
+        db.save_entries(&[StringEntry::new(
+            "e1",
+            "Hello world",
+            PathBuf::from("a.json"),
+        )])
+        .unwrap();
+
+        let primary = Arc::new(AlwaysErrorProvider::new());
+        let fallback = Arc::new(MockProvider::new());
+        let mut map: std::collections::HashMap<String, Arc<dyn TranslationProvider>> =
+            std::collections::HashMap::new();
+        map.insert(
+            "always-error".into(),
+            primary as Arc<dyn TranslationProvider>,
+        );
+        map.insert("mock".into(), fallback as Arc<dyn TranslationProvider>);
+        let map = Arc::new(map);
+
+        let chain = unique_provider_chain("always-error", Some(&["mock".into()]));
+        let (tx, mut rx) = mpsc::channel(256);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        let map2 = map.clone();
+        let db2 = db.clone();
+        let job = tokio::spawn(async move {
+            let resolve = |id: &str| map2.get(id).cloned();
+            run_fallback_chain(
+                &chain,
+                &resolve,
+                db2,
+                glossary,
+                opts,
+                tx,
+                "job-tauri-fb".into(),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        while rx.recv().await.is_some() {}
+        job.await.unwrap().unwrap();
+
+        let entry = db.get_entry("e1").unwrap().unwrap();
+        assert_eq!(entry.status, StringStatus::Translated);
+        assert_eq!(entry.provider_used.as_deref(), Some("mock"));
+    }
+
+    struct FlakyTransientProvider {
+        attempts: AtomicUsize,
+    }
+
+    impl FlakyTransientProvider {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranslationProvider for FlakyTransientProvider {
+        fn id(&self) -> &str {
+            "flaky-transient"
+        }
+        fn name(&self) -> &str {
+            "Flaky Transient"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                return Err(LocustError::ProviderError("503 Service Unavailable".into()));
+            }
+            Ok(requests
+                .iter()
+                .map(|r| TranslationResult {
+                    entry_id: r.entry_id.clone(),
+                    translation: format!("ok:{}", r.source),
+                    detected_source_lang: None,
+                    provider: "flaky-transient".into(),
+                    tokens_used: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_usd: None,
+                })
+                .collect())
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct AuthFailProvider {
+        attempts: AtomicUsize,
+    }
+
+    impl AuthFailProvider {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranslationProvider for AuthFailProvider {
+        fn id(&self) -> &str {
+            "auth-fail"
+        }
+        fn name(&self) -> &str {
+            "Auth Fail"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            true
+        }
+        async fn translate(
+            &self,
+            _requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(LocustError::ProviderError("401 Unauthorized".into()))
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_retry_on_transient_then_success() {
+        let (db, glossary) = setup();
+        let entries = vec![StringEntry::new("e0", "Hello", PathBuf::from("a.json"))];
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(FlakyTransientProvider::new());
+        let attempts = Arc::clone(&provider);
+        let manager = TranslationManager::new(provider, db.clone(), glossary).with_retry_config(
+            RetryConfig {
+                max_attempts: 3,
+                initial_delay_ms: 1,
+                max_delay_ms: 5,
+                ..Default::default()
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(32);
+        manager
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "job-retry".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(attempts.attempts.load(Ordering::SeqCst), 3);
+        let entry = db.get_entry("e0").unwrap().unwrap();
+        assert_eq!(entry.status, StringStatus::Translated);
+        assert_eq!(entry.provider_used.as_deref(), Some("flaky-transient"));
+    }
+
+    #[tokio::test]
+    async fn test_provider_auth_error_is_not_retried() {
+        let (db, glossary) = setup();
+        let entries = vec![StringEntry::new("e0", "Hello", PathBuf::from("a.json"))];
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(AuthFailProvider::new());
+        let attempts = Arc::clone(&provider);
+        let manager = TranslationManager::new(provider, db.clone(), glossary).with_retry_config(
+            RetryConfig {
+                max_attempts: 3,
+                initial_delay_ms: 1,
+                max_delay_ms: 5,
+                ..Default::default()
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(32);
+        manager
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "job-auth".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let mut saw_failed = false;
+        while let Some(ev) = rx.recv().await {
+            if matches!(ev, ProgressEvent::Failed { .. }) {
+                saw_failed = true;
+            }
+        }
+        assert_eq!(attempts.attempts.load(Ordering::SeqCst), 1);
+        assert!(saw_failed, "auth error must be surfaced");
+        let entry = db.get_entry("e0").unwrap().unwrap();
+        assert_ne!(entry.status, StringStatus::Translated);
     }
 }

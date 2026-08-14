@@ -27,7 +27,6 @@ import {
 	resolveWorkflowGuideStep,
 	saveSkipReviewPreference,
 	saveWorkflowGuideDismissed,
-	WORKFLOW_STEP_LABELS,
 } from "../lib/workflowGuide";
 import { addToast } from "../stores/toastStore";
 import { addLog } from "../stores/logStore";
@@ -43,8 +42,10 @@ import SearchReplaceModal from "../components/SearchReplaceModal";
 import ValidationResultsModal from "../components/ValidationResultsModal";
 import WorkflowGuideBanner from "../components/WorkflowGuideBanner";
 import EmptyState from "../components/EmptyState";
+import { useT } from "../lib/i18n";
 
 export default function Editor() {
+	const t = useT();
 	const { filter, selectedEntryId, setSelected } = useEditorStore();
 	const { project } = useProjectStore();
 	const navigate = useNavigate();
@@ -139,23 +140,23 @@ export default function Editor() {
 			}
 		} catch (e) {
 			const err = e instanceof Error ? e.message : String(e);
-			addToast("error", `Validate failed: ${err}`);
+			addToast("error", t("editor.toast.validateFailed", { error: err }));
 			addLog("error", "Validate failed", err, "validate");
 		} finally {
 			setValidating(false);
 		}
-	}, [validating]);
+	}, [validating, t]);
 
 	// Project-gated actions: buttons are disabled without a project, and the
 	// matching hotkeys give toast feedback instead of a silent no-op.
 	const hasProject = !!project;
 	const requireProject = useCallback((fn: () => void) => {
 		if (!useProjectStore.getState().project) {
-			addToast("info", "Open a project first");
+			addToast("info", t("editor.toast.openProjectFirst"));
 			return;
 		}
 		fn();
-	}, []);
+	}, [t]);
 
 	const editorModalOpen =
 		showTranslateModal ||
@@ -253,7 +254,7 @@ export default function Editor() {
 			{/* Top bar */}
 			<div className="flex items-center gap-3 px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
 				<div className="flex-1">
-					<span className="font-semibold">{project?.name || "No project"}</span>
+					<span className="font-semibold">{project?.name || t("editor.noProject")}</span>
 					{project && (
 						<span className="ml-2 px-2 py-0.5 bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300 rounded text-xs font-medium">
 							{project.format_id}
@@ -261,18 +262,21 @@ export default function Editor() {
 					)}
 					{statsData && (
 						<span className="ml-3 text-xs text-gray-500">
-							{statsData.pending} pending · {statsData.translated} translated ·{" "}
-							{statsData.approved} approved
+							{t("editor.stats", {
+								pending: statsData.pending,
+								translated: statsData.translated,
+								approved: statsData.approved,
+							})}
 						</span>
 					)}
 					{hasProject && guideDismissed && workflowStep && (
 						<button
 							type="button"
 							onClick={handleGuidePrimaryAction}
-							title="Next workflow step"
+							title={t("editor.nextStepTitle")}
 							className="ml-3 inline-flex items-center gap-0.5 rounded-full border border-emerald-300 px-2 py-0.5 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
 						>
-							Next: {WORKFLOW_STEP_LABELS[workflowStep]}
+							{t("editor.next", { step: t(`workflow.${workflowStep}`) })}
 							<ChevronRight size={12} aria-hidden="true" />
 						</button>
 					)}
@@ -284,27 +288,27 @@ export default function Editor() {
 						onClick={() => setShowTranslateModal(true)}
 						disabled={!hasProject}
 						className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+T" : "Open a project first"}
+						title={hasProject ? "Ctrl+T" : t("editor.hotkeyOrProject")}
 					>
-						<Languages size={16} /> Translate
+						<Languages size={16} /> {t("editor.translate")}
 					</button>
 
 					<button
 						onClick={() => setShowInjectModal(true)}
 						disabled={!hasProject}
 						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+I" : "Open a project first"}
+						title={hasProject ? "Ctrl+I" : t("editor.hotkeyOrProject")}
 					>
-						<FileCheck size={16} /> Inject
+						<FileCheck size={16} /> {t("editor.inject")}
 					</button>
 
 					<button
 						onClick={() => setShowPatchModal(true)}
 						disabled={!hasProject}
 						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+Shift+P" : "Open a project first"}
+						title={hasProject ? "Ctrl+Shift+P" : t("editor.hotkeyOrProject")}
 					>
-						<Package size={16} /> Patch
+						<Package size={16} /> {t("editor.patch")}
 					</button>
 
 					<PatchStatusIndicator
@@ -327,32 +331,32 @@ export default function Editor() {
 						}}
 						disabled={validating || !hasProject}
 						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+Shift+V" : "Open a project first"}
+						title={hasProject ? "Ctrl+Shift+V" : t("editor.hotkeyOrProject")}
 					>
 						{validating ? (
 							<Loader2 size={16} className="animate-spin" />
 						) : (
 							<Shield size={16} />
 						)}
-						Validate
+						{t("editor.validate")}
 					</button>
 
 					<button
 						onClick={() => setShowExportModal(true)}
 						disabled={!hasProject}
 						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+E" : "Open a project first"}
+						title={hasProject ? "Ctrl+E" : t("editor.hotkeyOrProject")}
 					>
-						<Download size={16} /> Export
+						<Download size={16} /> {t("editor.export")}
 					</button>
 
 					<button
 						onClick={() => setShowReplaceModal(true)}
 						disabled={!hasProject}
 						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+Shift+F" : "Open a project first"}
+						title={hasProject ? "Ctrl+Shift+F" : t("editor.hotkeyOrProject")}
 					>
-						<Replace size={16} /> Replace
+						<Replace size={16} /> {t("editor.replace")}
 					</button>
 				</div>
 			</div>
@@ -378,22 +382,22 @@ export default function Editor() {
 			<div className="flex flex-1 overflow-hidden">
 				{!hasProject ? (
 					<EmptyState
-						title="No project open"
-						description="Open a game from Welcome to load its strings. Nothing is shown from a previous session."
-						actionLabel="Go to Welcome"
+						title={t("editor.empty.title")}
+						description={t("editor.empty.description")}
+						actionLabel={t("editor.empty.action")}
 						onAction={() => navigate("/")}
 					/>
 				) : stringsLoading ? (
 					<div className="flex flex-1 items-center justify-center text-gray-500">
-						Loading strings…
+						{t("editor.loadingStrings")}
 					</div>
 				) : stringsError ? (
 					<div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
-						<p className="font-medium text-red-600">Could not load strings</p>
+						<p className="font-medium text-red-600">{t("editor.loadError")}</p>
 						<p className="text-sm text-gray-500">
 							{stringsErrorDetail instanceof Error
 								? stringsErrorDetail.message
-								: "Please try again."}
+								: t("common.tryAgain")}
 						</p>
 						<button
 							onClick={() => {
@@ -401,7 +405,7 @@ export default function Editor() {
 							}}
 							className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
 						>
-							Retry
+							{t("common.retry")}
 						</button>
 					</div>
 				) : (

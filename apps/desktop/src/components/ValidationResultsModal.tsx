@@ -13,6 +13,7 @@ import {
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
+import { useT } from "../lib/i18n";
 
 interface ValidationResultsModalProps {
 	open: boolean;
@@ -37,31 +38,39 @@ const KIND_BADGE: Record<string, string> = {
 		"bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
 };
 
-function kindDetail(kind: ValidationKind): string | null {
+function kindDetail(
+	kind: ValidationKind,
+	t: (key: string, vars?: Record<string, string | number>) => string,
+): string | null {
 	if (typeof kind === "string") return null;
 	if ("MissingPlaceholder" in kind)
-		return `missing ${kind.MissingPlaceholder.placeholder}`;
+		return t("validate.kind.missing", {
+			placeholder: kind.MissingPlaceholder.placeholder,
+		});
 	if ("ExtraPlaceholder" in kind)
-		return `extra ${kind.ExtraPlaceholder.placeholder}`;
+		return t("validate.kind.extra", {
+			placeholder: kind.ExtraPlaceholder.placeholder,
+		});
 	if ("ExceedsCharLimit" in kind) {
 		const { limit, actual } = kind.ExceedsCharLimit;
-		return `${actual} chars > limit ${limit}`;
+		return t("validate.kind.charLimit", { actual, limit });
 	}
 	if ("ExceedsBinarySlot" in kind) {
 		const { encoding, limit, actual } = kind.ExceedsBinarySlot;
-		return `${actual} > ${limit} bytes (${encoding})`;
+		return t("validate.kind.binarySlot", { actual, limit, encoding });
 	}
 	return null;
 }
 
 function FontSection({ fonts }: { fonts: FontCoverageReport[] }) {
+	const t = useT();
 	const withMissing = fonts.filter((f) => f.missing_count > 0);
 	if (withMissing.length === 0) return null;
 
 	return (
 		<div className="mt-4">
 			<h3 className="text-sm font-semibold text-gray-500 uppercase mb-2 flex items-center gap-1.5">
-				<Type size={14} /> Font coverage
+				<Type size={14} /> {t("validate.fontCoverage")}
 			</h3>
 			<div className="space-y-2 max-h-40 overflow-y-auto">
 				{withMissing.map((f) => {
@@ -69,7 +78,9 @@ function FontSection({ fonts }: { fonts: FontCoverageReport[] }) {
 						f.font_name || f.font_path.split(/[/\\]/).pop() || f.font_path;
 					const sample = f.missing_chars.slice(0, 24).join(" ");
 					const more =
-						f.missing_count > 24 ? ` +${f.missing_count - 24} more` : "";
+						f.missing_count > 24
+							? t("validate.more", { count: f.missing_count - 24 })
+							: "";
 					return (
 						<div
 							key={f.font_path}
@@ -79,9 +90,10 @@ function FontSection({ fonts }: { fonts: FontCoverageReport[] }) {
 								{name}
 							</div>
 							<div className="text-xs text-gray-500 mt-0.5">
-								{f.missing_count} missing glyph
-								{f.missing_count === 1 ? "" : "s"} ·{" "}
-								{f.coverage_percent.toFixed(1)}% coverage
+								{t("validate.missingGlyphs", {
+									count: f.missing_count,
+									percent: f.coverage_percent.toFixed(1),
+								})}
 							</div>
 							{sample && (
 								<div className="text-xs font-mono mt-1 text-gray-600 dark:text-gray-400 break-all">
@@ -103,6 +115,7 @@ export default function ValidationResultsModal({
 	onClose,
 	onSelectEntry,
 }: ValidationResultsModalProps) {
+	const t = useT();
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open: open && !!result,
 		ownEscape: false,
@@ -130,7 +143,7 @@ export default function ValidationResultsModal({
 					<div className="flex items-center gap-2">
 						<Shield size={18} className="text-emerald-600" />
 						<h2 {...titleProps} className="text-lg font-bold">
-							Validation results
+							{t("validate.title")}
 						</h2>
 					</div>
 					<button
@@ -145,13 +158,13 @@ export default function ValidationResultsModal({
 					{/* Summary */}
 					<div className="flex flex-wrap gap-3 text-sm">
 						<span className="text-gray-600 dark:text-gray-400">
-							Checked{" "}
+							{t("validate.checked")}{" "}
 							<strong className="text-gray-900 dark:text-gray-100">
 								{validation.total_checked}
 							</strong>
 						</span>
 						<span className="text-gray-600 dark:text-gray-400">
-							Issues{" "}
+							{t("validate.issues")}{" "}
 							<strong
 								className={
 									validation.issues_found > 0
@@ -163,7 +176,7 @@ export default function ValidationResultsModal({
 							</strong>
 						</span>
 						<span className="text-gray-600 dark:text-gray-400">
-							Entries{" "}
+							{t("validate.entries")}{" "}
 							<strong className="text-gray-900 dark:text-gray-100">
 								{validation.entries_with_issues}
 							</strong>
@@ -195,22 +208,21 @@ export default function ValidationResultsModal({
 								className="mx-auto mb-2 text-emerald-500 opacity-80"
 							/>
 							<p className="font-medium text-gray-700 dark:text-gray-300">
-								No issues found
+								{t("validate.noIssues")}
 							</p>
 							<p className="text-sm mt-1">
-								Validated {validation.total_checked} string
-								{validation.total_checked === 1 ? "" : "s"}.
+								{t("validate.validated", { count: validation.total_checked })}
 							</p>
 						</div>
 					) : (
 						<div>
 							<h3 className="text-sm font-semibold text-gray-500 uppercase mb-2 flex items-center gap-1.5">
-								<AlertTriangle size={14} /> Issues
+								<AlertTriangle size={14} /> {t("validate.issuesHeading")}
 							</h3>
 							<ul className="divide-y divide-gray-100 dark:divide-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
 								{issues.map((issue, i) => {
 									const label = validationKindLabel(issue.kind);
-									const detail = kindDetail(issue.kind);
+									const detail = kindDetail(issue.kind, t);
 									return (
 										<li key={`${issue.entry_id}-${label}-${i}`}>
 											<button
@@ -250,7 +262,7 @@ export default function ValidationResultsModal({
 								})}
 							</ul>
 							<p className="text-xs text-gray-400 mt-2">
-								Click an issue to open that string in the editor.
+								{t("validate.clickHint")}
 							</p>
 						</div>
 					)}
@@ -263,7 +275,7 @@ export default function ValidationResultsModal({
 						onClick={onClose}
 						className="px-4 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium"
 					>
-						Close
+						{t("common.close")}
 					</button>
 				</div>
 			</div>

@@ -1,5 +1,6 @@
 import { useToastStore } from "../stores/toastStore";
 import { X, CheckCircle, AlertCircle, Info, AlertTriangle } from "lucide-react";
+import { useT } from "../lib/i18n";
 
 const icons = {
 	success: CheckCircle,
@@ -16,6 +17,7 @@ const colors = {
 };
 
 export default function ToastContainer() {
+	const t = useT();
 	const { toasts, dismiss } = useToastStore();
 
 	if (toasts.length === 0) return null;
@@ -24,7 +26,7 @@ export default function ToastContainer() {
 		<div
 			className="fixed top-4 right-4 z-[100] flex flex-col gap-2 max-w-sm"
 			role="region"
-			aria-label="Notifications"
+			aria-label={t("toast.notifications")}
 		>
 			{toasts.map((toast) => {
 				const Icon = icons[toast.type];
@@ -39,7 +41,7 @@ export default function ToastContainer() {
 						<button
 							type="button"
 							onClick={() => dismiss(toast.id)}
-							aria-label="Dismiss notification"
+							aria-label={t("toast.dismiss")}
 							className="shrink-0 opacity-70 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-white/50 rounded p-0.5"
 						>
 							<X size={14} />

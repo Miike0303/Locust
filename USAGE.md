@@ -13,6 +13,10 @@ A short walkthrough for translating your first game. No coding needed.
    - **Linux**: `project-locust_<ver>_amd64.AppImage`
 3. Run the installer. Launch *Project Locust* from your start menu / applications.
 
+Only need to **apply** someone else's patch zip, not translate? Skip the desktop app and grab the CLI binary from the same release (`locust-x86_64-windows.exe`, `locust-aarch64-macos`, `locust-x86_64-macos`, or `locust-x86_64-linux`). See [Applying a patch](#7-applying-a-patch).
+
+The desktop menus themselves can be **English or Spanish**. That is the app's interface language, not the language you translate the game into. Change it in **Settings → Appearance → Interface language**.
+
 ---
 
 ## 2. Open a game
@@ -24,8 +28,13 @@ A short walkthrough for translating your first game. No coding needed.
    - If not detected, choose the format manually from the dropdown.
 4. Click **Open Project**. Extraction runs automatically (usually 1–10 seconds).
 
-**Supported right now**: RPG Maker MV/MZ/XP/VX Ace, Ren'Py.
-Unity, Unreal, HTML, QSP and others are marked *Coming soon* — you'll see them in the list but can't open them yet.
+**Stable**: RPG Maker MV/MZ, RPG Maker XP/VX Ace, Ren'Py.
+
+**Experimental** (working extract → inject → patch; still evolving): Unity, Unreal, Wolf RPG, HTML / Twine (SugarCube), QSP, TyranoBuilder, KiriKiri, YU-RIS, NScripter, VNTextPatch JSON.
+
+Nothing on that list is “coming soon.” Experimental means it works and you can open it; treat the result as something to playtest, not a finished localization pipeline.
+
+Each game gets its **own** database file. Reopening the same folder **keeps** your translations and approvals — Locust merges new strings in; it does not wipe the project.
 
 ---
 
@@ -38,6 +47,7 @@ Unity, Unreal, HTML, QSP and others are marked *Coming soon* — you'll see them
    - **Ollama** — free, runs offline. Needs [Ollama](https://ollama.com) installed locally.
 3. Pick **Source** (or leave on *Auto-detect*) and **Target** language.
    Default: source = Auto, target = Español.
+   This target is the **game's** language, not the Locust interface language (that lives under Settings → Appearance).
 4. Optional: add **Game context** (e.g. "dark fantasy RPG, medieval") — helps the AI pick the right tone.
 5. Click **Start Translation**.
 
@@ -54,7 +64,13 @@ You can close the modal. Translations continue in the background. Progress shows
 
 ## 4. Review and edit
 
-Your translations go into a database file next to your project. **You can safely close the app and reopen the project later — progress is saved.**
+Your work is saved in `<game-folder>/../<game-name>.locust.db` (the folder *next to* the game, not inside it). If that location is not writable, Locust falls back to its app data folder. **Close the app and reopen the project later — progress is saved.** Shown under Recent Projects on the welcome screen.
+
+If you open the game again after an update:
+
+- Existing translations, statuses, and which provider wrote them are kept.
+- Lines whose *original* text changed are kept but marked **Pending**, so a stale translation cannot ship as approved.
+- Strings that no longer exist in the game are removed.
 
 In the Editor:
 
@@ -71,20 +87,25 @@ When you're ready to play the translated game:
 
 1. Click the **Inject** button.
 2. Pick one or more target languages (checkboxes).
-3. Pick a mode:
+3. Pick a mode — only modes that engine supports are shown:
 
-### Mode: Add 
+### Mode: Add
 
-- Writes translation files into `<game>/game/tl/<lang>/`.
-- Adds a floating **🌐 Language** button to the game's main menu.
-- **Original game files are untouched** — you can toggle between languages in-game.
-- Best for casual testing or when you want multiple languages.
+Available for **Ren'Py** and **RPG Maker MV/MZ**. Adds a language pack beside the original files. Original game files stay playable.
 
-### Mode: Replace (recommended)
+- **Ren'Py**: writes `game/tl/<lang>/` and adds an in-game language picker on the main menu (and preferences). You can toggle languages inside the game.
+- **RPG Maker MV/MZ**: writes extra language packs. That is **not** a floating language button. To list the language in the game's own menu (Iavra / VisuMZ / boot-map choices), check **After inject, also register language(s) in game UI** — or use **Register … in game UI** without injecting. Same as the CLI `locust register-lang`. Optional menu label (for example Español) when one language is selected.
+
+### Mode: Replace
 
 - Copies the game to a new folder, e.g. `<game>-es/`, with translations applied.
-- Modifies dialogue `.rpy` / `.json` files in the copy.
-- Use when you want a standalone translated build.
+- Use when you want a standalone translated build. Keep a pristine original.
+
+### Mode: Direct
+
+- Writes into the game folder itself. A backup is created first.
+- Default for engines that do not support Add (Unity, Unreal, KiriKiri, and others). Work on a **copy** of the game when you can.
+- Direct inject is what Patch → Pack records from when you later build a shareable zip.
 
 Injection is fast (seconds even for large games). Then launch the game — translations should appear.
 
@@ -103,7 +124,37 @@ Repeat until happy. The project file keeps all your work.
 
 ---
 
-## 7. Updates
+## 7. Applying a patch
+
+Translators can pack a patch zip from the desktop (**Patch**, Ctrl+Shift+P) after a Direct inject.
+
+Players who only want to apply that zip do not need the desktop app:
+
+1. Download the CLI from the same [Releases page](https://github.com/Miike0303/Locust/releases) (`locust-x86_64-windows.exe` on Windows, `locust-aarch64-macos` / `locust-x86_64-macos` on macOS, `locust-x86_64-linux` on Linux).
+2. Apply onto a **copy** of the game (never the only original):
+
+```bash
+locust apply "<game-copy>" game-es-patch.zip
+```
+
+Or download and apply in one step (http/https only; do not pass a local zip at the same time):
+
+```bash
+locust apply "<game-copy>" --url "https://example.com/game-es-patch.zip"
+```
+
+Check or undo:
+
+```bash
+locust patch-status "<game-copy>"
+locust patch-rollback "<game-copy>"
+```
+
+Rollback restores the backup Locust stored under `<game>/.locust/backup/`.
+
+---
+
+## 8. Updates
 
 Locust checks for updates each time you launch it. When a new version is available, you'll see a green *Update available* banner in the bottom-right. Click **Download & install** and the app restarts on the new version automatically.
 
@@ -114,20 +165,20 @@ Locust checks for updates each time you launch it. When a new version is availab
 **Q: Translations don't appear in the game.**
 A: Usually one of:
 - The game caches compiled `.rpyc` — Locust deletes these automatically on inject. Try re-injecting.
-- Wrong target language — the game may not be configured to show your language by default. The Add-mode language picker button fixes this.
+- Wrong target language — the game may not be configured to show your language by default. On **Ren'Py**, Add mode installs an in-game language picker. On **RPG Maker MV/MZ**, use **Register … in game UI** (`register-lang`) so the language appears in the game's own menu.
 - The game was built from an archive (`.rpa`) — Locust extracts these transparently but some edge cases may fail. Report the game name in an issue.
 
 **Q: The game crashes after injection.**
-A: Rare. Usually caused by a translation provider returning malformed output (unbalanced quotes, broken tags). Check the Review tab — look for rows flagged with a warning icon — and fix them manually. Use the Inject again.
+A: Rare. Usually caused by a translation provider returning malformed output (unbalanced quotes, broken tags). Check the Review tab — look for rows flagged with a warning icon — and fix them manually. Use Inject again.
 
 **Q: Can I translate paid / commercial games?**
 A: Locust doesn't care — it's a tool. Legality depends on the game's EULA and your jurisdiction. Personal use is generally safe; redistributing modified commercial games is usually not.
 
 **Q: Does Locust support my game engine X?**
-A: Check the welcome screen format list. If X is marked "Coming soon", it's on the roadmap. File an issue with your game info to help prioritize.
+A: Check the welcome screen format list. Stable and Experimental engines can be opened. If X is not listed, file an issue with your game info to help prioritize.
 
 **Q: Where's the project file saved?**
-A: By default, `<game-folder>/../<game-name>.locust.db`. Shown under Recent Projects on the welcome screen.
+A: By default, `<game-folder>/../<game-name>.locust.db` — next to the game folder, not inside it. Shown under Recent Projects on the welcome screen. Reopening merges; it does not wipe your translations.
 
 ---
 

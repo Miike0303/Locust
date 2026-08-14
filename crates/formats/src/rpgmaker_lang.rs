@@ -7,8 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use locust_core::error::{LocustError, Result};
 use locust_core::encoding::EncodingDetector;
+use locust_core::error::{LocustError, Result};
 use serde::Serialize;
 
 use crate::rpgmaker_mv::RpgMakerMvPlugin;
@@ -35,7 +35,11 @@ pub fn register_language(
 ) -> Result<RegisterLanguageReport> {
     let lang = lang.trim();
     let label = label.trim();
-    if lang.is_empty() || !lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if lang.is_empty()
+        || !lang
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(LocustError::ParseError {
             file: game_root.display().to_string(),
             message: format!("invalid language code: {lang:?}"),
@@ -170,7 +174,11 @@ fn patch_iavra_languages_param(raw: &str, lang: &str) -> Option<String> {
     let start = raw.find(key)? + key.len();
     let end = raw[start..].find('"')? + start;
     let list = &raw[start..end];
-    let codes: Vec<&str> = list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let codes: Vec<&str> = list
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     if codes.contains(&lang) {
         return None;
     }
@@ -195,16 +203,17 @@ fn patch_iavra_labels_param(raw: &str, lang: &str, label: &str) -> Option<String
     let start = raw.find(key)? + key.len();
     let end = raw[start..].find('"')? + start;
     let list = &raw[start..end];
-    if list.split(',').any(|p| p.trim().starts_with(&format!("{lang}:"))) {
+    if list
+        .split(',')
+        .any(|p| p.trim().starts_with(&format!("{lang}:")))
+    {
         return None;
     }
     let mut new_list = list.to_string();
     if !new_list.is_empty() {
-        if list.contains(", ") {
-            new_list.push_str(", ");
-        } else {
-            new_list.push_str(", ");
-        }
+        // Iavra splits on ',' and trims, so a uniform ", " is safe whatever
+        // separator style the existing list used.
+        new_list.push_str(", ");
     }
     new_list.push_str(&format!("{lang}:{label}"));
     Some(format!("{}{}{}", &raw[..start], new_list, &raw[end..]))
@@ -272,7 +281,9 @@ fn rewrite_lang_length_clamps(raw: &str) -> String {
         let pos = search_from + rel;
         let window_start = pos.saturating_sub(600);
         let window = &out[window_start..pos + needle.len()];
-        if window.contains("langs") || window.contains("IAVRA") || window.contains("MasterLocalization")
+        if window.contains("langs")
+            || window.contains("IAVRA")
+            || window.contains("MasterLocalization")
         {
             out.replace_range(pos..pos + needle.len(), "(langs.length - 1)");
             search_from = pos + "(langs.length - 1)".len();
@@ -326,7 +337,8 @@ fn append_language_draw_label(raw: &str, _lang: &str, label: &str) -> Option<Str
         }
     }
     let (zi, _m) = hit?;
-    if raw.contains(&format!("drawText('{label}'")) || raw.contains(&format!("drawText(\"{label}\""))
+    if raw.contains(&format!("drawText('{label}'"))
+        || raw.contains(&format!("drawText(\"{label}\""))
     {
         return None;
     }
@@ -390,7 +402,9 @@ fn append_language_draw_label(raw: &str, _lang: &str, label: &str) -> Option<Str
         }
     }
     // Recompute end after possible length change — re-find marker
-    let zi2 = new_raw.find("drawText('中文'").or_else(|| new_raw.find("drawText(\"中文\""))?;
+    let zi2 = new_raw
+        .find("drawText('中文'")
+        .or_else(|| new_raw.find("drawText(\"中文\""))?;
     let slice2 = &new_raw[zi2..];
     let mut depth = 0i32;
     let mut end2 = None;
@@ -446,12 +460,11 @@ fn patch_language_choice_maps(
 fn patch_one_map(path: &Path, lang: &str, label: &str) -> Result<bool> {
     let (raw, _) = EncodingDetector::read_file_auto(path)?;
     let text = if path.extension().and_then(|e| e.to_str()) == Some("jsono") {
-        let units = lz_str::decompress_from_base64(raw.trim()).ok_or_else(|| {
-            LocustError::ParseError {
+        let units =
+            lz_str::decompress_from_base64(raw.trim()).ok_or_else(|| LocustError::ParseError {
                 file: path.display().to_string(),
                 message: "failed to decompress map .jsono".into(),
-            }
-        })?;
+            })?;
         String::from_utf16_lossy(&units)
     } else {
         raw
@@ -505,7 +518,11 @@ fn looks_like_language_choices(choices: &[String]) -> bool {
         l == "english" || l == "en" || l.contains("english")
     });
     let has_cjk_menu = choices.iter().any(|c| {
-        c.contains('日') || c.contains('中') || c.contains('韩') || c.contains('語') || c.contains('文')
+        c.contains('日')
+            || c.contains('中')
+            || c.contains('韩')
+            || c.contains('語')
+            || c.contains('文')
     });
     // Classic jp/en/zh picker
     (has_en && has_cjk_menu)
@@ -541,7 +558,10 @@ fn patch_event_list(list: &mut Vec<serde_json::Value>, lang: &str, label: &str) 
             i += 1;
             continue;
         }
-        if choice_strs.iter().any(|c| c == label || c.eq_ignore_ascii_case(lang)) {
+        if choice_strs
+            .iter()
+            .any(|c| c == label || c.eq_ignore_ascii_case(lang))
+        {
             i += 1;
             continue;
         }
@@ -595,8 +615,7 @@ fn patch_event_list(list: &mut Vec<serde_json::Value>, lang: &str, label: &str) 
 
         let template = en_branch.or_else(|| branches.first().copied());
         if let Some((start, end)) = template {
-            let mut new_cmds: Vec<serde_json::Value> =
-                list[start..end].to_vec();
+            let mut new_cmds: Vec<serde_json::Value> = list[start..end].to_vec();
             if let Some(first) = new_cmds.first_mut() {
                 if let Some(params) = first.get_mut("parameters").and_then(|p| p.as_array_mut()) {
                     if !params.is_empty() {
@@ -611,7 +630,11 @@ fn patch_event_list(list: &mut Vec<serde_json::Value>, lang: &str, label: &str) 
                 let c = cmd.get("code").and_then(|x| x.as_u64()).unwrap_or(0);
                 if c == 355 || c == 655 {
                     if let Some(params) = cmd.get_mut("parameters").and_then(|p| p.as_array_mut()) {
-                        if let Some(s) = params.first_mut().and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                        if let Some(s) = params
+                            .first_mut()
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                        {
                             let rewritten = rewrite_lang_script(&s, lang, new_index as i32);
                             params[0] = serde_json::Value::String(rewritten);
                         }
@@ -621,7 +644,10 @@ fn patch_event_list(list: &mut Vec<serde_json::Value>, lang: &str, label: &str) 
             // Insert before 404
             let mut insert_at = i + 1;
             while insert_at < list.len() {
-                let c = list[insert_at].get("code").and_then(|x| x.as_u64()).unwrap_or(0);
+                let c = list[insert_at]
+                    .get("code")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
                 if c == 404 {
                     break;
                 }
@@ -795,12 +821,16 @@ this.drawText('中文', fx3, rect.y, segment, "center")
         assert!(plugins.contains("Español") || plugins.contains("'es'"));
 
         let units = lz_str::decompress_from_base64(
-            fs::read_to_string(data.join("Map012.jsono")).unwrap().trim(),
+            fs::read_to_string(data.join("Map012.jsono"))
+                .unwrap()
+                .trim(),
         )
         .unwrap();
         let map_text = String::from_utf16_lossy(&units);
         assert!(map_text.contains("Español"), "{map_text}");
-        assert!(map_text.contains("language = \\\"es\\\"") || map_text.contains("language = \"es\""));
+        assert!(
+            map_text.contains("language = \\\"es\\\"") || map_text.contains("language = \"es\"")
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

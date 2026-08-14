@@ -4,6 +4,8 @@ import { waitForJob } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
 import { addLog } from "./logStore";
 import { addToast } from "./toastStore";
+import { t } from "../lib/i18n";
+import { JOB_STREAM_LOST_MESSAGE } from "../lib/ws";
 
 let activeJobId: string | null = null;
 
@@ -100,7 +102,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   startQueue: async () => {
     const { items, translationParams } = get();
     if (!translationParams) {
-      addToast("error", "Configure translation settings first");
+      addToast("error", t("queue.toast.configureFirst"));
       return;
     }
 
@@ -186,14 +188,18 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
         updateItem({ status: "done" });
         addLog("info", `Completed: ${result.project_name} (${result.total_strings} strings)`, undefined, "queue");
-        addToast("success", `${result.project_name} translated`);
+        addToast("success", t("queue.toast.itemDone", { name: result.project_name }));
       } catch (err: any) {
         if (get().cancelRequested) {
           updateItem({ status: "cancelled", error: null });
         } else {
-          updateItem({ status: "error", error: err.message });
-          addLog("error", `Failed: ${item.projectName}`, err.message, "queue");
-          addToast("error", `Queue error: ${item.projectName}`);
+          const raw = err.message ?? String(err);
+          updateItem({
+            status: "error",
+            error: raw === JOB_STREAM_LOST_MESSAGE ? t(JOB_STREAM_LOST_MESSAGE) : raw,
+          });
+          addLog("error", `Failed: ${item.projectName}`, raw, "queue");
+          addToast("error", t("queue.toast.itemFailed", { name: item.projectName }));
         }
       }
     }
@@ -201,7 +207,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     set({ isRunning: false, globalProgress: null });
     if (get().cancelRequested) {
       addLog("warning", "Queue cancelled by user", undefined, "queue");
-      addToast("warning", "Queue cancelled");
+      addToast("warning", t("queue.toast.cancelled"));
     } else {
       const runIds = new Set(pending.map((i) => i.id));
       let finished = 0;
@@ -213,10 +219,10 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       }
       if (failed === 0) {
         addLog("info", "Queue finished", undefined, "queue");
-        addToast("success", "All projects in queue completed");
+        addToast("success", t("queue.toast.allDone"));
       } else {
-        const summary = `${finished} finished, ${failed} failed`;
-        addLog("error", `Queue finished: ${summary}`, undefined, "queue");
+        const summary = t("queue.toast.summary", { finished, failed });
+        addLog("error", `Queue finished: ${finished} finished, ${failed} failed`, undefined, "queue");
         addToast("error", summary);
       }
     }

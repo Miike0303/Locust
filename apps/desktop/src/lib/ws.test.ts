@@ -69,10 +69,7 @@ const {
 	waitForJob,
 } = await import("./ws.ts");
 
-assert.equal(
-	JOB_STREAM_LOST_MESSAGE,
-	"connection to the translation job was lost",
-);
+assert.equal(JOB_STREAM_LOST_MESSAGE, "ws.jobStreamLost");
 
 function reset() {
 	FakeWebSocket.instances.length = 0;
@@ -137,10 +134,11 @@ async function lastSocket(): Promise<FakeWebSocket> {
 	const job = waitForJob("job-drop");
 	const socket = await lastSocket();
 	socket.emitClose();
-	await assert.rejects(
-		job,
-		/connection to the translation job was lost/,
-	);
+	await assert.rejects(job, (err: unknown) => {
+		assert.ok(err instanceof Error);
+		assert.equal(err.message, JOB_STREAM_LOST_MESSAGE);
+		return true;
+	});
 }
 
 // Socket error takes the same terminal path.
@@ -152,10 +150,11 @@ async function lastSocket(): Promise<FakeWebSocket> {
 		const job = waitForJob("job-error");
 		const socket = await lastSocket();
 		socket.emitError(new Error("boom"));
-		await assert.rejects(
-			job,
-			/connection to the translation job was lost/,
-		);
+		await assert.rejects(job, (err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.equal(err.message, JOB_STREAM_LOST_MESSAGE);
+			return true;
+		});
 	} finally {
 		console.error = origError;
 	}
@@ -185,10 +184,11 @@ async function lastSocket(): Promise<FakeWebSocket> {
 		(globalThis as any).__locustGetWsUrl = async () => {
 			throw new Error("port lookup failed");
 		};
-		await assert.rejects(
-			waitForJob("job-url-fail"),
-			/connection to the translation job was lost/,
-		);
+		await assert.rejects(waitForJob("job-url-fail"), (err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.equal(err.message, JOB_STREAM_LOST_MESSAGE);
+			return true;
+		});
 	} finally {
 		console.error = origError;
 	}

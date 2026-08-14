@@ -5,6 +5,8 @@
  * ProviderInfo.requires_api_key and AppConfig.providers[id].api_key.
  */
 
+import { t } from "./i18n";
+
 export interface ProviderReadinessMeta {
 	id: string;
 	requires_api_key: boolean;
@@ -72,8 +74,8 @@ export function formatProviderOptionLabel(meta: {
 	configured?: boolean;
 }): string {
 	let label = meta.name;
-	if (meta.is_free) label += " (free)";
-	if (meta.configured === false) label += " (needs API key)";
+	if (meta.is_free) label += ` (${t("provider.free")})`;
+	if (meta.configured === false) label += ` (${t("provider.needsApiKeySuffix")})`;
 	return label;
 }
 

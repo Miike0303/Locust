@@ -8,9 +8,10 @@ use locust_core::config::AppConfig;
 use locust_core::database::{EntryFilter, GlossaryEntry, ProjectStats};
 use locust_core::extraction::PluginInfo;
 use locust_core::models::{OutputMode, StringEntry, StringStatus};
+use locust_core::project;
 use locust_core::translation::TranslationOptions;
 use locust_core::validation::Validator;
-use locust_server::{AppState, ProjectInfo};
+use locust_server::{spawn_translation_job, AppState, ProjectInfo};
 
 /// Wrapper so we can use Arc<AppState> as Tauri managed state
 pub struct AppStateWrapper(pub Arc<AppState>);
@@ -40,6 +41,12 @@ pub struct ProjectOpenResponse {
     pub project_path: String,
     pub project_name: String,
     pub supported_modes: Vec<OutputMode>,
+    pub database_path: String,
+    pub added: usize,
+    pub updated: usize,
+    pub stale_source_reset: usize,
+    pub removed: usize,
+    pub preserved_translations: usize,
 }
 
 #[tauri::command]
@@ -50,62 +57,41 @@ pub async fn open_project(
 ) -> Result<ProjectOpenResponse, String> {
     let s = &state.0;
     let raw_path = PathBuf::from(&path);
-    if !raw_path.exists() {
-        return Err("Path not found".into());
-    }
-
-    // Resolve executable/file path to game root
-    let path = locust_core::extraction::resolve_game_root(&raw_path, &s.format_registry);
-
-    let plugin = if let Some(ref fid) = format_id {
-        s.format_registry
-            .get(fid)
-            .ok_or_else(|| format!("Unknown format: {}", fid))?
-    } else {
-        s.format_registry
-            .detect(&path)
-            .ok_or_else(|| "Could not detect game format".to_string())?
-    };
-
-    let format_id = plugin.id().to_string();
-    let format_name = plugin.name().to_string();
-    let supported_modes = plugin.supported_modes();
-
-    let entries = plugin.extract(&path).map_err(|e| e.to_string())?;
-
-    s.db.clear_entries().map_err(|e| e.to_string())?;
-    let total_strings = s.db.save_entries(&entries).map_err(|e| e.to_string())?;
-
-    let project_name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let outcome = project::open_project(&s.db, &s.format_registry, &raw_path, format_id.as_deref())
+        .map_err(|e| e.to_string())?;
 
     {
         let mut proj = s.current_project.write().await;
         *proj = Some(ProjectInfo {
-            path: path.clone(),
-            format_id: format_id.clone(),
-            name: project_name.clone(),
+            path: outcome.project_path.clone(),
+            format_id: outcome.format_id.clone(),
+            name: outcome.project_name.clone(),
         });
     }
 
-    let project_path = path.to_string_lossy().to_string();
-
     {
         let mut config = s.config.write().await;
-        config.add_recent_project(path, project_name.clone(), format_id.clone());
+        config.add_recent_project(
+            outcome.project_path.clone(),
+            outcome.project_name.clone(),
+            outcome.format_id.clone(),
+        );
         let _ = config.save(&AppConfig::default_path());
     }
 
     Ok(ProjectOpenResponse {
-        format_id,
-        format_name,
-        total_strings,
-        project_path,
-        project_name,
-        supported_modes,
+        format_id: outcome.format_id,
+        format_name: outcome.format_name,
+        total_strings: outcome.total_strings,
+        project_path: outcome.project_path.to_string_lossy().into_owned(),
+        project_name: outcome.project_name,
+        supported_modes: outcome.supported_modes,
+        database_path: outcome.database_path.to_string_lossy().into_owned(),
+        added: outcome.added,
+        updated: outcome.updated,
+        stale_source_reset: outcome.stale_source_reset,
+        removed: outcome.removed,
+        preserved_translations: outcome.preserved_translations,
     })
 }
 
@@ -117,13 +103,17 @@ pub fn get_formats(state: State<AppStateWrapper>) -> Vec<PluginInfo> {
 }
 
 #[tauri::command]
-pub async fn get_providers(state: State<'_, AppStateWrapper>) -> Result<Vec<serde_json::Value>, String> {
+pub async fn get_providers(
+    state: State<'_, AppStateWrapper>,
+) -> Result<Vec<serde_json::Value>, String> {
     let reg = state.0.provider_registry.read().await;
-    Ok(serde_json::to_value(locust_providers::list_providers_for_api(&reg))
-        .unwrap_or_default()
-        .as_array()
-        .cloned()
-        .unwrap_or_default())
+    Ok(
+        serde_json::to_value(locust_providers::list_providers_for_api(&reg))
+            .unwrap_or_default()
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    )
 }
 
 // ─── String commands ────────────────────────────────────────────────────────
@@ -180,7 +170,11 @@ pub async fn get_strings(
         limit: None,
         offset: None,
     };
-    let total = state.0.db.count_entries(&count_filter).map_err(|e| e.to_string())?;
+    let total = state
+        .0
+        .db
+        .count_entries(&count_filter)
+        .map_err(|e| e.to_string())?;
 
     let entry_filter = EntryFilter {
         status,
@@ -190,9 +184,18 @@ pub async fn get_strings(
         limit: Some(limit),
         offset: Some(offset),
     };
-    let entries = state.0.db.get_entries(&entry_filter).map_err(|e| e.to_string())?;
+    let entries = state
+        .0
+        .db
+        .get_entries(&entry_filter)
+        .map_err(|e| e.to_string())?;
 
-    Ok(StringsResponse { entries, total, offset, limit })
+    Ok(StringsResponse {
+        entries,
+        total,
+        offset,
+        limit,
+    })
 }
 
 #[derive(Deserialize)]
@@ -273,6 +276,8 @@ pub async fn batch_patch_strings(
 #[derive(Deserialize)]
 pub struct TranslateParams {
     pub provider_id: String,
+    #[serde(default)]
+    pub fallback_provider_ids: Option<Vec<String>>,
     pub options: TranslationOptions,
 }
 
@@ -281,59 +286,13 @@ pub async fn start_translation(
     params: TranslateParams,
     state: State<'_, AppStateWrapper>,
 ) -> Result<String, String> {
-    let s = &state.0;
-    let reg = s.provider_registry.read().await;
-    let provider = reg
-        .get(&params.provider_id)
-        .ok_or_else(|| "Provider not found".to_string())?;
-
-    let job_id = uuid::Uuid::new_v4().to_string();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1000);
-    let (broadcast_tx, _) = tokio::sync::broadcast::channel(1000);
-    let broadcast_tx_clone = broadcast_tx.clone();
-
-    let entries = s.db.get_entries(&EntryFilter::default()).map_err(|e| e.to_string())?;
-    let manager = locust_core::translation::TranslationManager::new(
-        provider,
-        s.db.clone(),
-        s.glossary.clone(),
-    );
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let cancel_clone = cancel.clone();
-    let job_id_clone = job_id.clone();
-
-    let jobs = s.active_jobs.clone();
-    let cleanup_job_id = job_id.clone();
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let is_terminal = matches!(
-                event,
-                locust_core::models::ProgressEvent::Completed { .. }
-                    | locust_core::models::ProgressEvent::Failed { .. }
-            );
-            let _ = broadcast_tx_clone.send(event);
-            if is_terminal {
-                break;
-            }
-        }
-        jobs.remove(&cleanup_job_id);
-    });
-
-    let handle = tokio::spawn(async move {
-        let _ = manager
-            .translate_entries(entries, params.options, tx, job_id_clone, cancel_clone)
-            .await;
-    });
-
-    s.active_jobs.insert(
-        job_id.clone(),
-        locust_server::JobState {
-            abort_handle: handle.abort_handle(),
-            progress_tx: broadcast_tx,
-        },
-    );
-
-    Ok(job_id)
+    spawn_translation_job(
+        &state.0,
+        params.provider_id,
+        params.fallback_provider_ids,
+        params.options,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -352,9 +311,13 @@ pub async fn cancel_translation(
 // ─── Validation & Injection ─────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn run_validation(state: State<'_, AppStateWrapper>) -> Result<serde_json::Value, String> {
+pub async fn run_validation(
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
     let s = &state.0;
-    let entries = s.db.get_entries(&EntryFilter::default()).map_err(|e| e.to_string())?;
+    let entries =
+        s.db.get_entries(&EntryFilter::default())
+            .map_err(|e| e.to_string())?;
     let validation = Validator::validate_and_save(&entries, &s.db)
         .await
         .map_err(|e| e.to_string())?;
@@ -387,18 +350,16 @@ pub async fn export_translations(
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
     let s = &state.0;
-    let entries = s
-        .db
-        .get_entries(&EntryFilter::default())
-        .map_err(|e| e.to_string())?;
+    let entries =
+        s.db.get_entries(&EntryFilter::default())
+            .map_err(|e| e.to_string())?;
     if entries.is_empty() {
         return Err("no strings in project — open a game and extract first".into());
     }
     let config = s.config.read().await;
-    let source = s
-        .db
-        .resolve_export_source_lang(&lang, &config.default_source_lang)
-        .map_err(|e| e.to_string())?;
+    let source =
+        s.db.resolve_export_source_lang(&lang, &config.default_source_lang)
+            .map_err(|e| e.to_string())?;
     let body = match format.as_str() {
         "po" => locust_core::export::export_po(&entries, &source, &lang),
         "xliff" => locust_core::export::export_xliff(&entries, &source, &lang),
@@ -440,8 +401,7 @@ pub async fn import_translations(
     let mut skipped = 0usize;
     match format.as_str() {
         "po" => {
-            let entries =
-                locust_core::export::import_po(&content).map_err(|e| e.to_string())?;
+            let entries = locust_core::export::import_po(&content).map_err(|e| e.to_string())?;
             for pe in &entries {
                 if pe.translation.is_empty() {
                     skipped += 1;
@@ -463,8 +423,7 @@ pub async fn import_translations(
             }
         }
         "xliff" => {
-            let units =
-                locust_core::export::import_xliff(&content).map_err(|e| e.to_string())?;
+            let units = locust_core::export::import_xliff(&content).map_err(|e| e.to_string())?;
             for unit in &units {
                 if unit.target.is_empty() {
                     skipped += 1;
@@ -529,9 +488,7 @@ pub async fn run_inject(
     // Same guard as CLI/server: empty languages used to return success with
     // zero work and zero recording — a silent no-op that breaks `locust patch`.
     if params.languages.is_empty() {
-        return Err(
-            "inject requires at least one language (e.g. [\"es\"])".into(),
-        );
+        return Err("inject requires at least one language (e.g. [\"es\"])".into());
     }
     let s = &state.0;
 
@@ -544,12 +501,7 @@ pub async fn run_inject(
         let backup = s.backup_manager.clone();
         let report = tokio::task::spawn_blocking(move || {
             locust_core::extraction::inject_direct(
-                &registry,
-                &db,
-                &backup,
-                &game_path,
-                &format_id,
-                &languages,
+                &registry, &db, &backup, &game_path, &format_id, &languages,
             )
         })
         .await
@@ -583,12 +535,9 @@ pub async fn run_inject(
     // Persist what each language's injection wrote — `locust patch` packs
     // exclusively from this recording, so an inject seam that skips it
     // produces projects that can never be packed.
-    locust_core::extraction::record_multilang_injection(
-        &s.db,
-        &report,
-        &languages,
-        &|_lang| INJECT_RECORD_REMEDY.to_string(),
-    )
+    locust_core::extraction::record_multilang_injection(&s.db, &report, &languages, &|_lang| {
+        INJECT_RECORD_REMEDY.to_string()
+    })
     .map_err(|e| e.to_string())?;
 
     serde_json::to_value(report).map_err(|e| e.to_string())
@@ -633,8 +582,15 @@ pub async fn get_config(state: State<'_, AppStateWrapper>) -> Result<serde_json:
     if let Some(providers) = val.get_mut("providers").and_then(|v| v.as_object_mut()) {
         for (_id, pc) in providers.iter_mut() {
             if let Some(obj) = pc.as_object_mut() {
-                if obj.get("api_key").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-                    obj.insert("api_key".to_string(), serde_json::Value::String("***".to_string()));
+                if obj
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    obj.insert(
+                        "api_key".to_string(),
+                        serde_json::Value::String("***".to_string()),
+                    );
                 }
             }
         }
@@ -662,8 +618,14 @@ pub async fn save_config(
 // ─── Backups & Glossary ─────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_backups(state: State<AppStateWrapper>) -> Result<Vec<locust_core::backup::BackupEntry>, String> {
-    state.0.backup_manager.list_backups().map_err(|e| e.to_string())
+pub fn get_backups(
+    state: State<AppStateWrapper>,
+) -> Result<Vec<locust_core::backup::BackupEntry>, String> {
+    state
+        .0
+        .backup_manager
+        .list_backups()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -671,7 +633,11 @@ pub fn get_glossary(
     lang_pair: String,
     state: State<AppStateWrapper>,
 ) -> Result<Vec<GlossaryEntry>, String> {
-    state.0.glossary.get_all(&lang_pair).map_err(|e| e.to_string())
+    state
+        .0
+        .glossary
+        .get_all(&lang_pair)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -682,6 +648,38 @@ pub fn add_glossary_entry(
     state
         .0
         .glossary
-        .add(&entry.term, &entry.translation, &entry.lang_pair, entry.context.as_deref())
+        .add(
+            &entry.term,
+            &entry.translation,
+            &entry.lang_pair,
+            entry.context.as_deref(),
+        )
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_params_deserializes_fallback_provider_ids() {
+        let params: TranslateParams = serde_json::from_value(serde_json::json!({
+            "provider_id": "always-error",
+            "fallback_provider_ids": ["mock"],
+            "options": {
+                "source_lang": "en",
+                "target_lang": "es",
+                "batch_size": 10,
+                "max_concurrent": 1,
+                "cost_limit_usd": null,
+                "game_context": null,
+                "use_glossary": false,
+                "use_memory": false,
+                "skip_approved": true
+            }
+        }))
+        .unwrap();
+        assert_eq!(params.provider_id, "always-error");
+        assert_eq!(params.fallback_provider_ids, Some(vec!["mock".to_string()]));
+    }
 }

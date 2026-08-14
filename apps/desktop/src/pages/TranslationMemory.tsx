@@ -5,14 +5,16 @@ import { getTranslationMemory, getTranslationMemoryStats, getTranslationMemoryLa
 import ConfirmDialog from "../components/ConfirmDialog";
 import EmptyState from "../components/EmptyState";
 import { addToast } from "../stores/toastStore";
+import { useT } from "../lib/i18n";
 
 const PAGE_SIZE = 50;
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : "Please try again.";
+function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error ? err.message : fallback;
 }
 
 export default function TranslationMemory() {
+  const t = useT();
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [langPair, setLangPair] = useState<string | undefined>();
@@ -62,11 +64,11 @@ export default function TranslationMemory() {
     setEntryToDelete(null);
     try {
       await deleteTranslationMemoryEntry(hash, lp);
-      addToast("success", "Memory entry deleted");
+      addToast("success", t("memory.toast.deleted"));
       refetch();
       qc.invalidateQueries({ queryKey: ["tm-stats"] });
     } catch (err) {
-      addToast("error", `Failed to delete entry: ${errorMessage(err)}`);
+      addToast("error", t("memory.toast.deleteFailed", { error: errorMessage(err, t("common.tryAgain")) }));
     }
   };
 
@@ -74,12 +76,12 @@ export default function TranslationMemory() {
     setConfirmClearAll(false);
     try {
       await clearTranslationMemory();
-      addToast("success", "Translation memory cleared");
+      addToast("success", t("memory.toast.cleared"));
       refetch();
       qc.invalidateQueries({ queryKey: ["tm-stats"] });
       qc.invalidateQueries({ queryKey: ["tm-lang-pairs"] });
     } catch (err) {
-      addToast("error", `Failed to clear translation memory: ${errorMessage(err)}`);
+      addToast("error", t("memory.toast.clearFailed", { error: errorMessage(err, t("common.tryAgain")) }));
     }
   };
 
@@ -90,21 +92,21 @@ export default function TranslationMemory() {
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-3">
             <Database size={20} className="text-emerald-600" />
-            <h1 className="text-xl font-bold">Translation Memory</h1>
+            <h1 className="text-xl font-bold">{t("memory.title")}</h1>
           </div>
           <button
             onClick={() => setConfirmClearAll(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 dark:bg-red-900/30 dark:hover:bg-red-900/50 dark:text-red-400 rounded text-sm font-medium"
           >
-            <Trash2 size={14} /> Clear All
+            <Trash2 size={14} /> {t("memory.clearAll")}
           </button>
         </div>
 
         {/* Stats */}
         <div className="flex gap-6 text-sm text-gray-500 mb-4">
-          <span><strong className="text-gray-800 dark:text-gray-200">{stats?.global_entries ?? 0}</strong> global entries</span>
-          <span><strong className="text-gray-800 dark:text-gray-200">{stats?.project_entries ?? 0}</strong> project entries</span>
-          <span><strong className="text-gray-800 dark:text-gray-200">{langPairs?.length ?? 0}</strong> language pairs</span>
+          <span className="text-gray-800 dark:text-gray-200">{t("memory.globalEntries", { count: stats?.global_entries ?? 0 })}</span>
+          <span className="text-gray-800 dark:text-gray-200">{t("memory.projectEntries", { count: stats?.project_entries ?? 0 })}</span>
+          <span className="text-gray-800 dark:text-gray-200">{t("memory.languagePairs", { count: langPairs?.length ?? 0 })}</span>
         </div>
 
         {/* Search & Filter */}
@@ -115,7 +117,7 @@ export default function TranslationMemory() {
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-              placeholder="Search source or translation text..."
+              placeholder={t("memory.searchPlaceholder")}
               className="w-full pl-9 pr-3 py-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
             />
           </div>
@@ -124,7 +126,7 @@ export default function TranslationMemory() {
             onChange={(e) => { setLangPair(e.target.value || undefined); setOffset(0); }}
             className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-sm"
           >
-            <option value="">All languages</option>
+            <option value="">{t("memory.allLanguages")}</option>
             {langPairs?.map((lp) => (
               <option key={lp} value={lp}>{lp}</option>
             ))}
@@ -133,7 +135,7 @@ export default function TranslationMemory() {
             onClick={handleSearch}
             className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium"
           >
-            Search
+            {t("common.search")}
           </button>
         </div>
       </div>
@@ -142,45 +144,45 @@ export default function TranslationMemory() {
       <div className="flex-1 overflow-auto">
         {isLoading ? (
           <div className="flex h-full items-center justify-center text-gray-500">
-            Loading memory…
+            {t("memory.loading")}
           </div>
         ) : isError ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-            <p className="font-medium text-red-600 dark:text-red-400">Could not load translation memory</p>
+            <p className="font-medium text-red-600 dark:text-red-400">{t("memory.loadError")}</p>
             <p className="text-sm text-gray-500">
-              {errorMessage(error)}
+              {errorMessage(error, t("common.tryAgain"))}
             </p>
             <button
               type="button"
               onClick={() => { void refetch(); }}
               className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
             >
-              Retry
+              {t("common.retry")}
             </button>
           </div>
         ) : entries.length === 0 ? (
           hasActiveFilter ? (
             <EmptyState
-              title="No matches found"
-              description="No entries match the current search or language filter."
-              actionLabel="Clear search"
+              title={t("memory.emptyFiltered.title")}
+              description={t("memory.emptyFiltered.description")}
+              actionLabel={t("memory.emptyFiltered.action")}
               onAction={handleClearSearch}
             />
           ) : (
             <EmptyState
-              title="Translation memory is empty"
-              description="Translations are stored here automatically after you translate a project."
+              title={t("memory.empty.title")}
+              description={t("memory.empty.description")}
             />
           )
         ) : (
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
               <tr className="text-left text-gray-500 text-xs uppercase">
-                <th className="px-4 py-2">Source</th>
-                <th className="px-4 py-2">Translation</th>
-                <th className="px-4 py-2 w-24">Language</th>
-                <th className="px-4 py-2 w-16 text-center">Uses</th>
-                <th className="px-4 py-2 w-36">Last Used</th>
+                <th className="px-4 py-2">{t("memory.col.source")}</th>
+                <th className="px-4 py-2">{t("memory.col.translation")}</th>
+                <th className="px-4 py-2 w-24">{t("memory.col.language")}</th>
+                <th className="px-4 py-2 w-16 text-center">{t("memory.col.uses")}</th>
+                <th className="px-4 py-2 w-36">{t("memory.col.lastUsed")}</th>
                 <th className="px-4 py-2 w-12"></th>
               </tr>
             </thead>
@@ -208,7 +210,7 @@ export default function TranslationMemory() {
                   <td className="px-4 py-2">
                     <button
                       type="button"
-                      aria-label={`Delete memory entry: ${entry.source.trim() || entry.source_hash}`}
+                      aria-label={t("memory.deleteAria", { name: entry.source.trim() || entry.source_hash })}
                       onClick={() => setEntryToDelete({ hash: entry.source_hash, lp: entry.lang_pair })}
                       className="text-red-400 hover:text-red-600"
                     >
@@ -226,7 +228,7 @@ export default function TranslationMemory() {
       {!isLoading && !isError && totalPages > 1 && (
         <div className="flex items-center justify-between px-6 py-3 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
           <span className="text-sm text-gray-500">
-            Showing {offset + 1}-{Math.min(offset + PAGE_SIZE, total)} of {total}
+            {t("memory.showing", { from: offset + 1, to: Math.min(offset + PAGE_SIZE, total), total })}
           </span>
           <div className="flex gap-2">
             <button
@@ -234,7 +236,7 @@ export default function TranslationMemory() {
               disabled={offset === 0}
               className="flex items-center gap-1 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm disabled:opacity-50"
             >
-              <ChevronLeft size={14} /> Prev
+              <ChevronLeft size={14} /> {t("common.prev")}
             </button>
             <span className="px-3 py-1.5 text-sm text-gray-600 dark:text-gray-400">
               {currentPage} / {totalPages}
@@ -244,7 +246,7 @@ export default function TranslationMemory() {
               disabled={offset + PAGE_SIZE >= total}
               className="flex items-center gap-1 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm disabled:opacity-50"
             >
-              Next <ChevronRight size={14} />
+              {t("common.next")} <ChevronRight size={14} />
             </button>
           </div>
         </div>
@@ -252,18 +254,18 @@ export default function TranslationMemory() {
 
       <ConfirmDialog
         open={entryToDelete !== null}
-        title="Delete memory entry"
-        message="Delete this memory entry?"
-        confirmLabel="Delete"
+        title={t("memory.confirm.deleteTitle")}
+        message={t("memory.confirm.deleteMessage")}
+        confirmLabel={t("common.delete")}
         destructive
         onConfirm={handleDeleteConfirmed}
         onCancel={() => setEntryToDelete(null)}
       />
       <ConfirmDialog
         open={confirmClearAll}
-        title="Clear translation memory"
-        message="Clear ALL translation memory entries? This cannot be undone."
-        confirmLabel="Clear All"
+        title={t("memory.confirm.clearTitle")}
+        message={t("memory.confirm.clearMessage")}
+        confirmLabel={t("memory.clearAll")}
         destructive
         onConfirm={handleClearAllConfirmed}
         onCancel={() => setConfirmClearAll(false)}

@@ -35,6 +35,7 @@ import {
 	type OperationalShortcut,
 } from "../lib/settingsNav";
 import { resolveProviderReadiness, formatProviderOptionLabel } from "../lib/providerReadiness";
+import { useT } from "../lib/i18n";
 
 interface TranslationModalProps {
 	open: boolean;
@@ -53,6 +54,7 @@ export default function TranslationModal({
 	onComplete,
 	onReview,
 }: TranslationModalProps) {
+	const t = useT();
 	const navigate = useNavigate();
 	const { data: providers } = useQuery({
 		queryKey: ["providers"],
@@ -294,7 +296,7 @@ export default function TranslationModal({
 						undefined,
 						"translation",
 					);
-					addToast("info", `Switched to ${e.provider_name}`);
+					addToast("info", t("translate.toast.switched", { name: e.provider_name }));
 				},
 				onCompleted: (e) => {
 					finishedRef.current = true;
@@ -310,7 +312,7 @@ export default function TranslationModal({
 					);
 					addToast(
 						"success",
-						`Translation complete: ${e.total_translated} strings`,
+						t("translate.toast.complete", { count: e.total_translated }),
 					);
 				},
 				onFailed: (e) => {
@@ -320,7 +322,7 @@ export default function TranslationModal({
 					setJob(null);
 					useQueueStore.getState().setGlobalProgress(null);
 					addLog("error", `Translation failed`, e.error, "translation");
-					addToast("error", `Translation failed: ${e.error}`);
+					addToast("error", t("translate.toast.failed", { error: e.error }));
 				},
 				onClosed: () => {
 					if (finishedRef.current) return;
@@ -332,17 +334,17 @@ export default function TranslationModal({
 						setCancelled(true);
 						setCancelling(false);
 						addLog("info", "Translation cancelled", undefined, "translation");
-						addToast("info", "Translation cancelled");
+						addToast("info", t("translate.toast.cancelled"));
 						return;
 					}
-					setError(JOB_STREAM_LOST_MESSAGE);
+					setError(t(JOB_STREAM_LOST_MESSAGE));
 					addLog(
 						"error",
 						"Translation failed",
 						JOB_STREAM_LOST_MESSAGE,
 						"translation",
 					);
-					addToast("error", `Translation failed: ${JOB_STREAM_LOST_MESSAGE}`);
+					addToast("error", t("translate.toast.failed", { error: t(JOB_STREAM_LOST_MESSAGE) }));
 				},
 			});
 		} catch (err: any) {
@@ -352,7 +354,7 @@ export default function TranslationModal({
 				err.stack ?? String(err),
 				"translation",
 			);
-			addToast("error", `Translation failed to start: ${err.message ?? err}`);
+			addToast("error", t("translate.toast.startFailed", { error: err.message ?? err }));
 			setError(err.message ?? String(err));
 		}
 	};
@@ -370,11 +372,11 @@ export default function TranslationModal({
 				undefined,
 				"translation",
 			);
-			addToast("info", "Cancelling translation…");
+			addToast("info", t("translate.toast.cancelling"));
 		} catch (err: any) {
 			cancelRequestedRef.current = false;
 			setCancelling(false);
-			addToast("error", `Cancel failed: ${err.message ?? err}`);
+			addToast("error", t("translate.toast.cancelFailed", { error: err.message ?? err }));
 		}
 	};
 
@@ -429,12 +431,12 @@ export default function TranslationModal({
 				<div className="flex justify-between items-center mb-4">
 					<h2 {...titleProps} className="text-lg font-bold">
 						{step === "configure"
-							? "Start Translation"
-							: "Translation Progress"}
+							? t("translate.title")
+							: t("translate.progressTitle")}
 					</h2>
 					<button
 						onClick={handleClose}
-						aria-label="Close translation dialog"
+						aria-label={t("translate.closeAria")}
 						className="text-gray-400 hover:text-gray-600"
 					>
 						<X aria-hidden="true" size={20} />
@@ -445,14 +447,14 @@ export default function TranslationModal({
 					<div className="space-y-4">
 						<div>
 							<div className="flex items-end justify-between gap-2">
-								<label className="text-sm font-medium">Provider</label>
+								<label className="text-sm font-medium">{t("translate.provider")}</label>
 								<button
 									type="button"
 									onClick={handleTestConnection}
 									disabled={!providerId || testingHealth}
 									className="text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
 								>
-									{testingHealth ? "Testing…" : "Test connection"}
+									{testingHealth ? t("translate.testing") : t("translate.testConnection")}
 								</button>
 							</div>
 							<select
@@ -474,13 +476,13 @@ export default function TranslationModal({
 							{!providerReadiness.ready &&
 								providerReadiness.reason === "missing_key" && (
 									<div className="mt-2 p-2 rounded border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20 text-sm text-amber-800 dark:text-amber-200">
-										This provider needs an API key — add it in Settings.{" "}
+										{t("translate.needsKey")}{" "}
 										<button
 											type="button"
 											onClick={() => openSettings("provider-settings")}
 											className="font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
 										>
-											Open Settings
+											{t("translate.openSettings")}
 										</button>
 									</div>
 								)}
@@ -500,16 +502,15 @@ export default function TranslationModal({
 								onClick={() => openSettings("provider-settings")}
 								className="mt-1 text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
 							>
-								Provider health &amp; settings
+								{t("translate.providerSettings")}
 							</button>
 						</div>
 						<div>
 							<label className="text-sm font-medium">
-								Fallback providers (optional)
+								{t("translate.fallbacks")}
 							</label>
 							<p className="text-xs text-gray-500 mt-0.5 mb-1">
-								Tried in order if the primary stops making progress on pending
-								strings.
+								{t("translate.fallbacksHint")}
 							</p>
 							<div className="flex gap-2">
 								<select
@@ -517,7 +518,7 @@ export default function TranslationModal({
 									onChange={(e) => setFallbackPick(e.target.value)}
 									className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 								>
-									<option value="">Add fallback…</option>
+									<option value="">{t("translate.addFallback")}</option>
 									{providers
 										?.filter(
 											(p) => p.id !== providerId && !fallbackIds.includes(p.id),
@@ -534,7 +535,7 @@ export default function TranslationModal({
 									disabled={!fallbackPick}
 									className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium disabled:opacity-50"
 								>
-									Add
+									{t("common.add")}
 								</button>
 							</div>
 							{fallbackIds.length > 0 && (
@@ -556,7 +557,7 @@ export default function TranslationModal({
 													onClick={() => removeFallback(id)}
 													className="text-red-500 hover:text-red-700 text-xs font-medium"
 												>
-													Remove
+													{t("common.remove")}
 												</button>
 											</li>
 										);
@@ -566,13 +567,13 @@ export default function TranslationModal({
 						</div>
 						<div className="grid grid-cols-2 gap-3">
 							<div>
-								<label className="text-sm font-medium">Source</label>
+								<label className="text-sm font-medium">{t("translate.source")}</label>
 								<select
 									value={sourceLang}
 									onChange={(e) => setSourceLang(e.target.value)}
 									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 								>
-									<option value="auto">Auto-detect</option>
+									<option value="auto">{t("translate.autoDetect")}</option>
 									{LANGUAGES.map((l) => (
 										<option key={l.code} value={l.code}>
 											{l.label}
@@ -581,7 +582,7 @@ export default function TranslationModal({
 								</select>
 							</div>
 							<div>
-								<label className="text-sm font-medium">Target</label>
+								<label className="text-sm font-medium">{t("translate.target")}</label>
 								<select
 									value={targetLang}
 									onChange={(e) => setTargetLang(e.target.value)}
@@ -596,12 +597,12 @@ export default function TranslationModal({
 							</div>
 						</div>
 						<div>
-							<label className="text-sm font-medium">Game context</label>
+							<label className="text-sm font-medium">{t("translate.gameContext")}</label>
 							<textarea
 								value={gameContext}
 								onChange={(e) => setGameContext(e.target.value)}
 								rows={2}
-								placeholder="Describe genre, tone, setting..."
+								placeholder={t("translate.gameContextPlaceholder")}
 								className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 							/>
 						</div>
@@ -612,14 +613,14 @@ export default function TranslationModal({
 									checked={useGlossary}
 									onChange={(e) => setUseGlossary(e.target.checked)}
 								/>{" "}
-								Use glossary
+								{t("translate.useGlossary")}
 							</label>
 							<button
 								type="button"
 								onClick={() => openSettings("manage-glossary")}
 								className="text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
 							>
-								Manage glossary
+								{t("translate.manageGlossary")}
 							</button>
 							<label className="flex items-center gap-2 text-sm">
 								<input
@@ -627,12 +628,12 @@ export default function TranslationModal({
 									checked={useMemory}
 									onChange={(e) => setUseMemory(e.target.checked)}
 								/>{" "}
-								Use memory
+								{t("translate.useMemory")}
 							</label>
 						</div>
 						<div className="grid grid-cols-3 gap-3">
 							<div>
-								<label className="text-sm font-medium">Batch size</label>
+								<label className="text-sm font-medium">{t("translate.batchSize")}</label>
 								<input
 									type="number"
 									value={batchSize}
@@ -645,9 +646,9 @@ export default function TranslationModal({
 							<div>
 								<label
 									className="text-sm font-medium"
-									title="Parallel requests. Use 1 for local models (LM Studio/Ollama); higher values only speed up remote APIs."
+									title={t("translate.parallelTitle")}
 								>
-									Parallel requests
+									{t("translate.parallelRequests")}
 								</label>
 								<select
 									value={maxConcurrent}
@@ -662,23 +663,23 @@ export default function TranslationModal({
 								</select>
 							</div>
 							<div>
-								<label className="text-sm font-medium">Cost limit ($)</label>
+								<label className="text-sm font-medium">{t("translate.costLimit")}</label>
 								<input
 									value={costLimit}
 									onChange={(e) => setCostLimit(e.target.value)}
-									placeholder="No limit"
+									placeholder={t("translate.noLimit")}
 									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 								/>
 							</div>
 						</div>
 						<p className="text-sm text-gray-500">
-							{totalPending} pending strings to translate
+							{t("translate.pending", { count: totalPending })}
 						</p>
 						<button
 							onClick={handleStart}
 							className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium transition-colors"
 						>
-							Start Translation
+							{t("translate.start")}
 						</button>
 					</div>
 				)}
@@ -693,20 +694,20 @@ export default function TranslationModal({
 						</div>
 						<div className="text-center text-sm">
 							{done
-								? "Complete!"
+								? t("translate.complete")
 								: cancelled
-									? "Cancelled"
+									? t("translate.cancelled")
 									: `${completed} / ${total}`}
 							{costSoFar > 0 && ` · $${costSoFar.toFixed(4)}`}
 						</div>
 						{activeProviderLabel && !done && !cancelled && !error && (
 							<div className="text-xs text-center text-emerald-700 dark:text-emerald-400">
-								Using provider: {activeProviderLabel}
+								{t("translate.usingProvider", { name: activeProviderLabel })}
 							</div>
 						)}
 						{lastTranslated && !done && !cancelled && !error && (
 							<div className="text-xs text-gray-500 truncate">
-								Last: {lastTranslated}
+								{t("translate.last", { text: lastTranslated })}
 							</div>
 						)}
 						{error && (
@@ -720,7 +721,7 @@ export default function TranslationModal({
 								disabled={cancelling}
 								className="w-full py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
 							>
-								{cancelling ? "Cancelling…" : "Cancel"}
+								{cancelling ? t("translate.cancelling") : t("translate.cancel")}
 							</button>
 						)}
 						{(done || cancelled || error) && (
@@ -733,14 +734,14 @@ export default function TranslationModal({
 											: "bg-emerald-600 hover:bg-emerald-700 text-white"
 									}`}
 								>
-									Close
+									{t("common.close")}
 								</button>
 								{done && onReview && (
 									<button
 										onClick={handleReview}
 										className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
 									>
-										Review translations
+										{t("translate.review")}
 									</button>
 								)}
 							</div>
