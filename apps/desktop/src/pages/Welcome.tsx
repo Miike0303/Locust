@@ -18,12 +18,14 @@ import {
 	Settings2,
 	Languages,
 	FileCheck,
+	Package,
 } from "lucide-react";
 import { getFormats, getConfig, getProviders, openProject } from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
 import { useQueueStore } from "../stores/queueStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
+import PatchModal from "../components/PatchModal";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
@@ -109,6 +111,7 @@ export default function Welcome() {
 	} | null>(null);
 	const [selectedFormat, setSelectedFormat] = useState("auto");
 	const [opening, setOpening] = useState(false);
+	const [showPatchModal, setShowPatchModal] = useState(false);
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open: !!picker,
 		onClose: () => setPicker(null),
@@ -317,7 +320,7 @@ export default function Welcome() {
 
 			{/* Open buttons */}
 			<div className="mb-10">
-				<div className="flex justify-center gap-4">
+				<div className="flex justify-center gap-4 flex-wrap">
 					<button
 						onClick={handleOpenFolder}
 						disabled={opening}
@@ -341,6 +344,15 @@ export default function Welcome() {
 							<File size={18} />
 						)}
 						{opening ? t("welcome.opening") : t("welcome.openFile")}
+					</button>
+					<button
+						type="button"
+						onClick={() => setShowPatchModal(true)}
+						disabled={opening}
+						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
+					>
+						<Package size={18} />
+						{t("welcome.applyPatch")}
 					</button>
 				</div>
 				<div className="flex justify-center mt-2">
@@ -675,6 +687,12 @@ export default function Welcome() {
 					</a>
 				</span>
 			</div>
+
+			<PatchModal
+				open={showPatchModal}
+				onClose={() => setShowPatchModal(false)}
+				allowPack={false}
+			/>
 		</div>
 	);
 }

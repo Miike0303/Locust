@@ -44,8 +44,10 @@ class FakeWebSocket {
 
 (globalThis as any).WebSocket = FakeWebSocket;
 
-(globalThis as any).__locustGetWsUrl = async (jobId: string) =>
-	`ws://localhost:7842/api/translate/ws/${jobId}`;
+(globalThis as any).__locustGetWsUrl = async (
+	jobId: string,
+	channel = "translate",
+) => `ws://localhost:7842/api/${channel}/ws/${jobId}`;
 
 registerHooks({
 	load(url, context, nextLoad) {
@@ -53,8 +55,8 @@ registerHooks({
 		if (normalized.endsWith("/src/lib/api.ts")) {
 			return {
 				format: "module",
-				source: `export async function getWsUrl(jobId) {
-          return globalThis.__locustGetWsUrl(jobId);
+				source: `export async function getWsUrl(jobId, channel) {
+          return globalThis.__locustGetWsUrl(jobId, channel ?? "translate");
         }`,
 				shortCircuit: true,
 			};
@@ -73,8 +75,10 @@ assert.equal(JOB_STREAM_LOST_MESSAGE, "ws.jobStreamLost");
 
 function reset() {
 	FakeWebSocket.instances.length = 0;
-	(globalThis as any).__locustGetWsUrl = async (jobId: string) =>
-		`ws://localhost:7842/api/translate/ws/${jobId}`;
+	(globalThis as any).__locustGetWsUrl = async (
+		jobId: string,
+		channel = "translate",
+	) => `ws://localhost:7842/api/${channel}/ws/${jobId}`;
 }
 
 function deferred<T>() {
@@ -192,6 +196,91 @@ async function lastSocket(): Promise<FakeWebSocket> {
 	} finally {
 		console.error = origError;
 	}
+}
+
+// Patch-apply channel: progress/done/error frames, and a drop without a
+// terminal frame still fires onClosed (same hang-fix as translation).
+{
+	reset();
+	const urls: string[] = [];
+	(globalThis as any).__locustGetWsUrl = async (jobId: string, channel?: string) => {
+		const url = `ws://localhost:7842/api/${channel ?? "translate"}/ws/${jobId}`;
+		urls.push(url);
+		return url;
+	};
+
+	const progress: unknown[] = [];
+	let done: unknown = null;
+	let closed = false;
+	subscribeToJob(
+		"patch-job",
+		{
+			onProgress: (e) => progress.push(e),
+			onDone: (e) => {
+				done = e.report;
+			},
+			onClosed: () => {
+				closed = true;
+			},
+		},
+		"patch",
+	);
+	const socket = await lastSocket();
+	assert.equal(urls.at(-1), "ws://localhost:7842/api/patch/ws/patch-job");
+	socket.emitMessage({
+		type: "progress",
+		current: 3,
+		total: 10,
+		path: "Foo.pak",
+		phase: "write",
+	});
+	assert.equal(progress.length, 1);
+	socket.emitMessage({
+		type: "done",
+		report: { patch_id: "p1", patch_version: "1", replaced: 3, added: 0 },
+	});
+	assert.equal((done as { patch_id: string }).patch_id, "p1");
+	socket.emitClose();
+	assert.equal(closed, true);
+}
+
+{
+	reset();
+	let closed = false;
+	let errored = false;
+	subscribeToJob(
+		"patch-drop",
+		{
+			onError: () => {
+				errored = true;
+			},
+			onClosed: () => {
+				closed = true;
+			},
+		},
+		"patch",
+	);
+	const socket = await lastSocket();
+	socket.emitClose();
+	assert.equal(errored, false);
+	assert.equal(closed, true);
+}
+
+{
+	reset();
+	let message = "";
+	subscribeToJob(
+		"patch-err",
+		{
+			onError: (e) => {
+				message = e.message;
+			},
+		},
+		"patch",
+	);
+	const socket = await lastSocket();
+	socket.emitMessage({ type: "error", message: "disk full" });
+	assert.equal(message, "disk full");
 }
 
 console.log("ws.test.ts: ok");

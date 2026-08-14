@@ -1047,6 +1047,107 @@ fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     out
 }
 
+/// Strict-tier zip + a pristine target game (`file_count` replaced files).
+fn make_strict_patch(file_count: usize) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let recorded = tmp.path().join("recorded");
+    let pristine = tmp.path().join("pristine");
+    let target = tmp.path().join("target");
+    std::fs::create_dir_all(recorded.join("data")).unwrap();
+    std::fs::create_dir_all(pristine.join("data")).unwrap();
+    let mut written = Vec::new();
+    for i in 0..file_count {
+        let name = format!("f{i}.txt");
+        std::fs::write(pristine.join("data").join(&name), format!("orig{i}")).unwrap();
+        let rec = recorded.join("data").join(&name);
+        std::fs::write(&rec, format!("xlat{i}")).unwrap();
+        written.push(rec);
+    }
+    let db = locust_core::database::Database::open_in_memory().unwrap();
+    // An injection recording alone is not packable: `pack_injection_recording`
+    // refuses a project with nothing translated, reviewed or approved. Seed one
+    // translated entry per replaced file so the pack has something to claim.
+    let entries: Vec<_> = (0..file_count)
+        .map(|i| {
+            let mut e = locust_core::models::StringEntry::new(
+                format!("f{i}"),
+                format!("orig{i}"),
+                std::path::PathBuf::from(format!("data/f{i}.txt")),
+            );
+            e.translation = Some(format!("xlat{i}"));
+            e.status = locust_core::models::StringStatus::Translated;
+            e
+        })
+        .collect();
+    db.save_entries(&entries).unwrap();
+    db.record_injection(Some("es"), &recorded, &written)
+        .unwrap();
+    let zip = tmp.path().join("p.zip");
+    locust_core::patch::pack_injection_recording(
+        &db,
+        locust_core::patch::PackOptions {
+            game_path: recorded,
+            lang: Some("es".into()),
+            output: zip.clone(),
+            pristine: Some(pristine.clone()),
+            engine: Some("rpgmaker-mv".into()),
+            project: tmp.path().join("proj.locust.db"),
+            require_pristine: true,
+        },
+    )
+    .expect("pack strict fixture");
+    copy_tree(&pristine, &target);
+    (tmp, zip, target)
+}
+
+async fn start_patch_apply_job(base_url: &str, body: &serde_json::Value) -> String {
+    let resp = client()
+        .post(format!("{}/api/patch/apply", base_url))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 202, "apply must return 202 + job_id: {text}");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    v["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("job_id missing: {text}"))
+        .to_string()
+}
+
+async fn collect_patch_ws_frames(base_url: &str, job_id: &str) -> Vec<serde_json::Value> {
+    let ws_url = format!(
+        "{}/api/patch/ws/{}",
+        base_url.replacen("http", "ws", 1),
+        job_id
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .unwrap_or_else(|e| panic!("ws connect {ws_url}: {e}"));
+    let mut frames = Vec::new();
+    let collect = async {
+        use futures_util::StreamExt;
+        while let Some(msg) = ws.next().await {
+            let msg = msg.expect("ws frame");
+            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let term = matches!(v["type"].as_str(), Some("done" | "error"));
+            frames.push(v);
+            if term {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), collect)
+        .await
+        .expect("timed out waiting for patch job frames");
+    frames
+}
+
 /// The four patch endpoints that had no coverage, driven in their real order
 /// against a real packed zip: verify → apply → status → rollback. The game must
 /// come back byte-identical, which is the whole promise of the transaction.
@@ -1189,20 +1290,21 @@ async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
         "verify must not touch the game"
     );
 
-    // apply
-    let ar = client()
-        .post(format!("{}/api/patch/apply", base_url))
-        .json(&paths)
-        .send()
-        .await
-        .unwrap();
-    let as_ = ar.status();
-    let abody = ar.text().await.unwrap();
-    assert_eq!(as_, 200, "apply: {abody}");
-    let ajson: serde_json::Value = serde_json::from_str(&abody).unwrap();
+    // apply — 202 job; report arrives on the patch WebSocket
+    let job_id = start_patch_apply_job(&base_url, &paths).await;
+    let frames = collect_patch_ws_frames(&base_url, &job_id).await;
+    assert!(
+        frames.iter().any(|f| f["type"] == "progress"),
+        "apply job must emit progress: {frames:?}"
+    );
+    let done = frames
+        .iter()
+        .find(|f| f["type"] == "done")
+        .unwrap_or_else(|| panic!("apply job must emit done: {frames:?}"));
+    let ajson = &done["report"];
     assert!(
         ajson["replaced"].as_u64().unwrap_or(0) > 0,
-        "apply should replace files: {abody}"
+        "apply should replace files: {ajson}"
     );
     assert_ne!(
         snapshot_tree(&game),
@@ -1276,23 +1378,187 @@ async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
         "structural patch over existing files must conflict: {lv}"
     );
 
-    let la = client()
-        .post(format!("{}/api/patch/apply", base_url))
-        .json(&loose_paths)
-        .send()
-        .await
-        .unwrap();
-    assert_ne!(
-        la.status(),
-        200,
-        "unforced structural apply must be refused: {}",
-        la.text().await.unwrap()
+    let loose_job = start_patch_apply_job(&base_url, &loose_paths).await;
+    let loose_frames = collect_patch_ws_frames(&base_url, &loose_job).await;
+    assert!(
+        loose_frames.iter().any(|f| f["type"] == "error"),
+        "unforced structural apply must be refused: {loose_frames:?}"
+    );
+    assert!(
+        !loose_frames.iter().any(|f| f["type"] == "done"),
+        "refused apply must not emit done: {loose_frames:?}"
     );
     assert_eq!(
         snapshot_tree(&game),
         before,
         "a refused apply must leave the game untouched"
     );
+}
+
+#[tokio::test]
+async fn test_patch_apply_job_emits_progress_then_done() {
+    let (_tmp, zip, game) = make_strict_patch(2);
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let body = serde_json::json!({
+        "game_path": game.to_string_lossy(),
+        "zip_path": zip.to_string_lossy(),
+    });
+    let job_id = start_patch_apply_job(&base_url, &body).await;
+    let frames = collect_patch_ws_frames(&base_url, &job_id).await;
+    assert!(
+        frames.iter().any(|f| f["type"] == "progress"),
+        "expected at least one progress frame: {frames:?}"
+    );
+    let progress = frames.iter().find(|f| f["type"] == "progress").unwrap();
+    assert!(progress["current"].as_u64().is_some(), "{progress}");
+    assert!(progress["total"].as_u64().unwrap() >= 1, "{progress}");
+    assert!(progress["path"].as_str().is_some(), "{progress}");
+    assert!(progress["phase"].as_str().is_some(), "{progress}");
+    let done = frames
+        .iter()
+        .find(|f| f["type"] == "done")
+        .unwrap_or_else(|| panic!("expected done: {frames:?}"));
+    let report = &done["report"];
+    assert!(report["replaced"].as_u64().unwrap_or(0) >= 1, "{report}");
+    assert!(report.get("patch_id").is_some(), "{report}");
+    assert!(report.get("messages").is_some(), "{report}");
+}
+
+#[tokio::test]
+async fn test_patch_apply_job_error_closes_socket() {
+    let tmp = TempDir::new().unwrap();
+    let game = tmp.path().join("game");
+    std::fs::create_dir_all(&game).unwrap();
+    let zip = tmp.path().join("not-a-patch.zip");
+    std::fs::write(&zip, b"this is not a zip").unwrap();
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let body = serde_json::json!({
+        "game_path": game.to_string_lossy(),
+        "zip_path": zip.to_string_lossy(),
+    });
+    let job_id = start_patch_apply_job(&base_url, &body).await;
+    let frames = collect_patch_ws_frames(&base_url, &job_id).await;
+    let err = frames
+        .iter()
+        .find(|f| f["type"] == "error")
+        .unwrap_or_else(|| panic!("expected error frame: {frames:?}"));
+    assert!(
+        err["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "{err}"
+    );
+    assert!(
+        !frames.iter().any(|f| f["type"] == "done"),
+        "failing apply must not emit done: {frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_patch_apply_cancel_stops_job() {
+    let tmp = TempDir::new().unwrap();
+    let game = tmp.path().join("game");
+    std::fs::create_dir_all(&game).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _server = tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n\
+                      Content-Length: 100000000\r\n\r\n",
+                )
+                .await;
+            loop {
+                if sock.write_all(&[0u8; 32]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    });
+
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let body = serde_json::json!({
+        "game_path": game.to_string_lossy(),
+        "zip_url": format!("http://{addr}/patch.zip"),
+    });
+    let job_id = start_patch_apply_job(&base_url, &body).await;
+
+    let ws_url = format!(
+        "{}/api/patch/ws/{}",
+        base_url.replacen("http", "ws", 1),
+        job_id
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("ws connect before cancel");
+
+    let cancel = client()
+        .post(format!("{}/api/patch/cancel/{}", base_url, job_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), 200, "cancel must find the in-flight job");
+
+    let mut saw_error = false;
+    let wait = async {
+        use futures_util::StreamExt;
+        while let Some(msg) = ws.next().await {
+            let Ok(msg) = msg else { break };
+            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if v["type"] == "error" {
+                saw_error = true;
+                break;
+            }
+            if v["type"] == "done" {
+                panic!("cancelled job must not emit done: {v}");
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .expect("cancelled job must close the socket promptly");
+    assert!(saw_error, "cancelled job must emit an error frame");
+
+    let again = client()
+        .post(format!("{}/api/patch/cancel/{}", base_url, job_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        again.status(),
+        404,
+        "cancelled job is gone like translate cancel"
+    );
+}
+
+#[tokio::test]
+async fn test_patch_verify_stays_synchronous() {
+    let (_tmp, zip, game) = make_strict_patch(1);
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let resp = client()
+        .post(format!("{}/api/patch/verify", base_url))
+        .json(&serde_json::json!({
+            "game_path": game.to_string_lossy(),
+            "zip_path": zip.to_string_lossy(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["outcome"], "Clean", "{v}");
+    assert_eq!(v["tier"], "Strict", "{v}");
 }
 
 #[derive(Deserialize)]

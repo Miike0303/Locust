@@ -11,7 +11,10 @@ use locust_core::models::{OutputMode, StringEntry, StringStatus};
 use locust_core::project;
 use locust_core::translation::TranslationOptions;
 use locust_core::validation::Validator;
-use locust_server::{spawn_translation_job, AppState, ProjectInfo};
+use locust_server::{
+    poll_xai_device_login, spawn_translation_job, start_xai_device_login, AppState, ProjectInfo,
+    XaiAuthPollResponse, XaiAuthStartResponse,
+};
 
 /// Wrapper so we can use Arc<AppState> as Tauri managed state
 pub struct AppStateWrapper(pub Arc<AppState>);
@@ -572,6 +575,23 @@ pub async fn register_lang(params: RegisterLangParams) -> Result<serde_json::Val
     serde_json::to_value(report).map_err(|e| e.to_string())
 }
 
+// ─── xAI device-code login ──────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn xai_auth_start(
+    state: State<'_, AppStateWrapper>,
+) -> Result<XaiAuthStartResponse, String> {
+    start_xai_device_login(&state.0).await
+}
+
+#[tauri::command]
+pub async fn xai_auth_poll(
+    handle: String,
+    state: State<'_, AppStateWrapper>,
+) -> Result<XaiAuthPollResponse, String> {
+    poll_xai_device_login(&state.0, &handle).await
+}
+
 // ─── Config ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -681,5 +701,108 @@ mod tests {
         .unwrap();
         assert_eq!(params.provider_id, "always-error");
         assert_eq!(params.fallback_provider_ids, Some(vec!["mock".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn xai_auth_poll_unknown_handle_is_clean_error() {
+        let state = locust_server::create_test_state();
+        let err = poll_xai_device_login(&state, "missing-handle")
+            .await
+            .expect_err("unknown handle must error");
+        assert!(
+            err.to_lowercase().contains("not found"),
+            "clean error, not a panic/500: {err}"
+        );
+    }
+
+    #[test]
+    fn xai_auth_shapes_match_http_contract() {
+        let start = serde_json::to_value(XaiAuthStartResponse {
+            handle: "h1".into(),
+            user_code: "ABCD".into(),
+            verification_uri: "https://auth.x.ai/device".into(),
+            expires_in_secs: 900,
+        })
+        .unwrap();
+        let obj = start.as_object().unwrap();
+        assert!(obj.contains_key("handle"));
+        assert!(obj.contains_key("user_code"));
+        assert!(obj.contains_key("verification_uri"));
+        assert!(obj.contains_key("expires_in_secs"));
+        assert_eq!(obj.len(), 4);
+
+        for status in [
+            locust_server::XaiAuthStatus::Pending,
+            locust_server::XaiAuthStatus::Complete,
+            locust_server::XaiAuthStatus::Denied,
+            locust_server::XaiAuthStatus::Expired,
+        ] {
+            let v = serde_json::to_value(XaiAuthPollResponse { status }).unwrap();
+            let s = v["status"].as_str().unwrap();
+            assert!(
+                matches!(s, "pending" | "complete" | "denied" | "expired"),
+                "{s}"
+            );
+            assert_eq!(s, s.to_lowercase());
+        }
+    }
+
+    #[tokio::test]
+    async fn xai_auth_poll_respects_interval_without_upstream() {
+        use locust_providers::xai_oauth::DeviceCode;
+        use locust_server::{XaiAuthStatus, XaiPendingAuth};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let state = locust_server::create_test_state();
+        *state.xai_token_url.write().await = Some("http://127.0.0.1:1/oauth2/token".into());
+        let handle = "interval-handle".to_string();
+        state.xai_pending.insert(
+            handle.clone(),
+            XaiPendingAuth {
+                device: Arc::new(DeviceCode::from_parts(
+                    "raw-device-must-not-leak",
+                    "CODE",
+                    "https://auth.x.ai/device",
+                    60,
+                    900,
+                    u64::MAX,
+                )),
+                last_poll: Some(Instant::now()),
+            },
+        );
+        let resp = poll_xai_device_login(&state, &handle).await.unwrap();
+        assert_eq!(resp.status, XaiAuthStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn xai_auth_poll_expired_entry_is_removed() {
+        use locust_providers::xai_oauth::DeviceCode;
+        use locust_server::{XaiAuthStatus, XaiPendingAuth};
+        use std::sync::Arc;
+
+        let state = locust_server::create_test_state();
+        let handle = "expired-handle".to_string();
+        state.xai_pending.insert(
+            handle.clone(),
+            XaiPendingAuth {
+                device: Arc::new(DeviceCode::from_parts(
+                    "raw-device-must-not-leak",
+                    "CODE",
+                    "https://auth.x.ai/device",
+                    5,
+                    1,
+                    1,
+                )),
+                last_poll: None,
+            },
+        );
+        let resp = poll_xai_device_login(&state, &handle).await.unwrap();
+        assert_eq!(resp.status, XaiAuthStatus::Expired);
+        assert!(state.xai_pending.get(&handle).is_none());
+        let err = poll_xai_device_login(&state, &handle)
+            .await
+            .expect_err("consumed handle");
+        assert!(err.to_lowercase().contains("not found"), "{err}");
     }
 }

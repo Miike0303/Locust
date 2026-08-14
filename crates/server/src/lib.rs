@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
@@ -35,10 +36,53 @@ fn err(status: StatusCode, msg: impl ToString) -> ApiError {
     (status, msg.to_string())
 }
 
-/// Per-job state: abort handle + broadcast sender for progress events
+/// Translation vs patch-apply — same `active_jobs` map, different terminal frames.
+#[derive(Clone, Copy)]
+enum JobKind {
+    Translate,
+    Patch,
+}
+
+/// Per-job state: abort handle + broadcast sender for progress events.
+/// Shared by translation and patch-apply (JSON frames, not a second job system).
 pub struct JobState {
     pub abort_handle: AbortHandle,
-    pub progress_tx: broadcast::Sender<ProgressEvent>,
+    pub progress_tx: broadcast::Sender<serde_json::Value>,
+    replay: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    cancel: tokio_util::sync::CancellationToken,
+    kind: JobKind,
+}
+
+fn job_event_is_terminal(v: &serde_json::Value) -> bool {
+    matches!(
+        v.get("type").and_then(|t| t.as_str()),
+        Some("completed" | "failed" | "done" | "error")
+    )
+}
+
+fn publish_job_event(
+    tx: &broadcast::Sender<serde_json::Value>,
+    replay: &std::sync::Mutex<Vec<serde_json::Value>>,
+    event: serde_json::Value,
+) {
+    if let Ok(mut log) = replay.lock() {
+        log.push(event.clone());
+    }
+    let _ = tx.send(event);
+}
+
+fn apply_report_json(report: locust_core::patch::ApplyReport) -> serde_json::Value {
+    serde_json::json!({
+        "patch_id": report.patch_id,
+        "patch_version": report.patch_version,
+        "replaced": report.replaced,
+        "added": report.added,
+        "forced": report.forced,
+        "baseline": format!("{:?}", report.baseline),
+        "dry_run": report.dry_run,
+        "user_edits_overwritten": report.user_edits_overwritten,
+        "messages": report.messages,
+    })
 }
 
 // ─── State ─────────────────────────────────────────────────────────────────
@@ -59,9 +103,21 @@ pub struct AppState {
     pub backup_manager: Arc<BackupManager>,
     pub global_memory: Arc<GlobalMemoryDb>,
     pub active_jobs: Arc<DashMap<String, JobState>>,
+    /// In-flight xAI device-code grants, keyed by an opaque uuid handle.
+    pub xai_pending: Arc<DashMap<String, XaiPendingAuth>>,
+    /// Test override for the device-code endpoint. `None` uses production.
+    pub xai_device_code_url: Arc<RwLock<Option<String>>>,
+    /// Test override for the token endpoint. `None` uses production.
+    pub xai_token_url: Arc<RwLock<Option<String>>>,
     pub current_project: Arc<RwLock<Option<ProjectInfo>>>,
     /// Temp directory to clean up on drop (only set for test states)
     temp_backup_dir: Option<PathBuf>,
+}
+
+/// One in-flight xAI device login. The map key is never the raw `device_code`.
+pub struct XaiPendingAuth {
+    pub device: Arc<locust_providers::xai_oauth::DeviceCode>,
+    pub last_poll: Option<Instant>,
 }
 
 impl Drop for AppState {
@@ -105,6 +161,9 @@ pub fn create_app_state() -> Arc<AppState> {
         backup_manager: Arc::new(BackupManager::new(backup_root)),
         global_memory: Arc::new(global_memory),
         active_jobs: Arc::new(DashMap::new()),
+        xai_pending: Arc::new(DashMap::new()),
+        xai_device_code_url: Arc::new(RwLock::new(None)),
+        xai_token_url: Arc::new(RwLock::new(None)),
         current_project: Arc::new(RwLock::new(None)),
         temp_backup_dir: None,
     })
@@ -138,6 +197,9 @@ fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
         backup_manager: Arc::new(BackupManager::new(backup_root.clone())),
         global_memory: Arc::new(GlobalMemoryDb::open_in_memory().unwrap()),
         active_jobs: Arc::new(DashMap::new()),
+        xai_pending: Arc::new(DashMap::new()),
+        xai_device_code_url: Arc::new(RwLock::new(None)),
+        xai_token_url: Arc::new(RwLock::new(None)),
         current_project: Arc::new(RwLock::new(None)),
         temp_backup_dir: Some(backup_root),
     })
@@ -167,6 +229,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/register-lang", post(register_lang))
         .route("/api/patch/verify", post(patch_verify))
         .route("/api/patch/apply", post(patch_apply))
+        .route("/api/patch/cancel/:job_id", post(patch_cancel))
+        .route("/api/patch/ws/:job_id", get(patch_ws))
         .route("/api/patch/rollback", post(patch_rollback))
         .route("/api/patch/status", post(patch_status))
         .route("/api/patch/pack", post(patch_pack))
@@ -177,6 +241,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/import/po", post(import_po))
         .route("/api/export/xliff", get(export_xliff))
         .route("/api/import/xliff", post(import_xliff))
+        .route("/api/auth/xai/start", post(auth_xai_start))
+        .route("/api/auth/xai/poll", post(auth_xai_poll))
         .route("/api/config", get(get_config).patch(patch_config))
         .route("/api/memory/stats", get(memory_stats))
         .route("/api/memory", get(list_memory).delete(clear_memory))
@@ -596,12 +662,14 @@ pub async fn spawn_translation_job(
 
     let job_id = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1000);
-    let (broadcast_tx, _) = broadcast::channel::<ProgressEvent>(1000);
+    let (broadcast_tx, _) = broadcast::channel::<serde_json::Value>(1000);
     let broadcast_tx_clone = broadcast_tx.clone();
 
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel.clone();
     let job_id_clone = job_id.clone();
+    let replay = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let replay_bridge = replay.clone();
 
     // Bridge mpsc → broadcast so WebSocket clients can subscribe.
     // ProviderSwitched is non-terminal; only Completed / Failed end the stream.
@@ -613,7 +681,8 @@ pub async fn spawn_translation_job(
                 event,
                 ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. }
             );
-            let _ = broadcast_tx_clone.send(event);
+            let json = serde_json::to_value(&event).unwrap_or_default();
+            publish_job_event(&broadcast_tx_clone, &replay_bridge, json);
             if is_terminal {
                 break;
             }
@@ -629,6 +698,9 @@ pub async fn spawn_translation_job(
         JobState {
             abort_handle: tokio::spawn(async {}).abort_handle(), // placeholder
             progress_tx: broadcast_tx,
+            replay,
+            cancel,
+            kind: JobKind::Translate,
         },
     );
 
@@ -678,7 +750,29 @@ async fn translate_cancel(
     State(state): State<Arc<AppState>>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    if let Some((_, job)) = state.active_jobs.remove(&job_id) {
+    cancel_job(&state, &job_id)
+}
+
+fn cancel_job(state: &AppState, job_id: &str) -> Result<StatusCode, ApiError> {
+    if let Some(job) = state.active_jobs.get(job_id) {
+        let already_done = job
+            .replay
+            .lock()
+            .map(|log| log.iter().any(job_event_is_terminal))
+            .unwrap_or(false);
+        if already_done {
+            return Ok(StatusCode::OK);
+        }
+    }
+    if let Some((_, job)) = state.active_jobs.remove(job_id) {
+        let terminal = match job.kind {
+            JobKind::Translate => {
+                serde_json::json!({"type": "failed", "entry_id": null, "error": "cancelled"})
+            }
+            JobKind::Patch => serde_json::json!({"type": "error", "message": "cancelled"}),
+        };
+        let _ = job.progress_tx.send(terminal);
+        job.cancel.cancel();
         job.abort_handle.abort();
         Ok(StatusCode::OK)
     } else {
@@ -691,42 +785,93 @@ async fn translate_ws(
     AxumPath(job_id): AxumPath<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    upgrade_job_ws(
+        state,
+        job_id,
+        ws,
+        serde_json::json!({"type": "failed", "error": "job not found"}),
+    )
+    .await
+}
+
+async fn patch_ws(
+    State(state): State<Arc<AppState>>,
+    AxumPath(job_id): AxumPath<String>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    upgrade_job_ws(
+        state,
+        job_id,
+        ws,
+        serde_json::json!({"type": "error", "message": "job not found"}),
+    )
+    .await
+}
+
+async fn patch_cancel(
+    State(state): State<Arc<AppState>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    cancel_job(&state, &job_id)
+}
+
+async fn upgrade_job_ws(
+    state: Arc<AppState>,
+    job_id: String,
+    ws: WebSocketUpgrade,
+    not_found: serde_json::Value,
+) -> impl IntoResponse {
     // Retry briefly to handle race condition where WS connects before job insert completes
-    let mut rx = None;
+    let mut found = None;
     for _ in 0..20 {
         if let Some(job) = state.active_jobs.get(&job_id) {
-            rx = Some(job.progress_tx.subscribe());
+            let rx = job.progress_tx.subscribe();
+            let replay = job.replay.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            found = Some((rx, replay));
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    ws.on_upgrade(move |socket| handle_translate_ws(socket, rx))
+    ws.on_upgrade(move |socket| handle_job_ws(socket, found, not_found))
 }
 
-async fn handle_translate_ws(
+async fn handle_job_ws(
     mut socket: WebSocket,
-    rx: Option<broadcast::Receiver<ProgressEvent>>,
+    found: Option<(
+        broadcast::Receiver<serde_json::Value>,
+        Vec<serde_json::Value>,
+    )>,
+    not_found: serde_json::Value,
 ) {
-    let Some(mut rx) = rx else {
-        let _ = socket
-            .send(Message::Text(
-                serde_json::json!({"type": "failed", "error": "job not found"}).to_string(),
-            ))
-            .await;
+    let Some((mut rx, replay)) = found else {
+        let _ = socket.send(Message::Text(not_found.to_string())).await;
         let _ = socket.close().await;
         return;
     };
 
+    let mut seen = std::collections::HashSet::new();
+    for event in replay {
+        let key = event.to_string();
+        seen.insert(key);
+        if socket.send(Message::Text(event.to_string())).await.is_err() {
+            let _ = socket.close().await;
+            return;
+        }
+        if job_event_is_terminal(&event) {
+            let _ = socket.close().await;
+            return;
+        }
+    }
+
     loop {
         match rx.recv().await {
             Ok(event) => {
-                let is_terminal = matches!(
-                    event,
-                    ProgressEvent::Completed { .. } | ProgressEvent::Failed { .. }
-                );
-                let json = serde_json::to_string(&event).unwrap_or_default();
-                if socket.send(Message::Text(json)).await.is_err() {
+                if !seen.insert(event.to_string()) {
+                    continue;
+                }
+                let is_terminal = job_event_is_terminal(&event);
+                if socket.send(Message::Text(event.to_string())).await.is_err() {
                     break;
                 }
                 if is_terminal {
@@ -903,6 +1048,14 @@ async fn resolve_patch_zip(
     zip_path: Option<String>,
     zip_url: Option<String>,
 ) -> Result<(PathBuf, Option<tempfile::TempDir>), ApiError> {
+    resolve_patch_zip_cancellable(zip_path, zip_url, None).await
+}
+
+async fn resolve_patch_zip_cancellable(
+    zip_path: Option<String>,
+    zip_url: Option<String>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<(PathBuf, Option<tempfile::TempDir>), ApiError> {
     match (zip_path, zip_url) {
         (Some(p), None) => {
             let path = PathBuf::from(p);
@@ -918,7 +1071,7 @@ async fn resolve_patch_zip(
             let dir =
                 tempfile::TempDir::new().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             let dest = dir.path().join("locust-patch.zip");
-            download_patch_zip_async(&url, &dest).await?;
+            download_patch_zip_async(&url, &dest, cancel).await?;
             Ok((dest, Some(dir)))
         }
         (Some(_), Some(_)) => Err(err(
@@ -929,7 +1082,11 @@ async fn resolve_patch_zip(
     }
 }
 
-async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError> {
+async fn download_patch_zip_async(
+    url: &str,
+    dest: &Path,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<(), ApiError> {
     let max_bytes = locust_core::patch::zipsec::max_download_bytes();
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid zip_url: {e}")))?;
@@ -975,10 +1132,24 @@ async fn download_patch_zip_async(url: &str, dest: &Path) -> Result<(), ApiError
         std::fs::File::create(dest).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let mut written: u64 = 0;
     loop {
-        let chunk = resp
-            .chunk()
-            .await
-            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download body: {e}")))?;
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            drop(file);
+            let _ = std::fs::remove_file(dest);
+            return Err(err(StatusCode::BAD_REQUEST, "cancelled"));
+        }
+        let chunk = if let Some(c) = cancel {
+            tokio::select! {
+                _ = c.cancelled() => {
+                    drop(file);
+                    let _ = std::fs::remove_file(dest);
+                    return Err(err(StatusCode::BAD_REQUEST, "cancelled"));
+                }
+                chunk = resp.chunk() => chunk,
+            }
+        } else {
+            resp.chunk().await
+        }
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download body: {e}")))?;
         let Some(chunk) = chunk else { break };
         written += chunk.len() as u64;
         if written > max_bytes {
@@ -1097,32 +1268,190 @@ async fn patch_verify(
 }
 
 async fn patch_apply(
+    State(state): State<Arc<AppState>>,
     Json(req): Json<PatchPathsRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let (zip, _guard) = resolve_patch_zip(req.zip_path, req.zip_url).await?;
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    match (&req.zip_path, &req.zip_url) {
+        (Some(_), Some(_)) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "pass either zip_path or zip_url, not both",
+            ));
+        }
+        (None, None) => {
+            return Err(err(StatusCode::BAD_REQUEST, "zip_path or zip_url required"));
+        }
+        (Some(p), None) if !Path::new(p).is_file() => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("zip_path not found: {p}"),
+            ));
+        }
+        _ => {}
+    }
+
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let (broadcast_tx, _) = broadcast::channel::<serde_json::Value>(1000);
+    let replay = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    state.active_jobs.insert(
+        job_id.clone(),
+        JobState {
+            abort_handle: tokio::spawn(async {}).abort_handle(),
+            progress_tx: broadcast_tx.clone(),
+            replay: replay.clone(),
+            cancel: cancel.clone(),
+            kind: JobKind::Patch,
+        },
+    );
+
+    let jobs = state.active_jobs.clone();
+    let cleanup_job_id = job_id.clone();
+    let worker_tx = broadcast_tx;
+    let worker_replay = replay;
+    let worker_cancel = cancel;
+    let handle = tokio::spawn(async move {
+        run_patch_apply_job(req, worker_tx, worker_replay, worker_cancel).await;
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        jobs.remove(&cleanup_job_id);
+    });
+
+    if let Some(mut job) = state.active_jobs.get_mut(&job_id) {
+        job.abort_handle = handle.abort_handle();
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_id": job_id })),
+    ))
+}
+
+async fn run_patch_apply_job(
+    req: PatchPathsRequest,
+    broadcast_tx: broadcast::Sender<serde_json::Value>,
+    replay: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let publish = |event: serde_json::Value| publish_job_event(&broadcast_tx, &replay, event);
+
+    if cancel.is_cancelled() {
+        publish(serde_json::json!({"type": "error", "message": "cancelled"}));
+        return;
+    }
+
+    let (zip, guard) =
+        match resolve_patch_zip_cancellable(req.zip_path, req.zip_url, Some(&cancel)).await {
+            Ok(v) => v,
+            Err((_, msg)) => {
+                if cancel.is_cancelled() || msg == "cancelled" {
+                    publish(serde_json::json!({"type": "error", "message": "cancelled"}));
+                } else {
+                    publish(serde_json::json!({"type": "error", "message": msg}));
+                }
+                return;
+            }
+        };
+
+    if cancel.is_cancelled() {
+        publish(serde_json::json!({"type": "error", "message": "cancelled"}));
+        return;
+    }
+
     let opts = locust_core::patch::ApplyOptions {
         force: req.force,
         confirm_legacy: req.confirm_legacy,
         dry_run: req.dry_run,
     };
-    // Apply is disk-bound and journaled; run off the async runtime.
     let game = PathBuf::from(&req.game_path);
-    let report =
-        tokio::task::spawn_blocking(move || locust_core::patch::apply(&game, &zip, opts, |_| {}))
-            .await
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-            .map_err(map_patch_err)?;
-    Ok(Json(serde_json::json!({
-        "patch_id": report.patch_id,
-        "patch_version": report.patch_version,
-        "replaced": report.replaced,
-        "added": report.added,
-        "forced": report.forced,
-        "baseline": format!("{:?}", report.baseline),
-        "dry_run": report.dry_run,
-        "user_edits_overwritten": report.user_edits_overwritten,
-        "messages": report.messages,
-    })))
+    let (progress_tx, progress_rx) =
+        tokio::sync::mpsc::channel::<locust_core::patch::PatchProgress>(1);
+    let apply_cancel = cancel.clone();
+
+    let apply_task = tokio::task::spawn_blocking(move || {
+        locust_core::patch::apply(&game, &zip, opts, |p| {
+            // apply has no cancel hook — fail the send / unwind so the blocking
+            // call stops instead of finishing the write loop after cancel.
+            if apply_cancel.is_cancelled() || progress_tx.blocking_send(p).is_err() {
+                panic!("patch apply cancelled");
+            }
+        })
+    });
+    tokio::pin!(apply_task);
+    let mut progress_rx = Some(progress_rx);
+
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // Drop the receiver so the next blocking_send fails and apply unwinds.
+                progress_rx.take();
+                let _ = apply_task.await;
+                break Err("cancelled".to_string());
+            }
+            ev = async {
+                match progress_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => None,
+                }
+            } => {
+                match ev {
+                    Some(p) => {
+                        publish(serde_json::json!({
+                            "type": "progress",
+                            "current": p.current as u64,
+                            "total": p.total as u64,
+                            "path": p.path,
+                            "phase": p.phase,
+                        }));
+                    }
+                    None => {
+                        break match apply_task.await {
+                            Ok(Ok(report)) => Ok(apply_report_json(report)),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(e) if e.is_cancelled() || cancel.is_cancelled() => {
+                                Err("cancelled".into())
+                            }
+                            Err(e) => Err(format!("apply task failed: {e}")),
+                        };
+                    }
+                }
+            }
+            result = &mut apply_task => {
+                break match result {
+                    Ok(Ok(report)) => {
+                        if let Some(rx) = progress_rx.as_mut() {
+                            while let Ok(p) = rx.try_recv() {
+                                publish(serde_json::json!({
+                                    "type": "progress",
+                                    "current": p.current as u64,
+                                    "total": p.total as u64,
+                                    "path": p.path,
+                                    "phase": p.phase,
+                                }));
+                            }
+                        }
+                        Ok(apply_report_json(report))
+                    }
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(e) if e.is_cancelled() || cancel.is_cancelled() => Err("cancelled".into()),
+                    Err(e) => Err(format!("apply task failed: {e}")),
+                };
+            }
+        }
+    };
+
+    drop(guard);
+
+    if cancel.is_cancelled() {
+        publish(serde_json::json!({"type": "error", "message": "cancelled"}));
+        return;
+    }
+
+    match outcome {
+        Ok(report) => publish(serde_json::json!({"type": "done", "report": report})),
+        Err(message) => publish(serde_json::json!({"type": "error", "message": message})),
+    }
 }
 
 async fn patch_rollback(
@@ -1416,7 +1745,164 @@ async fn patch_config(
         serde_json::from_value(current.clone()).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     // Persist to disk
     let _ = config.save(&AppConfig::default_path());
+    drop(config);
+    rebuild_provider_registry(&state).await;
     Ok(Json(current))
+}
+
+/// Rebuild the in-process provider registry from the current config.
+/// Shared by `PATCH /api/config` and xAI device-login completion so
+/// `grok-sub` appears without restarting the process.
+pub async fn rebuild_provider_registry(state: &AppState) {
+    let config = state.config.read().await;
+    *state.provider_registry.write().await = locust_providers::default_registry(&config);
+}
+
+// ─── xAI device-code login ─────────────────────────────────────────────────
+
+const XAI_HANDLE_NOT_FOUND: &str = "handle not found";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XaiAuthStartResponse {
+    pub handle: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum XaiAuthStatus {
+    Pending,
+    Complete,
+    Denied,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XaiAuthPollResponse {
+    pub status: XaiAuthStatus,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct XaiAuthPollRequest {
+    pub handle: String,
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn sweep_expired_xai_pending(state: &AppState) {
+    let now = unix_now_secs();
+    state
+        .xai_pending
+        .retain(|_, session| session.device.expires_at >= now);
+}
+
+/// Start an xAI device-code grant. Shared by HTTP and the Tauri command.
+pub async fn start_xai_device_login(state: &AppState) -> Result<XaiAuthStartResponse, String> {
+    sweep_expired_xai_pending(state);
+    let device = match state.xai_device_code_url.read().await.as_ref() {
+        Some(url) => locust_providers::xai_oauth::request_device_code_at(url).await,
+        None => locust_providers::xai_oauth::request_device_code().await,
+    }
+    .map_err(|e| e.to_string())?;
+
+    let handle = uuid::Uuid::new_v4().to_string();
+    let response = XaiAuthStartResponse {
+        handle: handle.clone(),
+        user_code: device.user_code.clone(),
+        verification_uri: device.verification_uri.clone(),
+        expires_in_secs: device.expires_in,
+    };
+    state.xai_pending.insert(
+        handle,
+        XaiPendingAuth {
+            device: Arc::new(device),
+            last_poll: None,
+        },
+    );
+    Ok(response)
+}
+
+/// Poll an in-flight xAI grant. Shared by HTTP and the Tauri command.
+pub async fn poll_xai_device_login(
+    state: &AppState,
+    handle: &str,
+) -> Result<XaiAuthPollResponse, String> {
+    if handle.is_empty() {
+        return Err(XAI_HANDLE_NOT_FOUND.into());
+    }
+
+    let device = {
+        let Some(mut session) = state.xai_pending.get_mut(handle) else {
+            return Err(XAI_HANDLE_NOT_FOUND.into());
+        };
+        if unix_now_secs() > session.device.expires_at {
+            drop(session);
+            state.xai_pending.remove(handle);
+            return Ok(XaiAuthPollResponse {
+                status: XaiAuthStatus::Expired,
+            });
+        }
+        if let Some(last) = session.last_poll {
+            if last.elapsed() < Duration::from_secs(session.device.interval()) {
+                return Ok(XaiAuthPollResponse {
+                    status: XaiAuthStatus::Pending,
+                });
+            }
+        }
+        session.last_poll = Some(Instant::now());
+        session.device.clone()
+    };
+
+    let outcome = match state.xai_token_url.read().await.as_ref() {
+        Some(url) => locust_providers::xai_oauth::poll_for_token_at(url, &device).await,
+        None => locust_providers::xai_oauth::poll_for_token(&device).await,
+    }
+    .map_err(|e| e.to_string())?;
+
+    let status = match outcome {
+        locust_providers::xai_oauth::PollOutcome::Pending => XaiAuthStatus::Pending,
+        locust_providers::xai_oauth::PollOutcome::Complete(_) => {
+            state.xai_pending.remove(handle);
+            rebuild_provider_registry(state).await;
+            XaiAuthStatus::Complete
+        }
+        locust_providers::xai_oauth::PollOutcome::Denied => {
+            state.xai_pending.remove(handle);
+            XaiAuthStatus::Denied
+        }
+        locust_providers::xai_oauth::PollOutcome::Expired => {
+            state.xai_pending.remove(handle);
+            XaiAuthStatus::Expired
+        }
+    };
+    Ok(XaiAuthPollResponse { status })
+}
+
+async fn auth_xai_start(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<XaiAuthStartResponse>, ApiError> {
+    start_xai_device_login(&state)
+        .await
+        .map(Json)
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, e))
+}
+
+async fn auth_xai_poll(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<XaiAuthPollRequest>,
+) -> Result<Json<XaiAuthPollResponse>, ApiError> {
+    match poll_xai_device_login(&state, &req.handle).await {
+        Ok(body) => Ok(Json(body)),
+        Err(e) if e == XAI_HANDLE_NOT_FOUND => Err(err(StatusCode::NOT_FOUND, e)),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, e)),
+    }
 }
 
 async fn memory_stats(
@@ -1582,7 +2068,7 @@ mod download_guard_tests {
     async fn download_rejects_non_http_scheme() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("p.zip");
-        let e = download_patch_zip_async("file:///C:/Windows/win.ini", &dest)
+        let e = download_patch_zip_async("file:///C:/Windows/win.ini", &dest, None)
             .await
             .expect_err("file:// must be rejected");
         assert!(format!("{e:?}").contains("http"), "{e:?}");
@@ -1604,7 +2090,7 @@ mod download_guard_tests {
 
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            download_patch_zip_async(&url, &dest),
+            download_patch_zip_async(&url, &dest, None),
         )
         .await;
         std::env::remove_var(locust_core::patch::zipsec::MAX_DOWNLOAD_ENV);
@@ -1620,7 +2106,7 @@ mod download_guard_tests {
         let url = serve_chunked(0).await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("p.zip");
-        let e = download_patch_zip_async(&url, &dest)
+        let e = download_patch_zip_async(&url, &dest, None)
             .await
             .expect_err("empty body must be rejected");
         assert!(format!("{e:?}").contains("empty"), "{e:?}");
@@ -2136,5 +2622,288 @@ mod tests {
         // CorsLayer::permissive() adds the header on actual CORS requests
         // but for same-origin it may not. Check the server responds OK.
         assert_eq!(resp.status(), 200);
+    }
+}
+
+#[cfg(test)]
+mod xai_auth_tests {
+    use super::*;
+    use httpmock::prelude::*;
+    use locust_providers::xai_oauth::{set_token_path_override, token_store_test_lock, DeviceCode};
+
+    fn assert_no_secrets(body: &serde_json::Value) {
+        let dumped = body.to_string();
+        assert!(
+            !dumped.contains("device_code"),
+            "must not echo device_code: {dumped}"
+        );
+        assert!(
+            !dumped.contains("access_token"),
+            "must not echo access_token: {dumped}"
+        );
+        assert!(
+            !dumped.contains("refresh_token"),
+            "must not echo refresh_token: {dumped}"
+        );
+    }
+
+    fn mock_device_payload() -> serde_json::Value {
+        serde_json::json!({
+            "device_code": "dev-abc-must-not-leak",
+            "user_code": "WDJB-MJHT",
+            "verification_uri": "https://auth.x.ai/device",
+            "verification_uri_complete": "https://auth.x.ai/device?user_code=WDJB-MJHT",
+            "interval": 5,
+            "expires_in": 900
+        })
+    }
+
+    async fn state_pointing_at(mock: &MockServer) -> Arc<AppState> {
+        let state = create_test_state();
+        *state.xai_device_code_url.write().await =
+            Some(format!("{}/oauth2/device/code", mock.base_url()));
+        *state.xai_token_url.write().await = Some(format!("{}/oauth2/token", mock.base_url()));
+        state
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    #[tokio::test]
+    async fn start_returns_handle_user_code_and_verification_uri() {
+        let mock = MockServer::start();
+        mock.mock(|when, then| {
+            when.method(POST).path("/oauth2/device/code");
+            then.status(200).json_body(mock_device_payload());
+        });
+        let state = state_pointing_at(&mock).await;
+        let (url, _h) = start_test_server(state).await;
+
+        let resp = client()
+            .post(format!("{}/api/auth/xai/start", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_no_secrets(&body);
+        let handle = body["handle"].as_str().expect("handle");
+        assert!(!handle.is_empty());
+        assert_ne!(handle, "dev-abc-must-not-leak");
+        assert_eq!(body["user_code"], "WDJB-MJHT");
+        assert_eq!(
+            body["verification_uri"],
+            "https://auth.x.ai/device?user_code=WDJB-MJHT"
+        );
+        assert_eq!(body["expires_in_secs"], 900);
+    }
+
+    #[tokio::test]
+    async fn poll_unknown_handle_is_404() {
+        let state = create_test_state();
+        let (url, _h) = start_test_server(state).await;
+        let resp = client()
+            .post(format!("{}/api/auth/xai/poll", url))
+            .json(&serde_json::json!({"handle": "no-such-handle"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{}", resp.status());
+        assert_ne!(resp.status(), 500);
+        let text = resp.text().await.unwrap();
+        assert!(
+            text.to_lowercase().contains("not found"),
+            "clean error body: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_faster_than_interval_short_circuits_without_upstream() {
+        let mock = MockServer::start();
+        mock.mock(|when, then| {
+            when.method(POST).path("/oauth2/device/code");
+            then.status(200).json_body(mock_device_payload());
+        });
+        let token = mock.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth2/token")
+                .body_contains("device_code=dev-abc-must-not-leak");
+            then.status(400)
+                .json_body(serde_json::json!({"error": "authorization_pending"}));
+        });
+        let state = state_pointing_at(&mock).await;
+        let (url, _h) = start_test_server(state).await;
+
+        let start: serde_json::Value = client()
+            .post(format!("{}/api/auth/xai/start", url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let handle = start["handle"].as_str().unwrap();
+
+        let first = client()
+            .post(format!("{}/api/auth/xai/poll", url))
+            .json(&serde_json::json!({"handle": handle}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 200);
+        let first_body: serde_json::Value = first.json().await.unwrap();
+        assert_eq!(first_body["status"], "pending");
+        assert_eq!(token.hits(), 1);
+
+        let second = client()
+            .post(format!("{}/api/auth/xai/poll", url))
+            .json(&serde_json::json!({"handle": handle}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 200);
+        let second_body: serde_json::Value = second.json().await.unwrap();
+        assert_eq!(second_body["status"], "pending");
+        assert_eq!(
+            token.hits(),
+            1,
+            "second poll must not hit the token endpoint"
+        );
+        assert_no_secrets(&second_body);
+    }
+
+    #[tokio::test]
+    async fn expired_entry_reports_expired_and_is_removed() {
+        let state = create_test_state();
+        let handle = uuid::Uuid::new_v4().to_string();
+        state.xai_pending.insert(
+            handle.clone(),
+            XaiPendingAuth {
+                device: Arc::new(DeviceCode::from_parts(
+                    "raw-device-must-not-leak",
+                    "ABCD-EFGH",
+                    "https://auth.x.ai/device",
+                    5,
+                    1,
+                    1,
+                )),
+                last_poll: None,
+            },
+        );
+        let (url, _h) = start_test_server(state.clone()).await;
+
+        let resp = client()
+            .post(format!("{}/api/auth/xai/poll", url))
+            .json(&serde_json::json!({"handle": handle}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "expired");
+        assert_no_secrets(&body);
+        assert!(
+            state.xai_pending.get(&handle).is_none(),
+            "expired handle must be dropped"
+        );
+
+        let again = client()
+            .post(format!("{}/api/auth/xai/poll", url))
+            .json(&serde_json::json!({"handle": handle}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 404);
+    }
+
+    // The guard must span the whole test: it serializes the tests that swap the
+    // on-disk token file, and `cargo test` runs them on parallel threads. Each
+    // `#[tokio::test]` gets its own current-thread runtime, so no other task in
+    // this runtime can be waiting on the same lock — the deadlock this lint
+    // guards against cannot happen here.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn complete_rebuilds_registry_with_grok_sub() {
+        let _lock = token_store_test_lock();
+        let token_file = std::env::temp_dir().join(format!(
+            "locust_xai_http_test_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        struct TokenPathGuard(std::path::PathBuf);
+        impl Drop for TokenPathGuard {
+            fn drop(&mut self) {
+                set_token_path_override(None);
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        set_token_path_override(Some(token_file.clone()));
+        let _guard = TokenPathGuard(token_file);
+
+        let mock = MockServer::start();
+        mock.mock(|when, then| {
+            when.method(POST).path("/oauth2/device/code");
+            then.status(200).json_body(mock_device_payload());
+        });
+        mock.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth2/token")
+                .body_contains("device_code=dev-abc-must-not-leak");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "access-xyz-must-not-leak",
+                "refresh_token": "refresh-secret-must-not-leak",
+                "expires_in": 3600
+            }));
+        });
+
+        let state = state_pointing_at(&mock).await;
+        rebuild_provider_registry(&state).await;
+        {
+            let reg = state.provider_registry.read().await;
+            let list = locust_providers::list_providers_for_api(&reg);
+            assert!(
+                list.iter().all(|p| p.id != "grok-sub"),
+                "grok-sub must be absent before login"
+            );
+        }
+
+        let (url, _h) = start_test_server(state.clone()).await;
+        let start: serde_json::Value = client()
+            .post(format!("{}/api/auth/xai/start", url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let handle = start["handle"].as_str().unwrap().to_string();
+
+        let poll = client()
+            .post(format!("{}/api/auth/xai/poll", url))
+            .json(&serde_json::json!({"handle": handle}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), 200);
+        let body: serde_json::Value = poll.json().await.unwrap();
+        assert_eq!(body["status"], "complete");
+        assert_no_secrets(&body);
+        assert!(state.xai_pending.get(&handle).is_none());
+
+        let providers = client()
+            .get(format!("{}/api/providers", url))
+            .send()
+            .await
+            .unwrap()
+            .json::<Vec<serde_json::Value>>()
+            .await
+            .unwrap();
+        assert!(
+            providers.iter().any(|p| p["id"] == "grok-sub"),
+            "grok-sub must be registered after complete: {providers:?}"
+        );
     }
 }

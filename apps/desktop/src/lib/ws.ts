@@ -1,4 +1,4 @@
-import { getWsUrl } from "./api";
+import { getWsUrl, type WsChannel } from "./api";
 import type {
   ProgressEventStarted,
   ProgressEventBatchCompleted,
@@ -6,6 +6,9 @@ import type {
   ProgressEventCompleted,
   ProgressEventFailed,
   ProgressEventProviderSwitched,
+  PatchProgressEvent,
+  PatchDoneEvent,
+  PatchErrorEvent,
 } from "./api";
 
 interface JobHandlers {
@@ -16,6 +19,10 @@ interface JobHandlers {
   onFailed?: (e: ProgressEventFailed) => void;
   onPaused?: () => void;
   onProviderSwitched?: (e: ProgressEventProviderSwitched) => void;
+  /** Patch-apply job frames (`GET /api/patch/ws/:job_id`). */
+  onProgress?: (e: PatchProgressEvent) => void;
+  onDone?: (e: PatchDoneEvent) => void;
+  onError?: (e: PatchErrorEvent) => void;
   /** Socket closed (server ended the stream or unsubscribe was called). */
   onClosed?: () => void;
 }
@@ -46,11 +53,15 @@ export function waitForJob(jobId: string, opts?: WaitOptions): Promise<void> {
   });
 }
 
-export function subscribeToJob(jobId: string, handlers: JobHandlers): () => void {
+export function subscribeToJob(
+  jobId: string,
+  handlers: JobHandlers,
+  channel: WsChannel = "translate",
+): () => void {
   let ws: WebSocket | null = null;
   let cancelled = false;
 
-  getWsUrl(jobId)
+  getWsUrl(jobId, channel)
     .then((url) => {
       ws = new WebSocket(url);
       if (cancelled) {
@@ -83,6 +94,15 @@ export function subscribeToJob(jobId: string, handlers: JobHandlers): () => void
               break;
             case "provider_switched":
               handlers.onProviderSwitched?.(data);
+              break;
+            case "progress":
+              handlers.onProgress?.(data);
+              break;
+            case "done":
+              handlers.onDone?.(data);
+              break;
+            case "error":
+              handlers.onError?.(data);
               break;
           }
         } catch (err) {

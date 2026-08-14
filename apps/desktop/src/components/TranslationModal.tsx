@@ -6,13 +6,15 @@ import {
 	getProviders,
 	getConfig,
 	startTranslation,
-	cancelTranslation,
 	checkProviderHealth,
 } from "../lib/api";
+import { translationModalStep } from "../lib/translationJob";
 import {
-	JOB_STREAM_LOST_MESSAGE,
-	subscribeToJob,
-} from "../lib/ws";
+	attachTranslationJob,
+	clearTranslationSnapshotIfIdle,
+	requestTranslationCancel,
+	setTranslationModalOpen,
+} from "../lib/translationJobSession";
 import {
 	resolveTranslationDefaults,
 	coerceProviderId,
@@ -21,7 +23,6 @@ import {
 } from "../lib/translationDefaults";
 import { LANGUAGES } from "../lib/languages";
 import { useEditorStore } from "../stores/editorStore";
-import { useQueueStore } from "../stores/queueStore";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -70,7 +71,7 @@ export default function TranslationModal({
 		queryFn: getConfig,
 		enabled: open,
 	});
-	const { setJob, setTranslating } = useEditorStore();
+	const { isTranslating, jobSnapshot } = useEditorStore();
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open,
 		ownEscape: false,
@@ -99,45 +100,13 @@ export default function TranslationModal({
 	const [useMemory, setUseMemory] = useState(true);
 
 	// Progress state
-	const [step, setStep] = useState<"configure" | "progress">("configure");
-	const [completed, setCompleted] = useState(0);
-	const [total, setTotal] = useState(0);
-	const [costSoFar, setCostSoFar] = useState(0);
-	const [lastTranslated, setLastTranslated] = useState("");
-	const [activeProviderLabel, setActiveProviderLabel] = useState("");
-	const [done, setDone] = useState(false);
-	const [cancelled, setCancelled] = useState(false);
-	const [cancelling, setCancelling] = useState(false);
-	const [error, setError] = useState<string | null>(null);
 	const [testingHealth, setTestingHealth] = useState(false);
 	const [healthResult, setHealthResult] = useState<{
 		ok: boolean;
 		message: string;
 	} | null>(null);
 
-	// Live job bookkeeping (refs so WS callbacks see current values)
-	const unsubRef = useRef<(() => void) | null>(null);
-	const jobIdRef = useRef<string | null>(null);
-	const finishedRef = useRef(false);
-	const cancelRequestedRef = useRef(false);
-
-	useEffect(() => {
-		if (open) {
-			setStep("configure");
-			setCompleted(0);
-			setTotal(0);
-			setCostSoFar(0);
-			setDone(false);
-			setCancelled(false);
-			setCancelling(false);
-			setError(null);
-			setLastTranslated("");
-			setActiveProviderLabel("");
-			jobIdRef.current = null;
-			finishedRef.current = false;
-			cancelRequestedRef.current = false;
-		}
-	}, [open]);
+	const [startError, setStartError] = useState<string | null>(null);
 
 	// Apply resolved defaults (last-used > Settings config > fallbacks) once per open,
 	// as soon as the config query settles (success or error — dead backend keeps fallbacks).
@@ -170,17 +139,17 @@ export default function TranslationModal({
 		setHealthResult(null);
 	}, [providerId]);
 
-	// Clean up the progress WebSocket on modal close / unmount.
 	useEffect(() => {
+		setTranslationModalOpen(open);
 		if (!open) {
-			unsubRef.current?.();
-			unsubRef.current = null;
+			clearTranslationSnapshotIfIdle();
+		} else {
+			setStartError(null);
 		}
 	}, [open]);
 	useEffect(
 		() => () => {
-			unsubRef.current?.();
-			unsubRef.current = null;
+			setTranslationModalOpen(false);
 		},
 		[],
 	);
@@ -246,107 +215,21 @@ export default function TranslationModal({
 			const result = await startTranslation(params);
 			addLog("info", `Got job_id: ${result.job_id}`, undefined, "translation");
 
-			setJob(result.job_id);
-			jobIdRef.current = result.job_id;
-			finishedRef.current = false;
-			cancelRequestedRef.current = false;
-			setTranslating(true);
-			setStep("progress");
-			setActiveProviderLabel(
-				providers?.find((p) => p.id === providerId)?.name ?? providerId,
-			);
+			const projectName =
+				useProjectStore.getState().project?.name ?? "Project";
+			const providerLabel =
+				providers?.find((p) => p.id === providerId)?.name ?? providerId;
+			attachTranslationJob({
+				jobId: result.job_id,
+				projectName,
+				providerLabel,
+			});
 			addLog(
 				"info",
 				`Translation started (${chainLabel}), subscribing to WebSocket...`,
 				undefined,
 				"translation",
 			);
-
-			const projectName = useProjectStore.getState().project?.name ?? "Project";
-
-			unsubRef.current = subscribeToJob(result.job_id, {
-				onStarted: (e) => {
-					setTotal(e.total);
-					useQueueStore.getState().setGlobalProgress({
-						projectName,
-						completed: 0,
-						total: e.total,
-						costSoFar: 0,
-						startedAt: Date.now(),
-					});
-				},
-				onBatchCompleted: (e) => {
-					setCompleted(e.completed);
-					setCostSoFar(e.cost_so_far);
-					useQueueStore.getState().setGlobalProgress({
-						projectName,
-						completed: e.completed,
-						total: e.total,
-						costSoFar: e.cost_so_far,
-						startedAt:
-							useQueueStore.getState().globalProgress?.startedAt ?? Date.now(),
-					});
-				},
-				onStringTranslated: (e) => setLastTranslated(e.translation),
-				onProviderSwitched: (e) => {
-					setActiveProviderLabel(e.provider_name);
-					addLog(
-						"info",
-						`Switched to provider ${e.provider_name} (${e.remaining_pending} still pending)`,
-						undefined,
-						"translation",
-					);
-					addToast("info", t("translate.toast.switched", { name: e.provider_name }));
-				},
-				onCompleted: (e) => {
-					finishedRef.current = true;
-					setDone(true);
-					setTranslating(false);
-					setJob(null);
-					useQueueStore.getState().setGlobalProgress(null);
-					addLog(
-						"info",
-						`Translation complete: ${e.total_translated} strings, $${e.total_cost?.toFixed(4) ?? "0"}`,
-						undefined,
-						"translation",
-					);
-					addToast(
-						"success",
-						t("translate.toast.complete", { count: e.total_translated }),
-					);
-				},
-				onFailed: (e) => {
-					finishedRef.current = true;
-					setError(e.error);
-					setTranslating(false);
-					setJob(null);
-					useQueueStore.getState().setGlobalProgress(null);
-					addLog("error", `Translation failed`, e.error, "translation");
-					addToast("error", t("translate.toast.failed", { error: e.error }));
-				},
-				onClosed: () => {
-					if (finishedRef.current) return;
-					finishedRef.current = true;
-					setTranslating(false);
-					setJob(null);
-					useQueueStore.getState().setGlobalProgress(null);
-					if (cancelRequestedRef.current) {
-						setCancelled(true);
-						setCancelling(false);
-						addLog("info", "Translation cancelled", undefined, "translation");
-						addToast("info", t("translate.toast.cancelled"));
-						return;
-					}
-					setError(t(JOB_STREAM_LOST_MESSAGE));
-					addLog(
-						"error",
-						"Translation failed",
-						JOB_STREAM_LOST_MESSAGE,
-						"translation",
-					);
-					addToast("error", t("translate.toast.failed", { error: t(JOB_STREAM_LOST_MESSAGE) }));
-				},
-			});
 		} catch (err: any) {
 			addLog(
 				"error",
@@ -355,34 +238,18 @@ export default function TranslationModal({
 				"translation",
 			);
 			addToast("error", t("translate.toast.startFailed", { error: err.message ?? err }));
-			setError(err.message ?? String(err));
+			setStartError(err.message ?? String(err));
 		}
 	};
 
 	const handleCancel = async () => {
-		const jobId = jobIdRef.current;
-		if (!jobId || cancelling) return;
-		cancelRequestedRef.current = true;
-		setCancelling(true);
-		try {
-			await cancelTranslation(jobId);
-			addLog(
-				"info",
-				`Cancel requested for job ${jobId}`,
-				undefined,
-				"translation",
-			);
-			addToast("info", t("translate.toast.cancelling"));
-		} catch (err: any) {
-			cancelRequestedRef.current = false;
-			setCancelling(false);
-			addToast("error", t("translate.toast.cancelFailed", { error: err.message ?? err }));
-		}
+		if (jobSnapshot?.cancelling) return;
+		await requestTranslationCancel();
 	};
 
 	const handleClose = () => {
 		onClose();
-		if (done || (step === "progress" && error)) onComplete();
+		if (jobSnapshot?.done || jobSnapshot?.error) onComplete();
 	};
 
 	const openSettings = (shortcut: OperationalShortcut) => {
@@ -419,6 +286,19 @@ export default function TranslationModal({
 
 	if (!open) return null;
 
+	const step = translationModalStep({
+		isTranslating,
+		snapshot: jobSnapshot,
+	});
+	const done = jobSnapshot?.done ?? false;
+	const cancelled = jobSnapshot?.cancelled ?? false;
+	const cancelling = jobSnapshot?.cancelling ?? false;
+	const error = jobSnapshot?.error ?? null;
+	const completed = jobSnapshot?.completed ?? 0;
+	const total = jobSnapshot?.total ?? 0;
+	const costSoFar = jobSnapshot?.costSoFar ?? 0;
+	const lastTranslated = jobSnapshot?.lastTranslated ?? "";
+	const activeProviderLabel = jobSnapshot?.activeProviderLabel ?? "";
 	const progressPercent = total > 0 ? (completed / total) * 100 : 0;
 
 	return (
@@ -675,6 +555,11 @@ export default function TranslationModal({
 						<p className="text-sm text-gray-500">
 							{t("translate.pending", { count: totalPending })}
 						</p>
+						{startError && (
+							<div className="p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 rounded text-sm text-red-600">
+								{startError}
+							</div>
+						)}
 						<button
 							onClick={handleStart}
 							className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium transition-colors"

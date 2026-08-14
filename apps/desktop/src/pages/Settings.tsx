@@ -1,17 +1,25 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
-import { CheckCircle, XCircle, Loader, Trash2, RotateCcw, Plus, Search } from "lucide-react";
+import { CheckCircle, XCircle, Loader, Trash2, RotateCcw, Plus, Search, Copy, ExternalLink } from "lucide-react";
 import clsx from "clsx";
 import {
   getProviders, checkProviderHealth, getConfig, updateConfig,
   getBackups, restoreBackup, deleteBackup,
   getGlossary, addGlossaryEntry, deleteGlossaryEntry,
   getTranslationRuns,
+  xaiAuthStart, xaiAuthPoll,
 } from "../lib/api";
-import type { GlossaryEntry, TranslationRun } from "../lib/api";
+import type { GlossaryEntry, TranslationRun, ProviderInfo } from "../lib/api";
 import { applyAppearance } from "../lib/appearance";
 import { resolveProviderReadiness } from "../lib/providerReadiness";
+import {
+  GROK_SUB_PROVIDER_ID,
+  XAI_POLL_INTERVAL_MS,
+  grokSubIsReady,
+  nextXaiPollAction,
+  type XaiAuthPollStatus,
+} from "../lib/xaiAuth";
 import {
   SETTINGS_SECTIONS,
   buildSettingsPath,
@@ -235,6 +243,225 @@ function HistorySection() {
   );
 }
 
+const IS_TAURI = "__TAURI_INTERNALS__" in window;
+
+async function openExternalUrl(url: string): Promise<void> {
+  if (IS_TAURI) {
+    const { open } = await import("@tauri-apps/plugin-shell");
+    await open(url);
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+function GrokSubCard({
+  provider,
+  onTest,
+  testing,
+  testResult,
+}: {
+  provider?: ProviderInfo;
+  onTest: () => void;
+  testing: boolean;
+  testResult?: { ok: boolean; message: string };
+}) {
+  const t = useT();
+  const qc = useQueryClient();
+  const ready = grokSubIsReady(provider ? [provider] : []);
+  const [starting, setStarting] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [phase, setPhase] = useState<"idle" | XaiAuthPollStatus>("idle");
+  const [session, setSession] = useState<{
+    handle: string;
+    user_code: string;
+    verification_uri: string;
+    expires_in_secs: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (phase !== "pending" || !session) return;
+    let stopped = false;
+    const startedAt = Date.now();
+
+    const tick = async () => {
+      if (stopped) return;
+      const expiry = nextXaiPollAction("pending", {
+        startedAtMs: startedAt,
+        expiresInSecs: session.expires_in_secs,
+        nowMs: Date.now(),
+      });
+      if (expiry.action === "stop") {
+        setPhase("expired");
+        addToast("error", t("settings.providers.toast.expired"));
+        return;
+      }
+      try {
+        const r = await xaiAuthPoll(session.handle);
+        if (stopped) return;
+        const next = nextXaiPollAction(r.status, {
+          startedAtMs: startedAt,
+          expiresInSecs: session.expires_in_secs,
+          nowMs: Date.now(),
+        });
+        if (next.action === "stop") {
+          setPhase(next.outcome);
+          if (next.outcome === "complete") {
+            addToast("success", t("settings.providers.toast.signedIn"));
+            void qc.invalidateQueries({ queryKey: ["providers"] });
+            void qc.invalidateQueries({ queryKey: ["config"] });
+          } else if (next.outcome === "denied") {
+            addToast("error", t("settings.providers.toast.denied"));
+          } else {
+            addToast("error", t("settings.providers.toast.expired"));
+          }
+        }
+      } catch {
+        /* keep polling until expiry */
+      }
+    };
+
+    void tick();
+    const id = window.setInterval(tick, XAI_POLL_INTERVAL_MS);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  }, [phase, session, qc, t]);
+
+  const startSignIn = async () => {
+    setStarting(true);
+    setCopied(false);
+    try {
+      const started = await xaiAuthStart();
+      setSession(started);
+      setPhase("pending");
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      addToast("error", t("settings.providers.toast.startFailed", { error: message }));
+      setPhase("idle");
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const copyCode = async () => {
+    if (!session) return;
+    try {
+      await navigator.clipboard.writeText(session.user_code);
+      setCopied(true);
+    } catch {
+      addToast("error", t("settings.providers.toast.copyFailed"));
+    }
+  };
+
+  const openVerification = async () => {
+    if (!session) return;
+    try {
+      await openExternalUrl(session.verification_uri);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      addToast("error", t("settings.providers.toast.openFailed", { error: message }));
+    }
+  };
+
+  return (
+    <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+      <div className="flex items-center gap-2 mb-2">
+        <h3 className="font-semibold">
+          {provider?.name ?? t("settings.providers.grokSubName")}
+        </h3>
+        <span className="px-2 py-0.5 rounded-full text-xs bg-amber-100 text-amber-700">
+          {t("settings.providers.paid")}
+        </span>
+        <span className={clsx(
+          "px-2 py-0.5 rounded-full text-xs font-medium",
+          ready
+            ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+            : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+        )}>
+          {ready ? t("settings.providers.signedIn") : t("settings.providers.needsSignIn")}
+        </span>
+      </div>
+      <p className="text-sm text-gray-500 mb-3">
+        {t("settings.providers.grokSubHint")}
+      </p>
+
+      {phase === "pending" && session && (
+        <div className="mb-3 p-3 rounded border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 space-y-2">
+          <div className="text-xs font-medium text-gray-500 uppercase">
+            {t("settings.providers.userCode")}
+          </div>
+          <div className="flex items-center gap-2">
+            <code className="text-2xl font-mono tracking-widest font-semibold">
+              {session.user_code}
+            </code>
+            <button
+              type="button"
+              onClick={() => void copyCode()}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600"
+            >
+              <Copy size={12} />
+              {copied ? t("common.copied") : t("common.copy")}
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={() => void openVerification()}
+            className="flex items-center gap-1.5 text-sm font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+          >
+            <ExternalLink size={14} />
+            {t("settings.providers.openVerification")}
+          </button>
+          <p className="text-xs text-gray-500">
+            {t("settings.providers.waitingApproval")}
+          </p>
+        </div>
+      )}
+
+      {phase === "denied" && (
+        <p className="mb-3 text-sm text-red-600">{t("settings.providers.denied")}</p>
+      )}
+      {phase === "expired" && (
+        <p className="mb-3 text-sm text-amber-700 dark:text-amber-300">
+          {t("settings.providers.expired")}
+        </p>
+      )}
+
+      <div className="flex items-center gap-3 flex-wrap">
+        <button
+          type="button"
+          onClick={() => void startSignIn()}
+          disabled={starting || phase === "pending"}
+          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded text-sm font-medium"
+        >
+          {starting
+            ? t("settings.providers.startingSignIn")
+            : phase === "expired" || phase === "denied"
+              ? t("settings.providers.retrySignIn")
+              : ready
+                ? t("settings.providers.signInAgain")
+                : t("settings.providers.signIn")}
+        </button>
+        {ready && (
+          <button
+            type="button"
+            onClick={onTest}
+            className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium"
+          >
+            {testing ? <Loader size={14} className="animate-spin" /> : t("settings.providers.testConnection")}
+          </button>
+        )}
+        {testResult && (
+          <span className={clsx("flex items-center gap-1 text-sm", testResult.ok ? "text-green-600" : "text-red-600")}>
+            {testResult.ok ? <CheckCircle size={14} /> : <XCircle size={14} />}
+            {testResult.ok ? t("settings.providers.connected") : testResult.message.slice(0, 60)}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ProvidersSection() {
   const t = useT();
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders });
@@ -260,10 +487,13 @@ function ProvidersSection() {
     qc.invalidateQueries({ queryKey: ["config"] });
   };
 
+  const grokSub = providers?.find((p) => p.id === GROK_SUB_PROVIDER_ID);
+
   return (
     <div className="space-y-4">
       <h2 className="text-xl font-bold">{t("settings.providers.title")}</h2>
-      {providers?.map((p) => {
+      <GrokSubCard provider={grokSub} onTest={() => handleTest(GROK_SUB_PROVIDER_ID)} testing={!!testing[GROK_SUB_PROVIDER_ID]} testResult={results[GROK_SUB_PROVIDER_ID]} />
+      {providers?.filter((p) => p.id !== GROK_SUB_PROVIDER_ID).map((p) => {
         const readiness = resolveProviderReadiness(p.id, providers, config);
         return (
         <div key={p.id} className="border border-gray-200 dark:border-gray-700 rounded-lg p-4">

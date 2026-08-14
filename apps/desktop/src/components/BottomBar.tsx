@@ -1,4 +1,5 @@
 import { useQueueStore } from "../stores/queueStore";
+import { useEditorStore } from "../stores/editorStore";
 import { Loader2 } from "lucide-react";
 import { useT } from "../lib/i18n";
 
@@ -19,8 +20,11 @@ function formatEta(
 export default function BottomBar() {
 	const t = useT();
 	const progress = useQueueStore((s) => s.globalProgress);
+	const queueRunning = useQueueStore((s) => s.isRunning);
+	const isTranslating = useEditorStore((s) => s.isTranslating);
 
 	if (!progress || progress.total === 0) return null;
+	if (!isTranslating && !queueRunning) return null;
 
 	const percent = Math.round((progress.completed / progress.total) * 100);
 	const eta = formatEta(progress.startedAt, progress.completed, progress.total, t);

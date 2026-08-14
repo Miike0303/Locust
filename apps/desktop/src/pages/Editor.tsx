@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -46,7 +46,7 @@ import { useT } from "../lib/i18n";
 
 export default function Editor() {
 	const t = useT();
-	const { filter, selectedEntryId, setSelected } = useEditorStore();
+	const { filter, selectedEntryId, setSelected, isTranslating } = useEditorStore();
 	const { project } = useProjectStore();
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
@@ -107,6 +107,14 @@ export default function Editor() {
 			queryClient.invalidateQueries({ queryKey: ["string", selectedEntryId] });
 		}
 	}, [refetch, queryClient, selectedEntryId]);
+
+	const wasTranslating = useRef(false);
+	useEffect(() => {
+		if (wasTranslating.current && !isTranslating) {
+			handleRefetch();
+		}
+		wasTranslating.current = isTranslating;
+	}, [isTranslating, handleRefetch]);
 
 	const handleValidate = useCallback(async () => {
 		if (validating) return;

@@ -63,6 +63,8 @@ fn main() {
             commands::import_translations,
             commands::run_inject,
             commands::register_lang,
+            commands::xai_auth_start,
+            commands::xai_auth_poll,
             commands::get_config,
             commands::save_config,
             commands::get_backups,

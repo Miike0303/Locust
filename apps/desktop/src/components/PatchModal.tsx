@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
 	X,
 	FolderOpen,
@@ -8,9 +8,11 @@ import {
 	AlertCircle,
 	ShieldCheck,
 	Archive,
+	Loader2,
 } from "lucide-react";
 import {
 	getConfig,
+	cancelPatchApply,
 	patchApply,
 	patchPack,
 	patchRollback,
@@ -29,6 +31,7 @@ import {
 	rememberPatchSource,
 	resolvePatchSource,
 } from "../lib/patchSource";
+import { subscribeToJob } from "../lib/ws";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 import {
@@ -51,6 +54,8 @@ interface PatchModalProps {
 	initialTab?: Tab;
 	/** Called after apply/rollback refresh so ambient indicators can update. */
 	onPatchStateChanged?: () => void;
+	/** Pack needs an inject recording from an open project. Hide when none. */
+	allowPack?: boolean;
 }
 
 export default function PatchModal({
@@ -59,6 +64,7 @@ export default function PatchModal({
 	defaultGamePath,
 	initialTab = "apply",
 	onPatchStateChanged,
+	allowPack = true,
 }: PatchModalProps) {
 	const t = useT();
 	const remembered = (() => {
@@ -84,6 +90,19 @@ export default function PatchModal({
 	const [packResult, setPackResult] = useState<PatchPackResult | null>(null);
 	const [status, setStatus] = useState<PatchStatusResult | null>(null);
 	const [error, setError] = useState<string | null>(null);
+	const [applying, setApplying] = useState(false);
+	const [cancellingApply, setCancellingApply] = useState(false);
+	const [needsRollback, setNeedsRollback] = useState(false);
+	const [applyProgress, setApplyProgress] = useState<{
+		current: number;
+		total: number;
+		path: string;
+		phase: string;
+	} | null>(null);
+	const applyUnsubRef = useRef<(() => void) | null>(null);
+	const applyJobIdRef = useRef<string | null>(null);
+	const applyFinishedRef = useRef(false);
+	const applyCancelRequestedRef = useRef(false);
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open,
 		ownEscape: false,
@@ -91,10 +110,12 @@ export default function PatchModal({
 
 	useEffect(() => {
 		if (!open) return;
+		if (applyJobIdRef.current) return;
 		if (defaultGamePath) setGamePath(defaultGamePath);
-		setTab(initialTab);
+		setTab(allowPack ? initialTab : "apply");
 		setError(null);
 		// Prefill pack language from config target lang
+		if (!allowPack) return;
 		getConfig()
 			.then((cfg) => {
 				if (cfg.default_target_lang) {
@@ -106,7 +127,19 @@ export default function PatchModal({
 			.catch(() => {
 				/* config optional for apply tab */
 			});
-	}, [open, defaultGamePath, initialTab]);
+	}, [open, defaultGamePath, initialTab, allowPack]);
+
+	useEffect(() => {
+		if (!allowPack && tab === "pack") setTab("apply");
+	}, [allowPack, tab]);
+
+	useEffect(
+		() => () => {
+			applyUnsubRef.current?.();
+			applyUnsubRef.current = null;
+		},
+		[],
+	);
 
 	const resolvedSource = resolvePatchSource(zipPath, zipUrl);
 	const sourceOk = patchSourceReady(resolvedSource);
@@ -237,6 +270,60 @@ export default function PatchModal({
 		}
 	};
 
+	const finishApplyReport = async (
+		report: PatchApplyResult,
+		source: { zip_path: string } | { zip_url: string },
+	) => {
+		rememberPatchSource(source);
+		setApplyResult(report);
+		await refreshStatus();
+		addLog(
+			"info",
+			report.dry_run
+				? `Patch dry-run: ${report.patch_id}@${report.patch_version}`
+				: `Patch applied: ${report.patch_id}@${report.patch_version}`,
+			`replaced ${report.replaced}, added ${report.added}, baseline ${report.baseline}`,
+			"patch",
+		);
+		addToast(
+			"success",
+			report.dry_run
+				? t("patch.toast.planned", { count: report.replaced + report.added })
+				: t("patch.toast.applied", { count: report.replaced + report.added }),
+		);
+	};
+
+	const finishApplyInterrupted = async (opts: {
+		cancelled: boolean;
+		error?: string;
+	}) => {
+		setNeedsRollback(true);
+		if (opts.cancelled) {
+			addLog(
+				"warning",
+				"Patch apply cancelled — game left partly patched",
+				undefined,
+				"patch",
+			);
+			addToast("warning", t("patch.toast.applyCancelled"));
+		} else {
+			const message = opts.error ?? t("ws.patchJobStreamLost");
+			setError(message);
+			addLog("error", "Patch apply failed", message, "patch");
+			addToast(
+				"warning",
+				t("patch.toast.applyFailedPartial", { error: message }),
+			);
+		}
+		try {
+			await refreshStatus();
+		} finally {
+			setApplying(false);
+			setCancellingApply(false);
+			setApplyProgress(null);
+		}
+	};
+
 	const handleApply = async () => {
 		if (!gamePath.trim()) {
 			addToast("error", t("patch.toast.selectGame"));
@@ -250,40 +337,114 @@ export default function PatchModal({
 			addToast("error", t(resolvedSource.error));
 			return;
 		}
-		setLoading(true);
+		const source = resolvedSource;
 		setError(null);
 		setApplyResult(null);
+		setApplyProgress(null);
+		setNeedsRollback(false);
+		setApplying(true);
+		setCancellingApply(false);
+		applyFinishedRef.current = false;
+		applyCancelRequestedRef.current = false;
+		applyUnsubRef.current?.();
+		applyUnsubRef.current = null;
 		try {
-			const report = await patchApply({
+			const started = await patchApply({
 				game_path: gamePath.trim(),
-				...resolvedSource,
+				...source,
 				force,
 				confirm_legacy: confirmLegacy,
 				dry_run: dryRun,
 			});
-			rememberPatchSource(resolvedSource);
-			setApplyResult(report);
-			await refreshStatus();
-			addLog(
-				"info",
-				dryRun
-					? `Patch dry-run: ${report.patch_id}@${report.patch_version}`
-					: `Patch applied: ${report.patch_id}@${report.patch_version}`,
-				`replaced ${report.replaced}, added ${report.added}, baseline ${report.baseline}`,
+			applyJobIdRef.current = started.job_id;
+			applyUnsubRef.current = subscribeToJob(
+				started.job_id,
+				{
+					onProgress: (e) => {
+						setApplyProgress({
+							current: e.current,
+							total: e.total,
+							path: e.path,
+							phase: e.phase,
+						});
+					},
+					onDone: (e) => {
+						if (applyFinishedRef.current) return;
+						applyFinishedRef.current = true;
+						applyUnsubRef.current?.();
+						applyUnsubRef.current = null;
+						applyJobIdRef.current = null;
+						void finishApplyReport(e.report, source).finally(() => {
+							setApplying(false);
+							setCancellingApply(false);
+							setApplyProgress(null);
+						});
+					},
+					onError: (e) => {
+						if (applyFinishedRef.current) return;
+						applyFinishedRef.current = true;
+						applyUnsubRef.current?.();
+						applyUnsubRef.current = null;
+						applyJobIdRef.current = null;
+						void finishApplyInterrupted(
+							applyCancelRequestedRef.current
+								? { cancelled: true }
+								: { cancelled: false, error: e.message },
+						);
+					},
+					onClosed: () => {
+						if (applyFinishedRef.current) return;
+						applyFinishedRef.current = true;
+						applyUnsubRef.current = null;
+						applyJobIdRef.current = null;
+						if (applyCancelRequestedRef.current) {
+							void finishApplyInterrupted({ cancelled: true });
+							return;
+						}
+						const message = t("ws.patchJobStreamLost");
+						setError(message);
+						addLog("error", "Patch apply failed", message, "patch");
+						addToast(
+							"error",
+							t("patch.toast.applyFailed", { error: message }),
+						);
+						setApplying(false);
+						setCancellingApply(false);
+					},
+				},
 				"patch",
 			);
-			addToast(
-				"success",
-				dryRun
-					? t("patch.toast.planned", { count: report.replaced + report.added })
-					: t("patch.toast.applied", { count: report.replaced + report.added }),
-			);
 		} catch (err: any) {
+			applyFinishedRef.current = true;
 			setError(err.message);
 			addLog("error", "Patch apply failed", err.message, "patch");
 			addToast("error", t("patch.toast.applyFailed", { error: err.message }));
-		} finally {
-			setLoading(false);
+			setApplying(false);
+			setCancellingApply(false);
+		}
+	};
+
+	const handleCancelApply = async () => {
+		const jobId = applyJobIdRef.current;
+		if (!jobId || cancellingApply) return;
+		applyCancelRequestedRef.current = true;
+		setCancellingApply(true);
+		try {
+			await cancelPatchApply(jobId);
+			addLog(
+				"info",
+				`Cancel requested for patch job ${jobId}`,
+				undefined,
+				"patch",
+			);
+			addToast("info", t("patch.toast.applyCancelling"));
+		} catch (err: any) {
+			applyCancelRequestedRef.current = false;
+			setCancellingApply(false);
+			addToast(
+				"error",
+				t("patch.toast.applyCancelFailed", { error: err.message ?? err }),
+			);
 		}
 	};
 
@@ -312,6 +473,7 @@ export default function PatchModal({
 						deleted: report.deleted,
 					}),
 				);
+				setNeedsRollback(false);
 			}
 			addLog(
 				"info",
@@ -375,6 +537,9 @@ export default function PatchModal({
 		}
 	};
 
+	const showPartialWarning =
+		needsRollback || status?.status === "interrupted";
+
 	const tabBtn = (id: Tab, label: string) => (
 		<button
 			type="button"
@@ -414,10 +579,14 @@ export default function PatchModal({
 					</button>
 				</div>
 
-				<div className="flex gap-1 border-b dark:border-gray-700 mb-4">
-					{tabBtn("apply", t("patch.apply"))}
-					{tabBtn("pack", t("patch.pack"))}
-				</div>
+				{allowPack ? (
+					<div className="flex gap-1 border-b dark:border-gray-700 mb-4">
+						{tabBtn("apply", t("patch.apply"))}
+						{tabBtn("pack", t("patch.pack"))}
+					</div>
+				) : (
+					<div className="mb-4" />
+				)}
 
 				<div className="space-y-4">
 					<div>
@@ -560,7 +729,7 @@ export default function PatchModal({
 							<div className="flex flex-wrap gap-2">
 								<button
 									onClick={handleVerify}
-									disabled={loading || !canVerifyApply}
+									disabled={loading || applying || !canVerifyApply}
 									title={
 										!gamePath.trim()
 											? t("patch.selectGame")
@@ -574,7 +743,7 @@ export default function PatchModal({
 								</button>
 								<button
 									onClick={handleApply}
-									disabled={loading || !canVerifyApply}
+									disabled={loading || applying || !canVerifyApply}
 									title={
 										!gamePath.trim()
 											? t("patch.selectGame")
@@ -584,23 +753,112 @@ export default function PatchModal({
 									}
 									className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium disabled:opacity-50"
 								>
-									<Package size={16} /> {dryRun ? t("patch.planApply") : t("patch.applyBtn")}
+									{applying ? (
+										<Loader2 size={16} className="animate-spin" />
+									) : (
+										<Package size={16} />
+									)}{" "}
+									{dryRun ? t("patch.planApply") : t("patch.applyBtn")}
 								</button>
 								<button
 									onClick={handleRollback}
-									disabled={loading}
-									className="flex items-center gap-1.5 px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100 dark:hover:bg-amber-900/60 rounded text-sm font-medium disabled:opacity-50"
+									disabled={loading || applying}
+									className={
+										showPartialWarning
+											? "flex items-center gap-1.5 px-3 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded text-sm font-medium disabled:opacity-50 ring-2 ring-amber-400 ring-offset-1 dark:ring-offset-gray-900"
+											: "flex items-center gap-1.5 px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100 dark:hover:bg-amber-900/60 rounded text-sm font-medium disabled:opacity-50"
+									}
 								>
 									<RotateCcw size={16} /> {t("patch.rollback")}
 								</button>
 								<button
 									onClick={refreshStatus}
-									disabled={loading || !gamePath.trim()}
+									disabled={loading || applying || !gamePath.trim()}
 									className="px-3 py-2 text-sm text-gray-600 hover:underline disabled:opacity-50"
 								>
 									{t("patch.refreshStatus")}
 								</button>
 							</div>
+
+							{applying && (
+								<div className="p-3 border border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 rounded text-sm space-y-2">
+									<div className="flex items-center gap-2 font-medium">
+										<Loader2
+											size={16}
+											className="animate-spin text-emerald-600"
+										/>
+										{t("patch.applying")}
+									</div>
+									{applyProgress && (
+										<>
+											{applyProgress.phase && (
+												<div className="text-xs text-gray-600 dark:text-gray-400">
+													{t("patch.progress.phase", {
+														phase: applyProgress.phase,
+													})}
+												</div>
+											)}
+											<div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+												<div
+													className="bg-emerald-500 h-2 rounded-full transition-all"
+													style={{
+														width: `${
+															applyProgress.total > 0
+																? Math.min(
+																		100,
+																		(applyProgress.current /
+																			applyProgress.total) *
+																			100,
+																	)
+																: 0
+														}%`,
+													}}
+												/>
+											</div>
+											<div className="text-xs tabular-nums">
+												{t("patch.progress.counts", {
+													current: applyProgress.current,
+													total: applyProgress.total,
+												})}
+											</div>
+											{applyProgress.path && (
+												<div className="text-xs text-gray-500 truncate" title={applyProgress.path}>
+													{t("patch.progress.file", {
+														path: applyProgress.path,
+													})}
+												</div>
+											)}
+										</>
+									)}
+									<button
+										type="button"
+										onClick={handleCancelApply}
+										disabled={cancellingApply}
+										className="w-full py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded text-sm font-medium"
+									>
+										{cancellingApply
+											? t("patch.cancelling")
+											: t("patch.cancelApply")}
+									</button>
+								</div>
+							)}
+
+							{!applying && showPartialWarning && (
+								<div className="p-3 border border-amber-400 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 rounded text-sm space-y-2">
+									<div className="flex gap-2 text-amber-950 dark:text-amber-100">
+										<AlertCircle size={16} className="shrink-0 mt-0.5" />
+										<span>{t("patch.partialWarning")}</span>
+									</div>
+									<button
+										type="button"
+										onClick={handleRollback}
+										disabled={loading}
+										className="w-full flex items-center justify-center gap-1.5 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded text-sm font-medium"
+									>
+										<RotateCcw size={16} /> {t("patch.rollbackNow")}
+									</button>
+								</div>
+							)}
 
 							{status && (
 								<div className="p-3 bg-gray-50 dark:bg-gray-800/60 rounded text-sm space-y-1">
@@ -738,7 +996,7 @@ export default function PatchModal({
 
 							<button
 								onClick={handlePack}
-								disabled={loading}
+								disabled={loading || applying}
 								className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium disabled:opacity-50"
 							>
 								<Archive size={16} /> {t("patch.packBtn")}

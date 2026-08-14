@@ -570,8 +570,34 @@ export interface PatchStatusResult {
 export const patchVerify = (params: PatchPathsParams): Promise<PatchVerifyResult> =>
   request("/patch/verify", { method: "POST", body: JSON.stringify(params) });
 
-export const patchApply = (params: PatchPathsParams): Promise<PatchApplyResult> =>
+export interface PatchApplyJobStart {
+  job_id: string;
+}
+
+export interface PatchProgressEvent {
+  type: "progress";
+  current: number;
+  total: number;
+  path: string;
+  phase: string;
+}
+
+export interface PatchDoneEvent {
+  type: "done";
+  report: PatchApplyResult;
+}
+
+export interface PatchErrorEvent {
+  type: "error";
+  message: string;
+}
+
+/** Starts an apply job (202 + job_id). Progress arrives on the patch WebSocket. */
+export const patchApply = (params: PatchPathsParams): Promise<PatchApplyJobStart> =>
   request("/patch/apply", { method: "POST", body: JSON.stringify(params) });
+
+export const cancelPatchApply = (jobId: string): Promise<void> =>
+  request(`/patch/cancel/${jobId}`, { method: "POST" });
 
 export const patchRollback = (params: PatchPathsParams): Promise<PatchRollbackResult> =>
   request("/patch/rollback", { method: "POST", body: JSON.stringify(params) });
@@ -653,9 +679,46 @@ export const deleteTranslationMemoryEntry = (hash: string, langPair: string): Pr
 export const clearTranslationMemory = (): Promise<void> =>
   request("/memory", { method: "DELETE" });
 
-/** Get the WebSocket URL for a translation job */
-export async function getWsUrl(jobId: string): Promise<string> {
+export type WsChannel = "translate" | "patch";
+
+/** WebSocket URL for a translation or patch-apply job. */
+export async function getWsUrl(
+  jobId: string,
+  channel: WsChannel = "translate",
+): Promise<string> {
   await baseUrl(); // ensure _serverPort is resolved
   const port = IS_TAURI ? _serverPort : 7842;
-  return `ws://localhost:${port}/api/translate/ws/${jobId}`;
+  const path =
+    channel === "patch"
+      ? `/api/patch/ws/${jobId}`
+      : `/api/translate/ws/${jobId}`;
+  return `ws://localhost:${port}${path}`;
 }
+
+// ─── xAI device-code auth (grok-sub) ─────────────────────────────────────
+
+export interface XaiAuthStartResult {
+  handle: string;
+  user_code: string;
+  verification_uri: string;
+  expires_in_secs: number;
+}
+
+export type XaiAuthPollStatus = "pending" | "complete" | "denied" | "expired";
+
+export interface XaiAuthPollResult {
+  status: XaiAuthPollStatus;
+}
+
+export const xaiAuthStart = (): Promise<XaiAuthStartResult> =>
+  IS_TAURI
+    ? invoke("xai_auth_start")
+    : request("/auth/xai/start", { method: "POST" });
+
+export const xaiAuthPoll = (handle: string): Promise<XaiAuthPollResult> =>
+  IS_TAURI
+    ? invoke("xai_auth_poll", { handle })
+    : request("/auth/xai/poll", {
+        method: "POST",
+        body: JSON.stringify({ handle }),
+      });

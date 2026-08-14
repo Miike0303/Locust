@@ -31,3 +31,6 @@ features = ["rt"]
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+httpmock = "0.7"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
