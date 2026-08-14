@@ -27,13 +27,6 @@ pub fn get_server_port(port: State<ServerPort>) -> u16 {
     port.0
 }
 
-#[tauri::command]
-pub async fn pick_game_folder() -> Result<Option<String>, String> {
-    // The frontend uses @tauri-apps/plugin-dialog directly for the native dialog.
-    // This command exists as a fallback / placeholder.
-    Ok(None)
-}
-
 // ─── Project commands ───────────────────────────────────────────────────────
 
 // Plain derive is fine here — unlike `TokenStore`, every field is already
