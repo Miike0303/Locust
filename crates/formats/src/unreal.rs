@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use locust_core::error::{LocustError, Result};
@@ -72,16 +73,13 @@ impl UnrealPlugin {
                 return false;
             }
         }
-        let Ok(data) = std::fs::read(path) else {
+        let Ok(mut file) = std::fs::File::open(path) else {
             return false;
         };
-        if data.len() < 32 {
+        let Ok(meta) = file.metadata() else {
             return false;
-        }
-        let magic = unreal_pak::PAK_MAGIC.to_le_bytes();
-        let window = data.len().min(1024 * 1024);
-        let start = data.len() - window;
-        data[start..].windows(4).any(|w| w == magic)
+        };
+        has_pak_magic_in_tail(&mut file, meta.len())
     }
 
     fn has_unreal_structure(path: &Path) -> bool {
@@ -884,10 +882,35 @@ impl FormatPlugin for UnrealPlugin {
     }
 }
 
+/// Same 1 MiB tail the previous full-file scan inspected.
+const PAK_MAGIC_TAIL_WINDOW: u64 = 1024 * 1024;
+
+/// Scan only the last `min(len, 1 MiB)` for `PAK_MAGIC`.
+///
+/// Magic that appears only near the start of a file larger than 1 MiB is
+/// intentionally not a hit — detection never looked past that tail window.
+fn has_pak_magic_in_tail<R: Read + Seek>(reader: &mut R, len: u64) -> bool {
+    if len < 32 {
+        return false;
+    }
+    let window = len.min(PAK_MAGIC_TAIL_WINDOW);
+    let start = len - window;
+    if reader.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut buf = vec![0u8; window as usize];
+    if reader.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    let magic = unreal_pak::PAK_MAGIC.to_le_bytes();
+    buf.windows(4).any(|w| w == magic)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
 
     fn tempdir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("locust_ue_{}", uuid::Uuid::new_v4()));
@@ -922,6 +945,82 @@ mod tests {
         fs::write(&pak_path, &data).unwrap();
 
         dir.to_path_buf()
+    }
+
+    fn pak_magic() -> [u8; 4] {
+        unreal_pak::PAK_MAGIC.to_le_bytes()
+    }
+
+    fn blob_with_magic_at(len: usize, magic_at: usize) -> Vec<u8> {
+        let mut data = vec![0u8; len];
+        data[magic_at..magic_at + 4].copy_from_slice(&pak_magic());
+        data
+    }
+
+    struct ReadCounter<R> {
+        inner: R,
+        bytes_read: usize,
+    }
+
+    impl<R: Read> Read for ReadCounter<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.bytes_read += n;
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for ReadCounter<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn test_pak_magic_in_last_mib_of_large_file_is_detected() {
+        let data = blob_with_magic_at(2 * 1024 * 1024, 2 * 1024 * 1024 - 4);
+        let len = data.len() as u64;
+        let mut cursor = Cursor::new(data);
+        assert!(has_pak_magic_in_tail(&mut cursor, len));
+    }
+
+    #[test]
+    fn test_pak_magic_only_near_start_of_large_file_is_not_detected() {
+        // Pins today's tail-only scan: magic at offset 0 of a >1 MiB file is ignored.
+        let data = blob_with_magic_at(2 * 1024 * 1024, 0);
+        let len = data.len() as u64;
+        let mut cursor = Cursor::new(data);
+        assert!(!has_pak_magic_in_tail(&mut cursor, len));
+    }
+
+    #[test]
+    fn test_pak_magic_in_small_file_is_detected_under_32_rejected() {
+        let data = blob_with_magic_at(64, 32);
+        let len = data.len() as u64;
+        let mut cursor = Cursor::new(data);
+        assert!(has_pak_magic_in_tail(&mut cursor, len));
+
+        let mut tiny = vec![0u8; 31];
+        tiny[..4].copy_from_slice(&pak_magic());
+        let tiny_len = tiny.len() as u64;
+        let mut tiny_cursor = Cursor::new(tiny);
+        assert!(!has_pak_magic_in_tail(&mut tiny_cursor, tiny_len));
+    }
+
+    #[test]
+    fn test_pak_magic_tail_reads_only_the_window() {
+        let data = blob_with_magic_at(2 * 1024 * 1024, 2 * 1024 * 1024 - 4);
+        let len = data.len() as u64;
+        let mut reader = ReadCounter {
+            inner: Cursor::new(data),
+            bytes_read: 0,
+        };
+        assert!(has_pak_magic_in_tail(&mut reader, len));
+        assert_eq!(
+            reader.bytes_read,
+            1024 * 1024,
+            "expected a 1 MiB tail window, not a full {len}-byte slurp"
+        );
     }
 
     #[test]
