@@ -12,8 +12,9 @@ use locust_core::project;
 use locust_core::translation::TranslationOptions;
 use locust_core::validation::Validator;
 use locust_server::{
-    poll_xai_device_login, spawn_translation_job, start_xai_device_login, AppState, ProjectInfo,
-    XaiAuthPollResponse, XaiAuthStartResponse,
+    active_translation_job, poll_xai_device_login, spawn_translation_job, start_xai_device_login,
+    AppState, ProjectInfo, XaiAuthPollResponse, XaiAuthStartResponse,
+    TRANSLATION_IN_FLIGHT_MESSAGE,
 };
 
 /// Wrapper so we can use Arc<AppState> as Tauri managed state
@@ -54,6 +55,9 @@ pub async fn open_project(
     state: State<'_, AppStateWrapper>,
 ) -> Result<ProjectOpenResponse, String> {
     let s = &state.0;
+    if active_translation_job(s).is_some() {
+        return Err(TRANSLATION_IN_FLIGHT_MESSAGE.to_string());
+    }
     let raw_path = PathBuf::from(&path);
     let outcome = project::open_project(&s.db, &s.format_registry, &raw_path, format_id.as_deref())
         .map_err(|e| e.to_string())?;
@@ -99,6 +103,9 @@ async fn apply_open_project_db(
     game_path: String,
     format_id: String,
 ) -> Result<ProjectOpenResponse, String> {
+    if active_translation_job(s).is_some() {
+        return Err(TRANSLATION_IN_FLIGHT_MESSAGE.to_string());
+    }
     let outcome = project::open_project_db(
         &s.db,
         &s.format_registry,

@@ -61,6 +61,40 @@ fn job_event_is_terminal(v: &serde_json::Value) -> bool {
     )
 }
 
+/// Shown verbatim in the desktop "failed to open" toast when a translation
+/// is still writing the live database.
+pub const TRANSLATION_IN_FLIGHT_MESSAGE: &str = "A translation is still running. Wait for it to finish or cancel it before opening another project.";
+
+/// Id of an in-flight translation job, if any.
+///
+/// Jobs linger in `active_jobs` for 30s after a terminal event so a
+/// reconnecting socket can replay. Only unfinished translations block a
+/// project switch. Patch-apply jobs never touch `state.db`.
+pub fn active_translation_job(state: &AppState) -> Option<String> {
+    for job in state.active_jobs.iter() {
+        if !matches!(job.kind, JobKind::Translate) {
+            continue;
+        }
+        let finished = job
+            .replay
+            .lock()
+            .map(|log| log.iter().any(job_event_is_terminal))
+            .unwrap_or(false);
+        if !finished {
+            return Some(job.key().clone());
+        }
+    }
+    None
+}
+
+fn refuse_if_translation_in_flight(state: &AppState) -> Result<(), ApiError> {
+    if active_translation_job(state).is_some() {
+        Err(err(StatusCode::CONFLICT, TRANSLATION_IN_FLIGHT_MESSAGE))
+    } else {
+        Ok(())
+    }
+}
+
 fn publish_job_event(
     tx: &broadcast::Sender<serde_json::Value>,
     replay: &std::sync::Mutex<Vec<serde_json::Value>>,
@@ -400,6 +434,7 @@ async fn project_open(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenProjectRequest>,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
+    refuse_if_translation_in_flight(&state)?;
     let raw_path = PathBuf::from(&req.path);
     let outcome = project::open_project(
         &state.db,
@@ -452,6 +487,7 @@ async fn project_open_db(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenProjectDbRequest>,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
+    refuse_if_translation_in_flight(&state)?;
     let outcome = project::open_project_db(
         &state.db,
         &state.format_registry,
@@ -2772,6 +2808,212 @@ mod tests {
         assert_eq!(cur_body["name"], "test-game");
         assert_eq!(state.db.path(), PathBuf::from(":memory:"));
         assert!(state.db.get_entry("keep").unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn park_job(state: &AppState, id: &str, kind: JobKind, terminal: Option<&str>) {
+        let (tx, _) = broadcast::channel(8);
+        let replay = Arc::new(std::sync::Mutex::new(Vec::new()));
+        if let Some(ty) = terminal {
+            replay
+                .lock()
+                .unwrap()
+                .push(serde_json::json!({ "type": ty }));
+        }
+        state.active_jobs.insert(
+            id.to_string(),
+            JobState {
+                abort_handle: tokio::spawn(async {}).abort_handle(),
+                progress_tx: tx,
+                replay,
+                cancel: tokio_util::sync::CancellationToken::new(),
+                kind,
+            },
+        );
+    }
+
+    fn write_rpgmaker_game(dir: &Path) {
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join("System.json"),
+            r#"{"gameTitle":"Other Game","terms":{"basic":["HP"],"commands":["Fight"],"params":["HP"],"messages":{}}}"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_returns_409_while_translation_in_flight_and_keeps_current_project() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[
+                translated("keep-a", "Hello", "f.json", "Hola"),
+                StringEntry::new("keep-b", "World", PathBuf::from("f.json")),
+            ])
+            .unwrap();
+        park_job(&state, "job-translate", JobKind::Translate, None);
+
+        let dir = std::env::temp_dir().join(format!("locust_open_busy_{}", uuid::Uuid::new_v4()));
+        let game = dir.join("OtherGame");
+        write_rpgmaker_game(&game);
+
+        let resp = client()
+            .post(format!("{}/api/project/open", url))
+            .json(&serde_json::json!({"path": game.to_string_lossy()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let text = resp.text().await.unwrap();
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("translation") && (lower.contains("cancel") || lower.contains("finish")),
+            "user-facing way out: {text}"
+        );
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "test-game");
+        assert_eq!(cur_body["format_id"], "rpgmaker-mv");
+
+        assert_eq!(state.db.path(), PathBuf::from(":memory:"));
+        let rows = state.db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(state.db.get_entry("keep-a").unwrap().is_some());
+        assert!(state
+            .config
+            .read()
+            .await
+            .recent_projects
+            .iter()
+            .all(|p| p.name != "OtherGame"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_db_returns_409_while_translation_in_flight_and_keeps_current_project() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[
+                translated("keep-a", "Hello", "f.json", "Hola"),
+                StringEntry::new("keep-b", "World", PathBuf::from("f.json")),
+            ])
+            .unwrap();
+        park_job(&state, "job-translate", JobKind::Translate, None);
+
+        let dir = std::env::temp_dir().join(format!("locust_opendb_busy_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = write_opendb_locust(
+            &dir,
+            "other.locust.db",
+            &[translated("other", "Bye", "g.json", "Adiós")],
+        );
+        let game = dir.join("OtherGame");
+        std::fs::create_dir_all(&game).unwrap();
+
+        let resp = client()
+            .post(format!("{}/api/project/open-db", url))
+            .json(&serde_json::json!({
+                "database_path": other.to_string_lossy(),
+                "game_path": game.to_string_lossy(),
+                "format_id": "rpgmaker-mv"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let text = resp.text().await.unwrap();
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("translation") && (lower.contains("cancel") || lower.contains("finish")),
+            "user-facing way out: {text}"
+        );
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "test-game");
+
+        assert_eq!(state.db.path(), PathBuf::from(":memory:"));
+        let rows = state.db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(state.db.get_entry("keep-a").unwrap().is_some());
+        assert!(state.db.get_entry("other").unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn finished_translation_in_retention_window_does_not_block_open() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        park_job(&state, "job-done", JobKind::Translate, Some("completed"));
+
+        let dir = std::env::temp_dir().join(format!("locust_open_done_{}", uuid::Uuid::new_v4()));
+        let game = dir.join("OtherGame");
+        write_rpgmaker_game(&game);
+
+        let resp = client()
+            .post(format!("{}/api/project/open", url))
+            .json(&serde_json::json!({"path": game.to_string_lossy()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "OtherGame");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn in_flight_patch_job_does_not_block_open() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        park_job(&state, "job-patch", JobKind::Patch, None);
+
+        let dir = std::env::temp_dir().join(format!("locust_open_patch_{}", uuid::Uuid::new_v4()));
+        let game = dir.join("OtherGame");
+        write_rpgmaker_game(&game);
+
+        let resp = client()
+            .post(format!("{}/api/project/open", url))
+            .json(&serde_json::json!({"path": game.to_string_lossy()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "OtherGame");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
