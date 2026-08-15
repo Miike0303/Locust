@@ -38,6 +38,7 @@ import {
 	isDetectionFailure,
 	pickGameFolder,
 } from "../lib/openProjectFlow";
+import { projectOpenMergeNotice } from "../lib/projectOpenMerge";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
@@ -162,12 +163,16 @@ export default function Welcome() {
 				setProject,
 				queryClient,
 			});
+			const notice = projectOpenMergeNotice(result, t);
 			addLog(
-				"info",
-				`Opened: ${result.project_name} (${result.format_name}, ${result.total_strings} strings)`,
+				notice.toast ? "warning" : "info",
+				notice.logMessage,
 				undefined,
 				"project",
 			);
+			if (notice.toastMessage) {
+				addToast("warning", notice.toastMessage);
+			}
 			setPicker(null);
 			navigate("/editor");
 		} catch (err: any) {

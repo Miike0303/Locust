@@ -37,6 +37,11 @@ const info = projectFromOpenResponse({
   project_path: "/games/title",
   project_name: "title",
   supported_modes: ["replace"],
+  added: 3,
+  updated: 0,
+  stale_source_reset: 0,
+  removed: 0,
+  preserved_translations: 0,
 });
 assert.equal(info.path, "/games/title");
 assert.equal(info.format_id, "renpy");

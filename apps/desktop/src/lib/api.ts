@@ -103,6 +103,8 @@ export interface ProjectInfo {
 export interface ProjectOpenResponse {
   format_id: string; format_name: string; total_strings: number;
   project_path: string; project_name: string; supported_modes: OutputMode[];
+  added: number; updated: number; stale_source_reset: number;
+  removed: number; preserved_translations: number;
 }
 
 export interface StringEntry {

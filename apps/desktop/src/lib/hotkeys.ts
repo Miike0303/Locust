@@ -11,6 +11,7 @@ import {
   isDetectionFailure,
   pickGameFolder,
 } from "./openProjectFlow";
+import { projectOpenMergeNotice } from "./projectOpenMerge";
 import { useProjectStore } from "../stores/projectStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -118,12 +119,16 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
             setProject,
             queryClient,
           });
+          const notice = projectOpenMergeNotice(result, t);
           addLog(
-            "info",
-            `Opened: ${result.project_name} (${result.format_name}, ${result.total_strings} strings)`,
+            notice.toast ? "warning" : "info",
+            notice.logMessage,
             undefined,
             "project",
           );
+          if (notice.toastMessage) {
+            addToast("warning", notice.toastMessage);
+          }
           navigate("/editor");
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);

@@ -60,6 +60,11 @@ const openedDb = projectInfoAfterPivotOpen(previous, {
   project_path: "C:\\Games\\Title-pivot.locust.db",
   project_name: "Title-pivot",
   supported_modes: ["replace"],
+  added: 0,
+  updated: 0,
+  stale_source_reset: 0,
+  removed: 0,
+  preserved_translations: 12,
 });
 assert.equal(openedDb.path, previous.path, "keep game folder when opened path is a db");
 assert.equal(openedDb.name, "Title-pivot");
@@ -71,6 +76,11 @@ const openedGame = projectInfoAfterPivotOpen(previous, {
   project_path: "C:\\Games\\Other",
   project_name: "Other",
   supported_modes: ["replace", "add"],
+  added: 4,
+  updated: 0,
+  stale_source_reset: 0,
+  removed: 0,
+  preserved_translations: 0,
 });
 assert.equal(openedGame.path, "C:\\Games\\Other");
 assert.equal(openedGame.format_id, "renpy");
@@ -116,6 +126,11 @@ const openedFromOpenDb = projectInfoAfterPivotOpen(previous, {
   project_path: previous.path,
   project_name: "Title",
   supported_modes: ["replace"],
+  added: 0,
+  updated: 0,
+  stale_source_reset: 0,
+  removed: 0,
+  preserved_translations: 12,
 });
 assert.equal(openedFromOpenDb.path, previous.path, "open-db returns the original game folder");
 assert.equal(openedFromOpenDb.format_id, previous.format_id);

@@ -80,6 +80,12 @@ export const en = {
   "welcome.dialog.allFiles": "All files",
   "welcome.prompt.folderPath": "Enter game folder path:",
   "welcome.prompt.filePath": "Enter game executable or file path:",
+  "welcome.log.openedMerge": "Opened {name} ({format}, {total} strings) — added {added}, updated {updated}, reset to pending {stale}, removed {removed}, translations kept {preserved}",
+  "welcome.toast.sourceChanged": "The game's text changed.",
+  "welcome.toast.staleReset.one": "{count} translation was sent back to pending so you can check it again.",
+  "welcome.toast.staleReset.other": "{count} translations were sent back to pending so you can check them again.",
+  "welcome.toast.removed.one": "{count} line no longer exists and was removed.",
+  "welcome.toast.removed.other": "{count} lines no longer exist and were removed.",
   "welcome.toast.addedToQueue": "Added to queue",
   "welcome.toast.failedOpen": "Failed to open: {error}",
 

@@ -79,6 +79,12 @@ export const es: Record<keyof typeof en, string> = {
   "welcome.dialog.allFiles": "Todos los archivos",
   "welcome.prompt.folderPath": "Introduzca la ruta de la carpeta del juego:",
   "welcome.prompt.filePath": "Introduzca la ruta del ejecutable o archivo del juego:",
+  "welcome.log.openedMerge": "Se abrió {name} ({format}, {total} cadenas): {added} nuevas, {updated} actualizadas, {stale} devueltas a pendiente, {removed} eliminadas, {preserved} traducciones conservadas",
+  "welcome.toast.sourceChanged": "El texto del juego cambió.",
+  "welcome.toast.staleReset.one": "{count} traducción volvió a pendiente para que la revise de nuevo.",
+  "welcome.toast.staleReset.other": "{count} traducciones volvieron a pendiente para que las revise de nuevo.",
+  "welcome.toast.removed.one": "{count} línea ya no existe y se eliminó.",
+  "welcome.toast.removed.other": "{count} líneas ya no existen y se eliminaron.",
   "welcome.toast.addedToQueue": "Añadido a la cola",
   "welcome.toast.failedOpen": "No se pudo abrir: {error}",
 
