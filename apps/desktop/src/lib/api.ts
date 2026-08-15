@@ -176,6 +176,12 @@ export interface InjectParams {
   direct?: boolean;
 }
 
+/** Serde externally-tagged core::extraction::RecordOutcome. */
+export type RecordOutcomeJson =
+  | { Recorded: { files: number } }
+  | { KeptPrevious: { recorded_at: string } }
+  | "NothingRecorded";
+
 export interface MultiLangReport {
   mode: OutputMode | "direct" | string;
   languages_processed: string[];
@@ -187,6 +193,10 @@ export interface MultiLangReport {
   strings_written?: number;
   strings_skipped?: number;
   warnings?: string[];
+  /** Paths plugins actually wrote (direct + per-lang nested under reports). */
+  files_written?: string[];
+  /** Per-language recording outcome (direct always; multi-lang when backend attaches it). */
+  outcomes?: Array<[string, RecordOutcomeJson]>;
   reports: Record<string, any>;
 }
 

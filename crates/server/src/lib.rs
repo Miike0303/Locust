@@ -1096,13 +1096,24 @@ async fn inject(
 
     // Persist what each language's injection wrote — `locust patch` packs
     // exclusively from this recording, so an inject seam that skips it
-    // produces projects that can never be packed.
-    locust_core::extraction::record_multilang_injection(&state.db, &report, &languages, &|_lang| {
-        INJECT_RECORD_REMEDY.to_string()
-    })
+    // produces projects that can never be packed. Surface outcomes on the
+    // JSON body so the desktop never celebrates a zero-write recording.
+    let outcomes = locust_core::extraction::record_multilang_injection(
+        &state.db,
+        &report,
+        &languages,
+        &|_lang| INJECT_RECORD_REMEDY.to_string(),
+    )
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+    let mut body = serde_json::to_value(&report).unwrap_or_default();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "outcomes".into(),
+            serde_json::to_value(outcomes).unwrap_or_default(),
+        );
+    }
+    Ok(Json(body))
 }
 
 // ─── Register language (RPG Maker multi-lang UI) ───────────────────────────

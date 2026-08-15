@@ -14,6 +14,15 @@ import {
 	defaultInjectMode,
 	type InjectUiMode,
 } from "../lib/injectModes";
+import {
+	classifyInjectReport,
+	collectFilesWritten,
+	collectInjectWarnings,
+	injectToastLevel,
+	outcomeRecordingIssues,
+	shouldOfferPackAfterInject,
+	sumStringsWritten,
+} from "../lib/injectOutcome";
 import { LANGUAGES, languageLabel } from "../lib/languages";
 import {
 	loadRegLabelOverride,
@@ -255,32 +264,56 @@ export default function InjectModal({
 			});
 			setResult(report);
 
+			const outcome = classifyInjectReport(report);
+			const written = sumStringsWritten(report);
+			const warnings = collectInjectWarnings(report);
+			const filesWritten = collectFilesWritten(report);
 			const destInfo = isDirect
 				? `Direct inject into ${project.path}` +
 					(report.backup_path ? `\nBackup: ${report.backup_path}` : "")
 				: mode === "replace"
 					? `Output: ${outputDir}`
 					: `Added translation folders in ${project.path}`;
+			const failDetail = report.languages_failed?.length
+				? `Failed: ${report.languages_failed.map(([l, e]) => `${l}: ${e}`).join(", ")}`
+				: "No language failures";
+			const warnDetail = warnings.length
+				? `\nWarnings:\n${warnings.map((w) => `- ${w}`).join("\n")}`
+				: "";
+			const filesDetail = filesWritten.length
+				? `\nFiles written:\n${filesWritten.map((f) => `- ${f}`).join("\n")}`
+				: "";
 
 			addLog(
-				"info",
-				`Inject complete: ${report.languages_processed.join(", ")} (${report.mode} mode)`,
-				`${destInfo}\n${
-					report.languages_failed?.length
-						? `Failed: ${report.languages_failed.map(([l, e]) => `${l}: ${e}`).join(", ")}`
-						: "All languages succeeded"
-				}`,
+				outcome === "empty" ? "error" : outcome === "partial" ? "warning" : "info",
+				outcome === "empty"
+					? `Inject wrote nothing: ${report.languages_processed.join(", ") || "(none)"} (${report.mode} mode)`
+					: outcome === "partial"
+						? `Inject partial: ${report.languages_processed.join(", ")} (${report.mode} mode)`
+						: `Inject complete: ${report.languages_processed.join(", ")} (${report.mode} mode)`,
+				`${destInfo}\nStrings written: ${written}\n${failDetail}${warnDetail}${filesDetail}`,
 				"inject",
 			);
-			addToast(
-				"success",
-				isDirect
-					? t("inject.toast.direct", { count: report.strings_written ?? 0 })
-					: t("inject.toast.injected", { count: report.languages_processed.length }),
-			);
+
+			const toastLevel = injectToastLevel(outcome);
+			const toastMsg =
+				outcome === "empty"
+					? t("inject.toast.nothingWritten")
+					: outcome === "partial"
+						? t("inject.toast.partial", {
+								written,
+								failed: report.languages_failed?.length ?? 0,
+						  })
+						: isDirect
+							? t("inject.toast.direct", { count: written })
+							: t("inject.toast.injected", {
+									count: report.languages_processed.length,
+							  });
+			addToast(toastLevel, toastMsg);
 
 			// Optional: register selected lang(s) in RM multi-lang UI after inject.
-			if (autoRegisterAfterInject && isRpgMaker) {
+			// Skip when nothing was written — registering a language with no text is noise.
+			if (autoRegisterAfterInject && isRpgMaker && outcome !== "empty") {
 				await runRegisterLang(true);
 			}
 		} catch (err: unknown) {
@@ -295,6 +328,13 @@ export default function InjectModal({
 	const gameName =
 		project.path.split(/[\\/]/).filter(Boolean).pop() ?? project.name;
 	const isDirectResult = result?.mode === "direct";
+	const resultKind = result ? classifyInjectReport(result) : null;
+	const resultWarnings = result ? collectInjectWarnings(result) : [];
+	const resultFiles = result ? collectFilesWritten(result) : [];
+	const resultRecording = result ? outcomeRecordingIssues(result) : [];
+	const resultWritten = result ? sumStringsWritten(result) : 0;
+	const offerPack =
+		Boolean(result) && isDirectResult && shouldOfferPackAfterInject(result!);
 
 	return (
 		<div className={MODAL_BACKDROP_CLASS}>
@@ -541,43 +581,59 @@ export default function InjectModal({
 					</div>
 				) : (
 					<div className="space-y-4">
-						<div className="p-3 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 rounded text-sm">
-							<p className="font-medium text-emerald-700 dark:text-emerald-300">
-								{t("inject.injectionComplete")}
+						<div
+							className={
+								resultKind === "empty"
+									? "p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm"
+									: resultKind === "partial"
+										? "p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-sm"
+										: "p-3 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 rounded text-sm"
+							}
+						>
+							<p
+								className={
+									resultKind === "empty"
+										? "font-medium text-red-700 dark:text-red-300"
+										: resultKind === "partial"
+											? "font-medium text-amber-800 dark:text-amber-200"
+											: "font-medium text-emerald-700 dark:text-emerald-300"
+								}
+							>
+								{resultKind === "empty"
+									? t("inject.injectionEmpty")
+									: resultKind === "partial"
+										? t("inject.injectionPartial")
+										: t("inject.injectionComplete")}
 							</p>
-							<p className="text-emerald-600 dark:text-emerald-400 mt-1">
+							<p className="text-sm mt-1 opacity-90">
 								{t("inject.languagesLine", {
-									langs: result.languages_processed.join(", "),
+									langs: result.languages_processed.join(", ") || t("inject.selectedNone"),
 								})}
 							</p>
-							<p className="text-emerald-600 dark:text-emerald-400">
+							<p className="text-sm opacity-90">
 								{t("inject.modeLine", { mode: result.mode })}
 							</p>
-							{isDirectResult && (
-								<>
-									<p className="text-emerald-600 dark:text-emerald-400">
-										{t("inject.stringsWritten", {
-											written: result.strings_written ?? 0,
-											files: result.files_modified ?? 0,
-											skipped: result.strings_skipped ?? 0,
-										})}
-									</p>
-									{result.backup_path && (
-										<p className="text-xs text-emerald-700 dark:text-emerald-300 mt-1 break-all">
-											{t("inject.backup", { path: result.backup_path })}
-										</p>
-									)}
-								</>
+							<p className="text-sm opacity-90">
+								{t("inject.stringsWritten", {
+									written: resultWritten,
+									files: result.files_modified ?? 0,
+									skipped: result.strings_skipped ?? 0,
+								})}
+							</p>
+							{isDirectResult && result.backup_path && (
+								<p className="text-xs mt-1 break-all opacity-90">
+									{t("inject.backup", { path: result.backup_path })}
+								</p>
 							)}
 							{!isDirectResult && mode === "replace" && outputDir && (
-								<p className="text-emerald-600 dark:text-emerald-400">
+								<p className="text-sm opacity-90">
 									{t("inject.output", { path: outputDir })}
 								</p>
 							)}
 							{result.reports && Object.keys(result.reports).length > 0 && (
 								<div className="mt-2 space-y-1">
 									{Object.entries(result.reports).map(([lang, report]) => (
-										<p key={lang} className="text-xs text-emerald-500">
+										<p key={lang} className="text-xs opacity-80">
 											{t("inject.langReport", {
 												lang,
 												written:
@@ -593,7 +649,53 @@ export default function InjectModal({
 							)}
 						</div>
 
-						{isDirectResult && (
+						{resultFiles.length > 0 && (
+							<div className="p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 rounded text-sm">
+								<p className="font-medium text-slate-800 dark:text-slate-100">
+									{t("inject.filesWritten")}
+								</p>
+								<ul className="mt-1 space-y-0.5 text-xs text-slate-700 dark:text-slate-300 break-all">
+									{resultFiles.map((path) => (
+										<li key={path}>{path}</li>
+									))}
+								</ul>
+							</div>
+						)}
+
+						{resultWarnings.length > 0 && (
+							<div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-sm">
+								<p className="font-medium text-amber-900 dark:text-amber-100 flex items-center gap-1.5">
+									<AlertCircle size={16} /> {t("inject.warnings")}
+								</p>
+								<ul className="mt-1 space-y-0.5 text-xs text-amber-800 dark:text-amber-200">
+									{resultWarnings.map((w) => (
+										<li key={w}>{w}</li>
+									))}
+								</ul>
+							</div>
+						)}
+
+						{resultRecording.length > 0 && (
+							<div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-sm">
+								<p className="font-medium text-amber-900 dark:text-amber-100">
+									{t("inject.recordingIssues")}
+								</p>
+								<ul className="mt-1 space-y-0.5 text-xs text-amber-800 dark:text-amber-200">
+									{resultRecording.map((issue) => (
+										<li key={`${issue.lang}-${issue.kind}`}>
+											{issue.kind === "nothing"
+												? t("inject.recordingNothing", { lang: issue.lang })
+												: t("inject.recordingKept", {
+														lang: issue.lang,
+														at: issue.detail ?? "",
+												  })}
+										</li>
+									))}
+								</ul>
+							</div>
+						)}
+
+						{offerPack && (
 							<div className="p-3 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 rounded text-sm text-sky-900 dark:text-sky-100">
 								<p className="font-medium flex items-center gap-1.5">
 									<Package size={16} /> {t("inject.recordingSaved")}

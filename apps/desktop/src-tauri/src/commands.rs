@@ -613,13 +613,22 @@ pub async fn run_inject(
 
     // Persist what each language's injection wrote — `locust patch` packs
     // exclusively from this recording, so an inject seam that skips it
-    // produces projects that can never be packed.
-    locust_core::extraction::record_multilang_injection(&s.db, &report, &languages, &|_lang| {
-        INJECT_RECORD_REMEDY.to_string()
-    })
-    .map_err(|e| e.to_string())?;
+    // produces projects that can never be packed. Attach outcomes so the UI
+    // can refuse a success toast on NothingRecorded / KeptPrevious.
+    let outcomes =
+        locust_core::extraction::record_multilang_injection(&s.db, &report, &languages, &|_lang| {
+            INJECT_RECORD_REMEDY.to_string()
+        })
+        .map_err(|e| e.to_string())?;
 
-    serde_json::to_value(report).map_err(|e| e.to_string())
+    let mut body = serde_json::to_value(report).map_err(|e| e.to_string())?;
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "outcomes".into(),
+            serde_json::to_value(outcomes).map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(body)
 }
 
 #[derive(Deserialize)]
