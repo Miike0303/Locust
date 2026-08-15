@@ -2089,15 +2089,17 @@ async fn restore_backup(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    let proj = state.current_project.read().await;
-    let target = proj
-        .as_ref()
-        .map(|p| p.path.clone())
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no project open"))?;
-    state
-        .backup_manager
-        .restore(&id, &target)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    state.backup_manager.restore(&id).map_err(|e| {
+        let msg = e.to_string();
+        // Missing origin or unreadable manifest: the user can re-open the
+        // original game folder or discard the backup. Anything else is ours.
+        let status = if msg.contains("manifest.json") || msg.contains("no longer exists") {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        err(status, e)
+    })?;
     Ok(StatusCode::OK)
 }
 
@@ -3400,6 +3402,144 @@ mod xai_auth_tests {
         assert!(
             providers.iter().any(|p| p["id"] == "grok-sub"),
             "grok-sub must be registered after complete: {providers:?}"
+        );
+    }
+
+    fn game_temp(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("locust_{prefix}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn restore_writes_to_backup_origin_not_the_open_project() {
+        let state = create_test_state();
+        let game_a = game_temp("restore_a");
+        let game_b = game_temp("restore_b");
+        std::fs::write(game_a.join("data.json"), r#"{"hp": 100}"#).unwrap();
+        std::fs::write(game_b.join("b_only.txt"), "keep-b").unwrap();
+
+        let entry = state.backup_manager.create_backup(&game_a).unwrap();
+        std::fs::write(game_a.join("data.json"), "A-MUTATED").unwrap();
+
+        {
+            let mut proj = state.current_project.write().await;
+            *proj = Some(ProjectInfo {
+                path: game_b.clone(),
+                format_id: "rpgmaker-mv".into(),
+                name: "game-b".into(),
+            });
+        }
+
+        let (url, _h) = start_test_server(state).await;
+        let resp = client()
+            .post(format!("{}/api/backups/{}/restore", url, entry.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(game_a.join("data.json")).unwrap(),
+            r#"{"hp": 100}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(game_b.join("b_only.txt")).unwrap(),
+            "keep-b"
+        );
+        assert!(
+            !game_b.join("data.json").exists(),
+            "open game B must not receive game A's restored files"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_does_not_require_an_open_project() {
+        let state = create_test_state();
+        let game = game_temp("restore_no_proj");
+        std::fs::write(game.join("data.json"), r#"{"hp": 100}"#).unwrap();
+        let entry = state.backup_manager.create_backup(&game).unwrap();
+        std::fs::write(game.join("data.json"), "MUTATED").unwrap();
+
+        let (url, _h) = start_test_server(state).await;
+        let resp = client()
+            .post(format!("{}/api/backups/{}/restore", url, entry.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(game.join("data.json")).unwrap(),
+            r#"{"hp": 100}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_missing_source_directory_is_4xx() {
+        let state = create_test_state();
+        let game = game_temp("restore_gone");
+        std::fs::write(game.join("data.json"), r#"{"hp": 100}"#).unwrap();
+        let entry = state.backup_manager.create_backup(&game).unwrap();
+        std::fs::remove_dir_all(&game).unwrap();
+
+        let (url, _h) = start_test_server(state).await;
+        let resp = client()
+            .post(format!("{}/api/backups/{}/restore", url, entry.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16() / 100, 4, "{}", resp.status());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains(&entry.id), "{body}");
+        assert!(body.contains("no longer exists"), "{body}");
+        assert!(
+            !game.exists(),
+            "must not recreate the deleted game directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_missing_or_corrupt_manifest_is_4xx() {
+        let state = create_test_state();
+        let game = game_temp("restore_manifest");
+        std::fs::write(game.join("data.json"), r#"{"hp": 100}"#).unwrap();
+
+        let missing = state.backup_manager.create_backup(&game).unwrap();
+        std::fs::write(game.join("data.json"), "AFTER-MISSING").unwrap();
+        std::fs::remove_file(missing.path.join("manifest.json")).unwrap();
+
+        let corrupt = state.backup_manager.create_backup(&game).unwrap();
+        std::fs::write(game.join("data.json"), "AFTER-CORRUPT").unwrap();
+        std::fs::write(corrupt.path.join("manifest.json"), "not-json{").unwrap();
+
+        let (url, _h) = start_test_server(state).await;
+
+        let resp = client()
+            .post(format!("{}/api/backups/{}/restore", url, missing.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16() / 100, 4, "{}", resp.status());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains(&missing.id), "{body}");
+        assert!(body.contains("manifest.json"), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(game.join("data.json")).unwrap(),
+            "AFTER-CORRUPT"
+        );
+
+        let resp = client()
+            .post(format!("{}/api/backups/{}/restore", url, corrupt.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16() / 100, 4, "{}", resp.status());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains(&corrupt.id), "{body}");
+        assert!(body.contains("manifest.json"), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(game.join("data.json")).unwrap(),
+            "AFTER-CORRUPT"
         );
     }
 }

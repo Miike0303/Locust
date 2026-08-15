@@ -128,12 +128,35 @@ impl BackupManager {
         Ok(self.backup_root.join(backup_id))
     }
 
-    pub fn restore(&self, backup_id: &str, target_path: &Path) -> Result<()> {
+    /// Read this backup's own `manifest.json`. Missing or unreadable is a hard
+    /// error — restore has no other destination to fall back to.
+    fn load_manifest(backup_id: &str, backup_dir: &Path) -> Result<BackupManifest> {
+        let manifest_path = backup_dir.join("manifest.json");
+        let manifest_str = std::fs::read_to_string(&manifest_path).map_err(|_| {
+            LocustError::BackupError(format!("backup {backup_id} has no readable manifest.json"))
+        })?;
+        serde_json::from_str(&manifest_str).map_err(|_| {
+            LocustError::BackupError(format!("backup {backup_id} has no readable manifest.json"))
+        })
+    }
+
+    /// Restore backup `backup_id` into the `source_path` recorded in its
+    /// `manifest.json`. The caller cannot choose another destination.
+    pub fn restore(&self, backup_id: &str) -> Result<()> {
         let backup_dir = self.resolve_backup_dir(backup_id)?;
         if !backup_dir.exists() {
             return Err(LocustError::BackupError(format!(
                 "backup not found: {}",
                 backup_id
+            )));
+        }
+
+        let manifest = Self::load_manifest(backup_id, &backup_dir)?;
+        let target_path = manifest.source_path;
+        if !target_path.is_dir() {
+            return Err(LocustError::BackupError(format!(
+                "backup {backup_id} cannot be restored: its source directory no longer exists ({})",
+                target_path.display()
             )));
         }
 
@@ -292,7 +315,6 @@ mod tests {
 
         let mgr = BackupManager::new(backup_root);
         let escape = format!("../{}", outsider.file_name().unwrap().to_string_lossy());
-        let restore_target = tempdir();
 
         for bad in [
             escape.as_str(),
@@ -303,10 +325,7 @@ mod tests {
             "sub\\dir",
             "/etc",
         ] {
-            assert!(
-                mgr.restore(bad, &restore_target).is_err(),
-                "restore accepted {bad:?}"
-            );
+            assert!(mgr.restore(bad).is_err(), "restore accepted {bad:?}");
             assert!(mgr.delete_backup(bad).is_err(), "delete accepted {bad:?}");
         }
 
@@ -318,7 +337,7 @@ mod tests {
         // A real id still works.
         let game_dir = create_game_dir();
         let entry = mgr.create_backup(&game_dir).unwrap();
-        mgr.restore(&entry.id, &restore_target).unwrap();
+        mgr.restore(&entry.id).unwrap();
         mgr.delete_backup(&entry.id).unwrap();
     }
 
@@ -350,10 +369,13 @@ mod tests {
 
         // Both remain independently listable and restorable.
         assert_eq!(mgr.list_backups().unwrap().len(), 2);
-        let restore_target = tempdir();
-        mgr.restore(&b.id, &restore_target).unwrap();
-        assert!(restore_target.join("only_in_b.txt").exists());
-        assert!(!restore_target.join("data.json").exists());
+        fs::write(game_b.join("only_in_b.txt"), "mutated").unwrap();
+        mgr.restore(&b.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(game_b.join("only_in_b.txt")).unwrap(),
+            "b"
+        );
+        assert!(!game_b.join("data.json").exists());
     }
 
     #[test]
@@ -371,10 +393,110 @@ mod tests {
         );
 
         // Restore
-        mgr.restore(&entry.id, &game_dir).unwrap();
+        mgr.restore(&entry.id).unwrap();
         assert_eq!(
             fs::read_to_string(game_dir.join("data.json")).unwrap(),
             r#"{"hp": 100}"#
+        );
+    }
+
+    #[test]
+    fn test_restore_writes_to_backup_origin_not_another_game() {
+        // Inject game A (a backup is taken), then another game exists as if it
+        // were the open project. Restore must land in A; B must stay untouched.
+        let game_a = create_game_dir();
+        let game_b = tempdir();
+        fs::write(game_b.join("b_only.txt"), "keep-b").unwrap();
+
+        let backup_root = tempdir();
+        let mgr = BackupManager::new(backup_root);
+        let entry = mgr.create_backup(&game_a).unwrap();
+
+        fs::write(game_a.join("data.json"), "A-MUTATED").unwrap();
+
+        mgr.restore(&entry.id).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(game_a.join("data.json")).unwrap(),
+            r#"{"hp": 100}"#
+        );
+        assert_eq!(
+            fs::read_to_string(game_b.join("b_only.txt")).unwrap(),
+            "keep-b"
+        );
+        assert!(
+            !game_b.join("data.json").exists(),
+            "game B must not receive game A's restored files"
+        );
+    }
+
+    #[test]
+    fn test_restore_refuses_deleted_source_directory() {
+        let game_dir = create_game_dir();
+        let backup_root = tempdir();
+        let mgr = BackupManager::new(backup_root);
+        let entry = mgr.create_backup(&game_dir).unwrap();
+
+        fs::remove_dir_all(&game_dir).unwrap();
+
+        let err = mgr.restore(&entry.id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&entry.id),
+            "error must name the backup id: {msg}"
+        );
+        assert!(
+            msg.contains("no longer exists"),
+            "error must say the source directory is gone: {msg}"
+        );
+        assert!(
+            !game_dir.exists(),
+            "restore must not recreate a deleted game directory"
+        );
+    }
+
+    #[test]
+    fn test_restore_refuses_missing_or_corrupt_manifest() {
+        let game_dir = create_game_dir();
+        let backup_root = tempdir();
+        let mgr = BackupManager::new(backup_root);
+
+        let missing = mgr.create_backup(&game_dir).unwrap();
+        fs::write(game_dir.join("data.json"), "AFTER-MISSING-BACKUP").unwrap();
+        fs::remove_file(missing.path.join("manifest.json")).unwrap();
+        let err = mgr.restore(&missing.id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&missing.id),
+            "error must name the backup id: {msg}"
+        );
+        assert!(
+            msg.contains("manifest.json"),
+            "error must name the missing manifest: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(game_dir.join("data.json")).unwrap(),
+            "AFTER-MISSING-BACKUP",
+            "a backup without a manifest must not write anything"
+        );
+
+        let corrupt = mgr.create_backup(&game_dir).unwrap();
+        fs::write(game_dir.join("data.json"), "AFTER-CORRUPT-BACKUP").unwrap();
+        fs::write(corrupt.path.join("manifest.json"), "not-json{").unwrap();
+        let err = mgr.restore(&corrupt.id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&corrupt.id),
+            "error must name the backup id: {msg}"
+        );
+        assert!(
+            msg.contains("manifest.json"),
+            "error must name the unreadable manifest: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(game_dir.join("data.json")).unwrap(),
+            "AFTER-CORRUPT-BACKUP",
+            "a backup with a corrupt manifest must not write anything"
         );
     }
 

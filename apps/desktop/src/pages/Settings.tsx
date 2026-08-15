@@ -76,6 +76,14 @@ export default function Settings() {
   );
 }
 
+/** Last folder (or file) name from a backup source path. Handles Windows and POSIX. */
+function gameFolderName(sourcePath: string): string {
+  const trimmed = sourcePath.replace(/[\\/]+$/, "").trim();
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]/);
+  return parts[parts.length - 1] || trimmed;
+}
+
 function formatRunDate(iso: string): string {
   if (!iso) return "—";
   // Prefer local short form; fall back to first 16 chars of ISO.
@@ -959,8 +967,11 @@ function DataSection() {
   const t = useT();
   const { data: backups, refetch } = useQuery({ queryKey: ["backups"], queryFn: getBackups });
   const [pendingAction, setPendingAction] = useState<
-    { kind: "restore" | "delete"; id: string } | null
+    { kind: "restore" | "delete"; id: string; game: string; sourcePath: string } | null
   >(null);
+
+  const gameLabel = (sourcePath: string) =>
+    gameFolderName(sourcePath) || t("settings.data.unknownGame");
 
   const runPendingAction = async () => {
     if (!pendingAction) return;
@@ -994,21 +1005,35 @@ function DataSection() {
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-gray-500">
-                <th className="pb-2">{t("settings.data.col.id")}</th><th className="pb-2">{t("settings.data.col.created")}</th><th className="pb-2">{t("settings.data.col.files")}</th><th className="pb-2">{t("settings.data.col.actions")}</th>
+                <th className="pb-2">{t("settings.data.col.game")}</th>
+                <th className="pb-2">{t("settings.data.col.id")}</th>
+                <th className="pb-2">{t("settings.data.col.created")}</th>
+                <th className="pb-2">{t("settings.data.col.files")}</th>
+                <th className="pb-2">{t("settings.data.col.actions")}</th>
               </tr>
             </thead>
             <tbody>
-              {backups.map((b) => (
-                <tr key={b.id} className="border-t border-gray-100 dark:border-gray-800">
-                  <td className="py-2 font-mono text-xs">{b.id}</td>
-                  <td className="py-2">{new Date(b.created_at).toLocaleString()}</td>
-                  <td className="py-2">{b.file_count}</td>
-                  <td className="py-2 flex gap-2">
-                    <button onClick={() => setPendingAction({ kind: "restore", id: b.id })} className="text-emerald-600 hover:text-emerald-800" title={t("settings.data.restore")}><RotateCcw size={14} /></button>
-                    <button onClick={() => setPendingAction({ kind: "delete", id: b.id })} className="text-red-500 hover:text-red-700" title={t("settings.data.delete")}><Trash2 size={14} /></button>
-                  </td>
-                </tr>
-              ))}
+              {backups.map((b) => {
+                const game = gameLabel(b.source_path);
+                const pending = { id: b.id, game, sourcePath: b.source_path };
+                return (
+                  <tr key={b.id} className="border-t border-gray-100 dark:border-gray-800">
+                    <td className="py-2" title={b.source_path || undefined}>
+                      <div className="font-medium break-words">{game}</div>
+                      {b.source_path ? (
+                        <div className="text-xs text-gray-500 break-all">{b.source_path}</div>
+                      ) : null}
+                    </td>
+                    <td className="py-2 font-mono text-xs">{b.id}</td>
+                    <td className="py-2">{new Date(b.created_at).toLocaleString()}</td>
+                    <td className="py-2">{b.file_count}</td>
+                    <td className="py-2 flex gap-2">
+                      <button onClick={() => setPendingAction({ kind: "restore", ...pending })} className="text-emerald-600 hover:text-emerald-800" title={t("settings.data.restore")}><RotateCcw size={14} /></button>
+                      <button onClick={() => setPendingAction({ kind: "delete", ...pending })} className="text-red-500 hover:text-red-700" title={t("settings.data.delete")}><Trash2 size={14} /></button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}
@@ -1019,7 +1044,11 @@ function DataSection() {
         title={pendingAction?.kind === "restore" ? t("settings.data.confirm.restoreTitle") : t("settings.data.confirm.deleteTitle")}
         message={
           pendingAction?.kind === "restore"
-            ? t("settings.data.confirm.restoreMessage", { id: pendingAction.id })
+            ? t("settings.data.confirm.restoreMessage", {
+                id: pendingAction.id,
+                game: pendingAction.game,
+                path: pendingAction.sourcePath || pendingAction.game,
+              })
             : t("settings.data.confirm.deleteMessage", { id: pendingAction?.id ?? "" })
         }
         confirmLabel={pendingAction?.kind === "restore" ? t("settings.data.restore") : t("common.delete")}
