@@ -34,9 +34,11 @@ import { addToast } from "../stores/toastStore";
 import PatchModal from "../components/PatchModal";
 import {
 	completeOpenProject,
+	completeOpenProjectDb,
 	formatPickerPathFromState,
 	isDetectionFailure,
 	pickGameFolder,
+	shouldOpenProjectDb,
 } from "../lib/openProjectFlow";
 import { projectOpenMergeNotice } from "../lib/projectOpenMerge";
 import {
@@ -189,6 +191,52 @@ export default function Welcome() {
 		} finally {
 			setOpening(false);
 		}
+	};
+
+	/** Reopen a saved .locust.db (pivot / open-db recent) without extracting the game. */
+	const openWithDb = async (
+		databasePath: string,
+		gamePath: string,
+		formatId: string,
+	) => {
+		setOpening(true);
+		try {
+			const result = await completeOpenProjectDb(databasePath, gamePath, formatId, {
+				setProject,
+				queryClient,
+			});
+			addLog(
+				"info",
+				t("welcome.log.openedDb", {
+					name: result.project_name,
+					db: databasePath,
+					total: result.total_strings,
+				}),
+				undefined,
+				"project",
+			);
+			addToast("success", t("welcome.toast.openedDb", { name: result.project_name }));
+			setPicker(null);
+			navigate("/editor");
+		} catch (err: unknown) {
+			const msg = err instanceof Error ? err.message : String(err);
+			addLog("error", "Failed to open project database", msg, "project");
+			addToast("error", t("welcome.toast.failedOpen", { error: msg }));
+		} finally {
+			setOpening(false);
+		}
+	};
+
+	const openRecent = async (p: {
+		path: string;
+		format_id: string;
+		database_path?: string | null;
+	}) => {
+		if (shouldOpenProjectDb(p.database_path)) {
+			await openWithDb(p.database_path!.trim(), p.path, p.format_id);
+			return;
+		}
+		await openWithPath(p.path, p.format_id);
 	};
 
 	const pickFolderPath = () => pickGameFolder(t);
@@ -541,13 +589,14 @@ export default function Welcome() {
 							const colorClass =
 								FORMAT_COLORS[p.format_id] ??
 								"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+							const isDbRecent = shouldOpenProjectDb(p.database_path);
 							return (
 								<div
 									key={i}
 									className="w-full p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-emerald-300 hover:bg-gray-50 dark:hover:border-emerald-700 dark:hover:bg-gray-800 transition-colors flex items-center gap-3"
 								>
 									<button
-										onClick={() => openWithPath(p.path, p.format_id)}
+										onClick={() => openRecent(p)}
 										disabled={opening}
 										className="flex items-center gap-3 flex-1 min-w-0 text-left disabled:opacity-50 disabled:cursor-not-allowed"
 									>
@@ -555,10 +604,22 @@ export default function Welcome() {
 											<Icon size={18} />
 										</div>
 										<div className="flex-1 min-w-0">
-											<div className="font-medium truncate">{p.name}</div>
-											<div className="text-xs text-gray-500 truncate">
-												{p.path}
+											<div className="font-medium truncate flex items-center gap-2">
+												<span className="truncate">{p.name}</span>
+												{isDbRecent && (
+													<span className="shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-200">
+														{t("welcome.recentDbBadge")}
+													</span>
+												)}
 											</div>
+											<div className="text-xs text-gray-500 truncate">
+												{isDbRecent ? p.database_path : p.path}
+											</div>
+											{isDbRecent && (
+												<div className="text-[11px] text-gray-400 truncate">
+													{t("welcome.recentGame", { path: p.path })}
+												</div>
+											)}
 										</div>
 									</button>
 									<div className="flex items-center gap-2 text-xs text-gray-400 shrink-0">

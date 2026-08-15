@@ -459,6 +459,7 @@ async fn project_open(
             outcome.project_path.clone(),
             outcome.project_name.clone(),
             outcome.format_id.clone(),
+            None,
         );
     }
 
@@ -504,6 +505,16 @@ async fn project_open_db(
             format_id: outcome.format_id.clone(),
             name: outcome.project_name.clone(),
         });
+    }
+
+    {
+        let mut config = state.config.write().await;
+        config.add_recent_project(
+            outcome.project_path.clone(),
+            outcome.project_name.clone(),
+            outcome.format_id.clone(),
+            Some(outcome.database_path.clone()),
+        );
     }
 
     Ok(Json(ProjectOpenResponse::from(outcome)))

@@ -60,7 +60,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   if (res.status === 204) return undefined as T;
   const text = await res.text();
   if (!text) return undefined as T;
-  return JSON.parse(text) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    addLog("error", `API invalid JSON: ${path}`, text.slice(0, 500), "api");
+    throw new Error(`Invalid JSON from ${path}`);
+  }
 }
 
 async function requestText(path: string): Promise<string> {
@@ -98,11 +103,15 @@ export interface ProjectInfo {
   path: string; format_id: string; name: string;
   /** From project open; drives Inject modal mode list. */
   supported_modes?: OutputMode[];
+  /** Absolute .locust.db when known (pivot / open-db). */
+  database_path?: string;
 }
 
 export interface ProjectOpenResponse {
   format_id: string; format_name: string; total_strings: number;
   project_path: string; project_name: string; supported_modes: OutputMode[];
+  /** Absolute path of the SQLite project file for this open. */
+  database_path?: string;
   added: number; updated: number; stale_source_reset: number;
   removed: number; preserved_translations: number;
 }
@@ -150,7 +159,14 @@ export interface AppConfig {
   default_batch_size: number;
   default_cost_limit: number | null;
   ui: { theme: string; font_size: number; show_source_column: boolean; table_row_height: number };
-  recent_projects: { path: string; name: string; format_id: string; last_opened: string }[];
+  recent_projects: {
+    path: string;
+    name: string;
+    format_id: string;
+    last_opened: string;
+    /** When set, reopen via open-db (pivoted / saved project db). */
+    database_path?: string | null;
+  }[];
 }
 
 export interface TranslationStartParams {

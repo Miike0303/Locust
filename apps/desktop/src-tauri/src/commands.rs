@@ -77,6 +77,7 @@ pub async fn open_project(
             outcome.project_path.clone(),
             outcome.project_name.clone(),
             outcome.format_id.clone(),
+            None,
         );
         let _ = config.save(&AppConfig::default_path());
     }
@@ -122,6 +123,17 @@ async fn apply_open_project_db(
             format_id: outcome.format_id.clone(),
             name: outcome.project_name.clone(),
         });
+    }
+
+    {
+        let mut config = s.config.write().await;
+        config.add_recent_project(
+            outcome.project_path.clone(),
+            outcome.project_name.clone(),
+            outcome.format_id.clone(),
+            Some(outcome.database_path.clone()),
+        );
+        let _ = config.save(&AppConfig::default_path());
     }
 
     Ok(ProjectOpenResponse {

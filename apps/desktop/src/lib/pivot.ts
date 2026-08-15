@@ -80,5 +80,6 @@ export function projectInfoAfterPivotOpen(
     supported_modes: opened.supported_modes?.length
       ? opened.supported_modes
       : previous.supported_modes,
+    database_path: opened.database_path || previous.database_path,
   };
 }

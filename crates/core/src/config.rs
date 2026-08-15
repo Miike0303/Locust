@@ -97,8 +97,30 @@ impl AppConfig {
         Self::config_dir().join("config.json")
     }
 
-    pub fn add_recent_project(&mut self, path: PathBuf, name: String, format_id: String) {
-        self.recent_projects.retain(|p| p.path != path);
+    /// Remember a project for Welcome → Recents.
+    ///
+    /// `path` is always the **game folder** (inject / pack root).
+    /// When `database_path` is `Some`, reopening must call open-db with that
+    /// file — never extract against the game path alone (pivoted projects).
+    /// Dedupes by database path when set, otherwise by game path among
+    /// extract-style entries only so a pivot and its source can coexist.
+    pub fn add_recent_project(
+        &mut self,
+        path: PathBuf,
+        name: String,
+        format_id: String,
+        database_path: Option<PathBuf>,
+    ) {
+        match &database_path {
+            Some(db) => {
+                self.recent_projects
+                    .retain(|p| p.database_path.as_ref() != Some(db));
+            }
+            None => {
+                self.recent_projects
+                    .retain(|p| !(p.path == path && p.database_path.is_none()));
+            }
+        }
         self.recent_projects.insert(
             0,
             RecentProject {
@@ -106,6 +128,7 @@ impl AppConfig {
                 name,
                 format_id,
                 last_opened: Utc::now(),
+                database_path,
             },
         );
         self.recent_projects.truncate(10);
@@ -165,10 +188,14 @@ impl Default for UiConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecentProject {
+    /// Game folder (inject / pack root). Never a `.locust.db` alone.
     pub path: PathBuf,
     pub name: String,
     pub format_id: String,
     pub last_opened: DateTime<Utc>,
+    /// When set, Welcome reopens via open-db (no extract/merge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<PathBuf>,
 }
 
 impl PartialEq for AppConfig {
@@ -261,9 +288,9 @@ mod tests {
     #[test]
     fn test_add_recent_project() {
         let mut cfg = AppConfig::default();
-        cfg.add_recent_project(PathBuf::from("/a"), "A".into(), "json".into());
-        cfg.add_recent_project(PathBuf::from("/b"), "B".into(), "json".into());
-        cfg.add_recent_project(PathBuf::from("/c"), "C".into(), "json".into());
+        cfg.add_recent_project(PathBuf::from("/a"), "A".into(), "json".into(), None);
+        cfg.add_recent_project(PathBuf::from("/b"), "B".into(), "json".into(), None);
+        cfg.add_recent_project(PathBuf::from("/c"), "C".into(), "json".into(), None);
         assert_eq!(cfg.recent_projects.len(), 3);
         assert_eq!(cfg.recent_projects[0].name, "C");
         assert_eq!(cfg.recent_projects[1].name, "B");
@@ -278,6 +305,7 @@ mod tests {
                 PathBuf::from(format!("/proj{}", i)),
                 format!("P{}", i),
                 "json".into(),
+                None,
             );
         }
         assert_eq!(cfg.recent_projects.len(), 10);
@@ -286,10 +314,39 @@ mod tests {
     #[test]
     fn test_recent_projects_deduplication() {
         let mut cfg = AppConfig::default();
-        cfg.add_recent_project(PathBuf::from("/same"), "First".into(), "json".into());
-        cfg.add_recent_project(PathBuf::from("/same"), "Second".into(), "json".into());
+        cfg.add_recent_project(PathBuf::from("/same"), "First".into(), "json".into(), None);
+        cfg.add_recent_project(PathBuf::from("/same"), "Second".into(), "json".into(), None);
         assert_eq!(cfg.recent_projects.len(), 1);
         assert_eq!(cfg.recent_projects[0].name, "Second");
+    }
+
+    #[test]
+    fn test_recent_pivot_coexists_with_source_game() {
+        let mut cfg = AppConfig::default();
+        let game = PathBuf::from("/game");
+        cfg.add_recent_project(game.clone(), "Game".into(), "rpgmaker-mv".into(), None);
+        cfg.add_recent_project(
+            game.clone(),
+            "Game-pivot".into(),
+            "rpgmaker-mv".into(),
+            Some(PathBuf::from("/game-pivot.locust.db")),
+        );
+        assert_eq!(cfg.recent_projects.len(), 2);
+        assert_eq!(
+            cfg.recent_projects[0].database_path.as_deref(),
+            Some(Path::new("/game-pivot.locust.db"))
+        );
+        assert!(cfg.recent_projects[1].database_path.is_none());
+
+        // Re-adding the same pivot replaces it, source stays.
+        cfg.add_recent_project(
+            game,
+            "Game-pivot".into(),
+            "rpgmaker-mv".into(),
+            Some(PathBuf::from("/game-pivot.locust.db")),
+        );
+        assert_eq!(cfg.recent_projects.len(), 2);
+        assert_eq!(cfg.recent_projects[0].name, "Game-pivot");
     }
 
     #[test]

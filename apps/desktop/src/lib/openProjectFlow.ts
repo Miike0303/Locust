@@ -13,7 +13,13 @@ export function projectFromOpenResponse(result: ProjectOpenResponse): ProjectInf
     format_id: result.format_id,
     name: result.project_name,
     supported_modes: result.supported_modes,
+    database_path: result.database_path || undefined,
   };
+}
+
+/** Prefer open-db when a recent entry (or picker) names a project database. */
+export function shouldOpenProjectDb(databasePath: string | null | undefined): boolean {
+  return typeof databasePath === "string" && /\.locust\.db$/i.test(databasePath.trim());
 }
 
 export const PROJECT_QUERY_KEYS = [
@@ -52,6 +58,23 @@ export async function completeOpenProject(
 ): Promise<ProjectOpenResponse> {
   const { openProject } = await import("./api");
   const result = await openProject(path, formatId);
+  deps.setProject(projectFromOpenResponse(result));
+  dropProjectQueries(deps.queryClient);
+  return result;
+}
+
+/** Open an existing .locust.db without extract/merge (pivot, CLI db, recents). */
+export async function completeOpenProjectDb(
+  databasePath: string,
+  gamePath: string,
+  formatId: string,
+  deps: {
+    setProject: (p: ProjectInfo) => void;
+    queryClient: QueryClient;
+  },
+): Promise<ProjectOpenResponse> {
+  const { openProjectDb } = await import("./api");
+  const result = await openProjectDb(databasePath, gamePath, formatId);
   deps.setProject(projectFromOpenResponse(result));
   dropProjectQueries(deps.queryClient);
   return result;

@@ -6,6 +6,7 @@ import {
   formatPickerPathFromState,
   isDetectionFailure,
   projectFromOpenResponse,
+  shouldOpenProjectDb,
 } from "./openProjectFlow.ts";
 
 const assert = {
@@ -37,6 +38,7 @@ const info = projectFromOpenResponse({
   project_path: "/games/title",
   project_name: "title",
   supported_modes: ["replace"],
+  database_path: "/games/title.locust.db",
   added: 3,
   updated: 0,
   stale_source_reset: 0,
@@ -46,5 +48,14 @@ const info = projectFromOpenResponse({
 assert.equal(info.path, "/games/title");
 assert.equal(info.format_id, "renpy");
 assert.equal(info.name, "title");
+assert.equal(info.database_path, "/games/title.locust.db");
+
+assert.equal(shouldOpenProjectDb(undefined), false);
+assert.equal(shouldOpenProjectDb(""), false);
+assert.equal(shouldOpenProjectDb("/games/title"), false);
+assert.equal(shouldOpenProjectDb("/games/title-pivot.locust.db"), true);
+assert.equal(shouldOpenProjectDb("C:\\x\\a.locust.db"), true);
+// Negative: treating a bare game path as open-db would re-extract pivots.
+assert.equal(shouldOpenProjectDb("/games/title"), false);
 
 console.log("openProjectFlow.test.ts: ok");
