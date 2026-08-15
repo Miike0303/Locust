@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::database::{paths_identical, sha256_hex, Database};
+use crate::database::{copy_path_chunked, paths_identical, sha256_file, Database};
 use crate::error::{LocustError, Result};
 use crate::models::StringStatus;
 use crate::patch::manifest::{PatchFileEntry, PatchManifest};
@@ -304,20 +304,21 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
             )));
         }
         let src = recording.root.join(rel.components().collect::<PathBuf>());
-        let bytes = match std::fs::read(&src) {
-            Ok(b) => b,
+        // Hash on disk in 1 MiB chunks — never `fs::read` a multi-GB pak.
+        let (hash, size) = match sha256_file(&src) {
+            Ok(v) => v,
             Err(_) => {
                 missing.push(src);
                 continue;
             }
         };
-        if bytes.len() as u64 != f.size || sha256_hex(&bytes) != f.hash {
+        if size != f.size || hash != f.hash {
             changed.push(f.rel.clone());
             continue;
         }
         let original_sha256 = pristine_root.as_ref().and_then(|root| {
             let p = root.join(rel.components().collect::<PathBuf>());
-            std::fs::read(&p).ok().map(|b| sha256_hex(&b))
+            sha256_file(&p).ok().map(|(h, _)| h)
         });
         manifest_files.push(PatchFileEntry {
             path: f.rel.clone(),
@@ -326,10 +327,11 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
             original_sha256,
         });
         // ZIP64 for entries at/over 4 GiB (multi-GB Unreal base paks).
-        let entry_opts = zip_opts.large_file(bytes.len() as u64 >= 0xFFFF_FFFF);
+        let entry_opts = zip_opts.large_file(size >= 0xFFFF_FFFF);
         zip.start_file(f.rel.clone(), entry_opts)
             .map_err(|e| pack_err(format!("zip start_file {}: {e}", f.rel)))?;
-        zip.write_all(&bytes)?;
+        copy_path_chunked(&src, &mut zip)
+            .map_err(|e| pack_err(format!("zip write {}: {e}", f.rel)))?;
         added += 1;
     }
 

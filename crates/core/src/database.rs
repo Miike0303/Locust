@@ -132,6 +132,47 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// 1 MiB — same chunk as patch apply/verify streaming. Pack and injection
+/// recording MUST use this path for multi-GB game files; `fs::read` peak RAM
+/// equals file size (2× with `--pristine`).
+const FILE_HASH_CHUNK: usize = 1024 * 1024;
+
+/// SHA-256 a file without loading it entirely into RAM.
+/// Returns `(lowercase_hex, byte_len)`.
+pub fn sha256_file(path: &Path) -> Result<(String, u64)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; FILE_HASH_CHUNK];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        hasher.update(&buf[..n]);
+    }
+    Ok((hex::encode(hasher.finalize()), total))
+}
+
+/// Stream `path` into `out` in fixed-size chunks (no full-file buffer).
+pub fn copy_path_chunked(path: &Path, out: &mut dyn std::io::Write) -> Result<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; FILE_HASH_CHUNK];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
+}
+
 /// Case-fold a path fragment for comparison — ONLY where the filesystem
 /// itself folds case (NTFS, APFS). On ext4 two case spellings are two
 /// different files, and folding would invent a match between them.
@@ -849,8 +890,8 @@ impl Database {
                     seen.insert(fold_path_case(&rel), (identity, p.clone()));
                 }
             }
-            let bytes = std::fs::read(p)?;
-            rows.push((rel, sha256_hex(&bytes), bytes.len() as u64));
+            let (hash, size) = sha256_file(p)?;
+            rows.push((rel, hash, size));
         }
 
         let root_str = root_abs.to_string_lossy().to_string();
@@ -1486,6 +1527,39 @@ mod tests {
     fn test_open_in_memory() {
         let db = Database::open_in_memory().unwrap();
         assert!(db.get_entries(&EntryFilter::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sha256_file_matches_in_memory_across_chunk_boundary() {
+        // FILE_HASH_CHUNK is 1 MiB — force at least two reads.
+        let dir = recording_tempdir();
+        let path = dir.join("big.bin");
+        let mut data = vec![0u8; FILE_HASH_CHUNK + 50_000];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        std::fs::write(&path, &data).unwrap();
+        let (hash, size) = sha256_file(&path).unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(hash, sha256_hex(&data));
+        // Negative: wrong length must not pass as equal to a truncated hash input.
+        assert_ne!(hash, sha256_hex(&data[..data.len() - 1]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_path_chunked_roundtrip_multi_chunk() {
+        let dir = recording_tempdir();
+        let src = dir.join("src.bin");
+        let dst = dir.join("dst.bin");
+        let data = vec![0x5Au8; FILE_HASH_CHUNK + 12];
+        std::fs::write(&src, &data).unwrap();
+        let mut out = std::fs::File::create(&dst).unwrap();
+        let n = copy_path_chunked(&src, &mut out).unwrap();
+        drop(out);
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(std::fs::read(&dst).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─── injection recording (root + rel + hash per language) ──────────────
