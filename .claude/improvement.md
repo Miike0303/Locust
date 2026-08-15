@@ -44,6 +44,17 @@ Owned by no lane; Claude applies these after the writers finish.
 - Never propose or accept an unattended write to the user's own game files —
   batch writes need a human.
 
+## Stopping
+
+The loop runs until the user stops it, the session closes, or there is nothing
+actionable left — an empty backlog **and** a research round that found nothing.
+Nothing else ends it. In particular a completed cycle does not: re-arm at the
+end of every turn.
+
+Cycles 3 and 4 ran only because the user prompted, after the tick was never
+re-armed. That failure is silent by nature — a loop that stopped looks the same
+as a loop with nothing to say.
+
 ## Notes
 
 `delivery: commit-only` and `branch: feature` are deliberate for this repo:
