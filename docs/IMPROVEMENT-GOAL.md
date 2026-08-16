@@ -23,7 +23,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 - `suggest_replacement_font` maps missing scripts to Noto families (`crates/core/src/font_validation.rs:118-184`) and is called only by its own tests. Validate reports missing glyphs and stops, so the user leaves the app to go font hunting. Found by Cursor, cycle 5.
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs:637-644`) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs:569-584`) and `find_utf16le_strings` walks it again (`unreal.rs:455-507`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
 - `find_pak_files` runs twice per open — once from `detect` (`crates/formats/src/unreal.rs:105`), again from `extract` (`:605`). Cheap now that detection only reads the tail, but still duplicated work.
-- `save_entries` (`crates/core/src/database.rs:399-409`) and `merge_entries` (`:1182`, `:1205`, `:1239`) call `tx.execute` inside loops, so the same SQL is parsed and planned once per row — up to 33,767 times on a real extract. `prepare_cached` would do it once. Found by Claude, cycle 2; no automatable check identified, which is why it lost to a measurable win.
 - Server error messages are not localized. They reach the user verbatim inside translated toasts (`apps/desktop/src/lib/api.ts` reads `res.text()`, `Welcome.tsx:182` interpolates it), so a Spanish UI shows English sentences from the backend. A whole class, not one string.
 - Any other database write racing `Database::reopen` is the same class as cycle 4 but was not the evidenced case — a synchronous inject, for instance. A general lock around the swap is a larger change and was deliberately not attempted.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
@@ -33,6 +32,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 11 (optimization, from backlog).** `save_entries` and `merge_entries` re-parsed the same SQL once per row via `tx.execute` inside loops (up to ~34k times on Ochiru). Both now `prepare_cached` the INSERT/UPDATE/DELETE statements once per transaction. Existing save/merge unit tests still green. No research duel: cited cycle-2 optimization. Next rotation: `defect`.
 
 - `pending` — **cycle 10 (capability, from backlog).** The queue hard-coded `max_concurrent: 3`, `cost_limit_usd: null`, and no fallbacks while Translate and the CLI already sent the full `TranslationStartParams` — the documented escape for grok count-mismatch stalls on Taimanin-scale runs. Shared `buildTranslationStartParams` + fallback storage with the translate dialog; Queue UI exposes concurrency, cost limit, and fallback chain; last-used prefs remember concurrency. Pinned by unit tests on the builder (negative: not the old hard-coded triple). No research duel: cited cycle-5 capability. Next rotation: `optimization`.
 

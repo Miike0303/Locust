@@ -435,7 +435,15 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         // Single transaction: per-row implicit transactions fsync each insert,
         // which takes minutes for a full game extraction.
+        // prepare_cached: parse/plan the INSERT once per connection, not per row
+        // (33k Ochiru / 22k Injuu extracts).
         let tx = conn.unchecked_transaction()?;
+        let mut insert = tx.prepare_cached(
+            "INSERT OR REPLACE INTO strings
+                 (id, source, translation, status, file_path, context, tags, metadata,
+                  char_limit, provider_used, created_at, translated_at, reviewed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        )?;
         let mut count = 0usize;
         for entry in entries {
             let tags_json = serde_json::to_string(&entry.tags)?;
@@ -447,29 +455,24 @@ impl Database {
             let reviewed_at_str = entry.reviewed_at.map(|d| d.to_rfc3339());
             let char_limit = entry.char_limit.map(|l| l as i64);
 
-            tx.execute(
-                "INSERT OR REPLACE INTO strings
-                 (id, source, translation, status, file_path, context, tags, metadata,
-                  char_limit, provider_used, created_at, translated_at, reviewed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    entry.id,
-                    entry.source,
-                    entry.translation,
-                    status_str,
-                    file_path_str,
-                    entry.context,
-                    tags_json,
-                    metadata_json,
-                    char_limit,
-                    entry.provider_used,
-                    created_at_str,
-                    translated_at_str,
-                    reviewed_at_str,
-                ],
-            )?;
+            insert.execute(params![
+                entry.id,
+                entry.source,
+                entry.translation,
+                status_str,
+                file_path_str,
+                entry.context,
+                tags_json,
+                metadata_json,
+                char_limit,
+                entry.provider_used,
+                created_at_str,
+                translated_at_str,
+                reviewed_at_str,
+            ])?;
             count += 1;
         }
+        drop(insert);
         tx.commit()?;
         Ok(count)
     }
@@ -1218,33 +1221,19 @@ impl Database {
 
         let mut stats = MergeStats::default();
 
-        for id in existing.keys() {
-            if !incoming.contains_key(id.as_str()) {
-                tx.execute("DELETE FROM strings WHERE id = ?1", params![id])?;
-                stats.removed += 1;
+        {
+            let mut delete = tx.prepare_cached("DELETE FROM strings WHERE id = ?1")?;
+            for id in existing.keys() {
+                if !incoming.contains_key(id.as_str()) {
+                    delete.execute(params![id])?;
+                    stats.removed += 1;
+                }
             }
         }
 
-        for (id, entry) in incoming {
-            let tags_json = serde_json::to_string(&entry.tags)?;
-            let metadata_json = serde_json::to_string(&entry.metadata)?;
-            let file_path_str = entry.file_path.to_string_lossy().to_string();
-            let char_limit = entry.char_limit.map(|l| l as i64);
-
-            if let Some(old) = existing.get(id) {
-                let source_changed = old.source != entry.source;
-                let status = if source_changed {
-                    stats.stale_source_reset += 1;
-                    StringStatus::Pending.to_string()
-                } else {
-                    old.status.clone()
-                };
-                if old.translation.as_ref().is_some_and(|t| !t.is_empty()) {
-                    stats.preserved_translations += 1;
-                }
-                stats.updated += 1;
-                tx.execute(
-                    "UPDATE strings SET
+        {
+            let mut update = tx.prepare_cached(
+                "UPDATE strings SET
                         source = ?1,
                         file_path = ?2,
                         context = ?3,
@@ -1258,7 +1247,33 @@ impl Database {
                         translated_at = ?11,
                         reviewed_at = ?12
                      WHERE id = ?13",
-                    params![
+            )?;
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO strings
+                     (id, source, translation, status, file_path, context, tags, metadata,
+                      char_limit, provider_used, created_at, translated_at, reviewed_at)
+                     VALUES (?1, ?2, NULL, 'pending', ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL)",
+            )?;
+
+            for (id, entry) in incoming {
+                let tags_json = serde_json::to_string(&entry.tags)?;
+                let metadata_json = serde_json::to_string(&entry.metadata)?;
+                let file_path_str = entry.file_path.to_string_lossy().to_string();
+                let char_limit = entry.char_limit.map(|l| l as i64);
+
+                if let Some(old) = existing.get(id) {
+                    let source_changed = old.source != entry.source;
+                    let status = if source_changed {
+                        stats.stale_source_reset += 1;
+                        StringStatus::Pending.to_string()
+                    } else {
+                        old.status.clone()
+                    };
+                    if old.translation.as_ref().is_some_and(|t| !t.is_empty()) {
+                        stats.preserved_translations += 1;
+                    }
+                    stats.updated += 1;
+                    update.execute(params![
                         entry.source,
                         file_path_str,
                         entry.context,
@@ -1272,17 +1287,11 @@ impl Database {
                         old.translated_at,
                         old.reviewed_at,
                         entry.id,
-                    ],
-                )?;
-            } else {
-                stats.added += 1;
-                let created_at = entry.created_at.to_rfc3339();
-                tx.execute(
-                    "INSERT INTO strings
-                     (id, source, translation, status, file_path, context, tags, metadata,
-                      char_limit, provider_used, created_at, translated_at, reviewed_at)
-                     VALUES (?1, ?2, NULL, 'pending', ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL)",
-                    params![
+                    ])?;
+                } else {
+                    stats.added += 1;
+                    let created_at = entry.created_at.to_rfc3339();
+                    insert.execute(params![
                         entry.id,
                         entry.source,
                         file_path_str,
@@ -1291,8 +1300,8 @@ impl Database {
                         metadata_json,
                         char_limit,
                         created_at,
-                    ],
-                )?;
+                    ])?;
+                }
             }
         }
 
