@@ -184,6 +184,15 @@ pub fn suggest_replacement_font(missing_chars: &[char]) -> Vec<FontSuggestion> {
     suggestions
 }
 
+/// Union missing glyphs across game fonts and map them to Noto families.
+pub fn suggestions_for_font_reports(fonts: &[FontCoverageReport]) -> Vec<FontSuggestion> {
+    let mut missing = Vec::new();
+    for report in fonts {
+        missing.extend(report.missing_chars.iter().copied());
+    }
+    suggest_replacement_font(&missing)
+}
+
 /// Build a minimal valid TrueType font that covers ASCII (0x20-0x7E).
 /// This is a hand-crafted minimal TTF for testing purposes.
 #[cfg(test)]
@@ -499,5 +508,23 @@ mod tests {
         assert!(!suggestions.is_empty());
         let has_cjk = suggestions.iter().any(|s| s.font_name.contains("CJK"));
         assert!(has_cjk);
+    }
+
+    #[test]
+    fn test_suggestions_for_font_reports_unions_missing() {
+        let fonts = vec![FontCoverageReport {
+            font_path: PathBuf::from("a.ttf"),
+            font_name: Some("A".into()),
+            total_unique_chars: 2,
+            missing_chars: vec!['ñ'],
+            missing_count: 1,
+            coverage_percent: 50.0,
+            has_full_coverage: false,
+        }];
+        let s = suggestions_for_font_reports(&fonts);
+        assert!(!s.is_empty());
+        assert!(s.iter().any(|x| x.font_name.contains("Noto")));
+        // Negative: empty missing → no shopping list
+        assert!(suggestions_for_font_reports(&[]).is_empty());
     }
 }

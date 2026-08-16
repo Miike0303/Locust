@@ -22,7 +22,9 @@ use locust_core::database::{
 };
 use locust_core::export;
 use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
-use locust_core::font_validation::{FontCoverageReport, FontValidator};
+use locust_core::font_validation::{
+    suggestions_for_font_reports, FontCoverageReport, FontValidator,
+};
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
 use locust_core::project::{self, ProjectOpenOutcome};
@@ -1727,10 +1729,12 @@ async fn validate(State(state): State<Arc<AppState>>) -> Result<Json<serde_json:
     } else {
         Vec::new()
     };
+    let font_suggestions = suggestions_for_font_reports(&fonts);
 
     Ok(Json(serde_json::json!({
         "validation": validation,
         "fonts": fonts,
+        "font_suggestions": font_suggestions,
     })))
 }
 

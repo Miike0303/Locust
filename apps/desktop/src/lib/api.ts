@@ -254,9 +254,18 @@ export interface FontCoverageReport {
   has_full_coverage: boolean;
 }
 
+export interface FontSuggestion {
+  font_name: string;
+  covers_scripts: string[];
+  download_url: string;
+  license: string;
+}
+
 export interface ValidationResponse {
   validation: ValidationReport;
   fonts: FontCoverageReport[];
+  /** Noto (etc.) families that cover missing scripts — empty when fonts are fine. */
+  font_suggestions?: FontSuggestion[];
 }
 
 /** Human label for a ValidationKind discriminant. */

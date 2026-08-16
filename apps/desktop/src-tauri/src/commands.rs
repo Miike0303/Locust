@@ -424,10 +424,12 @@ pub async fn run_validation(
     } else {
         Vec::new()
     };
+    let font_suggestions = locust_core::font_validation::suggestions_for_font_reports(&fonts);
 
     Ok(serde_json::json!({
         "validation": validation,
         "fonts": fonts,
+        "font_suggestions": font_suggestions,
     }))
 }
 

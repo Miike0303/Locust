@@ -20,7 +20,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 ## Backlog
 
 - **`t()` is not key-typed.** `apps/desktop/src/lib/i18n/index.ts:139` declares `t(key: string, ...)`, so the compile-time guarantee only covers EN↔ES parity (`es.ts` is `Record<keyof typeof en, string>`). A key the code uses but neither catalog defines compiles clean and renders its raw name on screen. Tightening to `keyof typeof en` would catch it, but the dynamic call sites — `t(JOB_STREAM_LOST_MESSAGE)`, `t(resolvedSource.error)` — would need their unions typed as key subsets first. Found by Claude, cycle 5.
-- `suggest_replacement_font` maps missing scripts to Noto families (`crates/core/src/font_validation.rs:118-184`) and is called only by its own tests. Validate reports missing glyphs and stops, so the user leaves the app to go font hunting. Found by Cursor, cycle 5.
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs:637-644`) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs:569-584`) and `find_utf16le_strings` walks it again (`unreal.rs:455-507`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
 - `find_pak_files` runs twice per open — once from `detect` (`crates/formats/src/unreal.rs:105`), again from `extract` (`:605`). Cheap now that detection only reads the tail, but still duplicated work.
 - Server error messages are not localized. They reach the user verbatim inside translated toasts (`apps/desktop/src/lib/api.ts` reads `res.text()`, `Welcome.tsx:182` interpolates it), so a Spanish UI shows English sentences from the backend. A whole class, not one string.
@@ -32,6 +31,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 12 (capability, from backlog).** `suggest_replacement_font` mapped missing scripts to Noto families but only ran in unit tests; Validate showed missing glyphs and stopped. Validate (HTTP + Tauri) now returns `font_suggestions` via `suggestions_for_font_reports`, and the results modal lists downloadable families with scripts covered. Pinned by union/empty tests. Category note: rotation called for defect; remaining defects are large classes (server i18n, reopen race) so this cited capability shipped instead. Next rotation: `optimization`.
 
 - `pending` — **cycle 11 (optimization, from backlog).** `save_entries` and `merge_entries` re-parsed the same SQL once per row via `tx.execute` inside loops (up to ~34k times on Ochiru). Both now `prepare_cached` the INSERT/UPDATE/DELETE statements once per transaction. Existing save/merge unit tests still green. No research duel: cited cycle-2 optimization. Next rotation: `defect`.
 

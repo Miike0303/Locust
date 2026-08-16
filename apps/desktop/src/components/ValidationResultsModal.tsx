@@ -5,6 +5,7 @@ import type {
 	ValidationIssue,
 	ValidationKind,
 	FontCoverageReport,
+	FontSuggestion,
 } from "../lib/api";
 import { validationKindLabel } from "../lib/api";
 import {
@@ -62,7 +63,13 @@ function kindDetail(
 	return null;
 }
 
-function FontSection({ fonts }: { fonts: FontCoverageReport[] }) {
+function FontSection({
+	fonts,
+	suggestions = [],
+}: {
+	fonts: FontCoverageReport[];
+	suggestions?: FontSuggestion[];
+}) {
 	const t = useT();
 	const withMissing = fonts.filter((f) => f.missing_count > 0);
 	if (withMissing.length === 0) return null;
@@ -105,6 +112,36 @@ function FontSection({ fonts }: { fonts: FontCoverageReport[] }) {
 					);
 				})}
 			</div>
+			{suggestions.length > 0 && (
+				<div className="mt-3 space-y-2">
+					<h4 className="text-xs font-semibold text-gray-500 uppercase">
+						{t("validate.fontSuggestions")}
+					</h4>
+					{suggestions.map((s) => (
+						<div
+							key={s.font_name}
+							className="text-sm border border-violet-200 dark:border-violet-800 bg-violet-50/50 dark:bg-violet-950/20 rounded p-2"
+						>
+							<div className="font-medium text-violet-900 dark:text-violet-100">
+								{s.font_name}
+							</div>
+							<div className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">
+								{t("validate.fontCovers", {
+									scripts: s.covers_scripts.join(", "),
+								})}
+							</div>
+							<div className="text-[11px] text-gray-500 mt-0.5">{s.license}</div>
+							<button
+								type="button"
+								onClick={() => window.open(s.download_url, "_blank", "noopener,noreferrer")}
+								className="text-xs font-medium text-violet-700 dark:text-violet-300 hover:underline mt-1"
+							>
+								{t("validate.fontDownload")}
+							</button>
+						</div>
+					))}
+				</div>
+			)}
 		</div>
 	);
 }
@@ -267,7 +304,7 @@ export default function ValidationResultsModal({
 						</div>
 					)}
 
-					<FontSection fonts={fonts ?? []} />
+					<FontSection fonts={fonts ?? []} suggestions={result.font_suggestions ?? []} />
 				</div>
 
 				<div className={MODAL_FOOTER_CLASS}>
