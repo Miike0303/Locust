@@ -30,6 +30,8 @@ export interface LastUsedTranslationPrefs {
   source?: string;
   target?: string;
   batchSize?: number;
+  /** Parallel batches; queue and translate dialog share last-used when set. */
+  maxConcurrent?: number;
   /** Raw input value; "" means an explicit "no limit". */
   costLimit?: string;
 }
@@ -40,6 +42,7 @@ export interface TranslationDefaults {
   sourceLang: string;
   targetLang: string;
   batchSize: number;
+  maxConcurrent: number;
   /** Raw input value; "" = no limit. */
   costLimit: string;
 }
@@ -69,7 +72,63 @@ export function resolveTranslationDefaults(
     sourceLang: nonEmpty(lastUsed?.source) ?? nonEmpty(config?.default_source_lang) ?? "auto",
     targetLang: nonEmpty(lastUsed?.target) ?? nonEmpty(config?.default_target_lang) ?? "es",
     batchSize: validBatch(lastUsed?.batchSize) ?? validBatch(config?.default_batch_size) ?? 40,
+    // Translate dialog historically defaulted to 1; queue used 3. Prefer last-used, else 3
+    // so batch runs keep the documented escape hatch for large projects.
+    maxConcurrent: validBatch(lastUsed?.maxConcurrent) ?? 3,
     costLimit,
+  };
+}
+
+/** Shape shared by TranslationModal and QueuePanel when calling startTranslation. */
+export type TranslationStartForm = {
+  providerId: string;
+  fallbackIds: string[];
+  sourceLang: string;
+  targetLang: string;
+  batchSize: number;
+  maxConcurrent: number;
+  /** Raw; empty string → null cost limit. */
+  costLimit: string;
+  gameContext: string;
+};
+
+export function buildTranslationStartParams(form: TranslationStartForm): {
+  provider_id: string;
+  fallback_provider_ids?: string[];
+  options: {
+    source_lang: string;
+    target_lang: string;
+    batch_size: number;
+    max_concurrent: number;
+    cost_limit_usd: number | null;
+    game_context: string | null;
+    use_glossary: boolean;
+    use_memory: boolean;
+    skip_approved: boolean;
+  };
+} {
+  const parsedCost = form.costLimit.trim() === "" ? NaN : Number.parseFloat(form.costLimit);
+  const cost_limit_usd =
+    Number.isFinite(parsedCost) && parsedCost > 0 ? parsedCost : null;
+  const max_concurrent = Math.max(1, validBatch(form.maxConcurrent) ?? 1);
+  const batch_size = Math.max(1, validBatch(form.batchSize) ?? 40);
+  const fallbacks = form.fallbackIds.filter(
+    (id) => typeof id === "string" && id.length > 0 && id !== form.providerId,
+  );
+  return {
+    provider_id: form.providerId,
+    ...(fallbacks.length > 0 ? { fallback_provider_ids: fallbacks } : {}),
+    options: {
+      source_lang: form.sourceLang,
+      target_lang: form.targetLang,
+      batch_size,
+      max_concurrent,
+      cost_limit_usd,
+      game_context: form.gameContext.trim() || null,
+      use_glossary: true,
+      use_memory: true,
+      skip_approved: true,
+    },
   };
 }
 
@@ -104,6 +163,28 @@ export function coerceProviderId(
 
 /** Historical key — legacy entries hold `{ source, target }` and still parse. */
 export const TRANSLATION_PREFS_KEY = "locust.translation.langs";
+
+/** Shared by TranslationModal and QueuePanel. */
+export const FALLBACK_STORAGE_KEY = "locust.translation.fallbacks";
+
+export function readTranslationFallbacks(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(FALLBACK_STORAGE_KEY) || "[]");
+    return Array.isArray(v)
+      ? v.filter((x: unknown): x is string => typeof x === "string" && x.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveTranslationFallbacks(ids: string[]): void {
+  try {
+    localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(ids));
+  } catch {
+    /* best effort */
+  }
+}
 
 export function readLastUsedTranslationPrefs(): LastUsedTranslationPrefs {
   try {

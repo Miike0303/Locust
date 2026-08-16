@@ -3,6 +3,7 @@
  */
 import assert from "node:assert/strict";
 import {
+  buildTranslationStartParams,
   coerceProviderId,
   resolveTranslationDefaults,
 } from "./translationDefaults.ts";
@@ -13,6 +14,7 @@ assert.deepEqual(resolveTranslationDefaults(undefined, undefined), {
   sourceLang: "auto",
   targetLang: "es",
   batchSize: 40,
+  maxConcurrent: 3,
   costLimit: "",
 });
 assert.deepEqual(resolveTranslationDefaults(null, null), {
@@ -20,6 +22,7 @@ assert.deepEqual(resolveTranslationDefaults(null, null), {
   sourceLang: "auto",
   targetLang: "es",
   batchSize: 40,
+  maxConcurrent: 3,
   costLimit: "",
 });
 
@@ -35,7 +38,14 @@ assert.deepEqual(
     },
     undefined
   ),
-  { providerId: "deepl", sourceLang: "ja", targetLang: "en", batchSize: 25, costLimit: "1.5" }
+  {
+    providerId: "deepl",
+    sourceLang: "ja",
+    targetLang: "en",
+    batchSize: 25,
+    maxConcurrent: 3,
+    costLimit: "1.5",
+  }
 );
 
 // Config with null provider / null cost limit / empty langs → fallbacks fill in
@@ -50,7 +60,14 @@ assert.deepEqual(
     },
     undefined
   ),
-  { providerId: "", sourceLang: "auto", targetLang: "es", batchSize: 25, costLimit: "" }
+  {
+    providerId: "",
+    sourceLang: "auto",
+    targetLang: "es",
+    batchSize: 25,
+    maxConcurrent: 3,
+    costLimit: "",
+  }
 );
 
 // Last-used wins over config
@@ -63,9 +80,23 @@ assert.deepEqual(
       default_batch_size: 25,
       default_cost_limit: 1.5,
     },
-    { provider: "ollama", source: "zh-CN", target: "fr", batchSize: 10, costLimit: "0.25" }
+    {
+      provider: "ollama",
+      source: "zh-CN",
+      target: "fr",
+      batchSize: 10,
+      maxConcurrent: 1,
+      costLimit: "0.25",
+    }
   ),
-  { providerId: "ollama", sourceLang: "zh-CN", targetLang: "fr", batchSize: 10, costLimit: "0.25" }
+  {
+    providerId: "ollama",
+    sourceLang: "zh-CN",
+    targetLang: "fr",
+    batchSize: 10,
+    maxConcurrent: 1,
+    costLimit: "0.25",
+  }
 );
 
 // Partial last-used → per-field merge (missing fields fall through to config)
@@ -80,7 +111,14 @@ assert.deepEqual(
     },
     { target: "pt-BR" }
   ),
-  { providerId: "deepl", sourceLang: "ja", targetLang: "pt-BR", batchSize: 25, costLimit: "1.5" }
+  {
+    providerId: "deepl",
+    sourceLang: "ja",
+    targetLang: "pt-BR",
+    batchSize: 25,
+    maxConcurrent: 3,
+    costLimit: "1.5",
+  }
 );
 
 // Last-used "" cost limit is an explicit "no limit" and beats the config limit
@@ -118,7 +156,66 @@ assert.deepEqual(
     { default_provider: "deepl", default_source_lang: "ja", default_target_lang: "en" },
     { provider: "", source: "", target: "" }
   ),
-  { providerId: "deepl", sourceLang: "ja", targetLang: "en", batchSize: 40, costLimit: "" }
+  {
+    providerId: "deepl",
+    sourceLang: "ja",
+    targetLang: "en",
+    batchSize: 40,
+    maxConcurrent: 3,
+    costLimit: "",
+  }
+);
+
+// buildTranslationStartParams: queue must send fallbacks, concurrency, cost
+{
+  const p = buildTranslationStartParams({
+    providerId: "grok-sub",
+    fallbackIds: ["mock", "grok-sub", ""],
+    sourceLang: "ja",
+    targetLang: "es",
+    batchSize: 20,
+    maxConcurrent: 2,
+    costLimit: "1.25",
+    gameContext: "  VN  ",
+  });
+  assert.equal(p.provider_id, "grok-sub");
+  assert.deepEqual(p.fallback_provider_ids, ["mock"]);
+  assert.equal(p.options.max_concurrent, 2);
+  assert.equal(p.options.cost_limit_usd, 1.25);
+  assert.equal(p.options.game_context, "VN");
+  assert.equal(p.options.batch_size, 20);
+}
+// empty cost / zero concurrency clamps
+{
+  const p = buildTranslationStartParams({
+    providerId: "mock",
+    fallbackIds: [],
+    sourceLang: "en",
+    targetLang: "es",
+    batchSize: 0,
+    maxConcurrent: 0,
+    costLimit: "",
+    gameContext: "",
+  });
+  assert.equal(p.fallback_provider_ids, undefined);
+  assert.equal(p.options.max_concurrent, 1);
+  assert.equal(p.options.cost_limit_usd, null);
+  assert.equal(p.options.batch_size, 40);
+  assert.equal(p.options.game_context, null);
+}
+// Negative: hardcoding max_concurrent:3 with null cost must not be the only path
+assert.notDeepEqual(
+  buildTranslationStartParams({
+    providerId: "mock",
+    fallbackIds: ["deepl"],
+    sourceLang: "ja",
+    targetLang: "es",
+    batchSize: 10,
+    maxConcurrent: 1,
+    costLimit: "5",
+    gameContext: "",
+  }).options,
+  { max_concurrent: 3, cost_limit_usd: null }
 );
 
 // coerceProviderId: keep a known ready id, replace unknown/unready with first ready provider

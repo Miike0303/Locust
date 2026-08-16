@@ -20,6 +20,9 @@ import {
 	coerceProviderId,
 	readLastUsedTranslationPrefs,
 	saveLastUsedTranslationPrefs,
+	readTranslationFallbacks,
+	saveTranslationFallbacks,
+	buildTranslationStartParams,
 } from "../lib/translationDefaults";
 import { LANGUAGES } from "../lib/languages";
 import { useEditorStore } from "../stores/editorStore";
@@ -45,8 +48,6 @@ interface TranslationModalProps {
 	onComplete: () => void;
 	onReview?: () => void;
 }
-
-const FALLBACK_STORAGE_KEY = "locust.translation.fallbacks";
 
 export default function TranslationModal({
 	open,
@@ -78,19 +79,11 @@ export default function TranslationModal({
 	});
 
 	const [providerId, setProviderId] = useState("");
-	const savedFallbacks: string[] = (() => {
-		try {
-			const v = JSON.parse(localStorage.getItem(FALLBACK_STORAGE_KEY) || "[]");
-			return Array.isArray(v)
-				? v.filter((x: unknown) => typeof x === "string")
-				: [];
-		} catch {
-			return [];
-		}
-	})();
 	const [sourceLang, setSourceLang] = useState("auto");
 	const [targetLang, setTargetLang] = useState("es");
-	const [fallbackIds, setFallbackIds] = useState<string[]>(savedFallbacks);
+	const [fallbackIds, setFallbackIds] = useState<string[]>(() =>
+		readTranslationFallbacks(),
+	);
 	const [fallbackPick, setFallbackPick] = useState("");
 	const [batchSize, setBatchSize] = useState(40);
 	const [maxConcurrent, setMaxConcurrent] = useState(1);
@@ -126,7 +119,9 @@ export default function TranslationModal({
 		setSourceLang(d.sourceLang);
 		setTargetLang(d.targetLang);
 		setBatchSize(d.batchSize);
+		setMaxConcurrent(d.maxConcurrent);
 		setCostLimit(d.costLimit);
+		setFallbackIds(readTranslationFallbacks());
 	}, [open, config, configFetched, configError, providers]);
 
 	// If the current provider id is missing or not ready, fall back to the first ready one.
@@ -176,11 +171,10 @@ export default function TranslationModal({
 			source: sourceLang,
 			target: targetLang,
 			batchSize,
+			maxConcurrent,
 			costLimit,
 		});
-		try {
-			localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(fallbackIds));
-		} catch {}
+		saveTranslationFallbacks(fallbackIds);
 		const chainLabel = [providerId, ...fallbackIds].join(" → ");
 		addLog(
 			"info",
@@ -189,21 +183,22 @@ export default function TranslationModal({
 			"translation",
 		);
 		try {
+			const base = buildTranslationStartParams({
+				providerId,
+				fallbackIds,
+				sourceLang,
+				targetLang,
+				batchSize,
+				maxConcurrent,
+				costLimit,
+				gameContext,
+			});
 			const params = {
-				provider_id: providerId,
-				...(fallbackIds.length > 0
-					? { fallback_provider_ids: fallbackIds }
-					: {}),
+				...base,
 				options: {
-					source_lang: sourceLang,
-					target_lang: targetLang,
-					batch_size: batchSize,
-					max_concurrent: maxConcurrent,
-					cost_limit_usd: costLimit ? parseFloat(costLimit) : null,
-					game_context: gameContext || null,
+					...base.options,
 					use_glossary: useGlossary,
 					use_memory: useMemory,
-					skip_approved: true,
 				},
 			};
 			addLog(

@@ -20,7 +20,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 ## Backlog
 
 - **`t()` is not key-typed.** `apps/desktop/src/lib/i18n/index.ts:139` declares `t(key: string, ...)`, so the compile-time guarantee only covers EN↔ES parity (`es.ts` is `Record<keyof typeof en, string>`). A key the code uses but neither catalog defines compiles clean and renders its raw name on screen. Tightening to `keyof typeof en` would catch it, but the dynamic call sites — `t(JOB_STREAM_LOST_MESSAGE)`, `t(resolvedSource.error)` — would need their unions typed as key subsets first. Found by Claude, cycle 5.
-- The queue cannot use translate options the Translate dialog and CLI both have: `QueuePanel.tsx:230-243` hardcodes `max_concurrent: 3`, `cost_limit_usd: null` and sends no `fallback_provider_ids`, though `TranslationStartParams` already carries them. Fallbacks and smaller batches are the documented escape from the grok count-mismatch stall on Taimanin-scale runs (`docs/VN_RPG_TRANSLATION.md:105-108`). Found by Cursor, cycle 5.
 - `suggest_replacement_font` maps missing scripts to Noto families (`crates/core/src/font_validation.rs:118-184`) and is called only by its own tests. Validate reports missing glyphs and stops, so the user leaves the app to go font hunting. Found by Cursor, cycle 5.
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs:637-644`) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs:569-584`) and `find_utf16le_strings` walks it again (`unreal.rs:455-507`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
 - `find_pak_files` runs twice per open — once from `detect` (`crates/formats/src/unreal.rs:105`), again from `extract` (`:605`). Cheap now that detection only reads the tail, but still duplicated work.
@@ -34,6 +33,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 10 (capability, from backlog).** The queue hard-coded `max_concurrent: 3`, `cost_limit_usd: null`, and no fallbacks while Translate and the CLI already sent the full `TranslationStartParams` — the documented escape for grok count-mismatch stalls on Taimanin-scale runs. Shared `buildTranslationStartParams` + fallback storage with the translate dialog; Queue UI exposes concurrency, cost limit, and fallback chain; last-used prefs remember concurrency. Pinned by unit tests on the builder (negative: not the old hard-coded triple). No research duel: cited cycle-5 capability. Next rotation: `optimization`.
 
 - `pending` — **cycle 9 (defect, from backlog).** A second patch apply to the same game folder was accepted while the first job was still writing, and the original research also flagged a silent UI hang if the socket dropped mid-job. The desktop already settles on `onClosed` with `ws.patchJobStreamLost` (cycle-era hang fix); the missing half was the server. Patch jobs now carry a canonical `patch_game_key`, unfinished applies block another apply to that folder with HTTP 409, and finished/other-folder jobs do not. Pinned by unit + integration tests (negative: finished terminal does not block; other folder still 202). No research duel: cited cycle-1 defect. Next rotation: `capability`.
 

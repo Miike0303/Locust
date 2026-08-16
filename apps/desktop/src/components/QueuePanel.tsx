@@ -27,6 +27,9 @@ import {
 	coerceProviderId,
 	readLastUsedTranslationPrefs,
 	saveLastUsedTranslationPrefs,
+	readTranslationFallbacks,
+	saveTranslationFallbacks,
+	buildTranslationStartParams,
 } from "../lib/translationDefaults";
 import {
 	useModalA11y,
@@ -137,6 +140,22 @@ export default function QueuePanel() {
 	const [batchSize, setBatchSize] = useState(
 		translationParams?.options.batch_size ?? initialDefaults.batchSize,
 	);
+	const [maxConcurrent, setMaxConcurrent] = useState(
+		translationParams?.options.max_concurrent ?? initialDefaults.maxConcurrent,
+	);
+	const [costLimit, setCostLimit] = useState(() => {
+		const fromParams = translationParams?.options.cost_limit_usd;
+		if (typeof fromParams === "number" && Number.isFinite(fromParams)) {
+			return String(fromParams);
+		}
+		return initialDefaults.costLimit;
+	});
+	const [fallbackIds, setFallbackIds] = useState<string[]>(() =>
+		translationParams?.fallback_provider_ids?.length
+			? [...translationParams.fallback_provider_ids]
+			: readTranslationFallbacks(),
+	);
+	const [fallbackPick, setFallbackPick] = useState("");
 	const [gameContext, setGameContext] = useState(
 		translationParams?.options.game_context ?? "",
 	);
@@ -166,6 +185,9 @@ export default function QueuePanel() {
 		setSourceLang(d.sourceLang);
 		setTargetLang(d.targetLang);
 		setBatchSize(d.batchSize);
+		setMaxConcurrent(d.maxConcurrent);
+		setCostLimit(d.costLimit);
+		setFallbackIds(readTranslationFallbacks());
 	}, [
 		isPanelOpen,
 		config,
@@ -227,20 +249,17 @@ export default function QueuePanel() {
 		}
 	};
 
-	const buildParams = (): TranslationStartParams => ({
-		provider_id: providerId,
-		options: {
-			source_lang: sourceLang,
-			target_lang: targetLang,
-			batch_size: batchSize,
-			max_concurrent: 3,
-			cost_limit_usd: null,
-			game_context: gameContext || null,
-			use_glossary: true,
-			use_memory: true,
-			skip_approved: true,
-		},
-	});
+	const buildParams = (): TranslationStartParams =>
+		buildTranslationStartParams({
+			providerId,
+			fallbackIds,
+			sourceLang,
+			targetLang,
+			batchSize,
+			maxConcurrent,
+			costLimit,
+			gameContext,
+		});
 
 	const handleStart = () => {
 		const params = buildParams();
@@ -249,9 +268,23 @@ export default function QueuePanel() {
 			source: sourceLang,
 			target: targetLang,
 			batchSize,
+			maxConcurrent,
+			costLimit,
 		});
+		saveTranslationFallbacks(fallbackIds);
 		setParams(params);
 		startQueue();
+	};
+
+	const addFallback = () => {
+		if (
+			!fallbackPick ||
+			fallbackPick === providerId ||
+			fallbackIds.includes(fallbackPick)
+		)
+			return;
+		setFallbackIds((prev) => [...prev, fallbackPick]);
+		setFallbackPick("");
 	};
 
 	const pendingCount = items.filter((i) => i.status === "pending").length;
@@ -381,7 +414,7 @@ export default function QueuePanel() {
 									/>
 								</div>
 							</div>
-							<div className="grid grid-cols-2 gap-3">
+							<div className="grid grid-cols-3 gap-3">
 								<div>
 									<label className={settingsLabelClass}>{t("queue.batchSize")}</label>
 									<input
@@ -394,14 +427,91 @@ export default function QueuePanel() {
 									/>
 								</div>
 								<div>
-									<label className={settingsLabelClass}>{t("queue.gameContext")}</label>
+									<label className={settingsLabelClass}>{t("queue.maxConcurrent")}</label>
 									<input
-										value={gameContext}
-										onChange={(e) => setGameContext(e.target.value)}
+										type="number"
+										value={maxConcurrent}
+										onChange={(e) => setMaxConcurrent(+e.target.value)}
+										min={1}
+										max={16}
+										className={settingsInputClass}
+									/>
+								</div>
+								<div>
+									<label className={settingsLabelClass}>{t("queue.costLimit")}</label>
+									<input
+										type="number"
+										step="0.01"
+										value={costLimit}
+										onChange={(e) => setCostLimit(e.target.value)}
 										placeholder={t("common.optional")}
 										className={settingsInputClass}
 									/>
 								</div>
+							</div>
+							<div>
+								<label className={settingsLabelClass}>{t("queue.gameContext")}</label>
+								<input
+									value={gameContext}
+									onChange={(e) => setGameContext(e.target.value)}
+									placeholder={t("common.optional")}
+									className={settingsInputClass}
+								/>
+							</div>
+							<div>
+								<label className={settingsLabelClass}>{t("queue.fallbacks")}</label>
+								<p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">
+									{t("queue.fallbacksHint")}
+								</p>
+								<div className="mt-1 flex gap-2">
+									<select
+										value={fallbackPick}
+										onChange={(e) => setFallbackPick(e.target.value)}
+										className={settingsInputClass + " flex-1"}
+									>
+										<option value="">{t("common.optional")}</option>
+										{providers
+											?.filter(
+												(p) =>
+													p.id !== providerId && !fallbackIds.includes(p.id),
+											)
+											.map((p) => (
+												<option key={p.id} value={p.id}>
+													{formatProviderOptionLabel(p)}
+												</option>
+											))}
+									</select>
+									<button
+										type="button"
+										onClick={addFallback}
+										disabled={!fallbackPick}
+										className="px-2 py-1.5 text-xs border rounded disabled:opacity-50 dark:border-gray-600"
+									>
+										{t("queue.addFallback")}
+									</button>
+								</div>
+								{fallbackIds.length > 0 && (
+									<ul className="mt-1 flex flex-wrap gap-1">
+										{fallbackIds.map((id) => (
+											<li
+												key={id}
+												className="text-[11px] px-1.5 py-0.5 rounded bg-gray-200 dark:bg-gray-700 flex items-center gap-1"
+											>
+												{id}
+												<button
+													type="button"
+													onClick={() =>
+														setFallbackIds((prev) => prev.filter((x) => x !== id))
+													}
+													className="opacity-70 hover:opacity-100"
+													aria-label={t("queue.removeFallback", { id })}
+												>
+													×
+												</button>
+											</li>
+										))}
+									</ul>
+								)}
 							</div>
 						</div>
 					)}
