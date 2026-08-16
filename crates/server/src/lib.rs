@@ -52,6 +52,9 @@ pub struct JobState {
     replay: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     cancel: tokio_util::sync::CancellationToken,
     kind: JobKind,
+    /// Canonical game-folder key for an in-flight patch apply (`None` for translate).
+    /// Two applies against the same folder must not race on disk.
+    patch_game_key: Option<String>,
 }
 
 fn job_event_is_terminal(v: &serde_json::Value) -> bool {
@@ -64,6 +67,41 @@ fn job_event_is_terminal(v: &serde_json::Value) -> bool {
 /// Shown verbatim in the desktop "failed to open" toast when a translation
 /// is still writing the live database.
 pub const TRANSLATION_IN_FLIGHT_MESSAGE: &str = "A translation is still running. Wait for it to finish or cancel it before opening another project.";
+
+/// Shown when a second patch apply targets a folder that already has one running.
+pub const PATCH_APPLY_IN_FLIGHT_MESSAGE: &str = "A patch is already being applied to this game folder. Wait for it to finish or cancel it before starting another.";
+
+/// Stable key for comparing game folders across apply requests.
+fn patch_game_key(game_path: &str) -> String {
+    let p = Path::new(game_path);
+    std::fs::canonicalize(p)
+        .or_else(|_| std::path::absolute(p))
+        .unwrap_or_else(|_| p.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Id of an unfinished patch-apply job targeting the same game folder, if any.
+pub fn active_patch_job_for_game(state: &AppState, game_path: &str) -> Option<String> {
+    let key = patch_game_key(game_path);
+    for job in state.active_jobs.iter() {
+        if !matches!(job.kind, JobKind::Patch) {
+            continue;
+        }
+        if job.patch_game_key.as_ref() != Some(&key) {
+            continue;
+        }
+        let finished = job
+            .replay
+            .lock()
+            .map(|log| log.iter().any(job_event_is_terminal))
+            .unwrap_or(false);
+        if !finished {
+            return Some(job.key().clone());
+        }
+    }
+    None
+}
 
 /// Id of an in-flight translation job, if any.
 ///
@@ -837,6 +875,7 @@ pub async fn spawn_translation_job(
             replay,
             cancel,
             kind: JobKind::Translate,
+            patch_game_key: None,
         },
     );
 
@@ -1437,10 +1476,18 @@ async fn patch_apply(
         _ => {}
     }
 
+    if req.game_path.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "game_path required"));
+    }
+    if active_patch_job_for_game(&state, &req.game_path).is_some() {
+        return Err(err(StatusCode::CONFLICT, PATCH_APPLY_IN_FLIGHT_MESSAGE));
+    }
+
     let job_id = uuid::Uuid::new_v4().to_string();
     let (broadcast_tx, _) = broadcast::channel::<serde_json::Value>(1000);
     let replay = Arc::new(std::sync::Mutex::new(Vec::new()));
     let cancel = tokio_util::sync::CancellationToken::new();
+    let game_key = patch_game_key(&req.game_path);
 
     state.active_jobs.insert(
         job_id.clone(),
@@ -1450,6 +1497,7 @@ async fn patch_apply(
             replay: replay.clone(),
             cancel: cancel.clone(),
             kind: JobKind::Patch,
+            patch_game_key: Some(game_key),
         },
     );
 
@@ -2834,6 +2882,16 @@ mod tests {
     }
 
     fn park_job(state: &AppState, id: &str, kind: JobKind, terminal: Option<&str>) {
+        park_job_with_patch_key(state, id, kind, terminal, None);
+    }
+
+    fn park_job_with_patch_key(
+        state: &AppState,
+        id: &str,
+        kind: JobKind,
+        terminal: Option<&str>,
+        patch_game_key: Option<String>,
+    ) {
         let (tx, _) = broadcast::channel(8);
         let replay = Arc::new(std::sync::Mutex::new(Vec::new()));
         if let Some(ty) = terminal {
@@ -2850,8 +2908,38 @@ mod tests {
                 replay,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 kind,
+                patch_game_key,
             },
         );
+    }
+
+    #[tokio::test]
+    async fn active_patch_job_for_game_ignores_finished_and_other_folders() {
+        let state = create_test_state();
+        let game_a = std::env::temp_dir().join(format!("locust_patch_a_{}", uuid::Uuid::new_v4()));
+        let game_b = std::env::temp_dir().join(format!("locust_patch_b_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&game_a).unwrap();
+        std::fs::create_dir_all(&game_b).unwrap();
+        let key_a = super::patch_game_key(&game_a.to_string_lossy());
+
+        park_job_with_patch_key(
+            &state,
+            "done",
+            JobKind::Patch,
+            Some("done"),
+            Some(key_a.clone()),
+        );
+        assert!(active_patch_job_for_game(&state, &game_a.to_string_lossy()).is_none());
+
+        park_job_with_patch_key(&state, "live", JobKind::Patch, None, Some(key_a));
+        assert_eq!(
+            active_patch_job_for_game(&state, &game_a.to_string_lossy()).as_deref(),
+            Some("live")
+        );
+        assert!(active_patch_job_for_game(&state, &game_b.to_string_lossy()).is_none());
+
+        let _ = std::fs::remove_dir_all(&game_a);
+        let _ = std::fs::remove_dir_all(&game_b);
     }
 
     fn write_rpgmaker_game(dir: &Path) {

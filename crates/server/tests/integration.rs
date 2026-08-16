@@ -1426,6 +1426,68 @@ async fn test_patch_apply_job_emits_progress_then_done() {
 }
 
 #[tokio::test]
+async fn test_second_patch_apply_same_game_returns_409() {
+    let tmp = TempDir::new().unwrap();
+    let game = tmp.path().join("game");
+    std::fs::create_dir_all(&game).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _server = tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n\
+                          Content-Length: 100000000\r\n\r\n",
+                )
+                .await;
+            loop {
+                if sock.write_all(&[0u8; 32]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    });
+
+    let state = locust_server::create_test_state();
+    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let body = serde_json::json!({
+        "game_path": game.to_string_lossy(),
+        "zip_url": format!("http://{addr}/patch.zip"),
+    });
+    let _first = start_patch_apply_job(&base_url, &body).await;
+
+    let second = client()
+        .post(format!("{}/api/patch/apply", base_url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 409, "second apply must conflict");
+    let text = second.text().await.unwrap();
+    assert!(
+        text.contains(locust_server::PATCH_APPLY_IN_FLIGHT_MESSAGE)
+            || text.contains("already being applied"),
+        "{text}"
+    );
+
+    // A different game folder must still be accepted (then fail on bad zip).
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let other_zip = tmp.path().join("bad.zip");
+    std::fs::write(&other_zip, b"not a zip").unwrap();
+    let other_body = serde_json::json!({
+        "game_path": other.to_string_lossy(),
+        "zip_path": other_zip.to_string_lossy(),
+    });
+    let _other_job = start_patch_apply_job(&base_url, &other_body).await;
+}
+
+#[tokio::test]
 async fn test_patch_apply_job_error_closes_socket() {
     let tmp = TempDir::new().unwrap();
     let game = tmp.path().join("game");

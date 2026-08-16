@@ -25,7 +25,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs:637-644`) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs:569-584`) and `find_utf16le_strings` walks it again (`unreal.rs:455-507`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
 - `find_pak_files` runs twice per open — once from `detect` (`crates/formats/src/unreal.rs:105`), again from `extract` (`:605`). Cheap now that detection only reads the tail, but still duplicated work.
 - `save_entries` (`crates/core/src/database.rs:399-409`) and `merge_entries` (`:1182`, `:1205`, `:1239`) call `tx.execute` inside loops, so the same SQL is parsed and planned once per row — up to 33,767 times on a real extract. `prepare_cached` would do it once. Found by Claude, cycle 2; no automatable check identified, which is why it lost to a measurable win.
-- Patch apply: closing the socket without a terminal frame leaves the UI idle while the job keeps writing, and a second apply for the same folder is accepted. Found by Grok, cycle 1.
 - Server error messages are not localized. They reach the user verbatim inside translated toasts (`apps/desktop/src/lib/api.ts` reads `res.text()`, `Welcome.tsx:182` interpolates it), so a Spanish UI shows English sentences from the backend. A whole class, not one string.
 - Any other database write racing `Database::reopen` is the same class as cycle 4 but was not the evidenced case — a synchronous inject, for instance. A general lock around the swap is a larger change and was deliberately not attempted.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
@@ -35,6 +34,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 9 (defect, from backlog).** A second patch apply to the same game folder was accepted while the first job was still writing, and the original research also flagged a silent UI hang if the socket dropped mid-job. The desktop already settles on `onClosed` with `ws.patchJobStreamLost` (cycle-era hang fix); the missing half was the server. Patch jobs now carry a canonical `patch_game_key`, unfinished applies block another apply to that folder with HTTP 409, and finished/other-folder jobs do not. Pinned by unit + integration tests (negative: finished terminal does not block; other folder still 202). No research duel: cited cycle-1 defect. Next rotation: `capability`.
 
 - `pending` — **cycle 8 (optimization, from backlog).** Packing a patch and recording an injection both `fs::read` every written file, so peak RAM ≈ file size (2× with `--pristine`) on multi-GB Unreal paks while apply already streamed in 1 MiB chunks. Added `sha256_file` / `copy_path_chunked` (1 MiB) next to `sha256_hex`, wired pack verify+write and `record_injection` through them, and pinned multi-chunk equality against the in-memory hash (negative: truncated bytes must not match). Existing pack zip tests still green. No research duel: cited cycle-2 optimization waiting behind smaller wins. Next rotation: `defect`.
 
