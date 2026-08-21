@@ -20,12 +20,12 @@ const assert = {
 };
 
 assert.deepEqual(SETTINGS_SECTIONS, [
-  { id: "providers", label: "Providers" },
-  { id: "defaults", label: "Translation Defaults" },
-  { id: "appearance", label: "Appearance" },
-  { id: "glossary", label: "Glossary" },
-  { id: "history", label: "History" },
-  { id: "data", label: "Data" },
+  { id: "providers", labelKey: "settings.nav.providers" },
+  { id: "defaults", labelKey: "settings.nav.defaults" },
+  { id: "appearance", labelKey: "settings.nav.appearance" },
+  { id: "glossary", labelKey: "settings.nav.glossary" },
+  { id: "history", labelKey: "settings.nav.history" },
+  { id: "data", labelKey: "settings.nav.data" },
 ]);
 
 assert.equal(parseSettingsSectionParam("?section=glossary"), "glossary");

@@ -7,7 +7,7 @@ import {
 	Package,
 } from "lucide-react";
 import { patchStatus, type PatchStatusResult } from "../lib/api";
-import { useT } from "../lib/i18n";
+import { useT, type TranslateFn } from "../lib/i18n";
 
 interface PatchStatusIndicatorProps {
 	gamePath?: string;
@@ -17,7 +17,7 @@ interface PatchStatusIndicatorProps {
 
 function statusPresentation(
 	status: PatchStatusResult["status"],
-	t: (key: string) => string,
+	t: TranslateFn,
 ) {
 	switch (status) {
 		case "not_patched":

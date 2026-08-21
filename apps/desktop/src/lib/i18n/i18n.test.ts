@@ -26,8 +26,9 @@ assert.equal(
   "Total (2 runs)",
 );
 
-assert.equal(t("this.key.does.not.exist"), "this.key.does.not.exist");
-assert.doesNotThrow(() => t("also.missing", { count: 3, name: "x" }));
+// Unknown keys still fall through at runtime via translate(); t() is MessageKey-typed.
+assert.equal(translate(en, "en", "this.key.does.not.exist"), "this.key.does.not.exist");
+assert.doesNotThrow(() => translate(en, "en", "also.missing", { count: 3, name: "x" }));
 
 // Pure translator: interpolation + plural without mutating module locale
 assert.equal(

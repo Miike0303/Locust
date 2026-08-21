@@ -13,7 +13,9 @@ import {
 } from "../lib/stringFilterFacets";
 import { useT } from "../lib/i18n";
 
-const STATUSES: { labelKey: string; value: StringStatus | undefined }[] = [
+import type { MessageKey } from "../lib/i18n";
+
+const STATUSES: { labelKey: MessageKey; value: StringStatus | undefined }[] = [
 	{ labelKey: "filter.all", value: undefined },
 	{ labelKey: "filter.pending", value: "pending" },
 	{ labelKey: "filter.translated", value: "translated" },

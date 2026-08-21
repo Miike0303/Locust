@@ -26,6 +26,7 @@ export const en = {
   "common.exit": "Exit",
   "common.copy": "Copy",
   "common.copied": "Copied",
+  "common.later": "Later",
 
   // ── nav ─────────────────────────────────────────────────────────────────
   "nav.home": "Home",

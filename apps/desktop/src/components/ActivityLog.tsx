@@ -2,7 +2,7 @@ import { useState } from "react";
 import { X, Trash2 } from "lucide-react";
 import clsx from "clsx";
 import { useLogStore, type LogLevel } from "../stores/logStore";
-import { useT } from "../lib/i18n";
+import { useT, type TranslateFn } from "../lib/i18n";
 
 const levelColors: Record<LogLevel, string> = {
 	info: "bg-blue-500 dark:bg-blue-400",
@@ -18,10 +18,7 @@ const levelBg: Record<LogLevel, string> = {
 
 const filters: Array<LogLevel | "all"> = ["all", "info", "warning", "error"];
 
-function timeAgo(
-	ts: number,
-	t: (key: string, vars?: Record<string, string | number>) => string,
-): string {
+function timeAgo(ts: number, t: TranslateFn): string {
 	const sec = Math.floor((Date.now() - ts) / 1000);
 	if (sec < 60) return t("log.timeSeconds", { count: sec });
 	const min = Math.floor(sec / 60);

@@ -5,7 +5,9 @@ import type { StringEntry, StringStatus } from "../lib/api";
 import { binarySlotOf, encodedByteLen, patchString } from "../lib/api";
 import { useT } from "../lib/i18n";
 
-const statusButtons: { value: StringStatus; labelKey: string; color: string }[] = [
+import type { MessageKey } from "../lib/i18n";
+
+const statusButtons: { value: StringStatus; labelKey: MessageKey; color: string }[] = [
 	{
 		value: "pending",
 		labelKey: "detail.status.pending",

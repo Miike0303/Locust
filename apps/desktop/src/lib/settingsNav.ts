@@ -1,11 +1,13 @@
+import type { MessageKey } from "./i18n";
+
 export const SETTINGS_SECTIONS = [
-  { id: "providers", label: "Providers" },
-  { id: "defaults", label: "Translation Defaults" },
-  { id: "appearance", label: "Appearance" },
-  { id: "glossary", label: "Glossary" },
-  { id: "history", label: "History" },
-  { id: "data", label: "Data" },
-] as const;
+  { id: "providers", labelKey: "settings.nav.providers" },
+  { id: "defaults", labelKey: "settings.nav.defaults" },
+  { id: "appearance", labelKey: "settings.nav.appearance" },
+  { id: "glossary", labelKey: "settings.nav.glossary" },
+  { id: "history", labelKey: "settings.nav.history" },
+  { id: "data", labelKey: "settings.nav.data" },
+] as const satisfies ReadonlyArray<{ id: string; labelKey: MessageKey }>;
 
 export type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
 export type OperationalShortcut =

@@ -26,9 +26,9 @@ import {
   parseSettingsSectionParam,
   type SettingsSectionId,
 } from "../lib/settingsNav";
+import { useT, useLocale, type Locale, type TranslateFn } from "../lib/i18n";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { addToast } from "../stores/toastStore";
-import { useLocale, useT, type Locale } from "../lib/i18n";
 
 export default function Settings() {
   const location = useLocation();
@@ -48,7 +48,7 @@ export default function Settings() {
   return (
     <div className="flex h-full">
       <nav className="w-48 border-r border-gray-200 dark:border-gray-700 p-4 space-y-1">
-        {SETTINGS_SECTIONS.map(({ id }) => (
+        {SETTINGS_SECTIONS.map(({ id, labelKey }) => (
           <button
             key={id}
             onClick={() => selectSection(id)}
@@ -60,7 +60,7 @@ export default function Settings() {
                 : "text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800"
             )}
           >
-            {t(`settings.nav.${id}`)}
+            {t(labelKey)}
           </button>
         ))}
       </nav>
@@ -100,7 +100,7 @@ function formatRunDate(iso: string): string {
   return iso.length >= 16 ? iso.slice(0, 16) : iso;
 }
 
-function formatDuration(secs: number, t: (key: string, vars?: Record<string, string | number>) => string): string {
+function formatDuration(secs: number, t: TranslateFn): string {
   const s = Math.max(0, Math.floor(secs));
   if (s >= 3600) {
     return t("settings.history.durationHoursMinutes", {
@@ -692,10 +692,16 @@ function AppearanceSection() {
       <div>
         <label className="text-sm font-medium">{t("settings.appearance.theme")}</label>
         <div className="flex gap-3 mt-2">
-          {(["system", "light", "dark"] as const).map((theme) => (
+          {(
+            [
+              ["system", "settings.appearance.theme.system"],
+              ["light", "settings.appearance.theme.light"],
+              ["dark", "settings.appearance.theme.dark"],
+            ] as const
+          ).map(([theme, labelKey]) => (
             <label key={theme} className="flex items-center gap-2 cursor-pointer">
               <input type="radio" name="theme" checked={config.ui.theme === theme} onChange={() => setTheme(theme)} />
-              <span className="text-sm">{t(`settings.appearance.theme.${theme}`)}</span>
+              <span className="text-sm">{t(labelKey)}</span>
             </label>
           ))}
         </div>

@@ -27,7 +27,7 @@ export interface HotkeyBinding {
   group: "Navigation" | "Editor" | "Review" | "General";
 }
 
-export const HOTKEY_MAP: Record<string, HotkeyBinding> = {
+export const HOTKEY_MAP = {
   openProject:    { key: "o", ctrl: true, description: "Open project", group: "General" },
   translate:      { key: "t", ctrl: true, description: "Start translation", group: "Editor" },
   inject:         { key: "i", ctrl: true, description: "Inject translations", group: "Editor" },
@@ -47,7 +47,9 @@ export const HOTKEY_MAP: Record<string, HotkeyBinding> = {
   navReview:      { key: "3", alt: true, description: "Go to Review", group: "Navigation" },
   navMemory:      { key: "4", alt: true, description: "Go to Memory", group: "Navigation" },
   navSettings:    { key: "5", alt: true, description: "Go to Settings", group: "Navigation" },
-};
+} as const satisfies Record<string, HotkeyBinding>;
+
+export type HotkeyActionId = keyof typeof HOTKEY_MAP;
 
 function matchesEvent(e: KeyboardEvent, binding: HotkeyBinding): boolean {
   const isMac = navigator.platform.includes("Mac");
@@ -75,7 +77,7 @@ export function useHotkey(
 
   useEffect(() => {
     if (!enabled) return;
-    const binding = HOTKEY_MAP[action];
+    const binding = HOTKEY_MAP[action as HotkeyActionId];
     if (!binding) return;
 
     const handler = (e: KeyboardEvent) => {
@@ -177,7 +179,8 @@ export function formatKey(binding: HotkeyBinding): string {
 export function getGroupedHotkeys(): Record<string, { action: string; binding: HotkeyBinding }[]> {
   const groups: Record<string, { action: string; binding: HotkeyBinding }[]> = {};
   for (const action of HELP_ACTIONS) {
-    const binding = HOTKEY_MAP[action];
+    const binding = HOTKEY_MAP[action as HotkeyActionId];
+    if (!binding) continue;
     if (!groups[binding.group]) groups[binding.group] = [];
     groups[binding.group].push({ action, binding });
   }

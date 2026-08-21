@@ -373,10 +373,10 @@ export default function Welcome() {
 												className="text-emerald-600 dark:text-emerald-400"
 												aria-hidden="true"
 											/>
-											{t(`welcome.guide.${step.id}.label`)}
+											{t(step.labelKey)}
 										</div>
 										<p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-											{t(`welcome.guide.${step.id}.description`)}
+											{t(step.descriptionKey)}
 										</p>
 									</div>
 								</li>

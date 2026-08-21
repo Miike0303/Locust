@@ -5,11 +5,13 @@
 
 export type PatchSourceOk = { zip_path: string } | { zip_url: string };
 
+import type { MessageKey } from "./i18n";
+
 /** Stable catalog keys — UI renders via `t()`, tests assert on the code. */
 export const PATCH_SOURCE_ERROR = {
   both: "patch.source.both",
   badUrl: "patch.source.badUrl",
-} as const;
+} as const satisfies Record<string, MessageKey>;
 
 export type PatchSourceErrorCode =
   (typeof PATCH_SOURCE_ERROR)[keyof typeof PATCH_SOURCE_ERROR];

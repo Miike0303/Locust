@@ -16,7 +16,8 @@ import {
 	File,
 } from "lucide-react";
 import clsx from "clsx";
-import { useQueueStore, type QueueItem } from "../stores/queueStore";
+import type { MessageKey } from "../lib/i18n";
+import { useQueueStore, type QueueItem, type QueueItemStatus } from "../stores/queueStore";
 import {
 	getProviders,
 	getConfig,
@@ -66,7 +67,7 @@ const statusRowStyles: Record<string, string> = {
 	cancelled: "opacity-60 border-l-gray-400",
 };
 
-const STATUS_LABEL_KEYS: Record<string, string> = {
+const STATUS_LABEL_KEYS: Record<QueueItemStatus, MessageKey> = {
 	pending: "queue.status.pending",
 	extracting: "queue.status.extracting",
 	translating: "queue.status.translating",
@@ -627,9 +628,7 @@ function QueueItemRow({
 						{item.projectName}
 					</div>
 					<span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-						{STATUS_LABEL_KEYS[item.status]
-							? t(STATUS_LABEL_KEYS[item.status])
-							: item.status}
+						{t(STATUS_LABEL_KEYS[item.status])}
 					</span>
 				</div>
 				<div className="text-xs text-gray-500 dark:text-gray-400 truncate">

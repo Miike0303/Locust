@@ -112,18 +112,18 @@ const WELCOME_GUIDE_DISMISSED_KEY = "locust.welcomeGuide.dismissed";
 export const WELCOME_WORKFLOW_STEPS = [
 	{
 		id: "open",
-		label: "Open",
-		description: "Open a game folder or file to extract strings.",
+		labelKey: "welcome.guide.open.label",
+		descriptionKey: "welcome.guide.open.description",
 	},
 	{
 		id: "translate",
-		label: "Translate",
-		description: "Run machine translation on pending strings.",
+		labelKey: "welcome.guide.translate.label",
+		descriptionKey: "welcome.guide.translate.description",
 	},
 	{
 		id: "inject",
-		label: "Inject / Patch",
-		description: "Write translations back into the game files.",
+		labelKey: "welcome.guide.inject.label",
+		descriptionKey: "welcome.guide.inject.description",
 	},
 ] as const;
 

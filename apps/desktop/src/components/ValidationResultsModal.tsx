@@ -8,13 +8,13 @@ import type {
 	FontSuggestion,
 } from "../lib/api";
 import { validationKindLabel } from "../lib/api";
+import { useT, type TranslateFn } from "../lib/i18n";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
-import { useT } from "../lib/i18n";
 
 interface ValidationResultsModalProps {
 	open: boolean;
@@ -41,7 +41,7 @@ const KIND_BADGE: Record<string, string> = {
 
 function kindDetail(
 	kind: ValidationKind,
-	t: (key: string, vars?: Record<string, string | number>) => string,
+	t: TranslateFn,
 ): string | null {
 	if (typeof kind === "string") return null;
 	if ("MissingPlaceholder" in kind)

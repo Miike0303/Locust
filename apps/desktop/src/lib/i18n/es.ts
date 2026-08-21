@@ -27,6 +27,7 @@ export const es: Record<keyof typeof en, string> = {
   "common.exit": "Salir",
   "common.copy": "Copiar",
   "common.copied": "Copiado",
+  "common.later": "Más tarde",
 
   "nav.home": "Inicio",
   "nav.editor": "Editor",

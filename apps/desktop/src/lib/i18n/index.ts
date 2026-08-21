@@ -13,8 +13,18 @@ import { es } from "./es";
 
 export type Locale = "en" | "es";
 export type MessageKey = keyof typeof en;
+/** Base key for plural forms (`foo.one` / `foo.other` in the catalog). */
+export type PluralStem = {
+  [K in MessageKey]: K extends `${infer Stem}.one`
+    ? Stem
+    : K extends `${infer Stem}.other`
+      ? Stem
+      : never;
+}[MessageKey];
+/** Keys accepted by `t()` — catalog entries plus plural stems. */
+export type TranslateKey = MessageKey | PluralStem;
 export type Vars = Record<string, string | number>;
-export type TranslateFn = (key: string, vars?: Vars) => string;
+export type TranslateFn = (key: TranslateKey, vars?: Vars) => string;
 
 export const UI_LANGUAGE_KEY = "locust.ui.language";
 export const LOCALES: readonly Locale[] = ["en", "es"];
@@ -136,7 +146,7 @@ export function setLocale(next: Locale): void {
 }
 
 /** Standalone t() for non-React callers (api.ts). */
-export function t(key: string, vars?: Vars): string {
+export function t(key: TranslateKey, vars?: Vars): string {
   return translate(catalogs[currentLocale], currentLocale, key, vars);
 }
 

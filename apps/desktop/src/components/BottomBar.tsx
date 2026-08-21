@@ -1,13 +1,13 @@
 import { useQueueStore } from "../stores/queueStore";
 import { useEditorStore } from "../stores/editorStore";
 import { Loader2 } from "lucide-react";
-import { useT } from "../lib/i18n";
+import { useT, type TranslateFn } from "../lib/i18n";
 
 function formatEta(
 	startedAt: number | null,
 	completed: number,
 	total: number,
-	t: (key: string, vars?: Record<string, string | number>) => string,
+	t: TranslateFn,
 ): string {
 	if (!startedAt || completed === 0 || total === 0) return "";
 	const elapsed = (Date.now() - startedAt) / 1000;
