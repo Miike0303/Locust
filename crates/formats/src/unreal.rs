@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -11,6 +13,13 @@ use crate::unreal_pak::{
     self, payload_offset, read_footer, read_index, record_containing_offset, writable_version,
     write_pak, PakWriteFile, DEFAULT_MOUNT_POINT,
 };
+
+// Per-test-thread counter for find_pak_files (avoids races under --test-threads>1).
+// Some(n) means this thread is counting; None means ignore.
+#[cfg(test)]
+thread_local! {
+    static FIND_PAK_FILES_CALLS: Cell<Option<usize>> = const { Cell::new(None) };
+}
 
 /// Plugin for Unreal Engine games.
 /// Scans .pak files and loose localization files for translatable strings.
@@ -27,6 +36,13 @@ impl UnrealPlugin {
     }
 
     fn find_pak_files(path: &Path) -> Vec<PathBuf> {
+        #[cfg(test)]
+        FIND_PAK_FILES_CALLS.with(|c| {
+            if let Some(n) = c.get() {
+                c.set(Some(n + 1));
+            }
+        });
+
         let mut paks = Vec::new();
         if path.is_file() && path.extension().is_some_and(|e| e == "pak") {
             if Self::looks_like_unreal_pak(path) {
@@ -86,9 +102,12 @@ impl UnrealPlugin {
         if !path.is_dir() {
             return false;
         }
-        // Check for typical Unreal folder structure
-        let has_engine = path.join("Engine").is_dir();
-        let game_name = path
+        // Typical Unreal layout — do not walk .pak files when this already matches.
+        // Open runs detect then extract; extract still needs find_pak_files once.
+        if path.join("Engine").is_dir() {
+            return true;
+        }
+        let has_content_game = path
             .read_dir()
             .ok()
             .and_then(|mut d| {
@@ -99,10 +118,11 @@ impl UnrealPlugin {
                 })
             })
             .is_some();
-        // Only count paks that pass Unreal magic / name filters — not NW.js chrome paks.
-        let has_content_paks = !Self::find_pak_files(path).is_empty();
-
-        has_engine || game_name || has_content_paks
+        if has_content_game {
+            return true;
+        }
+        // Pak-only trees (no Engine / Content) still need a filtered .pak walk.
+        !Self::find_pak_files(path).is_empty()
     }
 
     /// Loose `*.locres` under the game tree (Localization or anywhere, depth-capped).
@@ -1029,6 +1049,62 @@ mod tests {
         create_pak_fixture(&dir);
         let plugin = UnrealPlugin::new();
         assert!(plugin.detect(&dir));
+    }
+
+    #[test]
+    fn test_detect_skips_pak_walk_when_engine_present() {
+        // Negative-tested: restoring the old always-walk detect makes this fail.
+        let dir = tempdir();
+        fs::create_dir_all(dir.join("Engine")).unwrap();
+        // A real Unreal-looking pak that would be opened if detect walked.
+        let paks = dir.join("Content").join("Paks");
+        fs::create_dir_all(&paks).unwrap();
+        let mut data = vec![0u8; 64];
+        data[60..64].copy_from_slice(&pak_magic());
+        fs::write(paks.join("Game.pak"), &data).unwrap();
+
+        FIND_PAK_FILES_CALLS.with(|c| c.set(Some(0)));
+        let plugin = UnrealPlugin::new();
+        assert!(plugin.detect(&dir));
+        let calls = FIND_PAK_FILES_CALLS.with(|c| c.replace(None));
+        assert_eq!(
+            calls,
+            Some(0),
+            "detect must not walk .pak files when Engine/ is already present"
+        );
+    }
+
+    #[test]
+    fn test_detect_skips_pak_walk_when_content_game_present() {
+        let dir = tempdir();
+        create_pak_fixture(&dir);
+
+        FIND_PAK_FILES_CALLS.with(|c| c.set(Some(0)));
+        let plugin = UnrealPlugin::new();
+        assert!(plugin.detect(&dir));
+        let calls = FIND_PAK_FILES_CALLS.with(|c| c.replace(None));
+        assert_eq!(
+            calls,
+            Some(0),
+            "detect must not walk .pak files when a */Content game folder exists"
+        );
+    }
+
+    #[test]
+    fn test_detect_pak_only_tree_still_walks() {
+        let dir = tempdir();
+        let mut data = vec![0u8; 64];
+        data[60..64].copy_from_slice(&pak_magic());
+        fs::write(dir.join("orphan.pak"), &data).unwrap();
+
+        FIND_PAK_FILES_CALLS.with(|c| c.set(Some(0)));
+        let plugin = UnrealPlugin::new();
+        assert!(plugin.detect(&dir));
+        let calls = FIND_PAK_FILES_CALLS.with(|c| c.replace(None));
+        assert!(
+            calls.is_some_and(|n| n >= 1),
+            "pak-only trees still need find_pak_files during detect, got {calls:?}"
+        );
     }
 
     #[test]
