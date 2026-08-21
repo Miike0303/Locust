@@ -60,7 +60,7 @@ export function defaultPivotFileName(projectName: string): string {
 
 export function isExistingOutputError(message: string): boolean {
   const m = message.toLowerCase();
-  return /already exists|file exists|output (file )?exists|eexist/.test(m);
+  return /already exists|file exists|output (file )?exists|eexist|ya existe/.test(m);
 }
 
 export function errorMessage(err: unknown): string {

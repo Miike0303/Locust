@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { addLog } from "../stores/logStore";
 import { t } from "./i18n";
+import { localizeApiError } from "./apiError";
 import {
   PIVOT_OPEN_DB_HTTP_PATH,
   PIVOT_OPEN_DB_TAURI_CMD,
@@ -10,6 +11,16 @@ import {
 
 // ─── Runtime detection ────────────────────────────────────────────────────
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
+
+/** Tauri invoke that localizes stable English error bodies for UI toasts. */
+async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await invoke<T>(cmd, args);
+  } catch (e) {
+    const raw = e instanceof Error ? e.message : String(e);
+    throw new Error(localizeApiError(raw));
+  }
+}
 
 // ─── HTTP fallback helpers ────────────────────────────────────────────────
 let _serverPort = 7842;
@@ -54,7 +65,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
     addLog("error", `API ${res.status}: ${path}`, text, "api");
-    throw new Error(`${res.status}: ${text}`);
+    throw new Error(localizeApiError(`${res.status}: ${text}`));
   }
   // 204 / empty body (DELETE, some POSTs) — do not call res.json()
   if (res.status === 204) return undefined as T;
@@ -64,7 +75,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     return JSON.parse(text) as T;
   } catch {
     addLog("error", `API invalid JSON: ${path}`, text.slice(0, 500), "api");
-    throw new Error(`Invalid JSON from ${path}`);
+    throw new Error(t("api.error.invalidJson", { path }));
   }
 }
 
@@ -76,7 +87,10 @@ async function requestText(path: string): Promise<string> {
   } catch {
     throw unreachableBackend(base, path);
   }
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(localizeApiError(`${res.status}: ${text}`));
+  }
   return res.text();
 }
 
@@ -317,17 +331,17 @@ export interface ProgressEventProviderSwitched {
 // ─── API functions (Tauri IPC with HTTP fallback) ─────────────────────────
 
 export const getFormats = (): Promise<PluginInfo[]> =>
-  IS_TAURI ? invoke("get_formats") : request("/formats");
+  IS_TAURI ? tauriInvoke("get_formats") : request("/formats");
 
 export const getProviders = (): Promise<ProviderInfo[]> =>
-  IS_TAURI ? invoke("get_providers") : request("/providers");
+  IS_TAURI ? tauriInvoke("get_providers") : request("/providers");
 
 export const checkProviderHealth = (id: string) =>
   request<{ ok: boolean; message: string }>(`/providers/${id}/health`, { method: "POST" });
 
 export const openProject = (path: string, formatId?: string): Promise<ProjectOpenResponse> =>
   IS_TAURI
-    ? invoke("open_project", { path, formatId })
+    ? tauriInvoke("open_project", { path, formatId })
     : request("/project/open", { method: "POST", body: JSON.stringify({ path, format_id: formatId }) });
 
 /** Reopen a .locust.db without extracting or merging (pivoted projects). */
@@ -338,7 +352,7 @@ export const openProjectDb = (
 ): Promise<ProjectOpenResponse> => {
   const args = pivotOpenDbTauriArgs({ databasePath, gamePath, formatId });
   return IS_TAURI
-    ? invoke(PIVOT_OPEN_DB_TAURI_CMD, args)
+    ? tauriInvoke(PIVOT_OPEN_DB_TAURI_CMD, args)
     : request(PIVOT_OPEN_DB_HTTP_PATH, {
         method: "POST",
         body: JSON.stringify(pivotOpenDbHttpBody(args)),
@@ -350,7 +364,7 @@ export const getCurrentProject = () =>
 
 export const getStrings = (filter: StringFilter): Promise<StringsResponse> =>
   IS_TAURI
-    ? invoke("get_strings", { filter })
+    ? tauriInvoke("get_strings", { filter })
     : (() => {
         const params = new URLSearchParams();
         if (filter.status) params.set("status", filter.status);
@@ -369,7 +383,7 @@ export interface StringFacets {
 }
 
 export const getStringFacets = (): Promise<StringFacets> =>
-  IS_TAURI ? invoke("get_string_facets") : request("/strings/facets");
+  IS_TAURI ? tauriInvoke("get_string_facets") : request("/strings/facets");
 
 export interface PivotResult {
   database_path: string;
@@ -379,7 +393,7 @@ export interface PivotResult {
 /** New project whose SOURCE is the current project's translations. */
 export const runPivot = (outputPath: string): Promise<PivotResult> =>
   IS_TAURI
-    ? invoke("run_pivot", { outputPath })
+    ? tauriInvoke("run_pivot", { outputPath })
     : request("/pivot", {
         method: "POST",
         body: JSON.stringify({ output_path: outputPath }),
@@ -390,7 +404,7 @@ export const getString = (id: string) =>
 
 export const patchString = (id: string, data: Partial<Pick<StringEntry, "translation" | "status">>): Promise<StringEntry> =>
   IS_TAURI
-    ? invoke("patch_string", { id, data })
+    ? tauriInvoke("patch_string", { id, data })
     : request(`/strings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
 
 export interface BatchPatchResult {
@@ -405,28 +419,28 @@ export const batchPatchStrings = (
   provider = "manual"
 ): Promise<BatchPatchResult> =>
   IS_TAURI
-    ? invoke("batch_patch_strings", { data: { updates, provider } })
+    ? tauriInvoke("batch_patch_strings", { data: { updates, provider } })
     : request("/strings/batch", {
         method: "POST",
         body: JSON.stringify({ updates, provider }),
       });
 
 export const getStats = (): Promise<ProjectStats> =>
-  IS_TAURI ? invoke("get_stats") : request("/stats");
+  IS_TAURI ? tauriInvoke("get_stats") : request("/stats");
 
 export const startTranslation = (params: TranslationStartParams): Promise<{ job_id: string }> =>
   IS_TAURI
-    ? invoke<string>("start_translation", { params }).then(job_id => ({ job_id }))
+    ? tauriInvoke<string>("start_translation", { params }).then(job_id => ({ job_id }))
     : request("/translate/start", { method: "POST", body: JSON.stringify(params) });
 
 export const cancelTranslation = (jobId: string): Promise<void> =>
   IS_TAURI
-    ? invoke("cancel_translation", { jobId })
+    ? tauriInvoke("cancel_translation", { jobId })
     : request(`/translate/cancel/${jobId}`, { method: "POST" });
 
 export const inject = (params: InjectParams): Promise<MultiLangReport> =>
   IS_TAURI
-    ? invoke("run_inject", { params })
+    ? tauriInvoke("run_inject", { params })
     : request("/inject", { method: "POST", body: JSON.stringify(params) });
 
 /** Register a language in RM multi-lang UI (Iavra / VisuMZ / Map choices). */
@@ -447,22 +461,22 @@ export interface RegisterLangReport {
 
 export const registerLang = (params: RegisterLangParams): Promise<RegisterLangReport> =>
   IS_TAURI
-    ? invoke("register_lang", { params })
+    ? tauriInvoke("register_lang", { params })
     : request("/register-lang", { method: "POST", body: JSON.stringify(params) });
 
 export const validate = (): Promise<ValidationResponse> =>
   IS_TAURI
-    ? invoke("run_validation")
+    ? tauriInvoke("run_validation")
     : request("/validate", { method: "POST" });
 
 export const getGlossary = (langPair: string): Promise<GlossaryEntry[]> =>
   IS_TAURI
-    ? invoke("get_glossary", { langPair })
+    ? tauriInvoke("get_glossary", { langPair })
     : request(`/glossary?lang_pair=${encodeURIComponent(langPair)}`);
 
 export const addGlossaryEntry = (entry: GlossaryEntry): Promise<void> =>
   IS_TAURI
-    ? invoke("add_glossary_entry", { entry })
+    ? tauriInvoke("add_glossary_entry", { entry })
     : request("/glossary", { method: "POST", body: JSON.stringify(entry) });
 
 export const deleteGlossaryEntry = (term: string, langPair: string) =>
@@ -512,7 +526,7 @@ export async function exportTranslations(
 ): Promise<ExportResult> {
   if (IS_TAURI) {
     if (!path) throw new Error("path required for Tauri export");
-    return invoke<ExportResult>("export_translations", { format, lang, path });
+    return tauriInvoke<ExportResult>("export_translations", { format, lang, path });
   }
   const text = format === "po" ? await exportPo(lang) : await exportXliff(lang);
   const filename = path?.split(/[/\\]/).pop() || `translation_${lang}.${format === "po" ? "po" : "xliff"}`;
@@ -534,7 +548,7 @@ export async function importTranslations(
   pathOrContent: string
 ): Promise<ImportResult> {
   if (IS_TAURI) {
-    return invoke<ImportResult>("import_translations", {
+    return tauriInvoke<ImportResult>("import_translations", {
       format,
       path: pathOrContent,
     });
@@ -573,15 +587,15 @@ export const getTranslationRuns = (): Promise<TranslationRun[]> =>
   request("/runs");
 
 export const getConfig = (): Promise<AppConfig> =>
-  IS_TAURI ? invoke("get_config") : request("/config");
+  IS_TAURI ? tauriInvoke("get_config") : request("/config");
 
 export const updateConfig = (partial: Partial<AppConfig>): Promise<AppConfig> =>
   IS_TAURI
-    ? invoke("save_config", { partial })
+    ? tauriInvoke("save_config", { partial })
     : request("/config", { method: "PATCH", body: JSON.stringify(partial) });
 
 export const getBackups = (): Promise<BackupEntry[]> =>
-  IS_TAURI ? invoke("get_backups") : request("/backups");
+  IS_TAURI ? tauriInvoke("get_backups") : request("/backups");
 
 export const restoreBackup = (id: string) =>
   request<void>(`/backups/${encodeURIComponent(id)}/restore`, { method: "POST" });
@@ -793,12 +807,12 @@ export interface XaiAuthPollResult {
 
 export const xaiAuthStart = (): Promise<XaiAuthStartResult> =>
   IS_TAURI
-    ? invoke("xai_auth_start")
+    ? tauriInvoke("xai_auth_start")
     : request("/auth/xai/start", { method: "POST" });
 
 export const xaiAuthPoll = (handle: string): Promise<XaiAuthPollResult> =>
   IS_TAURI
-    ? invoke("xai_auth_poll", { handle })
+    ? tauriInvoke("xai_auth_poll", { handle })
     : request("/auth/xai/poll", {
         method: "POST",
         body: JSON.stringify({ handle }),

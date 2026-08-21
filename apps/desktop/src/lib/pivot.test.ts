@@ -42,6 +42,7 @@ assert.equal(defaultPivotFileName(""), "project-pivot.locust.db");
 assert.ok(isExistingOutputError("409: output file already exists: C:\\a.locust.db"));
 assert.ok(isExistingOutputError("File exists"));
 assert.ok(isExistingOutputError("EEXIST"));
+assert.ok(isExistingOutputError("El archivo de salida ya existe: C:\\a.locust.db"));
 assert.equal(isExistingOutputError("no translated entries"), false);
 
 assert.equal(errorMessage(new Error("boom")), "boom");

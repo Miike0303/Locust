@@ -21,7 +21,7 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 - **`t()` is not key-typed.** `apps/desktop/src/lib/i18n/index.ts:139` declares `t(key: string, ...)`, so the compile-time guarantee only covers EN↔ES parity (`es.ts` is `Record<keyof typeof en, string>`). A key the code uses but neither catalog defines compiles clean and renders its raw name on screen. Tightening to `keyof typeof en` would catch it, but the dynamic call sites — `t(JOB_STREAM_LOST_MESSAGE)`, `t(resolvedSource.error)` — would need their unions typed as key subsets first. Found by Claude, cycle 5.
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
-- Server error messages are not localized. They reach the user verbatim inside translated toasts (`apps/desktop/src/lib/api.ts` reads `res.text()`, `Welcome.tsx:182` interpolates it), so a Spanish UI shows English sentences from the backend. A whole class, not one string.
+- Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Expanding the catalog or returning stable error codes from the server is the rest of this class.
 - Any other database write racing `Database::reopen` is the same class as cycle 4 but was not the evidenced case — a synchronous inject, for instance. A general lock around the swap is a larger change and was deliberately not attempted.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 
@@ -30,6 +30,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 14 (defect, from backlog).** Spanish UI toasts interpolated raw English `res.text()` / Tauri error strings (`api.ts` request throw, Welcome open failure). Desktop now `localizeApiError`s stable bodies (translation/patch in-flight, no project, path/format detect, zip/download messages, output-exists) via EN/ES keys; HTTP `request`/`requestText` and user-facing `tauriInvoke` both apply it; Activity Log keeps the raw English. Pinned by `apiError.test.ts` (negative: EN locale still English; unknown 500 keeps English body inside Spanish frame; Spanish detect failure still trips `isDetectionFailure`). Next rotation: `capability`.
 
 - `pending` — **cycle 13 (optimization, from backlog).** `has_unreal_structure` always walked `.pak` files even when `Engine/` or a `*/Content` game folder already proved the tree was Unreal — so every open paid a second `find_pak_files` walk on detect before extract walked again. Detect now returns on folder layout first; pak-only trees still walk. Pinned by per-thread `FIND_PAK_FILES_CALLS` counters (Engine + Content fixtures stay at 0; pak-only still ≥1). Negative: restoring the always-walk detect fails those two zero-call asserts. Next rotation: `defect`.
 
