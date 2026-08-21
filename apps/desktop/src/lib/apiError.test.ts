@@ -3,6 +3,7 @@ import {
 	localizeApiError,
 	parseApiError,
 	PATCH_APPLY_IN_FLIGHT_EN,
+	PROJECT_BUSY_EN,
 	TRANSLATION_IN_FLIGHT_EN,
 } from "./apiError";
 import { setLocale } from "./i18n";
@@ -23,6 +24,10 @@ assert.equal(
 assert.equal(
 	localizeApiError(PATCH_APPLY_IN_FLIGHT_EN),
 	"Ya se está aplicando un parche a esta carpeta de juego. Espere a que termine o cancele antes de iniciar otro.",
+);
+assert.equal(
+	localizeApiError(`409: ${PROJECT_BUSY_EN}`),
+	"Todavía hay una inyección en curso. Espere a que termine antes de abrir otro proyecto.",
 );
 assert.equal(localizeApiError("404: no project open"), "No hay ningún proyecto abierto.");
 assert.equal(localizeApiError("path not found"), "No se encontró la ruta.");
@@ -51,6 +56,7 @@ assert.equal(
 	localizeApiError(`409: ${TRANSLATION_IN_FLIGHT_EN}`),
 	TRANSLATION_IN_FLIGHT_EN,
 );
+assert.equal(localizeApiError(PROJECT_BUSY_EN), PROJECT_BUSY_EN);
 assert.equal(localizeApiError("no project open"), "No project is open.");
 
 // Detection heuristic still matches the localized detect failure (Welcome picker)

@@ -21,7 +21,7 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
 - Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Expanding the catalog or returning stable error codes from the server is the rest of this class.
-- Any other database write racing `Database::reopen` is the same class as cycle 4 but was not the evidenced case — a synchronous inject, for instance. A general lock around the swap is a larger change and was deliberately not attempted.
+- Other long-running writers that touch `state.db` without taking `project_exclusive` (e.g. pivot mid-read) remain a thinner race class than inject; a full mutex around every DB op is still larger than needed.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 
 ## In flight
@@ -29,6 +29,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 17 (defect, from backlog / goal).** Cycle 4 blocked open during translation; a concurrent inject could still finish `record_multilang_injection` after open had `Database::reopen`d under it, so recording landed in the wrong project. Inject (HTTP + Tauri) now holds `ProjectExclusiveGuard`; open/open-db refuse with 409 `PROJECT_BUSY_MESSAGE` while the counter is non-zero (desktop localizes EN/ES). Pinned by `open_returns_409_while_inject_exclusive_and_keeps_current_project` + `apiError.test.ts`. Next rotation: `capability`.
 
 - `pending` — **cycle 16 (optimization, from backlog class).** `record_injection` re-parsed the same INSERT once per written file via `tx.execute` in a loop (Unity/Unreal injects can record hundreds of paths); `save_translations_batch` used non-cached `prepare` for the same reason on search-replace bulk updates. Both now `prepare_cached`. Pinned by `test_record_injection_many_files_all_persist` (40 files) plus existing recording suite. Unreal full-pak extract remains deferred. Next rotation: `defect`.
 

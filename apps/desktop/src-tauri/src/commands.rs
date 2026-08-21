@@ -13,8 +13,8 @@ use locust_core::translation::TranslationOptions;
 use locust_core::validation::Validator;
 use locust_server::{
     active_translation_job, poll_xai_device_login, spawn_translation_job, start_xai_device_login,
-    AppState, ProjectInfo, XaiAuthPollResponse, XaiAuthStartResponse,
-    TRANSLATION_IN_FLIGHT_MESSAGE,
+    AppState, ProjectExclusiveGuard, ProjectInfo, XaiAuthPollResponse, XaiAuthStartResponse,
+    PROJECT_BUSY_MESSAGE, TRANSLATION_IN_FLIGHT_MESSAGE,
 };
 
 /// Wrapper so we can use Arc<AppState> as Tauri managed state
@@ -57,6 +57,12 @@ pub async fn open_project(
     let s = &state.0;
     if active_translation_job(s).is_some() {
         return Err(TRANSLATION_IN_FLIGHT_MESSAGE.to_string());
+    }
+    if s.project_exclusive
+        .load(std::sync::atomic::Ordering::SeqCst)
+        > 0
+    {
+        return Err(PROJECT_BUSY_MESSAGE.to_string());
     }
     let raw_path = PathBuf::from(&path);
     let outcome = project::open_project(&s.db, &s.format_registry, &raw_path, format_id.as_deref())
@@ -106,6 +112,12 @@ async fn apply_open_project_db(
 ) -> Result<ProjectOpenResponse, String> {
     if active_translation_job(s).is_some() {
         return Err(TRANSLATION_IN_FLIGHT_MESSAGE.to_string());
+    }
+    if s.project_exclusive
+        .load(std::sync::atomic::Ordering::SeqCst)
+        > 0
+    {
+        return Err(PROJECT_BUSY_MESSAGE.to_string());
     }
     let outcome = project::open_project_db(
         &s.db,
@@ -584,6 +596,7 @@ pub async fn run_inject(
         return Err("inject requires at least one language (e.g. [\"es\"])".into());
     }
     let s = &state.0;
+    let _exclusive = ProjectExclusiveGuard::enter(&s.project_exclusive);
 
     if params.direct {
         let game_path = PathBuf::from(&params.project_path);

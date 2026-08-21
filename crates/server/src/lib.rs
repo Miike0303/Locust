@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -73,6 +74,26 @@ pub const TRANSLATION_IN_FLIGHT_MESSAGE: &str = "A translation is still running.
 /// Shown when a second patch apply targets a folder that already has one running.
 pub const PATCH_APPLY_IN_FLIGHT_MESSAGE: &str = "A patch is already being applied to this game folder. Wait for it to finish or cancel it before starting another.";
 
+/// Shown when open/open-db would swap the DB under a synchronous inject.
+pub const PROJECT_BUSY_MESSAGE: &str =
+    "An inject is still running. Wait for it to finish before opening another project.";
+
+/// RAII counter: inject holds this so open cannot `Database::reopen` mid-write.
+pub struct ProjectExclusiveGuard(Arc<AtomicUsize>);
+
+impl ProjectExclusiveGuard {
+    pub fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for ProjectExclusiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Stable key for comparing game folders across apply requests.
 fn patch_game_key(game_path: &str) -> String {
     let p = Path::new(game_path);
@@ -127,12 +148,14 @@ pub fn active_translation_job(state: &AppState) -> Option<String> {
     None
 }
 
-fn refuse_if_translation_in_flight(state: &AppState) -> Result<(), ApiError> {
+fn refuse_if_cannot_switch_project(state: &AppState) -> Result<(), ApiError> {
     if active_translation_job(state).is_some() {
-        Err(err(StatusCode::CONFLICT, TRANSLATION_IN_FLIGHT_MESSAGE))
-    } else {
-        Ok(())
+        return Err(err(StatusCode::CONFLICT, TRANSLATION_IN_FLIGHT_MESSAGE));
     }
+    if state.project_exclusive.load(Ordering::SeqCst) > 0 {
+        return Err(err(StatusCode::CONFLICT, PROJECT_BUSY_MESSAGE));
+    }
+    Ok(())
 }
 
 fn publish_job_event(
@@ -185,6 +208,8 @@ pub struct AppState {
     /// Test override for the token endpoint. `None` uses production.
     pub xai_token_url: Arc<RwLock<Option<String>>>,
     pub current_project: Arc<RwLock<Option<ProjectInfo>>>,
+    /// Inject (and similar) hold this so open cannot reopen the DB underneath them.
+    pub project_exclusive: Arc<AtomicUsize>,
     /// Temp directory to clean up on drop (only set for test states)
     temp_backup_dir: Option<PathBuf>,
 }
@@ -240,6 +265,7 @@ pub fn create_app_state() -> Arc<AppState> {
         xai_device_code_url: Arc::new(RwLock::new(None)),
         xai_token_url: Arc::new(RwLock::new(None)),
         current_project: Arc::new(RwLock::new(None)),
+        project_exclusive: Arc::new(AtomicUsize::new(0)),
         temp_backup_dir: None,
     })
 }
@@ -276,6 +302,7 @@ fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
         xai_device_code_url: Arc::new(RwLock::new(None)),
         xai_token_url: Arc::new(RwLock::new(None)),
         current_project: Arc::new(RwLock::new(None)),
+        project_exclusive: Arc::new(AtomicUsize::new(0)),
         temp_backup_dir: Some(backup_root),
     })
 }
@@ -474,7 +501,7 @@ async fn project_open(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenProjectRequest>,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
-    refuse_if_translation_in_flight(&state)?;
+    refuse_if_cannot_switch_project(&state)?;
     let raw_path = PathBuf::from(&req.path);
     let outcome = project::open_project(
         &state.db,
@@ -528,7 +555,7 @@ async fn project_open_db(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenProjectDbRequest>,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
-    refuse_if_translation_in_flight(&state)?;
+    refuse_if_cannot_switch_project(&state)?;
     let outcome = project::open_project_db(
         &state.db,
         &state.format_registry,
@@ -1105,6 +1132,9 @@ async fn inject(
             "inject requires at least one language in `languages` (e.g. [\"es\"])",
         ));
     }
+
+    // Hold for the whole request (including awaits) so open cannot reopen mid-inject.
+    let _exclusive = ProjectExclusiveGuard::enter(&state.project_exclusive);
 
     if req.direct {
         let game_path = PathBuf::from(&req.project_path);
@@ -3008,6 +3038,55 @@ mod tests {
             .recent_projects
             .iter()
             .all(|p| p.name != "OtherGame"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_returns_409_while_inject_exclusive_and_keeps_current_project() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[
+                translated("keep-a", "Hello", "f.json", "Hola"),
+                StringEntry::new("keep-b", "World", PathBuf::from("f.json")),
+            ])
+            .unwrap();
+        let _hold = ProjectExclusiveGuard::enter(&state.project_exclusive);
+
+        let dir = std::env::temp_dir().join(format!("locust_open_inject_{}", uuid::Uuid::new_v4()));
+        let game = dir.join("OtherGame");
+        write_rpgmaker_game(&game);
+
+        let resp = client()
+            .post(format!("{}/api/project/open", url))
+            .json(&serde_json::json!({"path": game.to_string_lossy()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let text = resp.text().await.unwrap();
+        assert_eq!(text, PROJECT_BUSY_MESSAGE);
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("inject") && lower.contains("finish"),
+            "user-facing way out: {text}"
+        );
+
+        let cur = client()
+            .get(format!("{}/api/project/current", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cur.status(), 200);
+        let cur_body: serde_json::Value = cur.json().await.unwrap();
+        assert_eq!(cur_body["name"], "test-game");
+
+        assert_eq!(state.db.path(), PathBuf::from(":memory:"));
+        let rows = state.db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(state.db.get_entry("keep-a").unwrap().is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

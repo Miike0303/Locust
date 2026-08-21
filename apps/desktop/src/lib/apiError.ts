@@ -17,9 +17,14 @@ export const TRANSLATION_IN_FLIGHT_EN =
 export const PATCH_APPLY_IN_FLIGHT_EN =
 	"A patch is already being applied to this game folder. Wait for it to finish or cancel it before starting another.";
 
+/** Mirrors `locust_server::PROJECT_BUSY_MESSAGE`. */
+export const PROJECT_BUSY_EN =
+	"An inject is still running. Wait for it to finish before opening another project.";
+
 const EXACT: Record<string, MessageKey> = {
 	[TRANSLATION_IN_FLIGHT_EN]: "api.error.translationInFlight",
 	[PATCH_APPLY_IN_FLIGHT_EN]: "api.error.patchApplyInFlight",
+	[PROJECT_BUSY_EN]: "api.error.projectBusy",
 	"no project open": "api.error.noProjectOpen",
 	"path not found": "api.error.pathNotFound",
 	"entry not found": "api.error.entryNotFound",
