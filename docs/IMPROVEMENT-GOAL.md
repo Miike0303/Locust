@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 16 (optimization, from backlog class).** `record_injection` re-parsed the same INSERT once per written file via `tx.execute` in a loop (Unity/Unreal injects can record hundreds of paths); `save_translations_batch` used non-cached `prepare` for the same reason on search-replace bulk updates. Both now `prepare_cached`. Pinned by `test_record_injection_many_files_all_persist` (40 files) plus existing recording suite. Unreal full-pak extract remains deferred. Next rotation: `defect`.
+
 - `pending` — **cycle 15 (capability, from backlog).** `t(key: string)` let missing catalog keys compile and render as the raw key on screen. `t` / `TranslateFn` now take `TranslateKey` (`MessageKey | PluralStem`); dynamic sites (queue statuses, settings nav/theme, welcome guide, hotkeys, patch-source errors) use typed maps; helpers accept `TranslateFn`. Typing also surfaced a missing `common.later` (UpdateChecker) — added EN/ES. Pinned by `tsc --noEmit` and unit tests (negative: a typoed key is a type error). Next rotation: `optimization`.
 
 - `pending` — **cycle 14 (defect, from backlog).** Spanish UI toasts interpolated raw English `res.text()` / Tauri error strings (`api.ts` request throw, Welcome open failure). Desktop now `localizeApiError`s stable bodies (translation/patch in-flight, no project, path/format detect, zip/download messages, output-exists) via EN/ES keys; HTTP `request`/`requestText` and user-facing `tauriInvoke` both apply it; Activity Log keeps the raw English. Pinned by `apiError.test.ts` (negative: EN locale still English; unknown 500 keeps English body inside Spanish frame; Spanish detect failure still trips `isDetectionFailure`). Next rotation: `capability`.

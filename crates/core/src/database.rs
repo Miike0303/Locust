@@ -717,7 +717,7 @@ impl Database {
             let tx = conn.unchecked_transaction()?;
             let mut applied = 0usize;
             {
-                let mut stmt = tx.prepare(
+                let mut stmt = tx.prepare_cached(
                     "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3 WHERE id = ?4",
                 )?;
                 for (id, translation) in &updates {
@@ -902,12 +902,16 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM injected_files WHERE lang IS ?1", params![lang])?;
-        for (rel, hash, size) in &rows {
-            tx.execute(
+        // Same class as save_entries/merge_entries: one plan for N file rows
+        // (Unreal/Unity injects can record hundreds of written paths).
+        {
+            let mut insert = tx.prepare_cached(
                 "INSERT INTO injected_files (lang, root, rel, hash, size, recorded_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![lang, root_str, rel, hash, *size as i64, now],
             )?;
+            for (rel, hash, size) in &rows {
+                insert.execute(params![lang, root_str, rel, hash, *size as i64, now])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1619,6 +1623,27 @@ mod tests {
         );
         assert_eq!(rec.files[0].hash, sha256_hex(&bytes));
         assert_eq!(rec.files[0].size, bytes.len() as u64);
+    }
+
+    #[test]
+    fn test_record_injection_many_files_all_persist() {
+        // Pins the prepare_cached INSERT path: N rows in one transaction must
+        // all round-trip (guards against accidentally emptying the insert loop).
+        let base = recording_tempdir();
+        let root = base.join("root");
+        let sub = root.join("game");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut files = Vec::new();
+        for i in 0..40 {
+            let p = sub.join(format!("f{i}.rpy"));
+            std::fs::write(&p, format!("line {i}")).unwrap();
+            files.push(p);
+        }
+        let db = Database::open_in_memory().unwrap();
+        db.record_injection(Some("es"), &root, &files).unwrap();
+        let rec = db.get_injection(Some("es")).unwrap().unwrap();
+        assert_eq!(rec.files.len(), 40);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
