@@ -22,6 +22,20 @@ export function shouldOpenProjectDb(databasePath: string | null | undefined): bo
   return typeof databasePath === "string" && /\.locust\.db$/i.test(databasePath.trim());
 }
 
+/** Ready to call open-db: real .locust.db, non-empty game folder, concrete format (not auto). */
+export function openDbCanConfirm(
+  databasePath: string,
+  gamePath: string,
+  formatId: string,
+): boolean {
+  return (
+    shouldOpenProjectDb(databasePath) &&
+    gamePath.trim().length > 0 &&
+    formatId.trim().length > 0 &&
+    formatId !== "auto"
+  );
+}
+
 export const PROJECT_QUERY_KEYS = [
   "strings",
   "stats",
@@ -46,6 +60,35 @@ export async function pickGameFolder(t: TranslateFn): Promise<string | null> {
     return typeof selected === "string" ? selected : null;
   }
   return prompt(t("welcome.prompt.folderPath"));
+}
+
+/** Pick an existing `.locust.db` (CLI extract / pivot) without opening a bare game folder. */
+export type PickLocustDbResult =
+  | { status: "picked"; path: string }
+  | { status: "cancelled" }
+  | { status: "invalid" };
+
+export async function pickLocustDbFile(t: TranslateFn): Promise<PickLocustDbResult> {
+  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      title: t("welcome.dialog.selectDb"),
+      filters: [
+        {
+          name: t("welcome.dialog.locustDb"),
+          extensions: ["db"],
+        },
+        { name: t("welcome.dialog.allFiles"), extensions: ["*"] },
+      ],
+    });
+    if (typeof selected !== "string") return { status: "cancelled" };
+    if (!shouldOpenProjectDb(selected)) return { status: "invalid" };
+    return { status: "picked", path: selected };
+  }
+  const typed = prompt(t("welcome.prompt.dbPath"));
+  if (typed === null) return { status: "cancelled" };
+  if (!shouldOpenProjectDb(typed)) return { status: "invalid" };
+  return { status: "picked", path: typed.trim() };
 }
 
 export async function completeOpenProject(

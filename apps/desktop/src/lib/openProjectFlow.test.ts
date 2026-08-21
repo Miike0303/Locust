@@ -5,6 +5,7 @@
 import {
   formatPickerPathFromState,
   isDetectionFailure,
+  openDbCanConfirm,
   projectFromOpenResponse,
   shouldOpenProjectDb,
 } from "./openProjectFlow.ts";
@@ -57,5 +58,10 @@ assert.equal(shouldOpenProjectDb("/games/title-pivot.locust.db"), true);
 assert.equal(shouldOpenProjectDb("C:\\x\\a.locust.db"), true);
 // Negative: treating a bare game path as open-db would re-extract pivots.
 assert.equal(shouldOpenProjectDb("/games/title"), false);
+
+assert.ok(openDbCanConfirm("/x/a.locust.db", "/games/title", "renpy"));
+assert.equal(openDbCanConfirm("/x/a.locust.db", "/games/title", "auto"), false);
+assert.equal(openDbCanConfirm("/x/a.locust.db", "  ", "renpy"), false);
+assert.equal(openDbCanConfirm("/games/title", "/games/title", "renpy"), false);
 
 console.log("openProjectFlow.test.ts: ok");

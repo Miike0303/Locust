@@ -25,6 +25,7 @@ import {
 	Clapperboard,
 	Puzzle,
 	Braces,
+	Database,
 } from "lucide-react";
 import { getFormats, getConfig, getProviders } from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
@@ -37,7 +38,9 @@ import {
 	completeOpenProjectDb,
 	formatPickerPathFromState,
 	isDetectionFailure,
+	openDbCanConfirm,
 	pickGameFolder,
+	pickLocustDbFile,
 	shouldOpenProjectDb,
 } from "../lib/openProjectFlow";
 import { projectOpenMergeNotice } from "../lib/projectOpenMerge";
@@ -136,17 +139,25 @@ export default function Welcome() {
 	const addToQueue = useQueueStore((s) => s.addItem);
 	const setQueueOpen = useQueueStore((s) => s.setPanelOpen);
 
-	// Format picker state — shown only when auto-detect fails, or on explicit request.
+	// Format picker — extract path, or open-db draft (CLI / external .locust.db).
 	const [picker, setPicker] = useState<{
 		path: string | null;
 		reason: "manual" | "detect-failed";
 	} | null>(null);
+	const [openDbDraft, setOpenDbDraft] = useState<{
+		databasePath: string;
+		gamePath: string;
+	} | null>(null);
 	const [selectedFormat, setSelectedFormat] = useState("auto");
 	const [opening, setOpening] = useState(false);
 	const [showPatchModal, setShowPatchModal] = useState(false);
+	const formatOverlayOpen = !!picker || !!openDbDraft;
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
-		open: !!picker,
-		onClose: () => setPicker(null),
+		open: formatOverlayOpen,
+		onClose: () => {
+			setPicker(null);
+			setOpenDbDraft(null);
+		},
 		ownEscape: true,
 	});
 
@@ -217,6 +228,7 @@ export default function Welcome() {
 			);
 			addToast("success", t("welcome.toast.openedDb", { name: result.project_name }));
 			setPicker(null);
+			setOpenDbDraft(null);
 			navigate("/editor");
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -242,6 +254,17 @@ export default function Welcome() {
 	const pickFolderPath = () => pickGameFolder(t);
 
 	const handleConfirmFormat = async () => {
+		if (openDbDraft) {
+			if (!openDbCanConfirm(openDbDraft.databasePath, openDbDraft.gamePath, selectedFormat)) {
+				return;
+			}
+			await openWithDb(
+				openDbDraft.databasePath,
+				openDbDraft.gamePath,
+				selectedFormat,
+			);
+			return;
+		}
 		if (!picker) return;
 		const formatId = selectedFormat === "auto" ? undefined : selectedFormat;
 		if (picker.path) {
@@ -251,6 +274,23 @@ export default function Welcome() {
 		// Manual mode: format chosen first, now pick the game folder.
 		const path = await pickFolderPath();
 		if (path) await openWithPath(path, formatId);
+	};
+
+	const handleOpenProjectDb = async () => {
+		const picked = await pickLocustDbFile(t);
+		if (picked.status === "cancelled") return;
+		if (picked.status === "invalid") {
+			addToast("info", t("welcome.toast.needLocustDb"));
+			return;
+		}
+		const gamePath = await pickFolderPath();
+		if (!gamePath) {
+			addToast("info", t("welcome.toast.cancelledOpenDb"));
+			return;
+		}
+		setPicker(null);
+		setSelectedFormat("");
+		setOpenDbDraft({ databasePath: picked.path, gamePath });
 	};
 
 	const handleAddToQueue = (path: string) => {
@@ -415,6 +455,19 @@ export default function Welcome() {
 					</button>
 					<button
 						type="button"
+						onClick={handleOpenProjectDb}
+						disabled={opening}
+						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
+					>
+						{opening ? (
+							<Loader size={18} className="animate-spin" />
+						) : (
+							<Database size={18} />
+						)}
+						{opening ? t("welcome.opening") : t("welcome.openDb")}
+					</button>
+					<button
+						type="button"
 						onClick={() => setShowPatchModal(true)}
 						disabled={opening}
 						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
@@ -466,8 +519,8 @@ export default function Welcome() {
 				</div>
 			)}
 
-			{/* Format Picker Modal — shown when auto-detect fails or on "Choose format manually" */}
-			{picker && (
+			{/* Format Picker Modal — extract detect/manual, or open-db after picking .locust.db + game */}
+			{(picker || openDbDraft) && (
 				<div className={MODAL_BACKDROP_CLASS}>
 					<div
 						ref={dialogRef}
@@ -479,30 +532,49 @@ export default function Welcome() {
 								{t("welcome.format.title")}
 							</h2>
 							<button
-								onClick={() => setPicker(null)}
+								onClick={() => {
+									setPicker(null);
+									setOpenDbDraft(null);
+								}}
 								className="text-gray-400 hover:text-gray-600"
 							>
 								<X size={20} />
 							</button>
 						</div>
 
-						{picker.path && (
-							<p className="text-sm text-gray-500 mb-1 truncate">
-								{picker.path}
-							</p>
-						)}
-						{picker.reason === "detect-failed" ? (
-							<p className="text-xs text-amber-600 dark:text-amber-400 mb-4">
-								{t("welcome.format.detectFailed")}
-							</p>
+						{openDbDraft ? (
+							<>
+								<p className="text-sm text-gray-500 mb-1 truncate" title={openDbDraft.databasePath}>
+									{openDbDraft.databasePath}
+								</p>
+								<p className="text-xs text-gray-400 mb-1 truncate" title={openDbDraft.gamePath}>
+									{t("welcome.recentGame", { path: openDbDraft.gamePath })}
+								</p>
+								<p className="text-xs text-gray-400 mb-4">
+									{t("welcome.format.openDbHint")}
+								</p>
+							</>
 						) : (
-							<p className="text-xs text-gray-400 mb-4">
-								{t("welcome.format.manualHint")}
-							</p>
+							<>
+								{picker?.path && (
+									<p className="text-sm text-gray-500 mb-1 truncate">
+										{picker.path}
+									</p>
+								)}
+								{picker?.reason === "detect-failed" ? (
+									<p className="text-xs text-amber-600 dark:text-amber-400 mb-4">
+										{t("welcome.format.detectFailed")}
+									</p>
+								) : (
+									<p className="text-xs text-gray-400 mb-4">
+										{t("welcome.format.manualHint")}
+									</p>
+								)}
+							</>
 						)}
 
 						<div className="space-y-1.5 max-h-64 overflow-y-auto mb-4">
-							{picker.reason !== "detect-failed" && (
+							{!openDbDraft && picker?.reason !== "detect-failed" && (
 								<button
 									onClick={() => setSelectedFormat("auto")}
 									className={`w-full text-left p-3 rounded-lg border transition-colors flex items-center gap-3 ${
@@ -564,14 +636,25 @@ export default function Welcome() {
 
 						<button
 							onClick={handleConfirmFormat}
-							disabled={opening || !selectedFormat}
+							disabled={
+								opening ||
+								!selectedFormat ||
+								(!!openDbDraft &&
+									!openDbCanConfirm(
+										openDbDraft.databasePath,
+										openDbDraft.gamePath,
+										selectedFormat,
+									))
+							}
 							className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg font-medium transition-colors"
 						>
 							{opening
 								? t("welcome.openingDots")
-								: picker.path
-									? t("welcome.format.openProject")
-									: t("welcome.format.chooseFolder")}
+								: openDbDraft
+									? t("welcome.format.openDbConfirm")
+									: picker?.path
+										? t("welcome.format.openProject")
+										: t("welcome.format.chooseFolder")}
 						</button>
 					</div>
 				</div>

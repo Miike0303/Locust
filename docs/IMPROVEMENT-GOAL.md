@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 18 (capability, from backlog / cycle 7 still-need).** CLI/`locust extract -o` and pivots that never hit Recents had no Welcome entry: "Open Game Folder" re-extracts into the sibling path and can ignore that work. Welcome now has **Open project database** → pick `.locust.db` → game folder → format (no auto) → existing `completeOpenProjectDb` (lands in Recents). Pinned by `openDbCanConfirm` negatives (auto / empty game / bare path) + unit suite. Next rotation: `optimization`.
+
 - `pending` — **cycle 17 (defect, from backlog / goal).** Cycle 4 blocked open during translation; a concurrent inject could still finish `record_multilang_injection` after open had `Database::reopen`d under it, so recording landed in the wrong project. Inject (HTTP + Tauri) now holds `ProjectExclusiveGuard`; open/open-db refuse with 409 `PROJECT_BUSY_MESSAGE` while the counter is non-zero (desktop localizes EN/ES). Pinned by `open_returns_409_while_inject_exclusive_and_keeps_current_project` + `apiError.test.ts`. Next rotation: `capability`.
 
 - `pending` — **cycle 16 (optimization, from backlog class).** `record_injection` re-parsed the same INSERT once per written file via `tx.execute` in a loop (Unity/Unreal injects can record hundreds of paths); `save_translations_batch` used non-cached `prepare` for the same reason on search-replace bulk updates. Both now `prepare_cached`. Pinned by `test_record_injection_many_files_all_persist` (40 files) plus existing recording suite. Unreal full-pak extract remains deferred. Next rotation: `defect`.
