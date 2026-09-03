@@ -21,10 +21,15 @@ export const PATCH_APPLY_IN_FLIGHT_EN =
 export const PROJECT_BUSY_EN =
 	"An inject is still running. Wait for it to finish before opening another project.";
 
+/** Mirrors `locust_server::INJECT_EMPTY_LANGUAGES_MESSAGE`. */
+export const INJECT_EMPTY_LANGUAGES_EN =
+	"inject requires at least one language (e.g. [\"es\"])";
+
 const EXACT: Record<string, MessageKey> = {
 	[TRANSLATION_IN_FLIGHT_EN]: "api.error.translationInFlight",
 	[PATCH_APPLY_IN_FLIGHT_EN]: "api.error.patchApplyInFlight",
 	[PROJECT_BUSY_EN]: "api.error.projectBusy",
+	[INJECT_EMPTY_LANGUAGES_EN]: "api.error.injectEmptyLanguages",
 	"no project open": "api.error.noProjectOpen",
 	"path not found": "api.error.pathNotFound",
 	"entry not found": "api.error.entryNotFound",
@@ -38,6 +43,11 @@ const EXACT: Record<string, MessageKey> = {
 	"format not detected": "api.error.formatNotDetected",
 	"Could not detect game format": "api.error.formatNotDetected",
 	"path required for Tauri export": "api.error.exportPathRequired",
+	"no strings in project — open a game and extract first": "api.error.noStrings",
+	"import file is empty": "api.error.importEmpty",
+	"batch too large (max 50000 updates)": "api.error.batchTooLarge",
+	"no translated, reviewed, or approved strings — nothing to pack yet. Run translate first.":
+		"api.error.nothingToPack",
 };
 
 type PrefixRule = { prefix: string; key: MessageKey; detail?: boolean };
@@ -67,6 +77,7 @@ const PREFIXES: PrefixRule[] = [
 		key: "api.error.outputExists",
 		detail: true,
 	},
+	{ prefix: "no translated entries", key: "api.error.noTranslatedToPivot" },
 ];
 
 /** Strip optional `123: ` HTTP status prefix from `request()` throws. */

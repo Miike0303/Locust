@@ -800,6 +800,15 @@ export const es: Record<keyof typeof en, string> = {
   "api.error.downloadHttp": "Error HTTP en la descarga: {detail}",
   "api.error.downloadBody": "Error en el cuerpo de la descarga: {detail}",
   "api.error.outputExists": "El archivo de salida ya existe: {detail}",
+  "api.error.injectEmptyLanguages":
+    "La inyección necesita al menos un idioma (por ejemplo es).",
+  "api.error.noStrings": "Este proyecto no tiene cadenas — abra un juego y extraiga primero.",
+  "api.error.importEmpty": "El archivo de importación está vacío.",
+  "api.error.batchTooLarge": "Demasiadas actualizaciones en un lote (máximo 50.000).",
+  "api.error.nothingToPack":
+    "Aún no hay nada que empaquetar — traduzca, inyecte y después empaquete.",
+  "api.error.noTranslatedToPivot":
+    "No hay traducciones para pivotar. Traduzca o importe primero.",
   "ws.jobStreamLost": "se perdió la conexión con el trabajo de traducción",
   "ws.patchJobStreamLost": "se perdió la conexión con el trabajo de parche",
   "provider.free": "gratuito",

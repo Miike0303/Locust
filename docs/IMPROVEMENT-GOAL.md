@@ -20,7 +20,7 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 ## Backlog
 
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
-- Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Expanding the catalog or returning stable error codes from the server is the rest of this class.
+- Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Remaining: dynamic IO/parse messages, unknown export format, xAI handle errors.
 - Other long-running writers that touch `state.db` without taking `project_exclusive` (e.g. pivot mid-read) remain a thinner race class than inject; a full mutex around every DB op is still larger than needed.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 
@@ -29,6 +29,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 20 (defect, from backlog / cycle 14 class).** Inject/export/import/pack/pivot still toasted raw English (`inject requires…`, empty project export, empty import, batch cap, pack-nothing, pivot-no-translations). Catalog maps those stable bodies EN/ES; HTTP and Tauri now share `INJECT_EMPTY_LANGUAGES_MESSAGE`. Pinned by `apiError.test.ts` (negative: EN locale still English). Next rotation: `capability`.
 
 - `pending` — **cycle 19 (optimization, from backlog class).** Editor `/api/stats` walked `strings` six times (`COUNT(*)` plus five status filters) on every poll; `save_validation_issues` re-parsed INSERT once per issue with no transaction. Stats now one `GROUP BY status` (unknown statuses still increment `total`); validation writes `prepare_cached` in one tx. Pinned by `test_stats_accuracy` (negative: a raw `weird` status must bump total without changing buckets) and `test_save_validation_issues_many_all_persist` (40 rows). Unreal full-pak extract remains deferred. Next rotation: `defect`.
 

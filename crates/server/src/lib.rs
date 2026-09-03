@@ -78,6 +78,10 @@ pub const PATCH_APPLY_IN_FLIGHT_MESSAGE: &str = "A patch is already being applie
 pub const PROJECT_BUSY_MESSAGE: &str =
     "An inject is still running. Wait for it to finish before opening another project.";
 
+/// Empty `languages` used to succeed with zero recording — a silent broken patch.
+pub const INJECT_EMPTY_LANGUAGES_MESSAGE: &str =
+    "inject requires at least one language (e.g. [\"es\"])";
+
 /// RAII counter: inject holds this so open cannot `Database::reopen` mid-write.
 pub struct ProjectExclusiveGuard(Arc<AtomicUsize>);
 
@@ -1127,10 +1131,7 @@ async fn inject(
     // Same guard as CLI: empty languages used to return 200 with zero work and
     // zero recording — a silent no-op that becomes an untranslatable patch later.
     if req.languages.is_empty() {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "inject requires at least one language in `languages` (e.g. [\"es\"])",
-        ));
+        return Err(err(StatusCode::BAD_REQUEST, INJECT_EMPTY_LANGUAGES_MESSAGE));
     }
 
     // Hold for the whole request (including awaits) so open cannot reopen mid-inject.

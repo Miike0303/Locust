@@ -829,6 +829,15 @@ export const en = {
   "api.error.downloadHttp": "Download HTTP error: {detail}",
   "api.error.downloadBody": "Download body error: {detail}",
   "api.error.outputExists": "Output file already exists: {detail}",
+  "api.error.injectEmptyLanguages":
+    "Inject needs at least one language (for example es).",
+  "api.error.noStrings": "No strings in this project — open a game and extract first.",
+  "api.error.importEmpty": "The import file is empty.",
+  "api.error.batchTooLarge": "Too many updates in one batch (maximum 50,000).",
+  "api.error.nothingToPack":
+    "Nothing to pack yet — translate some strings, then inject, then pack.",
+  "api.error.noTranslatedToPivot":
+    "No translations to pivot from. Translate or import first.",
   "ws.jobStreamLost": "connection to the translation job was lost",
   "ws.patchJobStreamLost": "connection to the patch job was lost",
   "provider.free": "free",

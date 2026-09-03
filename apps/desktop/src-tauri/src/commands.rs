@@ -14,7 +14,7 @@ use locust_core::validation::Validator;
 use locust_server::{
     active_translation_job, poll_xai_device_login, spawn_translation_job, start_xai_device_login,
     AppState, ProjectExclusiveGuard, ProjectInfo, XaiAuthPollResponse, XaiAuthStartResponse,
-    PROJECT_BUSY_MESSAGE, TRANSLATION_IN_FLIGHT_MESSAGE,
+    INJECT_EMPTY_LANGUAGES_MESSAGE, PROJECT_BUSY_MESSAGE, TRANSLATION_IN_FLIGHT_MESSAGE,
 };
 
 /// Wrapper so we can use Arc<AppState> as Tauri managed state
@@ -593,7 +593,7 @@ pub async fn run_inject(
     // Same guard as CLI/server: empty languages used to return success with
     // zero work and zero recording — a silent no-op that breaks `locust patch`.
     if params.languages.is_empty() {
-        return Err("inject requires at least one language (e.g. [\"es\"])".into());
+        return Err(INJECT_EMPTY_LANGUAGES_MESSAGE.to_string());
     }
     let s = &state.0;
     let _exclusive = ProjectExclusiveGuard::enter(&s.project_exclusive);
