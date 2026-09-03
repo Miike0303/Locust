@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 25 (optimization, from backlog class).** `pivot_to` loaded every string via `get_entries` then discarded pending/empty rows in Rust, so a mostly-untranslated project paid O(n) materialization (tens of thousands on KiriKiri extracts) for a few dozen pivots. Pivot now selects only non-empty trimmed translations in SQL (`entries_with_nonempty_translation`). Pinned by `test_entries_with_nonempty_translation_skips_pending_bulk` (negative: full `get_entries` still sees 202 rows while the pivot query returns 1). Unreal full-pak extract remains deferred. Next rotation: `defect`.
+
 - `pending` — **cycle 24 (capability, from cycle 5 still-need).** After a game update, the merge toast said N translations were sent back to pending, then the Editor opened with no status filter — the user was told to re-check but not shown where. Welcome and the open-project hotkey now set the editor filter to pending when `stale_source_reset > 0` (removed-only toasts do not). Pinned by `shouldFocusPendingAfterOpen` negatives in `projectOpenMerge.test.ts`. Next rotation: `optimization`.
 
 - `pending` — **cycle 23 (defect, from backlog).** Pivot read every translated row from the live DB without holding `project_exclusive`, so open could `reopen` mid-pivot and produce a half-wrong output DB. Pivot (HTTP + Tauri) now takes `ProjectExclusiveGuard`; `PROJECT_BUSY_MESSAGE` covers inject and pivot ("project operation"). Pinned by renamed `open_returns_409_while_project_exclusive_and_keeps_current_project` + `apiError.test.ts`. Next rotation: `capability`.

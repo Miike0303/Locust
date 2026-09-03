@@ -2525,7 +2525,7 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         state
             .db
-            .record_injection(Some("es"), &root, &[file.clone()])
+            .record_injection(Some("es"), &root, std::slice::from_ref(&file))
             .unwrap();
 
         let hidden = client()

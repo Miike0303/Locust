@@ -607,6 +607,40 @@ impl Database {
         Ok(StringFacets { file_paths, tags })
     }
 
+    /// Rows with a non-empty trimmed `translation` — the only inputs pivot needs.
+    /// Avoids loading every pending row on large projects (tens of thousands).
+    fn entries_with_nonempty_translation(&self) -> Result<Vec<StringEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at
+             FROM strings
+             WHERE translation IS NOT NULL AND length(trim(translation)) > 0
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RawEntry {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                translation: row.get(2)?,
+                status: row.get(3)?,
+                file_path: row.get(4)?,
+                context: row.get(5)?,
+                tags: row.get(6)?,
+                metadata: row.get(7)?,
+                char_limit: row.get(8)?,
+                provider_used: row.get(9)?,
+                created_at: row.get(10)?,
+                translated_at: row.get(11)?,
+                reviewed_at: row.get(12)?,
+            })
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(raw_to_entry(row?)?);
+        }
+        Ok(entries)
+    }
+
     /// Write a new project DB at `output` whose SOURCE text is this project's
     /// non-empty translations. Does not modify `self`. Refuses to overwrite.
     pub fn pivot_to(&self, output: &Path) -> Result<PivotResult> {
@@ -618,8 +652,8 @@ impl Database {
             .into());
         }
 
-        let entries = self.get_entries(&EntryFilter::default())?;
-        let mut pivoted: Vec<StringEntry> = Vec::new();
+        let entries = self.entries_with_nonempty_translation()?;
+        let mut pivoted: Vec<StringEntry> = Vec::with_capacity(entries.len());
         for e in entries {
             let Some(translation) = e.translation.filter(|t| !t.trim().is_empty()) else {
                 continue;
@@ -2532,6 +2566,35 @@ mod tests {
         let world = original.iter().find(|e| e.id == "b").unwrap();
         assert_eq!(world.source, "World");
         assert!(world.translation.is_none());
+    }
+
+    /// Pin: pivot's source query must not materialize the pending bulk that
+    /// `get_entries` still returns (negative: equal lengths would mean the
+    /// SQL filter is gone and large projects pay O(n) for mostly-empty rows).
+    #[test]
+    fn test_entries_with_nonempty_translation_skips_pending_bulk() {
+        let src = Database::open_in_memory().unwrap();
+        let mut bulk: Vec<StringEntry> = (0..200)
+            .map(|i| {
+                StringEntry::new(
+                    format!("p{i}"),
+                    format!("Pending {i}"),
+                    PathBuf::from("f.json"),
+                )
+            })
+            .collect();
+        bulk.push(translated_entry("done", "Hello", "f.json", "Hola"));
+        bulk.push(translated_entry("ws", "Whitespace", "f.json", "   "));
+        src.save_entries(&bulk).unwrap();
+
+        let pivoted_src = src.entries_with_nonempty_translation().unwrap();
+        assert_eq!(pivoted_src.len(), 1);
+        assert_eq!(pivoted_src[0].id, "done");
+        assert_eq!(
+            src.get_entries(&EntryFilter::default()).unwrap().len(),
+            202,
+            "full table scan still sees every row; pivot query must stay narrower"
+        );
     }
 
     #[test]
