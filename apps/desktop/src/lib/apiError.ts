@@ -19,7 +19,7 @@ export const PATCH_APPLY_IN_FLIGHT_EN =
 
 /** Mirrors `locust_server::PROJECT_BUSY_MESSAGE`. */
 export const PROJECT_BUSY_EN =
-	"An inject is still running. Wait for it to finish before opening another project.";
+	"A project operation is still running. Wait for it to finish before opening another project.";
 
 /** Mirrors `locust_server::INJECT_EMPTY_LANGUAGES_MESSAGE`. */
 export const INJECT_EMPTY_LANGUAGES_EN =

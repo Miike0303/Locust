@@ -304,10 +304,9 @@ pub async fn run_pivot(
     if state.0.current_project.read().await.is_none() {
         return Err("no project open".into());
     }
-    state
-        .0
-        .db
-        .pivot_to(&PathBuf::from(output_path))
+    let s = &state.0;
+    let _exclusive = ProjectExclusiveGuard::enter(&s.project_exclusive);
+    s.db.pivot_to(&PathBuf::from(output_path))
         .map_err(|e| e.to_string())
 }
 

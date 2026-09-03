@@ -74,15 +74,15 @@ pub const TRANSLATION_IN_FLIGHT_MESSAGE: &str = "A translation is still running.
 /// Shown when a second patch apply targets a folder that already has one running.
 pub const PATCH_APPLY_IN_FLIGHT_MESSAGE: &str = "A patch is already being applied to this game folder. Wait for it to finish or cancel it before starting another.";
 
-/// Shown when open/open-db would swap the DB under a synchronous inject.
+/// Shown when open/open-db would swap the DB under inject, pivot, or similar.
 pub const PROJECT_BUSY_MESSAGE: &str =
-    "An inject is still running. Wait for it to finish before opening another project.";
+    "A project operation is still running. Wait for it to finish before opening another project.";
 
 /// Empty `languages` used to succeed with zero recording — a silent broken patch.
 pub const INJECT_EMPTY_LANGUAGES_MESSAGE: &str =
     "inject requires at least one language (e.g. [\"es\"])";
 
-/// RAII counter: inject holds this so open cannot `Database::reopen` mid-write.
+/// RAII counter: inject/pivot hold this so open cannot `Database::reopen` mid-op.
 pub struct ProjectExclusiveGuard(Arc<AtomicUsize>);
 
 impl ProjectExclusiveGuard {
@@ -212,7 +212,7 @@ pub struct AppState {
     /// Test override for the token endpoint. `None` uses production.
     pub xai_token_url: Arc<RwLock<Option<String>>>,
     pub current_project: Arc<RwLock<Option<ProjectInfo>>>,
-    /// Inject (and similar) hold this so open cannot reopen the DB underneath them.
+    /// Inject/pivot hold this so open cannot reopen the DB underneath them.
     pub project_exclusive: Arc<AtomicUsize>,
     /// Temp directory to clean up on drop (only set for test states)
     temp_backup_dir: Option<PathBuf>,
@@ -614,6 +614,8 @@ async fn pivot_project(
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
+    // Pivot reads every translated row from the live DB — open must not reopen under it.
+    let _exclusive = ProjectExclusiveGuard::enter(&state.project_exclusive);
     let output = PathBuf::from(&req.output_path);
     state.db.pivot_to(&output).map(Json).map_err(|e| {
         let msg = e.to_string();
@@ -3105,7 +3107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_returns_409_while_inject_exclusive_and_keeps_current_project() {
+    async fn open_returns_409_while_project_exclusive_and_keeps_current_project() {
         let (url, _h, state) = setup_with_state().await;
         mark_project_open(&state).await;
         state
@@ -3117,7 +3119,7 @@ mod tests {
             .unwrap();
         let _hold = ProjectExclusiveGuard::enter(&state.project_exclusive);
 
-        let dir = std::env::temp_dir().join(format!("locust_open_inject_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("locust_open_excl_{}", uuid::Uuid::new_v4()));
         let game = dir.join("OtherGame");
         write_rpgmaker_game(&game);
 
@@ -3132,7 +3134,7 @@ mod tests {
         assert_eq!(text, PROJECT_BUSY_MESSAGE);
         let lower = text.to_lowercase();
         assert!(
-            lower.contains("inject") && lower.contains("finish"),
+            lower.contains("project") && lower.contains("finish"),
             "user-facing way out: {text}"
         );
 

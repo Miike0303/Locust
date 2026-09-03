@@ -781,7 +781,7 @@ export const es: Record<keyof typeof en, string> = {
   "api.error.patchApplyInFlight":
     "Ya se está aplicando un parche a esta carpeta de juego. Espere a que termine o cancele antes de iniciar otro.",
   "api.error.projectBusy":
-    "Todavía hay una inyección en curso. Espere a que termine antes de abrir otro proyecto.",
+    "Todavía hay una operación de proyecto en curso. Espere a que termine antes de abrir otro proyecto.",
   "api.error.noProjectOpen": "No hay ningún proyecto abierto.",
   "api.error.pathNotFound": "No se encontró la ruta.",
   "api.error.entryNotFound": "No se encontró la entrada.",

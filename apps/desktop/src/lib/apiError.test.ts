@@ -28,7 +28,7 @@ assert.equal(
 );
 assert.equal(
 	localizeApiError(`409: ${PROJECT_BUSY_EN}`),
-	"Todavía hay una inyección en curso. Espere a que termine antes de abrir otro proyecto.",
+	"Todavía hay una operación de proyecto en curso. Espere a que termine antes de abrir otro proyecto.",
 );
 assert.equal(localizeApiError("404: no project open"), "No hay ningún proyecto abierto.");
 assert.equal(localizeApiError("path not found"), "No se encontró la ruta.");

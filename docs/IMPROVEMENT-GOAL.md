@@ -21,7 +21,7 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
 - Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Remaining: dynamic IO/parse messages, unknown export format, xAI handle errors.
-- Other long-running writers that touch `state.db` without taking `project_exclusive` (e.g. pivot mid-read) remain a thinner race class than inject; a full mutex around every DB op is still larger than needed.
+- Other long-running writers that touch `state.db` without taking `project_exclusive` beyond inject/pivot (e.g. bulk validate) remain a thinner race class; a full mutex around every DB op is still larger than needed.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 
 ## In flight
@@ -29,6 +29,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 23 (defect, from backlog).** Pivot read every translated row from the live DB without holding `project_exclusive`, so open could `reopen` mid-pivot and produce a half-wrong output DB. Pivot (HTTP + Tauri) now takes `ProjectExclusiveGuard`; `PROJECT_BUSY_MESSAGE` covers inject and pivot ("project operation"). Pinned by renamed `open_returns_409_while_project_exclusive_and_keeps_current_project` + `apiError.test.ts`. Next rotation: `capability`.
 
 - `pending` — **cycle 22 (optimization, from cycle 8 leftover).** Pack/record already streamed hashes; apply, verify, rollback, and `.locust` backup still `fs::read` every game file to SHA-256 (peak RAM ≈ file size on Unreal paks). Those paths now use `sha256_path` / `sha256_file`; restore copies through `copy_path_chunked`. Pinned by `sha256_file_matches_in_memory_across_chunk_boundary` (`sha256_path` equals the in-memory digest). Existing patch apply/verify tests still green. Unreal full-pak extract remains deferred. Next rotation: `defect`.
 
