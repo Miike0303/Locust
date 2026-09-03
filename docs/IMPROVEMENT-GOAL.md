@@ -21,7 +21,7 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
 - Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Remaining: dynamic IO/parse messages, unknown export format, xAI handle errors.
-- Other long-running writers that touch `state.db` without taking `project_exclusive` beyond inject/pivot (e.g. bulk validate) remain a thinner race class; a full mutex around every DB op is still larger than needed.
+- Other long-running writers that touch `state.db` without taking `project_exclusive` beyond inject/pivot/validate (e.g. export/import bulk paths) remain a thinner race class; a full mutex around every DB op is still larger than needed.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 
 ## In flight
@@ -29,6 +29,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 26 (defect, from backlog).** Validate wrote issue rows via `validate_and_save` without `ProjectExclusiveGuard`, so open could `reopen` mid-validate the same way inject/pivot used to. HTTP + Tauri validate now take the guard; open still refuses with `PROJECT_BUSY_MESSAGE`. Pinned by `validate_releases_project_exclusive_so_open_can_proceed` (negative: a leaked enter would leave open at 409). Next rotation: `capability`.
 
 - `pending` — **cycle 25 (optimization, from backlog class).** `pivot_to` loaded every string via `get_entries` then discarded pending/empty rows in Rust, so a mostly-untranslated project paid O(n) materialization (tens of thousands on KiriKiri extracts) for a few dozen pivots. Pivot now selects only non-empty trimmed translations in SQL (`entries_with_nonempty_translation`). Pinned by `test_entries_with_nonempty_translation_skips_pending_bulk` (negative: full `get_entries` still sees 202 rows while the pivot query returns 1). Unreal full-pak extract remains deferred. Next rotation: `defect`.
 

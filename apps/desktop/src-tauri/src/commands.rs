@@ -427,6 +427,8 @@ pub async fn run_validation(
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
     let s = &state.0;
+    // Same exclusive as HTTP validate: issue writes must not race Database::reopen.
+    let _exclusive = ProjectExclusiveGuard::enter(&s.project_exclusive);
     let entries =
         s.db.get_entries(&EntryFilter::default())
             .map_err(|e| e.to_string())?;

@@ -1766,6 +1766,9 @@ async fn patch_status(
 }
 
 async fn validate(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
+    // validate_and_save writes issue rows into the live DB — open must not reopen under it.
+    let _exclusive = ProjectExclusiveGuard::enter(&state.project_exclusive);
+
     let entries = state
         .db
         .get_entries(&EntryFilter::default())
@@ -3108,6 +3111,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_returns_409_while_project_exclusive_and_keeps_current_project() {
+        // Covers inject, pivot, and validate (all take ProjectExclusiveGuard).
         let (url, _h, state) = setup_with_state().await;
         mark_project_open(&state).await;
         state
@@ -3151,6 +3155,50 @@ mod tests {
         let rows = state.db.get_entries(&EntryFilter::default()).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(state.db.get_entry("keep-a").unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Validate writes issue rows into `state.db`. After it finishes the
+    /// exclusive counter must be zero so open is not stuck refusing forever
+    /// (negative: a leaked enter would leave open at 409).
+    #[tokio::test]
+    async fn validate_releases_project_exclusive_so_open_can_proceed() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[translated("a", "Hello {0}", "f.json", "Hola {0}")])
+            .unwrap();
+
+        let resp = client()
+            .post(format!("{}/api/validate", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            state.project_exclusive.load(Ordering::SeqCst),
+            0,
+            "validate must drop ProjectExclusiveGuard on completion"
+        );
+
+        let dir = std::env::temp_dir().join(format!("locust_val_excl_{}", uuid::Uuid::new_v4()));
+        let game = dir.join("OtherGame");
+        write_rpgmaker_game(&game);
+
+        let open = client()
+            .post(format!("{}/api/project/open", url))
+            .json(&serde_json::json!({"path": game.to_string_lossy()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            open.status(),
+            200,
+            "open after validate must not see a leaked exclusive: {}",
+            open.text().await.unwrap_or_default()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
