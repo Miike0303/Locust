@@ -43,7 +43,12 @@ import {
 	pickLocustDbFile,
 	shouldOpenProjectDb,
 } from "../lib/openProjectFlow";
-import { projectOpenMergeNotice } from "../lib/projectOpenMerge";
+import {
+	PENDING_AFTER_STALE_FILTER,
+	projectOpenMergeNotice,
+	shouldFocusPendingAfterOpen,
+} from "../lib/projectOpenMerge";
+import { useEditorStore } from "../stores/editorStore";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
@@ -114,6 +119,7 @@ export default function Welcome() {
 	const location = useLocation();
 	const queryClient = useQueryClient();
 	const setProject = useProjectStore((s) => s.setProject);
+	const setFilter = useEditorStore((s) => s.setFilter);
 	const { data: formats } = useQuery({
 		queryKey: ["formats"],
 		queryFn: getFormats,
@@ -185,6 +191,9 @@ export default function Welcome() {
 			);
 			if (notice.toastMessage) {
 				addToast("warning", notice.toastMessage);
+			}
+			if (shouldFocusPendingAfterOpen(result)) {
+				setFilter(PENDING_AFTER_STALE_FILTER);
 			}
 			setPicker(null);
 			navigate("/editor");

@@ -6,7 +6,9 @@ import assert from "node:assert/strict";
 import { translate } from "./i18n/index.ts";
 import type { TranslateFn } from "./i18n";
 import {
+  PENDING_AFTER_STALE_FILTER,
   projectOpenMergeNotice,
+  shouldFocusPendingAfterOpen,
   shouldToastProjectOpenMerge,
   type ProjectOpenMergeInput,
 } from "./projectOpenMerge.ts";
@@ -61,6 +63,9 @@ const staleOpen = projectOpenMergeNotice(
   t,
 );
 assert.equal(shouldToastProjectOpenMerge({ stale_source_reset: 12, removed: 0 }), true);
+assert.equal(shouldFocusPendingAfterOpen({ stale_source_reset: 12 }), true);
+assert.equal(PENDING_AFTER_STALE_FILTER.status, "pending");
+assert.equal(PENDING_AFTER_STALE_FILTER.offset, 0);
 assert.equal(staleOpen.toast, true);
 assert.ok(staleOpen.toastMessage);
 assert.match(staleOpen.toastMessage, /12/);
@@ -77,6 +82,8 @@ const removedOnly = projectOpenMergeNotice(
   t,
 );
 assert.equal(shouldToastProjectOpenMerge({ stale_source_reset: 0, removed: 4 }), true);
+// Negative: removed-only toasts but must not jump to pending (those rows are gone).
+assert.equal(shouldFocusPendingAfterOpen({ stale_source_reset: 0 }), false);
 assert.equal(removedOnly.toast, true);
 assert.ok(removedOnly.toastMessage);
 assert.match(removedOnly.toastMessage, /4/);
@@ -88,6 +95,7 @@ const unchangedReopen = projectOpenMergeNotice(
   t,
 );
 assert.equal(unchangedReopen.toast, false);
+assert.equal(shouldFocusPendingAfterOpen({ stale_source_reset: 0 }), false);
 assert.equal(unchangedReopen.toastMessage, null);
 assert.match(unchangedReopen.logMessage, /translations kept 100/);
 assert.match(unchangedReopen.logMessage, /added 0/);

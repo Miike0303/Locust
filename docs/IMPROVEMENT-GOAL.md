@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 24 (capability, from cycle 5 still-need).** After a game update, the merge toast said N translations were sent back to pending, then the Editor opened with no status filter — the user was told to re-check but not shown where. Welcome and the open-project hotkey now set the editor filter to pending when `stale_source_reset > 0` (removed-only toasts do not). Pinned by `shouldFocusPendingAfterOpen` negatives in `projectOpenMerge.test.ts`. Next rotation: `optimization`.
+
 - `pending` — **cycle 23 (defect, from backlog).** Pivot read every translated row from the live DB without holding `project_exclusive`, so open could `reopen` mid-pivot and produce a half-wrong output DB. Pivot (HTTP + Tauri) now takes `ProjectExclusiveGuard`; `PROJECT_BUSY_MESSAGE` covers inject and pivot ("project operation"). Pinned by renamed `open_returns_409_while_project_exclusive_and_keeps_current_project` + `apiError.test.ts`. Next rotation: `capability`.
 
 - `pending` — **cycle 22 (optimization, from cycle 8 leftover).** Pack/record already streamed hashes; apply, verify, rollback, and `.locust` backup still `fs::read` every game file to SHA-256 (peak RAM ≈ file size on Unreal paks). Those paths now use `sha256_path` / `sha256_file`; restore copies through `copy_path_chunked`. Pinned by `sha256_file_matches_in_memory_across_chunk_boundary` (`sha256_path` equals the in-memory digest). Existing patch apply/verify tests still green. Unreal full-pak extract remains deferred. Next rotation: `defect`.

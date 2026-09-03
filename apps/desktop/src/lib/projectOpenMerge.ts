@@ -35,6 +35,19 @@ export function shouldToastProjectOpenMerge(
   return asCount(counts.stale_source_reset) > 0 || asCount(counts.removed) > 0;
 }
 
+/** Editor filter after open when translations were reset to pending for review. */
+export const PENDING_AFTER_STALE_FILTER = {
+  status: "pending" as const,
+  offset: 0,
+};
+
+/** Only stale resets need the pending list — removed rows are gone, not pending. */
+export function shouldFocusPendingAfterOpen(
+  counts: Pick<ProjectOpenMergeCounts, "stale_source_reset">,
+): boolean {
+  return asCount(counts.stale_source_reset) > 0;
+}
+
 export function projectOpenMergeNotice(
   result: ProjectOpenMergeInput,
   t: TranslateFn,

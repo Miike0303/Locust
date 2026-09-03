@@ -11,8 +11,13 @@ import {
   isDetectionFailure,
   pickGameFolder,
 } from "./openProjectFlow";
-import { projectOpenMergeNotice } from "./projectOpenMerge";
+import {
+  PENDING_AFTER_STALE_FILTER,
+  projectOpenMergeNotice,
+  shouldFocusPendingAfterOpen,
+} from "./projectOpenMerge";
 import { useProjectStore } from "../stores/projectStore";
+import { useEditorStore } from "../stores/editorStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 import { useT } from "./i18n";
@@ -107,6 +112,7 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const setProject = useProjectStore((s) => s.setProject);
+  const setFilter = useEditorStore((s) => s.setFilter);
   const t = useT();
 
   useHotkey("openProject", () => {
@@ -130,6 +136,9 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
           );
           if (notice.toastMessage) {
             addToast("warning", notice.toastMessage);
+          }
+          if (shouldFocusPendingAfterOpen(result)) {
+            setFilter(PENDING_AFTER_STALE_FILTER);
           }
           navigate("/editor");
         } catch (err: unknown) {
