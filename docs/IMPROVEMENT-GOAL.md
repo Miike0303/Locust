@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 19 (optimization, from backlog class).** Editor `/api/stats` walked `strings` six times (`COUNT(*)` plus five status filters) on every poll; `save_validation_issues` re-parsed INSERT once per issue with no transaction. Stats now one `GROUP BY status` (unknown statuses still increment `total`); validation writes `prepare_cached` in one tx. Pinned by `test_stats_accuracy` (negative: a raw `weird` status must bump total without changing buckets) and `test_save_validation_issues_many_all_persist` (40 rows). Unreal full-pak extract remains deferred. Next rotation: `defect`.
+
 - `pending` — **cycle 18 (capability, from backlog / cycle 7 still-need).** CLI/`locust extract -o` and pivots that never hit Recents had no Welcome entry: "Open Game Folder" re-extracts into the sibling path and can ignore that work. Welcome now has **Open project database** → pick `.locust.db` → game folder → format (no auto) → existing `completeOpenProjectDb` (lands in Recents). Pinned by `openDbCanConfirm` negatives (auto / empty game / bare path) + unit suite. Next rotation: `optimization`.
 
 - `pending` — **cycle 17 (defect, from backlog / goal).** Cycle 4 blocked open during translation; a concurrent inject could still finish `record_multilang_injection` after open had `Database::reopen`d under it, so recording landed in the wrong project. Inject (HTTP + Tauri) now holds `ProjectExclusiveGuard`; open/open-db refuse with 409 `PROJECT_BUSY_MESSAGE` while the counter is non-zero (desktop localizes EN/ES). Pinned by `open_returns_409_while_inject_exclusive_and_keeps_current_project` + `apiError.test.ts`. Next rotation: `capability`.

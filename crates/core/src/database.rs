@@ -1026,42 +1026,26 @@ impl Database {
 
     pub fn get_stats(&self) -> Result<ProjectStats> {
         let conn = self.conn.lock().unwrap();
-        let total: usize = conn.query_row("SELECT COUNT(*) FROM strings", [], |row| row.get(0))?;
-        let pending: usize = conn.query_row(
-            "SELECT COUNT(*) FROM strings WHERE status = 'pending'",
-            [],
-            |row| row.get(0),
-        )?;
-        let translated: usize = conn.query_row(
-            "SELECT COUNT(*) FROM strings WHERE status = 'translated'",
-            [],
-            |row| row.get(0),
-        )?;
-        let reviewed: usize = conn.query_row(
-            "SELECT COUNT(*) FROM strings WHERE status = 'reviewed'",
-            [],
-            |row| row.get(0),
-        )?;
-        let approved: usize = conn.query_row(
-            "SELECT COUNT(*) FROM strings WHERE status = 'approved'",
-            [],
-            |row| row.get(0),
-        )?;
-        let error: usize = conn.query_row(
-            "SELECT COUNT(*) FROM strings WHERE status = 'error'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        Ok(ProjectStats {
-            total,
-            pending,
-            translated,
-            reviewed,
-            approved,
-            error,
-            total_cost_usd: 0.0,
-        })
+        // One table scan: the editor polls this after every page of work.
+        let mut stmt =
+            conn.prepare_cached("SELECT status, COUNT(*) FROM strings GROUP BY status")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+        })?;
+        let mut stats = ProjectStats::default();
+        for row in rows {
+            let (status, n) = row?;
+            stats.total += n;
+            match status.as_str() {
+                "pending" => stats.pending = n,
+                "translated" => stats.translated = n,
+                "reviewed" => stats.reviewed = n,
+                "approved" => stats.approved = n,
+                "error" => stats.error = n,
+                _ => {}
+            }
+        }
+        Ok(stats)
     }
 
     pub fn save_glossary_entry(&self, entry: &GlossaryEntry) -> Result<()> {
@@ -1119,14 +1103,21 @@ impl Database {
         let issues: Vec<ValidationIssue> = issues.to_vec();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            for issue in &issues {
-                let kind_json =
-                    serde_json::to_string(&issue.kind).unwrap_or_else(|_| "unknown".to_string());
-                conn.execute(
-                    "INSERT INTO validation_issues (entry_id, kind, message) VALUES (?1, ?2, ?3)",
-                    params![issue.entry_id, kind_json, issue.message],
-                )?;
+            if issues.is_empty() {
+                return Ok(());
             }
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO validation_issues (entry_id, kind, message) VALUES (?1, ?2, ?3)",
+                )?;
+                for issue in &issues {
+                    let kind_json = serde_json::to_string(&issue.kind)
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    insert.execute(params![issue.entry_id, kind_json, issue.message])?;
+                }
+            }
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -2254,6 +2245,23 @@ mod tests {
         assert_eq!(stats.total, 5);
         assert_eq!(stats.pending, 3);
         assert_eq!(stats.translated, 2);
+        assert_eq!(stats.reviewed, 0);
+        assert_eq!(stats.approved, 0);
+        assert_eq!(stats.error, 0);
+
+        // Unknown status still counts toward total (GROUP BY must not drop it).
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO strings (id, source, file_path, status, created_at) VALUES ('x1', 'X', 'f.json', 'weird', 't')",
+                [],
+            )
+            .unwrap();
+        }
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.total, 6);
+        assert_eq!(stats.pending, 3);
+        assert_eq!(stats.translated, 2);
     }
 
     #[test]
@@ -2322,6 +2330,25 @@ mod tests {
         });
         let all = db.get_validation_issues(None).unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_save_validation_issues_many_all_persist() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let issues: Vec<ValidationIssue> = (0..40)
+            .map(|i| ValidationIssue {
+                entry_id: format!("e{i}"),
+                kind: ValidationKind::EmptyTranslation,
+                message: format!("empty-{i}"),
+                source: None,
+            })
+            .collect();
+        rt.block_on(async {
+            db.save_validation_issues(&issues).await.unwrap();
+        });
+        let all = db.get_validation_issues(None).unwrap();
+        assert_eq!(all.len(), 40);
     }
 
     #[test]
