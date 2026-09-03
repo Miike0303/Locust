@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 27 (capability, from research).** Paid translation spend lived in CLI `stats`, `/api/runs`, and the Activity Log, but the completion toast was count-only and Editor chrome never showed `total_cost_usd` or a path to Settings → History. Toast uses `completeWithCost` when cost &gt; 0; Editor stats append spend the same way; **History** deep-links to the runs table. Pinned by `translationCost.test.ts` (negative: free/$0 stays on the count-only key). Next rotation: `optimization`.
+
 - `pending` — **cycle 26 (defect, from backlog).** Validate wrote issue rows via `validate_and_save` without `ProjectExclusiveGuard`, so open could `reopen` mid-validate the same way inject/pivot used to. HTTP + Tauri validate now take the guard; open still refuses with `PROJECT_BUSY_MESSAGE`. Pinned by `validate_releases_project_exclusive_so_open_can_proceed` (negative: a leaked enter would leave open at 409). Next rotation: `capability`.
 
 - `pending` — **cycle 25 (optimization, from backlog class).** `pivot_to` loaded every string via `get_entries` then discarded pending/empty rows in Rust, so a mostly-untranslated project paid O(n) materialization (tens of thousands on KiriKiri extracts) for a few dozen pivots. Pivot now selects only non-empty trimmed translations in SQL (`entries_with_nonempty_translation`). Pinned by `test_entries_with_nonempty_translation_skips_pending_bulk` (negative: full `get_entries` still sees 202 rows while the pivot query returns 1). Unreal full-pak extract remains deferred. Next rotation: `defect`.

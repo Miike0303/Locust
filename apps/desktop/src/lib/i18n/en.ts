@@ -105,6 +105,9 @@ export const en = {
   // ── editor ──────────────────────────────────────────────────────────────
   "editor.noProject": "No project",
   "editor.stats": "{pending} pending · {translated} translated · {approved} approved",
+  "editor.statsWithCost": "{pending} pending · {translated} translated · {approved} approved · ${cost}",
+  "editor.viewHistory": "History",
+  "editor.viewHistoryTitle": "Translation run cost and tokens (Settings → History)",
   "editor.nextStepTitle": "Next workflow step",
   "editor.next": "Next: {step}",
   "editor.translate": "Translate",
@@ -490,6 +493,7 @@ export const en = {
   "translate.review": "Review translations",
   "translate.toast.switched": "Switched to {name}",
   "translate.toast.complete": "Translation complete: {count} strings",
+  "translate.toast.completeWithCost": "Translation complete: {count} strings · ${cost}",
   "translate.toast.failed": "Translation failed: {error}",
   "translate.toast.cancelled": "Translation cancelled",
   "translate.toast.cancelling": "Cancelling translation…",

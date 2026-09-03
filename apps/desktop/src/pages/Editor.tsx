@@ -45,6 +45,11 @@ import WorkflowGuideBanner from "../components/WorkflowGuideBanner";
 import EmptyState from "../components/EmptyState";
 import PivotModal from "../components/PivotModal";
 import { pivotCarryOverCount } from "../lib/pivot";
+import {
+	editorStatsKey,
+	formatUsdCost,
+} from "../lib/translationCost";
+import { buildSettingsPath } from "../lib/settingsNav";
 import { useT } from "../lib/i18n";
 
 export default function Editor() {
@@ -276,12 +281,23 @@ export default function Editor() {
 					)}
 					{statsData && (
 						<span className="ml-3 text-xs text-gray-500">
-							{t("editor.stats", {
+							{t(editorStatsKey(statsData.total_cost_usd), {
 								pending: statsData.pending,
 								translated: statsData.translated,
 								approved: statsData.approved,
+								cost: formatUsdCost(statsData.total_cost_usd),
 							})}
 						</span>
+					)}
+					{hasProject && (
+						<button
+							type="button"
+							onClick={() => navigate(buildSettingsPath("history"))}
+							title={t("editor.viewHistoryTitle")}
+							className="ml-2 text-xs font-medium text-emerald-700 underline-offset-2 hover:underline dark:text-emerald-300"
+						>
+							{t("editor.viewHistory")}
+						</button>
 					)}
 					{hasProject && guideDismissed && workflowStep && (
 						<button

@@ -103,6 +103,9 @@ export const es: Record<keyof typeof en, string> = {
 
   "editor.noProject": "Sin proyecto",
   "editor.stats": "{pending} pendientes · {translated} traducidas · {approved} aprobadas",
+  "editor.statsWithCost": "{pending} pendientes · {translated} traducidas · {approved} aprobadas · ${cost}",
+  "editor.viewHistory": "Historial",
+  "editor.viewHistoryTitle": "Coste y tokens de cada pasada (Ajustes → Historial)",
   "editor.nextStepTitle": "Siguiente paso del flujo",
   "editor.next": "Siguiente: {step}",
   "editor.translate": "Traducir",
@@ -471,6 +474,7 @@ export const es: Record<keyof typeof en, string> = {
   "translate.review": "Revisar traducciones",
   "translate.toast.switched": "Cambiado a {name}",
   "translate.toast.complete": "Traducción completada: {count} cadenas",
+  "translate.toast.completeWithCost": "Traducción completada: {count} cadenas · ${cost}",
   "translate.toast.failed": "La traducción falló: {error}",
   "translate.toast.cancelled": "Traducción cancelada",
   "translate.toast.cancelling": "Cancelando la traducción…",

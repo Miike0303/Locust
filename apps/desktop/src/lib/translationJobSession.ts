@@ -4,6 +4,10 @@
  */
 import { cancelTranslation } from "./api";
 import { t } from "./i18n";
+import {
+  formatUsdCost,
+  translationCompleteToastKey,
+} from "./translationCost";
 import { shouldSubscribeToJob } from "./translationJob";
 import { JOB_STREAM_LOST_MESSAGE, subscribeToJob } from "./ws";
 import { useEditorStore } from "../stores/editorStore";
@@ -127,9 +131,13 @@ export function attachTranslationJob(opts: {
         undefined,
         "translation",
       );
+      const cost = e.total_cost ?? 0;
       addToast(
         "success",
-        t("translate.toast.complete", { count: e.total_translated }),
+        t(translationCompleteToastKey(cost), {
+          count: e.total_translated,
+          cost: formatUsdCost(cost),
+        }),
       );
       endJob();
       discardSnapshotIfModalClosed();
