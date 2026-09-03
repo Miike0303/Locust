@@ -287,6 +287,16 @@ pub async fn get_string_facets(state: State<'_, AppStateWrapper>) -> Result<Stri
 }
 
 #[tauri::command]
+pub async fn list_injection_recordings(
+    state: State<'_, AppStateWrapper>,
+) -> Result<Vec<Option<String>>, String> {
+    if state.0.current_project.read().await.is_none() {
+        return Ok(vec![]);
+    }
+    state.0.db.list_recorded_langs().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn run_pivot(
     output_path: String,
     state: State<'_, AppStateWrapper>,

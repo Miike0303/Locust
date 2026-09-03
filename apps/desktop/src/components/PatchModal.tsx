@@ -17,12 +17,20 @@ import {
 	patchPack,
 	patchRollback,
 	patchStatus,
+	getPatchRecordings,
 	patchVerify,
 	type PatchApplyResult,
 	type PatchPackResult,
 	type PatchStatusResult,
 	type PatchVerifyResult,
 } from "../lib/api";
+import {
+	canPackFromRecordings,
+	isPackLangSelected,
+	packLangFromRecording,
+	preferredPackLang,
+	type RecordedLang,
+} from "../lib/patchRecordings";
 import {
 	isHttpPatchUrl,
 	loadRememberedPatchSource,
@@ -80,6 +88,7 @@ export default function PatchModal({
 	const [zipUrl, setZipUrl] = useState(remembered.zipUrl);
 	const [outputPath, setOutputPath] = useState("");
 	const [languages, setLanguages] = useState("");
+	const [recordings, setRecordings] = useState<RecordedLang[]>([]);
 	const [pristine, setPristine] = useState(false);
 	const [pristinePath, setPristinePath] = useState("");
 	const [force, setForce] = useState(false);
@@ -115,18 +124,19 @@ export default function PatchModal({
 		if (defaultGamePath) setGamePath(defaultGamePath);
 		setTab(allowPack ? initialTab : "apply");
 		setError(null);
-		// Prefill pack language from config target lang
-		if (!allowPack) return;
-		getConfig()
-			.then((cfg) => {
-				if (cfg.default_target_lang) {
-					setLanguages((prev) =>
-						prev.trim() ? prev : cfg.default_target_lang,
-					);
-				}
+		if (!allowPack) {
+			setRecordings([]);
+			return;
+		}
+		void Promise.all([getPatchRecordings(), getConfig()])
+			.then(([rec, cfg]) => {
+				setRecordings(rec.languages);
+				setLanguages((prev) =>
+					preferredPackLang(rec.languages, cfg.default_target_lang, prev),
+				);
 			})
 			.catch(() => {
-				/* config optional for apply tab */
+				setRecordings([]);
 			});
 	}, [open, defaultGamePath, initialTab, allowPack]);
 
@@ -522,6 +532,10 @@ export default function PatchModal({
 		}
 		if (!outputPath.trim()) {
 			addToast("error", t("patch.toast.chooseOutput"));
+			return;
+		}
+		if (!canPackFromRecordings(recordings, languages)) {
+			addToast("error", t("patch.recordedLangsEmpty"));
 			return;
 		}
 		setLoading(true);
@@ -996,6 +1010,37 @@ export default function PatchModal({
 									placeholder={t("patch.languagesPlaceholder")}
 									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
 								/>
+								<p className="text-xs font-medium text-gray-600 dark:text-gray-400 mt-2">
+									{t("patch.recordedLangs")}
+								</p>
+								{recordings.length === 0 ? (
+									<p className="text-xs text-amber-700 dark:text-amber-400 mt-1">
+										{t("patch.recordedLangsEmpty")}
+									</p>
+								) : (
+									<div className="flex flex-wrap gap-1.5 mt-1">
+										{recordings.map((lang) => {
+											const key = lang ?? "(unspecified)";
+											const selected = isPackLangSelected(languages, lang);
+											return (
+												<button
+													key={key}
+													type="button"
+													onClick={() =>
+														setLanguages(packLangFromRecording(lang))
+													}
+													className={`px-2 py-0.5 rounded text-xs font-medium border ${
+														selected
+															? "border-emerald-500 bg-emerald-50 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-200"
+															: "border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800"
+													}`}
+												>
+													{lang ?? t("patch.recordedUnspecified")}
+												</button>
+											);
+										})}
+									</div>
+								)}
 								<p className="text-xs text-gray-500 mt-1">
 									{t("patch.languagesHint")}
 								</p>
@@ -1047,7 +1092,11 @@ export default function PatchModal({
 
 							<button
 								onClick={handlePack}
-								disabled={loading || applying}
+								disabled={
+									loading ||
+									applying ||
+									!canPackFromRecordings(recordings, languages)
+								}
 								className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium disabled:opacity-50"
 							>
 								<Archive size={16} /> {t("patch.packBtn")}

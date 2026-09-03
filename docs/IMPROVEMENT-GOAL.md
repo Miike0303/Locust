@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 21 (capability, from research).** Pack asked for a language with no list of what Inject recorded, so a wrong code failed with an opaque error. `GET /api/patch/recordings` + Tauri `list_injection_recordings` expose `list_recorded_langs`; Pack shows chips, prefills a single recording (or the config target when it was injected), and disables Pack when nothing is recorded or the typed lang is not in the list. Hidden without an open project (same leak guard as strings). Pinned by `patchRecordings.test.ts` (negative: inventing `ja` when only `es` is recorded) + `patch_recordings_lists_langs_and_hides_them_without_a_project`. Next rotation: `optimization`.
+
 - `pending` — **cycle 20 (defect, from backlog / cycle 14 class).** Inject/export/import/pack/pivot still toasted raw English (`inject requires…`, empty project export, empty import, batch cap, pack-nothing, pivot-no-translations). Catalog maps those stable bodies EN/ES; HTTP and Tauri now share `INJECT_EMPTY_LANGUAGES_MESSAGE`. Pinned by `apiError.test.ts` (negative: EN locale still English). Next rotation: `capability`.
 
 - `pending` — **cycle 19 (optimization, from backlog class).** Editor `/api/stats` walked `strings` six times (`COUNT(*)` plus five status filters) on every poll; `save_validation_issues` re-parsed INSERT once per issue with no transaction. Stats now one `GROUP BY status` (unknown statuses still increment `total`); validation writes `prepare_cached` in one tx. Pinned by `test_stats_accuracy` (negative: a raw `weird` status must bump total without changing buckets) and `test_save_validation_issues_many_all_persist` (40 rows). Unreal full-pak extract remains deferred. Next rotation: `defect`.

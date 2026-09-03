@@ -728,6 +728,17 @@ export interface PatchPackResult {
 export const patchPack = (params: PatchPackParams): Promise<PatchPackResult> =>
   request("/patch/pack", { method: "POST", body: JSON.stringify(params) });
 
+export interface PatchRecordings {
+  languages: Array<string | null>;
+}
+
+export const getPatchRecordings = (): Promise<PatchRecordings> =>
+  IS_TAURI
+    ? tauriInvoke<Array<string | null>>("list_injection_recordings").then((languages) => ({
+        languages,
+      }))
+    : request("/patch/recordings");
+
 // ─── Translation Memory ──────────────────────────────────────────────────
 
 export interface MemoryEntry {

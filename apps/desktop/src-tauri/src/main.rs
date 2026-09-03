@@ -55,6 +55,7 @@ fn main() {
             commands::get_stats,
             commands::get_strings,
             commands::get_string_facets,
+            commands::list_injection_recordings,
             commands::run_pivot,
             commands::patch_string,
             commands::batch_patch_strings,

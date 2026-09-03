@@ -343,6 +343,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/patch/rollback", post(patch_rollback))
         .route("/api/patch/status", post(patch_status))
         .route("/api/patch/pack", post(patch_pack))
+        .route("/api/patch/recordings", get(patch_recordings))
         .route("/api/validate", post(validate))
         .route("/api/glossary", get(get_glossary).post(add_glossary))
         .route("/api/glossary/:term", delete(delete_glossary))
@@ -1468,6 +1469,27 @@ async fn patch_pack(
     Ok(Json(report))
 }
 
+#[derive(Serialize)]
+struct PatchRecordingsResponse {
+    /// Named keys first; JSON `null` is the language-unspecified recording.
+    languages: Vec<Option<String>>,
+}
+
+async fn patch_recordings(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<PatchRecordingsResponse>, ApiError> {
+    // Same leak guard as get_strings: leftover recordings from another session
+    // must not surface without an open project.
+    if state.current_project.read().await.is_none() {
+        return Ok(Json(PatchRecordingsResponse { languages: vec![] }));
+    }
+    let languages = state
+        .db
+        .list_recorded_langs()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(PatchRecordingsResponse { languages }))
+}
+
 async fn patch_verify(
     Json(req): Json<PatchPathsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -2489,6 +2511,45 @@ mod tests {
             format_id: "rpgmaker-mv".into(),
             name: "test-game".into(),
         });
+    }
+
+    #[tokio::test]
+    async fn patch_recordings_lists_langs_and_hides_them_without_a_project() {
+        let (url, _h, state) = setup_with_state().await;
+        let dir = std::env::temp_dir().join(format!("locust_rec_{}", uuid::Uuid::new_v4()));
+        let root = dir.join("game");
+        let file = root.join("a.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        state
+            .db
+            .record_injection(Some("es"), &root, &[file.clone()])
+            .unwrap();
+
+        let hidden = client()
+            .get(format!("{}/api/patch/recordings", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hidden.status(), 200);
+        let hidden_body: serde_json::Value = hidden.json().await.unwrap();
+        assert_eq!(
+            hidden_body["languages"],
+            serde_json::json!([]),
+            "recordings must not leak without an open project"
+        );
+
+        mark_project_open(&state).await;
+        let shown = client()
+            .get(format!("{}/api/patch/recordings", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(shown.status(), 200);
+        let shown_body: serde_json::Value = shown.json().await.unwrap();
+        assert_eq!(shown_body["languages"], serde_json::json!(["es"]));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
