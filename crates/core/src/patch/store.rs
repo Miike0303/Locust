@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::database::sha256_hex;
+use crate::database::{copy_path_chunked, sha256_file, sha256_path};
 use crate::error::{LocustError, Result};
 
 use super::manifest::{BackupFileEntry, BackupManifest, Journal, Receipt};
@@ -236,13 +236,10 @@ impl PatchStore {
                 dest.display()
             ))
         })?;
-        let bytes = fs::read(&dest)
-            .map_err(|e| LocustError::PatchError(format!("read backup {}: {e}", dest.display())))?;
-        let hash = sha256_hex(&bytes);
-        let src_hash =
-            sha256_hex(&fs::read(src).map_err(|e| {
-                LocustError::PatchError(format!("read src {}: {e}", src.display()))
-            })?);
+        let (hash, size) = sha256_file(&dest)
+            .map_err(|e| LocustError::PatchError(format!("hash backup {}: {e}", dest.display())))?;
+        let src_hash = sha256_path(src)
+            .map_err(|e| LocustError::PatchError(format!("hash src {}: {e}", src.display())))?;
         if hash != src_hash {
             return Err(LocustError::PatchError(format!(
                 "backup hash mismatch for {rel}"
@@ -265,7 +262,7 @@ impl PatchStore {
         Ok(BackupFileEntry {
             path: rel.replace('\\', "/"),
             sha256: hash,
-            size: bytes.len() as u64,
+            size,
         })
     }
 
@@ -279,8 +276,7 @@ impl PatchStore {
                 entry.path
             )));
         }
-        let bytes = fs::read(&src)?;
-        let hash = sha256_hex(&bytes);
+        let hash = sha256_path(&src)?;
         if hash != entry.sha256 {
             return Err(LocustError::PatchBackupIncomplete(format!(
                 "backup file hash mismatch: {} (expected {}, got {})",
@@ -296,7 +292,10 @@ impl PatchStore {
             t.push(".locust-tmp");
             PathBuf::from(t)
         };
-        fs::write(&tmp, &bytes)?;
+        {
+            let mut tmpf = fs::File::create(&tmp)?;
+            copy_path_chunked(&src, &mut tmpf)?;
+        }
         {
             let f = fs::OpenOptions::new().read(true).write(true).open(&tmp)?;
             f.sync_all()?;

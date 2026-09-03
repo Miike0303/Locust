@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use semver::Version;
 use zip::ZipArchive;
 
-use crate::database::sha256_hex;
+use crate::database::sha256_path;
 use crate::error::{LocustError, Result};
 
 use super::manifest::{PatchFileEntry, PatchManifest, Receipt, VerificationTier};
@@ -386,7 +386,7 @@ fn verify_strict(
         // A pristine game matching that hash is Clean, not AlreadyApplied/Unknown.
         let identity_patch = !original.is_empty() && original == f.patched_sha256;
         if target.is_file() {
-            let hash = sha256_hex(&fs::read(&target)?);
+            let hash = sha256_path(&target)?;
             if hash == f.patched_sha256 {
                 if identity_patch || hash == original {
                     any_clean = true;
@@ -461,8 +461,8 @@ fn verify_strict(
             // absent added path is "clean" not patched-looking
             f.original_sha256.is_none()
         } else {
-            fs::read(&target)
-                .map(|b| sha256_hex(&b) == f.patched_sha256)
+            sha256_path(&target)
+                .map(|h| h == f.patched_sha256)
                 .unwrap_or(false)
         }
     });
@@ -471,10 +471,7 @@ fn verify_strict(
         let Some(orig) = f.original_sha256.as_ref() else {
             return false;
         };
-        target.is_file()
-            && fs::read(&target)
-                .map(|b| sha256_hex(&b) == *orig)
-                .unwrap_or(false)
+        target.is_file() && sha256_path(&target).map(|h| h == *orig).unwrap_or(false)
     });
     let outcome = if all_look_patched && !any_original && !manifest.files.is_empty() {
         // If every path is an added path that is absent, that's Clean not Unknown.
@@ -530,7 +527,7 @@ fn verify_structural(
     for f in &manifest.files {
         let target = game_root.join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if target.is_file() {
-            let hash = sha256_hex(&fs::read(&target)?);
+            let hash = sha256_path(&target)?;
             if hash == f.patched_sha256 {
                 // looks already applied
                 replaced.push(f.path.clone());
@@ -712,7 +709,7 @@ pub fn classify_files(
     for f in files {
         let target = game_root.join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if target.is_file() {
-            let hash = sha256_hex(&fs::read(&target)?);
+            let hash = sha256_path(&target)?;
             if let Some(orig) = &f.original_sha256 {
                 replaced.push(ReceiptReplaced {
                     path: f.path.clone(),

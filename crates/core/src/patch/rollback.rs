@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::database::sha256_hex;
+use crate::database::sha256_path;
 use crate::error::{LocustError, Result};
 
 use super::manifest::{BackupBaseline, JournalState};
@@ -82,7 +82,7 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                 let rel = safe_stored_rel(&a.path)?;
                 let target = game_root.join(&rel);
                 if target.is_file() {
-                    let h = sha256_hex(&fs::read(&target)?);
+                    let h = sha256_path(&target)?;
                     if h != a.patched_sha256 {
                         // Torn by interrupted apply — delete without confirmation.
                         torn.push(a.path.clone());
@@ -144,7 +144,7 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                         entry.path
                     )));
                 }
-                let h = sha256_hex(&fs::read(&src)?);
+                let h = sha256_path(&src)?;
                 if h != entry.sha256 {
                     return Err(LocustError::PatchBackupIncomplete(format!(
                         "backup file corrupt: {}",
@@ -168,7 +168,7 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                 if !target.is_file() {
                     continue;
                 }
-                let h = sha256_hex(&fs::read(&target)?);
+                let h = sha256_path(&target)?;
                 if h != a.patched_sha256 {
                     edited.push(a.path.clone());
                 }

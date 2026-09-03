@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 22 (optimization, from cycle 8 leftover).** Pack/record already streamed hashes; apply, verify, rollback, and `.locust` backup still `fs::read` every game file to SHA-256 (peak RAM ≈ file size on Unreal paks). Those paths now use `sha256_path` / `sha256_file`; restore copies through `copy_path_chunked`. Pinned by `sha256_file_matches_in_memory_across_chunk_boundary` (`sha256_path` equals the in-memory digest). Existing patch apply/verify tests still green. Unreal full-pak extract remains deferred. Next rotation: `defect`.
+
 - `pending` — **cycle 21 (capability, from research).** Pack asked for a language with no list of what Inject recorded, so a wrong code failed with an opaque error. `GET /api/patch/recordings` + Tauri `list_injection_recordings` expose `list_recorded_langs`; Pack shows chips, prefills a single recording (or the config target when it was injected), and disables Pack when nothing is recorded or the typed lang is not in the list. Hidden without an open project (same leak guard as strings). Pinned by `patchRecordings.test.ts` (negative: inventing `ja` when only `es` is recorded) + `patch_recordings_lists_langs_and_hides_them_without_a_project`. Next rotation: `optimization`.
 
 - `pending` — **cycle 20 (defect, from backlog / cycle 14 class).** Inject/export/import/pack/pivot still toasted raw English (`inject requires…`, empty project export, empty import, batch cap, pack-nothing, pivot-no-translations). Catalog maps those stable bodies EN/ES; HTTP and Tauri now share `INJECT_EMPTY_LANGUAGES_MESSAGE`. Pinned by `apiError.test.ts` (negative: EN locale still English). Next rotation: `capability`.

@@ -156,6 +156,11 @@ pub fn sha256_file(path: &Path) -> Result<(String, u64)> {
     Ok((hex::encode(hasher.finalize()), total))
 }
 
+/// Digest of a file on disk — same hex as [`sha256_hex`] of its bytes.
+pub fn sha256_path(path: &Path) -> Result<String> {
+    Ok(sha256_file(path)?.0)
+}
+
 /// Stream `path` into `out` in fixed-size chunks (no full-file buffer).
 pub fn copy_path_chunked(path: &Path, out: &mut dyn std::io::Write) -> Result<u64> {
     use std::io::Read;
@@ -1546,6 +1551,7 @@ mod tests {
         let (hash, size) = sha256_file(&path).unwrap();
         assert_eq!(size, data.len() as u64);
         assert_eq!(hash, sha256_hex(&data));
+        assert_eq!(sha256_path(&path).unwrap(), hash);
         // Negative: wrong length must not pass as equal to a truncated hash input.
         assert_ne!(hash, sha256_hex(&data[..data.len() - 1]));
         let _ = std::fs::remove_dir_all(&dir);

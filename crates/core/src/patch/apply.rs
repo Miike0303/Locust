@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use zip::ZipArchive;
 
-use crate::database::sha256_hex;
+use crate::database::sha256_path;
 use crate::error::{LocustError, Result};
 
 use super::manifest::{
@@ -332,7 +332,7 @@ where
             let target = game_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
             let patched = staged.sha256.clone();
             if target.is_file() {
-                let orig = sha256_hex(&fs::read(&target)?);
+                let orig = sha256_path(&target)?;
                 replaced.push(ReceiptReplaced {
                     path: path.clone(),
                     original_sha256: Some(orig),
@@ -370,7 +370,7 @@ where
                 // Check user edit.
                 let target = game_root.join(r.path.replace('/', std::path::MAIN_SEPARATOR_STR));
                 if target.is_file() {
-                    let h = sha256_hex(&fs::read(&target)?);
+                    let h = sha256_path(&target)?;
                     if h != pa.patched_sha256 {
                         user_edits.push(r.path.clone());
                     }
@@ -400,7 +400,7 @@ where
                 if let Some(pa) = prior_added.get(&a.path) {
                     let target = game_root.join(a.path.replace('/', std::path::MAIN_SEPARATOR_STR));
                     if target.is_file() {
-                        let h = sha256_hex(&fs::read(&target)?);
+                        let h = sha256_path(&target)?;
                         if h != pa.patched_sha256 {
                             user_edits.push(a.path.clone());
                         }
