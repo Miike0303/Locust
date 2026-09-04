@@ -1702,34 +1702,21 @@ async fn cmd_import(
     let db = Database::open(&project)?;
     let content = std::fs::read_to_string(&input)?;
 
-    let mut imported = 0;
-    match format.as_str() {
+    let (updates, pre_skipped) = match format.as_str() {
         "po" => {
             let entries = export::import_po(&content)?;
-            for pe in &entries {
-                if !pe.translation.is_empty() {
-                    if let Some(ref id) = pe.id {
-                        if db.save_translation(id, &pe.translation, "import").await? {
-                            imported += 1;
-                        }
-                    }
-                }
-            }
+            export::po_entries_for_batch(&entries)
         }
         "xliff" => {
             let units = export::import_xliff(&content)?;
-            for unit in &units {
-                if !unit.target.is_empty()
-                    && db
-                        .save_translation(&unit.id, &unit.target, "import")
-                        .await?
-                {
-                    imported += 1;
-                }
-            }
+            export::xliff_units_for_batch(&units)
         }
         _ => anyhow::bail!("unsupported import format: {}. Use 'po' or 'xliff'", format),
-    }
+    };
+    let attempted = updates.len();
+    let applied = db.save_translations_batch(updates, "import").await?;
+    let (imported, _skipped) =
+        export::import_counts_after_batch(pre_skipped, attempted, applied);
 
     println!(
         "Imported {} translations from {}",

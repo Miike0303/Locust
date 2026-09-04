@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 28 (optimization, from backlog class).** PO/XLIFF import (HTTP, Tauri, CLI) awaited `save_translation` once per row — each a `spawn_blocking` + lock + UPDATE — so a large CAT re-import paid O(n) round-trips. Imports now collect updates and use `save_translations_batch` (one tx, `prepare_cached`). Pinned by `test_po_entries_for_batch_skips_empty_and_missing_id` (negative: unknown id after batch must inflate skipped, not imported). Unreal full-pak extract remains deferred. Next rotation: `defect`.
+
 - `pending` — **cycle 27 (capability, from research).** Paid translation spend lived in CLI `stats`, `/api/runs`, and the Activity Log, but the completion toast was count-only and Editor chrome never showed `total_cost_usd` or a path to Settings → History. Toast uses `completeWithCost` when cost &gt; 0; Editor stats append spend the same way; **History** deep-links to the runs table. Pinned by `translationCost.test.ts` (negative: free/$0 stays on the count-only key). Next rotation: `optimization`.
 
 - `pending` — **cycle 26 (defect, from backlog).** Validate wrote issue rows via `validate_and_save` without `ProjectExclusiveGuard`, so open could `reopen` mid-validate the same way inject/pivot used to. HTTP + Tauri validate now take the guard; open still refuses with `PROJECT_BUSY_MESSAGE`. Pinned by `validate_releases_project_exclusive_so_open_can_proceed` (negative: a leaked enter would leave open at 409). Next rotation: `capability`.

@@ -2221,25 +2221,15 @@ mod tests {
         let imported = import_po(&po).unwrap();
         assert_eq!(imported[0].id.as_deref(), Some(id));
 
-        let mut applied = 0usize;
-        let mut missed = 0usize;
-        for pe in &imported {
-            if pe.translation.is_empty() {
-                continue;
-            }
-            if let Some(ref pe_id) = pe.id {
-                if db
-                    .save_translation(pe_id, &pe.translation, "import")
-                    .await
-                    .unwrap()
-                {
-                    applied += 1;
-                } else {
-                    missed += 1;
-                }
-            }
-        }
-        assert_eq!(applied, 1);
+        let (updates, pre_skipped) = crate::export::po_entries_for_batch(&imported);
+        let attempted = updates.len();
+        let applied = db
+            .save_translations_batch(updates, "import")
+            .await
+            .unwrap();
+        let (imported_n, missed) =
+            crate::export::import_counts_after_batch(pre_skipped, attempted, applied);
+        assert_eq!(imported_n, 1);
         assert_eq!(missed, 0);
         let again = db.get_entry(id).unwrap().unwrap();
         assert_eq!(again.translation.as_deref(), Some("Hola alli"));

@@ -297,6 +297,49 @@ pub struct XliffUnit {
     pub target: String,
 }
 
+/// Collect `(id, translation)` pairs for [`crate::database::Database::save_translations_batch`].
+/// Empty msgstr / missing id count toward `skipped` (unknown ids are counted after the batch).
+pub fn po_entries_for_batch(entries: &[PoEntry]) -> (Vec<(String, String)>, usize) {
+    let mut skipped = 0usize;
+    let mut updates = Vec::with_capacity(entries.len());
+    for pe in entries {
+        if pe.translation.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let Some(ref id) = pe.id else {
+            skipped += 1;
+            continue;
+        };
+        updates.push((id.clone(), pe.translation.clone()));
+    }
+    (updates, skipped)
+}
+
+/// Same as [`po_entries_for_batch`] for XLIFF units (empty target → skipped).
+pub fn xliff_units_for_batch(units: &[XliffUnit]) -> (Vec<(String, String)>, usize) {
+    let mut skipped = 0usize;
+    let mut updates = Vec::with_capacity(units.len());
+    for unit in units {
+        if unit.target.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        updates.push((unit.id.clone(), unit.target.clone()));
+    }
+    (updates, skipped)
+}
+
+/// After a batch apply: unknown ids become extra skips.
+pub fn import_counts_after_batch(
+    pre_skipped: usize,
+    attempted: usize,
+    applied: usize,
+) -> (usize /* imported */, usize /* skipped */) {
+    let unknown = attempted.saturating_sub(applied);
+    (applied, pre_skipped + unknown)
+}
+
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -439,5 +482,56 @@ msgstr "Hola"
         assert_eq!(imported[0].target, "Hola");
         assert_eq!(imported[2].source, "Untranslated");
         assert_eq!(imported[2].target, "");
+    }
+
+    /// Pin: empty/missing rows stay out of the batch; unknown ids inflate skipped
+    /// after apply (negative: treating unknown as imported would under-count skips).
+    #[test]
+    fn test_po_entries_for_batch_skips_empty_and_missing_id() {
+        let entries = [
+            PoEntry {
+                id: Some("a".into()),
+                source: "A".into(),
+                translation: "Á".into(),
+            },
+            PoEntry {
+                id: Some("b".into()),
+                source: "B".into(),
+                translation: String::new(),
+            },
+            PoEntry {
+                id: None,
+                source: "C".into(),
+                translation: "Cé".into(),
+            },
+        ];
+        let (updates, pre_skipped) = po_entries_for_batch(&entries);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, "a");
+        assert_eq!(pre_skipped, 2);
+        let (imported, skipped) = import_counts_after_batch(pre_skipped, updates.len(), 0);
+        assert_eq!(imported, 0);
+        assert_eq!(skipped, 3, "unknown id must count as skipped, not imported");
+    }
+
+    #[test]
+    fn test_xliff_units_for_batch_skips_empty_target() {
+        let units = [
+            XliffUnit {
+                id: "a".into(),
+                source: "A".into(),
+                target: "Á".into(),
+            },
+            XliffUnit {
+                id: "b".into(),
+                source: "B".into(),
+                target: String::new(),
+            },
+        ];
+        let (updates, pre_skipped) = xliff_units_for_batch(&units);
+        assert_eq!(updates, vec![("a".into(), "Á".into())]);
+        assert_eq!(pre_skipped, 1);
+        let (imported, skipped) = import_counts_after_batch(pre_skipped, 1, 1);
+        assert_eq!((imported, skipped), (1, 1));
     }
 }

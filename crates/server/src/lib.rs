@@ -1880,27 +1880,14 @@ async fn import_po(
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let po_entries = export::import_po(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let mut imported = 0;
-    let mut skipped = 0;
-    for pe in &po_entries {
-        if pe.translation.is_empty() {
-            skipped += 1;
-            continue;
-        }
-        let Some(ref id) = pe.id else {
-            skipped += 1;
-            continue;
-        };
-        match state
-            .db
-            .save_translation(id, &pe.translation, "import")
-            .await
-        {
-            Ok(true) => imported += 1,
-            Ok(false) => skipped += 1,
-            Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
-        }
-    }
+    let (updates, pre_skipped) = export::po_entries_for_batch(&po_entries);
+    let attempted = updates.len();
+    let applied = state
+        .db
+        .save_translations_batch(updates, "import")
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (imported, skipped) = export::import_counts_after_batch(pre_skipped, attempted, applied);
     Ok(Json(
         serde_json::json!({"imported": imported, "skipped": skipped}),
     ))
@@ -1941,23 +1928,14 @@ async fn import_xliff(
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let units = export::import_xliff(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let mut imported = 0;
-    let mut skipped = 0;
-    for unit in &units {
-        if unit.target.is_empty() {
-            skipped += 1;
-            continue;
-        }
-        match state
-            .db
-            .save_translation(&unit.id, &unit.target, "import")
-            .await
-        {
-            Ok(true) => imported += 1,
-            Ok(false) => skipped += 1,
-            Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
-        }
-    }
+    let (updates, pre_skipped) = export::xliff_units_for_batch(&units);
+    let attempted = updates.len();
+    let applied = state
+        .db
+        .save_translations_batch(updates, "import")
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (imported, skipped) = export::import_counts_after_batch(pre_skipped, attempted, applied);
     Ok(Json(
         serde_json::json!({"imported": imported, "skipped": skipped}),
     ))

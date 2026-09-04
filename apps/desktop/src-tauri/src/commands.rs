@@ -513,55 +513,29 @@ pub async fn import_translations(
     if content.trim().is_empty() {
         return Err("import file is empty".into());
     }
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
-    match format.as_str() {
+    let (updates, pre_skipped) = match format.as_str() {
         "po" => {
             let entries = locust_core::export::import_po(&content).map_err(|e| e.to_string())?;
-            for pe in &entries {
-                if pe.translation.is_empty() {
-                    skipped += 1;
-                    continue;
-                }
-                let Some(ref id) = pe.id else {
-                    skipped += 1;
-                    continue;
-                };
-                if s.db
-                    .save_translation(id, &pe.translation, "import")
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    imported += 1;
-                } else {
-                    skipped += 1;
-                }
-            }
+            locust_core::export::po_entries_for_batch(&entries)
         }
         "xliff" => {
             let units = locust_core::export::import_xliff(&content).map_err(|e| e.to_string())?;
-            for unit in &units {
-                if unit.target.is_empty() {
-                    skipped += 1;
-                    continue;
-                }
-                if s.db
-                    .save_translation(&unit.id, &unit.target, "import")
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    imported += 1;
-                } else {
-                    skipped += 1;
-                }
-            }
+            locust_core::export::xliff_units_for_batch(&units)
         }
         other => {
             return Err(format!(
                 "unknown import format \"{other}\" — use \"po\" or \"xliff\""
             ))
         }
-    }
+    };
+    let attempted = updates.len();
+    let applied = s
+        .db
+        .save_translations_batch(updates, "import")
+        .await
+        .map_err(|e| e.to_string())?;
+    let (imported, skipped) =
+        locust_core::export::import_counts_after_batch(pre_skipped, attempted, applied);
     Ok(serde_json::json!({
         "path": path,
         "format": format,
