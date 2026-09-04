@@ -2223,10 +2223,7 @@ mod tests {
 
         let (updates, pre_skipped) = crate::export::po_entries_for_batch(&imported);
         let attempted = updates.len();
-        let applied = db
-            .save_translations_batch(updates, "import")
-            .await
-            .unwrap();
+        let applied = db.save_translations_batch(updates, "import").await.unwrap();
         let (imported_n, missed) =
             crate::export::import_counts_after_batch(pre_skipped, attempted, applied);
         assert_eq!(imported_n, 1);

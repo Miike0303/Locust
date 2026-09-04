@@ -845,6 +845,12 @@ export const en = {
     "Nothing to pack yet — translate some strings, then inject, then pack.",
   "api.error.noTranslatedToPivot":
     "No translations to pivot from. Translate or import first.",
+  "api.error.unknownExportFormat":
+    "Unknown export format: {detail}. Use po or xliff.",
+  "api.error.unknownImportFormat":
+    "Unknown import format: {detail}. Use po or xliff.",
+  "api.error.xaiHandleNotFound":
+    "That xAI login session expired or was not found. Start login again.",
   "ws.jobStreamLost": "connection to the translation job was lost",
   "ws.patchJobStreamLost": "connection to the patch job was lost",
   "provider.free": "free",

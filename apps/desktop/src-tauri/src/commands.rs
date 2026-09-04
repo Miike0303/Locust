@@ -416,7 +416,7 @@ pub async fn cancel_translation(
         job.abort_handle.abort();
         Ok(())
     } else {
-        Err("Job not found".to_string())
+        Err("job not found".to_string())
     }
 }
 
@@ -479,11 +479,7 @@ pub async fn export_translations(
     let body = match format.as_str() {
         "po" => locust_core::export::export_po(&entries, &source, &lang),
         "xliff" => locust_core::export::export_xliff(&entries, &source, &lang),
-        other => {
-            return Err(format!(
-                "unknown export format \"{other}\" — use \"po\" or \"xliff\""
-            ))
-        }
+        other => return Err(format!("unknown export format: {other}")),
     };
     let out = PathBuf::from(&path);
     if let Some(parent) = out.parent() {
@@ -522,18 +518,13 @@ pub async fn import_translations(
             let units = locust_core::export::import_xliff(&content).map_err(|e| e.to_string())?;
             locust_core::export::xliff_units_for_batch(&units)
         }
-        other => {
-            return Err(format!(
-                "unknown import format \"{other}\" — use \"po\" or \"xliff\""
-            ))
-        }
+        other => return Err(format!("unknown import format: {other}")),
     };
     let attempted = updates.len();
-    let applied = s
-        .db
-        .save_translations_batch(updates, "import")
-        .await
-        .map_err(|e| e.to_string())?;
+    let applied =
+        s.db.save_translations_batch(updates, "import")
+            .await
+            .map_err(|e| e.to_string())?;
     let (imported, skipped) =
         locust_core::export::import_counts_after_batch(pre_skipped, attempted, applied);
     Ok(serde_json::json!({

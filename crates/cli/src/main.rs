@@ -1715,8 +1715,7 @@ async fn cmd_import(
     };
     let attempted = updates.len();
     let applied = db.save_translations_batch(updates, "import").await?;
-    let (imported, _skipped) =
-        export::import_counts_after_batch(pre_skipped, attempted, applied);
+    let (imported, _skipped) = export::import_counts_after_batch(pre_skipped, attempted, applied);
 
     println!(
         "Imported {} translations from {}",

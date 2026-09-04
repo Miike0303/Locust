@@ -57,6 +57,18 @@ assert.equal(
 	"No hay traducciones para pivotar. Traduzca o importe primero.",
 );
 assert.equal(localizeApiError("import file is empty"), "El archivo de importación está vacío.");
+assert.equal(
+	localizeApiError("unknown export format: csv"),
+	"Formato de exportación desconocido: csv. Use po o xliff.",
+);
+assert.equal(
+	localizeApiError("unknown import format: yaml"),
+	"Formato de importación desconocido: yaml. Use po o xliff.",
+);
+assert.equal(
+	localizeApiError("handle not found"),
+	"Esa sesión de inicio de xAI caducó o no se encontró. Vuelva a iniciar sesión.",
+);
 
 // Unknown bodies keep the English detail but get a Spanish frame
 assert.equal(
@@ -76,6 +88,14 @@ assert.equal(
 	"Inject needs at least one language (for example es).",
 );
 assert.equal(localizeApiError("no project open"), "No project is open.");
+assert.equal(
+	localizeApiError("unknown export format: csv"),
+	"Unknown export format: csv. Use po or xliff.",
+);
+assert.equal(
+	localizeApiError("handle not found"),
+	"That xAI login session expired or was not found. Start login again.",
+);
 
 // Detection heuristic still matches the localized detect failure (Welcome picker)
 import { isDetectionFailure } from "./openProjectFlow";

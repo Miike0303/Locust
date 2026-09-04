@@ -48,6 +48,7 @@ const EXACT: Record<string, MessageKey> = {
 	"batch too large (max 50000 updates)": "api.error.batchTooLarge",
 	"no translated, reviewed, or approved strings — nothing to pack yet. Run translate first.":
 		"api.error.nothingToPack",
+	"handle not found": "api.error.xaiHandleNotFound",
 };
 
 type PrefixRule = { prefix: string; key: MessageKey; detail?: boolean };
@@ -78,6 +79,16 @@ const PREFIXES: PrefixRule[] = [
 		detail: true,
 	},
 	{ prefix: "no translated entries", key: "api.error.noTranslatedToPivot" },
+	{
+		prefix: "unknown export format: ",
+		key: "api.error.unknownExportFormat",
+		detail: true,
+	},
+	{
+		prefix: "unknown import format: ",
+		key: "api.error.unknownImportFormat",
+		detail: true,
+	},
 ];
 
 /** Strip optional `123: ` HTTP status prefix from `request()` throws. */

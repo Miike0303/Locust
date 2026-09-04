@@ -20,7 +20,7 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 ## Backlog
 
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
-- Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Remaining: dynamic IO/parse messages, unknown export format, xAI handle errors.
+- Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Remaining: dynamic IO/parse messages (and other free-form backend text). Unknown export/import format and xAI `handle not found` were catalogued in cycle 29.
 - Other long-running writers that touch `state.db` without taking `project_exclusive` beyond inject/pivot/validate (e.g. export/import bulk paths) remain a thinner race class; a full mutex around every DB op is still larger than needed.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 
@@ -29,6 +29,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 29 (defect, from backlog / cycle 14 class).** Unknown export/import format and xAI `handle not found` still toasted raw English in the Spanish UI. Tauri messages use stable `unknown export/import format: {name}` prefixes; catalog maps those plus `handle not found` EN/ES; cancel uses lowercase `job not found` to hit the existing exact key. Pinned by `apiError.test.ts` (negative: EN locale still English). Next rotation: `capability`.
 
 - `pending` — **cycle 28 (optimization, from backlog class).** PO/XLIFF import (HTTP, Tauri, CLI) awaited `save_translation` once per row — each a `spawn_blocking` + lock + UPDATE — so a large CAT re-import paid O(n) round-trips. Imports now collect updates and use `save_translations_batch` (one tx, `prepare_cached`). Pinned by `test_po_entries_for_batch_skips_empty_and_missing_id` (negative: unknown id after batch must inflate skipped, not imported). Unreal full-pak extract remains deferred. Next rotation: `defect`.
 

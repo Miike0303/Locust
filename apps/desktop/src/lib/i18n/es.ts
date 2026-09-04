@@ -816,6 +816,12 @@ export const es: Record<keyof typeof en, string> = {
     "Aún no hay nada que empaquetar — traduzca, inyecte y después empaquete.",
   "api.error.noTranslatedToPivot":
     "No hay traducciones para pivotar. Traduzca o importe primero.",
+  "api.error.unknownExportFormat":
+    "Formato de exportación desconocido: {detail}. Use po o xliff.",
+  "api.error.unknownImportFormat":
+    "Formato de importación desconocido: {detail}. Use po o xliff.",
+  "api.error.xaiHandleNotFound":
+    "Esa sesión de inicio de xAI caducó o no se encontró. Vuelva a iniciar sesión.",
   "ws.jobStreamLost": "se perdió la conexión con el trabajo de traducción",
   "ws.patchJobStreamLost": "se perdió la conexión con el trabajo de parche",
   "provider.free": "gratuito",
