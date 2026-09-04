@@ -15,6 +15,10 @@ import {
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
+import {
+	canStartValidationWorklist,
+	uniqueIssueEntryIds,
+} from "../lib/validationWorklist";
 
 interface ValidationResultsModalProps {
 	open: boolean;
@@ -22,6 +26,8 @@ interface ValidationResultsModalProps {
 	onClose: () => void;
 	/** Select entry in the editor and close this panel. */
 	onSelectEntry: (entryId: string) => void;
+	/** Start a Prev/Next walk over unique issue entry ids in the Editor. */
+	onReviewInEditor?: (entryIds: string[]) => void;
 }
 
 const KIND_BADGE: Record<string, string> = {
@@ -151,6 +157,7 @@ export default function ValidationResultsModal({
 	result,
 	onClose,
 	onSelectEntry,
+	onReviewInEditor,
 }: ValidationResultsModalProps) {
 	const t = useT();
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
@@ -161,12 +168,19 @@ export default function ValidationResultsModal({
 
 	const { validation, fonts } = result;
 	const issues = validation.issues ?? [];
+	const worklistIds = uniqueIssueEntryIds(issues);
+	const canReview = canStartValidationWorklist(worklistIds.length);
 	const kindEntries = Object.entries(validation.by_kind || {}).sort(
 		(a, b) => b[1] - a[1],
 	);
 
 	const handleClick = (issue: ValidationIssue) => {
 		onSelectEntry(issue.entry_id);
+	};
+
+	const handleReviewInEditor = () => {
+		if (!canReview || !onReviewInEditor) return;
+		onReviewInEditor(worklistIds);
 	};
 
 	return (
@@ -308,6 +322,21 @@ export default function ValidationResultsModal({
 				</div>
 
 				<div className={MODAL_FOOTER_CLASS}>
+					{onReviewInEditor && (
+						<button
+							type="button"
+							onClick={handleReviewInEditor}
+							disabled={!canReview}
+							title={
+								canReview
+									? t("validate.reviewInEditorTitle")
+									: t("validate.reviewInEditorDisabled")
+							}
+							className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium"
+						>
+							{t("validate.reviewInEditor")}
+						</button>
+					)}
 					<button
 						onClick={onClose}
 						className="px-4 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium"

@@ -30,6 +30,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 30 (capability, from research).** Closing Validate dropped the issue list; users had to re-run or hunt ids one click at a time (same class as cycle 24's "told but not shown"). **Review in Editor** builds a unique-id worklist, selects the first string, and keeps a Prev/Next/Done banner until dismissed. Pinned by `validationWorklist.test.ts` (negative: empty ids / zero issues must not start a worklist). Next rotation: `optimization`.
+
 - `pending` — **cycle 29 (defect, from backlog / cycle 14 class).** Unknown export/import format and xAI `handle not found` still toasted raw English in the Spanish UI. Tauri messages use stable `unknown export/import format: {name}` prefixes; catalog maps those plus `handle not found` EN/ES; cancel uses lowercase `job not found` to hit the existing exact key. Pinned by `apiError.test.ts` (negative: EN locale still English). Next rotation: `capability`.
 
 - `pending` — **cycle 28 (optimization, from backlog class).** PO/XLIFF import (HTTP, Tauri, CLI) awaited `save_translation` once per row — each a `spawn_blocking` + lock + UPDATE — so a large CAT re-import paid O(n) round-trips. Imports now collect updates and use `save_translations_batch` (one tx, `prepare_cached`). Pinned by `test_po_entries_for_batch_skips_empty_and_missing_id` (negative: unknown id after batch must inflate skipped, not imported). Unreal full-pak extract remains deferred. Next rotation: `defect`.

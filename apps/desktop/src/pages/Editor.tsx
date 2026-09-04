@@ -55,6 +55,11 @@ import { useT } from "../lib/i18n";
 export default function Editor() {
 	const t = useT();
 	const { filter, selectedEntryId, setSelected, isTranslating } = useEditorStore();
+	const validationWorklist = useEditorStore((s) => s.validationWorklist);
+	const validationWorklistIndex = useEditorStore((s) => s.validationWorklistIndex);
+	const startValidationWorklist = useEditorStore((s) => s.startValidationWorklist);
+	const clearValidationWorklist = useEditorStore((s) => s.clearValidationWorklist);
+	const stepValidationWorklist = useEditorStore((s) => s.stepValidationWorklist);
 	const { project } = useProjectStore();
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
@@ -401,6 +406,44 @@ export default function Editor() {
 				</div>
 			</div>
 
+			{validationWorklist && validationWorklist.length > 0 && (
+				<div className="flex items-center gap-3 px-4 py-1.5 border-b border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
+					<span className="text-xs font-medium">
+						{t("validate.worklist", {
+							current: validationWorklistIndex + 1,
+							total: validationWorklist.length,
+						})}
+					</span>
+					<div className="flex items-center gap-1.5 ml-auto">
+						<button
+							type="button"
+							onClick={() => stepValidationWorklist(-1)}
+							disabled={validationWorklistIndex <= 0}
+							className="px-2 py-0.5 text-xs font-medium rounded border border-amber-300 disabled:opacity-40 dark:border-amber-800"
+						>
+							{t("validate.worklistPrev")}
+						</button>
+						<button
+							type="button"
+							onClick={() => stepValidationWorklist(1)}
+							disabled={
+								validationWorklistIndex >= validationWorklist.length - 1
+							}
+							className="px-2 py-0.5 text-xs font-medium rounded border border-amber-300 disabled:opacity-40 dark:border-amber-800"
+						>
+							{t("validate.worklistNext")}
+						</button>
+						<button
+							type="button"
+							onClick={clearValidationWorklist}
+							className="px-2 py-0.5 text-xs font-medium rounded border border-amber-300 dark:border-amber-800"
+						>
+							{t("validate.worklistDone")}
+						</button>
+					</div>
+				</div>
+			)}
+
 			{!guideDismissed && workflowStep && (
 				<WorkflowGuideBanner
 					step={workflowStep}
@@ -524,6 +567,10 @@ export default function Editor() {
 				onSelectEntry={(entryId) => {
 					setShowValidationModal(false);
 					setSelected(entryId);
+				}}
+				onReviewInEditor={(entryIds) => {
+					setShowValidationModal(false);
+					startValidationWorklist(entryIds);
 				}}
 			/>
 		</div>
