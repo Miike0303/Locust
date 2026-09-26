@@ -34,6 +34,7 @@ import { addLog } from "../stores/logStore";
 import FilterBar from "../components/FilterBar";
 import StringTable from "../components/StringTable";
 import DetailPanel from "../components/DetailPanel";
+import { draftEntryKey, draftProjectKey } from "../stores/draftStore";
 import TranslationModal from "../components/TranslationModal";
 import InjectModal from "../components/InjectModal";
 import PatchModal from "../components/PatchModal";
@@ -41,6 +42,7 @@ import PatchStatusIndicator from "../components/PatchStatusIndicator";
 import ExportModal from "../components/ExportModal";
 import SearchReplaceModal from "../components/SearchReplaceModal";
 import ValidationResultsModal from "../components/ValidationResultsModal";
+import FontPatchDialog from "../components/FontPatchDialog";
 import WorkflowGuideBanner from "../components/WorkflowGuideBanner";
 import EmptyState from "../components/EmptyState";
 import PivotModal from "../components/PivotModal";
@@ -61,6 +63,7 @@ export default function Editor() {
 	const clearValidationWorklist = useEditorStore((s) => s.clearValidationWorklist);
 	const stepValidationWorklist = useEditorStore((s) => s.stepValidationWorklist);
 	const { project } = useProjectStore();
+	const projectKey = project ? draftProjectKey(project) : "";
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const [showTranslateModal, setShowTranslateModal] = useState(false);
@@ -74,6 +77,9 @@ export default function Editor() {
 	const [showPivotModal, setShowPivotModal] = useState(false);
 	const [showReplaceModal, setShowReplaceModal] = useState(false);
 	const [showValidationModal, setShowValidationModal] = useState(false);
+	const [showFontPatch, setShowFontPatch] = useState(false);
+	const [fontPatchSelection, setFontPatchSelection] = useState<{ path: string; gamePath: string } | null>(null);
+	const [patchBackupId, setPatchBackupId] = useState<string | undefined>();
 	const [validationResult, setValidationResult] =
 		useState<ValidationResponse | null>(null);
 	const [validating, setValidating] = useState(false);
@@ -91,21 +97,21 @@ export default function Editor() {
 		error: stringsErrorDetail,
 		refetch,
 	} = useQuery({
-		queryKey: ["strings", filter],
+		queryKey: ["strings", filter, projectKey],
 		queryFn: () => getStrings(filter),
 		staleTime: 30_000,
 		enabled: !!project,
 	});
 
 	const { data: statsData } = useQuery({
-		queryKey: ["stats"],
+		queryKey: ["stats", projectKey],
 		queryFn: getStats,
 		staleTime: 10_000,
 		enabled: !!project,
 	});
 
 	const { data: selectedEntry } = useQuery({
-		queryKey: ["string", selectedEntryId],
+		queryKey: ["string", selectedEntryId, projectKey],
 		queryFn: () => getString(selectedEntryId!),
 		enabled: !!project && !!selectedEntryId,
 	});
@@ -187,7 +193,7 @@ export default function Editor() {
 		showExportModal ||
 		showPivotModal ||
 		showReplaceModal ||
-		showValidationModal;
+		showValidationModal || showFontPatch;
 
 	// Action hotkeys pause behind work modals; Escape remains available in their inputs.
 	useHotkey(
@@ -242,7 +248,7 @@ export default function Editor() {
 			else if (showTranslateModal) setShowTranslateModal(false);
 			else if (selectedEntryId) setSelected(null);
 		},
-		editorModalOpen || !!selectedEntryId,
+		!showFontPatch && (editorModalOpen || !!selectedEntryId),
 		true,
 	);
 
@@ -275,9 +281,22 @@ export default function Editor() {
 
 	return (
 		<div className="flex flex-col h-full">
+			{project?.persistence_warning && <div role="alert" className="border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
+				<p>{t("editor.recentSaveFailed")}</p>
+				<details><summary>{t("recovery.details")}</summary><p className="break-words">{project.persistence_warning}</p></details>
+			</div>}
+			{!!project?.extraction_warnings?.length && (
+				<details className="border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
+					<summary className="cursor-pointer font-medium">{t("editor.partialExtraction")}</summary>
+					<p className="mt-1">{t("editor.partialExtractionDetail")}</p>
+					<ul className="mt-1 max-h-32 overflow-y-auto list-disc pl-5 break-words">
+						{project.extraction_warnings.map((warning, index) => <li key={index}>{warning}</li>)}
+					</ul>
+				</details>
+			)}
 			{/* Top bar */}
-			<div className="flex items-center gap-3 px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
-				<div className="flex-1">
+			<div className="flex flex-wrap items-center gap-3 px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+				<div className="w-full min-w-0 break-words">
 					<span className="font-semibold">{project?.name || t("editor.noProject")}</span>
 					{project && (
 						<span className="ml-2 px-2 py-0.5 bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300 rounded text-xs font-medium">
@@ -285,7 +304,7 @@ export default function Editor() {
 						</span>
 					)}
 					{statsData && (
-						<span className="ml-3 text-xs text-gray-500">
+						<span className="ml-3 text-xs text-gray-500 dark:text-gray-400">
 							{t(editorStatsKey(statsData.total_cost_usd), {
 								pending: statsData.pending,
 								translated: statsData.translated,
@@ -318,7 +337,7 @@ export default function Editor() {
 				</div>
 
 				{/* Primary workflow actions */}
-				<div className="flex items-center gap-2">
+				<div className="flex flex-wrap items-center gap-2">
 					<button
 						onClick={() => setShowTranslateModal(true)}
 						disabled={!hasProject}
@@ -353,13 +372,8 @@ export default function Editor() {
 					/>
 				</div>
 
-				<div
-					aria-hidden="true"
-					className="h-6 w-px bg-gray-200 dark:bg-gray-700"
-				/>
-
 				{/* Secondary project tools */}
-				<div className="flex items-center gap-2">
+				<div className="flex flex-wrap items-center gap-2">
 					<button
 						onClick={() => {
 							void handleValidate();
@@ -500,6 +514,8 @@ export default function Editor() {
 				)}
 				{hasProject && !stringsLoading && !stringsError && selectedEntry && (
 					<DetailPanel
+						key={draftEntryKey(projectKey, selectedEntry.id)}
+						projectKey={projectKey}
 						entry={selectedEntry}
 						onRefetch={handleRefetch}
 						onClose={() => setSelected(null)}
@@ -520,7 +536,8 @@ export default function Editor() {
 			<InjectModal
 				open={showInjectModal}
 				onClose={() => setShowInjectModal(false)}
-				onOpenPack={() => {
+				onOpenPack={(backupId) => {
+					setPatchBackupId(backupId);
 					setShowInjectModal(false);
 					setPatchInitialTab("pack");
 					setShowPatchModal(true);
@@ -533,8 +550,12 @@ export default function Editor() {
 				onClose={() => {
 					setShowPatchModal(false);
 					setPatchInitialTab("apply");
+					setFontPatchSelection(null);
+					setPatchBackupId(undefined);
 				}}
-				defaultGamePath={project?.path}
+				defaultGamePath={fontPatchSelection?.gamePath ?? project?.path}
+				initialZipPath={fontPatchSelection?.path}
+				initialBackupId={patchBackupId}
 				initialTab={patchInitialTab}
 				onPatchStateChanged={bumpPatchStatus}
 			/>
@@ -563,6 +584,7 @@ export default function Editor() {
 			<ValidationResultsModal
 				open={showValidationModal}
 				result={validationResult}
+				onFontPatch={project && ["html-game", "rpgmaker-mv", "rpgmaker-mz", "renpy"].includes(project.format_id) ? () => { setShowValidationModal(false); setShowFontPatch(true); } : undefined}
 				onClose={() => setShowValidationModal(false)}
 				onSelectEntry={(entryId) => {
 					setShowValidationModal(false);
@@ -573,6 +595,7 @@ export default function Editor() {
 					startValidationWorklist(entryIds);
 				}}
 			/>
+			<FontPatchDialog open={showFontPatch} defaultGamePath={project?.path ?? ""} onClose={() => setShowFontPatch(false)} onUsePatch={(path, gamePath) => { setShowFontPatch(false); setFontPatchSelection({ path, gamePath }); setPatchInitialTab("apply"); setShowPatchModal(true); }} />
 		</div>
 	);
 }

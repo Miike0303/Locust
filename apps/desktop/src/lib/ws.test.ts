@@ -284,3 +284,35 @@ async function lastSocket(): Promise<FakeWebSocket> {
 }
 
 console.log("ws.test.ts: ok");
+
+// A recoverable batch error must not reject/close a job before fallback completes.
+{
+    reset();
+    let settled = false;
+    const job = waitForJob("job-fallback").then(() => { settled = true; });
+    const socket = await lastSocket();
+    socket.emitMessage({ type: "batch_failed", entry_id: null, error: "primary failed" });
+    socket.emitMessage({ type: "provider_switched", provider_id: "fallback", provider_name: "Fallback", remaining_pending: 1 });
+    await tick();
+    assert.equal(settled, false);
+    assert.equal(socket.closed, false);
+    socket.emitMessage({ type: "completed", total_translated: 1, total_cost: 0, cost_is_complete: false, duration_secs: 1 });
+    await job;
+    assert.equal(settled, true);
+}
+{
+    reset();
+    let warnings = 0;
+    let errors = 0;
+    const unsub = subscribeToJob("job-warnings", {
+        onBatchFailed: () => { warnings += 1; },
+        onFailed: () => { errors += 1; },
+    });
+    const socket = await lastSocket();
+    socket.emitMessage({ type: "batch_failed", entry_id: null, error: "retry elsewhere" });
+    assert.equal(warnings, 1);
+    assert.equal(errors, 0);
+    socket.emitMessage({ type: "failed", entry_id: null, error: "terminal" });
+    assert.equal(errors, 1);
+    unsub();
+}

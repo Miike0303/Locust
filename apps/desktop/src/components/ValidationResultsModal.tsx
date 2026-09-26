@@ -28,6 +28,7 @@ interface ValidationResultsModalProps {
 	onSelectEntry: (entryId: string) => void;
 	/** Start a Prev/Next walk over unique issue entry ids in the Editor. */
 	onReviewInEditor?: (entryIds: string[]) => void;
+	onFontPatch?: () => void;
 }
 
 const KIND_BADGE: Record<string, string> = {
@@ -43,12 +44,15 @@ const KIND_BADGE: Record<string, string> = {
 		"bg-gray-200 text-gray-800 dark:bg-gray-700 dark:text-gray-200",
 	IdenticalToSource:
 		"bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
+	StaleTranslation:
+		"bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
 };
 
 function kindDetail(
 	kind: ValidationKind,
 	t: TranslateFn,
 ): string | null {
+	if (kind === "StaleTranslation") return t("validate.kind.staleDetail");
 	if (typeof kind === "string") return null;
 	if ("MissingPlaceholder" in kind)
 		return t("validate.kind.missing", {
@@ -72,19 +76,37 @@ function kindDetail(
 function FontSection({
 	fonts,
 	suggestions = [],
+	issues = [],
+	limitations,
 }: {
 	fonts: FontCoverageReport[];
 	suggestions?: FontSuggestion[];
+	issues?: NonNullable<ValidationResponse["font_issues"]>;
+	limitations?: string;
 }) {
 	const t = useT();
 	const withMissing = fonts.filter((f) => f.missing_count > 0);
-	if (withMissing.length === 0) return null;
+	if (fonts.length === 0 && issues.length === 0 && !limitations) return null;
 
 	return (
 		<div className="mt-4">
 			<h3 className="text-sm font-semibold text-gray-500 uppercase mb-2 flex items-center gap-1.5">
 				<Type size={14} /> {t("validate.fontCoverage")}
 			</h3>
+			<p className="text-xs text-gray-600 dark:text-gray-400 mb-2">
+				{fonts.length ? t("validate.fontsChecked", { count: fonts.length }) : t("validate.noLooseFonts")}
+			</p>
+			{limitations && (
+				<p className="text-xs text-gray-600 dark:text-gray-400 mb-2">
+					{t("validate.fontLimitations")}
+				</p>
+			)}
+			{issues.map((issue, index) => (
+				<div key={`${issue.font_path}:${index}`} className="text-xs border border-amber-300 dark:border-amber-800 rounded p-2 mb-2 break-words">
+					<div className="font-medium">{t("validate.fontUnreadable")}: {issue.font_path}</div>
+					<div>{issue.message}</div>
+				</div>
+			))}
 			<div className="space-y-2 max-h-40 overflow-y-auto">
 				{withMissing.map((f) => {
 					const name =
@@ -96,7 +118,7 @@ function FontSection({
 							: "";
 					return (
 						<div
-							key={f.font_path}
+							key={`${f.font_path}:${f.face_index ?? 0}`}
 							className="text-sm border border-gray-200 dark:border-gray-700 rounded p-2"
 						>
 							<div className="font-medium truncate" title={f.font_path}>
@@ -158,6 +180,7 @@ export default function ValidationResultsModal({
 	onClose,
 	onSelectEntry,
 	onReviewInEditor,
+	onFontPatch,
 }: ValidationResultsModalProps) {
 	const t = useT();
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
@@ -168,6 +191,8 @@ export default function ValidationResultsModal({
 
 	const { validation, fonts } = result;
 	const issues = validation.issues ?? [];
+	const fontProblems = (fonts ?? []).filter((font) => font.missing_count > 0).length + (result.font_issues?.length ?? 0);
+	const ResultIcon = fontProblems > 0 ? AlertTriangle : Shield;
 	const worklistIds = uniqueIssueEntryIds(issues);
 	const canReview = canStartValidationWorklist(worklistIds.length);
 	const kindEntries = Object.entries(validation.by_kind || {}).sort(
@@ -232,6 +257,7 @@ export default function ValidationResultsModal({
 								{validation.entries_with_issues}
 							</strong>
 						</span>
+						{fontProblems > 0 && <span className="font-medium text-amber-700 dark:text-amber-400">{t("validate.fontProblems", { count: fontProblems })}</span>}
 					</div>
 
 					{kindEntries.length > 0 && (
@@ -254,12 +280,12 @@ export default function ValidationResultsModal({
 					{/* Issue list */}
 					{issues.length === 0 ? (
 						<div className="py-10 text-center text-gray-500">
-							<Shield
+							<ResultIcon
 								size={32}
-								className="mx-auto mb-2 text-emerald-500 opacity-80"
+								className={clsx("mx-auto mb-2 opacity-80", fontProblems > 0 ? "text-amber-500" : "text-emerald-500")}
 							/>
 							<p className="font-medium text-gray-700 dark:text-gray-300">
-								{t("validate.noIssues")}
+								{t(fontProblems > 0 ? "validate.textPassedFontsPending" : "validate.noIssues")}
 							</p>
 							<p className="text-sm mt-1">
 								{t("validate.validated", { count: validation.total_checked })}
@@ -288,7 +314,7 @@ export default function ValidationResultsModal({
 															KIND_BADGE[label] || "bg-gray-100 text-gray-700",
 														)}
 													>
-														{label}
+														{label === "StaleTranslation" ? t("validate.kind.staleLabel") : label}
 													</span>
 													<div className="min-w-0 flex-1">
 														<div className="font-mono text-xs text-gray-500 truncate">
@@ -318,10 +344,11 @@ export default function ValidationResultsModal({
 						</div>
 					)}
 
-					<FontSection fonts={fonts ?? []} suggestions={result.font_suggestions ?? []} />
+					<FontSection fonts={fonts ?? []} suggestions={result.font_suggestions ?? []} issues={result.font_issues ?? []} limitations={result.font_limitations} />
 				</div>
 
 				<div className={MODAL_FOOTER_CLASS}>
+					{onFontPatch && <button type="button" onClick={onFontPatch} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded text-sm font-medium">{t("fontPatch.title")}</button>}
 					{onReviewInEditor && (
 						<button
 							type="button"

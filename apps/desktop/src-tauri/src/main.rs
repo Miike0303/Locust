@@ -22,22 +22,32 @@ fn main() {
     let state = locust_server::create_app_state();
     let state_for_server = state.clone();
 
-    // Pick an available port for the embedded server
-    let port = portpicker::pick_unused_port().unwrap_or(7842);
+    // Keep the socket bound while handing it to the backend. Probing a free
+    // port and reopening it races other processes and other Locust instances.
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind the embedded server");
+    listener
+        .set_nonblocking(true)
+        .expect("Failed to configure embedded server socket");
+    let port = listener
+        .local_addr()
+        .expect("Failed to read embedded server address")
+        .port();
 
     // Start the backend server in a background thread
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
             tracing::info!("Starting embedded server on port {}", port);
-            if let Err(e) = locust_server::start_server(state_for_server, port).await {
+            let listener = tokio::net::TcpListener::from_std(listener)
+                .expect("Failed to initialize embedded server socket");
+            if let Err(e) =
+                locust_server::start_server_with_listener(state_for_server, listener).await
+            {
                 tracing::error!("Server error: {}", e);
             }
         });
     });
-
-    // Give the server a moment to start
-    std::thread::sleep(std::time::Duration::from_millis(300));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

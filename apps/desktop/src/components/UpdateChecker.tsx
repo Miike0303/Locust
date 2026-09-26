@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Download, CheckCircle, AlertCircle } from "lucide-react";
 import { t as translateStandalone, useT } from "../lib/i18n";
+import { addLog } from "../stores/logStore";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -22,7 +23,7 @@ export default function UpdateChecker() {
       if (!silent) setState({ kind: "error", message: t("update.desktopOnly") });
       return;
     }
-    setState({ kind: "checking" });
+    if (!silent) setState({ kind: "checking" });
     try {
       const { check } = await import("@tauri-apps/plugin-updater");
       const update = await check();
@@ -33,11 +34,16 @@ export default function UpdateChecker() {
           notes: update.body ?? "",
         });
       } else {
-        setState({ kind: "upToDate" });
-        if (silent) setTimeout(() => setState({ kind: "idle" }), 3000);
+        setState({ kind: silent ? "idle" : "upToDate" });
       }
     } catch (err: any) {
-      setState({ kind: "error", message: err.message ?? String(err) });
+      const message = err?.message ?? String(err);
+      if (silent) {
+        addLog("warning", t("update.checkFailed"), message, "updater");
+        setState({ kind: "idle" });
+      } else {
+        setState({ kind: "error", message });
+      }
     }
   };
 

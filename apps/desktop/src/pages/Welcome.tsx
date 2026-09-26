@@ -26,13 +26,15 @@ import {
 	Puzzle,
 	Braces,
 	Database,
+	RotateCcw,
 } from "lucide-react";
-import { getFormats, getConfig, getProviders } from "../lib/api";
+import { getFormats, getConfig, getProviders, getInjectionStatus } from "../lib/api";
 import { useProjectStore } from "../stores/projectStore";
 import { useQueueStore } from "../stores/queueStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 import PatchModal from "../components/PatchModal";
+import InjectionRecoveryModal from "../components/InjectionRecoveryModal";
 import {
 	completeOpenProject,
 	completeOpenProjectDb,
@@ -157,6 +159,7 @@ export default function Welcome() {
 	const [selectedFormat, setSelectedFormat] = useState("auto");
 	const [opening, setOpening] = useState(false);
 	const [showPatchModal, setShowPatchModal] = useState(false);
+	const [recoveryPath, setRecoveryPath] = useState<string | null>(null);
 	const formatOverlayOpen = !!picker || !!openDbDraft;
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open: formatOverlayOpen,
@@ -175,13 +178,27 @@ export default function Welcome() {
 		navigate(".", { replace: true, state: {} });
 	}, [location.state, navigate]);
 
-	const openWithPath = async (path: string, formatId?: string) => {
+	const offerRecovery = async (path: string) => {
+		try {
+			const status = await getInjectionStatus(path);
+			if (status.pending) {
+				setPicker(null);
+				setOpenDbDraft(null);
+				setRecoveryPath(path);
+				addToast("warning", t("recovery.pending"));
+				return true;
+			}
+		} catch { /* Keep the original open error; manual recovery remains available. */ }
+		return false;
+	};
+
+	const openWithPath = async (path: string, formatId?: string, preferSaved = false) => {
 		setOpening(true);
 		try {
 			const result = await completeOpenProject(path, formatId, {
 				setProject,
 				queryClient,
-			});
+			}, preferSaved);
 			const notice = projectOpenMergeNotice(result, t);
 			addLog(
 				notice.toast ? "warning" : "info",
@@ -206,7 +223,7 @@ export default function Welcome() {
 				setPicker({ path, reason: "detect-failed" });
 			} else {
 				addLog("error", `Failed to open project`, msg, "project");
-				addToast("error", t("welcome.toast.failedOpen", { error: msg }));
+				if (!await offerRecovery(path)) addToast("error", t("welcome.toast.failedOpen", { error: msg }));
 			}
 		} finally {
 			setOpening(false);
@@ -242,7 +259,7 @@ export default function Welcome() {
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addLog("error", "Failed to open project database", msg, "project");
-			addToast("error", t("welcome.toast.failedOpen", { error: msg }));
+			if (!await offerRecovery(gamePath)) addToast("error", t("welcome.toast.failedOpen", { error: msg }));
 		} finally {
 			setOpening(false);
 		}
@@ -257,7 +274,7 @@ export default function Welcome() {
 			await openWithDb(p.database_path!.trim(), p.path, p.format_id);
 			return;
 		}
-		await openWithPath(p.path, p.format_id);
+		await openWithPath(p.path, p.format_id, true);
 	};
 
 	const pickFolderPath = () => pickGameFolder(t);
@@ -483,6 +500,10 @@ export default function Welcome() {
 					>
 						<Package size={18} />
 						{t("welcome.applyPatch")}
+					</button>
+					<button type="button" onClick={() => setRecoveryPath(project?.path ?? "")} disabled={opening}
+						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 rounded-lg text-sm font-medium">
+						<RotateCcw size={18} />{t("recovery.action")}
 					</button>
 				</div>
 				<div className="flex justify-center mt-2">
@@ -749,7 +770,7 @@ export default function Welcome() {
 					<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
 						{t("welcome.availableFormats")}
 					</h2>
-					<div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+					<div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))] gap-3">
 						{formats
 							.filter((f) => f.stability !== "comingsoon")
 							.map((f) => {
@@ -763,18 +784,20 @@ export default function Welcome() {
 										key={f.id}
 										className="p-3 rounded-lg border border-gray-200 dark:border-gray-700"
 									>
-										<div className="flex items-center gap-2 mb-1">
-											<div className={`p-1.5 rounded ${colorClass}`}>
+										<div className="flex items-start gap-2 mb-2">
+											<div className={`p-1.5 rounded shrink-0 ${colorClass}`}>
 												<Icon size={14} />
 											</div>
-											<span className="text-sm font-medium truncate">
+											<div className="min-w-0 flex-1">
+											<span className="block text-sm font-medium break-words">
 												{f.name}
 											</span>
 											{experimental && (
-												<span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+												<span className="inline-block mt-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
 													{t("welcome.format.experimental")}
 												</span>
 											)}
+											</div>
 										</div>
 										{f.description && (
 											<p className="text-xs text-gray-500 line-clamp-2">
@@ -821,6 +844,7 @@ export default function Welcome() {
 				onClose={() => setShowPatchModal(false)}
 				allowPack={false}
 			/>
+			{recoveryPath !== null && <InjectionRecoveryModal defaultGamePath={recoveryPath} onClose={() => setRecoveryPath(null)} />}
 		</div>
 	);
 }

@@ -58,6 +58,9 @@ interface PatchModalProps {
 	onClose: () => void;
 	/** Optional default game path (e.g. current project folder). */
 	defaultGamePath?: string;
+	initialZipPath?: string;
+	/** Exact pre-injection backup, scoped to defaultGamePath. */
+	initialBackupId?: string;
 	/** Open on Apply or Pack (e.g. after direct inject). */
 	initialTab?: Tab;
 	/** Called after apply/rollback refresh so ambient indicators can update. */
@@ -70,11 +73,29 @@ export default function PatchModal({
 	open,
 	onClose,
 	defaultGamePath,
+	initialZipPath,
+	initialBackupId,
 	initialTab = "apply",
 	onPatchStateChanged,
 	allowPack = true,
 }: PatchModalProps) {
 	const t = useT();
+	const patchValue = (value: string): string => {
+		const labels: Record<string, string> = {
+			pristine: t("patch.status.pristine"),
+			patched: t("patch.status.patched"),
+			interrupted: t("patch.status.interrupted"),
+			unknown: t("patch.status.unknown"),
+			strict: t("patch.value.strict"),
+			structural: t("patch.value.structural"),
+			legacy: t("patch.value.legacy"),
+			unverified: t("patch.value.unverified"),
+			clean: t("patch.value.clean"),
+			alreadyapplied: t("patch.value.alreadyApplied"),
+			upgradeavailable: t("patch.value.upgradeAvailable"),
+		};
+		return labels[value.toLowerCase()] ?? value;
+	};
 	const remembered = (() => {
 		try {
 			return loadRememberedPatchSource();
@@ -89,6 +110,7 @@ export default function PatchModal({
 	const [outputPath, setOutputPath] = useState("");
 	const [languages, setLanguages] = useState("");
 	const [recordings, setRecordings] = useState<RecordedLang[]>([]);
+	const [pristineRecordings, setPristineRecordings] = useState<RecordedLang[]>([]);
 	const [pristine, setPristine] = useState(false);
 	const [pristinePath, setPristinePath] = useState("");
 	const [force, setForce] = useState(false);
@@ -122,23 +144,32 @@ export default function PatchModal({
 		if (!open) return;
 		if (applyJobIdRef.current) return;
 		if (defaultGamePath) setGamePath(defaultGamePath);
+		if (initialBackupId) { setPristine(true); setPristinePath(""); }
+		if (initialZipPath) { setZipPath(initialZipPath); setZipUrl(""); setVerify(null); setApplyResult(null); }
 		setTab(allowPack ? initialTab : "apply");
 		setError(null);
 		if (!allowPack) {
 			setRecordings([]);
+			setPristineRecordings([]);
 			return;
 		}
+		let cancelled = false;
 		void Promise.all([getPatchRecordings(), getConfig()])
 			.then(([rec, cfg]) => {
+				if (cancelled) return;
 				setRecordings(rec.languages);
+				setPristineRecordings(rec.pristine_languages ?? []);
 				setLanguages((prev) =>
 					preferredPackLang(rec.languages, cfg.default_target_lang, prev),
 				);
 			})
 			.catch(() => {
+				if (cancelled) return;
 				setRecordings([]);
+				setPristineRecordings([]);
 			});
-	}, [open, defaultGamePath, initialTab, allowPack]);
+		return () => { cancelled = true; };
+	}, [open, defaultGamePath, initialZipPath, initialBackupId, initialTab, allowPack]);
 
 	useEffect(() => {
 		if (!allowPack && tab === "pack") setTab("apply");
@@ -291,7 +322,7 @@ export default function PatchModal({
 				report.messages?.join("\n") || "",
 				"patch",
 			);
-			addToast("success", t("patch.toast.verify", { outcome: report.outcome }));
+			addToast("success", t("patch.toast.verify", { outcome: patchValue(report.outcome) }));
 		} catch (err: any) {
 			setError(err.message);
 			addLog("error", "Patch verify failed", err.message, "patch");
@@ -552,6 +583,7 @@ export default function PatchModal({
 				languages: langs,
 				pristine,
 				pristine_path: pristinePath.trim() || undefined,
+				pristine_backup_id: pristine && !pristinePath.trim() && gamePath.trim() === defaultGamePath?.trim() ? initialBackupId : undefined,
 			});
 			setPackResult(report);
 			addLog(
@@ -562,7 +594,7 @@ export default function PatchModal({
 			);
 			addToast(
 				"success",
-				t("patch.toast.packed", { count: report.files_packed, tier: report.tier }),
+				t("patch.toast.packed", { count: report.files_packed, tier: patchValue(report.tier) }),
 			);
 		} catch (err: any) {
 			setError(err.message);
@@ -609,6 +641,7 @@ export default function PatchModal({
 					</h2>
 					<button
 						onClick={onClose}
+						aria-label={t("common.close")}
 						className="text-gray-400 hover:text-gray-600"
 					>
 						<X size={20} />
@@ -898,7 +931,7 @@ export default function PatchModal({
 
 							{status && (
 								<div className="p-3 bg-gray-50 dark:bg-gray-800/60 rounded text-sm space-y-1">
-									<div className="font-medium">{t("patch.status", { status: status.status })}</div>
+									<div className="font-medium">{t("patch.status", { status: patchValue(status.status) })}</div>
 									{status.status === "patched" && (
 										<div className="text-xs text-gray-600 dark:text-gray-400">
 											{t("patch.statusDetail", {
@@ -906,7 +939,7 @@ export default function PatchModal({
 												version: status.patch_version ?? "",
 												engine: status.engine ?? "",
 												language: status.language ?? "",
-												baseline: status.baseline ?? "",
+												baseline: patchValue(status.baseline ?? ""),
 												replaced: status.replaced ?? 0,
 												added: status.added ?? 0,
 											})}
@@ -922,9 +955,9 @@ export default function PatchModal({
 
 							{verify && (
 								<div className="p-3 border rounded dark:border-gray-700 text-sm space-y-1">
-									<div className="font-medium">{t("patch.verifyLine", { outcome: verify.outcome })}</div>
+									<div className="font-medium">{t("patch.verifyLine", { outcome: patchValue(verify.outcome) })}</div>
 									{verify.tier && (
-										<div className="text-xs">{t("patch.tier", { tier: verify.tier })}</div>
+										<div className="text-xs">{t("patch.tier", { tier: patchValue(verify.tier) })}</div>
 									)}
 									<div className="text-xs text-gray-600 dark:text-gray-400">
 										{t("patch.plan", {
@@ -962,7 +995,7 @@ export default function PatchModal({
 										{t("patch.applyDetail", {
 											replaced: applyResult.replaced,
 											added: applyResult.added,
-											baseline: applyResult.baseline,
+											baseline: patchValue(applyResult.baseline),
 										})}
 									</div>
 									{applyResult.user_edits_overwritten?.length > 0 && (
@@ -1062,7 +1095,8 @@ export default function PatchModal({
 							</label>
 
 							<div>
-								<label className="text-sm font-medium">{t("patch.pristinePath")}</label>
+							<label className="text-sm font-medium">{t("patch.pristinePath")}</label>
+							{pristine && (initialBackupId || pristineRecordings.some(lang => isPackLangSelected(languages, lang))) && gamePath.trim() === defaultGamePath?.trim() && !pristinePath.trim() && <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-300">{t("patch.injectionBackup")}</p>}
 								<div className="flex gap-2 mt-1">
 									<input
 										value={pristinePath}
@@ -1115,7 +1149,7 @@ export default function PatchModal({
 											{t("patch.packedStats", {
 												files: packResult.files_packed,
 												bytes: packResult.size_bytes,
-												tier: packResult.tier,
+												tier: patchValue(packResult.tier),
 											})}
 										</div>
 										<div>

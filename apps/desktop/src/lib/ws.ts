@@ -5,6 +5,7 @@ import type {
   ProgressEventStringTranslated,
   ProgressEventCompleted,
   ProgressEventFailed,
+  ProgressEventBatchFailed,
   ProgressEventProviderSwitched,
   PatchProgressEvent,
   PatchDoneEvent,
@@ -17,6 +18,7 @@ interface JobHandlers {
   onStringTranslated?: (e: ProgressEventStringTranslated) => void;
   onCompleted?: (e: ProgressEventCompleted) => void;
   onFailed?: (e: ProgressEventFailed) => void;
+  onBatchFailed?: (e: ProgressEventBatchFailed) => void;
   onPaused?: () => void;
   onProviderSwitched?: (e: ProgressEventProviderSwitched) => void;
   /** Patch-apply job frames (`GET /api/patch/ws/:job_id`). */
@@ -28,7 +30,7 @@ interface JobHandlers {
 }
 
 interface WaitOptions {
-  onProgress?: (completed: number, total: number, costSoFar: number) => void;
+  onProgress?: (completed: number, total: number, costSoFar: number, costIsComplete: boolean) => void;
 }
 
 /** Catalog key — UI renders via `t()`, tests assert on the code. */
@@ -38,7 +40,7 @@ export function waitForJob(jobId: string, opts?: WaitOptions): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
     const unsub = subscribeToJob(jobId, {
-      onBatchCompleted: (e) => opts?.onProgress?.(e.completed, e.total, e.cost_so_far),
+      onBatchCompleted: (e) => opts?.onProgress?.(e.completed, e.total, e.cost_so_far, e.cost_is_complete === true),
       onCompleted: () => settle(() => resolve()),
       onFailed: (e) => settle(() => reject(new Error(e.error))),
       onClosed: () =>
@@ -85,6 +87,9 @@ export function subscribeToJob(
               break;
             case "completed":
               handlers.onCompleted?.(data);
+              break;
+            case "batch_failed":
+              handlers.onBatchFailed?.(data);
               break;
             case "failed":
               handlers.onFailed?.(data);

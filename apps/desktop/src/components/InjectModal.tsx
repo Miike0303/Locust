@@ -18,6 +18,9 @@ import {
 	classifyInjectReport,
 	collectFilesWritten,
 	collectInjectWarnings,
+	injectionRecoveryPath,
+	isRedundantBackupRemoved,
+	collectSkipReasons,
 	injectToastLevel,
 	outcomeRecordingIssues,
 	shouldOfferPackAfterInject,
@@ -47,7 +50,7 @@ interface InjectModalProps {
 	open: boolean;
 	onClose: () => void;
 	/** Optional: open Patch modal on the Pack tab after a successful direct inject. */
-	onOpenPack?: () => void;
+	onOpenPack?: (backupId?: string) => void;
 }
 
 export default function InjectModal({
@@ -83,7 +86,7 @@ export default function InjectModal({
 		}
 	})();
 	const [selectedLangs, setSelectedLangs] = useState<string[]>(
-		savedLangs ?? ["es"],
+		savedLangs?.length ? savedLangs.slice(0, 1) : ["es"],
 	);
 	const [outputDir, setOutputDir] = useState("");
 	const [loading, setLoading] = useState(false);
@@ -92,6 +95,14 @@ export default function InjectModal({
 	const [regReports, setRegReports] = useState<
 		{ lang: string; label: string; report: RegisterLangReport }[]
 	>([]);
+	// A completed report belongs to this visit. Keep an in-flight operation
+	// alive when hidden, then clear its result before the next visit.
+	useEffect(() => {
+		if (!open && !loading && !regLoading) {
+			setResult(null);
+			setRegReports([]);
+		}
+	}, [open, loading, regLoading]);
 	/** Optional UI label override (CLI `--label`). Used when a single lang is selected. */
 	const [regLabelOverride, setRegLabelOverride] = useState(() =>
 		loadRegLabelOverride(),
@@ -111,9 +122,7 @@ export default function InjectModal({
 	};
 
 	const toggleLang = (code: string) => {
-		setSelectedLangs((prev) =>
-			prev.includes(code) ? prev.filter((l) => l !== code) : [...prev, code],
-		);
+		setSelectedLangs([code]);
 	};
 
 	const defaultLabelFor = (code: string) => languageLabel(code);
@@ -286,7 +295,9 @@ export default function InjectModal({
 
 			addLog(
 				outcome === "empty" ? "error" : outcome === "partial" ? "warning" : "info",
-				outcome === "empty"
+				outcome === "unchanged"
+					? `Inject unchanged: ${report.languages_processed.join(", ")} (${report.mode} mode)`
+					: outcome === "empty"
 					? `Inject wrote nothing: ${report.languages_processed.join(", ") || "(none)"} (${report.mode} mode)`
 					: outcome === "partial"
 						? `Inject partial: ${report.languages_processed.join(", ")} (${report.mode} mode)`
@@ -297,7 +308,9 @@ export default function InjectModal({
 
 			const toastLevel = injectToastLevel(outcome);
 			const toastMsg =
-				outcome === "empty"
+				outcome === "unchanged"
+					? t("inject.toast.unchanged")
+					: outcome === "empty"
 					? t("inject.toast.nothingWritten")
 					: outcome === "partial"
 						? t("inject.toast.partial", {
@@ -313,7 +326,7 @@ export default function InjectModal({
 
 			// Optional: register selected lang(s) in RM multi-lang UI after inject.
 			// Skip when nothing was written — registering a language with no text is noise.
-			if (autoRegisterAfterInject && isRpgMaker && outcome !== "empty") {
+			if (autoRegisterAfterInject && isRpgMaker && written > 0) {
 				await runRegisterLang(true);
 			}
 		} catch (err: unknown) {
@@ -329,10 +342,14 @@ export default function InjectModal({
 		project.path.split(/[\\/]/).filter(Boolean).pop() ?? project.name;
 	const isDirectResult = result?.mode === "direct";
 	const resultKind = result ? classifyInjectReport(result) : null;
-	const resultWarnings = result ? collectInjectWarnings(result) : [];
+	const resultDiagnostics = result ? collectInjectWarnings(result) : [];
+	const resultWarnings = resultDiagnostics.filter((message) => !injectionRecoveryPath(message) && !isRedundantBackupRemoved(message));
+	const removedRedundantBackup = resultDiagnostics.some(isRedundantBackupRemoved);
+	const recoveryPaths = [...new Set(resultDiagnostics.map(injectionRecoveryPath).filter((path): path is string => path !== null))];
 	const resultFiles = result ? collectFilesWritten(result) : [];
 	const resultRecording = result ? outcomeRecordingIssues(result) : [];
 	const resultWritten = result ? sumStringsWritten(result) : 0;
+	const resultSkips = result ? collectSkipReasons(result) : [];
 	const offerPack =
 		Boolean(result) && isDirectResult && shouldOfferPackAfterInject(result!);
 
@@ -349,6 +366,7 @@ export default function InjectModal({
 					</h2>
 					<button
 						onClick={onClose}
+						aria-label={t("common.close")}
 						className="text-gray-400 hover:text-gray-600"
 					>
 						<X size={20} />
@@ -358,8 +376,9 @@ export default function InjectModal({
 				{!result ? (
 					<div className="space-y-4">
 						<div>
-							<label className="text-sm font-medium">{t("inject.mode")}</label>
+							<label htmlFor="inject-mode" className="text-sm font-medium">{t("inject.mode")}</label>
 							<select
+								id="inject-mode"
 								value={mode}
 								onChange={(e) => setMode(e.target.value as InjectUiMode)}
 								className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
@@ -380,7 +399,7 @@ export default function InjectModal({
 									</option>
 								)}
 							</select>
-							<p className="text-xs text-gray-500 mt-1">
+							<p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
 								{mode === "replace" &&
 									t("inject.hint.replace", { gameName })}
 								{mode === "add" && t("inject.hint.add")}
@@ -416,7 +435,7 @@ export default function InjectModal({
 							<label className="text-sm font-medium">
 								{t("inject.languages")}
 								{mode === "direct" && (
-									<span className="font-normal text-gray-500">
+									<span className="font-normal text-gray-500 dark:text-gray-400">
 										{" "}
 										{t("inject.recordingKey")}
 									</span>
@@ -429,7 +448,8 @@ export default function InjectModal({
 										className="flex items-center gap-1 text-sm cursor-pointer"
 									>
 										<input
-											type="checkbox"
+											type="radio"
+											name="inject-target-language"
 											checked={selectedLangs.includes(l.code)}
 											onChange={() => toggleLang(l.code)}
 										/>
@@ -437,18 +457,16 @@ export default function InjectModal({
 									</label>
 								))}
 							</div>
-							<p className="text-xs text-gray-500 mt-1">
+							<p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
 								{t("inject.selected", {
 									langs:
 										selectedLangs.length === 0
 											? t("inject.selectedNone")
 											: selectedLangs.join(", "),
 								})}
-								{mode === "direct" && selectedLangs.length > 1 && (
-									<span className="block mt-0.5">
-										{t("inject.multiRecording")}
-									</span>
-								)}
+								<span className="block mt-0.5">
+									{t("inject.multiRecording")}
+								</span>
 							</p>
 						</div>
 
@@ -479,7 +497,7 @@ export default function InjectModal({
 									</p>
 								)}
 								{outputDir.trim() && (
-									<p className="text-xs text-gray-500 mt-1">
+									<p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
 										{t("inject.willCreate", {
 											path: `${outputDir}/${gameName}-${selectedLangs[0] || "lang"}/`,
 										})}
@@ -488,7 +506,7 @@ export default function InjectModal({
 							</div>
 						)}
 
-						<div className="pt-2 flex items-center gap-3 text-xs text-gray-500">
+						<div className="pt-2 flex items-center gap-3 text-xs text-gray-500 dark:text-gray-400">
 							<FileCheck size={14} />
 							<span>
 								{t("inject.source", { name: project.name, format: project.format_id })}
@@ -509,7 +527,7 @@ export default function InjectModal({
 
 						{isRpgMaker && (
 							<div className="pt-1 border-t dark:border-gray-700 space-y-2">
-								<p className="text-xs text-gray-500">
+								<p className="text-xs text-gray-500 dark:text-gray-400">
 									{t("inject.rpgHint")}
 								</p>
 								<label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400 cursor-pointer">
@@ -543,7 +561,7 @@ export default function InjectModal({
 											placeholder={defaultLabelFor(selectedLangs[0])}
 											className="w-full mt-0.5 p-1.5 text-sm border rounded dark:bg-gray-800 dark:border-gray-600"
 										/>
-										<p className="text-[11px] text-gray-500 mt-0.5">
+										<p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">
 											{t("inject.menuLabelHint", {
 												label: defaultLabelFor(selectedLangs[0]),
 											})}
@@ -583,7 +601,9 @@ export default function InjectModal({
 					<div className="space-y-4">
 						<div
 							className={
-								resultKind === "empty"
+								resultKind === "unchanged"
+									? "p-3 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 rounded text-sm"
+									: resultKind === "empty"
 									? "p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm"
 									: resultKind === "partial"
 										? "p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-sm"
@@ -592,14 +612,18 @@ export default function InjectModal({
 						>
 							<p
 								className={
-									resultKind === "empty"
+									resultKind === "unchanged"
+										? "font-medium text-sky-800 dark:text-sky-200"
+										: resultKind === "empty"
 										? "font-medium text-red-700 dark:text-red-300"
 										: resultKind === "partial"
 											? "font-medium text-amber-800 dark:text-amber-200"
 											: "font-medium text-emerald-700 dark:text-emerald-300"
 								}
 							>
-								{resultKind === "empty"
+								{resultKind === "unchanged"
+									? t("inject.injectionUnchanged")
+									: resultKind === "empty"
 									? t("inject.injectionEmpty")
 									: resultKind === "partial"
 										? t("inject.injectionPartial")
@@ -649,6 +673,22 @@ export default function InjectModal({
 							)}
 						</div>
 
+						{resultSkips.length > 0 && (
+                            <div className="p-3 bg-slate-50 dark:bg-slate-900/40 rounded text-sm">
+                                <p className="font-medium">{t("inject.skipReasons")}</p>
+                                <ul>{resultSkips.map(({lang, reason, count}) => {
+                                    const labels = {
+                                        untranslated: "inject.skip.untranslated", unchanged: "inject.skip.unchanged",
+                                        duplicate: "inject.skip.duplicate", too_long: "inject.skip.too_long",
+                                        target_missing: "inject.skip.target_missing", source_changed: "inject.skip.source_changed",
+                                        ambiguous_target: "inject.skip.ambiguous_target", invalid_placeholders: "inject.skip.invalid_placeholders",
+                                        unsupported: "inject.skip.unsupported", error: "inject.skip.error",
+                                        unclassified: "inject.skip.unclassified",
+                                    } as const;
+                                    return <li key={`${lang}:${reason}`}>{lang && `${lang}: `}{t(labels[reason as keyof typeof labels] ?? labels.unclassified)}: {count}</li>;
+                                })}</ul>
+                            </div>
+                        )}
 						{resultFiles.length > 0 && (
 							<div className="p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 rounded text-sm">
 								<p className="font-medium text-slate-800 dark:text-slate-100">
@@ -659,6 +699,14 @@ export default function InjectModal({
 										<li key={path}>{path}</li>
 									))}
 								</ul>
+							</div>
+						)}
+
+						{recoveryPaths.length > 0 && (
+							<div className="p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 rounded text-sm text-slate-800 dark:text-slate-200">
+								<p className="font-medium">{t("inject.recoveryOriginals")}</p>
+								<p className="text-xs mt-1">{t("inject.recoveryOriginalsHint")}</p>
+								<ul className="mt-1 text-xs break-all">{recoveryPaths.map((path) => <li key={path}>{path}</li>)}</ul>
 							</div>
 						)}
 
@@ -675,12 +723,18 @@ export default function InjectModal({
 							</div>
 						)}
 
+						{removedRedundantBackup && (
+							<p className="text-sm text-slate-600 dark:text-slate-300">{t("inject.redundantBackupRemoved")}</p>
+						)}
+
 						{resultRecording.length > 0 && (
-							<div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-sm">
-								<p className="font-medium text-amber-900 dark:text-amber-100">
+							<div className={resultKind === "unchanged"
+								? "p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 rounded text-sm text-slate-800 dark:text-slate-200"
+								: "p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-sm text-amber-900 dark:text-amber-100"}>
+								<p className="font-medium">
 									{t("inject.recordingIssues")}
 								</p>
-								<ul className="mt-1 space-y-0.5 text-xs text-amber-800 dark:text-amber-200">
+								<ul className="mt-1 space-y-0.5 text-xs">
 									{resultRecording.map((issue) => (
 										<li key={`${issue.lang}-${issue.kind}`}>
 											{issue.kind === "nothing"
@@ -708,7 +762,7 @@ export default function InjectModal({
 										type="button"
 										onClick={() => {
 											onClose();
-											onOpenPack();
+											onOpenPack(result?.pristine_backup_id || undefined);
 										}}
 										className="mt-2 text-xs font-medium text-sky-700 dark:text-sky-300 hover:underline"
 									>

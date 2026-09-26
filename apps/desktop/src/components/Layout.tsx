@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Suspense, useState } from "react";
 import { Outlet, NavLink } from "react-router-dom";
 import {
 	Home,
@@ -22,6 +22,8 @@ import { useLogStore } from "../stores/logStore";
 import { useQueueStore } from "../stores/queueStore";
 import { APP_VERSION } from "../lib/appVersion";
 import { useT } from "../lib/i18n";
+import { useQuery } from "@tanstack/react-query";
+import { getConfig } from "../lib/api";
 
 const navItems = [
 	{ to: "/", icon: Home, labelKey: "nav.home", shortcut: "Alt+1" },
@@ -33,6 +35,7 @@ const navItems = [
 
 export default function Layout() {
 	const t = useT();
+	const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
 	const [showHelp, setShowHelp] = useState(false);
 	useGlobalHotkeys(() => setShowHelp(true));
 
@@ -53,7 +56,7 @@ export default function Layout() {
 
 	return (
 		<div className="flex h-screen">
-			<aside className="w-60 flex flex-col bg-gray-50 dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
+			<aside className="w-60 shrink-0 flex flex-col bg-gray-50 dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
 				<div className="p-4">
 					<h1 className="text-lg font-bold text-emerald-600">{t("nav.appName")}</h1>
 					<p className="text-xs text-gray-500 dark:text-gray-400">
@@ -137,9 +140,15 @@ export default function Layout() {
 				</div>
 			</aside>
 
-			<main className="flex-1 flex flex-col overflow-hidden">
+			<main className="min-w-0 flex-1 flex flex-col overflow-hidden">
+				{config?.load_warning && <div role="alert" className="shrink-0 border-b border-amber-300 bg-amber-50 px-5 py-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
+					<p>{t("settings.configLoadFailed")}</p>
+					<p className="mt-1 break-all font-mono text-xs">{config.load_warning}</p>
+				</div>}
 				<div className="flex-1 overflow-auto">
+				<Suspense fallback={<div role="status" className="p-6 text-sm text-gray-500">{t("common.loading")}</div>}>
 					<Outlet />
+				</Suspense>
 				</div>
 				<BottomBar />
 			</main>

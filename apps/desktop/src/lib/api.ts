@@ -8,6 +8,7 @@ import {
   pivotOpenDbHttpBody,
   pivotOpenDbTauriArgs,
 } from "./pivot";
+import { projectOpenHttpBody, projectOpenTauriArgs } from "./openProjectFlow";
 
 // ─── Runtime detection ────────────────────────────────────────────────────
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
@@ -115,6 +116,8 @@ export interface ProviderInfo {
 
 export interface ProjectInfo {
   path: string; format_id: string; name: string;
+  extraction_warnings?: string[];
+  persistence_warning?: string | null;
   /** From project open; drives Inject modal mode list. */
   supported_modes?: OutputMode[];
   /** Absolute .locust.db when known (pivot / open-db). */
@@ -123,6 +126,8 @@ export interface ProjectInfo {
 
 export interface ProjectOpenResponse {
   format_id: string; format_name: string; total_strings: number;
+  extraction_warnings?: string[];
+  persistence_warning?: string | null;
   project_path: string; project_name: string; supported_modes: OutputMode[];
   /** Absolute path of the SQLite project file for this open. */
   database_path?: string;
@@ -166,6 +171,8 @@ export interface BackupEntry {
 }
 
 export interface AppConfig {
+  /** Protected startup fallback: original configuration could not be read. */
+  load_warning?: string;
   providers: Record<string, any>;
   default_provider: string | null;
   default_source_lang: string;
@@ -217,6 +224,8 @@ export interface MultiLangReport {
   languages_processed: string[];
   languages_failed: [string, string][];
   backup_id: string;
+  /** Exact backup associated with the preserved injection recording. */
+  pristine_backup_id?: string | null;
   /** Absolute backup path when direct inject created one. */
   backup_path?: string | null;
   files_modified?: number;
@@ -237,6 +246,8 @@ export type ValidationKind =
   | { ExceedsCharLimit: { limit: number; actual: number } }
   | { ExceedsBinarySlot: { encoding: string; limit: number; actual: number } }
   | "EmptyTranslation"
+  | "InvalidInjectionProvenance"
+  | "StaleTranslation"
   | "IdenticalToSource";
 
 export interface ValidationIssue {
@@ -260,6 +271,7 @@ export interface ValidationReport {
 export interface FontCoverageReport {
   font_path: string;
   font_name: string | null;
+  face_index?: number;
   total_unique_chars: number;
   /** JSON chars as single-codepoint strings */
   missing_chars: string[];
@@ -280,7 +292,42 @@ export interface ValidationResponse {
   fonts: FontCoverageReport[];
   /** Noto (etc.) families that cover missing scripts — empty when fonts are fine. */
   font_suggestions?: FontSuggestion[];
+  font_issues?: { font_path: string; message: string }[];
+  font_limitations?: string;
 }
+
+export interface InjectionStatus {
+  game_root: string;
+  pending: null | {
+    transaction_id: string;
+    phase: "preparing" | "applying" | "committed_unrecorded" | "rolling_back";
+    format: string;
+    language: string | null;
+    changed_files: number;
+    backup_path: string;
+    conflicts: { path: string; reason: string }[];
+  };
+}
+
+export interface InjectionRecoveryReport {
+  transaction_id: string | null;
+  restored: number;
+  removed: number;
+  preserved_conflicts: string[];
+  messages: string[];
+}
+
+/** Available even when an unfinished insertion prevents opening a project. */
+export const getInjectionStatus = (gamePath: string) =>
+  request<InjectionStatus>("/inject/status", {
+    method: "POST", body: JSON.stringify({ game_path: gamePath }),
+  });
+
+export const recoverInjection = (gamePath: string, transactionId: string, force = false) =>
+  request<InjectionRecoveryReport>("/inject/recover", {
+    method: "POST",
+    body: JSON.stringify({ game_path: gamePath, expected_transaction_id: transactionId, force }),
+  });
 
 /** Human label for a ValidationKind discriminant. */
 export function validationKindLabel(kind: ValidationKind): string {
@@ -296,20 +343,7 @@ export function validationKindLabel(kind: ValidationKind): string {
  *  JS strings are UTF-16 code units, so utf16le = length × 2.
  *  Shift-JIS needs a native encoder — live UI returns null; full check is Rust `validate`.
  */
-export function encodedByteLen(encoding: string, text: string): number | null {
-  switch (encoding) {
-    case "utf8":
-      return new TextEncoder().encode(text).length;
-    case "utf16le":
-      return text.length * 2;
-    case "sjis":
-    case "shift_jis":
-    case "shift-jis":
-      return null;
-    default:
-      return null;
-  }
-}
+export { encodedByteLen } from "./binaryBudget";
 
 export function binarySlotOf(entry: StringEntry): string | null {
   const v = entry.metadata?.binary_slot;
@@ -317,9 +351,10 @@ export function binarySlotOf(entry: StringEntry): string | null {
 }
 
 export interface ProgressEventStarted { type: "started"; total: number; job_id: string }
-export interface ProgressEventBatchCompleted { type: "batch_completed"; completed: number; total: number; cost_so_far: number; language: string | null }
+export interface ProgressEventBatchCompleted { type: "batch_completed"; completed: number; total: number; cost_so_far: number; cost_is_complete?: boolean; language: string | null }
 export interface ProgressEventStringTranslated { type: "string_translated"; entry_id: string; translation: string }
-export interface ProgressEventCompleted { type: "completed"; total_translated: number; total_cost: number; duration_secs: number }
+export interface ProgressEventCompleted { type: "completed"; total_translated: number; total_cost: number; cost_is_complete?: boolean; duration_secs: number }
+export interface ProgressEventBatchFailed { type: "batch_failed"; entry_id: string | null; error: string }
 export interface ProgressEventFailed { type: "failed"; entry_id: string | null; error: string }
 export interface ProgressEventProviderSwitched {
   type: "provider_switched";
@@ -333,16 +368,34 @@ export interface ProgressEventProviderSwitched {
 export const getFormats = (): Promise<PluginInfo[]> =>
   IS_TAURI ? tauriInvoke("get_formats") : request("/formats");
 
+export interface FontPatchRequest {
+  game_path: string; source_font: string; target_path: string;
+  language: string; output_path: string; base_patch?: string;
+}
+export interface FontPatchResponse {
+  output_path: string;
+  report: { coverage: FontCoverageReport; limitations: string };
+}
+export const createFontPatch = (body: FontPatchRequest): Promise<FontPatchResponse> =>
+  request("/patch/font", { method: "POST", body: JSON.stringify(body) });
+
 export const getProviders = (): Promise<ProviderInfo[]> =>
   IS_TAURI ? tauriInvoke("get_providers") : request("/providers");
 
 export const checkProviderHealth = (id: string) =>
   request<{ ok: boolean; message: string }>(`/providers/${id}/health`, { method: "POST" });
 
-export const openProject = (path: string, formatId?: string): Promise<ProjectOpenResponse> =>
+export const openProject = (
+  path: string,
+  formatId?: string,
+  preferSaved = false,
+): Promise<ProjectOpenResponse> =>
   IS_TAURI
-    ? tauriInvoke("open_project", { path, formatId })
-    : request("/project/open", { method: "POST", body: JSON.stringify({ path, format_id: formatId }) });
+    ? tauriInvoke("open_project", projectOpenTauriArgs(path, formatId, preferSaved))
+    : request("/project/open", {
+        method: "POST",
+        body: JSON.stringify(projectOpenHttpBody(path, formatId, preferSaved)),
+      });
 
 /** Reopen a .locust.db without extracting or merging (pivoted projects). */
 export const openProjectDb = (
@@ -485,14 +538,14 @@ export const deleteGlossaryEntry = (term: string, langPair: string) =>
 export const exportPo = (lang: string) => requestText(`/export/po?lang=${encodeURIComponent(lang)}`);
 export const exportXliff = (lang: string) => requestText(`/export/xliff?lang=${encodeURIComponent(lang)}`);
 export const importPo = (content: string) =>
-  request<{ imported: number }>(`/import/po`, {
+  request<ImportCounts>(`/import/po`, {
     method: "POST",
     body: content,
     headers: { "Content-Type": "text/plain" },
   });
 
 export const importXliff = (content: string) =>
-  request<{ imported: number }>(`/import/xliff`, {
+  request<ImportCounts>(`/import/xliff`, {
     method: "POST",
     body: content,
     headers: { "Content-Type": "text/plain" },
@@ -508,11 +561,16 @@ export interface ExportResult {
   bytes: number;
 }
 
-export interface ImportResult {
-  path: string;
-  format: string;
+export interface ImportCounts {
   imported: number;
   skipped: number;
+  stale_sources?: number;
+  unknown_ids?: number;
+}
+
+export interface ImportResult extends ImportCounts {
+  path: string;
+  format: string;
 }
 
 /** Save translations to a PO or XLIFF file.
@@ -560,7 +618,9 @@ export async function importTranslations(
     path: "(browser upload)",
     format,
     imported: res.imported,
-    skipped: 0,
+    skipped: res.skipped ?? 0,
+    stale_sources: res.stale_sources,
+    unknown_ids: res.unknown_ids,
   };
 }
 
@@ -579,7 +639,9 @@ export interface TranslationRun {
   tokens_used: number;
   input_tokens: number;
   output_tokens: number;
+  /** Numeric cost is the known subtotal. Missing metadata is unknown. */
   cost_usd: number;
+  cost_is_complete?: boolean;
 }
 
 /** Newest-first list of translation runs for the open project. */
@@ -589,10 +651,16 @@ export const getTranslationRuns = (): Promise<TranslationRun[]> =>
 export const getConfig = (): Promise<AppConfig> =>
   IS_TAURI ? tauriInvoke("get_config") : request("/config");
 
-export const updateConfig = (partial: Partial<AppConfig>): Promise<AppConfig> =>
-  IS_TAURI
-    ? tauriInvoke("save_config", { partial })
-    : request("/config", { method: "PATCH", body: JSON.stringify(partial) });
+export type ConfigUpdate = Omit<Partial<AppConfig>, "ui" | "load_warning"> & { ui?: Partial<AppConfig["ui"]> };
+let configWriteTail: Promise<void> = Promise.resolve();
+/** Keep rapid edits ordered even if the user switches settings sections. */
+export const updateConfig = (partial: ConfigUpdate): Promise<AppConfig> => {
+  const operation = configWriteTail.then(() => IS_TAURI
+    ? tauriInvoke<AppConfig>("save_config", { partial })
+    : request<AppConfig>("/config", { method: "PATCH", body: JSON.stringify(partial) }));
+  configWriteTail = operation.then(() => {}, () => {});
+  return operation;
+};
 
 export const getBackups = (): Promise<BackupEntry[]> =>
   IS_TAURI ? tauriInvoke("get_backups") : request("/backups");
@@ -708,6 +776,8 @@ export interface PatchPackParams {
   /** Require pristine hashes (.locust/backup or pristine_path). */
   pristine?: boolean;
   pristine_path?: string;
+  /** Exact backup returned by Direct injection; verified before packing. */
+  pristine_backup_id?: string;
 }
 
 export interface PatchPackResult {
@@ -730,14 +800,12 @@ export const patchPack = (params: PatchPackParams): Promise<PatchPackResult> =>
 
 export interface PatchRecordings {
   languages: Array<string | null>;
+  pristine_languages?: Array<string | null>;
 }
 
+// Patch operations use the shared embedded HTTP backend in desktop mode too.
 export const getPatchRecordings = (): Promise<PatchRecordings> =>
-  IS_TAURI
-    ? tauriInvoke<Array<string | null>>("list_injection_recordings").then((languages) => ({
-        languages,
-      }))
-    : request("/patch/recordings");
+  request("/patch/recordings");
 
 // ─── Translation Memory ──────────────────────────────────────────────────
 

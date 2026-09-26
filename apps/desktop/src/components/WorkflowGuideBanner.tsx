@@ -26,10 +26,10 @@ export default function WorkflowGuideBanner({
   return (
     <section
       aria-label={t("workflow.guideAria")}
-      className="flex items-center gap-4 border-b border-emerald-200 bg-emerald-50 px-4 py-2 dark:border-emerald-900 dark:bg-emerald-950/30"
+      className="relative flex flex-wrap items-center gap-2 border-b border-emerald-200 bg-emerald-50 px-4 py-2 dark:border-emerald-900 dark:bg-emerald-950/30"
     >
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-3">
+      <div className="min-w-0 w-full pr-7">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <span className="text-xs font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
             {t("workflow.title")}
           </span>
@@ -51,7 +51,7 @@ export default function WorkflowGuideBanner({
             ))}
           </ol>
         </div>
-        <p className="mt-0.5 truncate text-sm text-gray-700 dark:text-gray-300">
+        <p className="mt-0.5 text-sm text-gray-700 dark:text-gray-300">
           {content.description}
         </p>
       </div>
@@ -77,7 +77,7 @@ export default function WorkflowGuideBanner({
         onClick={onDismiss}
         aria-label={t("workflow.dismiss")}
         title={t("workflow.dismiss")}
-        className="shrink-0 rounded p-1 text-gray-500 hover:bg-emerald-100 hover:text-gray-800 dark:hover:bg-emerald-900 dark:hover:text-white"
+        className="absolute right-3 top-2 rounded p-1 text-gray-500 hover:bg-emerald-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-emerald-900 dark:hover:text-white"
       >
         <X aria-hidden="true" size={18} />
       </button>

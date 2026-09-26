@@ -5,8 +5,7 @@
 import { cancelTranslation } from "./api";
 import { t } from "./i18n";
 import {
-  formatUsdCost,
-  translationCompleteToastKey,
+  formatObservedCost,
 } from "./translationCost";
 import { shouldSubscribeToJob } from "./translationJob";
 import { JOB_STREAM_LOST_MESSAGE, subscribeToJob } from "./ws";
@@ -48,6 +47,14 @@ function discardSnapshotIfModalClosed(): void {
   if (!modalOpen) {
     useEditorStore.getState().setJobSnapshot(null);
   }
+}
+
+function finishCancelledJob(): void {
+  patchSnapshot({ cancelled: true, cancelling: false, error: null });
+  addLog("info", "Translation cancelled", undefined, "translation");
+  addToast("info", t("translate.toast.cancelled"));
+  endJob();
+  discardSnapshotIfModalClosed();
 }
 
 export function attachTranslationJob(opts: {
@@ -94,12 +101,14 @@ export function attachTranslationJob(opts: {
         completed: e.completed,
         total: e.total,
         costSoFar: e.cost_so_far,
+        costIsComplete: e.cost_is_complete === true,
       });
       useQueueStore.getState().setGlobalProgress({
         projectName: opts.projectName,
         completed: e.completed,
         total: e.total,
         costSoFar: e.cost_so_far,
+        costIsComplete: e.cost_is_complete === true,
         startedAt:
           useQueueStore.getState().globalProgress?.startedAt ?? Date.now(),
       });
@@ -124,27 +133,39 @@ export function attachTranslationJob(opts: {
         done: true,
         cancelling: false,
         completed: e.total_translated,
+        costSoFar: e.total_cost,
+        costIsComplete: e.cost_is_complete === true,
       });
       addLog(
         "info",
-        `Translation complete: ${e.total_translated} strings, $${e.total_cost?.toFixed(4) ?? "0"}`,
+        `Translation complete: ${e.total_translated} strings, ${formatObservedCost(e.total_cost, e.cost_is_complete, t)}`,
         undefined,
         "translation",
       );
       const cost = e.total_cost ?? 0;
       addToast(
         "success",
-        t(translationCompleteToastKey(cost), {
+        t("translate.toast.completeObservedCost", {
           count: e.total_translated,
-          cost: formatUsdCost(cost),
+          cost: formatObservedCost(cost, e.cost_is_complete, t),
         }),
       );
       endJob();
       discardSnapshotIfModalClosed();
     },
+    onBatchFailed: (e) => {
+      if (finished) return;
+      addLog("warning", "Translation batch failed; continuing", e.error, "translation");
+    },
     onFailed: (e) => {
       if (finished) return;
       finished = true;
+      // The server replays cancellation as this stable terminal event, also
+      // when another client requested it or the socket reconnected afterward.
+      if (e.error === "cancelled") {
+        finishCancelledJob();
+        return;
+      }
       patchSnapshot({ error: e.error, cancelling: false });
       addLog("error", `Translation failed`, e.error, "translation");
       addToast("error", t("translate.toast.failed", { error: e.error }));
@@ -155,11 +176,7 @@ export function attachTranslationJob(opts: {
       if (finished) return;
       finished = true;
       if (cancelRequested) {
-        patchSnapshot({ cancelled: true, cancelling: false });
-        addLog("info", "Translation cancelled", undefined, "translation");
-        addToast("info", t("translate.toast.cancelled"));
-        endJob();
-        discardSnapshotIfModalClosed();
+        finishCancelledJob();
         return;
       }
       const message = t(JOB_STREAM_LOST_MESSAGE);
@@ -184,13 +201,15 @@ export function clearTranslationCancelRequested(): void {
 
 export async function requestTranslationCancel(): Promise<void> {
   const jobId = useEditorStore.getState().jobId;
-  if (!jobId) return;
+  if (!jobId || jobId !== subscribedJobId || finished || cancelRequested) return;
   markTranslationCancelRequested();
   try {
     await cancelTranslation(jobId);
+    if (finished || subscribedJobId !== jobId) return;
     addLog("info", `Cancel requested for job ${jobId}`, undefined, "translation");
     addToast("info", t("translate.toast.cancelling"));
   } catch (err: unknown) {
+    if (finished || subscribedJobId !== jobId) return;
     clearTranslationCancelRequested();
     const message = err instanceof Error ? err.message : String(err);
     addToast("error", t("translate.toast.cancelFailed", { error: message }));

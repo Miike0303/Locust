@@ -240,3 +240,11 @@ assert.equal(coerceProviderId("google", undefined), "google");
 assert.equal(coerceProviderId("google", []), "google");
 
 console.log("translationDefaults.test.ts: ok");
+
+// Invalid budgets must never silently become an unlimited API run.
+const budgetForm = { providerId: "grok-sub", fallbackIds: [], sourceLang: "en", targetLang: "es",
+  batchSize: 10, maxConcurrent: 10, costLimit: "0", gameContext: "" };
+assert.equal(buildTranslationStartParams(budgetForm).options.cost_limit_usd, 0);
+for (const costLimit of ["-1", "NaN", "Infinity", "2oops", "1,5"]) {
+  assert.throws(() => buildTranslationStartParams({ ...budgetForm, costLimit }), /cost limit/);
+}

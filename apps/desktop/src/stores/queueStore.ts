@@ -21,7 +21,7 @@ export interface QueueItem {
   projectName: string;
   formatId: string | null;
   status: QueueItemStatus;
-  progress: { completed: number; total: number; costSoFar: number; startedAt: number | null };
+  progress: { completed: number; total: number; costSoFar: number; costIsComplete?: boolean; startedAt: number | null };
   error: string | null;
   /** Set after a successful validation run. Null if validation did not run. */
   validationIssues: number | null;
@@ -34,6 +34,7 @@ export interface GlobalProgress {
   completed: number;
   total: number;
   costSoFar: number;
+  costIsComplete?: boolean;
   startedAt: number | null;
   queuePosition?: number;
   queueTotal?: number;
@@ -157,6 +158,8 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           format_id: result.format_id,
           name: result.project_name,
           supported_modes: result.supported_modes,
+          database_path: result.database_path,
+          extraction_warnings: result.extraction_warnings,
         });
 
         if (get().cancelRequested) {
@@ -183,11 +186,11 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           if (get().cancelRequested) get().cancelQueue();
           // Step 3: Wait for completion
           await waitForJob(job.job_id, {
-            onProgress: (completed, total, costSoFar) => {
-              updateItem({ progress: { completed, total, costSoFar, startedAt: get().items.find((i) => i.id === item.id)?.progress.startedAt ?? null } });
+            onProgress: (completed, total, costSoFar, costIsComplete) => {
+              updateItem({ progress: { completed, total, costSoFar, costIsComplete, startedAt: get().items.find((i) => i.id === item.id)?.progress.startedAt ?? null } });
               set((s) => ({
                 globalProgress: s.globalProgress
-                  ? { ...s.globalProgress, completed, total, costSoFar }
+                  ? { ...s.globalProgress, completed, total, costSoFar, costIsComplete }
                   : null,
               }));
             },

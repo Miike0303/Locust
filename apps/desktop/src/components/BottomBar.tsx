@@ -1,3 +1,4 @@
+import { formatObservedCost } from "../lib/translationCost";
 import { useQueueStore } from "../stores/queueStore";
 import { useEditorStore } from "../stores/editorStore";
 import { Loader2 } from "lucide-react";
@@ -50,9 +51,9 @@ export default function BottomBar() {
 				{progress.completed}/{progress.total} · {percent}%
 			</span>
 
-			{progress.costSoFar > 0 && (
+			{(
 				<span className="text-gray-500 dark:text-gray-400 tabular-nums">
-					${progress.costSoFar.toFixed(4)}
+					{formatObservedCost(progress.costSoFar, progress.costIsComplete, t)}
 				</span>
 			)}
 

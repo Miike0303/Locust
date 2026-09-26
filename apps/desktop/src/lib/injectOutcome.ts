@@ -4,15 +4,39 @@
  * toast success on any non-throwing response.
  */
 
-export type InjectOutcomeKind = "success" | "partial" | "empty";
+export type InjectOutcomeKind = "success" | "partial" | "empty" | "unchanged";
 
 export type InjectLangReport = {
+  skip_reasons?: Record<string, number>;
   strings_written?: number;
   files_modified?: number;
   strings_skipped?: number;
   warnings?: string[];
   files_written?: string[];
 };
+
+/** Per-language detail avoids counting a direct report twice. Old engines
+ * retain an explicit unclassified remainder instead of guessing its cause. */
+export function collectSkipReasons(report: InjectReportLike): Array<{lang: string; reason: string; count: number}> {
+  const out: Array<{lang: string; reason: string; count: number}> = [];
+  const sources = report.reports && Object.keys(report.reports).length > 0
+    ? Object.entries(report.reports) : [["", report] as const];
+  for (const [lang, details] of sources) {
+    if (!details) continue;
+    let remaining = asNonNegIntAllowZero(details.strings_skipped);
+    for (const [reason, value] of Object.entries(details.skip_reasons ?? {})) {
+      const count = Math.min(remaining, asNonNegIntAllowZero(value));
+      if (count > 0) out.push({ lang, reason, count });
+      remaining -= count;
+    }
+    if (remaining > 0) {
+      const unclassified = out.find(row => row.lang === lang && row.reason === "unclassified");
+      if (unclassified) unclassified.count += remaining;
+      else out.push({lang, reason: "unclassified", count: remaining});
+    }
+  }
+  return out;
+}
 
 /** Serde externally-tagged RecordOutcome from core. */
 export type RecordOutcomeJson =
@@ -21,6 +45,7 @@ export type RecordOutcomeJson =
   | "NothingRecorded";
 
 export type InjectReportLike = {
+  skip_reasons?: Record<string, number>;
   languages_processed?: string[];
   languages_failed?: [string, string][] | Array<[string, string]>;
   strings_written?: number;
@@ -58,17 +83,57 @@ export function collectInjectWarnings(report: InjectReportLike): string[] {
       if (typeof w === "string" && w.trim()) out.push(w);
     }
   }
+  const topLevel = new Set(out);
   if (report.reports) {
     for (const [lang, r] of Object.entries(report.reports)) {
       if (!r || !Array.isArray(r.warnings)) continue;
       for (const w of r.warnings) {
-        if (typeof w === "string" && w.trim()) {
+        if (typeof w === "string" && w.trim() && !topLevel.has(w)) {
           out.push(`${lang}: ${w}`);
         }
       }
     }
   }
-  return out;
+  return [...new Set(out)];
+}
+
+/** Compatibility with the core's successful journal-retention diagnostic.
+ * Only this exact notice is informational; unknown diagnostics stay warnings. */
+export function injectionRecoveryPath(message: string): string | null {
+  return /^(?:[A-Za-z0-9_-]+: )?injection [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} completed; verified originals retained at (.+)$/.exec(message)?.[1] ?? null;
+}
+
+/** Exact backend notice, not a general suppression of backup diagnostics. */
+export function isRedundantBackupRemoved(message: string): boolean {
+  return /^(?:[A-Za-z0-9_-]+: )?unchanged injection: redundant new backup removed$/.test(message);
+}
+
+function isVerifiedUnchanged(report: InjectReportLike): boolean {
+  const langs = report.languages_processed ?? [];
+  if (!langs.length || new Set(langs).size !== langs.length || report.languages_failed?.length) return false;
+  if (report.strings_written !== undefined && report.strings_written !== 0) return false;
+  if (report.files_modified !== undefined && report.files_modified !== 0) return false;
+  if (collectFilesWritten(report).length) return false;
+  if (collectInjectWarnings(report).some(w => !injectionRecoveryPath(w) && !isRedundantBackupRemoved(w))) return false;
+  const details = report.reports && Object.keys(report.reports).length
+    ? report.reports : langs.length === 1 ? { [langs[0]]: report } : {};
+  if (Object.keys(details).length !== langs.length) return false;
+  let skipped = 0;
+  for (const lang of langs) {
+    const r = details[lang];
+    if (!r || r.strings_written !== 0 || r.files_modified !== 0) return false;
+    const count = r.strings_skipped;
+    if (typeof count !== "number" || !Number.isSafeInteger(count) || count <= 0) return false;
+    if (r.skip_reasons?.unchanged !== count) return false;
+    if (Object.entries(r.skip_reasons).some(([reason, n]) => reason !== "unchanged" && n !== 0)) return false;
+    skipped += count;
+  }
+  if (report.strings_skipped !== undefined && report.strings_skipped !== skipped) return false;
+  if (report.outcomes && (report.outcomes.length !== langs.length ||
+    new Set(report.outcomes.map(([lang]) => lang)).size !== langs.length ||
+    report.outcomes.some(([lang, outcome]) => !langs.includes(lang) ||
+      !(isNothingRecorded(outcome) || isKeptPrevious(outcome))))) return false;
+  return true;
 }
 
 export function collectFilesWritten(report: InjectReportLike): string[] {
@@ -125,6 +190,7 @@ export function outcomeRecordingIssues(
 
 /**
  * - empty: nothing useful written (all failed, or zero strings across the run)
+ * - unchanged: explicit, complete evidence that every candidate already matches
  * - partial: some languages failed, or recording kept/nothing while some text landed
  * - success: at least one string written and no language failures
  */
@@ -142,17 +208,21 @@ export function classifyInjectReport(report: InjectReportLike): InjectOutcomeKin
   if (processed === 0 && failed > 0) return "empty";
   if (written === 0) {
     if (failed > 0 && processed > 0) return "partial";
+    if (isVerifiedUnchanged(report)) return "unchanged";
     return "empty";
   }
   if (failed > 0) return "partial";
   if (hasRecordingIssue) return "partial";
+  if (collectSkipReasons(report).some(r => !["unchanged", "duplicate", "untranslated"].includes(r.reason))) return "partial";
   return "success";
 }
 
-export type ToastLevel = "success" | "warning" | "error";
+export type ToastLevel = "success" | "warning" | "error" | "info";
 
 export function injectToastLevel(kind: InjectOutcomeKind): ToastLevel {
   switch (kind) {
+    case "unchanged":
+      return "info";
     case "success":
       return "success";
     case "partial":
@@ -164,7 +234,7 @@ export function injectToastLevel(kind: InjectOutcomeKind): ToastLevel {
 
 /** Pack CTA only when direct inject actually recorded usable work. */
 export function shouldOfferPackAfterInject(report: InjectReportLike): boolean {
-  if (classifyInjectReport(report) === "empty") return false;
+  if (sumStringsWritten(report) === 0 || classifyInjectReport(report) === "empty") return false;
   const issues = outcomeRecordingIssues(report);
   if (issues.length === 0) return true;
   // All keys nothing-recorded → packing will refuse.

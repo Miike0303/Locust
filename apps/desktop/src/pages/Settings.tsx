@@ -1,3 +1,4 @@
+import { formatObservedCost } from "../lib/translationCost";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -10,7 +11,7 @@ import {
   getTranslationRuns,
   xaiAuthStart, xaiAuthPoll,
 } from "../lib/api";
-import type { GlossaryEntry, TranslationRun, ProviderInfo } from "../lib/api";
+import type { GlossaryEntry, TranslationRun, ProviderInfo, ConfigUpdate } from "../lib/api";
 import { applyAppearance, clampTableRowHeight, TABLE_ROW_HEIGHT_MAX, TABLE_ROW_HEIGHT_MIN } from "../lib/appearance";
 import { resolveProviderReadiness } from "../lib/providerReadiness";
 import {
@@ -28,6 +29,7 @@ import {
 } from "../lib/settingsNav";
 import { useT, useLocale, type Locale, type TranslateFn } from "../lib/i18n";
 import ConfirmDialog from "../components/ConfirmDialog";
+import BufferedSetting from "../components/BufferedSetting";
 import { addToast } from "../stores/toastStore";
 
 export default function Settings() {
@@ -133,10 +135,11 @@ function HistorySection() {
         acc.input += r.input_tokens;
         acc.output += r.output_tokens;
         acc.cost += r.cost_usd;
+        acc.complete &&= r.cost_is_complete === true;
         acc.secs += r.duration_secs;
         return acc;
       },
-      { strings: 0, tokens: 0, input: 0, output: 0, cost: 0, secs: 0 }
+      { strings: 0, tokens: 0, input: 0, output: 0, cost: 0, secs: 0, complete: true }
     );
   }, [runs]);
 
@@ -145,7 +148,7 @@ function HistorySection() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 className="text-xl font-bold">{t("settings.history.title")}</h2>
-          <p className="text-sm text-gray-500 mt-1">
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
             {t("settings.history.description")}
           </p>
         </div>
@@ -159,7 +162,7 @@ function HistorySection() {
       </div>
 
       {isLoading && (
-        <div className="flex items-center gap-2 text-sm text-gray-500">
+        <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
           <Loader size={16} className="animate-spin" /> {t("settings.history.loading")}
         </div>
       )}
@@ -173,7 +176,7 @@ function HistorySection() {
       )}
 
       {!isLoading && !isError && (runs?.length ?? 0) === 0 && (
-        <div className="border border-dashed border-gray-300 dark:border-gray-600 rounded-lg p-8 text-center text-sm text-gray-500">
+        <div className="border border-dashed border-gray-300 dark:border-gray-600 rounded-lg p-8 text-center text-sm text-gray-500 dark:text-gray-400">
           {t("settings.history.empty")}
         </div>
       )}
@@ -182,7 +185,7 @@ function HistorySection() {
         <div className="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
           <table className="w-full text-sm">
             <thead>
-              <tr className="bg-gray-50 dark:bg-gray-800/80 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+              <tr className="bg-gray-50 dark:bg-gray-800/80 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide">
                 <th className="px-3 py-2">{t("settings.history.col.date")}</th>
                 <th className="px-3 py-2">{t("settings.history.col.provider")}</th>
                 <th className="px-3 py-2">{t("settings.history.col.langs")}</th>
@@ -208,14 +211,14 @@ function HistorySection() {
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">{r.strings_translated}</td>
                   <td className="px-3 py-2 text-right tabular-nums">{r.tokens_used}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                  <td className="px-3 py-2 text-right tabular-nums text-gray-500 dark:text-gray-400">
                     {r.input_tokens}
                   </td>
-                  <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                  <td className="px-3 py-2 text-right tabular-nums text-gray-500 dark:text-gray-400">
                     {r.output_tokens}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">
-                    {r.cost_usd.toFixed(4)}
+                    {formatObservedCost(r.cost_usd, r.cost_is_complete, t)}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums whitespace-nowrap">
                     {formatDuration(r.duration_secs, t)}
@@ -230,14 +233,14 @@ function HistorySection() {
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums">{totals.strings}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{totals.tokens}</td>
-                <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500 dark:text-gray-400">
                   {totals.input}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums text-gray-500">
+                <td className="px-3 py-2 text-right tabular-nums text-gray-500 dark:text-gray-400">
                   {totals.output}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums">
-                  {totals.cost.toFixed(4)}
+                  {formatObservedCost(totals.cost, totals.complete, t)}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums whitespace-nowrap">
                   {formatDuration(totals.secs, t)}
@@ -264,11 +267,15 @@ async function openExternalUrl(url: string): Promise<void> {
 
 function GrokSubCard({
   provider,
+  model,
+  onModelChange,
   onTest,
   testing,
   testResult,
 }: {
   provider?: ProviderInfo;
+  model?: string;
+  onModelChange: (model: string) => void;
   onTest: () => void;
   testing: boolean;
   testResult?: { ok: boolean; message: string };
@@ -390,13 +397,19 @@ function GrokSubCard({
           {ready ? t("settings.providers.signedIn") : t("settings.providers.needsSignIn")}
         </span>
       </div>
-      <p className="text-sm text-gray-500 mb-3">
+      <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
         {t("settings.providers.grokSubHint")}
       </p>
+      <label className="block mb-3 text-sm text-gray-600 dark:text-gray-300">
+        {t("settings.providers.model")}
+        <input key={model ?? "default"} defaultValue={model || "grok-4.6"}
+          onBlur={(e) => { const value = e.target.value.trim(); if (value && value !== (model || "grok-4.6")) onModelChange(value); }}
+          className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
+      </label>
 
       {phase === "pending" && session && (
         <div className="mb-3 p-3 rounded border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 space-y-2">
-          <div className="text-xs font-medium text-gray-500 uppercase">
+          <div className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">
             {t("settings.providers.userCode")}
           </div>
           <div className="flex items-center gap-2">
@@ -420,7 +433,7 @@ function GrokSubCard({
             <ExternalLink size={14} />
             {t("settings.providers.openVerification")}
           </button>
-          <p className="text-xs text-gray-500">
+          <p className="text-xs text-gray-500 dark:text-gray-400">
             {t("settings.providers.waitingApproval")}
           </p>
         </div>
@@ -470,11 +483,28 @@ function GrokSubCard({
   );
 }
 
+function useSettingsSave() {
+  const t = useT();
+  const qc = useQueryClient();
+  return async (partial: ConfigUpdate) => {
+    try {
+      const saved = await updateConfig(partial);
+      qc.setQueryData(["config"], saved);
+      applyAppearance(saved.ui);
+      if (partial.providers) void qc.invalidateQueries({ queryKey: ["providers"] });
+      return saved;
+    } catch (error) {
+      addToast("error", t("settings.saveFailed", { error: error instanceof Error ? error.message : String(error) }));
+      return null;
+    }
+  };
+}
+
 function ProvidersSection() {
   const t = useT();
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders });
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
-  const qc = useQueryClient();
+  const saveSettings = useSettingsSave();
   const [testing, setTesting] = useState<Record<string, boolean>>({});
   const [results, setResults] = useState<Record<string, { ok: boolean; message: string }>>({});
 
@@ -490,9 +520,7 @@ function ProvidersSection() {
   };
 
   const saveKey = async (providerId: string, key: string, value: string) => {
-    const providers = { ...config?.providers, [providerId]: { ...config?.providers?.[providerId], [key]: value } };
-    await updateConfig({ providers } as any);
-    qc.invalidateQueries({ queryKey: ["config"] });
+    await saveSettings({ providers: { [providerId]: { [key]: value } } });
   };
 
   const grokSub = providers?.find((p) => p.id === GROK_SUB_PROVIDER_ID);
@@ -500,7 +528,7 @@ function ProvidersSection() {
   return (
     <div className="space-y-4">
       <h2 className="text-xl font-bold">{t("settings.providers.title")}</h2>
-      <GrokSubCard provider={grokSub} onTest={() => handleTest(GROK_SUB_PROVIDER_ID)} testing={!!testing[GROK_SUB_PROVIDER_ID]} testResult={results[GROK_SUB_PROVIDER_ID]} />
+      <GrokSubCard provider={grokSub} model={config?.providers?.[GROK_SUB_PROVIDER_ID]?.model} onModelChange={(model) => void saveKey(GROK_SUB_PROVIDER_ID, "model", model)} onTest={() => handleTest(GROK_SUB_PROVIDER_ID)} testing={!!testing[GROK_SUB_PROVIDER_ID]} testResult={results[GROK_SUB_PROVIDER_ID]} />
       {providers?.filter((p) => p.id !== GROK_SUB_PROVIDER_ID).map((p) => {
         const readiness = resolveProviderReadiness(p.id, providers, config);
         return (
@@ -557,6 +585,15 @@ function ProvidersSection() {
             </div>
           )}
 
+          {p.id === "grok" && (
+            <label className="block mb-3 text-sm text-gray-600 dark:text-gray-300">
+              {t("settings.providers.model")}
+              <input key={config?.providers?.[p.id]?.model ?? "default"}
+                defaultValue={config?.providers?.[p.id]?.model || "grok-4.6"}
+                onBlur={(e) => { const value = e.target.value.trim(); if (value && value !== (config?.providers?.[p.id]?.model || "grok-4.6")) void saveKey(p.id, "model", value); }}
+                className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
+            </label>
+          )}
           {(p.id === "openai" || p.id === "claude") && (
             <div className="mb-3">
               <label className="text-sm text-gray-600">{t("settings.providers.model")}</label>
@@ -602,11 +639,10 @@ function DefaultsSection() {
   const t = useT();
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
   const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders });
-  const qc = useQueryClient();
+  const saveSettings = useSettingsSave();
 
   const save = async (key: string, value: any) => {
-    await updateConfig({ [key]: value } as any);
-    qc.invalidateQueries({ queryKey: ["config"] });
+    return Boolean(await saveSettings({ [key]: value }));
   };
 
   if (!config) return null;
@@ -622,32 +658,13 @@ function DefaultsSection() {
           {providers?.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select>
       </div>
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="text-sm font-medium">{t("settings.defaults.sourceLang")}</label>
-          <input value={config.default_source_lang} onChange={(e) => save("default_source_lang", e.target.value)}
-            className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
-        </div>
-        <div>
-          <label className="text-sm font-medium">{t("settings.defaults.targetLang")}</label>
-          <input value={config.default_target_lang} onChange={(e) => save("default_target_lang", e.target.value)}
-            className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
-        </div>
+      <div className="grid grid-cols-2 gap-4 [&_label]:block [&_label]:min-h-10">
+        <BufferedSetting label={t("settings.defaults.sourceLang")} value={config.default_source_lang} required normalize={value => value.trim()} onSave={value => save("default_source_lang", value)} />
+        <BufferedSetting label={t("settings.defaults.targetLang")} value={config.default_target_lang} required normalize={value => value.trim()} onSave={value => save("default_target_lang", value)} />
       </div>
-      <p className="text-xs text-gray-500 -mt-2">{t("settings.defaults.langHint")}</p>
-      <div>
-        <label className="text-sm font-medium">{t("settings.defaults.batchSize", { size: config.default_batch_size })}</label>
-        <input type="range" min={10} max={100} value={config.default_batch_size}
-          onChange={(e) => save("default_batch_size", +e.target.value)}
-          className="mt-1 w-full" />
-      </div>
-      <div>
-        <label className="text-sm font-medium">{t("settings.defaults.costLimit")}</label>
-        <input type="number" step="0.01" value={config.default_cost_limit ?? ""}
-          onChange={(e) => save("default_cost_limit", e.target.value ? +e.target.value : null)}
-          placeholder={t("settings.defaults.noLimit")}
-          className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
-      </div>
+      <p className="text-xs text-gray-500 dark:text-gray-400 -mt-2">{t("settings.defaults.langHint")}</p>
+      <BufferedSetting label={value => t("settings.defaults.batchSize", { size: value })} type="range" min={10} max={100} value={config.default_batch_size} onSave={value => save("default_batch_size", Number(value))} />
+      <BufferedSetting label={t("settings.defaults.costLimit")} type="number" min={0} step={0.01} value={config.default_cost_limit ?? ""} placeholder={t("settings.defaults.noLimit")} onSave={value => save("default_cost_limit", value ? Number(value) : null)} />
     </div>
   );
 }
@@ -656,32 +673,22 @@ function AppearanceSection() {
   const t = useT();
   const { locale, setLocale } = useLocale();
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
-  const qc = useQueryClient();
+  const saveSettings = useSettingsSave();
 
   const setTheme = async (theme: string) => {
-    const ui = { ...config?.ui, theme };
-    await updateConfig({ ui } as any);
-    qc.invalidateQueries({ queryKey: ["config"] });
-    applyAppearance(ui);
+    await saveSettings({ ui: { theme } });
   };
 
   const setFontSize = async (size: number) => {
-    const ui = { ...config?.ui, font_size: size };
-    await updateConfig({ ui } as any);
-    qc.invalidateQueries({ queryKey: ["config"] });
-    applyAppearance(ui);
+    return Boolean(await saveSettings({ ui: { font_size: size } }));
   };
 
   const setShowSourceColumn = async (show: boolean) => {
-    const ui = { ...config?.ui, show_source_column: show };
-    await updateConfig({ ui } as any);
-    qc.invalidateQueries({ queryKey: ["config"] });
+    await saveSettings({ ui: { show_source_column: show } });
   };
 
   const setTableRowHeight = async (height: number) => {
-    const ui = { ...config?.ui, table_row_height: height };
-    await updateConfig({ ui } as any);
-    qc.invalidateQueries({ queryKey: ["config"] });
+    return Boolean(await saveSettings({ ui: { table_row_height: height } }));
   };
 
   if (!config) return null;
@@ -706,12 +713,7 @@ function AppearanceSection() {
           ))}
         </div>
       </div>
-      <div>
-        <label className="text-sm font-medium">{t("settings.appearance.fontSize", { size: config.ui.font_size })}</label>
-        <input type="range" min={12} max={18} value={config.ui.font_size}
-          onChange={(e) => setFontSize(+e.target.value)}
-          className="mt-1 w-full" />
-      </div>
+      <BufferedSetting label={value => t("settings.appearance.fontSize", { size: value })} type="range" min={12} max={18} value={config.ui.font_size} onSave={value => setFontSize(Number(value))} />
       <label className="flex items-start gap-2 cursor-pointer">
         <input
           type="checkbox"
@@ -721,26 +723,14 @@ function AppearanceSection() {
         />
         <span>
           <span className="text-sm font-medium">{t("settings.appearance.showSourceColumn")}</span>
-          <span className="block text-xs text-gray-500 mt-0.5">
+          <span className="block text-xs text-gray-500 dark:text-gray-400 mt-0.5">
             {t("settings.appearance.showSourceColumnHint")}
           </span>
         </span>
       </label>
       <div>
-        <label className="text-sm font-medium">
-          {t("settings.appearance.tableRowHeight", {
-            size: clampTableRowHeight(config.ui.table_row_height),
-          })}
-        </label>
-        <input
-          type="range"
-          min={TABLE_ROW_HEIGHT_MIN}
-          max={TABLE_ROW_HEIGHT_MAX}
-          value={clampTableRowHeight(config.ui.table_row_height)}
-          onChange={(e) => setTableRowHeight(+e.target.value)}
-          className="mt-1 w-full"
-        />
-        <p className="text-xs text-gray-500 mt-0.5">
+        <BufferedSetting label={value => t("settings.appearance.tableRowHeight", { size: value })} type="range" min={TABLE_ROW_HEIGHT_MIN} max={TABLE_ROW_HEIGHT_MAX} value={clampTableRowHeight(config.ui.table_row_height)} onSave={value => setTableRowHeight(Number(value))} />
+        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
           {t("settings.appearance.tableRowHeightHint")}
         </p>
       </div>
@@ -842,7 +832,7 @@ function GlossarySection() {
   return (
     <div className="space-y-6 max-w-3xl">
       <h2 className="text-xl font-bold">{t("settings.glossary.title")}</h2>
-      <p className="text-sm text-gray-500">
+      <p className="text-sm text-gray-500 dark:text-gray-400">
         {t("settings.glossary.description")}
       </p>
 
@@ -871,7 +861,7 @@ function GlossarySection() {
       </div>
 
       <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 space-y-3">
-        <h3 className="text-sm font-semibold text-gray-500 uppercase">{t("settings.glossary.addEntry")}</h3>
+        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase">{t("settings.glossary.addEntry")}</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
             <label className="text-sm text-gray-600">{t("settings.glossary.term")}</label>
@@ -904,15 +894,15 @@ function GlossarySection() {
       </div>
 
       <div>
-        <h3 className="text-sm font-semibold text-gray-500 uppercase mb-2">
+        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase mb-2">
           {entries ? t("settings.glossary.entries", { count: filtered.length }) : t("settings.glossary.entriesBare")}
         </h3>
         {isLoading ? (
-          <p className="text-sm text-gray-500 flex items-center gap-2">
+          <p className="text-sm text-gray-500 dark:text-gray-400 flex items-center gap-2">
             <Loader size={14} className="animate-spin" /> {t("common.loading")}
           </p>
         ) : filtered.length === 0 ? (
-          <p className="text-sm text-gray-500">
+          <p className="text-sm text-gray-500 dark:text-gray-400">
             {filter
               ? t("settings.glossary.emptyFilter")
               : t("settings.glossary.empty")}
@@ -920,7 +910,7 @@ function GlossarySection() {
         ) : (
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-gray-500 text-xs uppercase">
+              <tr className="text-left text-gray-500 dark:text-gray-400 text-xs uppercase">
                 <th className="pb-2">{t("settings.glossary.col.term")}</th>
                 <th className="pb-2">{t("settings.glossary.col.translation")}</th>
                 <th className="pb-2 w-24">{t("settings.glossary.col.pair")}</th>
@@ -1004,13 +994,13 @@ function DataSection() {
     <div className="space-y-6">
       <h2 className="text-xl font-bold">{t("settings.data.title")}</h2>
       <div>
-        <h3 className="text-sm font-semibold text-gray-500 uppercase mb-2">{t("settings.data.backups")}</h3>
+        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase mb-2">{t("settings.data.backups")}</h3>
         {(!backups || backups.length === 0) ? (
-          <p className="text-sm text-gray-500">{t("settings.data.noBackups")}</p>
+          <p className="text-sm text-gray-500 dark:text-gray-400">{t("settings.data.noBackups")}</p>
         ) : (
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-gray-500">
+              <tr className="text-left text-gray-500 dark:text-gray-400">
                 <th className="pb-2">{t("settings.data.col.game")}</th>
                 <th className="pb-2">{t("settings.data.col.id")}</th>
                 <th className="pb-2">{t("settings.data.col.created")}</th>
@@ -1027,7 +1017,7 @@ function DataSection() {
                     <td className="py-2" title={b.source_path || undefined}>
                       <div className="font-medium break-words">{game}</div>
                       {b.source_path ? (
-                        <div className="text-xs text-gray-500 break-all">{b.source_path}</div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400 break-all">{b.source_path}</div>
                       ) : null}
                     </td>
                     <td className="py-2 font-mono text-xs">{b.id}</td>

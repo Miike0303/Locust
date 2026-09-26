@@ -107,9 +107,11 @@ export function buildTranslationStartParams(form: TranslationStartForm): {
     skip_approved: boolean;
   };
 } {
-  const parsedCost = form.costLimit.trim() === "" ? NaN : Number.parseFloat(form.costLimit);
-  const cost_limit_usd =
-    Number.isFinite(parsedCost) && parsedCost > 0 ? parsedCost : null;
+  const rawCost = form.costLimit.trim();
+  const cost_limit_usd = rawCost === "" ? null : Number(rawCost);
+  if (cost_limit_usd !== null && (!Number.isFinite(cost_limit_usd) || cost_limit_usd < 0)) {
+    throw new Error("cost limit must be finite and non-negative");
+  }
   const max_concurrent = Math.max(1, validBatch(form.maxConcurrent) ?? 1);
   const batch_size = Math.max(1, validBatch(form.batchSize) ?? 40);
   const fallbacks = form.fallbackIds.filter(

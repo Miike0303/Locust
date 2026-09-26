@@ -34,3 +34,13 @@ assert.equal(editorStatsKey(0), "editor.stats");
 assert.equal(editorStatsKey(2), "editor.statsWithCost");
 
 console.log("translationCost.test.ts: ok");
+
+// Missing legacy metadata is unknown; a known subtotal is explicitly partial.
+import { formatObservedCost } from "./translationCost";
+import type { TranslateFn } from "./i18n";
+const costLabels = ((key: string, params?: Record<string, unknown>) =>
+    key === "cost.partial" ? `partial:${params?.cost}` : "unknown") as TranslateFn;
+assert.equal(formatObservedCost(0, undefined, costLabels), "unknown");
+assert.equal(formatObservedCost(0, false, costLabels), "unknown");
+assert.equal(formatObservedCost(0.25, false, costLabels), "partial:0.2500");
+assert.equal(formatObservedCost(0, true, costLabels), "$0.0000");

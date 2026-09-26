@@ -14,12 +14,34 @@ export function projectFromOpenResponse(result: ProjectOpenResponse): ProjectInf
     name: result.project_name,
     supported_modes: result.supported_modes,
     database_path: result.database_path || undefined,
+    extraction_warnings: result.extraction_warnings ?? [],
+    persistence_warning: result.persistence_warning,
   };
 }
 
 /** Prefer open-db when a recent entry (or picker) names a project database. */
 export function shouldOpenProjectDb(databasePath: string | null | undefined): boolean {
   return typeof databasePath === "string" && /\.locust\.db$/i.test(databasePath.trim());
+}
+
+export function projectOpenHttpBody(
+  path: string,
+  formatId?: string,
+  preferSaved = false,
+): { path: string; format_id?: string; prefer_saved?: true } {
+  return preferSaved
+    ? { path, format_id: formatId, prefer_saved: true }
+    : { path, format_id: formatId };
+}
+
+export function projectOpenTauriArgs(
+  path: string,
+  formatId?: string,
+  preferSaved = false,
+): { path: string; formatId?: string; preferSaved?: true } {
+  return preferSaved
+    ? { path, formatId, preferSaved: true }
+    : { path, formatId };
 }
 
 /** Ready to call open-db: real .locust.db, non-empty game folder, concrete format (not auto). */
@@ -98,9 +120,10 @@ export async function completeOpenProject(
     setProject: (p: ProjectInfo) => void;
     queryClient: QueryClient;
   },
+  preferSaved = false,
 ): Promise<ProjectOpenResponse> {
   const { openProject } = await import("./api");
-  const result = await openProject(path, formatId);
+  const result = await openProject(path, formatId, preferSaved);
   deps.setProject(projectFromOpenResponse(result));
   dropProjectQueries(deps.queryClient);
   return result;

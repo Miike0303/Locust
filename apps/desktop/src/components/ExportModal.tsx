@@ -5,6 +5,7 @@ import {
 	exportTranslations,
 	importTranslations,
 	type ExportFormat,
+	type ImportResult,
 } from "../lib/api";
 import { LANGUAGES } from "../lib/languages";
 import { useProjectStore } from "../stores/projectStore";
@@ -89,27 +90,23 @@ export default function ExportModal({
 		}
 	};
 
+	const reportImport = (result: ImportResult, name: string) => {
+		const message = result.skipped
+			? t("export.toast.importedSkipped", { count: result.imported, skipped: result.skipped })
+			: t("export.toast.imported", { count: result.imported });
+		const stale = result.stale_sources ? ` ${t("export.toast.staleSources", { count: result.stale_sources })}` : "";
+		addToast(result.skipped ? "warning" : "success", message + stale);
+		addLog(result.skipped ? "warning" : "info",
+			`Import ${format}: ${result.imported} applied, ${result.skipped} skipped, ${result.stale_sources ?? 0} outdated sources`, name, "import");
+		onImported?.();
+		onClose();
+	};
+
 	const runImportFromPath = async (path: string) => {
 		setLoading(true);
 		try {
 			const result = await importTranslations(format, path);
-			addToast(
-				"success",
-				result.skipped
-					? t("export.toast.importedSkipped", {
-							count: result.imported,
-							skipped: result.skipped,
-						})
-					: t("export.toast.imported", { count: result.imported }),
-			);
-			addLog(
-				"info",
-				`Import ${format}: ${result.imported} applied, ${result.skipped} skipped`,
-				result.path,
-				"import",
-			);
-			onImported?.();
-			onClose();
+			reportImport(result, result.path);
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addToast("error", t("export.toast.importFailed", { error: msg }));
@@ -144,15 +141,7 @@ export default function ExportModal({
 		setLoading(true);
 		try {
 			const result = await importTranslations(format, text);
-			addToast("success", t("export.toast.imported", { count: result.imported }));
-			addLog(
-				"info",
-				`Import ${format}: ${result.imported} applied`,
-				file.name,
-				"import",
-			);
-			onImported?.();
-			onClose();
+			reportImport(result, file.name);
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addToast("error", t("export.toast.importFailed", { error: msg }));

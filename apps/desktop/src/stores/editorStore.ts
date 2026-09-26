@@ -6,6 +6,7 @@ export interface TranslationJobSnapshot {
   completed: number;
   total: number;
   costSoFar: number;
+  costIsComplete?: boolean;
   lastTranslated: string;
   activeProviderLabel: string;
   error: string | null;

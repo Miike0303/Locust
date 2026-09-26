@@ -7,6 +7,8 @@ import {
   isDetectionFailure,
   openDbCanConfirm,
   projectFromOpenResponse,
+  projectOpenHttpBody,
+  projectOpenTauriArgs,
   shouldOpenProjectDb,
 } from "./openProjectFlow.ts";
 
@@ -63,5 +65,30 @@ assert.ok(openDbCanConfirm("/x/a.locust.db", "/games/title", "renpy"));
 assert.equal(openDbCanConfirm("/x/a.locust.db", "/games/title", "auto"), false);
 assert.equal(openDbCanConfirm("/x/a.locust.db", "  ", "renpy"), false);
 assert.equal(openDbCanConfirm("/games/title", "/games/title", "renpy"), false);
+
+const folderBody = projectOpenHttpBody("C:\\Games\\Title", "html-game");
+assert.equal(folderBody.path, "C:\\Games\\Title");
+assert.equal(folderBody.format_id, "html-game");
+assert.equal("prefer_saved" in folderBody, false, "explicit folder must not prefer saved DB");
+assert.equal(
+  JSON.stringify(folderBody).includes("prefer_saved"),
+  false,
+);
+
+const recentBody = projectOpenHttpBody("C:\\Games\\Title", "html-game", true);
+assert.equal(recentBody.prefer_saved, true);
+assert.equal(JSON.parse(JSON.stringify(recentBody)).prefer_saved, true);
+
+const omittedFormat = projectOpenHttpBody("C:\\Games\\Title", undefined, true);
+assert.equal(omittedFormat.prefer_saved, true);
+assert.equal(
+  Object.prototype.hasOwnProperty.call(JSON.parse(JSON.stringify(omittedFormat)), "format_id"),
+  false,
+);
+
+const folderTauri = projectOpenTauriArgs("C:\\Games\\Title", "html-game");
+assert.equal("preferSaved" in folderTauri, false, "Ctrl+O / Open Folder omit preferSaved");
+const recentTauri = projectOpenTauriArgs("C:\\Games\\Title", "html-game", true);
+assert.equal(recentTauri.preferSaved, true);
 
 console.log("openProjectFlow.test.ts: ok");

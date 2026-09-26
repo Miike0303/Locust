@@ -1,15 +1,16 @@
-import { useEffect } from "react";
+import { lazy, useEffect } from "react";
 import { Routes, Route } from "react-router-dom";
 import Layout from "./components/Layout";
-import Welcome from "./pages/Welcome";
-import Editor from "./pages/Editor";
-import Settings from "./pages/Settings";
-import Review from "./pages/Review";
-import TranslationMemory from "./pages/TranslationMemory";
 import UpdateChecker from "./components/UpdateChecker";
 import { getConfig, getCurrentProject } from "./lib/api";
 import { applyAppearance } from "./lib/appearance";
 import { useProjectStore } from "./stores/projectStore";
+
+const Welcome = lazy(() => import("./pages/Welcome"));
+const Editor = lazy(() => import("./pages/Editor"));
+const Settings = lazy(() => import("./pages/Settings"));
+const Review = lazy(() => import("./pages/Review"));
+const TranslationMemory = lazy(() => import("./pages/TranslationMemory"));
 
 export default function App() {
   // Boot-time restore: apply persisted appearance and reattach the project

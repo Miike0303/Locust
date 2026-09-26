@@ -1,3 +1,5 @@
+import { addToast } from "../stores/toastStore";
+import { localizeApiError } from "../lib/apiError";
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -263,7 +265,12 @@ export default function QueuePanel() {
 		});
 
 	const handleStart = () => {
-		const params = buildParams();
+        let params: TranslationStartParams;
+        try { params = buildParams(); }
+        catch (error) {
+            addToast("error", localizeApiError(error instanceof Error ? error.message : String(error)));
+            return;
+        }
 		saveLastUsedTranslationPrefs({
 			provider: providerId,
 			source: sourceLang,

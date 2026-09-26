@@ -1,3 +1,5 @@
+import { localizeApiError } from "../lib/apiError";
+import { formatObservedCost } from "../lib/translationCost";
 import { useState, useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -232,8 +234,8 @@ export default function TranslationModal({
 				err.stack ?? String(err),
 				"translation",
 			);
-			addToast("error", t("translate.toast.startFailed", { error: err.message ?? err }));
-			setStartError(err.message ?? String(err));
+			addToast("error", t("translate.toast.startFailed", { error: localizeApiError(err.message ?? String(err)) }));
+			setStartError(localizeApiError(err.message ?? String(err)));
 		}
 	};
 
@@ -506,6 +508,12 @@ export default function TranslationModal({
 								{t("translate.useMemory")}
 							</label>
 						</div>
+                        {(providerId === "grok" || providerId === "grok-sub") && (
+                            <button type="button" className="text-sm text-emerald-700 dark:text-emerald-400 underline"
+                                onClick={() => { setBatchSize(10); setMaxConcurrent(10); }}>
+                                {t("translate.grokThroughputPreset")}
+                            </button>
+                        )}
 						<div className="grid grid-cols-3 gap-3">
 							<div>
 								<label className="text-sm font-medium">{t("translate.batchSize")}</label>
@@ -578,7 +586,7 @@ export default function TranslationModal({
 								: cancelled
 									? t("translate.cancelled")
 									: `${completed} / ${total}`}
-							{costSoFar > 0 && ` · $${costSoFar.toFixed(4)}`}
+							{` · ${formatObservedCost(costSoFar, jobSnapshot?.costIsComplete, t)}`}
 						</div>
 						{activeProviderLabel && !done && !cancelled && !error && (
 							<div className="text-xs text-center text-emerald-700 dark:text-emerald-400">

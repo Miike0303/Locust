@@ -4,7 +4,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use locust_core::config::AppConfig;
 use locust_core::database::{EntryFilter, GlossaryEntry, PivotResult, ProjectStats, StringFacets};
 use locust_core::extraction::PluginInfo;
 use locust_core::models::{OutputMode, StringEntry, StringStatus};
@@ -12,9 +11,10 @@ use locust_core::project;
 use locust_core::translation::TranslationOptions;
 use locust_core::validation::Validator;
 use locust_server::{
-    active_translation_job, poll_xai_device_login, spawn_translation_job, start_xai_device_login,
-    AppState, ProjectExclusiveGuard, ProjectInfo, XaiAuthPollResponse, XaiAuthStartResponse,
-    INJECT_EMPTY_LANGUAGES_MESSAGE, PROJECT_BUSY_MESSAGE, TRANSLATION_IN_FLIGHT_MESSAGE,
+    cancel_translation_job, poll_xai_device_login, remember_open_project,
+    run_owned_project_operation, spawn_translation_job, start_xai_device_login,
+    try_project_operation, update_app_config, AppState, ProjectInfo, XaiAuthPollResponse,
+    XaiAuthStartResponse, INJECT_EMPTY_LANGUAGES_MESSAGE,
 };
 
 /// Wrapper so we can use Arc<AppState> as Tauri managed state
@@ -46,122 +46,123 @@ pub struct ProjectOpenResponse {
     pub stale_source_reset: usize,
     pub removed: usize,
     pub preserved_translations: usize,
+    pub extraction_warnings: Vec<String>,
+    pub persistence_warning: Option<String>,
 }
 
 #[tauri::command]
 pub async fn open_project(
     path: String,
     format_id: Option<String>,
+    prefer_saved: Option<bool>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<ProjectOpenResponse, String> {
-    let s = &state.0;
-    if active_translation_job(s).is_some() {
-        return Err(TRANSLATION_IN_FLIGHT_MESSAGE.to_string());
-    }
-    if s.project_exclusive
-        .load(std::sync::atomic::Ordering::SeqCst)
-        > 0
-    {
-        return Err(PROJECT_BUSY_MESSAGE.to_string());
-    }
-    let raw_path = PathBuf::from(&path);
-    let outcome = project::open_project(&s.db, &s.format_registry, &raw_path, format_id.as_deref())
+    apply_open_project(&state.0, path, format_id, prefer_saved.unwrap_or(false)).await
+}
+
+async fn apply_open_project(
+    s: &Arc<AppState>,
+    path: String,
+    format_id: Option<String>,
+    prefer_saved: bool,
+) -> Result<ProjectOpenResponse, String> {
+    let s = s.clone();
+    let exclusive = try_project_operation(&s)?;
+    run_owned_project_operation(exclusive, async move {
+        let raw_path = PathBuf::from(&path);
+        let outcome = if prefer_saved {
+            project::open_recent_project(&s.db, &s.format_registry, &raw_path, format_id.as_deref())
+        } else {
+            project::open_project(&s.db, &s.format_registry, &raw_path, format_id.as_deref())
+        }
         .map_err(|e| e.to_string())?;
 
-    {
-        let mut proj = s.current_project.write().await;
-        *proj = Some(ProjectInfo {
-            path: outcome.project_path.clone(),
-            format_id: outcome.format_id.clone(),
-            name: outcome.project_name.clone(),
-        });
-    }
+        let persistence_warning = remember_open_project(&s, &outcome, true).await;
+        {
+            let mut proj = s.current_project.write().await;
+            *proj = Some(ProjectInfo {
+                path: outcome.project_path.clone(),
+                format_id: outcome.format_id.clone(),
+                name: outcome.project_name.clone(),
+                extraction_warnings: outcome.extraction_warnings.clone(),
+                database_path: Some(outcome.database_path.clone()),
+                supported_modes: outcome.supported_modes.clone(),
+                persistence_warning: persistence_warning.clone(),
+            });
+        }
 
-    {
-        let mut config = s.config.write().await;
-        config.add_recent_project(
-            outcome.project_path.clone(),
-            outcome.project_name.clone(),
-            outcome.format_id.clone(),
-            None,
-        );
-        let _ = config.save(&AppConfig::default_path());
-    }
-
-    Ok(ProjectOpenResponse {
-        format_id: outcome.format_id,
-        format_name: outcome.format_name,
-        total_strings: outcome.total_strings,
-        project_path: outcome.project_path.to_string_lossy().into_owned(),
-        project_name: outcome.project_name,
-        supported_modes: outcome.supported_modes,
-        database_path: outcome.database_path.to_string_lossy().into_owned(),
-        added: outcome.added,
-        updated: outcome.updated,
-        stale_source_reset: outcome.stale_source_reset,
-        removed: outcome.removed,
-        preserved_translations: outcome.preserved_translations,
+        Ok(ProjectOpenResponse {
+            format_id: outcome.format_id,
+            format_name: outcome.format_name,
+            total_strings: outcome.total_strings,
+            project_path: outcome.project_path.to_string_lossy().into_owned(),
+            project_name: outcome.project_name,
+            supported_modes: outcome.supported_modes,
+            database_path: outcome.database_path.to_string_lossy().into_owned(),
+            added: outcome.added,
+            updated: outcome.updated,
+            stale_source_reset: outcome.stale_source_reset,
+            removed: outcome.removed,
+            preserved_translations: outcome.preserved_translations,
+            extraction_warnings: outcome.extraction_warnings,
+            persistence_warning,
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 async fn apply_open_project_db(
-    s: &AppState,
+    s: &Arc<AppState>,
     database_path: String,
     game_path: String,
     format_id: String,
 ) -> Result<ProjectOpenResponse, String> {
-    if active_translation_job(s).is_some() {
-        return Err(TRANSLATION_IN_FLIGHT_MESSAGE.to_string());
-    }
-    if s.project_exclusive
-        .load(std::sync::atomic::Ordering::SeqCst)
-        > 0
-    {
-        return Err(PROJECT_BUSY_MESSAGE.to_string());
-    }
-    let outcome = project::open_project_db(
-        &s.db,
-        &s.format_registry,
-        Path::new(&database_path),
-        Path::new(&game_path),
-        &format_id,
-    )
-    .map_err(|e| e.to_string())?;
+    let s = s.clone();
+    let exclusive = try_project_operation(&s)?;
+    run_owned_project_operation(exclusive, async move {
+        let outcome = project::open_project_db(
+            &s.db,
+            &s.format_registry,
+            Path::new(&database_path),
+            Path::new(&game_path),
+            &format_id,
+        )
+        .map_err(|e| e.to_string())?;
 
-    {
-        let mut proj = s.current_project.write().await;
-        *proj = Some(ProjectInfo {
-            path: outcome.project_path.clone(),
-            format_id: outcome.format_id.clone(),
-            name: outcome.project_name.clone(),
-        });
-    }
+        let persistence_warning = remember_open_project(&s, &outcome, true).await;
+        {
+            let mut proj = s.current_project.write().await;
+            *proj = Some(ProjectInfo {
+                path: outcome.project_path.clone(),
+                format_id: outcome.format_id.clone(),
+                name: outcome.project_name.clone(),
+                extraction_warnings: outcome.extraction_warnings.clone(),
+                database_path: Some(outcome.database_path.clone()),
+                supported_modes: outcome.supported_modes.clone(),
+                persistence_warning: persistence_warning.clone(),
+            });
+        }
 
-    {
-        let mut config = s.config.write().await;
-        config.add_recent_project(
-            outcome.project_path.clone(),
-            outcome.project_name.clone(),
-            outcome.format_id.clone(),
-            Some(outcome.database_path.clone()),
-        );
-        let _ = config.save(&AppConfig::default_path());
-    }
-
-    Ok(ProjectOpenResponse {
-        format_id: outcome.format_id,
-        format_name: outcome.format_name,
-        total_strings: outcome.total_strings,
-        project_path: outcome.project_path.to_string_lossy().into_owned(),
-        project_name: outcome.project_name,
-        supported_modes: outcome.supported_modes,
-        database_path: outcome.database_path.to_string_lossy().into_owned(),
-        added: outcome.added,
-        updated: outcome.updated,
-        stale_source_reset: outcome.stale_source_reset,
-        removed: outcome.removed,
-        preserved_translations: outcome.preserved_translations,
+        Ok(ProjectOpenResponse {
+            format_id: outcome.format_id,
+            format_name: outcome.format_name,
+            total_strings: outcome.total_strings,
+            project_path: outcome.project_path.to_string_lossy().into_owned(),
+            project_name: outcome.project_name,
+            supported_modes: outcome.supported_modes,
+            database_path: outcome.database_path.to_string_lossy().into_owned(),
+            added: outcome.added,
+            updated: outcome.updated,
+            stale_source_reset: outcome.stale_source_reset,
+            removed: outcome.removed,
+            preserved_translations: outcome.preserved_translations,
+            extraction_warnings: outcome.extraction_warnings,
+            persistence_warning,
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Open an existing Locust project database without extracting or merging.
@@ -301,11 +302,11 @@ pub async fn run_pivot(
     output_path: String,
     state: State<'_, AppStateWrapper>,
 ) -> Result<PivotResult, String> {
-    if state.0.current_project.read().await.is_none() {
+    let s = &state.0;
+    let _exclusive = try_project_operation(s)?;
+    if s.current_project.read().await.is_none() {
         return Err("no project open".into());
     }
-    let s = &state.0;
-    let _exclusive = ProjectExclusiveGuard::enter(&s.project_exclusive);
     s.db.pivot_to(&PathBuf::from(output_path))
         .map_err(|e| e.to_string())
 }
@@ -322,20 +323,25 @@ pub async fn patch_string(
     data: PatchStringReq,
     state: State<'_, AppStateWrapper>,
 ) -> Result<StringEntry, String> {
-    let s = &state.0;
-    if let Some(ref translation) = data.translation {
-        s.db.save_translation(&id, translation, "manual")
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    if let Some(ref status) = data.status {
-        s.db.update_entry_status(&id, status.clone())
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    s.db.get_entry(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Entry not found".to_string())
+    let s = state.0.clone();
+    let exclusive = try_project_operation(&s)?;
+    run_owned_project_operation(exclusive, async move {
+        if let Some(ref translation) = data.translation {
+            s.db.save_translation(&id, translation, "manual")
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(ref status) = data.status {
+            s.db.update_entry_status(&id, status.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        s.db.get_entry(&id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Entry not found".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -370,17 +376,21 @@ pub async fn batch_patch_strings(
         .map(|u| (u.id, u.translation))
         .collect();
     let requested = pairs.len();
-    let applied = state
-        .0
-        .db
-        .save_translations_batch(pairs, &data.provider)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({
-        "requested": requested,
-        "applied": applied,
-        "skipped": requested.saturating_sub(applied),
-    }))
+    let s = state.0.clone();
+    let exclusive = try_project_operation(&s)?;
+    run_owned_project_operation(exclusive, async move {
+        let applied =
+            s.db.save_translations_batch(pairs, &data.provider)
+                .await
+                .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "requested": requested,
+            "applied": applied,
+            "skipped": requested.saturating_sub(applied),
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ─── Translation commands ───────────────────────────────────────────────────
@@ -412,12 +422,7 @@ pub async fn cancel_translation(
     job_id: String,
     state: State<'_, AppStateWrapper>,
 ) -> Result<(), String> {
-    if let Some((_, job)) = state.0.active_jobs.remove(&job_id) {
-        job.abort_handle.abort();
-        Ok(())
-    } else {
-        Err("job not found".to_string())
-    }
+    cancel_translation_job(&state.0, &job_id)
 }
 
 // ─── Validation & Injection ─────────────────────────────────────────────────
@@ -426,34 +431,37 @@ pub async fn cancel_translation(
 pub async fn run_validation(
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    let s = &state.0;
+    let s = state.0.clone();
     // Same exclusive as HTTP validate: issue writes must not race Database::reopen.
-    let _exclusive = ProjectExclusiveGuard::enter(&s.project_exclusive);
-    let entries =
-        s.db.get_entries(&EntryFilter::default())
+    let exclusive = try_project_operation(&s)?;
+    run_owned_project_operation(exclusive, async move {
+        let entries =
+            s.db.get_entries(&EntryFilter::default())
+                .map_err(|e| e.to_string())?;
+        let validation = Validator::validate_and_save(&entries, &s.db)
+            .await
             .map_err(|e| e.to_string())?;
-    let validation = Validator::validate_and_save(&entries, &s.db)
-        .await
-        .map_err(|e| e.to_string())?;
 
-    let proj = s.current_project.read().await;
-    let fonts: Vec<locust_core::font_validation::FontCoverageReport> = if let Some(ref p) = *proj {
-        let translations: Vec<&str> = entries
-            .iter()
-            .filter_map(|e| e.translation.as_deref())
-            .collect();
-        locust_core::font_validation::FontValidator::check_game_fonts(&p.path, &translations)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let font_suggestions = locust_core::font_validation::suggestions_for_font_reports(&fonts);
+        let game_path = s
+            .current_project
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.path.clone());
+        let font_audit = locust_server::audit_project_fonts(game_path, entries).await;
+        let font_suggestions =
+            locust_core::font_validation::suggestions_for_font_reports(&font_audit.fonts);
 
-    Ok(serde_json::json!({
-        "validation": validation,
-        "fonts": fonts,
-        "font_suggestions": font_suggestions,
-    }))
+        Ok(serde_json::json!({
+            "validation": validation,
+            "fonts": font_audit.fonts,
+            "font_issues": font_audit.issues,
+            "font_limitations": locust_core::font_validation::FONT_COVERAGE_LIMITATION,
+            "font_suggestions": font_suggestions,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Export current project translations to a PO or XLIFF file at `path`.
@@ -466,15 +474,16 @@ pub async fn export_translations(
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
     let s = &state.0;
+    let default_source = s.config.read().await.default_source_lang.clone();
+    let _exclusive = try_project_operation(s)?;
     let entries =
         s.db.get_entries(&EntryFilter::default())
             .map_err(|e| e.to_string())?;
     if entries.is_empty() {
         return Err("no strings in project — open a game and extract first".into());
     }
-    let config = s.config.read().await;
     let source =
-        s.db.resolve_export_source_lang(&lang, &config.default_source_lang)
+        s.db.resolve_export_source_lang(&lang, &default_source)
             .map_err(|e| e.to_string())?;
     let body = match format.as_str() {
         "po" => locust_core::export::export_po(&entries, &source, &lang),
@@ -504,7 +513,7 @@ pub async fn import_translations(
     path: String,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    let s = &state.0;
+    let s = state.0.clone();
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     if content.trim().is_empty() {
         return Err("import file is empty".into());
@@ -521,18 +530,25 @@ pub async fn import_translations(
         other => return Err(format!("unknown import format: {other}")),
     };
     let attempted = updates.len();
-    let applied =
-        s.db.save_translations_batch(updates, "import")
-            .await
-            .map_err(|e| e.to_string())?;
-    let (imported, skipped) =
-        locust_core::export::import_counts_after_batch(pre_skipped, attempted, applied);
-    Ok(serde_json::json!({
-        "path": path,
-        "format": format,
-        "imported": imported,
-        "skipped": skipped,
-    }))
+    let exclusive = try_project_operation(&s)?;
+    run_owned_project_operation(exclusive, async move {
+        let report =
+            s.db.save_imported_translations_batch(updates)
+                .await
+                .map_err(|e| e.to_string())?;
+        let (imported, skipped) =
+            locust_core::export::import_counts_after_batch(pre_skipped, attempted, report.imported);
+        Ok(serde_json::json!({
+            "path": path,
+            "format": format,
+            "imported": imported,
+            "skipped": skipped,
+            "stale_sources": report.stale_sources,
+            "unknown_ids": report.unknown_ids,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -571,8 +587,8 @@ pub async fn run_inject(
     if params.languages.is_empty() {
         return Err(INJECT_EMPTY_LANGUAGES_MESSAGE.to_string());
     }
-    let s = &state.0;
-    let _exclusive = ProjectExclusiveGuard::enter(&s.project_exclusive);
+    let s = state.0.clone();
+    let exclusive = try_project_operation(&s)?;
 
     if params.direct {
         let game_path = PathBuf::from(&params.project_path);
@@ -582,6 +598,7 @@ pub async fn run_inject(
         let db = s.db.clone();
         let backup = s.backup_manager.clone();
         let report = tokio::task::spawn_blocking(move || {
+            let _exclusive = exclusive;
             locust_core::extraction::inject_direct(
                 &registry, &db, &backup, &game_path, &format_id, &languages,
             )
@@ -592,46 +609,52 @@ pub async fn run_inject(
         return serde_json::to_value(report).map_err(|e| e.to_string());
     }
 
-    let mode = params.mode.unwrap_or(OutputMode::Replace);
-    let injector = locust_core::extraction::MultiLangInjector::new(
-        s.format_registry.clone(),
-        s.db.clone(),
-        s.backup_manager.clone(),
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
-
-    let languages = params.languages.clone();
-    let report = injector
-        .inject(
-            &PathBuf::from(&params.project_path),
-            &params.format_id,
-            mode,
-            params.languages,
-            params.output_dir.map(PathBuf::from),
-            tx,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Persist what each language's injection wrote — `locust patch` packs
-    // exclusively from this recording, so an inject seam that skips it
-    // produces projects that can never be packed. Attach outcomes so the UI
-    // can refuse a success toast on NothingRecorded / KeptPrevious.
-    let outcomes =
-        locust_core::extraction::record_multilang_injection(&s.db, &report, &languages, &|_lang| {
-            INJECT_RECORD_REMEDY.to_string()
-        })
-        .map_err(|e| e.to_string())?;
-
-    let mut body = serde_json::to_value(report).map_err(|e| e.to_string())?;
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "outcomes".into(),
-            serde_json::to_value(outcomes).map_err(|e| e.to_string())?,
+    run_owned_project_operation(exclusive, async move {
+        let mode = params.mode.unwrap_or(OutputMode::Replace);
+        let injector = locust_core::extraction::MultiLangInjector::new(
+            s.format_registry.clone(),
+            s.db.clone(),
+            s.backup_manager.clone(),
         );
-    }
-    Ok(body)
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let languages = params.languages.clone();
+        let report = injector
+            .inject(
+                &PathBuf::from(&params.project_path),
+                &params.format_id,
+                mode,
+                params.languages,
+                params.output_dir.map(PathBuf::from),
+                tx,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Persist what each language's injection wrote — `locust patch` packs
+        // exclusively from this recording, so an inject seam that skips it
+        // produces projects that can never be packed. Attach outcomes so the UI
+        // can refuse a success toast on NothingRecorded / KeptPrevious.
+        let outcomes = locust_core::extraction::record_multilang_injection(
+            &s.db,
+            &report,
+            &languages,
+            &|_lang| INJECT_RECORD_REMEDY.to_string(),
+        )
+        .map_err(|e| e.to_string())?;
+
+        let mut body = serde_json::to_value(report).map_err(|e| e.to_string())?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "outcomes".into(),
+                serde_json::to_value(outcomes).map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(body)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -684,26 +707,7 @@ pub async fn xai_auth_poll(
 
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppStateWrapper>) -> Result<serde_json::Value, String> {
-    let config = state.0.config.read().await;
-    let mut val = serde_json::to_value(&*config).unwrap_or_default();
-    // Redact API keys
-    if let Some(providers) = val.get_mut("providers").and_then(|v| v.as_object_mut()) {
-        for (_id, pc) in providers.iter_mut() {
-            if let Some(obj) = pc.as_object_mut() {
-                if obj
-                    .get("api_key")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| !s.is_empty())
-                {
-                    obj.insert(
-                        "api_key".to_string(),
-                        serde_json::Value::String("***".to_string()),
-                    );
-                }
-            }
-        }
-    }
-    Ok(val)
+    Ok(locust_server::public_app_config(&state.0).await)
 }
 
 #[tauri::command]
@@ -711,16 +715,9 @@ pub async fn save_config(
     partial: serde_json::Value,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    let mut config = state.0.config.write().await;
-    let mut current = serde_json::to_value(&*config).unwrap_or_default();
-    if let (Some(cur_obj), Some(patch_obj)) = (current.as_object_mut(), partial.as_object()) {
-        for (k, v) in patch_obj {
-            cur_obj.insert(k.clone(), v.clone());
-        }
-    }
-    *config = serde_json::from_value(current.clone()).map_err(|e| e.to_string())?;
-    let _ = config.save(&AppConfig::default_path());
-    Ok(current)
+    update_app_config(&state.0, partial)
+        .await
+        .map_err(|(_, message)| message)
 }
 
 // ─── Backups & Glossary ─────────────────────────────────────────────────────
@@ -924,6 +921,8 @@ mod tests {
             path: PathBuf::from("/tmp/original-game"),
             format_id: "rpgmaker-mv".into(),
             name: "original-game".into(),
+            extraction_warnings: Vec::new(),
+            ..Default::default()
         });
 
         let pivot = dir.join("pivoted.locust.db");
@@ -958,6 +957,14 @@ mod tests {
         let cur = state.current_project.read().await.clone().unwrap();
         assert_eq!(cur.name, "PivotedGame");
         assert_eq!(cur.format_id, "rpgmaker-mv");
+        assert_eq!(cur.database_path.as_ref(), Some(&pivot));
+        assert_eq!(cur.supported_modes, out.supported_modes);
+        assert!(out.persistence_warning.is_none());
+        let saved = locust_core::config::AppConfig::load(&state.config_path).unwrap();
+        assert_eq!(
+            saved.recent_projects[0].database_path.as_ref(),
+            Some(&pivot)
+        );
 
         let src = locust_core::database::Database::open(&source_path).unwrap();
         let src_rows = src.get_entries(&EntryFilter::default()).unwrap();
@@ -977,6 +984,8 @@ mod tests {
             path: PathBuf::from("/tmp/original-game"),
             format_id: "rpgmaker-mv".into(),
             name: "original-game".into(),
+            extraction_warnings: Vec::new(),
+            ..Default::default()
         });
         state
             .db
@@ -1016,6 +1025,8 @@ mod tests {
             path: PathBuf::from("/tmp/original-game"),
             format_id: "rpgmaker-mv".into(),
             name: "original-game".into(),
+            extraction_warnings: Vec::new(),
+            ..Default::default()
         });
         let missing = std::env::temp_dir().join(format!(
             "locust_opendb_tauri_missing_{}.locust.db",
@@ -1040,6 +1051,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_project_db_cannot_switch_during_an_owned_operation() {
+        let state = locust_server::create_test_state();
+        state
+            .db
+            .save_entries(&[translated_entry("keep", "Japanese source", "English")])
+            .unwrap();
+        let operation = try_project_operation(&state).unwrap();
+        let error = apply_open_project_db(
+            &state,
+            "not-read-while-busy.locust.db".into(),
+            "not-read-while-busy".into(),
+            "rpgmaker-mv".into(),
+        )
+        .await
+        .expect_err("another operation owns this project");
+        assert_eq!(error, locust_server::PROJECT_BUSY_MESSAGE);
+        assert_eq!(
+            state.db.get_entry("keep").unwrap().unwrap().source,
+            "Japanese source"
+        );
+        assert_eq!(state.db.path(), PathBuf::from(":memory:"));
+        drop(operation);
+        let error = apply_open_project_db(
+            &state,
+            format!("missing-{}.locust.db", uuid::Uuid::new_v4()),
+            "missing-game".into(),
+            "rpgmaker-mv".into(),
+        )
+        .await
+        .expect_err("missing database");
+        assert_ne!(error, locust_server::PROJECT_BUSY_MESSAGE);
+        assert!(
+            try_project_operation(&state).is_ok(),
+            "failed open must release its reservation"
+        );
+    }
+
+    #[tokio::test]
     async fn open_project_db_rejects_unknown_format() {
         let db_path = write_tauri_locust_db(&[translated_entry("a", "Hello", "Hola")]);
         let state = locust_server::create_test_state();
@@ -1047,6 +1096,8 @@ mod tests {
             path: PathBuf::from("/tmp/original-game"),
             format_id: "rpgmaker-mv".into(),
             name: "original-game".into(),
+            extraction_warnings: Vec::new(),
+            ..Default::default()
         });
         let err = apply_open_project_db(
             &state,
@@ -1062,6 +1113,64 @@ mod tests {
         assert_eq!(state.db.path(), PathBuf::from(":memory:"));
         drop(state);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn prefer_saved_open_skips_extract_after_source_change() {
+        let game =
+            std::env::temp_dir().join(format!("locust_prefer_saved_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("story.html"), "<p>Hello</p>").unwrap();
+        let state = locust_server::create_test_state();
+        let first = apply_open_project(
+            &state,
+            game.to_string_lossy().into_owned(),
+            Some("html-game".into()),
+            false,
+        )
+        .await
+        .unwrap();
+        let hero = state
+            .db
+            .get_entries(&EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.source == "Hello")
+            .unwrap();
+        assert!(state
+            .db
+            .save_translation(&hero.id, "Hola", "mock")
+            .await
+            .unwrap());
+        std::fs::write(game.join("story.html"), "<p>Hello, traveler</p>").unwrap();
+
+        let saved = apply_open_project(
+            &state,
+            game.to_string_lossy().into_owned(),
+            Some("html-game".into()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.stale_source_reset, 0);
+        assert_eq!(saved.database_path, first.database_path);
+        assert_eq!(
+            state.db.get_entry(&hero.id).unwrap().unwrap().source,
+            "Hello"
+        );
+
+        let explicit = apply_open_project(
+            &state,
+            game.to_string_lossy().into_owned(),
+            Some("html-game".into()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(explicit.stale_source_reset, 1);
+        drop(state);
+        let _ = std::fs::remove_file(&first.database_path);
+        let _ = std::fs::remove_dir_all(&game);
     }
 
     #[tokio::test]

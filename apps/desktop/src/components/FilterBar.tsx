@@ -91,8 +91,8 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 		filter.status || filter.search || filter.file_path || filter.tag;
 
 	return (
-		<div className="flex items-center gap-2 p-2 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
-			<div className="flex gap-0.5">
+		<div className="flex flex-wrap items-center gap-2 p-2 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+			<div className="flex flex-wrap gap-0.5">
 				{STATUSES.map(({ labelKey, value }) => (
 					<button
 						key={labelKey}
@@ -111,7 +111,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 				))}
 			</div>
 
-			<div className="flex-1 relative max-w-md">
+			<div className="flex-1 relative min-w-40 max-w-md">
 				<Search
 					size={16}
 					className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"

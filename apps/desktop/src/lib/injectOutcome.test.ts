@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import type { InjectReportLike } from "./injectOutcome.ts";
 import {
   classifyInjectReport,
   collectFilesWritten,
   collectInjectWarnings,
+  injectionRecoveryPath,
+  isRedundantBackupRemoved,
+  collectSkipReasons,
   injectToastLevel,
   outcomeRecordingIssues,
   shouldOfferPackAfterInject,
@@ -19,6 +23,105 @@ assert.equal(
   5,
 );
 assert.equal(sumStringsWritten({ reports: { es: { strings_written: 0 } } }), 0);
+
+// --- skip reasons: exact counts, language scope, and legacy remainder ---
+assert.deepEqual(collectSkipReasons({}), []);
+assert.deepEqual(collectSkipReasons({ strings_skipped: 0 }), []);
+assert.deepEqual(
+  collectSkipReasons({
+    strings_skipped: 5,
+    skip_reasons: { unchanged: 2, too_long: 1 },
+  }),
+  [
+    { lang: "", reason: "unchanged", count: 2 },
+    { lang: "", reason: "too_long", count: 1 },
+    { lang: "", reason: "unclassified", count: 2 },
+  ],
+);
+// Historical skips are explicitly unclassified, never assumed too long.
+assert.deepEqual(collectSkipReasons({ strings_skipped: 7 }), [
+  { lang: "", reason: "unclassified", count: 7 },
+]);
+assert.deepEqual(
+  collectSkipReasons({ strings_skipped: 2, reports: {} }),
+  [{ lang: "", reason: "unclassified", count: 2 }],
+);
+// A direct response may repeat the same counts in its per-language report.
+// Detailed reports take precedence so each skipped entry is counted once.
+assert.deepEqual(
+  collectSkipReasons({
+    strings_skipped: 4,
+    skip_reasons: { too_long: 4 },
+    reports: {
+      es: { strings_skipped: 4, skip_reasons: { too_long: 4 } },
+      fr: { strings_skipped: 2, skip_reasons: { source_changed: 1 } },
+      de: undefined,
+    },
+  }),
+  [
+    { lang: "es", reason: "too_long", count: 4 },
+    { lang: "fr", reason: "source_changed", count: 1 },
+    { lang: "fr", reason: "unclassified", count: 1 },
+  ],
+);
+// Invalid counters cannot inflate the total or make negative rows. Fractional
+// legacy values are truncated and reason counts cannot exceed strings_skipped.
+assert.deepEqual(
+  collectSkipReasons({
+    strings_skipped: 3.9,
+    skip_reasons: {
+      negative: -2,
+      nan: Number.NaN,
+      infinite: Number.POSITIVE_INFINITY,
+      zero: 0,
+      unchanged: 1.8,
+      too_long: 20,
+      source_changed: 1,
+    },
+  }),
+  [
+    { lang: "", reason: "unchanged", count: 1 },
+    { lang: "", reason: "too_long", count: 2 },
+  ],
+);
+for (const invalidTotal of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+  assert.deepEqual(
+    collectSkipReasons({ strings_skipped: invalidTotal, skip_reasons: { too_long: 2 } }),
+    [],
+  );
+}
+
+// Benign skips leave a successful write successful. Actionable skips, legacy
+// unknown reasons, and future backend reasons must downgrade it to partial.
+for (const reason of ["unchanged", "duplicate", "untranslated"]) {
+  assert.equal(
+    classifyInjectReport({
+      strings_written: 3,
+      strings_skipped: 1,
+      skip_reasons: { [reason]: 1 },
+    }),
+    "success",
+  );
+}
+for (const reason of ["too_long", "target_missing", "source_changed", "invalid_placeholders", "unclassified", "future_reason"]) {
+  assert.equal(
+    classifyInjectReport({
+      strings_written: 3,
+      strings_skipped: 1,
+      skip_reasons: { [reason]: 1 },
+    }),
+    "partial",
+  );
+}
+assert.equal(classifyInjectReport({ strings_written: 3, strings_skipped: 1 }), "partial");
+assert.equal(
+  classifyInjectReport({
+    strings_written: 0,
+    strings_skipped: 1,
+    skip_reasons: { unchanged: 1 },
+  }),
+  "empty",
+);
 
 // --- classify: empty ---
 assert.equal(
@@ -107,6 +210,15 @@ assert.equal(injectToastLevel("partial"), "warning");
 assert.equal(injectToastLevel("empty"), "error");
 
 // --- warnings / files ---
+const retained = "injection 728ec773-0fcc-431a-aa1c-00c2b6e395db completed; verified originals retained at C:/game/.locust-injections/originals";
+assert.deepEqual(collectInjectWarnings({
+  warnings: [retained, retained],
+  reports: { es: { warnings: [retained, "cannot re-encode", "cannot re-encode"] }, fr: { warnings: ["cannot re-encode"] } },
+}), [retained, "es: cannot re-encode", "fr: cannot re-encode"]);
+assert.equal(injectionRecoveryPath(retained), "C:/game/.locust-injections/originals");
+assert.equal(injectionRecoveryPath(`zh-CN: ${retained}`), "C:/game/.locust-injections/originals");
+assert.equal(injectionRecoveryPath("cannot re-encode"), null);
+assert.equal(injectionRecoveryPath(retained.replace("completed;", "failed;")), null);
 assert.deepEqual(
   collectInjectWarnings({
     warnings: ["top"],
@@ -172,3 +284,56 @@ assert.notEqual(
 );
 
 console.log("injectOutcome.test.ts: ok");
+
+assert.deepEqual(collectSkipReasons({ strings_skipped: 5, skip_reasons: { unclassified: 2 } }),
+  [{ lang: "", reason: "unclassified", count: 5 }]);
+
+// Only complete, explicit unchanged evidence may downgrade zero writes to info.
+const unchangedReport: InjectReportLike = {
+  languages_processed: ["es"], languages_failed: [],
+  strings_written: 0, files_modified: 0, files_written: [], strings_skipped: 2,
+  reports: { es: { strings_written: 0, files_modified: 0, strings_skipped: 2,
+    skip_reasons: { unchanged: 2 }, files_written: [] } },
+  outcomes: [["es", { KeptPrevious: { recorded_at: "2026-09-21" } }]],
+  warnings: [retained, "unchanged injection: redundant new backup removed"],
+};
+assert.equal(classifyInjectReport(unchangedReport), "unchanged");
+assert.equal(injectToastLevel("unchanged"), "info");
+assert(isRedundantBackupRemoved("unchanged injection: redundant new backup removed"));
+assert(isRedundantBackupRemoved("zh-CN: unchanged injection: redundant new backup removed"));
+assert(!isRedundantBackupRemoved("unchanged injection: redundant new backup removed; ERROR"));
+assert(!isRedundantBackupRemoved("unchanged injection completed, but duplicate backup cleanup was incomplete"));
+assert.equal(classifyInjectReport({ ...unchangedReport,
+  languages_processed: ["es", "fr"], strings_skipped: 4, outcomes: undefined,
+  reports: { es: unchangedReport.reports!.es, fr: unchangedReport.reports!.es },
+}), "unchanged");
+assert.equal(classifyInjectReport({ ...unchangedReport, outcomes: [["es", "NothingRecorded"]] }), "unchanged");
+assert.equal(shouldOfferPackAfterInject(unchangedReport), false);
+assert.equal(shouldOfferPackAfterInject({ strings_written: 1,
+  languages_processed: [], languages_failed: [["es", "failed"]] }), false);
+for (const reason of ["untranslated", "duplicate", "too_long", "source_changed", "future_reason"]) {
+  assert.notEqual(classifyInjectReport({ ...unchangedReport, reports: {
+    es: { ...unchangedReport.reports!.es, skip_reasons: { unchanged: 1, [reason]: 1 } },
+  } }), "unchanged", reason);
+}
+for (const override of [
+  { languages_processed: [] },
+  { languages_processed: ["es", "fr"] },
+  { languages_failed: [["fr", "failure"]] },
+  { strings_written: 1 }, { files_modified: 1 }, { files_written: ["story.html"] },
+  { strings_skipped: 3 },
+  { reports: { es: { ...unchangedReport.reports!.es, strings_skipped: 3 } } },
+  { reports: { es: { ...unchangedReport.reports!.es, strings_skipped: 0 } } },
+  { reports: { es: { ...unchangedReport.reports!.es, strings_written: 1 } } },
+  { reports: { es: { ...unchangedReport.reports!.es, files_modified: 1 } } },
+  { reports: { es: { ...unchangedReport.reports!.es, skip_reasons: { unchanged: 2, too_long: 1 } } } },
+  { reports: { es: undefined } },
+  { reports: { es: unchangedReport.reports!.es, fr: undefined } },
+  { reports: { es: { ...unchangedReport.reports!.es, strings_skipped: 2.1 } } },
+  { reports: { es: { ...unchangedReport.reports!.es, warnings: ["engine diagnostic"] } } },
+  { warnings: ["unchanged injection completed, but duplicate backup cleanup was incomplete"] },
+  { warnings: ["unrecognized backend warning"] },
+  { outcomes: [["es", { Recorded: { files: 1 } }]] },
+] as Partial<InjectReportLike>[]) {
+  assert.notEqual(classifyInjectReport({ ...unchangedReport, ...override }), "unchanged", JSON.stringify(override));
+}

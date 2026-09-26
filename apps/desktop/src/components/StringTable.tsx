@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo } from "react";
+import { useState, useRef, useMemo, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
 	useReactTable,
@@ -14,7 +14,17 @@ import type { StringEntry } from "../lib/api";
 import { getConfig, patchString } from "../lib/api";
 import { clampTableRowHeight, showSourceColumnEnabled } from "../lib/appearance";
 import { useEditorStore } from "../stores/editorStore";
-import { useT } from "../lib/i18n";
+import { useT, type MessageKey } from "../lib/i18n";
+import { useProjectStore } from "../stores/projectStore";
+import { acknowledgeDraft, draftEntryKey, draftProjectKey, editDraft, saveDraft, useDraftStore } from "../stores/draftStore";
+
+const statusLabel: Record<string, MessageKey> = {
+	pending: "detail.status.pending",
+	translated: "detail.status.translated",
+	reviewed: "detail.status.reviewed",
+	approved: "detail.status.approved",
+	error: "detail.status.error",
+};
 
 const statusBadge: Record<string, string> = {
 	pending: "bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200",
@@ -35,30 +45,50 @@ function InlineEdit({
 	onSave: () => void;
 }) {
 	const [editing, setEditing] = useState(false);
-	const [value, setValue] = useState(entry.translation || "");
 	const t = useT();
-	const ref = useRef<HTMLTextAreaElement>(null);
+	const project = useProjectStore(state => state.project);
+	const projectKey = project ? draftProjectKey(project) : "";
+	const draftKey = draftEntryKey(projectKey, entry.id);
+	const draft = useDraftStore(state => state.drafts[draftKey]);
+	const persistenceIssue = useDraftStore(state => state.persistenceIssues[draftKey] ?? state.persistenceIssue);
+	const value = draft?.text ?? entry.translation ?? "";
+	const saving = draft?.saving ?? false;
+	const initialValue = useRef(value);
+	const cancelled = useRef(false);
+	useEffect(() => { acknowledgeDraft(draftKey, entry.translation || ""); }, [draftKey, entry.translation, saving]);
+	const isCurrentProject = () => {
+		const current = useProjectStore.getState().project;
+		return !!current && draftProjectKey(current) === projectKey;
+	};
 
 	const handleBlur = async () => {
+		if (cancelled.current) return;
 		setEditing(false);
-		if (value !== (entry.translation || "")) {
-			await patchString(entry.id, { translation: value } as any);
-			onSave();
-		}
+		if (!isCurrentProject()) return;
+		await saveDraft(draftKey, entry.translation || "", async text => {
+			if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
+			await patchString(entry.id, { translation: text });
+			if (isCurrentProject()) onSave();
+		});
 	};
 
 	if (editing) {
 		return (
 			<textarea
-				ref={ref}
+				aria-label={t("table.editTranslation")}
 				value={value}
-				onChange={(e) => setValue(e.target.value)}
+				disabled={saving}
+				onChange={(e) => editDraft(draftKey, e.target.value)}
 				onBlur={handleBlur}
+				onClick={e => e.stopPropagation()}
 				onKeyDown={(e) => {
-					if (e.key === "Enter" && e.ctrlKey) handleBlur();
+					if (e.key === "Enter" && e.ctrlKey) { e.preventDefault(); void handleBlur(); }
 					if (e.key === "Escape") {
+						e.preventDefault(); e.stopPropagation();
+						cancelled.current = true;
+						editDraft(draftKey, initialValue.current);
+						acknowledgeDraft(draftKey, entry.translation || "");
 						setEditing(false);
-						setValue(entry.translation || "");
 					}
 				}}
 				autoFocus
@@ -69,19 +99,26 @@ function InlineEdit({
 	}
 
 	return (
-		<div
+		<div onClick={e => e.stopPropagation()}>
+		<button type="button" disabled={!project || saving}
+			aria-label={t("table.editTranslation")}
 			onClick={(e) => {
 				e.stopPropagation();
+				cancelled.current = false;
+				initialValue.current = value;
 				setEditing(true);
-				setValue(entry.translation || "");
 			}}
-			className="cursor-text text-xs truncate"
+			className="block w-full text-left cursor-text text-xs truncate disabled:cursor-wait"
 		>
-			{entry.translation || (
-				<span className="text-gray-400 dark:text-gray-500 italic">
+			{value || (
+				<span className="text-gray-500 dark:text-gray-400 italic">
 					{t("table.clickToEdit")}
 				</span>
 			)}
+		</button>
+		{draft && <span role="status" className="block text-[11px] text-amber-800 dark:text-amber-200">{saving ? t("table.saving") : t("table.unsaved")}</span>}
+		{draft?.error && <div className="text-xs text-red-700 dark:text-red-300 break-words"><p role="alert">{draft.error}</p><button type="button" disabled={saving} onClick={() => void handleBlur()} className="underline">{t("common.retry")}</button></div>}
+		{persistenceIssue && <p role="alert" className="text-xs text-red-700 dark:text-red-300">{t("detail.draftStorageFailed")}</p>}
 		</div>
 	);
 }
@@ -124,7 +161,7 @@ export default function StringTable({
 									"bg-gray-100 dark:bg-gray-700 dark:text-gray-300",
 							)}
 						>
-							{status}
+							{statusLabel[status] ? t(statusLabel[status]) : status}
 						</span>
 					);
 				},

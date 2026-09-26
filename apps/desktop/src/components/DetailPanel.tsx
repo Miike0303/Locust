@@ -1,9 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import clsx from "clsx";
 import type { StringEntry, StringStatus } from "../lib/api";
-import { binarySlotOf, encodedByteLen, patchString } from "../lib/api";
+import { encodedByteLen, patchString } from "../lib/api";
+import { binaryBudgetHint } from "../lib/binaryBudget";
 import { useT } from "../lib/i18n";
+import { acknowledgeDraft, draftAlternatives, selectDraftAlternative, draftEntryKey, draftProjectKey, editDraft, saveDraft, useDraftStore } from "../stores/draftStore";
+import { useProjectStore } from "../stores/projectStore";
 
 import type { MessageKey } from "../lib/i18n";
 
@@ -28,42 +31,70 @@ const statusButtons: { value: StringStatus; labelKey: MessageKey; color: string 
 ];
 
 interface DetailPanelProps {
+	projectKey: string;
 	entry: StringEntry;
 	onRefetch: () => void;
 	onClose: () => void;
 }
 
 export default function DetailPanel({
+	projectKey,
 	entry,
 	onRefetch,
 	onClose,
 }: DetailPanelProps) {
 	const t = useT();
-	const [translation, setTranslation] = useState(entry.translation || "");
+	const draftKey = draftEntryKey(projectKey, entry.id);
+	const draft = useDraftStore((state) => state.drafts[draftKey]);
+	const records = useDraftStore((state) => state.records);
+	const persistenceIssue = useDraftStore((state) => state.persistenceIssues[draftKey] ?? state.persistenceIssue);
+	const alternatives = draftAlternatives(draftKey, records, draft);
+	const translation = draft?.text ?? entry.translation ?? "";
 	const [showMeta, setShowMeta] = useState(false);
+	const [actionError, setActionError] = useState<string | null>(null);
+	const saving = draft?.saving ?? false;
+	const [changingStatus, setChangingStatus] = useState(false);
+	const currentEntryId = useRef(entry.id);
+	currentEntryId.current = entry.id;
+	const isCurrentProject = () => {
+		const project = useProjectStore.getState().project;
+		return !!project && draftProjectKey(project) === projectKey;
+	};
 
 	useEffect(() => {
-		setTranslation(entry.translation || "");
-	}, [entry.id, entry.translation]);
+		acknowledgeDraft(draftKey, entry.translation || "");
+	}, [draftKey, entry.translation, saving]);
+	useEffect(() => { setActionError(null); }, [entry.id]);
 
-	const handleSave = async () => {
-		if (translation !== (entry.translation || "")) {
-			await patchString(entry.id, { translation } as any);
-			onRefetch();
-		}
+	const handleSave = (): Promise<boolean> => {
+		if (!isCurrentProject()) return Promise.resolve(false);
+		const id = entry.id;
+		setActionError(null);
+		return saveDraft(draftKey, entry.translation || "", async (text) => {
+			if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
+			await patchString(id, { translation: text });
+			if (isCurrentProject()) onRefetch();
+		});
 	};
 
 	const handleStatusChange = async (status: StringStatus) => {
-		await patchString(entry.id, { status } as any);
-		onRefetch();
+		const id = entry.id;
+		setChangingStatus(true);
+		try {
+			if (!(await handleSave()) || currentEntryId.current !== id || !isCurrentProject()) return;
+			await patchString(id, { status });
+			setActionError(null); onRefetch();
+		} catch (error) {
+			if (currentEntryId.current === id) setActionError(error instanceof Error ? error.message : String(error));
+		} finally { setChangingStatus(false); }
 	};
 
-	const charCount = translation.length;
+	const charCount = Array.from(translation).length;
 	const limitExceeded =
 		entry.char_limit != null && charCount > entry.char_limit;
-	const binarySlot = binarySlotOf(entry);
-	const srcSlotBytes =
-		binarySlot != null ? encodedByteLen(binarySlot, entry.source) : null;
+	const budgetHint = binaryBudgetHint(entry);
+	const binarySlot = budgetHint.encoding;
+	const srcSlotBytes = budgetHint.capacity;
 	const trSlotBytes =
 		binarySlot != null ? encodedByteLen(binarySlot, translation) : null;
 	const binarySlotExceeded =
@@ -85,6 +116,21 @@ export default function DetailPanel({
 			</div>
 
 			<div className="p-3 space-y-3 flex-1">
+				{Object.prototype.hasOwnProperty.call(entry.metadata ?? {}, "locust_stale_translation") && (
+					<p className="text-xs text-amber-800 dark:text-amber-200 bg-amber-50 dark:bg-amber-950/40 rounded p-2">
+						<strong>{t("validate.kind.staleLabel")}. </strong>{t("validate.kind.staleDetail")}
+					</p>
+				)}
+				{(actionError || draft?.error) && <p role="alert" className="text-xs text-red-700 dark:text-red-300 break-words">{actionError || draft?.error}</p>}
+                {persistenceIssue && <p role="alert" className="text-xs text-red-700 dark:text-red-300">{t("detail.draftStorageFailed")}</p>}
+                {alternatives.length > 0 && <div className="text-xs text-amber-800 dark:text-amber-200">
+                    <p>{t("detail.draftConflict")}</p>
+                    {alternatives.map(alternative => <button key={alternative.revision} type="button" disabled={saving || changingStatus}
+                        className="block w-full text-left border rounded p-1 mt-1 whitespace-pre-wrap break-words"
+                        onClick={() => selectDraftAlternative(draftKey, alternative.revision)}>
+                        {t("detail.draftRestore")}: {alternative.text.length ? alternative.text.slice(0, 100) : t("detail.draftEmpty")}
+                    </button>)}
+                </div>}
 				{/* Source */}
 				<div>
 					<label className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase">
@@ -101,8 +147,9 @@ export default function DetailPanel({
 						{t("detail.translation")}
 					</label>
 					<textarea
+						disabled={saving || changingStatus}
 						value={translation}
-						onChange={(e) => setTranslation(e.target.value)}
+						onChange={(e) => editDraft(draftKey, e.target.value)}
 						onBlur={handleSave}
 						onKeyDown={(e) => {
 							if (e.key === "Enter" && e.ctrlKey) handleSave();
@@ -130,6 +177,8 @@ export default function DetailPanel({
 								{t("detail.sjisNote")}
 							</span>
 						)}
+						{budgetHint.grouped && <p className="mt-1">{t("detail.sharedBudget")}</p>}
+						{budgetHint.expandable && !budgetHint.grouped && <p className="mt-1">{t("detail.expandableBudget")}</p>}
 					</div>
 				</div>
 
@@ -142,6 +191,7 @@ export default function DetailPanel({
 						{statusButtons.map(({ value, labelKey, color }) => (
 							<button
 								key={value}
+								disabled={changingStatus}
 								onClick={() => handleStatusChange(value)}
 								className={clsx(
 									"px-2.5 py-0.5 rounded-full text-[11px] font-medium transition-colors",
