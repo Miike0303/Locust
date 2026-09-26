@@ -77,10 +77,10 @@ Owned by no lane; Claude applies these after the writers finish.
   the per-user game-lock dir (`%LOCALAPPDATA%\locust-patch-locks-v1`), so about
   111 core tests fail, and it cannot open loopback sockets (server integration
   tests). Ask Codex for targeted tests only, and run the full gates yourself.
-- **Cursor `cursor-ask` returned empty stdout (exit 0) on a long research brief**
-  in `plan` mode twice (models cursor-grok-4.6-xhigh and grok-4.7-high). Short
-  prompts work. Check the output size and never count an empty answer as a
-  proposal.
+- **Use `cursor-ask -Mode ask`, not `plan`, for research.** `plan` returned empty
+  stdout (exit 0) on the long brief twice, with both cursor-grok-4.6-xhigh and
+  grok-4.7-high. `ask` with the same brief reads the repo and answers. Always
+  check the output size, and never count an empty answer as a proposal.
 - Playwright is available as `py -3.13` with its bundled Chromium. The default
   `python` has no Playwright.
 - A new placeholder syntax needs a detector in

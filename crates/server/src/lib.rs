@@ -291,11 +291,7 @@ pub fn create_app_state() -> Arc<AppState> {
     let backup_root = data_dir.join("backups");
     std::fs::create_dir_all(&backup_root).ok();
 
-    // Auto-clean old backups on startup (keep last 5)
-    let backup_mgr_tmp = BackupManager::new(backup_root.clone());
-    if let Err(e) = backup_mgr_tmp.delete_old_backups(5) {
-        tracing::warn!("Failed to clean old backups: {}", e);
-    }
+    // Startup never prunes: project DB recordings may reference any backup; users delete in Settings → Data.
 
     let config_path = AppConfig::default_path();
     let (config, config_load_failed) = config_persistence::load_startup_config(&config_path);
@@ -2671,6 +2667,46 @@ mod download_guard_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct DataDirRestore(Option<std::ffi::OsString>);
+
+    impl DataDirRestore {
+        fn capture() -> Self {
+            Self(std::env::var_os("LOCUST_DATA_DIR"))
+        }
+    }
+
+    impl Drop for DataDirRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("LOCUST_DATA_DIR", value),
+                None => std::env::remove_var("LOCUST_DATA_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn startup_keeps_all_existing_backups() {
+        let _lock = DATA_DIR_LOCK.lock().unwrap();
+        let _data_dir_restore = DataDirRestore::capture();
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCUST_DATA_DIR", data_dir.path());
+
+        let backup_manager = BackupManager::new(data_dir.path().join("backups"));
+        for index in 0..6 {
+            let game = data_dir.path().join(format!("game-{index}"));
+            std::fs::create_dir(&game).unwrap();
+            std::fs::write(game.join("story.txt"), format!("original-{index}")).unwrap();
+            backup_manager.create_backup(&game).unwrap();
+        }
+        assert_eq!(backup_manager.list_backups().unwrap().len(), 6);
+        drop(backup_manager);
+
+        let state = create_app_state();
+        assert_eq!(state.backup_manager.list_backups().unwrap().len(), 6);
+    }
 
     async fn setup() -> (String, tokio::task::JoinHandle<()>) {
         let state = create_test_state();

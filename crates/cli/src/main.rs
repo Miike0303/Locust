@@ -491,13 +491,14 @@ fn writes_to_entry_tree(format_id: &str) -> bool {
     matches!(format_id, "unity" | "unreal" | "wolf-rpg")
 }
 
-/// Central backup root for inject / direct-inject. `LOCUST_BACKUP_ROOT` isolates
-/// tests and lets operators put backups on a larger volume; default matches the
-/// historical `temp_dir()/locust_bak` path named in recovery messages.
+/// Persistent backup root for inject / direct-inject. A nonempty
+/// `LOCUST_BACKUP_ROOT` isolates tests or selects another volume; otherwise the
+/// root follows `AppConfig::config_dir()`, including `LOCUST_DATA_DIR`.
 fn locust_backup_root() -> PathBuf {
     std::env::var_os("LOCUST_BACKUP_ROOT")
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("locust_bak"))
+        .unwrap_or_else(|| locust_core::config::AppConfig::config_dir().join("backups"))
 }
 
 /// The restore step shared by every remedy issued from a state where the
@@ -1419,8 +1420,7 @@ async fn cmd_inject(
 
     let format_id = plugin.id().to_string();
 
-    // Use short temp path for backups to avoid Windows MAX_PATH issues
-    // (overridable with LOCUST_BACKUP_ROOT — same helper as --direct).
+    // Keep originals in persistent app data; Rust's Windows paths support long paths.
     let backup_root = locust_backup_root();
     std::fs::create_dir_all(&backup_root).ok();
     let backup_mgr = Arc::new(BackupManager::new(backup_root));
@@ -1968,8 +1968,58 @@ mod tests {
     use locust_core::models::StringStatus;
     use std::fs;
 
-    /// Process-global env var — serialize tests that set LOCUST_BACKUP_ROOT.
+    /// Process-global env vars — serialize tests that select backup/data roots.
     static BACKUP_ROOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvVarRestore {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn capture(name: &'static str) -> Self {
+            Self {
+                name,
+                previous: std::env::var_os(name),
+            }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_root_follows_data_dir_not_temp() {
+        let _lock = BACKUP_ROOT_LOCK.lock().await;
+        let _backup_root_restore = EnvVarRestore::capture("LOCUST_BACKUP_ROOT");
+        let _data_dir_restore = EnvVarRestore::capture("LOCUST_DATA_DIR");
+        let data_dir =
+            std::env::temp_dir().join(format!("locust_cli_data_{}", uuid::Uuid::new_v4()));
+
+        std::env::remove_var("LOCUST_BACKUP_ROOT");
+        std::env::set_var("LOCUST_DATA_DIR", &data_dir);
+
+        let expected = data_dir.join("backups");
+        assert_eq!(locust_backup_root(), expected);
+        assert_ne!(
+            locust_backup_root(),
+            std::env::temp_dir().join("locust_bak")
+        );
+
+        std::env::set_var("LOCUST_BACKUP_ROOT", "");
+        assert_eq!(locust_backup_root(), expected);
+
+        let override_root =
+            std::env::temp_dir().join(format!("locust_cli_backup_{}", uuid::Uuid::new_v4()));
+        std::env::set_var("LOCUST_BACKUP_ROOT", &override_root);
+        assert_eq!(locust_backup_root(), override_root);
+    }
 
     #[test]
     fn download_patch_zip_rejects_non_http_schemes() {
