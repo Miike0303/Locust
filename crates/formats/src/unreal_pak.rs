@@ -19,16 +19,29 @@
 //! - **Data record**: index-style entry with `offset=0` at the data position,
 //!   then payload. Index entry `offset` points at that header.
 //!
+//! # Reader support
+//! Seek-based v3-v8 classic indexes, non-frozen v9 classic indexes, and v10-v11
+//! compact indexes with a full directory. Primary/secondary index reads share
+//! a 32 MiB cap. Selected LocRes records support uncompressed, Zlib and Gzip
+//! payloads with 64 MiB stored/output caps and SHA-1 validation.
+//!
+//! Frozen v9, v8A byte-method entries, path-hash-only archives without a full
+//! directory, encrypted records/indexes, Oodle and other codecs, signatures,
+//! and IoStore remain unsupported. No archive-wide scan is used for them.
+//!
 //! # Writer support
-//! Uncompressed-only. Write versions **3** and **8** (and **7** as v8 without
-//! compression-method table). Read probes any footer with valid magic; classic
-//! index parse supports v3–v8. v9+ frozen / v10–11 path-hash indexes are not
-//! fully parsed — write for those versions returns a clear error (patch paks
-//! should use v8, which UE 4.22–5.x still mounts).
+//! Uncompressed patch PAKs in versions 3, 7 and 8. Modern bases map to v8;
+//! whether a particular game mounts the overlay remains game-dependent.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use sha1::{Digest, Sha1};
+#[path = "unreal_pak_modern.rs"]
+mod modern;
+#[path = "unreal_pak_payload.rs"]
+mod payload;
+pub use payload::read_payload;
 
 /// Pak footer magic (little-endian `0x5A6F12E1`).
 pub const PAK_MAGIC: u32 = 0x5A6F12E1;
@@ -40,6 +53,13 @@ pub const WRITE_VERSION_CLASSIC: u32 = 3;
 
 const COMPRESSION_METHOD_NAME_LEN: usize = 32;
 const COMPRESSION_METHOD_COUNT_V8: usize = 5;
+
+/// Aggregate serialized primary + secondary index byte cap.
+pub const MAX_INDEX_SIZE: u64 = 32 * 1024 * 1024;
+/// Uncompressed LocRes payload cap for a single record.
+pub const MAX_LOCRES_PAYLOAD: u64 = 64 * 1024 * 1024;
+/// Footer magic is searched in this tail window (absolute file bytes).
+const FOOTER_SEARCH_WINDOW: u64 = 512;
 
 #[derive(Debug)]
 pub struct PakError {
@@ -83,6 +103,8 @@ pub struct PakFooter {
     pub index_size: u64,
     pub index_hash: [u8; 20],
     pub encrypted_index: bool,
+    pub compression_methods: Vec<String>,
+    pub frozen_index: bool,
     /// Absolute file offset of the 4-byte magic field.
     pub magic_offset: usize,
 }
@@ -92,54 +114,94 @@ pub fn read_footer(data: &[u8], file_label: &str) -> Result<PakFooter, PakError>
     if data.len() < 44 {
         return Err(err(file_label, "file too small for pak footer"));
     }
-    let search_from = data.len().saturating_sub(512);
+    let window = (data.len() as u64).min(FOOTER_SEARCH_WINDOW) as usize;
+    let start = data.len() - window;
+    parse_footer_window(&data[start..], start as u64, file_label)
+}
+
+/// Probe footer by seeking to EOF. Reads at most [`FOOTER_SEARCH_WINDOW`] bytes.
+pub fn read_footer_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    file_label: &str,
+) -> Result<PakFooter, PakError> {
+    if file_len < 44 {
+        return Err(err(file_label, "file too small for pak footer"));
+    }
+    let window = file_len.min(FOOTER_SEARCH_WINDOW);
+    let start = file_len - window;
+    reader
+        .seek(SeekFrom::Start(start))
+        .map_err(|e| err(file_label, format!("seek footer: {e}")))?;
+    let mut buf = vec![0u8; window as usize];
+    reader
+        .read_exact(&mut buf)
+        .map_err(|e| err(file_label, format!("read footer: {e}")))?;
+    parse_footer_window(&buf, start, file_label)
+}
+
+fn parse_footer_window(
+    window: &[u8],
+    window_start: u64,
+    file_label: &str,
+) -> Result<PakFooter, PakError> {
+    if window.len() < 44 {
+        return Err(err(file_label, "file too small for pak footer"));
+    }
     let magic_le = PAK_MAGIC.to_le_bytes();
     let mut magic_pos = None;
-    // Scan backwards for magic.
-    let mut i = data.len() - 4;
+    let mut i = window.len() - 4;
     loop {
-        if i < search_from {
+        if window[i..i + 4] == magic_le && i + 4 + 4 + 8 + 8 + 20 <= window.len() {
+            magic_pos = Some(i);
             break;
-        }
-        if data[i..i + 4] == magic_le {
-            // Prefer magic that has room after it for version+index fields.
-            if i + 4 + 4 + 8 + 8 + 20 <= data.len() {
-                magic_pos = Some(i);
-                break;
-            }
         }
         if i == 0 {
             break;
         }
         i -= 1;
     }
-    let magic_offset =
+    let magic_in_window =
         magic_pos.ok_or_else(|| err(file_label, "pak magic 0x5A6F12E1 not found near EOF"))?;
 
-    let version = u32::from_le_bytes(data[magic_offset + 4..magic_offset + 8].try_into().unwrap());
+    let version = u32::from_le_bytes(
+        window[magic_in_window + 4..magic_in_window + 8]
+            .try_into()
+            .unwrap(),
+    );
     if version == 0 || version > 11 {
         return Err(err(
             file_label,
             format!("implausible pak version {version} at footer"),
         ));
     }
+    let prefix = if version >= 7 {
+        17
+    } else if version >= 4 {
+        1
+    } else {
+        0
+    };
+    if magic_in_window < prefix {
+        return Err(err(file_label, "truncated pak footer prefix"));
+    }
     let index_offset = u64::from_le_bytes(
-        data[magic_offset + 8..magic_offset + 16]
+        window[magic_in_window + 8..magic_in_window + 16]
             .try_into()
             .unwrap(),
     );
     let index_size = u64::from_le_bytes(
-        data[magic_offset + 16..magic_offset + 24]
+        window[magic_in_window + 16..magic_in_window + 24]
             .try_into()
             .unwrap(),
     );
     let mut index_hash = [0u8; 20];
-    index_hash.copy_from_slice(&data[magic_offset + 24..magic_offset + 44]);
+    index_hash.copy_from_slice(&window[magic_in_window + 24..magic_in_window + 44]);
 
     // Encrypted flag sits immediately before magic for version ≥ 4; for v≥7 a
     // 16-byte encryption guid precedes that flag.
-    let encrypted_index = if version >= 4 && magic_offset >= 1 {
-        data[magic_offset - 1] != 0
+    let encrypted_index = if version >= 4 && magic_in_window >= 1 {
+        window[magic_in_window - 1] != 0
     } else {
         false
     };
@@ -147,16 +209,47 @@ pub fn read_footer(data: &[u8], file_label: &str) -> Result<PakFooter, PakError>
     if encrypted_index {
         return Err(err(
             file_label,
-            "encrypted pak index is not supported (need decryption key)",
+            "encrypted pak index is not supported (need decryption key); \
+             IoStore/signed paks are also unsupported",
         ));
     }
 
+    let mut tail = magic_in_window + 44;
+    let frozen_index = if version == 9 {
+        let frozen = *window
+            .get(tail)
+            .ok_or_else(|| err(file_label, "truncated frozen-index flag"))?;
+        tail += 1;
+        if frozen > 1 {
+            return Err(err(file_label, "invalid frozen-index flag"));
+        }
+        frozen != 0
+    } else {
+        false
+    };
+    let compression_methods = if version >= 8 {
+        if window.len().saturating_sub(tail) != 160 {
+            return Err(err(file_label, "unsupported pak compression table layout (v8A byte-method entries are unsupported)"));
+        }
+        window[tail..]
+            .chunks_exact(32)
+            .map(|slot| {
+                let end = slot.iter().position(|b| *b == 0).unwrap_or(32);
+                String::from_utf8_lossy(&slot[..end]).into_owned()
+            })
+            .collect()
+    } else {
+        vec!["Zlib".into(), "Gzip".into(), "Oodle".into()]
+    };
+    let magic_offset = window_start as usize + magic_in_window;
     Ok(PakFooter {
         version,
         index_offset,
         index_size,
         index_hash,
         encrypted_index,
+        compression_methods,
+        frozen_index,
         magic_offset,
     })
 }
@@ -175,6 +268,12 @@ pub struct PakRecord {
     pub compression_method: u32,
     pub sha1: [u8; 20],
     pub encrypted: bool,
+    pub compression_blocks: Vec<(u64, u64)>,
+    pub compression_block_size: u32,
+    pub compression_name: String,
+    /// Compact modern entries omit SHA-1; the data header supplies it.
+    pub hash_in_index: bool,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -238,11 +337,14 @@ impl<'a> R<'a> {
         if length > 0 {
             let n = length as usize;
             let bytes = self.take(n)?;
+            let bytes = bytes
+                .strip_suffix(&[0])
+                .ok_or_else(|| err(self.file, "unterminated ANSI FString"))?;
             let s =
                 std::str::from_utf8(bytes).map_err(|_| err(self.file, "invalid FString UTF-8"))?;
-            Ok(s.trim_end_matches('\0').to_string())
+            Ok(s.to_string())
         } else {
-            let units = (-length) as usize;
+            let units = length.unsigned_abs() as usize;
             let n = units
                 .checked_mul(2)
                 .ok_or_else(|| err(self.file, "FString size overflow"))?;
@@ -251,8 +353,8 @@ impl<'a> R<'a> {
             for c in bytes.chunks_exact(2) {
                 u16s.push(u16::from_le_bytes([c[0], c[1]]));
             }
-            if u16s.last() == Some(&0) {
-                u16s.pop();
+            if u16s.pop() != Some(0) {
+                return Err(err(self.file, "unterminated UTF-16 FString"));
             }
             String::from_utf16(&u16s).map_err(|_| err(self.file, "invalid UTF-16 FString"))
         }
@@ -290,66 +392,144 @@ fn read_entry_body(r: &mut R<'_>, version: u32) -> Result<PakRecord, PakError> {
         let _ts = r.u64()?;
     }
     let sha1 = r.sha1()?;
+    let mut compression_blocks = Vec::new();
+    let mut flags = 0;
+    let mut compression_block_size = 0;
     if version >= 3 {
         if compression_method != 0 {
-            let block_count = r.u32()? as usize;
-            if block_count > 1_000_000 {
-                return Err(err(r.file, "compression block count too large"));
+            let count = r.u32()? as usize;
+            if count > 65536 || count > r.data.len().saturating_sub(r.pos) / 16 {
+                return Err(err(
+                    r.file,
+                    "compression block count exceeds safety limit or remaining bytes",
+                ));
             }
-            for _ in 0..block_count {
-                let _ = r.u64()?;
-                let _ = r.u64()?;
+            for _ in 0..count {
+                compression_blocks.push((r.u64()?, r.u64()?));
             }
         }
-        let encrypted = r.u8()? != 0;
-        let _block_size = r.u32()?;
-        Ok(PakRecord {
-            name: String::new(),
-            offset,
-            size,
-            uncompressed_size,
-            compression_method,
-            sha1,
-            encrypted,
-        })
-    } else {
-        Ok(PakRecord {
-            name: String::new(),
-            offset,
-            size,
-            uncompressed_size,
-            compression_method,
-            sha1,
-            encrypted: false,
-        })
+        flags = r.u8()?;
+        if flags & !3 != 0 {
+            return Err(err(r.file, "invalid pak entry flags"));
+        }
+        compression_block_size = r.u32()?;
     }
+    Ok(PakRecord {
+        name: String::new(),
+        offset,
+        size,
+        uncompressed_size,
+        compression_method,
+        sha1,
+        encrypted: flags & 1 != 0,
+        compression_blocks,
+        compression_block_size,
+        compression_name: String::new(),
+        hash_in_index: true,
+        deleted: flags & 2 != 0,
+    })
 }
 
-/// Parse classic (non–path-hash) index. Suitable for writer-produced paks and
-/// many v3–v8 game paks. v9+ frozen / v10–11 path-hash indexes return Err.
+/// Parse a supported classic or modern full-directory index from a slice.
 pub fn read_index(data: &[u8], file_label: &str) -> Result<PakIndex, PakError> {
-    let footer = read_footer(data, file_label)?;
-    if footer.version >= 9 {
+    read_index_from_reader(
+        &mut std::io::Cursor::new(data),
+        data.len() as u64,
+        file_label,
+    )
+}
+
+/// Seek-based classic or modern full-directory index read; never loads the whole archive.
+pub fn read_index_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    file_label: &str,
+) -> Result<PakIndex, PakError> {
+    let footer = read_footer_from_reader(reader, file_len, file_label)?;
+    read_index_body_from_reader(reader, file_len, footer, file_label)
+}
+
+fn read_index_body_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    footer: PakFooter,
+    file_label: &str,
+) -> Result<PakIndex, PakError> {
+    if footer.frozen_index {
+        return Err(err(
+            file_label,
+            "unsupported v9 frozen pak index; refusing a full-file scan",
+        ));
+    }
+    if footer.index_size == 0 {
+        return Err(err(file_label, "pak index size is 0"));
+    }
+    if footer.index_size > MAX_INDEX_SIZE {
         return Err(err(
             file_label,
             format!(
-                "pak version {} uses frozen/path-hash index — classic index parse unsupported \
-                 (write a v{} patch pak instead)",
-                footer.version, WRITE_VERSION_MODERN
+                "pak index size {} exceeds {} byte safety limit",
+                footer.index_size, MAX_INDEX_SIZE
             ),
         ));
     }
-    let start = footer.index_offset as usize;
-    let end = start
-        .checked_add(footer.index_size as usize)
-        .filter(|e| *e <= data.len())
-        .ok_or_else(|| err(file_label, "index range past EOF"))?;
-    let index_bytes = &data[start..end];
-    // Optional integrity check
+    if footer
+        .index_offset
+        .checked_add(footer.index_size)
+        .filter(|&end| end <= file_len && end <= footer_start(&footer))
+        .is_none()
+    {
+        return Err(err(file_label, "index range past EOF or overlaps footer"));
+    }
+    reader
+        .seek(SeekFrom::Start(footer.index_offset))
+        .map_err(|e| err(file_label, format!("seek index: {e}")))?;
+    let mut index_bytes = vec![0u8; footer.index_size as usize];
+    reader
+        .read_exact(&mut index_bytes)
+        .map_err(|e| err(file_label, format!("read index: {e}")))?;
+    if footer.version >= 10 {
+        modern::parse_index(reader, &index_bytes, footer, file_label)
+    } else {
+        parse_classic_index(&index_bytes, footer, file_label)
+    }
+}
+
+fn footer_start(footer: &PakFooter) -> u64 {
+    (footer.magic_offset as u64).saturating_sub(if footer.version >= 7 {
+        17
+    } else if footer.version >= 4 {
+        1
+    } else {
+        0
+    })
+}
+
+fn assign_compression(record: &mut PakRecord, footer: &PakFooter) {
+    record.compression_name = record
+        .compression_method
+        .checked_sub(1)
+        .and_then(|slot| footer.compression_methods.get(slot as usize))
+        .cloned()
+        .unwrap_or_default();
+}
+
+fn parse_classic_index(
+    index_bytes: &[u8],
+    footer: PakFooter,
+    file_label: &str,
+) -> Result<PakIndex, PakError> {
+    if footer.index_size > MAX_INDEX_SIZE {
+        return Err(err(
+            file_label,
+            format!(
+                "pak index size {} exceeds {} byte safety limit",
+                footer.index_size, MAX_INDEX_SIZE
+            ),
+        ));
+    }
     let got = sha1_bytes(index_bytes);
     if got != footer.index_hash {
-        // Non-fatal for some hand-edited paks; still try to parse but warn via Err soft?
-        // Strict: reject so tests and real paks stay honest.
         return Err(err(
             file_label,
             "index SHA-1 mismatch (corrupt or encrypted index)",
@@ -363,14 +543,26 @@ pub fn read_index(data: &[u8], file_label: &str) -> Result<PakIndex, PakError> {
     };
     let mount_point = r.fstring()?;
     let count = r.u32()? as usize;
-    if count > 5_000_000 {
+    if count > 1_000_000
+        || count > r.data.len().saturating_sub(r.pos) / (4 + entry_header_size(footer.version))
+    {
         return Err(err(file_label, "record count exceeds safety limit"));
     }
     let mut records = Vec::with_capacity(count);
+    let mut expanded_path_bytes = 0usize;
     for _ in 0..count {
         let name = r.fstring()?;
+        let path_len = mount_point.len().saturating_add(name.len());
+        expanded_path_bytes = expanded_path_bytes.saturating_add(path_len);
+        if path_len > 4096 || expanded_path_bytes > MAX_INDEX_SIZE as usize {
+            return Err(err(
+                file_label,
+                "expanded resource paths exceed safety limit",
+            ));
+        }
         let mut rec = read_entry_body(&mut r, footer.version)?;
         rec.name = name;
+        assign_compression(&mut rec, &footer);
         records.push(rec);
     }
 
@@ -381,13 +573,102 @@ pub fn read_index(data: &[u8], file_label: &str) -> Result<PakIndex, PakError> {
     })
 }
 
+/// True when an index path looks like a LocRes resource.
+pub fn is_locres_record_name(name: &str) -> bool {
+    name.rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".locres"))
+}
+
+/// Join mount point + inner path into a stable virtual resource path.
+///
+/// Lexical only (no OS path access): `\` → `/`, skip `.` and empty segments,
+/// collapse interior `..`. Leading `..` from a mount such as `../../../` are
+/// kept. Equivalent mount/name splits of the same tree collapse to one key.
+/// Distinct culture/resource leaves stay distinct.
+///
+/// Rejects control characters, `:`, and empty / `..`-only results.
+pub fn mounted_resource_path(mount_point: &str, name: &str) -> Result<String, PakError> {
+    let mount = mount_point.replace('\\', "/");
+    let name = name.replace('\\', "/");
+    let joined = if mount.trim_end_matches('/').is_empty() {
+        name.trim_start_matches('/').to_string()
+    } else if name.trim_start_matches('/').is_empty() {
+        mount.trim_end_matches('/').to_string()
+    } else {
+        format!(
+            "{}/{}",
+            mount.trim_end_matches('/'),
+            name.trim_start_matches('/')
+        )
+    };
+    normalize_virtual_path(&joined)
+}
+
+fn normalize_virtual_path(path: &str) -> Result<String, PakError> {
+    if path.as_bytes().contains(&0) || path.chars().any(|c| c.is_control()) {
+        return Err(err("pak", "malformed virtual path (control character)"));
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg.contains(':') {
+            return Err(err("pak", "malformed virtual path (ambiguous drive/colon)"));
+        }
+        if seg == ".." {
+            match out.last() {
+                Some(prev) if *prev != ".." => {
+                    out.pop();
+                }
+                _ => out.push(".."),
+            }
+            continue;
+        }
+        out.push(seg);
+    }
+    if out.is_empty() || out.iter().all(|s| *s == "..") {
+        return Err(err("pak", "malformed virtual path (empty or parent-only)"));
+    }
+    Ok(out.join("/"))
+}
+
+/// Inner pak record name for writing a Locust patch: normalized, no `..`.
+pub fn canonical_inner_name(name: &str) -> Result<String, PakError> {
+    let virtual_path = mounted_resource_path("", name)?;
+    if virtual_path.split('/').any(|s| s == "..") {
+        return Err(err(
+            "pak",
+            format!("unsafe record path '{name}' (contains parent segments)"),
+        ));
+    }
+    Ok(virtual_path)
+}
+
+/// Read one uncompressed, unencrypted record payload by seeking. Verifies SHA-1.
+pub fn read_uncompressed_payload<R: Read + Seek>(
+    reader: &mut R,
+    record: &PakRecord,
+    version: u32,
+    file_len: u64,
+    file_label: &str,
+) -> Result<Vec<u8>, PakError> {
+    if record.compression_method != 0 {
+        return Err(err(
+            file_label,
+            "compressed record: use read_payload for codec decoding",
+        ));
+    }
+    read_payload(reader, record, version, file_len, file_label)
+}
+
 /// Find the index record whose data span contains absolute file offset `abs`.
 /// Data span is `[offset, offset + entry_header_size + size)`.
 pub fn record_containing_offset(index: &PakIndex, abs: u64) -> Option<&PakRecord> {
-    let hdr = entry_header_size(index.footer.version) as u64;
     index.records.iter().find(|r| {
         let start = r.offset;
-        let end = start.saturating_add(hdr).saturating_add(r.size);
+        let end = payload_offset(r, index.footer.version).saturating_add(r.size);
         abs >= start && abs < end
     })
 }
@@ -396,10 +677,19 @@ pub fn record_containing_offset(index: &PakIndex, abs: u64) -> Option<&PakRecord
 pub fn payload_offset(record: &PakRecord, version: u32) -> u64 {
     record
         .offset
-        .saturating_add(entry_header_size(version) as u64)
+        .saturating_add(record_header_size(record, version) as u64)
 }
 
 // ─── Writer ────────────────────────────────────────────────────────────────
+
+fn record_header_size(record: &PakRecord, version: u32) -> usize {
+    entry_header_size(version)
+        + if record.compression_method != 0 {
+            4 + 16 * record.compression_blocks.len()
+        } else {
+            0
+        }
+}
 
 struct W {
     buf: Vec<u8>,
@@ -439,17 +729,26 @@ impl W {
     }
 }
 
-fn write_entry_body(w: &mut W, version: u32, offset: u64, size: u64, sha1: &[u8; 20]) {
+fn write_entry_body(
+    w: &mut W,
+    version: u32,
+    offset: u64,
+    size: u64,
+    sha1: &[u8; 20],
+    compression_method: u32,
+) {
     w.u64(offset);
     w.u64(size);
     w.u64(size); // uncompressed == size
-    w.u32(0); // uncompressed method
+    w.u32(compression_method);
     if version <= 1 {
         w.u64(0); // timestamp
     }
     w.bytes(sha1);
     if version >= 3 {
-        // no blocks
+        if compression_method != 0 {
+            w.u32(0); // zero compression blocks (index-parseable, still unsupported)
+        }
         w.u8(0); // not encrypted
         w.u32(0); // block size
     }
@@ -488,6 +787,28 @@ pub fn write_pak(
     files: &[PakWriteFile],
     file_label: &str,
 ) -> Result<Vec<u8>, PakError> {
+    write_pak_inner(mount_point, version, files, 0, file_label)
+}
+
+/// Same layout as [`write_pak`] but every index/data entry is marked compressed
+/// (`compression_method = 1`, zero blocks). Payload bytes are still stored raw.
+/// Used to test that compressed LocRes cannot silently lose to a lower PAK.
+pub fn write_pak_marked_compressed(
+    mount_point: &str,
+    version: u32,
+    files: &[PakWriteFile],
+    file_label: &str,
+) -> Result<Vec<u8>, PakError> {
+    write_pak_inner(mount_point, version, files, 1, file_label)
+}
+
+fn write_pak_inner(
+    mount_point: &str,
+    version: u32,
+    files: &[PakWriteFile],
+    compression_method: u32,
+    file_label: &str,
+) -> Result<Vec<u8>, PakError> {
     if !matches!(version, 3 | 7 | 8) {
         return Err(err(
             file_label,
@@ -509,7 +830,14 @@ pub fn write_pak(
         let hash = sha1_bytes(&f.data);
         let header_off = data_w.pos();
         // On-disk header copy uses offset=0 (u4pak).
-        write_entry_body(&mut data_w, version, 0, f.data.len() as u64, &hash);
+        write_entry_body(
+            &mut data_w,
+            version,
+            0,
+            f.data.len() as u64,
+            &hash,
+            compression_method,
+        );
         data_w.bytes(&f.data);
         planned.push((f.name.clone(), header_off, f.data.len() as u64, hash));
     }
@@ -520,7 +848,14 @@ pub fn write_pak(
     index_w.u32(planned.len() as u32);
     for (name, header_off, size, hash) in &planned {
         index_w.fstring_ascii(name);
-        write_entry_body(&mut index_w, version, *header_off, *size, hash);
+        write_entry_body(
+            &mut index_w,
+            version,
+            *header_off,
+            *size,
+            hash,
+            compression_method,
+        );
     }
     let index_bytes = index_w.into_vec();
     let index_hash = sha1_bytes(&index_bytes);
@@ -542,8 +877,8 @@ pub fn write_pak(
     data_w.bytes(&index_hash);
 
     if version >= 8 {
-        // Five 32-byte compression method names; first is "None".
-        let methods = ["None", "Zlib", "Gzip", "Oodle", "LZ4"];
+        // Five 32-byte method slots; method zero (None) is implicit.
+        let methods = ["Zlib", "Gzip", "Oodle", "LZ4", ""];
         for (i, name) in methods.iter().enumerate() {
             if i >= COMPRESSION_METHOD_COUNT_V8 {
                 break;
@@ -576,8 +911,17 @@ pub fn write_patch_pak_matching(
 pub const DEFAULT_MOUNT_POINT: &str = "../../../";
 
 /// Suggest patch pak path beside `base_pak_path`: `<stem>_LOCUST_P.pak`.
+/// A generated Locust patch is rewritten in place so re-inject does not nest
+/// `Game_LOCUST_LOCUST_P.pak`.
 pub fn patch_pak_path(base_pak_path: &Path) -> std::path::PathBuf {
     let parent = base_pak_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = base_pak_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("patch.pak");
+    if file_name.to_ascii_lowercase().ends_with("_locust_p.pak") {
+        return base_pak_path.to_path_buf();
+    }
     let stem = base_pak_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -711,6 +1055,18 @@ mod tests {
     }
 
     #[test]
+    fn patch_pak_path_locust_rewrites_in_place() {
+        let p = Path::new("/game/Content/Paks/Game_LOCUST_P.pak");
+        let out = patch_pak_path(p);
+        assert_eq!(out, p);
+        let from_p = patch_pak_path(Path::new("/game/Content/Paks/Game_P.pak"));
+        assert_eq!(
+            from_p.file_name().unwrap().to_str().unwrap(),
+            "Game_LOCUST_P.pak"
+        );
+    }
+
+    #[test]
     fn matching_base_footer() {
         let base = write_pak(DEFAULT_MOUNT_POINT, 8, &sample_files(), "base.pak").unwrap();
         let (patch, ver) =
@@ -719,5 +1075,162 @@ mod tests {
         assert_eq!(ver, 8);
         let idx = read_index(&patch, "patch.pak").unwrap();
         assert_eq!(idx.records.len(), 1);
+    }
+
+    #[test]
+    fn read_index_from_reader_matches_slice() {
+        use std::io::Cursor;
+        let files = sample_files();
+        let bytes = write_pak(DEFAULT_MOUNT_POINT, 8, &files, "t.pak").unwrap();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let from_reader = read_index_from_reader(&mut cursor, bytes.len() as u64, "t.pak").unwrap();
+        let from_slice = read_index(&bytes, "t.pak").unwrap();
+        assert_eq!(from_reader.mount_point, from_slice.mount_point);
+        assert_eq!(from_reader.records.len(), from_slice.records.len());
+        for (a, b) in from_reader.records.iter().zip(&from_slice.records) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.sha1, b.sha1);
+        }
+        let rec = &from_reader.records[0];
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let payload = read_uncompressed_payload(
+            &mut cursor,
+            rec,
+            from_reader.footer.version,
+            bytes.len() as u64,
+            "t.pak",
+        )
+        .unwrap();
+        assert_eq!(payload, files[0].data);
+    }
+
+    #[test]
+    fn read_index_from_reader_rejects_encrypted_index() {
+        use std::io::Cursor;
+        let mut bytes = write_pak(DEFAULT_MOUNT_POINT, 8, &sample_files(), "t.pak").unwrap();
+        let footer = read_footer(&bytes, "t.pak").unwrap();
+        assert!(footer.magic_offset >= 1);
+        bytes[footer.magic_offset - 1] = 1;
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let err = read_index_from_reader(&mut cursor, bytes.len() as u64, "t.pak").unwrap_err();
+        assert!(err.message.contains("encrypted"), "{}", err.message);
+    }
+
+    #[test]
+    fn read_index_rejects_sha1_mismatch() {
+        let mut bytes = write_pak(DEFAULT_MOUNT_POINT, 3, &sample_files(), "t.pak").unwrap();
+        let footer = read_footer(&bytes, "t.pak").unwrap();
+        bytes[footer.magic_offset + 24] ^= 0xFF;
+        let err = read_index(&bytes, "t.pak").unwrap_err();
+        assert!(err.message.contains("SHA-1"), "{}", err.message);
+    }
+
+    #[test]
+    fn mounted_resource_path_joins_mount_and_name() {
+        assert_eq!(
+            mounted_resource_path(DEFAULT_MOUNT_POINT, "TestGame/Content/Game.locres").unwrap(),
+            "../../../TestGame/Content/Game.locres"
+        );
+        assert!(is_locres_record_name(
+            "TestGame/Content/Localization/Game/es/Game.locres"
+        ));
+        assert!(!is_locres_record_name("TestGame/Content/Foo.uasset"));
+    }
+
+    #[test]
+    fn mounted_resource_path_aliases_dedupe_cultures_stay_distinct() {
+        let a = mounted_resource_path(
+            DEFAULT_MOUNT_POINT,
+            "TestGame/Content/Localization/Game/en/Game.locres",
+        )
+        .unwrap();
+        let b = mounted_resource_path(
+            "../../",
+            "../TestGame/Content/./Localization/Game/en/Game.locres",
+        )
+        .unwrap();
+        let c = mounted_resource_path(
+            "../../../",
+            r"TestGame\Content\Localization\Game\en\Game.locres",
+        )
+        .unwrap();
+        let collapsed = mounted_resource_path(
+            "../../../",
+            "TestGame/Content/../Content/Localization/Game/en/Game.locres",
+        )
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(a, collapsed);
+        let es = mounted_resource_path(
+            DEFAULT_MOUNT_POINT,
+            "TestGame/Content/Localization/Game/es/Game.locres",
+        )
+        .unwrap();
+        let engine = mounted_resource_path(
+            DEFAULT_MOUNT_POINT,
+            "TestGame/Content/Localization/Engine/en/Engine.locres",
+        )
+        .unwrap();
+        assert_ne!(a, es);
+        assert_ne!(a, engine);
+    }
+
+    #[test]
+    fn mounted_resource_path_rejects_escape_and_empty() {
+        let err = mounted_resource_path("../../../", "").unwrap_err();
+        assert!(err.message.contains("malformed"), "{}", err.message);
+        let err = mounted_resource_path("../../../", "..").unwrap_err();
+        assert!(err.message.contains("malformed"), "{}", err.message);
+        let err = mounted_resource_path("../../../", "C:/Windows/Game.locres").unwrap_err();
+        assert!(err.message.contains("malformed"), "{}", err.message);
+        let err = canonical_inner_name("../Windows/evil.locres").unwrap_err();
+        assert!(
+            err.message.contains("malformed") || err.message.contains("unsafe"),
+            "{}",
+            err.message
+        );
+    }
+}
+
+#[cfg(test)]
+mod fstring_hardening_tests {
+    use super::*;
+
+    fn read_string(bytes: &[u8]) -> Result<String, PakError> {
+        R {
+            data: bytes,
+            pos: 0,
+            file: "fstring-review",
+        }
+        .fstring()
+    }
+
+    #[test]
+    fn ansi_fstring_must_end_in_nul() {
+        let mut bytes = 1i32.to_le_bytes().to_vec();
+        bytes.push(b'A');
+        assert!(read_string(&bytes).is_err());
+    }
+
+    #[test]
+    fn utf16_fstring_must_end_in_nul() {
+        let mut bytes = (-1i32).to_le_bytes().to_vec();
+        bytes.extend(0x4e2du16.to_le_bytes());
+        assert!(read_string(&bytes).is_err());
+    }
+
+    #[test]
+    fn embedded_nuls_are_preserved_and_rejected_as_resource_paths() {
+        let mut ansi = 3i32.to_le_bytes().to_vec();
+        ansi.extend(b"A\0\0");
+        let mut wide = (-3i32).to_le_bytes().to_vec();
+        wide.extend(0x4e2du16.to_le_bytes());
+        wide.extend([0; 4]);
+        assert_eq!(read_string(&ansi).unwrap(), "A\0");
+        assert_eq!(read_string(&wide).unwrap(), "中\0");
+        assert!(canonical_inner_name(&read_string(&ansi).unwrap()).is_err());
+        assert!(mounted_resource_path(&read_string(&wide).unwrap(), "Game.locres").is_err());
     }
 }

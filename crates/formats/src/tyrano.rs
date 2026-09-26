@@ -9,7 +9,7 @@
 //! - Game layout (TyranoBuilder shipping tree; not re-fetched here):
 //!   `data/scenario/*.ks` UTF-8 scenario scripts; engine assets under `tyrano/`.
 //!   Desktop Electron packs use `app.asar` (see [`crate::tyrano_asar`]); inject rebuilds
-//!   the asar in place with a `.locust-old` safety rename.
+//!   the asar in place with an exclusively owned backup and staged replacement.
 //!   NW.js desktop packs use `package.nw` or a self-extracting `*.exe` with an
 //!   appended ZIP (see [`crate::tyrano_nw`]).
 //!
@@ -28,9 +28,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::archive_replace::{guard_target, note_backups, replace_files};
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
+use locust_core::patch::GameLock;
 use tracing::warn;
 
 use crate::tyrano_asar::{self, AsarArchive};
@@ -216,6 +218,7 @@ fn collect_ks_under(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
+        .filter_entry(crate::discovery::is_game_entry)
         .filter_map(|e| e.ok())
     {
         let p = entry.path();
@@ -557,32 +560,6 @@ fn split_nw_virtual_path(path: &Path) -> Option<(String, String)> {
     None
 }
 
-/// Replace `path` with `new_bytes` after moving the original to `path` + `.locust-old`.
-fn replace_file_with_backup(path: &Path, new_bytes: &[u8]) -> Result<()> {
-    let backup = {
-        let mut s = path.to_string_lossy().into_owned();
-        s.push_str(".locust-old");
-        PathBuf::from(s)
-    };
-    if backup.exists() {
-        std::fs::remove_file(&backup).ok();
-    }
-    std::fs::rename(path, &backup).map_err(|e| {
-        parse_err(
-            &path.display().to_string(),
-            format!("cannot move aside for backup: {e}"),
-        )
-    })?;
-    if let Err(e) = std::fs::write(path, new_bytes) {
-        let _ = std::fs::rename(&backup, path);
-        return Err(parse_err(
-            &path.display().to_string(),
-            format!("write failed after backup (restored): {e}"),
-        ));
-    }
-    Ok(())
-}
-
 // ─── Plugin ────────────────────────────────────────────────────────────────
 
 impl FormatPlugin for TyranoPlugin {
@@ -800,6 +777,22 @@ impl FormatPlugin for TyranoPlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+        let search_root = Self::root_dir(path);
+        let game_lock = GameLock::acquire(if search_root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &search_root
+        })?;
+        self.inject_under_lock(path, entries, &game_lock)
+    }
+
+    fn inject_under_lock(
+        &self,
+        path: &Path,
+        entries: &[StringEntry],
+        game_lock: &GameLock,
+    ) -> Result<InjectionReport> {
+        game_lock.validate_selection(path)?;
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
@@ -850,6 +843,7 @@ impl FormatPlugin for TyranoPlugin {
                 strings_skipped += file_entries.len();
                 continue;
             }
+            guard_target(game_lock, &actual)?;
             let bytes = match std::fs::read(&actual) {
                 Ok(b) => b,
                 Err(e) => {
@@ -895,6 +889,7 @@ impl FormatPlugin for TyranoPlugin {
                 continue;
             }
 
+            guard_target(game_lock, &arch_path)?;
             let archive = match AsarArchive::open(&arch_path) {
                 Ok(a) => a,
                 Err(e) => {
@@ -923,6 +918,12 @@ impl FormatPlugin for TyranoPlugin {
                         continue;
                     }
                 };
+                if entry.unpacked {
+                    let normalized = locust_core::patch::zipsec::normalize_entry_name(&entry.path);
+                    let relative =
+                        locust_core::patch::zipsec::safe_entry_path(&normalized, &entry.path)?;
+                    guard_target(game_lock, &archive.unpacked_dir().join(relative))?;
+                }
                 let bytes = match archive.read_entry(entry) {
                     Ok(b) => b,
                     Err(e) => {
@@ -958,42 +959,29 @@ impl FormatPlugin for TyranoPlugin {
                 }
             }
 
-            // Unpacked files: write with per-file backup (or create if missing)
-            for (_key, disk, data) in &unpacked_writes {
-                if let Some(parent) = disk.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if disk.exists() {
-                    match replace_file_with_backup(disk, data) {
-                        Ok(()) => {
-                            files_modified += 1;
-                            files_written.push(disk.clone());
-                        }
-                        Err(e) => {
-                            warnings.push(format!("safe-replace {}: {e}", disk.display()));
-                        }
-                    }
-                } else if let Err(e2) = std::fs::write(disk, data) {
-                    warnings.push(format!("write unpacked {}: {e2}", disk.display()));
-                } else {
-                    files_modified += 1;
-                    files_written.push(disk.clone());
-                }
-            }
-
+            // Prepare the archive and all unpacked payloads together. A later
+            // installation failure must restore earlier payloads and header.
             if !replacements.is_empty() {
                 match tyrano_asar::rebuild_asar(&archive, &replacements) {
-                    Ok(new_arch) => match replace_file_with_backup(&arch_path, &new_arch) {
-                        Ok(()) => {
-                            files_modified += 1;
-                            files_written.push(arch_path.clone());
-                            strings_written += arch_written;
+                    Ok(new_arch) => {
+                        let mut outputs: Vec<(PathBuf, Vec<u8>)> = unpacked_writes
+                            .into_iter()
+                            .map(|(_, disk, data)| (disk, data))
+                            .collect();
+                        outputs.push((arch_path.clone(), new_arch));
+                        match replace_files(game_lock, &outputs) {
+                            Ok(backups) => {
+                                note_backups(backups, &mut warnings);
+                                files_modified += outputs.len();
+                                files_written.extend(outputs.into_iter().map(|(path, _)| path));
+                                strings_written += arch_written;
+                            }
+                            Err(e) => {
+                                warnings.push(format!("safe-replace {archive_rel}: {e}"));
+                                strings_skipped += arch_written;
+                            }
                         }
-                        Err(e) => {
-                            warnings.push(format!("safe-replace {archive_rel}: {e}"));
-                            strings_skipped += arch_written;
-                        }
-                    },
+                    }
                     Err(e) => {
                         warnings.push(format!("rebuild {archive_rel}: {e}"));
                         strings_skipped += arch_written;
@@ -1020,6 +1008,7 @@ impl FormatPlugin for TyranoPlugin {
                 continue;
             }
 
+            guard_target(game_lock, &arch_path)?;
             let archive = match NwArchive::open(&arch_path) {
                 Ok(a) => a,
                 Err(e) => {
@@ -1074,17 +1063,20 @@ impl FormatPlugin for TyranoPlugin {
 
             if !replacements.is_empty() {
                 match tyrano_nw::rebuild_nw_zip(&archive, &replacements) {
-                    Ok(new_pkg) => match replace_file_with_backup(&arch_path, &new_pkg) {
-                        Ok(()) => {
-                            files_modified += 1;
-                            files_written.push(arch_path.clone());
-                            strings_written += arch_written;
+                    Ok(new_pkg) => {
+                        match replace_files(game_lock, &[(arch_path.clone(), new_pkg)]) {
+                            Ok(backups) => {
+                                note_backups(backups, &mut warnings);
+                                files_modified += 1;
+                                files_written.push(arch_path.clone());
+                                strings_written += arch_written;
+                            }
+                            Err(e) => {
+                                warnings.push(format!("safe-replace {archive_rel}: {e}"));
+                                strings_skipped += arch_written;
+                            }
                         }
-                        Err(e) => {
-                            warnings.push(format!("safe-replace {archive_rel}: {e}"));
-                            strings_skipped += arch_written;
-                        }
-                    },
+                    }
                     Err(e) => {
                         warnings.push(format!("rebuild {archive_rel}: {e}"));
                         strings_skipped += arch_written;
@@ -1094,6 +1086,7 @@ impl FormatPlugin for TyranoPlugin {
         }
 
         Ok(InjectionReport {
+            skip_reasons: Default::default(),
             files_modified,
             strings_written,
             strings_skipped,
@@ -1107,6 +1100,187 @@ impl FormatPlugin for TyranoPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn held_lock_injects_loose_and_archive_without_releasing_exclusion() {
+        for packed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let other = tempfile::tempdir().unwrap();
+            let path = if packed {
+                let path = root.path().join("package.nw");
+                fs::write(&path, build_nw_zip_bytes(sample_scenario())).unwrap();
+                path
+            } else {
+                write_tyrano_layout(root.path(), "scene.ks", sample_scenario(), false)
+            };
+            let original = fs::read(&path).unwrap();
+            let plugin = TyranoPlugin::new();
+            let mut entries = plugin.extract(root.path()).unwrap();
+            entries.retain(|e| e.source == "This is narration.");
+            assert_eq!(entries.len(), 1);
+            entries[0].translation = Some("Texto traducido.".into());
+            let wrong = GameLock::acquire(other.path()).unwrap();
+            assert!(plugin
+                .inject_under_lock(root.path(), &entries, &wrong)
+                .is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let lock = GameLock::acquire(root.path()).unwrap();
+            assert!(plugin.inject(root.path(), &entries).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let report = plugin
+                .inject_under_lock(root.path(), &entries, &lock)
+                .unwrap();
+            assert_eq!(report.strings_written, 1, "{report:?}");
+            assert!(plugin
+                .extract(root.path())
+                .unwrap()
+                .iter()
+                .any(|e| e.source == "Texto traducido."));
+            assert!(GameLock::acquire(root.path()).is_err());
+            drop(lock);
+            assert!(GameLock::acquire(root.path()).is_ok());
+        }
+    }
+
+    #[test]
+    fn all_packed_formats_roundtrip_quoted_text_and_preserve_unrelated_sidecars() {
+        for kind in ["asar", "nw", "exe"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (path, bytes) = match kind {
+                "asar" => (
+                    dir.path().join("app.asar"),
+                    crate::tyrano_asar::write_asar(&[(
+                        "data/scenario/scene1.ks".into(),
+                        sample_scenario().as_bytes().to_vec(),
+                    )])
+                    .unwrap(),
+                ),
+                "nw" => (
+                    dir.path().join("package.nw"),
+                    build_nw_zip_bytes(sample_scenario()),
+                ),
+                _ => {
+                    let mut bytes = b"MZ\x90\x00NEUTRAL_STUB".to_vec();
+                    bytes.extend(build_nw_zip_bytes(sample_scenario()));
+                    (dir.path().join("data.exe"), bytes)
+                }
+            };
+            fs::write(&path, &bytes).unwrap();
+            let sidecar = std::path::PathBuf::from(format!("{}.locust-old", path.display()));
+            fs::create_dir(&sidecar).unwrap();
+            fs::write(sidecar.join("sentinel"), b"recursive exact bytes").unwrap();
+            let plugin = TyranoPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            let translated = "He said \"hello\"; it's C:\\folder.";
+            for e in &mut entries {
+                if e.source == "This is narration." {
+                    e.translation = Some(translated.into());
+                }
+            }
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(report.strings_written, 1, "{kind}: {report:?}");
+            assert_eq!(fs::read(backup_path(&report)).unwrap(), bytes);
+            assert_eq!(
+                fs::read(sidecar.join("sentinel")).unwrap(),
+                b"recursive exact bytes"
+            );
+            assert_eq!(report.files_written, vec![path]);
+            let again = plugin.extract(dir.path()).unwrap();
+            assert!(
+                again.iter().any(|e| e.source == translated),
+                "{kind}: {again:?}"
+            );
+            assert_eq!(again.len(), entries.len());
+        }
+    }
+
+    #[test]
+    fn unpacked_payload_and_archive_header_are_committed_with_exact_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch_path = dir.path().join("app.asar");
+        let disk = dir.path().join("app.asar.unpacked/data/scenario/scene.ks");
+        fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        let original = b"Original narration.\n";
+        fs::write(&disk, original).unwrap();
+        let json=serde_json::json!({"files":{"data":{"files":{"scenario":{"files":{"scene.ks":{"size":original.len(),"unpacked":true}}}}}}}).to_string();
+        let pad = (4 - json.len() % 4) % 4;
+        let mut bytes = Vec::new();
+        for n in [
+            4u32,
+            (8 + json.len() + pad) as u32,
+            (4 + json.len() + pad) as u32,
+            json.len() as u32,
+        ] {
+            bytes.extend(n.to_le_bytes());
+        }
+        bytes.extend(json.as_bytes());
+        bytes.resize(bytes.len() + pad, 0);
+        fs::write(&arch_path, &bytes).unwrap();
+        let plugin = TyranoPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        entries[0].translation = Some("A much longer \"quoted\" narration.".into());
+        let report = plugin.inject(dir.path(), &entries).unwrap();
+        assert_eq!(report.files_modified, 2, "{report:?}");
+        assert_eq!(report.strings_written, 1);
+        let backups: Vec<_> = report
+            .warnings
+            .iter()
+            .filter_map(|w| w.strip_prefix("previous archive retained at "))
+            .map(|p| fs::read(p).unwrap())
+            .collect();
+        assert!(backups.contains(&bytes));
+        assert!(backups.contains(&original.to_vec()));
+        let archive = AsarArchive::open(&arch_path).unwrap();
+        assert_eq!(archive.entries[0].size, fs::metadata(&disk).unwrap().len());
+        assert_eq!(
+            plugin.extract(dir.path()).unwrap()[0].source,
+            "A much longer \"quoted\" narration."
+        );
+        assert_eq!(report.files_written, vec![disk, arch_path]);
+    }
+
+    #[test]
+    fn archive_basename_fallback_is_confined_to_selected_game() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.nw");
+        fs::write(&path, build_nw_zip_bytes(sample_scenario())).unwrap();
+        let plugin = TyranoPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        for e in &mut entries {
+            e.file_path = PathBuf::from("obsolete/location").join(&e.file_path);
+            if e.source == "This is narration." {
+                e.translation = Some("Fallback translation.".into());
+            }
+        }
+        let report = plugin.inject(dir.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.files_written, vec![path]);
+        assert!(plugin
+            .extract(dir.path())
+            .unwrap()
+            .iter()
+            .any(|e| e.source == "Fallback translation."));
+    }
+    fn backup_path(report: &locust_core::extraction::InjectionReport) -> std::path::PathBuf {
+        report
+            .warnings
+            .iter()
+            .find_map(|w| w.strip_prefix("previous archive retained at "))
+            .map(std::path::PathBuf::from)
+            .expect("reported owned backup")
+    }
+
+    #[test]
+    fn unrelated_backup_sentinel_survives_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.nw");
+        std::fs::write(&path, b"original archive").unwrap();
+        let sidecar = dir.path().join("package.nw.locust-old");
+        std::fs::write(&sidecar, b"unrelated exact bytes").unwrap();
+        let lock = locust_core::patch::GameLock::acquire(dir.path()).unwrap();
+        crate::archive_replace::replace_files(&lock, &[(path, b"new archive".to_vec())]).unwrap();
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"unrelated exact bytes");
+    }
     use super::*;
     use std::fs;
 
@@ -1464,7 +1638,7 @@ block comment body\r\n\
         let report = plugin.inject(&dir, &entries).unwrap();
         assert!(report.files_modified >= 1, "{report:?}");
 
-        let backup = PathBuf::from(format!("{}.locust-old", asar_path.display()));
+        let backup = backup_path(&report);
         assert!(backup.is_file(), "expected .locust-old at {backup:?}");
         assert!(asar_path.is_file());
 
@@ -1519,7 +1693,7 @@ block comment body\r\n\
         }
         let report = plugin.inject(&dir, &entries).unwrap();
         assert!(report.files_modified >= 1, "{report:?}");
-        let backup = PathBuf::from(format!("{}.locust-old", nw_path.display()));
+        let backup = backup_path(&report);
         assert!(backup.is_file(), "expected .locust-old");
 
         // Untouched asset still present after inject.
@@ -1559,54 +1733,50 @@ block comment body\r\n\
                 e.translation = Some("Narracion en exe.".into());
             }
         }
-        plugin.inject(&dir, &entries).unwrap();
+        let report = plugin.inject(&dir, &entries).unwrap();
         let out = fs::read(&exe_path).unwrap();
         assert!(
             out.starts_with(&prefix),
             "exe prefix must be preserved after inject"
         );
-        let backup = PathBuf::from(format!("{}.locust-old", exe_path.display()));
+        let backup = backup_path(&report);
         assert!(backup.is_file());
         let again = plugin.extract(&dir).unwrap();
         assert!(again.iter().any(|e| e.source.contains("Narracion en exe")));
     }
 
     #[test]
-    fn test_locust_old_restored_on_write_failure_path() {
-        // replace_file_with_backup restores original when the write step fails —
-        // exercise via a path that is a directory (write fails after rename).
+    fn repeated_injection_keeps_every_prior_backup() {
         let dir = tempdir();
-        let nw_path = dir.join("package.nw");
-        fs::write(&nw_path, build_nw_zip_bytes(sample_scenario())).unwrap();
-        // After a successful inject, .locust-old holds prior bytes.
+        let path = dir.join("package.nw");
+        let original = build_nw_zip_bytes(sample_scenario());
+        fs::write(&path, &original).unwrap();
         let plugin = TyranoPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
         for e in &mut entries {
             if e.source.contains("This is narration") {
-                e.translation = Some("x".into());
+                e.translation = Some("First replacement".into());
             }
         }
-        plugin.inject(&dir, &entries).unwrap();
-        let backup = PathBuf::from(format!("{}.locust-old", nw_path.display()));
-        assert!(backup.is_file());
-        let old = fs::read(&backup).unwrap();
-        // Second inject overwrites .locust-old with the previous package.nw.
+        let first = plugin.inject(&dir, &entries).unwrap();
+        let backup = backup_path(&first);
+        let first_bytes = fs::read(&path).unwrap();
+        let mut entries = plugin.extract(&dir).unwrap();
         for e in &mut entries {
-            if e.source.contains("This is narration") || e.source.contains("x") {
-                e.translation = Some("yy".into());
+            if e.source.contains("First replacement") {
+                e.translation = Some("Second replacement".into());
             }
         }
-        // Re-extract so translations match current file text.
-        let mut entries2 = plugin.extract(&dir).unwrap();
-        for e in &mut entries2 {
-            if e.source.contains("x") || e.source.contains("narration") {
-                e.translation = Some("second pass".into());
-            }
-        }
-        plugin.inject(&dir, &entries2).unwrap();
-        assert!(backup.is_file());
-        // Prior package (post-first-inject) should have been moved to .locust-old.
-        assert_ne!(fs::read(&backup).unwrap(), old);
+        let second = plugin.inject(&dir, &entries).unwrap();
+        let second_backup = backup_path(&second);
+        assert_ne!(backup, second_backup);
+        assert_eq!(fs::read(backup).unwrap(), original);
+        assert_eq!(fs::read(second_backup).unwrap(), first_bytes);
+        assert!(plugin
+            .extract(&dir)
+            .unwrap()
+            .iter()
+            .any(|e| e.source == "Second replacement"));
     }
 
     #[test]

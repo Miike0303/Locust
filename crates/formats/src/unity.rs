@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
+use locust_core::textasset_group::{self, GroupKind};
 
 use crate::unity_serialized::{
     is_binary_looking_script, is_textasset_script_worth_extracting,
@@ -18,6 +19,7 @@ use crate::unity_serialized::{
 /// 2. Structural TextAsset + MonoBehaviour + TextMesh + GUIText extraction from
 ///    SerializedFile `.assets` / `level*` (type-tree blobs skipped; no full type-tree walk)
 /// 3. Heuristic length-prefixed UTF-8 scan of the same files (skips structural ranges)
+/// 4. UnityFS `*_Data/data.unity3d` bundles (contained SerializedFiles as virtual paths)
 pub struct UnityPlugin;
 
 impl UnityPlugin {
@@ -89,6 +91,7 @@ impl UnityPlugin {
         for entry in walkdir::WalkDir::new(scripts_dir)
             .follow_links(false)
             .into_iter()
+            .filter_entry(crate::discovery::is_game_entry)
             .filter_map(|e| e.ok())
         {
             let fpath = entry.path();
@@ -181,103 +184,97 @@ impl UnityPlugin {
         Ok(all)
     }
 
-    fn inject_text_scripts(_path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
-        let mut files_modified = 0;
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
-        let mut files_written: Vec<PathBuf> = Vec::new();
-
+    fn inject_text_scripts(_path: &Path, entries: &[&StringEntry]) -> Result<InjectionReport> {
+        let mut report = empty_injection_report();
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
-            by_file
-                .entry(entry.file_path.clone())
-                .or_default()
-                .push(entry);
+            if entry_needs_write(entry, &mut report) {
+                by_file
+                    .entry(entry.file_path.clone())
+                    .or_default()
+                    .push(entry);
+            }
         }
-
-        for (file_path, file_entries) in &by_file {
-            if !file_path.exists() {
+        for (file_path, file_entries) in by_file {
+            if !file_path.is_file() {
+                report.skip("target_missing", file_entries.len());
                 continue;
             }
-            let content = std::fs::read_to_string(file_path)?;
-            let filename = file_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            let mut line_translations: HashMap<usize, (&str, &str)> = HashMap::new();
-            for entry in file_entries {
-                let id_suffix = entry.id.strip_prefix(&format!("{}#", filename));
-                if let Some(num_str) = id_suffix {
-                    if let Ok(line_num) = num_str.parse::<usize>() {
-                        if let Some(ref t) = entry.translation {
-                            line_translations.insert(line_num, (&entry.source, t.as_str()));
-                            strings_written += 1;
-                        } else {
-                            strings_skipped += 1;
-                        }
-                    }
-                }
-            }
-
-            let mut new_lines = Vec::new();
+            let content = std::fs::read_to_string(&file_path)?;
+            // Preserve original newline style and final newline while editing.
+            let mut lines: Vec<String> =
+                content.split_inclusive('\n').map(str::to_string).collect();
+            let filename = file_path.file_name().unwrap_or_default().to_string_lossy();
             let mut modified = false;
-            for (line_idx, line) in content.lines().enumerate() {
-                let line_num = line_idx + 1;
-                if let Some((source, translation)) = line_translations.get(&line_num) {
-                    let trimmed = line.trim();
-
-                    // Button lines: only replace the quoted label
-                    if trimmed.starts_with("button ") {
-                        let search = format!("\"{}\"", source);
-                        let replace = format!("\"{}\"", translation);
-                        if line.contains(&search) {
-                            new_lines.push(line.replacen(&search, &replace, 1));
-                            modified = true;
-                            continue;
-                        }
-                        new_lines.push(line.to_string());
-                        continue;
-                    }
-
-                    // Dialogue lines: CharID Text → CharID TranslatedText
-                    // Source was stored with format codes stripped.
-                    // Find the original text (with codes) in the line and replace,
-                    // preserving format codes around the translation.
-                    let trimmed_line = line.trim();
-                    if let Some(space_pos) = trimmed_line.find(' ') {
-                        let after_char = &trimmed_line[space_pos + 1..];
-                        let (prefix_codes, _inner, suffix_codes) = split_format_codes(after_char);
-                        // Reconstruct: indent + CharID + space + prefix_codes + translation + suffix_codes
-                        let indent = &line[..line.len() - trimmed_line.len()];
-                        let char_id = &trimmed_line[..space_pos];
-                        let translated_with_codes = format!(
-                            "{}{} {}{}{}",
-                            indent, char_id, prefix_codes, translation, suffix_codes
-                        );
-                        new_lines.push(translated_with_codes);
-                        modified = true;
-                        continue;
-                    }
+            for entry in file_entries {
+                let Some(line_num) = entry
+                    .id
+                    .strip_prefix(&format!("{filename}#"))
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .and_then(|n| n.checked_sub(1))
+                else {
+                    report.skip("error", 1);
+                    continue;
+                };
+                let Some(line) = lines.get_mut(line_num) else {
+                    report.skip("target_missing", 1);
+                    continue;
+                };
+                let body = line.trim_end_matches(['\r', '\n']);
+                let ending = &line[body.len()..];
+                let trimmed = body.trim();
+                let translation = entry.translation.as_deref().unwrap();
+                if translation.contains(['\r', '\n']) {
+                    report.skip("error", 1);
+                    continue;
                 }
-                new_lines.push(line.to_string());
+                let replacement = if trimmed.starts_with("button ") {
+                    if extract_quoted_in_line(trimmed) != Some(entry.source.as_str()) {
+                        report.skip("source_changed", 1);
+                        continue;
+                    }
+                    if translation.contains('"') {
+                        report.skip("error", 1);
+                        continue;
+                    }
+                    body.replacen(
+                        &format!("\"{}\"", entry.source),
+                        &format!("\"{translation}\""),
+                        1,
+                    )
+                } else if let Some(space_pos) = trimmed.find(' ') {
+                    let after_character = &trimmed[space_pos + 1..];
+                    let (prefix, _inner, suffix) = split_format_codes(after_character);
+                    if strip_vn_format_codes(after_character) != entry.source
+                        || entry
+                            .context
+                            .as_deref()
+                            .is_some_and(|character| character != &trimmed[..space_pos])
+                    {
+                        report.skip("source_changed", 1);
+                        continue;
+                    }
+                    let indent = &body[..body.len() - body.trim_start().len()];
+                    let trailing = &body[body.trim_end().len()..];
+                    format!(
+                        "{indent}{} {prefix}{translation}{suffix}{trailing}",
+                        &trimmed[..space_pos]
+                    )
+                } else {
+                    report.skip("source_changed", 1);
+                    continue;
+                };
+                *line = format!("{replacement}{ending}");
+                report.strings_written += 1;
+                modified = true;
             }
-
             if modified {
-                std::fs::write(file_path, new_lines.join("\n"))?;
-                files_modified += 1;
-                files_written.push(file_path.clone());
+                std::fs::write(&file_path, lines.concat())?;
+                report.files_modified += 1;
+                report.files_written.push(file_path);
             }
         }
-
-        Ok(InjectionReport {
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings: Vec::new(),
-            files_written,
-        })
+        Ok(report)
     }
 
     // ─── Binary .assets Extraction (fallback) ───────────────────────────────
@@ -312,6 +309,7 @@ impl UnityPlugin {
             .max_depth(3)
             .follow_links(false)
             .into_iter()
+            .filter_entry(crate::discovery::is_game_entry)
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
@@ -320,6 +318,470 @@ impl UnityPlugin {
             }
         }
         assets
+    }
+
+    fn find_unityfs_files(path: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if path.is_file() {
+            if crate::unity_fs::is_unity_fs_file(path) {
+                out.push(path.to_path_buf());
+            }
+            return out;
+        }
+        let data_dir = if path.is_dir() {
+            if let Some(d) = Self::find_data_dir(path) {
+                d
+            } else if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with("_Data"))
+            {
+                path.to_path_buf()
+            } else {
+                return out;
+            }
+        } else {
+            return out;
+        };
+        let candidate = data_dir.join("data.unity3d");
+        if crate::unity_fs::is_unity_fs_file(&candidate) {
+            out.push(candidate);
+        }
+        out
+    }
+
+    /// Walk parents until an existing UnityFS file is found; remainder is the node path.
+    fn resolve_unityfs_virtual_path(file_path: &Path) -> Option<(PathBuf, String)> {
+        let mut current = file_path.parent()?;
+        loop {
+            if current.is_file() && crate::unity_fs::is_unity_fs_file(current) {
+                let rel = file_path.strip_prefix(current).ok()?;
+                let node = rel.to_string_lossy().replace("\\", "/");
+                if node.is_empty() {
+                    return None;
+                }
+                return Some((current.to_path_buf(), node));
+            }
+            current = current.parent()?;
+        }
+    }
+
+    fn inject_serialized_bytes(
+        bytes: &mut Vec<u8>,
+        file_entries: &[&StringEntry],
+        label: &str,
+        report: &mut InjectionReport,
+    ) -> bool {
+        let mut modified = false;
+        let (rewriteable, technical_ranges): (_, Vec<_>) =
+            SerializedFile::parse(bytes.clone(), label)
+                .map(|sf| {
+                    let ranges = sf
+                        .objects
+                        .iter()
+                        .filter(|object| {
+                            crate::unity_serialized::is_heuristic_noise_class(object.class_id)
+                        })
+                        .map(|object| {
+                            let start = object.data_abs as usize;
+                            (start, start + object.byte_size as usize)
+                        })
+                        .collect();
+                    (sf.rewriteable_text_assets().unwrap_or_default(), ranges)
+                })
+                .unwrap_or_default();
+        let mut textasset_plan = std::collections::BTreeMap::new();
+        let mut planned_writes = 0usize;
+        let active: Vec<&StringEntry> = file_entries
+            .iter()
+            .copied()
+            .filter(|entry| entry_needs_write(entry, report))
+            .collect();
+        let file_entries = active.as_slice();
+        // CSV cells and locale lines share one binary slot. Only changed, valid
+        // entries count as writes; preserve every other line from the payload.
+        let mut groups: HashMap<(i64, bool), Vec<&StringEntry>> = HashMap::new();
+        for entry in file_entries
+            .iter()
+            .copied()
+            .filter(|e| is_textasset_csv_cell_entry(e) || is_textasset_loc_line_entry(e))
+        {
+            let Some(path_id) = entry.metadata.get("path_id").and_then(|v| v.as_i64()) else {
+                report.skip("error", 1);
+                continue;
+            };
+            groups
+                .entry((path_id, is_textasset_csv_cell_entry(entry)))
+                .or_default()
+                .push(entry);
+        }
+        for ((path_id, csv), group) in groups {
+            let head = group[0];
+            let Some(off) = metadata_usize(head, "textasset_script_offset") else {
+                report.skip("error", group.len());
+                continue;
+            };
+            let Some(len) = metadata_usize(head, "textasset_script_byte_len") else {
+                report.skip("error", group.len());
+                continue;
+            };
+            let Some(original) =
+                slot_payload(bytes, off, len).and_then(|b| std::str::from_utf8(b).ok())
+            else {
+                report.skip("source_changed", group.len());
+                continue;
+            };
+            let (mut rebuilt, changed) = apply_table_translations(original, &group, csv, report);
+            if changed == 0 {
+                continue;
+            }
+            if group.iter().all(|e| has_textasset_rewrite_capability(e)) {
+                if !rewriteable
+                    .get(&path_id)
+                    .is_some_and(|ta| ta.script_len_offset == off && ta.script_byte_len == len)
+                {
+                    report.skip("invalid_target", changed);
+                    report.warnings.push(format!("TextAsset {path_id}: resize capability cannot be verified against current object layout"));
+                    continue;
+                }
+                if rebuilt.len() > crate::unity_serialized::MAX_REBUILT_TEXT_ASSET_BYTES {
+                    report.skip("too_long", changed);
+                } else if let std::collections::btree_map::Entry::Vacant(slot) =
+                    textasset_plan.entry(path_id)
+                {
+                    slot.insert(rebuilt);
+                    planned_writes += changed;
+                } else {
+                    report.skip("ambiguous_target", changed);
+                }
+                continue;
+            }
+            // A prior rewrite may have left spaces reserved at the end of the
+            // shared slot. Consume only those needed for expansion, not rows.
+            if rebuilt.len() > len {
+                let excess = rebuilt.len() - len;
+                let padding = rebuilt.len() - rebuilt.trim_end_matches(' ').len();
+                if padding >= excess {
+                    rebuilt.truncate(len);
+                }
+            }
+            if rebuilt.len() > len {
+                report.skip("too_long", changed);
+                continue;
+            }
+            match rewrite_text_asset_script_inplace(bytes, off, len, &rebuilt, label) {
+                Ok(()) => {
+                    report.strings_written += changed;
+                    modified = true;
+                }
+                Err(error) => {
+                    report
+                        .warnings
+                        .push(format!("TextAsset table rewrite {}: {error}", head.id));
+                    report.skip("error", changed);
+                }
+            }
+        }
+
+        // ── Structural TextAsset / MonoBehaviour / TextMesh / GUIText inject ──
+        for entry in file_entries.iter().filter(|e| {
+            is_structural_entry(e)
+                && !is_textasset_loc_line_entry(e)
+                && !is_textasset_csv_cell_entry(e)
+        }) {
+            let translation = match &entry.translation {
+                Some(t) => t,
+                None => {
+                    report.skip("untranslated", 1);
+                    continue;
+                }
+            };
+            if translation == &entry.source {
+                report.skip("unchanged", 1);
+                continue;
+            }
+            let (off_key, len_key, kind) = if is_textasset_entry(entry) {
+                (
+                    "textasset_script_offset",
+                    "textasset_script_byte_len",
+                    "TextAsset",
+                )
+            } else if is_textmesh_entry(entry) {
+                ("textmesh_text_offset", "textmesh_text_byte_len", "TextMesh")
+            } else if is_guitext_entry(entry) {
+                ("guitext_text_offset", "guitext_text_byte_len", "GUIText")
+            } else {
+                (
+                    "mono_string_offset",
+                    "mono_string_byte_len",
+                    "MonoBehaviour",
+                )
+            };
+            let Some(script_off) = entry
+                .metadata
+                .get(off_key)
+                .and_then(|v| v.as_u64())
+                .map(|u| u as usize)
+            else {
+                report
+                    .warnings
+                    .push(format!("{kind} entry '{}' missing {off_key}", entry.id));
+                report.skip("error", 1);
+                continue;
+            };
+            let orig_len = entry
+                .metadata
+                .get(len_key)
+                .and_then(|v| v.as_u64())
+                .map(|u| u as usize)
+                .unwrap_or(entry.source.len());
+            if is_textasset_entry(entry) && has_textasset_rewrite_capability(entry) {
+                let path_id = entry.metadata.get("path_id").and_then(|v| v.as_i64());
+                let target = path_id.and_then(|id| rewriteable.get(&id));
+                if let Some(ta) = target.filter(|ta| {
+                    ta.script_len_offset == script_off && ta.script_byte_len == orig_len
+                }) {
+                    if ta.script != entry.source {
+                        report.skip("source_changed", 1);
+                    } else if translation.len()
+                        > crate::unity_serialized::MAX_REBUILT_TEXT_ASSET_BYTES
+                    {
+                        report.skip("too_long", 1);
+                    } else if let std::collections::btree_map::Entry::Vacant(slot) =
+                        textasset_plan.entry(ta.path_id)
+                    {
+                        slot.insert(translation.clone());
+                        planned_writes += 1;
+                    } else {
+                        report.skip("ambiguous_target", 1);
+                    }
+                    continue;
+                }
+                report.skip("invalid_target", 1);
+                report.warnings.push(format!("TextAsset {}: resize capability cannot be verified against current object layout", entry.id));
+                continue;
+            }
+            if translation.len() > orig_len {
+                if report.skip_reasons.get("too_long").copied().unwrap_or(0) < 5 {
+                    report.warnings.push(format!(
+                            "translation for '{}' longer than original {kind} string ({} > {} bytes), skipping",
+                            entry.id,
+                            translation.len(),
+                            orig_len
+                        ));
+                }
+                report.skip("too_long", 1);
+                continue;
+            }
+            if slot_payload(bytes, script_off, orig_len) != Some(entry.source.as_bytes()) {
+                report.skip("source_changed", 1);
+                continue;
+            }
+            match rewrite_text_asset_script_inplace(bytes, script_off, orig_len, translation, label)
+            {
+                Ok(()) => {
+                    report.strings_written += 1;
+                    modified = true;
+                }
+                Err(e) => {
+                    report
+                        .warnings
+                        .push(format!("{kind} rewrite {}: {e}", entry.id));
+                    report.skip("error", 1);
+                }
+            }
+        }
+
+        // ── Heuristic length-prefixed inject (non-structural entries) ──
+        struct Work {
+            id: String,
+            needle: Vec<u8>,
+            /// Alternate endian needle when metadata did not pin endianness.
+            alt_needle: Option<Vec<u8>>,
+            endian: LengthEndian,
+            alt_endian: Option<LengthEndian>,
+            explicit_offset: Option<usize>,
+            trans_bytes: Vec<u8>,
+            orig_payload_len: usize,
+        }
+        let mut work: Vec<Work> = Vec::new();
+        for entry in file_entries.iter().filter(|e| !is_structural_entry(e)) {
+            let translation = match &entry.translation {
+                Some(t) => t,
+                None => {
+                    report.skip("untranslated", 1);
+                    continue;
+                }
+            };
+            let orig_bytes = entry.source.as_bytes();
+            let trans_bytes = translation.as_bytes();
+            if trans_bytes == orig_bytes {
+                report.skip("unchanged", 1);
+                continue;
+            }
+            if trans_bytes.len() > orig_bytes.len() {
+                if report.skip_reasons.get("too_long").copied().unwrap_or(0) < 5 {
+                    report.warnings.push(format!(
+                        "translation for '{}' longer than original ({} > {} bytes), skipping",
+                        entry.id,
+                        trans_bytes.len(),
+                        orig_bytes.len()
+                    ));
+                }
+                report.skip("too_long", 1);
+                continue;
+            }
+            let pinned = entry
+                .metadata
+                .get("length_endian")
+                .and_then(|v| v.as_str())
+                .and_then(LengthEndian::from_meta);
+            let explicit_offset = match entry.metadata.get("binary_offset") {
+                Some(value) => {
+                    let Some(offset) = value.as_u64().and_then(|u| usize::try_from(u).ok()) else {
+                        report.skip("invalid_target", 1);
+                        continue;
+                    };
+                    if pinned.is_none() {
+                        report.skip("invalid_target", 1);
+                        continue;
+                    }
+                    Some(offset)
+                }
+                None => None,
+            };
+            let (endian, alt_endian) = match pinned {
+                Some(e) => (e, None),
+                None => (LengthEndian::Little, Some(LengthEndian::Big)),
+            };
+            let mut needle = Vec::with_capacity(4 + orig_bytes.len());
+            needle.extend_from_slice(&endian.encode_u32(orig_bytes.len() as u32));
+            needle.extend_from_slice(orig_bytes);
+            let alt_needle = alt_endian.map(|ae| {
+                let mut n = Vec::with_capacity(4 + orig_bytes.len());
+                n.extend_from_slice(&ae.encode_u32(orig_bytes.len() as u32));
+                n.extend_from_slice(orig_bytes);
+                n
+            });
+            work.push(Work {
+                id: entry.id.clone(),
+                needle,
+                alt_needle,
+                endian,
+                alt_endian,
+                explicit_offset,
+                trans_bytes: trans_bytes.to_vec(),
+                orig_payload_len: orig_bytes.len(),
+            });
+        }
+
+        if !work.is_empty() {
+            // Resolve every target against the same pre-write image. New entries
+            // pin their exact prefix offset; legacy entries are safe only when
+            // their complete length+payload needle occurs exactly once.
+            let patterns: Vec<&[u8]> = work
+                .iter()
+                .flat_map(|w| [w.needle.as_slice(), w.alt_needle.as_deref().unwrap_or(&[])])
+                .collect();
+            let matches = crate::binary_search::find_all_matches(bytes, &patterns);
+            let resolved: Vec<HeuristicTarget> = work
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    if let Some(pos) = w.explicit_offset {
+                        return if pos
+                            .checked_add(w.needle.len())
+                            .and_then(|end| bytes.get(pos..end))
+                            == Some(w.needle.as_slice())
+                        {
+                            HeuristicTarget::Found(pos, w.endian)
+                        } else {
+                            HeuristicTarget::Missing
+                        };
+                    }
+                    let primary = &matches[i * 2];
+                    let alternate = &matches[i * 2 + 1];
+                    match primary.len() + alternate.len() {
+                        0 => HeuristicTarget::Missing,
+                        1 if primary.len() == 1 => HeuristicTarget::Found(primary[0], w.endian),
+                        1 => HeuristicTarget::Found(alternate[0], w.alt_endian.unwrap()),
+                        _ => HeuristicTarget::Ambiguous,
+                    }
+                })
+                .collect();
+
+            for (w, target) in work.iter().zip(resolved) {
+                if let HeuristicTarget::Found(pos, used_endian) = target {
+                    let expected = if used_endian == w.endian {
+                        &w.needle
+                    } else {
+                        w.alt_needle.as_ref().unwrap()
+                    };
+                    if bytes.get(pos..pos + expected.len()) != Some(expected.as_slice()) {
+                        report.skip("source_changed", 1);
+                        continue;
+                    }
+                    // Older project databases may contain candidates emitted
+                    // before technical classes were excluded during extraction.
+                    // Their matching bytes still do not make a control binding,
+                    // shader or managed type name a valid translation target.
+                    if range_overlaps(&technical_ranges, pos, pos + expected.len()) {
+                        report.skip("invalid_target", 1);
+                        report.warnings.push(format!(
+                            "Unity entry '{}' points into a technical object; re-extract the project before translating",
+                            w.id
+                        ));
+                        continue;
+                    }
+                    let new_len = w.trans_bytes.len() as u32;
+                    bytes[pos..pos + 4].copy_from_slice(&used_endian.encode_u32(new_len));
+                    bytes[pos + 4..pos + 4 + w.trans_bytes.len()].copy_from_slice(&w.trans_bytes);
+                    for b in &mut bytes[pos + 4 + w.trans_bytes.len()..pos + 4 + w.orig_payload_len]
+                    {
+                        *b = 0;
+                    }
+                    report.strings_written += 1;
+                    modified = true;
+                } else if target == HeuristicTarget::Ambiguous {
+                    report.skip("ambiguous_target", 1);
+                } else {
+                    if w.explicit_offset.is_some() {
+                        tracing::warn!(entry_id = %w.id, "Unity heuristic target offset is invalid or stale");
+                    }
+                    report.skip("source_changed", 1);
+                }
+            }
+        }
+
+        // Fixed-offset edits above refer to the original image. Relayout is
+        // deliberately last, including when multiple TextAssets change size.
+        if !textasset_plan.is_empty() {
+            match SerializedFile::parse(bytes.clone(), label)
+                .and_then(|sf| {
+                    for id in textasset_plan.keys() {
+                        if sf.read_text_asset(*id)?.script != rewriteable[id].script {
+                            return Err(crate::unity_serialized::SerializedError {
+                                file: label.into(),
+                                message: format!("TextAsset {id} changed during fixed-offset edits; overlapping writes refused"),
+                            });
+                        }
+                    }
+                    sf.rewrite_text_assets(&textasset_plan)
+                })
+            {
+                Ok(rebuilt) => {
+                    *bytes = rebuilt;
+                    report.strings_written += planned_writes;
+                    modified = true;
+                }
+                Err(error) => {
+                    report
+                        .warnings
+                        .push(format!("TextAsset structural rebuild: {error}"));
+                    report.skip("error", planned_writes);
+                }
+            }
+        }
+        modified
     }
 
     /// Structural TextAsset + heuristic scan (skipping TextAsset ranges).
@@ -333,12 +795,13 @@ impl UnityPlugin {
 
         match SerializedFile::parse(bytes.to_vec(), file_path) {
             Ok(sf) => {
+                let rewriteable = sf.rewriteable_text_assets().unwrap_or_default();
                 // Structural ranges + MonoScript/Shader (type names / HLSL noise).
                 skip_ranges = sf.heuristic_skip_byte_ranges();
                 for obj in sf.text_asset_objects() {
-                    match sf.read_text_asset(obj.path_id) {
+                    match sf.read_text_asset_object(obj) {
                         Ok(ta) => {
-                            if !is_textasset_script_worth_extracting(&ta.script) {
+                            if !is_unity_textasset_script_worth_extracting(&ta.script) {
                                 continue;
                             }
                             // Non-player assets by m_Name (TMP linebreak tables, SFX tech
@@ -362,6 +825,7 @@ impl UnityPlugin {
                                 } else {
                                     "\n"
                                 };
+                                let mut group_entries = Vec::new();
                                 for cell in csv.cells {
                                     let id = format!(
                                         "textasset/{}/csv/{}/{}",
@@ -420,8 +884,26 @@ impl UnityPlugin {
                                         "binary_slot".to_string(),
                                         serde_json::Value::String("utf8".to_string()),
                                     );
-                                    entries.push(entry);
+                                    // Shared m_Script blob: no per-cell byte budget.
+                                    group_entries.push(entry);
                                 }
+                                textasset_group::attach_to_entries(
+                                    &mut group_entries,
+                                    GroupKind::Csv,
+                                    &ta.script,
+                                    ta.script_byte_len,
+                                    format!(
+                                        "unity-textasset:{}:{}:csv",
+                                        file_path.to_string_lossy(),
+                                        ta.path_id
+                                    ),
+                                );
+                                if rewriteable.contains_key(&ta.path_id) {
+                                    for entry in &mut group_entries {
+                                        mark_textasset_rewrite(entry, sf.header.version);
+                                    }
+                                }
+                                entries.extend(group_entries);
                                 continue;
                             }
                             // Naninovel ManagedText / locale docs: split Key: Value lines
@@ -432,6 +914,7 @@ impl UnityPlugin {
                                 } else {
                                     "\n"
                                 };
+                                let mut group_entries = Vec::new();
                                 for (line_index, loc) in lines.into_iter().enumerate() {
                                     let id =
                                         format!("textasset/{}/line/{}", ta.path_id, line_index);
@@ -492,8 +975,8 @@ impl UnityPlugin {
                                             serde_json::Value::String(loc.sep.clone()),
                                         );
                                     }
-                                    // Per-value budget for length-aware translate; inject
-                                    // still pads the whole m_Script blob.
+                                    // Inject still pads the whole m_Script blob; do not set
+                                    // char_limit — the group budget cannot be attributed per line.
                                     entry.metadata.insert(
                                         "binary_slot".to_string(),
                                         serde_json::Value::String("utf8".to_string()),
@@ -502,8 +985,25 @@ impl UnityPlugin {
                                         "line_value_byte_len".to_string(),
                                         serde_json::json!(loc.value.len()),
                                     );
-                                    entries.push(entry);
+                                    group_entries.push(entry);
                                 }
+                                textasset_group::attach_to_entries(
+                                    &mut group_entries,
+                                    GroupKind::LocLine,
+                                    &ta.script,
+                                    ta.script_byte_len,
+                                    format!(
+                                        "unity-textasset:{}:{}:loc_line",
+                                        file_path.to_string_lossy(),
+                                        ta.path_id
+                                    ),
+                                );
+                                if rewriteable.contains_key(&ta.path_id) {
+                                    for entry in &mut group_entries {
+                                        mark_textasset_rewrite(entry, sf.header.version);
+                                    }
+                                }
+                                entries.extend(group_entries);
                                 continue;
                             }
                             // Keep every structural instance (unique path_id / inject offset).
@@ -539,6 +1039,10 @@ impl UnityPlugin {
                                 "binary_slot".to_string(),
                                 serde_json::Value::String("utf8".to_string()),
                             );
+                            entry.char_limit = Some(entry.source.len());
+                            if rewriteable.contains_key(&ta.path_id) {
+                                mark_textasset_rewrite(&mut entry, sf.header.version);
+                            }
                             entries.push(entry);
                         }
                         Err(e) => {
@@ -556,7 +1060,7 @@ impl UnityPlugin {
                     match sf.read_mono_strings(obj.path_id) {
                         Ok(fields) => {
                             for field in fields {
-                                if field.text.trim().is_empty() {
+                                if !is_structural_unity_text(&field.text) {
                                     continue;
                                 }
                                 // Do not dedupe by text — repeated UI labels need each slot.
@@ -606,6 +1110,7 @@ impl UnityPlugin {
                                     "binary_slot".to_string(),
                                     serde_json::Value::String("utf8".to_string()),
                                 );
+                                entry.char_limit = Some(entry.source.len());
                                 entries.push(entry);
                             }
                         }
@@ -623,10 +1128,7 @@ impl UnityPlugin {
                 for obj in sf.text_mesh_objects() {
                     match sf.read_text_mesh(obj.path_id) {
                         Ok(tm) => {
-                            if tm.text.trim().is_empty() {
-                                continue;
-                            }
-                            if is_binary_looking_script(&tm.text) {
+                            if !is_structural_unity_text(&tm.text) {
                                 continue;
                             }
                             let id = format!("textmesh/{}", tm.path_id);
@@ -653,6 +1155,7 @@ impl UnityPlugin {
                                 "binary_slot".to_string(),
                                 serde_json::Value::String("utf8".to_string()),
                             );
+                            entry.char_limit = Some(entry.source.len());
                             entries.push(entry);
                         }
                         Err(e) => {
@@ -669,10 +1172,7 @@ impl UnityPlugin {
                 for obj in sf.gui_text_objects() {
                     match sf.read_gui_text(obj.path_id) {
                         Ok(gt) => {
-                            if gt.text.trim().is_empty() {
-                                continue;
-                            }
-                            if is_binary_looking_script(&gt.text) {
+                            if !is_structural_unity_text(&gt.text) {
                                 continue;
                             }
                             let id = format!("guitext/{}", gt.path_id);
@@ -699,6 +1199,7 @@ impl UnityPlugin {
                                 "binary_slot".to_string(),
                                 serde_json::Value::String("utf8".to_string()),
                             );
+                            entry.char_limit = Some(entry.source.len());
                             entries.push(entry);
                         }
                         Err(e) => {
@@ -755,6 +1256,7 @@ impl UnityPlugin {
                         "binary_slot".to_string(),
                         serde_json::Value::String("utf8".to_string()),
                     );
+                    entry.char_limit = Some(entry.source.len());
                     entry.metadata.insert(
                         "extraction_method".to_string(),
                         serde_json::Value::String("heuristic".to_string()),
@@ -763,6 +1265,9 @@ impl UnityPlugin {
                         "length_endian".to_string(),
                         serde_json::Value::String(endian.as_meta().to_string()),
                     );
+                    entry
+                        .metadata
+                        .insert("binary_offset".to_string(), serde_json::json!(i));
                     entries.push(entry);
                 }
             }
@@ -778,6 +1283,13 @@ impl UnityPlugin {
 enum LengthEndian {
     Little,
     Big,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeuristicTarget {
+    Missing,
+    Ambiguous,
+    Found(usize, LengthEndian),
 }
 
 impl LengthEndian {
@@ -849,14 +1361,6 @@ fn is_unity_serialized_candidate(path: &Path) -> bool {
             lower.starts_with("level") || lower == "globalgamemanagers" || lower == "resources"
         })
         .unwrap_or(false)
-}
-
-/// First occurrence of `needle` in `haystack`, or `None`.
-fn find_bytes_once(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn range_contains(ranges: &[(usize, usize)], pos: usize) -> bool {
@@ -1242,93 +1746,214 @@ fn parse_textasset_csv(script: &str) -> Option<TextAssetCsv> {
     Some(TextAssetCsv { cells })
 }
 
-/// Apply CSV cell translations onto the original script (re-parse + rewrite).
-fn apply_csv_translations_to_script(original: &str, cells: &[&StringEntry]) -> Option<String> {
-    let newline = if original.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let lines: Vec<&str> = original
-        .lines()
-        .map(|l| l.trim_end_matches('\r'))
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    if lines.is_empty() {
-        return None;
+fn empty_injection_report() -> InjectionReport {
+    InjectionReport {
+        skip_reasons: Default::default(),
+        files_modified: 0,
+        strings_written: 0,
+        strings_skipped: 0,
+        warnings: Vec::new(),
+        files_written: Vec::new(),
     }
-    let headers: Vec<&str> = lines[0].split(',').map(|s| s.trim()).collect();
-    let ncols = headers.len();
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    for line in &lines[1..] {
-        let row: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
-        if row.len() != ncols {
-            return None;
-        }
-        rows.push(row);
-    }
-    for e in cells {
-        let Some(row_i) = e.metadata.get("csv_row").and_then(|v| v.as_u64()) else {
-            continue;
-        };
-        let Some(col) = e.metadata.get("csv_col").and_then(|v| v.as_u64()) else {
-            continue;
-        };
-        let row_i = row_i as usize;
-        let col = col as usize;
-        // csv_row is 1-based data index.
-        if row_i == 0 || row_i > rows.len() || col >= ncols {
-            continue;
-        }
-        let text = e.translation.as_deref().unwrap_or(e.source.as_str());
-        // Reject commas / newlines in translation (would break simple CSV).
-        if text.contains(',') || text.contains('\n') || text.contains('\r') {
-            continue;
-        }
-        rows[row_i - 1][col] = text.to_string();
-    }
-    let mut out = headers.join(",");
-    for row in rows {
-        out.push_str(newline);
-        out.push_str(&row.join(","));
-    }
-    // Preserve a trailing newline if the original had one after the last row.
-    if original.ends_with("\r\n") || original.ends_with('\n') {
-        out.push_str(newline);
-    }
-    Some(out)
 }
 
-/// Rebuild a loc document from line entries (sorted by `line_index`).
-fn rebuild_textasset_loc_script(lines: &[&StringEntry]) -> Option<String> {
-    if lines.is_empty() {
-        return None;
+fn entry_needs_write(entry: &StringEntry, report: &mut InjectionReport) -> bool {
+    match entry.translation.as_deref() {
+        None | Some("") => {
+            report.skip("untranslated", 1);
+            false
+        }
+        Some(t) if t == entry.source => {
+            report.skip("unchanged", 1);
+            false
+        }
+        Some(_) => true,
     }
-    let mut ordered: Vec<&StringEntry> = lines.to_vec();
-    ordered.sort_by_key(|e| {
-        e.metadata
-            .get("line_index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-    });
-    let newline = ordered[0]
+}
+
+fn has_textasset_rewrite_capability(entry: &StringEntry) -> bool {
+    matches!(
+        entry
+            .metadata
+            .get("extraction_method")
+            .and_then(|v| v.as_str()),
+        Some("textasset" | "textasset_loc_line" | "textasset_csv_cell")
+    ) && entry
         .metadata
-        .get("newline")
+        .get("textasset_rewrite")
         .and_then(|v| v.as_str())
-        .unwrap_or("\n");
-    let mut parts: Vec<String> = Vec::with_capacity(ordered.len());
-    for e in ordered {
-        let text = e.translation.as_deref().unwrap_or(e.source.as_str());
-        let line = match (
-            e.metadata.get("loc_key").and_then(|v| v.as_str()),
-            e.metadata.get("loc_sep").and_then(|v| v.as_str()),
-        ) {
-            (Some(k), Some(sep)) => format!("{k}{sep}{text}"),
-            _ => text.to_string(),
-        };
-        parts.push(line);
+        == Some("serialized-v1")
+        && entry
+            .metadata
+            .get("unity_serialized_version")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| (17..=22).contains(&v))
+}
+
+fn mark_textasset_rewrite(entry: &mut StringEntry, version: u32) {
+    entry.metadata.insert(
+        "textasset_rewrite".into(),
+        serde_json::json!("serialized-v1"),
+    );
+    entry.metadata.insert(
+        "unity_serialized_version".into(),
+        serde_json::json!(version),
+    );
+    entry.char_limit = None;
+}
+
+fn metadata_usize(entry: &StringEntry, key: &str) -> Option<usize> {
+    entry.metadata.get(key)?.as_u64()?.try_into().ok()
+}
+
+fn slot_payload(bytes: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
+    let start = offset.checked_add(4)?;
+    bytes.get(start..start.checked_add(len)?)
+}
+
+fn line_body(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+/// Edit only validated destinations, preserving untouched CSV/loc rows and
+/// newline bytes. Accounting is per entry; shared-slot overflow is applied to
+/// the returned valid count by the caller, not to already rejected entries.
+fn apply_table_translations(
+    original: &str,
+    entries: &[&StringEntry],
+    csv: bool,
+    report: &mut InjectionReport,
+) -> (String, usize) {
+    let mut lines: Vec<String> = original.split_inclusive('\n').map(str::to_string).collect();
+    let rows: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    let headers: Vec<String> = rows
+        .first()
+        .map(|i| {
+            line_body(&lines[*i])
+                .split(',')
+                .map(|h| h.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    // Extraction indexes only included locale entries, not blank/excluded lines.
+    // Resolve that index against the original before any translations are made.
+    let loc = if csv {
+        Vec::new()
+    } else {
+        parse_textasset_loc_lines(original).unwrap_or_default()
+    };
+    let mut loc_rows = Vec::new();
+    let mut next = 0;
+    for item in &loc {
+        let found = (next..lines.len()).find(|i| {
+            let body = line_body(&lines[*i]);
+            match (&item.key, split_loc_kv(body)) {
+                (Some(key), Some((actual, sep, value))) => {
+                    actual == key && sep == item.sep && value == item.value
+                }
+                (None, None) => body == item.value,
+                _ => false,
+            }
+        });
+        if let Some(i) = found {
+            next = i + 1;
+        }
+        loc_rows.push(found);
     }
-    Some(parts.join(newline))
+    let mut changed = 0;
+    for entry in entries {
+        if metadata_usize(entry, "textasset_script_offset")
+            != metadata_usize(entries[0], "textasset_script_offset")
+            || metadata_usize(entry, "textasset_script_byte_len")
+                != metadata_usize(entries[0], "textasset_script_byte_len")
+        {
+            report.skip("error", 1);
+            continue;
+        }
+        let result: std::result::Result<(usize, String), &'static str> = (|| {
+            let translation = entry.translation.as_deref().ok_or("untranslated")?;
+            if translation.contains(['\r', '\n']) {
+                return Err("error");
+            }
+            let physical = entry.injection_source().map_err(|_| "error")?;
+            if csv {
+                if translation.contains([',', '"']) {
+                    return Err("error");
+                }
+                let row = metadata_usize(entry, "csv_row").ok_or("error")?;
+                let col = metadata_usize(entry, "csv_col").ok_or("error")?;
+                if row == 0 {
+                    return Err("error");
+                }
+                let i = *rows.get(row).ok_or("target_missing")?;
+                let header = headers.get(col).ok_or("target_missing")?;
+                if entry
+                    .metadata
+                    .get("csv_header")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|expected| expected != header)
+                {
+                    return Err("source_changed");
+                }
+                let mut cells: Vec<String> = line_body(&lines[i])
+                    .split(',')
+                    .map(str::to_string)
+                    .collect();
+                if cells.len() != headers.len() {
+                    return Err("source_changed");
+                }
+                let cell = cells.get_mut(col).ok_or("target_missing")?;
+                if cell.trim() != physical {
+                    return Err("source_changed");
+                }
+                let leading = &cell[..cell.len() - cell.trim_start().len()];
+                let trailing = &cell[cell.trim_end().len()..];
+                *cell = format!("{leading}{translation}{trailing}");
+                Ok((i, cells.join(",")))
+            } else {
+                let index = metadata_usize(entry, "line_index").ok_or("error")?;
+                let i = loc_rows
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .ok_or("target_missing")?;
+                let body = line_body(&lines[i]);
+                let expected_key = entry.metadata.get("loc_key").and_then(|v| v.as_str());
+                match (expected_key, split_loc_kv(body)) {
+                    (Some(key), Some((actual, _sep, value))) if actual == key => {
+                        if value != physical {
+                            return Err("source_changed");
+                        }
+                        Ok((
+                            i,
+                            format!("{}{translation}", &body[..body.len() - value.len()]),
+                        ))
+                    }
+                    (None, None) => {
+                        if body != physical {
+                            return Err("source_changed");
+                        }
+                        Ok((i, translation.to_string()))
+                    }
+                    _ => Err("source_changed"),
+                }
+            }
+        })();
+        match result {
+            Ok((i, body)) => {
+                let ending = &lines[i][line_body(&lines[i]).len()..];
+                lines[i] = format!("{body}{ending}");
+                changed += 1;
+            }
+            Err(reason) => report.skip(reason, 1),
+        }
+    }
+    (lines.concat(), changed)
 }
 
 fn is_mono_entry(entry: &StringEntry) -> bool {
@@ -1465,17 +2090,71 @@ fn split_format_codes(text: &str) -> (String, String, String) {
     (prefix, remaining.to_string(), suffix)
 }
 
-fn is_unity_translatable(text: &str) -> bool {
+/// Safety floor for fields whose Unity class identifies them as text.
+///
+/// Structural readers already supply valid UTF-8 and bounded string framing, so
+/// these fields may contain a single CJK character. Still reject malformed-looking
+/// controls, replacement characters, binary payloads, and symbol-only artifacts.
+fn is_structural_unity_text(text: &str) -> bool {
     let s = text.trim();
-    if s.is_empty() || s.len() < 5 {
+    !s.is_empty()
+        && !s.contains('\u{FFFD}')
+        && !s
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+        && !is_binary_looking_script(s)
+        && s.chars().any(char::is_alphanumeric)
+}
+
+/// The shared TextAsset filter deliberately rejects no-space CJK character-class
+/// tables. That shape also describes real Japanese/Chinese prose, so recover only
+/// strongly text-like CJK bodies after the shared noise checks reject them.
+fn is_unity_textasset_script_worth_extracting(script: &str) -> bool {
+    if !is_structural_unity_text(script) {
         return false;
     }
-    // Binary soup / mis-framed length prefixes leave C0 controls in the payload.
+    is_textasset_script_worth_extracting(script) || looks_like_natural_cjk_text(script, 2)
+}
+
+/// Conservative evidence that a string is natural East-Asian text rather than a
+/// random symbol table. This is intentionally script/range based: Japanese and
+/// Chinese do not have reliable whitespace-delimited words.
+fn looks_like_natural_cjk_text(text: &str, min_cjk: usize) -> bool {
+    let s = text.trim();
+    let total = s.chars().count();
+    if total == 0 {
+        return false;
+    }
+    let cjk = s.chars().filter(|&c| is_cjk_script_char(c)).count();
+    cjk >= min_cjk && cjk * 100 >= total * 60
+}
+
+pub(crate) fn is_cjk_script_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3041..=0x3096 // Hiragana letters
+            | 0x30A1..=0x30FA // Katakana letters
+            | 0x3105..=0x312F // Bopomofo
+            | 0x31A0..=0x31BF // Bopomofo extended
+            | 0x31F0..=0x31FF // Katakana phonetic extensions
+            | 0x3400..=0x4DBF // CJK Extension A
+            | 0x4E00..=0x9FFF // CJK unified ideographs
+            | 0xAC00..=0xD7AF // Hangul syllables
+            | 0xF900..=0xFAFF // CJK compatibility ideographs
+            | 0x20000..=0x2FA1F // supplementary CJK ideographs
+    )
+}
+
+fn is_unity_translatable(text: &str) -> bool {
+    let s = text.trim();
+    if s.is_empty() || s.contains('\u{FFFD}') {
+        return false;
+    }
+    // Binary soup / mis-framed length prefixes leave controls in the payload.
     // Allow tab/CR/LF for multi-line dialogue; reject other controls.
-    if s.chars().any(|c| {
-        let u = c as u32;
-        u < 32 && c != '\t' && c != '\n' && c != '\r'
-    }) {
+    if s.chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+    {
         return false;
     }
     // Managed type refs flood heuristic scans of ScriptableObject blobs.
@@ -1486,19 +2165,36 @@ fn is_unity_translatable(text: &str) -> bool {
         return false;
     }
     let total = s.chars().count();
-    let ascii_printable = s
-        .chars()
-        .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
-        .count();
-    if (ascii_printable as f64 / total as f64) < 0.85 {
+    let letters = s.chars().filter(|c| c.is_alphabetic()).count();
+    let cjk = s.chars().filter(|&c| is_cjk_script_char(c)).count();
+    if cjk == 0 && s.len() < 5 {
         return false;
     }
-    let letters = s.chars().filter(|c| c.is_alphabetic()).count();
-    if letters < 3 {
+    // Unicode letters are text evidence; unrelated symbols are not. Retain
+    // the old noise threshold without restricting natural text to ASCII.
+    let textual = s
+        .chars()
+        .filter(|c| {
+            c.is_alphanumeric()
+                || c.is_whitespace()
+                || c.is_ascii_punctuation()
+                || matches!(*c as u32, 0x0300..=0x036F | 0x2000..=0x206F | 0x3000..=0x303F | 0xFF01..=0xFF65)
+                || matches!(*c, '¡' | '¿' | '«' | '»')
+        })
+        .count();
+    if textual * 100 < total * 85 {
+        return false;
+    }
+    // Byte heuristics need more evidence than structurally known text fields:
+    // two CJK letters are enough for real UI (`設定`, `保存`), while one is too
+    // easy to find by chance. Other scripts retain the existing three-letter bar.
+    if (cjk > 0 && (cjk < 2 || cjk * 100 < total * 60)) || (cjk == 0 && letters < 3) {
         return false;
     }
     let has_space = s.contains(' ');
-    if !has_space && s.len() > 20 {
+    // Long no-space Japanese/Chinese sentences are normal. Keep the legacy
+    // single-token guard only for scripts where it is meaningful.
+    if cjk == 0 && !has_space && total > 20 {
         return false;
     }
     if s.contains('/') && s.contains('.') && !s.contains(' ') {
@@ -1746,6 +2442,13 @@ impl Default for UnityPlugin {
     }
 }
 
+fn unityfs_to_locust(err: crate::unity_fs::UnityFsError) -> LocustError {
+    LocustError::ParseError {
+        file: err.file,
+        message: err.message,
+    }
+}
+
 impl FormatPlugin for UnityPlugin {
     fn id(&self) -> &str {
         "unity"
@@ -1765,7 +2468,7 @@ impl FormatPlugin for UnityPlugin {
     }
 
     fn supported_extensions(&self) -> &[&str] {
-        &[".assets"]
+        &[".assets", ".unity3d"]
     }
 
     fn supported_modes(&self) -> Vec<OutputMode> {
@@ -1774,7 +2477,10 @@ impl FormatPlugin for UnityPlugin {
 
     fn detect(&self, path: &Path) -> bool {
         if path.is_file() {
-            return path.extension().is_some_and(|e| e == "assets");
+            return path
+                .extension()
+                .is_some_and(|e| e == "assets" || e == "unity3d")
+                || crate::unity_fs::is_unity_fs_file(path);
         }
         Self::has_unity_structure(path)
     }
@@ -1788,12 +2494,13 @@ impl FormatPlugin for UnityPlugin {
             }
         }
 
-        // Fallback to binary .assets extraction
+        // Fallback to binary SerializedFiles (loose .assets / UnityFS CABs)
         let assets = Self::find_assets_files(path);
-        if assets.is_empty() {
+        let bundles = Self::find_unityfs_files(path);
+        if assets.is_empty() && bundles.is_empty() {
             return Err(LocustError::ParseError {
                 file: path.display().to_string(),
-                message: "no script files or .assets files found".to_string(),
+                message: "no script files, .assets files, or UnityFS bundles found".to_string(),
             });
         }
 
@@ -1809,421 +2516,141 @@ impl FormatPlugin for UnityPlugin {
                 &bytes, &filename, asset_file,
             ));
         }
+        for bundle in &bundles {
+            let mut archive =
+                crate::unity_fs::UnityFsArchive::parse_path(bundle).map_err(unityfs_to_locust)?;
+            archive.discard_storage_cache();
+            let supports_relayout = archive.supports_relayout();
+            for node in &archive.nodes {
+                if !crate::unity_fs::is_serialized_bundle_node(&node.path) {
+                    continue;
+                }
+                let bytes = archive.node_bytes(node).map_err(unityfs_to_locust)?;
+                let virtual_path = bundle.join(&node.path);
+                let filename = {
+                    let norm = node.path.replace("\\", "/");
+                    norm.rsplit('/').next().unwrap_or("cab").to_string()
+                };
+                let mut node_entries =
+                    Self::extract_strings_from_assets(bytes, &filename, &virtual_path);
+                if !supports_relayout {
+                    for entry in &mut node_entries {
+                        entry.metadata.remove("textasset_rewrite");
+                        entry.metadata.remove("unity_serialized_version");
+                        if is_textasset_entry(entry) {
+                            entry.char_limit = Some(entry.source.len());
+                        }
+                    }
+                }
+                all.extend(node_entries);
+            }
+        }
         Ok(all)
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
-        // Check if entries come from text scripts (file_path ends in .txt)
-        let from_text = entries
+        // Route per entry: a single external .txt must not hide binary entries.
+        let (text, binary): (Vec<&StringEntry>, Vec<&StringEntry>) = entries
             .iter()
-            .any(|e| e.file_path.extension().is_some_and(|ext| ext == "txt"));
-
-        if from_text {
-            return Self::inject_text_scripts(path, entries);
-        }
-
-        // Binary .assets injection
-        let mut files_modified = 0;
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
-        let mut length_skipped = 0usize;
-        let mut warnings = Vec::new();
-        let mut files_written: Vec<PathBuf> = Vec::new();
+            .partition(|e| e.file_path.extension().is_some_and(|ext| ext == "txt"));
+        let mut report = Self::inject_text_scripts(path, &text)?;
+        let entries = binary.as_slice();
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
-            by_file
-                .entry(entry.file_path.clone())
-                .or_default()
-                .push(entry);
+            if entry_needs_write(entry, &mut report) {
+                by_file
+                    .entry(entry.file_path.clone())
+                    .or_default()
+                    .push(entry);
+            }
         }
+
+        let mut unityfs_jobs: HashMap<PathBuf, HashMap<String, Vec<&StringEntry>>> = HashMap::new();
 
         for (file_path, file_entries) in &by_file {
-            if !file_path.exists() {
+            if file_path.is_file() {
+                let mut bytes = std::fs::read(file_path)?;
+                let label = file_path.display().to_string();
+                let modified =
+                    Self::inject_serialized_bytes(&mut bytes, file_entries, &label, &mut report);
+                if modified {
+                    std::fs::write(file_path, &bytes)?;
+                    report.files_modified += 1;
+                    report.files_written.push(file_path.clone());
+                }
                 continue;
             }
-            let mut bytes = std::fs::read(file_path)?;
-            let mut modified = false;
-            let label = file_path.display().to_string();
-
-            // ── TextAsset CSV cell groups (re-parse original blob, apply cells) ──
-            {
-                let mut csv_groups: HashMap<i64, Vec<&StringEntry>> = HashMap::new();
-                for entry in file_entries
-                    .iter()
-                    .filter(|e| is_textasset_csv_cell_entry(e))
-                {
-                    let Some(path_id) = entry.metadata.get("path_id").and_then(|v| v.as_i64())
-                    else {
-                        warnings.push(format!("TextAsset csv cell '{}' missing path_id", entry.id));
-                        strings_skipped += 1;
-                        continue;
-                    };
-                    csv_groups.entry(path_id).or_default().push(*entry);
-                }
-                for (_path_id, group) in csv_groups {
-                    let Some(head) = group.first() else { continue };
-                    let Some(script_off) = head
-                        .metadata
-                        .get("textasset_script_offset")
-                        .and_then(|v| v.as_u64())
-                        .map(|u| u as usize)
-                    else {
-                        strings_skipped += group.len();
-                        continue;
-                    };
-                    let orig_len = head
-                        .metadata
-                        .get("textasset_script_byte_len")
-                        .and_then(|v| v.as_u64())
-                        .map(|u| u as usize)
-                        .unwrap_or(0);
-                    if orig_len == 0 || script_off + 4 + orig_len > bytes.len() {
-                        strings_skipped += group.len();
-                        continue;
-                    }
-                    // Payload starts after the u32 length prefix.
-                    let payload = &bytes[script_off + 4..script_off + 4 + orig_len];
-                    let Ok(original) = std::str::from_utf8(payload) else {
-                        strings_skipped += group.len();
-                        continue;
-                    };
-                    let Some(mut rebuilt) = apply_csv_translations_to_script(original, &group)
-                    else {
-                        strings_skipped += group.len();
-                        continue;
-                    };
-                    if rebuilt.len() > orig_len {
-                        if length_skipped < 5 {
-                            warnings.push(format!(
-                                "TextAsset CSV rebuild longer than slot ({} > {}) for '{}', skipping",
-                                rebuilt.len(),
-                                orig_len,
-                                head.id
-                            ));
-                        }
-                        length_skipped += 1;
-                        strings_skipped += group.len();
-                        continue;
-                    }
-                    while rebuilt.len() < orig_len {
-                        rebuilt.push(' ');
-                    }
-                    match rewrite_text_asset_script_inplace(
-                        &mut bytes, script_off, orig_len, &rebuilt, &label,
-                    ) {
-                        Ok(()) => {
-                            let changed = group
-                                .iter()
-                                .filter(|e| {
-                                    e.translation
-                                        .as_ref()
-                                        .map(|t| t != &e.source)
-                                        .unwrap_or(false)
-                                })
-                                .count();
-                            strings_written += changed.max(1);
-                            strings_skipped += group.len().saturating_sub(changed.max(1));
-                            modified = true;
-                        }
-                        Err(e) => {
-                            warnings.push(format!("TextAsset CSV rewrite {}: {e}", head.id));
-                            strings_skipped += group.len();
-                        }
+            if let Some((bundle, node)) = Self::resolve_unityfs_virtual_path(file_path) {
+                unityfs_jobs
+                    .entry(bundle)
+                    .or_default()
+                    .entry(node)
+                    .or_default()
+                    .extend(file_entries.iter().copied());
+            } else {
+                for entry in file_entries {
+                    if entry_needs_write(entry, &mut report) {
+                        report.skip("target_missing", 1);
                     }
                 }
-            }
-
-            // ── TextAsset loc-line groups (rebuild whole m_Script once per path_id) ──
-            {
-                let mut loc_groups: HashMap<i64, Vec<&StringEntry>> = HashMap::new();
-                for entry in file_entries
-                    .iter()
-                    .filter(|e| is_textasset_loc_line_entry(e))
-                {
-                    let Some(path_id) = entry.metadata.get("path_id").and_then(|v| v.as_i64())
-                    else {
-                        warnings.push(format!("TextAsset loc line '{}' missing path_id", entry.id));
-                        strings_skipped += 1;
-                        continue;
-                    };
-                    loc_groups.entry(path_id).or_default().push(*entry);
-                }
-                for (_path_id, group) in loc_groups {
-                    let Some(head) = group.first() else { continue };
-                    let Some(script_off) = head
-                        .metadata
-                        .get("textasset_script_offset")
-                        .and_then(|v| v.as_u64())
-                        .map(|u| u as usize)
-                    else {
-                        warnings.push(format!(
-                            "TextAsset loc group missing textasset_script_offset ({})",
-                            head.id
-                        ));
-                        strings_skipped += group.len();
-                        continue;
-                    };
-                    let orig_len = head
-                        .metadata
-                        .get("textasset_script_byte_len")
-                        .and_then(|v| v.as_u64())
-                        .map(|u| u as usize)
-                        .unwrap_or(0);
-                    if orig_len == 0 {
-                        strings_skipped += group.len();
-                        continue;
-                    }
-                    let Some(mut rebuilt) = rebuild_textasset_loc_script(&group) else {
-                        strings_skipped += group.len();
-                        continue;
-                    };
-                    // Preserve original trailing newline style if present in budget.
-                    if rebuilt.len() > orig_len {
-                        if length_skipped < 5 {
-                            warnings.push(format!(
-                                "TextAsset loc rebuild longer than slot ({} > {} bytes) for '{}', skipping group",
-                                rebuilt.len(),
-                                orig_len,
-                                head.id
-                            ));
-                        }
-                        length_skipped += 1;
-                        strings_skipped += group.len();
-                        continue;
-                    }
-                    // Pad with spaces to keep m_Script byte length identical.
-                    while rebuilt.len() < orig_len {
-                        rebuilt.push(' ');
-                    }
-                    match rewrite_text_asset_script_inplace(
-                        &mut bytes, script_off, orig_len, &rebuilt, &label,
-                    ) {
-                        Ok(()) => {
-                            let changed = group
-                                .iter()
-                                .filter(|e| {
-                                    e.translation
-                                        .as_ref()
-                                        .map(|t| t != &e.source)
-                                        .unwrap_or(false)
-                                })
-                                .count();
-                            strings_written += changed.max(1);
-                            strings_skipped += group.len().saturating_sub(changed.max(1));
-                            modified = true;
-                        }
-                        Err(e) => {
-                            warnings.push(format!("TextAsset loc rewrite {}: {e}", head.id));
-                            strings_skipped += group.len();
-                        }
-                    }
-                }
-            }
-
-            // ── Structural TextAsset / MonoBehaviour / TextMesh / GUIText inject ──
-            for entry in file_entries.iter().filter(|e| {
-                is_structural_entry(e)
-                    && !is_textasset_loc_line_entry(e)
-                    && !is_textasset_csv_cell_entry(e)
-            }) {
-                let translation = match &entry.translation {
-                    Some(t) => t,
-                    None => {
-                        strings_skipped += 1;
-                        continue;
-                    }
-                };
-                if translation == &entry.source {
-                    strings_skipped += 1;
-                    continue;
-                }
-                let (off_key, len_key, kind) = if is_textasset_entry(entry) {
-                    (
-                        "textasset_script_offset",
-                        "textasset_script_byte_len",
-                        "TextAsset",
-                    )
-                } else if is_textmesh_entry(entry) {
-                    ("textmesh_text_offset", "textmesh_text_byte_len", "TextMesh")
-                } else if is_guitext_entry(entry) {
-                    ("guitext_text_offset", "guitext_text_byte_len", "GUIText")
-                } else {
-                    (
-                        "mono_string_offset",
-                        "mono_string_byte_len",
-                        "MonoBehaviour",
-                    )
-                };
-                let Some(script_off) = entry
-                    .metadata
-                    .get(off_key)
-                    .and_then(|v| v.as_u64())
-                    .map(|u| u as usize)
-                else {
-                    warnings.push(format!("{kind} entry '{}' missing {off_key}", entry.id));
-                    strings_skipped += 1;
-                    continue;
-                };
-                let orig_len = entry
-                    .metadata
-                    .get(len_key)
-                    .and_then(|v| v.as_u64())
-                    .map(|u| u as usize)
-                    .unwrap_or(entry.source.len());
-                if translation.len() > orig_len {
-                    if length_skipped < 5 {
-                        warnings.push(format!(
-                            "translation for '{}' longer than original {kind} string ({} > {} bytes), skipping",
-                            entry.id,
-                            translation.len(),
-                            orig_len
-                        ));
-                    }
-                    length_skipped += 1;
-                    strings_skipped += 1;
-                    continue;
-                }
-                match rewrite_text_asset_script_inplace(
-                    &mut bytes,
-                    script_off,
-                    orig_len,
-                    translation,
-                    &label,
-                ) {
-                    Ok(()) => {
-                        strings_written += 1;
-                        modified = true;
-                    }
-                    Err(e) => {
-                        warnings.push(format!("{kind} rewrite {}: {e}", entry.id));
-                        strings_skipped += 1;
-                    }
-                }
-            }
-
-            // ── Heuristic length-prefixed inject (non-structural entries) ──
-            struct Work {
-                needle: Vec<u8>,
-                /// Alternate endian needle when metadata did not pin endianness.
-                alt_needle: Option<Vec<u8>>,
-                endian: LengthEndian,
-                alt_endian: Option<LengthEndian>,
-                trans_bytes: Vec<u8>,
-                orig_payload_len: usize,
-            }
-            let mut work: Vec<Work> = Vec::new();
-            for entry in file_entries.iter().filter(|e| !is_structural_entry(e)) {
-                let translation = match &entry.translation {
-                    Some(t) => t,
-                    None => {
-                        strings_skipped += 1;
-                        continue;
-                    }
-                };
-                let orig_bytes = entry.source.as_bytes();
-                let trans_bytes = translation.as_bytes();
-                if trans_bytes == orig_bytes {
-                    strings_skipped += 1;
-                    continue;
-                }
-                if trans_bytes.len() > orig_bytes.len() {
-                    if length_skipped < 5 {
-                        warnings.push(format!(
-                            "translation for '{}' longer than original ({} > {} bytes), skipping",
-                            entry.id,
-                            trans_bytes.len(),
-                            orig_bytes.len()
-                        ));
-                    }
-                    length_skipped += 1;
-                    strings_skipped += 1;
-                    continue;
-                }
-                let pinned = entry
-                    .metadata
-                    .get("length_endian")
-                    .and_then(|v| v.as_str())
-                    .and_then(LengthEndian::from_meta);
-                let (endian, alt_endian) = match pinned {
-                    Some(e) => (e, None),
-                    None => (LengthEndian::Little, Some(LengthEndian::Big)),
-                };
-                let mut needle = Vec::with_capacity(4 + orig_bytes.len());
-                needle.extend_from_slice(&endian.encode_u32(orig_bytes.len() as u32));
-                needle.extend_from_slice(orig_bytes);
-                let alt_needle = alt_endian.map(|ae| {
-                    let mut n = Vec::with_capacity(4 + orig_bytes.len());
-                    n.extend_from_slice(&ae.encode_u32(orig_bytes.len() as u32));
-                    n.extend_from_slice(orig_bytes);
-                    n
-                });
-                work.push(Work {
-                    needle,
-                    alt_needle,
-                    endian,
-                    alt_endian,
-                    trans_bytes: trans_bytes.to_vec(),
-                    orig_payload_len: orig_bytes.len(),
-                });
-            }
-
-            if !work.is_empty() {
-                let patterns: Vec<&[u8]> = work.iter().map(|w| w.needle.as_slice()).collect();
-                let mut cursor =
-                    crate::binary_search::MatchCursor::from_patterns(&bytes, &patterns);
-
-                for (i, w) in work.iter().enumerate() {
-                    let mut matched: Option<(usize, LengthEndian)> = cursor
-                        .next_valid(i, &bytes, &w.needle)
-                        .map(|p| (p, w.endian));
-                    if matched.is_none() {
-                        if let (Some(alt), Some(ae)) = (&w.alt_needle, w.alt_endian) {
-                            if let Some(pos) = find_bytes_once(&bytes, alt) {
-                                matched = Some((pos, ae));
-                            }
-                        }
-                    }
-                    if let Some((pos, used_endian)) = matched {
-                        let new_len = w.trans_bytes.len() as u32;
-                        bytes[pos..pos + 4].copy_from_slice(&used_endian.encode_u32(new_len));
-                        bytes[pos + 4..pos + 4 + w.trans_bytes.len()]
-                            .copy_from_slice(&w.trans_bytes);
-                        for b in
-                            &mut bytes[pos + 4 + w.trans_bytes.len()..pos + 4 + w.orig_payload_len]
-                        {
-                            *b = 0;
-                        }
-                        strings_written += 1;
-                        modified = true;
-                    } else {
-                        strings_skipped += 1;
-                    }
-                }
-            }
-
-            if modified {
-                std::fs::write(file_path, &bytes)?;
-                files_modified += 1;
-                files_written.push(file_path.clone());
             }
         }
 
+        for (bundle_path, nodes) in unityfs_jobs {
+            let mut archive = crate::unity_fs::UnityFsArchive::parse_path(&bundle_path)
+                .map_err(unityfs_to_locust)?;
+            let mut bundle_modified = false;
+            for (node_path, node_entries) in nodes {
+                let Some(node) = archive.node(&node_path).cloned() else {
+                    report.warnings.push(format!(
+                        "UnityFS node '{}' missing in {}",
+                        node_path,
+                        bundle_path.display()
+                    ));
+                    for entry in node_entries {
+                        if entry_needs_write(entry, &mut report) {
+                            report.skip("target_missing", 1);
+                        }
+                    }
+                    continue;
+                };
+                let mut bytes = archive
+                    .node_bytes(&node)
+                    .map_err(unityfs_to_locust)?
+                    .to_vec();
+                let label = format!("{} / {node_path}", bundle_path.display());
+                let modified =
+                    Self::inject_serialized_bytes(&mut bytes, &node_entries, &label, &mut report);
+                if modified {
+                    if bytes.len() == node.size as usize {
+                        archive
+                            .replace_node(&node_path, &bytes)
+                            .map_err(unityfs_to_locust)?;
+                    } else {
+                        archive
+                            .resize_node(&node_path, &bytes)
+                            .map_err(unityfs_to_locust)?;
+                    }
+                    bundle_modified = true;
+                }
+            }
+            if bundle_modified {
+                let out = archive.write_bytes().map_err(unityfs_to_locust)?;
+                std::fs::write(&bundle_path, out)?;
+                report.files_modified += 1;
+                report.files_written.push(bundle_path);
+            }
+        }
+
+        let length_skipped = report.skip_reasons.get("too_long").copied().unwrap_or(0);
         if length_skipped > 0 {
-            warnings.push(format!(
-                "{length_skipped} translation(s) skipped because they are longer than the \
-                 original Unity string (UTF-8 byte length must be ≤ source). Shorten them or \
-                 use a length-aware model; equal-length translations inject cleanly."
+            report.warnings.push(format!(
+                "{length_skipped} translation(s) skipped because the rebuilt Unity slot exceeds its UTF-8 byte budget."
             ));
         }
-
-        Ok(InjectionReport {
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings,
-            files_written,
-        })
+        report.classify_remaining_skips();
+        Ok(report)
     }
 }
 
@@ -2232,10 +2659,312 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn empty_translation_is_untranslated_and_never_erases_a_unity_slot() {
+        let fixture = tempfile::tempdir().unwrap();
+        create_unity_fixture(fixture.path());
+        let asset = fixture.path().join("TestGame_Data/resources.assets");
+        let original = fs::read(&asset).unwrap();
+        let mut entry = StringEntry::new("empty", "Hello World", asset.clone());
+        entry.translation = Some(String::new());
+        let report = UnityPlugin::new().inject(fixture.path(), &[entry]).unwrap();
+        assert_eq!((report.strings_written, report.files_modified), (0, 0));
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(report.skip_reasons.get("untranslated"), Some(&1));
+        assert_eq!(fs::read(&asset).unwrap(), original);
+    }
+
+    fn assert_diagnostic_totals(report: &InjectionReport, entries: usize) {
+        assert_eq!(
+            report.strings_written + report.strings_skipped,
+            entries,
+            "{report:?}"
+        );
+        assert_eq!(
+            report.skip_reasons.values().sum::<usize>(),
+            report.strings_skipped,
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_binary_skips_are_exhaustive_and_missing_files_count() {
+        let fixture = tempfile::tempdir().unwrap();
+        create_unity_fixture(fixture.path());
+        let asset = fixture.path().join("TestGame_Data/resources.assets");
+        let make = |id: &str, source: &str, translation: Option<&str>| {
+            let mut entry = StringEntry::new(id, source, asset.clone());
+            entry.translation = translation.map(str::to_string);
+            entry
+        };
+        let mut entries = vec![
+            make("write", "Hello World", Some("Hola Mundo")),
+            make("pending", "Pending source", None),
+            make("same", "Identity", Some("Identity")),
+            make("long", "Short", Some("Translation exceeds this slot")),
+            make("stale", "No longer present", Some("Absent")),
+        ];
+        let mut missing = make("missing", "Missing source", Some("Absent"));
+        missing.file_path = fixture.path().join("missing.assets");
+        entries.push(missing);
+        let mut invalid = make("invalid", "Structural source", Some("Cambio"));
+        invalid
+            .metadata
+            .insert("extraction_method".into(), serde_json::json!("textasset"));
+        entries.push(invalid);
+        let report = UnityPlugin::new().inject(fixture.path(), &entries).unwrap();
+        assert_diagnostic_totals(&report, entries.len());
+        assert_eq!(report.strings_written, 1);
+        for reason in [
+            "untranslated",
+            "unchanged",
+            "too_long",
+            "source_changed",
+            "target_missing",
+            "error",
+        ] {
+            assert_eq!(report.skip_reasons.get(reason), Some(&1), "{report:?}");
+        }
+    }
+
+    #[test]
+    fn diagnostics_unityfs_missing_node_is_not_silently_lost() {
+        let fixture = tempfile::tempdir().unwrap();
+        let bundle_path = fixture.path().join("data.unity3d");
+        let bundle = crate::unity_fs::build_test_bundle(
+            &[("CAB-present", b"payload")],
+            true,
+            8,
+            true,
+            false,
+        );
+        fs::write(&bundle_path, &bundle).unwrap();
+        let mut entry = StringEntry::new(
+            "missing-node",
+            "Missing source",
+            bundle_path.join("CAB-absent"),
+        );
+        entry.translation = Some("Cambio".into());
+        let report = UnityPlugin::new().inject(fixture.path(), &[entry]).unwrap();
+        assert_diagnostic_totals(&report, 1);
+        assert_eq!(report.skip_reasons.get("target_missing"), Some(&1));
+        assert_eq!(fs::read(bundle_path).unwrap(), bundle);
+    }
+
+    #[test]
+    fn diagnostics_csv_counts_only_cells_actually_written() {
+        let fixture = tempfile::tempdir().unwrap();
+        let asset = fixture.path().join("resources.assets");
+        let script = "ITEM_ID,ITEM_NAME\r\n1,apple\r\n2,banana\r\n3,orange\r\n4,grape\r\n";
+        fs::write(
+            &asset,
+            crate::unity_serialized::write_v17_fixture("Items", script),
+        )
+        .unwrap();
+        let plugin = UnityPlugin::new();
+        let mut entries: Vec<_> = plugin
+            .extract(&asset)
+            .unwrap()
+            .into_iter()
+            .filter(is_textasset_csv_cell_entry)
+            .collect();
+        assert_eq!(entries.len(), 4);
+        for entry in &mut entries {
+            entry.translation = match entry.source.as_str() {
+                "apple" => None,
+                "banana" => Some("banana".into()),
+                "orange" => Some("bad,value".into()),
+                "grape" => Some("uva".into()),
+                other => panic!("Unexpected cell {other}"),
+            };
+        }
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_diagnostic_totals(&report, 4);
+        assert_eq!(report.strings_written, 1);
+        for reason in ["untranslated", "unchanged", "error"] {
+            assert_eq!(report.skip_reasons.get(reason), Some(&1));
+        }
+        let after = plugin.extract(&asset).unwrap();
+        for source in ["apple", "banana", "orange", "uva"] {
+            assert!(after.iter().any(|e| e.source == source), "Missing {source}");
+        }
+    }
+
+    #[test]
+    fn diagnostics_tables_without_changes_do_not_rewrite_or_claim_one_write() {
+        for script in [
+            "ITEM_ID,ITEM_NAME\n1,apple\n2,banana\n   ",
+            "TitleMenu.START: NEW GAME\nTitleMenu.CREDITS: CREDITS\n   ",
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let asset = fixture.path().join("resources.assets");
+            let original = crate::unity_serialized::write_v17_fixture("Table", script);
+            fs::write(&asset, &original).unwrap();
+            let plugin = UnityPlugin::new();
+            let mut entries: Vec<_> = plugin
+                .extract(&asset)
+                .unwrap()
+                .into_iter()
+                .filter(|e| is_textasset_csv_cell_entry(e) || is_textasset_loc_line_entry(e))
+                .collect();
+            assert!(!entries.is_empty());
+            for entry in &mut entries {
+                entry.translation = Some(entry.source.clone());
+            }
+            let report = plugin.inject(fixture.path(), &entries).unwrap();
+            assert_diagnostic_totals(&report, entries.len());
+            assert_eq!(report.strings_written, 0);
+            assert_eq!(report.files_modified, 0);
+            assert_eq!(report.skip_reasons.get("unchanged"), Some(&entries.len()));
+            assert_eq!(fs::read(&asset).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn diagnostics_partial_loc_preserves_rows_not_in_the_request() {
+        let fixture = tempfile::tempdir().unwrap();
+        let asset = fixture.path().join("resources.assets");
+        let script = "TitleMenu.START: NEW GAME\r\n\r\nTitleMenu.CREDITS: CREDITS\r\nConfirmation.Yes: YES\r\n";
+        fs::write(
+            &asset,
+            crate::unity_serialized::write_v17_fixture("ManagedText", script),
+        )
+        .unwrap();
+        let plugin = UnityPlugin::new();
+        let mut entry = plugin
+            .extract(&asset)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.source == "NEW GAME")
+            .unwrap();
+        entry.translation = Some("NUEVO".into());
+        let report = plugin.inject(fixture.path(), &[entry]).unwrap();
+        assert_diagnostic_totals(&report, 1);
+        assert_eq!(report.strings_written, 1);
+        let bytes = fs::read(&asset).unwrap();
+        let parsed = SerializedFile::parse(bytes, &asset).unwrap();
+        let object = parsed.text_asset_objects().next().unwrap();
+        let text = parsed.read_text_asset(object.path_id).unwrap().script;
+        assert!(text.contains(
+            "TitleMenu.START: NUEVO\r\n\r\nTitleMenu.CREDITS: CREDITS\r\nConfirmation.Yes: YES\r\n"
+        ));
+    }
+
+    #[test]
+    fn diagnostics_loc_inject_uses_physical_injection_source_after_pivot() {
+        let fixture = tempfile::tempdir().unwrap();
+        let asset = fixture.path().join("resources.assets");
+        let script = "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS\r\n";
+        fs::write(
+            &asset,
+            crate::unity_serialized::write_v17_fixture("ManagedText", script),
+        )
+        .unwrap();
+        let plugin = UnityPlugin::new();
+        let mut entry = plugin
+            .extract(&asset)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.source == "NEW GAME")
+            .unwrap();
+        entry.metadata.insert(
+            locust_core::models::INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("NEW GAME"),
+        );
+        entry.source = "Start".into();
+        entry.translation = Some("Inicio".into());
+        let report = plugin.inject(fixture.path(), &[entry]).unwrap();
+        assert_eq!(report.strings_written, 1);
+        let bytes = fs::read(&asset).unwrap();
+        let parsed = SerializedFile::parse(bytes, &asset).unwrap();
+        let object = parsed.text_asset_objects().next().unwrap();
+        let text = parsed.read_text_asset(object.path_id).unwrap().script;
+        assert!(text.contains("TitleMenu.START: Inicio"), "{text}");
+        assert!(text.contains("TitleMenu.CREDITS: CREDITS"), "{text}");
+    }
+
+    #[test]
+    fn diagnostics_loc_group_overflow_counts_changed_entries_not_pending_rows() {
+        let fixture = tempfile::tempdir().unwrap();
+        let asset = fixture.path().join("resources.assets");
+        let script =
+            "TitleMenu.START: NEW GAME\nTitleMenu.CREDITS: CREDITS\nConfirmation.Yes: YES\n";
+        let original = crate::unity_serialized::write_v17_fixture("ManagedText", script);
+        fs::write(&asset, &original).unwrap();
+        let plugin = UnityPlugin::new();
+        let mut entries: Vec<_> = plugin
+            .extract(&asset)
+            .unwrap()
+            .into_iter()
+            .filter(is_textasset_loc_line_entry)
+            .collect();
+        assert_eq!(entries.len(), 3);
+        for entry in entries.iter_mut().take(2) {
+            entry.metadata.remove("textasset_rewrite"); // Legacy fixed-slot diagnostic.
+            entry.translation = Some("X".repeat(script.len()));
+        }
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_diagnostic_totals(&report, 3);
+        assert_eq!(report.skip_reasons.get("too_long"), Some(&2));
+        assert_eq!(report.skip_reasons.get("untranslated"), Some(&1));
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(fs::read(&asset).unwrap(), original);
+    }
+
+    #[test]
+    fn diagnostics_script_lines_and_binary_entries_can_share_a_batch() {
+        let fixture = tempfile::tempdir().unwrap();
+        create_unity_fixture(fixture.path());
+        let script = fixture.path().join("Chapter.txt");
+        fs::write(
+            &script,
+            "  J Hello there.\r\n  J Changed since extraction.\r\n",
+        )
+        .unwrap();
+        let mut text = StringEntry::new("Chapter.txt#1", "Hello there.", script.clone());
+        text.translation = Some("Hola amigo.".into());
+        let mut stale = StringEntry::new("Chapter.txt#2", "Original source.", script.clone());
+        stale.translation = Some("Antiguo.".into());
+        let mut missing = StringEntry::new("Chapter.txt#99", "Missing line.", script.clone());
+        missing.translation = Some("Ausente.".into());
+        let mut binary = StringEntry::new(
+            "binary",
+            "Hello World",
+            fixture.path().join("TestGame_Data/resources.assets"),
+        );
+        binary.translation = Some("Hola Mundo".into());
+        let report = UnityPlugin::new()
+            .inject(fixture.path(), &[text, stale, missing, binary])
+            .unwrap();
+        assert_diagnostic_totals(&report, 4);
+        assert_eq!(report.strings_written, 2);
+        assert_eq!(report.files_modified, 2);
+        assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+        assert_eq!(report.skip_reasons.get("target_missing"), Some(&1));
+        assert_eq!(
+            fs::read_to_string(&script).unwrap(),
+            "  J Hola amigo.\r\n  J Changed since extraction.\r\n"
+        );
+    }
+
     fn tempdir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("locust_unity_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn assert_inplace_char_limit(entry: &StringEntry) {
+        if has_textasset_rewrite_capability(entry) {
+            assert_eq!(entry.char_limit, None);
+            return;
+        }
+        assert_eq!(
+            entry.char_limit,
+            Some(entry.source.len()),
+            "in-place slot {} char_limit must be UTF-8 byte length of source ({:?})",
+            entry.id,
+            entry.source
+        );
     }
 
     fn create_unity_fixture(dir: &Path) -> PathBuf {
@@ -2390,6 +3119,94 @@ script Chapter_1_script chapter 1 {
     }
 
     #[test]
+    fn test_unityfs_data_unity3d_extract_and_inject() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+
+        let cab = crate::unity_serialized::write_v17_fixture("Speaker", "Hello from the bundle.");
+        let ress = b"SHOULD_NOT_EXTRACT_RESS_PAYLOAD!!!!";
+        let bundle = crate::unity_fs::build_test_bundle(
+            &[
+                ("CAB-test", cab.as_slice()),
+                ("CAB-test.resS", ress.as_slice()),
+            ],
+            true,
+            8,
+            true,
+            false,
+        );
+        let bundle_path = data_dir.join("data.unity3d");
+        fs::write(&bundle_path, &bundle).unwrap();
+
+        let plugin = UnityPlugin::new();
+        assert!(plugin.detect(&dir));
+        assert!(plugin.detect(&bundle_path));
+        assert!(plugin.supported_extensions().contains(&".unity3d"));
+
+        let found = UnityPlugin::find_unityfs_files(&dir);
+        assert_eq!(found, vec![bundle_path.clone()]);
+
+        let entries = plugin.extract(&dir).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source == "Hello from the bundle."),
+            "got: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.source != "SHOULD_NOT_EXTRACT_RESS_PAYLOAD!!!!"),
+            "must skip .resS nodes: {:?}",
+            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+        let hit = entries
+            .iter()
+            .find(|e| e.source == "Hello from the bundle.")
+            .unwrap();
+        assert_inplace_char_limit(hit);
+        let fp = hit.file_path.to_string_lossy();
+        assert!(
+            fp.contains("data.unity3d") && fp.contains("CAB-test"),
+            "virtual path should be data.unity3d/CAB-test, got {fp}"
+        );
+
+        let mut to_inject = entries.clone();
+        for e in &mut to_inject {
+            if e.source == "Hello from the bundle." {
+                e.translation = Some("Hola desde el bundle.".to_string());
+            }
+        }
+        let report = plugin.inject(&dir, &to_inject).unwrap();
+        assert!(report.strings_written >= 1);
+        assert!(report.files_modified >= 1);
+        assert!(
+            report
+                .files_written
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "data.unity3d")),
+            "files_written: {:?}",
+            report.files_written
+        );
+
+        let rewritten = fs::read(&bundle_path).unwrap();
+        let again =
+            crate::unity_fs::UnityFsArchive::parse(rewritten.clone(), "data.unity3d").unwrap();
+        assert_eq!(again.header.size as usize, rewritten.len());
+        assert_eq!(again.write_bytes().unwrap().len(), rewritten.len());
+
+        let after = plugin.extract(&dir).unwrap();
+        assert!(
+            after
+                .iter()
+                .any(|e| e.source.trim_end() == "Hola desde el bundle."),
+            "got: {:?}",
+            after.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_find_assets_nested_depth3_level() {
         let dir = tempdir();
         let data_dir = dir.join("TestGame_Data");
@@ -2447,6 +3264,23 @@ script Chapter_1_script chapter 1 {
                 "entry {} missing binary_slot for validate/inject preflight",
                 entry.id
             );
+            if entry
+                .metadata
+                .get("extraction_method")
+                .and_then(|v| v.as_str())
+                == Some("heuristic")
+            {
+                assert!(
+                    entry
+                        .metadata
+                        .get("binary_offset")
+                        .and_then(|v| v.as_u64())
+                        .is_some(),
+                    "heuristic entry {} missing pinned binary_offset",
+                    entry.id
+                );
+            }
+            assert_inplace_char_limit(entry);
         }
     }
 
@@ -2545,6 +3379,110 @@ script Chapter_1_script chapter 1 {
         assert!(report.strings_written >= 1);
     }
 
+    /// Exercise the complete heuristic path because translated strings must remain
+    /// discoverable on the next extract, for both Unity byte orders.
+    #[test]
+    fn test_heuristic_multilingual_extract_inject_reextract_le_and_be() {
+        let cases = [
+            ("保存", "存档"),
+            (
+                "物語を続けますか？次の章を始めますか？",
+                "¿Continuación? ¡Sí, próximo capítulo!",
+            ),
+            ("Continue", "继续"),
+            ("Settings", "设置"),
+            ("Main Menu", "主菜单"),
+        ];
+
+        for endian in [LengthEndian::Little, LengthEndian::Big] {
+            let dir = tempdir();
+            let data_dir = dir.join("TestGame_Data");
+            fs::create_dir_all(&data_dir).unwrap();
+            fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+
+            // Invalid SerializedFile header forces the heuristic scanner.
+            let mut data = vec![0xFF; 64];
+            for (source, _) in cases {
+                let source = source.as_bytes();
+                data.extend_from_slice(&endian.encode_u32(source.len() as u32));
+                data.extend_from_slice(source);
+                data.resize((data.len() + 3) & !3, 0);
+            }
+            let assets = data_dir.join("resources.assets");
+            fs::write(&assets, data).unwrap();
+
+            let plugin = UnityPlugin::new();
+            let mut entries = plugin.extract(&dir).unwrap();
+            let expected_endian = endian.as_meta();
+            for (source, _) in cases {
+                let hit = entries
+                    .iter()
+                    .find(|e| e.source == source)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{expected_endian} must extract {source:?}; got {:?}",
+                            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+                        )
+                    });
+                assert_eq!(
+                    hit.metadata.get("length_endian").and_then(|v| v.as_str()),
+                    Some(expected_endian)
+                );
+                assert!(
+                    hit.metadata
+                        .get("binary_offset")
+                        .and_then(|v| v.as_u64())
+                        .is_some(),
+                    "{source:?} must preserve its pinned binary_offset"
+                );
+            }
+
+            for entry in &mut entries {
+                if let Some((_, target)) = cases.iter().find(|(source, _)| *source == entry.source)
+                {
+                    assert!(
+                        target.len() <= entry.source.len(),
+                        "fixture target must fit the in-place byte slot"
+                    );
+                    entry.translation = Some((*target).to_string());
+                }
+            }
+            let report = plugin.inject(&dir, &entries).unwrap();
+            assert_eq!(
+                report.strings_written,
+                cases.len(),
+                "{expected_endian} multilingual inject: skipped={} reasons={:?} warnings={:?}",
+                report.strings_skipped,
+                report.skip_reasons,
+                report.warnings
+            );
+
+            let again = plugin.extract(&dir).unwrap();
+            for (_, target) in cases {
+                let hit = again
+                    .iter()
+                    .find(|e| e.source == target)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{expected_endian} must re-extract {target:?}; got {:?}",
+                            again.iter().map(|e| &e.source).collect::<Vec<_>>()
+                        )
+                    });
+                assert_eq!(
+                    hit.metadata.get("length_endian").and_then(|v| v.as_str()),
+                    Some(expected_endian)
+                );
+                assert!(
+                    hit.metadata
+                        .get("binary_offset")
+                        .and_then(|v| v.as_u64())
+                        .is_some(),
+                    "re-extracted {target:?} must retain binary_offset metadata"
+                );
+            }
+        }
+    }
+
     /// Big-endian length-prefixed strings must extract and inject without
     /// assuming little-endian u32, and must not steal LE strings via off-by-3
     /// BE shadows.
@@ -2577,6 +3515,11 @@ script Chapter_1_script chapter 1 {
             "must record big-endian length: {:?}",
             hello.metadata
         );
+        assert_eq!(
+            hello.metadata.get("binary_offset").and_then(|v| v.as_u64()),
+            Some(64)
+        );
+        assert_inplace_char_limit(hello);
 
         let mut inject_entries = entries;
         for e in &mut inject_entries {
@@ -2655,6 +3598,7 @@ script Chapter_1_script chapter 1 {
         let s_ok = b"OkText!!"; // normal same-length
 
         let mut data: Vec<u8> = vec![0; 16];
+        let mut offsets = Vec::new();
         for s in [
             s_dup.as_slice(),
             s_id.as_slice(),
@@ -2662,6 +3606,7 @@ script Chapter_1_script chapter 1 {
             s_long.as_slice(),
             s_ok.as_slice(),
         ] {
+            offsets.push(data.len());
             data.extend_from_slice(&(s.len() as u32).to_le_bytes());
             data.extend_from_slice(s);
             data.push(0);
@@ -2669,17 +3614,21 @@ script Chapter_1_script chapter 1 {
         let assets = data_dir.join("sharedassets0.assets");
         fs::write(&assets, &data).unwrap();
 
-        let mk = |id: &str, source: &str, translation: Option<&str>| {
+        let mk = |id: &str, source: &str, translation: Option<&str>, offset: usize| {
             let mut e = StringEntry::new(id, source, assets.clone());
             e.translation = translation.map(|s| s.to_string());
+            e.metadata
+                .insert("binary_offset".into(), serde_json::json!(offset));
+            e.metadata
+                .insert("length_endian".into(), serde_json::json!("le"));
             e
         };
         let inject_list = vec![
-            mk("dup1", "DupStr!!", Some("DupOk!!!")),   // 8 → 8
-            mk("id", "SameSame", Some("SameSame")),     // identity → skip
-            mk("dup2", "DupStr!!", Some("DupOk!!!")),   // second occurrence
-            mk("over", "SlotTxt!", Some("WAYTOOLONG")), // oversize → skip
-            mk("ok", "OkText!!", Some("OkTxt!!!")),     // 8 → 8
+            mk("dup1", "DupStr!!", Some("DupOne!!"), offsets[0]),
+            mk("id", "SameSame", Some("SameSame"), offsets[1]),
+            mk("dup2", "DupStr!!", Some("DupTwo!!"), offsets[2]),
+            mk("over", "SlotTxt!", Some("WAYTOOLONG"), offsets[3]),
+            mk("ok", "OkText!!", Some("OkTxt!!!"), offsets[4]),
         ];
 
         let plugin = UnityPlugin::new();
@@ -2700,11 +3649,8 @@ script Chapter_1_script chapter 1 {
         );
 
         let out = fs::read(&assets).unwrap();
-        assert_eq!(
-            out.windows(8).filter(|w| *w == b"DupOk!!!").count(),
-            2,
-            "both DupStr slots rewritten"
-        );
+        assert_eq!(out.windows(8).filter(|w| *w == b"DupOne!!").count(), 1);
+        assert_eq!(out.windows(8).filter(|w| *w == b"DupTwo!!").count(), 1);
         assert!(out.windows(8).any(|w| w == b"OkTxt!!!"));
         assert!(
             out.windows(8).any(|w| w == b"SameSame"),
@@ -2717,14 +3663,160 @@ script Chapter_1_script chapter 1 {
     }
 
     #[test]
+    fn test_heuristic_offsets_and_legacy_targets_are_safe() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+        let mut data = vec![0xFF; 16];
+        let mut offsets = Vec::new();
+        for text in [b"DupStr!!", b"DupStr!!", b"Unique!!", b"Other!!!"] {
+            offsets.push(data.len());
+            data.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            data.extend_from_slice(text);
+        }
+        let assets = data_dir.join("resources.assets");
+        fs::write(&assets, &data).unwrap();
+
+        let mut pinned_second = StringEntry::new("second", "DupStr!!", assets.clone());
+        pinned_second.translation = Some("Only2nd!".into());
+        pinned_second
+            .metadata
+            .insert("binary_offset".into(), serde_json::json!(offsets[1]));
+        pinned_second
+            .metadata
+            .insert("length_endian".into(), serde_json::json!("le"));
+
+        let mut legacy_ambiguous = StringEntry::new("legacy-dup", "DupStr!!", assets.clone());
+        legacy_ambiguous.translation = Some("Legacy!!".into());
+        let mut legacy_unique = StringEntry::new("legacy-one", "Unique!!", assets.clone());
+        legacy_unique.translation = Some("Changed!".into());
+
+        let mut invalid_offset = StringEntry::new("invalid", "Other!!!", assets.clone());
+        invalid_offset.translation = Some("Invalid!".into());
+        invalid_offset
+            .metadata
+            .insert("binary_offset".into(), serde_json::json!(u64::MAX));
+        invalid_offset
+            .metadata
+            .insert("length_endian".into(), serde_json::json!("le"));
+
+        let mut stale_offset = StringEntry::new("stale", "Unique!!", assets.clone());
+        stale_offset.translation = Some("Stale!!!".into());
+        stale_offset
+            .metadata
+            .insert("binary_offset".into(), serde_json::json!(offsets[3]));
+        stale_offset
+            .metadata
+            .insert("length_endian".into(), serde_json::json!("le"));
+
+        let report = UnityPlugin::new()
+            .inject(
+                &dir,
+                &[
+                    pinned_second,
+                    legacy_ambiguous,
+                    legacy_unique,
+                    invalid_offset,
+                    stale_offset,
+                ],
+            )
+            .unwrap();
+        assert_eq!(report.strings_written, 2);
+        assert_eq!(report.skip_reasons.get("ambiguous_target"), Some(&1));
+        assert_eq!(report.skip_reasons.get("source_changed"), Some(&2));
+
+        let out = fs::read(&assets).unwrap();
+        assert_eq!(&out[offsets[0] + 4..offsets[0] + 12], b"DupStr!!");
+        assert_eq!(&out[offsets[1] + 4..offsets[1] + 12], b"Only2nd!");
+        assert_eq!(&out[offsets[2] + 4..offsets[2] + 12], b"Changed!");
+        assert_eq!(&out[offsets[3] + 4..offsets[3] + 12], b"Other!!!");
+    }
+
+    #[test]
+    fn test_runtime_configuration_is_not_extracted() {
+        for class_id in [13, 78, 94] {
+            let bytes = crate::unity_serialized::write_v17_technical_noise_fixture(
+                class_id,
+                &["left ctrl", "Debug Persistent", "joystick button 2"],
+            );
+            let entries = UnityPlugin::extract_strings_from_assets(
+                &bytes,
+                "globalgamemanagers",
+                Path::new("globalgamemanagers"),
+            );
+            assert_eq!(
+                entries.len(),
+                1,
+                "only the TextAsset should remain: {entries:?}"
+            );
+            assert_eq!(entries[0].source, "Hello traveler welcome!");
+        }
+    }
+
+    #[test]
+    fn test_runtime_configuration_old_heuristic_translations_cannot_write() {
+        for class_id in [13, 78, 94] {
+            for pinned in [false, true] {
+                let dir = tempdir();
+                let data_dir = dir.join("TestGame_Data");
+                fs::create_dir_all(&data_dir).unwrap();
+                fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+                let bytes = crate::unity_serialized::write_v17_technical_noise_fixture(
+                    class_id,
+                    &["left ctrl", "Debug Persistent"],
+                );
+                let assets = data_dir.join("globalgamemanagers");
+                fs::write(&assets, &bytes).unwrap();
+                let sf = SerializedFile::parse(bytes.clone(), &assets).unwrap();
+                let offset = sf
+                    .objects
+                    .iter()
+                    .find(|o| o.class_id == class_id)
+                    .unwrap()
+                    .data_abs;
+                let mut entry = StringEntry::new("old-control", "left ctrl", assets.clone());
+                entry.translation = Some("tecla".into());
+                if pinned {
+                    entry
+                        .metadata
+                        .insert("binary_offset".into(), serde_json::json!(offset));
+                    entry
+                        .metadata
+                        .insert("length_endian".into(), serde_json::json!("le"));
+                }
+                let report = UnityPlugin::new().inject(&dir, &[entry]).unwrap();
+                assert_eq!(report.strings_written, 0, "pinned={pinned}");
+                assert_eq!(report.skip_reasons.get("invalid_target"), Some(&1));
+                assert_eq!(fs::read(&assets).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
     fn test_is_translatable() {
         assert!(is_unity_translatable("Hello World"));
         assert!(is_unity_translatable("Press any key to continue"));
         assert!(is_unity_translatable("Hello")); // plain word, not code id
         assert!(is_unity_translatable("Save game"));
+        assert!(is_unity_translatable("設定"));
+        assert!(is_unity_translatable("保存"));
+        assert!(is_unity_translatable("继续"));
+        assert!(is_unity_translatable(
+            "物語を続けますか？次の章を始めますか？"
+        ));
+        assert!(is_unity_translatable("Configuración"));
+        assert!(is_unity_translatable("Überprüfung"));
+        assert!(is_unity_translatable("Настройки"));
+        assert!(!is_unity_translatable("Save◆◇※☆"));
         assert!(!is_unity_translatable("abc"));
+        assert!(!is_unity_translatable("中")); // byte heuristics require two CJK letters
+        assert!(!is_unity_translatable("◆◇※☆"));
+        assert!(!is_unity_translatable("保存\u{1}"));
+        assert!(!is_unity_translatable("\u{FFFD}設定"));
         assert!(!is_unity_translatable("SOME_CONSTANT_NAME"));
         assert!(!is_unity_translatable("Assets/Textures/player.png"));
+        assert!(!is_unity_translatable("素材/画像/背景.png"));
         assert!(!is_unity_translatable("UnityEngine.CoreModule"));
         // Full .NET AQN (spaces after commas — old filter missed these)
         assert!(!is_unity_translatable(
@@ -2811,6 +3903,63 @@ script Chapter_1_script chapter 1 {
     }
 
     #[test]
+    fn test_structural_textasset_and_mono_extract_cjk_fields() {
+        let dir = tempdir();
+        let data_dir = dir.join("TestGame_Data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
+
+        let dialogue = "今日は静かな町を歩いて、古い友人に会いに行きます。";
+        fs::write(
+            data_dir.join("text.assets"),
+            crate::unity_serialized::write_v17_fixture("会話", dialogue),
+        )
+        .unwrap();
+        fs::write(
+            data_dir.join("mono.assets"),
+            crate::unity_serialized::write_v17_mono_fixture("メニュー", &["設定", "保存"]),
+        )
+        .unwrap();
+        // A structurally identified m_Text can safely retain a single CJK glyph.
+        fs::write(
+            data_dir.join("textmesh.assets"),
+            crate::unity_serialized::write_v17_textmesh_fixture("戻"),
+        )
+        .unwrap();
+        // Structural framing alone does not make random symbol payloads text.
+        fs::write(
+            data_dir.join("symbols.assets"),
+            crate::unity_serialized::write_v17_textmesh_fixture("◆◇※☆"),
+        )
+        .unwrap();
+
+        let entries = UnityPlugin::new().extract(&dir).unwrap();
+        assert!(entries.iter().any(|e| {
+            e.source == dialogue
+                && e.metadata.get("extraction_method").and_then(|v| v.as_str()) == Some("textasset")
+        }));
+        for source in ["メニュー", "設定", "保存"] {
+            assert!(
+                entries.iter().any(|e| {
+                    e.source == source
+                        && e.metadata.get("extraction_method").and_then(|v| v.as_str())
+                            == Some("monobehaviour")
+                }),
+                "missing structural MonoBehaviour {source:?}: {:?}",
+                entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+            );
+        }
+        assert!(entries.iter().any(|e| {
+            e.source == "戻"
+                && e.metadata.get("extraction_method").and_then(|v| v.as_str()) == Some("textmesh")
+        }));
+        assert!(
+            !entries.iter().any(|e| e.source == "◆◇※☆"),
+            "symbol-only structural payload must stay excluded"
+        );
+    }
+
+    #[test]
     fn test_textasset_skips_linebreak_charset_tables() {
         let dir = tempdir();
         let data_dir = dir.join("TestGame_Data");
@@ -2818,9 +3967,14 @@ script Chapter_1_script chapter 1 {
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
         // Near-zero alphabetic content — TMP line-break character class table.
         let charset = "([｛〔〈《「『【〘〖〝‘“｟«$—…‥〳〴〵\\［（{£¥\"々〇〉》」＄｠￥￦ #)]｝〕〉》」』】〙〗〟’”｠»";
+        let kana_table = ")]｝〕〉》」』】〙〗〟’”｠»ヽゴミ袋ァィゥェォッャュョヮヵヶぁぃぅぇぉっゃゅょゎゕゖㇰㇱㇲㇳㇴㇵㇶㇷㇸㇹㇺㇻㇼㇽㇾㇿ々〻‐゠–〜?!‼⁇⁈⁉・、%,.:;。！？］）：；＝}¢°\"†‡℃〆％，．";
         assert!(
             !crate::unity_serialized::is_textasset_script_worth_extracting(charset),
             "charset table must be rejected"
+        );
+        assert!(
+            !is_unity_textasset_script_worth_extracting(kana_table),
+            "multilingual recovery must not reopen small-kana charset tables"
         );
         assert!(
             crate::unity_serialized::is_textasset_script_worth_extracting(
@@ -2973,6 +4127,9 @@ Confirmation.Yes: YES\r\n";
                 .and_then(|v| v.as_str()),
             Some("textasset")
         );
+        for e in &ta {
+            assert_inplace_char_limit(e);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3043,6 +4200,31 @@ Electronics,video games,13\r\n",
                 .collect::<Vec<_>>()
         );
         assert!(cells.iter().any(|e| e.source == "towel"));
+        assert!(
+            cells.iter().all(|e| e.char_limit.is_none()),
+            "csv cells share one TextAsset blob; char_limit must stay unset: {:?}",
+            cells
+                .iter()
+                .map(|e| (&e.id, e.char_limit))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            cells.iter().all(|e| {
+                match locust_core::textasset_group::parse_group_meta(e) {
+                    Ok(meta) => {
+                        let original: &str = meta.original.as_ref();
+                        original == script
+                            && meta.capacity >= script.len()
+                            && Some(script.len() as u64)
+                                == e.metadata
+                                    .get("textasset_script_byte_len")
+                                    .and_then(|v| v.as_u64())
+                    }
+                    Err(_) => false,
+                }
+            }),
+            "csv cells must record whole-blob original and script_byte_len capacity"
+        );
 
         for e in &mut entries {
             if e.source == "towel" {
@@ -3197,6 +4379,30 @@ Confirmation.Yes: YES\r\n\
         assert!(loc.iter().any(|e| {
             e.metadata.get("loc_key").and_then(|v| v.as_str()) == Some("TitleMenu.START")
         }));
+        assert!(
+            loc.iter().all(|e| e.char_limit.is_none()),
+            "loc lines share one TextAsset blob; char_limit must stay unset: {:?}",
+            loc.iter()
+                .map(|e| (&e.id, e.char_limit))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            loc.iter().all(|e| {
+                match locust_core::textasset_group::parse_group_meta(e) {
+                    Ok(meta) => {
+                        let original: &str = meta.original.as_ref();
+                        original == script
+                            && meta.capacity >= script.len()
+                            && Some(script.len() as u64)
+                                == e.metadata
+                                    .get("textasset_script_byte_len")
+                                    .and_then(|v| v.as_u64())
+                    }
+                    Err(_) => false,
+                }
+            }),
+            "loc lines must record whole-blob original and script_byte_len capacity"
+        );
 
         for e in &mut entries {
             if e.source == "NEW GAME" {
@@ -3303,6 +4509,9 @@ Confirmation.Yes: YES\r\n\
                 .and_then(|v| v.as_str()),
             Some("monobehaviour")
         );
+        for e in &mono {
+            assert_inplace_char_limit(e);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3503,6 +4712,9 @@ Confirmation.Yes: YES\r\n\
                 .and_then(|v| v.as_str()),
             Some("textmesh")
         );
+        for e in &tm {
+            assert_inplace_char_limit(e);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3575,6 +4787,9 @@ Confirmation.Yes: YES\r\n\
                 .and_then(|v| v.as_str()),
             Some("guitext")
         );
+        for e in &gt {
+            assert_inplace_char_limit(e);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3611,12 +4826,13 @@ Confirmation.Yes: YES\r\n\
     }
 
     #[test]
-    fn test_textasset_inject_oversize_skips() {
+    fn test_legacy_textasset_inject_oversize_skips() {
         let dir = tempdir();
         create_textasset_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
         for e in &mut entries {
+            e.metadata.remove("textasset_rewrite");
             if e.tags.iter().any(|t| t == "textasset") {
                 e.translation = Some(
                     "This translation is intentionally far longer than the original TextAsset script"

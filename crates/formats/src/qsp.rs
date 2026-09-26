@@ -627,6 +627,7 @@ impl FormatPlugin for QspPlugin {
         }
 
         Ok(InjectionReport {
+            skip_reasons: Default::default(),
             files_modified,
             strings_written,
             strings_skipped,

@@ -1,4 +1,6 @@
+mod archive_replace;
 pub mod binary_search;
+mod discovery;
 pub mod html_game;
 pub mod qsp;
 pub mod renpy;
@@ -7,8 +9,11 @@ pub mod rpgmaker_mv;
 pub mod rpgmaker_vxa;
 pub mod sugarcube;
 pub mod unity;
+pub mod unity_fs;
 pub mod unity_serialized;
 pub mod unreal;
+pub mod unreal_iostore;
+pub mod unreal_iostore_native;
 pub mod unreal_locres;
 pub mod unreal_pak;
 pub mod vntextpatch;
@@ -47,3 +52,6 @@ pub fn default_registry() -> FormatRegistry {
     r.register(Box::new(vntextpatch::VnTextPatchPlugin::new()));
     r
 }
+
+#[cfg(test)]
+mod recovery_discovery_tests;

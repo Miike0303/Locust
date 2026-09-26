@@ -27,7 +27,7 @@
 //! (VNTextPatch; verified on Injuu Kangoku RE yst00000–04 / yst00042 → B4 62 6A D8).
 //!
 //! YPF containers: see [`crate::yuris_ypf`] (GARbro ArcYPF layout; inject rebuilds
-//! the archive in place with a `.locust-old` safety rename).
+//! the archive in place with an exclusively owned backup and staged replacement).
 //!
 //! Out of scope: ysc.ybn command-name table (WORD/_/GOSUB filtering uses structural
 //! heuristics instead — over-extraction OK); exotic per-title YPF swap schemes.
@@ -35,9 +35,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::archive_replace::{guard_target, note_backups, replace_files};
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
+use locust_core::patch::GameLock;
 use tracing::warn;
 
 use crate::yuris_ypf::{self, YpfArchive};
@@ -86,6 +88,7 @@ impl YurisPlugin {
         for entry in walkdir::WalkDir::new(root)
             .follow_links(false)
             .into_iter()
+            .filter_entry(crate::discovery::is_game_entry)
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
@@ -933,33 +936,6 @@ fn split_ypf_virtual_path(path: &Path) -> Option<(String, String)> {
     Some((archive, inner))
 }
 
-/// Replace `path` with `new_bytes` after moving the original to `path` + `.locust-old`.
-/// Restores the backup if the write fails.
-fn replace_file_with_backup(path: &Path, new_bytes: &[u8]) -> Result<()> {
-    let backup = {
-        let mut s = path.to_string_lossy().into_owned();
-        s.push_str(".locust-old");
-        PathBuf::from(s)
-    };
-    if backup.exists() {
-        std::fs::remove_file(&backup).ok();
-    }
-    std::fs::rename(path, &backup).map_err(|e| {
-        parse_err(
-            &path.display().to_string(),
-            format!("cannot move aside for backup: {e}"),
-        )
-    })?;
-    if let Err(e) = std::fs::write(path, new_bytes) {
-        let _ = std::fs::rename(&backup, path);
-        return Err(parse_err(
-            &path.display().to_string(),
-            format!("write failed after backup (restored): {e}"),
-        ));
-    }
-    Ok(())
-}
-
 // ─── FormatPlugin ──────────────────────────────────────────────────────────
 
 impl FormatPlugin for YurisPlugin {
@@ -1095,6 +1071,22 @@ impl FormatPlugin for YurisPlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+        let search_root = Self::root_dir(path);
+        let game_lock = GameLock::acquire(if search_root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &search_root
+        })?;
+        self.inject_under_lock(path, entries, &game_lock)
+    }
+
+    fn inject_under_lock(
+        &self,
+        path: &Path,
+        entries: &[StringEntry],
+        game_lock: &GameLock,
+    ) -> Result<InjectionReport> {
+        game_lock.validate_selection(path)?;
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
@@ -1141,6 +1133,7 @@ impl FormatPlugin for YurisPlugin {
                 continue;
             }
 
+            guard_target(game_lock, &actual)?;
             let bytes = match std::fs::read(&actual) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1184,7 +1177,7 @@ impl FormatPlugin for YurisPlugin {
             strings_written += translations.len();
         }
 
-        // YPF archives — rebuild each affected archive in place with .locust-old backup
+        // YPF archives — rebuild each affected archive in place with an exclusively owned backup
         for (archive_rel, inners) in ypf_groups {
             let arch_path = {
                 let p = search_root.join(&archive_rel);
@@ -1203,6 +1196,7 @@ impl FormatPlugin for YurisPlugin {
                 continue;
             }
 
+            guard_target(game_lock, &arch_path)?;
             let archive = match YpfArchive::open(&arch_path) {
                 Ok(a) => a,
                 Err(e) => {
@@ -1274,8 +1268,9 @@ impl FormatPlugin for YurisPlugin {
             }
 
             match yuris_ypf::rebuild_ypf(&archive, &replacements) {
-                Ok(new_arch) => match replace_file_with_backup(&arch_path, &new_arch) {
-                    Ok(()) => {
+                Ok(new_arch) => match replace_files(game_lock, &[(arch_path.clone(), new_arch)]) {
+                    Ok(backups) => {
+                        note_backups(backups, &mut warnings);
                         files_modified += 1;
                         files_written.push(arch_path.clone());
                         strings_written += arch_written;
@@ -1293,6 +1288,7 @@ impl FormatPlugin for YurisPlugin {
         }
 
         Ok(InjectionReport {
+            skip_reasons: Default::default(),
             files_modified,
             strings_written,
             strings_skipped,
@@ -1306,6 +1302,139 @@ impl FormatPlugin for YurisPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn held_lock_injects_loose_and_archive_without_releasing_exclusion() {
+        for packed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let other = tempfile::tempdir().unwrap();
+            let bytes = build_ystb_with_inst_pad(
+                TRUE_KEY_B4626AD8,
+                &["Hello original!", "Untouched line"],
+                &[],
+                0,
+                0,
+            );
+            let path = if packed {
+                let path = root.path().join("game.ypf");
+                fs::write(
+                    &path,
+                    crate::yuris_ypf::write_ypf(
+                        0x1E4,
+                        0xFF,
+                        &[("yst00000.ybn".into(), bytes, true)],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                path
+            } else {
+                let path = root.path().join("yst00000.ybn");
+                fs::write(&path, bytes).unwrap();
+                path
+            };
+            let original = fs::read(&path).unwrap();
+            let plugin = YurisPlugin::new();
+            let mut entries = plugin.extract(root.path()).unwrap();
+            entries.retain(|e| e.source == "Hello original!");
+            assert_eq!(entries.len(), 1);
+            entries[0].translation = Some("Texto traducido.".into());
+            let wrong = GameLock::acquire(other.path()).unwrap();
+            assert!(plugin
+                .inject_under_lock(root.path(), &entries, &wrong)
+                .is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let lock = GameLock::acquire(root.path()).unwrap();
+            assert!(plugin.inject(root.path(), &entries).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let report = plugin
+                .inject_under_lock(root.path(), &entries, &lock)
+                .unwrap();
+            assert_eq!(report.strings_written, 1, "{report:?}");
+            assert!(plugin
+                .extract(root.path())
+                .unwrap()
+                .iter()
+                .any(|e| e.source == "Texto traducido."));
+            assert!(GameLock::acquire(root.path()).is_err());
+            drop(lock);
+            assert!(GameLock::acquire(root.path()).is_ok());
+        }
+    }
+
+    #[test]
+    fn ypf_reinjection_keeps_original_backup_sidecar_and_quoted_text() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("game.ypf");
+        let ystb = build_ystb_with_inst_pad(
+            TRUE_KEY_B4626AD8,
+            &["Hello original!", "Untouched line"],
+            &[],
+            0,
+            0,
+        );
+        let original =
+            crate::yuris_ypf::write_ypf(0x1E4, 0xFF, &[("yst00000.ybn".into(), ystb, true)])
+                .unwrap();
+        fs::write(&path, &original).unwrap();
+        let sidecar = root.path().join("game.ypf.locust-old");
+        fs::write(&sidecar, b"unrelated exact bytes").unwrap();
+        let plugin = YurisPlugin::new();
+        let first_text = "She said \"yes\"; it's fine.";
+        let mut entries = plugin.extract(root.path()).unwrap();
+        for e in &mut entries {
+            if e.source == "Hello original!" {
+                e.translation = Some(first_text.into());
+            }
+        }
+        let first = plugin.inject(root.path(), &entries).unwrap();
+        assert_eq!(first.strings_written, 1, "{first:?}");
+        let first_backup = backup_path(&first);
+        let first_bytes = fs::read(&path).unwrap();
+        let mut entries = plugin.extract(root.path()).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source == first_text),
+            "{entries:?}"
+        );
+        for e in &mut entries {
+            if e.source == first_text {
+                e.translation = Some("Second \"quoted\" pass.".into());
+            }
+        }
+        let second = plugin.inject(root.path(), &entries).unwrap();
+        assert_eq!(second.strings_written, 1);
+        let second_backup = backup_path(&second);
+        assert_ne!(first_backup, second_backup);
+        assert_eq!(fs::read(first_backup).unwrap(), original);
+        assert_eq!(fs::read(second_backup).unwrap(), first_bytes);
+        assert_eq!(fs::read(sidecar).unwrap(), b"unrelated exact bytes");
+        assert_eq!(second.files_written, vec![path]);
+        let final_entries = plugin.extract(root.path()).unwrap();
+        assert_eq!(final_entries.len(), 2);
+        assert!(final_entries
+            .iter()
+            .any(|e| e.source == "Second \"quoted\" pass."));
+        assert!(final_entries.iter().any(|e| e.source == "Untouched line"));
+    }
+    fn backup_path(report: &locust_core::extraction::InjectionReport) -> std::path::PathBuf {
+        report
+            .warnings
+            .iter()
+            .find_map(|w| w.strip_prefix("previous archive retained at "))
+            .map(std::path::PathBuf::from)
+            .expect("reported owned backup")
+    }
+
+    #[test]
+    fn unrelated_backup_sentinel_survives_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.ypf");
+        std::fs::write(&path, b"original archive").unwrap();
+        let sidecar = dir.path().join("game.ypf.locust-old");
+        std::fs::write(&sidecar, b"unrelated exact bytes").unwrap();
+        let lock = locust_core::patch::GameLock::acquire(dir.path()).unwrap();
+        crate::archive_replace::replace_files(&lock, &[(path, b"new archive".to_vec())]).unwrap();
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"unrelated exact bytes");
+    }
     use super::*;
     use std::fs;
 
@@ -1796,7 +1925,7 @@ mod tests {
         let report = plugin.inject(&dir, &entries).unwrap();
         assert!(report.files_modified >= 1, "{report:?}");
 
-        let backup = PathBuf::from(format!("{}.locust-old", ypf_path.display()));
+        let backup = backup_path(&report);
         assert!(
             backup.is_file(),
             "expected .locust-old backup at {backup:?}"
@@ -1852,5 +1981,25 @@ mod tests {
             plugin.stability(),
             locust_core::extraction::FormatStability::Experimental
         );
+    }
+    #[test]
+    fn recovery_discovery_yuris_preserves_user_loose_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        create_fixture(root);
+        let source = fs::read(root.join("ysbin/yst00001.ybn")).unwrap();
+        let user = root.join(".locust-injections-user");
+        fs::create_dir_all(&user).unwrap();
+        fs::write(user.join("yst00002.ybn"), &source).unwrap();
+        let plugin = YurisPlugin::new();
+        let before = crate::recovery_discovery_tests::projection(plugin.extract(root).unwrap());
+        assert_eq!(before.len(), 4);
+        for name in [".locust", ".locust-injections"] {
+            let internal = root.join(name).join("results");
+            fs::create_dir_all(&internal).unwrap();
+            fs::write(internal.join("yst90001.ybn"), &source).unwrap();
+            fs::write(internal.join("sentinel.bin"), b"preserve recovery bytes").unwrap();
+        }
+        crate::recovery_discovery_tests::assert_unchanged(&plugin, root, before);
     }
 }

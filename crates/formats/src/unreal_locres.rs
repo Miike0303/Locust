@@ -29,7 +29,48 @@
 //! string-table order while remaining semantically equal.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
+
+/// Bounds apply to both loose files and decompressed PAK resources.
+pub const MAX_LOCRES_FILE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_LOCRES_DECODED_BYTES: usize = 128 * 1024 * 1024;
+const MAX_LOCRES_RECORDS: usize = 1_000_000;
+
+/// Reserved only for identities that cannot retain the legacy namespace/key ID.
+pub const LOCRES_TUPLE_ID_PREFIX: &str = "~locres-tuple:";
+pub type LocresKey = (String, String);
+
+pub fn encoded_identity(namespace: &str, key: &str) -> String {
+    // Serializing a pair of strings cannot fail.
+    format!(
+        "{LOCRES_TUPLE_ID_PREFIX}{}",
+        serde_json::to_string(&(namespace, key)).unwrap()
+    )
+}
+
+fn legacy_identity(namespace: &str, key: &str) -> String {
+    if namespace.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{namespace}/{key}")
+    }
+}
+
+struct DecodedBudget {
+    used: usize,
+    limit: usize,
+}
+impl DecodedBudget {
+    fn charge(&mut self, bytes: usize, file: &str) -> Result<(), LocresError> {
+        self.used = self
+            .used
+            .checked_add(bytes)
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(|| err(file, "decoded LocRes allocation exceeds safety limit"))?;
+        Ok(())
+    }
+}
 
 /// LocRes magic GUID (UnrealLocres byte order).
 pub const LOCRES_MAGIC: [u8; 16] = [
@@ -209,6 +250,21 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    fn count(&mut self, minimum_bytes: usize, label: &str) -> Result<usize, LocresError> {
+        let count = self.i32()?;
+        if count < 0 {
+            return Err(err(self.file, format!("negative {label} count")));
+        }
+        let count = count as usize;
+        if count > MAX_LOCRES_RECORDS || count > self.remaining() / minimum_bytes {
+            return Err(err(
+                self.file,
+                format!("{label} count {count} exceeds safety limit or remaining bytes"),
+            ));
+        }
+        Ok(count)
+    }
+
     /// Unreal FString (NUL-terminated in file; returned without NUL).
     fn fstring(&mut self) -> Result<String, LocresError> {
         let length = self.i32()?;
@@ -218,12 +274,15 @@ impl<'a> Reader<'a> {
         if length > 0 {
             let len = length as usize;
             let bytes = self.read_exact(len)?;
-            // ANSI/UTF-8 path (UE uses "ANSI" — treat as UTF-8/latin1-ish ASCII).
+            let bytes = bytes
+                .strip_suffix(&[0])
+                .ok_or_else(|| err(self.file, "unterminated ANSI FString"))?;
+            // Preserve embedded NULs rather than collapsing distinct identities.
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| err(self.file, format!("invalid ANSI FString at {}", self.pos)))?;
-            Ok(s.trim_end_matches('\0').to_string())
+            Ok(s.to_string())
         } else {
-            let units = (-length) as usize;
+            let units = length.unsigned_abs() as usize;
             let byte_len = units
                 .checked_mul(2)
                 .ok_or_else(|| err(self.file, "UTF-16 FString size overflow"))?;
@@ -232,9 +291,8 @@ impl<'a> Reader<'a> {
             for chunk in bytes.chunks_exact(2) {
                 u16s.push(u16::from_le_bytes([chunk[0], chunk[1]]));
             }
-            // Drop trailing NUL unit if present.
-            if u16s.last() == Some(&0) {
-                u16s.pop();
+            if u16s.pop() != Some(0) {
+                return Err(err(self.file, "unterminated UTF-16 FString"));
             }
             String::from_utf16(&u16s)
                 .map_err(|_| err(self.file, format!("invalid UTF-16 FString at {}", self.pos)))
@@ -310,11 +368,25 @@ impl Writer {
 
 impl LocresFile {
     pub fn parse(data: &[u8], file_label: &str) -> Result<Self, LocresError> {
+        Self::parse_with_budget(data, file_label, MAX_LOCRES_DECODED_BYTES)
+    }
+
+    fn parse_with_budget(
+        data: &[u8],
+        file_label: &str,
+        decoded_limit: usize,
+    ) -> Result<Self, LocresError> {
         if data.is_empty() {
             return Err(err(file_label, "empty file"));
         }
+        if data.len() > MAX_LOCRES_FILE_BYTES {
+            return Err(err(file_label, "LocRes file exceeds 64 MiB safety limit"));
+        }
+        let mut budget = DecodedBudget {
+            used: 0,
+            limit: decoded_limit,
+        };
         let mut r = Reader::new(data, file_label);
-
         let version = if data.len() >= 16 && data[..16] == LOCRES_MAGIC {
             r.read_exact(16)?;
             let v = r.u8()?;
@@ -323,73 +395,74 @@ impl LocresFile {
         } else {
             LocresVersion::Legacy
         };
-
-        let mut string_array: Vec<String> = Vec::new();
-
-        if version as u8 >= LocresVersion::Compact as u8 {
-            let array_offset = r.i64()?;
-            if array_offset < 0 {
-                return Err(err(file_label, "negative string array offset"));
-            }
-            let array_offset = array_offset as usize;
+        let modern = version as u8 >= LocresVersion::Compact as u8;
+        let mut string_array = Vec::new();
+        if modern {
+            let offset = r.i64()?;
+            let array_offset = usize::try_from(offset)
+                .map_err(|_| err(file_label, "negative or overflowing string array offset"))?;
             let resume = r.pos;
-            r.seek(array_offset)?;
-            let count = r.i32()?;
-            if count < 0 {
-                return Err(err(file_label, "negative string array count"));
-            }
-            let count = count as usize;
-            // Soft cap — locres string tables are not multi-GB.
-            if count > 10_000_000 {
+            let minimum_offset = resume + if version.is_optimized() { 8 } else { 4 };
+            if array_offset < minimum_offset {
                 return Err(err(
                     file_label,
-                    format!("string array count {count} exceeds safety limit"),
+                    "string array overlaps LocRes header/namespace count",
                 ));
             }
+            r.seek(array_offset)?;
+            let count = r.count(if version.is_optimized() { 8 } else { 4 }, "string array")?;
+            budget.charge(count * std::mem::size_of::<String>(), file_label)?;
             string_array.reserve(count);
             for _ in 0..count {
-                string_array.push(r.fstring()?);
-                if version.is_optimized() {
-                    let _ref_count = r.i32()?;
+                let value = r.fstring()?;
+                budget.charge(value.len(), file_label)?;
+                string_array.push(value);
+                if version.is_optimized() && r.i32()? < 0 {
+                    return Err(err(file_label, "negative string reference count"));
                 }
             }
+            // Namespace/key records cannot consume bytes belonging to the table.
+            r = Reader::new(&data[..array_offset], file_label);
             r.seek(resume)?;
         }
-
-        if version.is_optimized() {
-            let _entries_count = r.i32()?;
-        }
-
-        let namespace_count = r.i32()?;
-        if namespace_count < 0 {
-            return Err(err(file_label, "negative namespace count"));
-        }
-        let namespace_count = namespace_count as usize;
-        if namespace_count > 1_000_000 {
-            return Err(err(
-                file_label,
-                format!("namespace count {namespace_count} exceeds safety limit"),
-            ));
-        }
-
+        let minimum_key_bytes = if version.is_optimized() { 16 } else { 12 };
+        let declared_entries = if version.is_optimized() {
+            Some(r.count(minimum_key_bytes, "entry")?)
+        } else {
+            None
+        };
+        let namespace_count = r.count(if version.is_optimized() { 12 } else { 8 }, "namespace")?;
+        budget.charge(
+            namespace_count * std::mem::size_of::<LocresNamespace>(),
+            file_label,
+        )?;
         let mut namespaces = Vec::with_capacity(namespace_count);
+        let mut string_indices = Vec::new();
+        let mut actual_entries = 0usize;
         for _ in 0..namespace_count {
             let name_hash = if version.is_optimized() { r.u32()? } else { 0 };
             let name = r.fstring()?;
-            let key_count = r.i32()?;
-            if key_count < 0 {
-                return Err(err(
-                    file_label,
-                    format!("negative key count in namespace {name:?}"),
-                ));
+            budget.charge(name.len(), file_label)?;
+            let key_count = r.count(minimum_key_bytes, "key")?;
+            actual_entries = actual_entries
+                .checked_add(key_count)
+                .filter(|n| *n <= MAX_LOCRES_RECORDS)
+                .ok_or_else(|| err(file_label, "total entry count exceeds safety limit"))?;
+            if declared_entries.is_some_and(|count| actual_entries > count) {
+                return Err(err(file_label, "entry count exceeds declared total"));
             }
-            let key_count = key_count as usize;
+            budget.charge(key_count * std::mem::size_of::<LocresString>(), file_label)?;
+            if modern {
+                budget.charge(key_count * std::mem::size_of::<usize>(), file_label)?;
+                string_indices.reserve(key_count);
+            }
             let mut strings = Vec::with_capacity(key_count);
             for _ in 0..key_count {
                 let key_hash = if version.is_optimized() { r.u32()? } else { 0 };
                 let key = r.fstring()?;
+                budget.charge(key.len(), file_label)?;
                 let source_string_hash = r.u32()?;
-                let value = if version as u8 >= LocresVersion::Compact as u8 {
+                let value = if modern {
                     let idx = r.i32()?;
                     if idx < 0 || idx as usize >= string_array.len() {
                         return Err(err(
@@ -400,9 +473,15 @@ impl LocresFile {
                             ),
                         ));
                     }
-                    string_array[idx as usize].clone()
+                    // Account for ALL expanded values before cloning ANY. One
+                    // stored value referenced many times cannot explode memory.
+                    budget.charge(string_array[idx as usize].len(), file_label)?;
+                    string_indices.push(idx as usize);
+                    String::new()
                 } else {
-                    r.fstring()?
+                    let value = r.fstring()?;
+                    budget.charge(value.len(), file_label)?;
+                    value
                 };
                 strings.push(LocresString {
                     key,
@@ -417,7 +496,18 @@ impl LocresFile {
                 strings,
             });
         }
-
+        if declared_entries.is_some_and(|count| actual_entries != count) {
+            return Err(err(file_label, "entry count does not match declared total"));
+        }
+        if modern {
+            for (entry, index) in namespaces
+                .iter_mut()
+                .flat_map(|ns| ns.strings.iter_mut())
+                .zip(string_indices)
+            {
+                entry.value = string_array[index].clone();
+            }
+        }
         Ok(Self {
             version,
             namespaces,
@@ -426,7 +516,20 @@ impl LocresFile {
 
     pub fn parse_path(path: &Path) -> Result<Self, LocresError> {
         let label = path.display().to_string();
-        let data = std::fs::read(path).map_err(|e| err(&label, format!("read failed: {e}")))?;
+        let file =
+            std::fs::File::open(path).map_err(|e| err(&label, format!("read failed: {e}")))?;
+        if file
+            .metadata()
+            .map_err(|e| err(&label, format!("metadata failed: {e}")))?
+            .len()
+            > MAX_LOCRES_FILE_BYTES as u64
+        {
+            return Err(err(&label, "LocRes file exceeds 64 MiB safety limit"));
+        }
+        let mut data = Vec::new();
+        file.take(MAX_LOCRES_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| err(&label, format!("read failed: {e}")))?;
         Self::parse(&data, &label)
     }
 
@@ -446,23 +549,146 @@ impl LocresFile {
 
     /// Apply translations: map of `"namespace/key"` → new value. Preserves hashes.
     pub fn apply_translations(&mut self, translations: &HashMap<String, String>) -> usize {
-        let mut n = 0;
-        for ns in &mut self.namespaces {
-            for s in &mut ns.strings {
+        // Keep only requested identities. Retaining a flattened ID for every
+        // entry would itself amplify a long namespace prefix across all keys.
+        #[derive(Default)]
+        struct Candidate {
+            count: usize,
+            namespace: usize,
+            key: usize,
+        }
+        let mut matches: HashMap<&str, Candidate> = translations
+            .keys()
+            .map(|id| (id.as_str(), Candidate::default()))
+            .collect();
+        let max_id_len = translations.keys().map(String::len).max().unwrap_or(0);
+        for (ns_index, ns) in self.namespaces.iter().enumerate() {
+            for (key_index, string) in ns.strings.iter().enumerate() {
+                let length = ns
+                    .name
+                    .len()
+                    .saturating_add(string.key.len())
+                    .saturating_add(usize::from(!ns.name.is_empty()));
+                if length > max_id_len {
+                    continue;
+                }
                 let id = if ns.name.is_empty() {
-                    s.key.clone()
+                    string.key.clone()
                 } else {
-                    format!("{}/{}", ns.name, s.key)
+                    format!("{}/{}", ns.name, string.key)
                 };
-                if let Some(t) = translations.get(&id) {
-                    if s.value != *t {
-                        s.value = t.clone();
-                        n += 1;
-                    }
+                if let Some(candidate) = matches.get_mut(id.as_str()) {
+                    candidate.count += 1;
+                    candidate.namespace = ns_index;
+                    candidate.key = key_index;
+                }
+            }
+        }
+        let mut n = 0;
+        for (id, candidate) in matches {
+            if candidate.count != 1 {
+                continue;
+            }
+            let entry = &mut self.namespaces[candidate.namespace].strings[candidate.key];
+            if let Some(translation) = translations.get(id) {
+                if entry.value != *translation {
+                    entry.value = translation.clone();
+                    n += 1;
                 }
             }
         }
         n
+    }
+
+    /// IDs for extraction in entry order. Existing unambiguous IDs stay byte
+    /// identical. Slash collisions and raw reserved-prefix IDs are escaped as
+    /// JSON tuples, including the prefix case to prevent raw/escaped collisions.
+    /// Exact duplicate tuples cannot be independently addressed and are errors.
+    pub fn extraction_ids(&self, label: &str) -> Result<Vec<String>, LocresError> {
+        let mut tuples = std::collections::HashSet::new();
+        let mut counts = HashMap::<String, usize>::new();
+        let mut budget = DecodedBudget {
+            used: 0,
+            limit: MAX_LOCRES_DECODED_BYTES,
+        };
+        for (namespace, key, _, _) in self.iter_entries() {
+            if !tuples.insert((namespace, key)) {
+                return Err(err(
+                    label,
+                    "duplicate LocRes namespace/key identity cannot be extracted safely",
+                ));
+            }
+            budget.charge(
+                namespace.len().saturating_add(key.len()).saturating_add(1),
+                label,
+            )?;
+            *counts.entry(legacy_identity(namespace, key)).or_default() += 1;
+        }
+        let mut ids = Vec::with_capacity(tuples.len());
+        let mut output_budget = DecodedBudget {
+            used: 0,
+            limit: MAX_LOCRES_DECODED_BYTES,
+        };
+        for (namespace, key, _, _) in self.iter_entries() {
+            let flat = legacy_identity(namespace, key);
+            let id = if counts.get(&flat).copied().unwrap_or(0) > 1
+                || flat.starts_with(LOCRES_TUPLE_ID_PREFIX)
+            {
+                encoded_identity(namespace, key)
+            } else {
+                flat
+            };
+            output_budget.charge(id.len(), label)?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// Structured translation authority used by the engine. Duplicate physical
+    /// tuples remain unwritable; namespace/key slash placement never conflates.
+    pub fn apply_translations_by_key(
+        &mut self,
+        translations: &HashMap<LocresKey, String>,
+    ) -> usize {
+        #[derive(Default)]
+        struct Candidate {
+            count: usize,
+            namespace: usize,
+            key: usize,
+        }
+        let mut matches: HashMap<(&str, &str), Candidate> = translations
+            .keys()
+            .map(|(ns, key)| ((ns.as_str(), key.as_str()), Candidate::default()))
+            .collect();
+        for (ns_index, ns) in self.namespaces.iter().enumerate() {
+            for (key_index, string) in ns.strings.iter().enumerate() {
+                if let Some(candidate) = matches.get_mut(&(ns.name.as_str(), string.key.as_str())) {
+                    candidate.count += 1;
+                    candidate.namespace = ns_index;
+                    candidate.key = key_index;
+                }
+            }
+        }
+        let updates: Vec<_> = matches
+            .into_iter()
+            .filter_map(|((ns, key), candidate)| {
+                if candidate.count != 1 {
+                    return None;
+                }
+                translations
+                    .get(&(ns.to_owned(), key.to_owned()))
+                    .map(|value| (candidate.namespace, candidate.key, value.clone()))
+            })
+            .collect();
+        let mut written = 0;
+        for (namespace, key, translation) in updates {
+            let entry = &mut self.namespaces[namespace].strings[key];
+            if entry.value != translation {
+                entry.value = translation;
+                written += 1;
+            }
+        }
+        written
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, LocresError> {

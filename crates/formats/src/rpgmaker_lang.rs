@@ -215,8 +215,24 @@ fn patch_iavra_labels_param(raw: &str, lang: &str, label: &str) -> Option<String
         // separator style the existing list used.
         new_list.push_str(", ");
     }
-    new_list.push_str(&format!("{lang}:{label}"));
+    new_list.push_str(&format!("{lang}:{}", js_json_string_escape(label)));
     Some(format!("{}{}{}", &raw[..start], new_list, &raw[end..]))
+}
+
+fn js_json_string_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Extend JS array literals after a marker, e.g. `langs = ['jp', 'en', 'zh']`.
@@ -384,9 +400,9 @@ fn append_language_draw_label(raw: &str, _lang: &str, label: &str) -> Option<Str
         "\"center\""
     };
     let label_lit = if raw[zi..end].contains('\'') {
-        format!("'{label}'")
+        format!("'{}'", label.replace('\\', "\\\\").replace('\'', "\\'"))
     } else {
-        format!("\"{label}\"")
+        format!("\"{}\"", label.replace('\\', "\\\\").replace('"', "\\\""))
     };
 
     let insert = format!(
@@ -449,15 +465,14 @@ fn patch_language_choice_maps(
         if !(lower.starts_with("map") && lower[3..].chars().all(|c| c.is_ascii_digit())) {
             continue;
         }
-        if patch_one_map(&path, lang, label)? {
-            let bak = backup_file(&path)?;
+        if let Some(bak) = patch_one_map(&path, lang, label)? {
             changed.push((path, bak));
         }
     }
     Ok(changed)
 }
 
-fn patch_one_map(path: &Path, lang: &str, label: &str) -> Result<bool> {
+fn patch_one_map(path: &Path, lang: &str, label: &str) -> Result<Option<PathBuf>> {
     let (raw, _) = EncodingDetector::read_file_auto(path)?;
     let text = if path.extension().and_then(|e| e.to_str()) == Some("jsono") {
         let units =
@@ -474,7 +489,7 @@ fn patch_one_map(path: &Path, lang: &str, label: &str) -> Result<bool> {
     let mut any = false;
 
     let Some(events) = map.get_mut("events").and_then(|v| v.as_array_mut()) else {
-        return Ok(false);
+        return Ok(None);
     };
 
     for ev in events.iter_mut() {
@@ -495,17 +510,19 @@ fn patch_one_map(path: &Path, lang: &str, label: &str) -> Result<bool> {
     }
 
     if !any {
-        return Ok(false);
+        return Ok(None);
     }
 
     let out = serde_json::to_string(&map)?;
-    if path.extension().and_then(|e| e.to_str()) == Some("jsono") {
-        let enc = lz_str::compress_to_base64(&out);
-        std::fs::write(path, enc)?;
+    let encoded = if path.extension().and_then(|e| e.to_str()) == Some("jsono") {
+        lz_str::compress_to_base64(&out)
     } else {
-        std::fs::write(path, serde_json::to_string_pretty(&map)?)?;
-    }
-    Ok(true)
+        serde_json::to_string_pretty(&map)?
+    };
+    // Backup original bytes before the first write. Existing .bak-locust is kept.
+    let bak = backup_file(path)?;
+    std::fs::write(path, encoded)?;
+    Ok(Some(bak))
 }
 
 fn looks_like_language_choices(choices: &[String]) -> bool {
@@ -529,24 +546,156 @@ fn looks_like_language_choices(choices: &[String]) -> bool {
         || (joined.contains("english") && (joined.contains("日本語") || joined.contains("中文")))
 }
 
+fn event_code(cmd: &serde_json::Value) -> u64 {
+    cmd.get("code").and_then(|c| c.as_u64()).unwrap_or(0)
+}
+
+fn event_indent(cmd: &serde_json::Value) -> i64 {
+    cmd.get("indent")
+        .and_then(|c| c.as_i64().or_else(|| c.as_u64().map(|u| u as i64)))
+        .unwrap_or(0)
+}
+
+fn skip_choice_branch_body(list: &[serde_json::Value], mut j: usize, indent: i64) -> usize {
+    while j < list.len() {
+        let c2 = event_code(&list[j]);
+        let i2 = event_indent(&list[j]);
+        if i2 < indent {
+            break;
+        }
+        if i2 == indent && (c2 == 402 || c2 == 403 || c2 == 404) {
+            break;
+        }
+        j += 1;
+    }
+    j
+}
+
+fn is_english_choice_branch(cmd: &serde_json::Value) -> bool {
+    let idx = cmd
+        .get("parameters")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    let name = cmd
+        .get("parameters")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    idx == 1 || name.eq_ignore_ascii_case("english") || name.eq_ignore_ascii_case("en")
+}
+
+fn collect_choice_branches(
+    list: &[serde_json::Value],
+    i_show: usize,
+) -> (Vec<(usize, usize)>, Option<usize>) {
+    let indent = event_indent(&list[i_show]);
+    let mut j = i_show + 1;
+    let mut branches: Vec<(usize, usize)> = Vec::new();
+    let mut end404 = None;
+    while j < list.len() {
+        let c = event_code(&list[j]);
+        let ind = event_indent(&list[j]);
+        if ind < indent {
+            break;
+        }
+        if ind == indent && c == 404 {
+            end404 = Some(j);
+            break;
+        }
+        if ind == indent && c == 402 {
+            let start = j;
+            j = skip_choice_branch_body(list, j + 1, indent);
+            branches.push((start, j));
+            continue;
+        }
+        if ind == indent && c == 403 {
+            j = skip_choice_branch_body(list, j + 1, indent);
+            continue;
+        }
+        j += 1;
+    }
+    (branches, end404)
+}
+
+fn script_param_mut(cmd: &mut serde_json::Value) -> Option<&mut String> {
+    cmd.get_mut("parameters")
+        .and_then(|p| p.as_array_mut())
+        .and_then(|a| a.first_mut())
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        })
+}
+
+fn clone_usable_lang_branch(
+    list: &[serde_json::Value],
+    start: usize,
+    end: usize,
+    lang: &str,
+    label: &str,
+    new_index: i64,
+) -> Option<Vec<serde_json::Value>> {
+    let mut new_cmds: Vec<serde_json::Value> = list[start..end].to_vec();
+    if let Some(first) = new_cmds.first_mut() {
+        if let Some(params) = first.get_mut("parameters").and_then(|p| p.as_array_mut()) {
+            if !params.is_empty() {
+                params[0] = serde_json::json!(new_index);
+            }
+            if params.len() > 1 {
+                params[1] = serde_json::Value::String(label.to_string());
+            }
+        }
+    }
+    let mut recognized = false;
+    for cmd in &mut new_cmds {
+        let c = event_code(cmd);
+        if c != 355 && c != 655 {
+            continue;
+        }
+        let Some(s) = cmd
+            .get("parameters")
+            .and_then(|p| p.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        match rewrite_lang_script(&s, lang, new_index as i32) {
+            LangScriptRewrite::Refuse => return None,
+            LangScriptRewrite::Unrelated(_) => {}
+            LangScriptRewrite::Rewritten(rewritten) => {
+                recognized = true;
+                if let Some(slot) = script_param_mut(cmd) {
+                    *slot = rewritten;
+                }
+            }
+        }
+    }
+    if recognized {
+        Some(new_cmds)
+    } else {
+        None
+    }
+}
+
 fn patch_event_list(list: &mut Vec<serde_json::Value>, lang: &str, label: &str) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i < list.len() {
-        let code = list[i].get("code").and_then(|c| c.as_u64()).unwrap_or(0);
-        if code != 102 {
+        if event_code(&list[i]) != 102 {
             i += 1;
             continue;
         }
-        let Some(choices_val) = list[i]
-            .get_mut("parameters")
-            .and_then(|p| p.as_array_mut())
-            .and_then(|a| a.get_mut(0))
+        let Some(choices) = list[i]
+            .get("parameters")
+            .and_then(|p| p.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_array())
         else {
-            i += 1;
-            continue;
-        };
-        let Some(choices) = choices_val.as_array_mut() else {
             i += 1;
             continue;
         };
@@ -566,172 +715,275 @@ fn patch_event_list(list: &mut Vec<serde_json::Value>, lang: &str, label: &str) 
             continue;
         }
 
-        let new_index = choices.len() as i64;
-        choices.push(serde_json::Value::String(label.to_string()));
-        changed = true;
+        let new_index = choice_strs.len() as i64;
+        let (branches, end404) = collect_choice_branches(list, i);
+        let Some(insert_at) = end404 else {
+            i += 1;
+            continue;
+        };
 
-        // Collect When branches until 404
-        let mut j = i + 1;
-        let mut branches: Vec<(usize, usize)> = Vec::new(); // (start, end exclusive)
-        let mut en_branch: Option<(usize, usize)> = None;
-        while j < list.len() {
-            let c = list[j].get("code").and_then(|x| x.as_u64()).unwrap_or(0);
-            if c == 402 {
-                let start = j;
-                let idx = list[j]
-                    .get("parameters")
-                    .and_then(|p| p.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(-1);
-                let name = list[j]
-                    .get("parameters")
-                    .and_then(|p| p.as_array())
-                    .and_then(|a| a.get(1))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                j += 1;
-                while j < list.len() {
-                    let c2 = list[j].get("code").and_then(|x| x.as_u64()).unwrap_or(0);
-                    if c2 == 402 || c2 == 403 || c2 == 404 {
-                        break;
-                    }
-                    j += 1;
-                }
-                branches.push((start, j));
-                if idx == 1
-                    || name.eq_ignore_ascii_case("english")
-                    || name.eq_ignore_ascii_case("en")
-                {
-                    en_branch = Some((start, j));
-                }
-                continue;
-            }
-            if c == 404 || c == 403 {
+        let en_range = branches.iter().copied().find(|(start, _)| {
+            list.get(*start)
+                .map(is_english_choice_branch)
+                .unwrap_or(false)
+        });
+        let mut template = None;
+        for range in en_range.into_iter().chain(branches.iter().copied()) {
+            if let Some(cmds) =
+                clone_usable_lang_branch(list, range.0, range.1, lang, label, new_index)
+            {
+                template = Some(cmds);
                 break;
             }
-            j += 1;
         }
+        let Some(new_cmds) = template else {
+            i += 1;
+            continue;
+        };
 
-        let template = en_branch.or_else(|| branches.first().copied());
-        if let Some((start, end)) = template {
-            let mut new_cmds: Vec<serde_json::Value> = list[start..end].to_vec();
-            if let Some(first) = new_cmds.first_mut() {
-                if let Some(params) = first.get_mut("parameters").and_then(|p| p.as_array_mut()) {
-                    if !params.is_empty() {
-                        params[0] = serde_json::json!(new_index);
-                    }
-                    if params.len() > 1 {
-                        params[1] = serde_json::Value::String(label.to_string());
-                    }
-                }
-            }
-            for cmd in &mut new_cmds {
-                let c = cmd.get("code").and_then(|x| x.as_u64()).unwrap_or(0);
-                if c == 355 || c == 655 {
-                    if let Some(params) = cmd.get_mut("parameters").and_then(|p| p.as_array_mut()) {
-                        if let Some(s) = params
-                            .first_mut()
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                        {
-                            let rewritten = rewrite_lang_script(&s, lang, new_index as i32);
-                            params[0] = serde_json::Value::String(rewritten);
-                        }
-                    }
-                }
-            }
-            // Insert before 404
-            let mut insert_at = i + 1;
-            while insert_at < list.len() {
-                let c = list[insert_at]
-                    .get("code")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
-                if c == 404 {
-                    break;
-                }
-                insert_at += 1;
-            }
-            for (k, cmd) in new_cmds.into_iter().enumerate() {
-                list.insert(insert_at + k, cmd);
-            }
+        let Some(choices_val) = list[i]
+            .get_mut("parameters")
+            .and_then(|p| p.as_array_mut())
+            .and_then(|a| a.get_mut(0))
+        else {
+            i += 1;
+            continue;
+        };
+        let Some(choices) = choices_val.as_array_mut() else {
+            i += 1;
+            continue;
+        };
+        choices.push(serde_json::Value::String(label.to_string()));
+        for (k, cmd) in new_cmds.into_iter().enumerate() {
+            list.insert(insert_at + k, cmd);
         }
+        changed = true;
         i += 1;
     }
     changed
 }
 
-fn rewrite_lang_script(script: &str, lang: &str, index: i32) -> String {
-    let mut s = script.to_string();
-    // IAVRA.MasterLocalization.I18N.language = "en";
-    if s.contains("I18N.language") {
-        s = regex_replace_lang_assign(&s, lang);
-    }
-    if s.contains("ConfigManager.lang") {
-        s = s
-            .lines()
-            .map(|line| {
-                if line.contains("ConfigManager.lang") {
-                    // keep indentation
-                    let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-                    format!("{indent}ConfigManager.lang = {index};")
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !s.contains('\n') && s.contains("ConfigManager.lang") {
-            s = format!("ConfigManager.lang = {index};");
-        }
-    }
-    s
+#[derive(Debug, PartialEq, Eq)]
+enum LangScriptRewrite {
+    Unrelated(String),
+    Rewritten(String),
+    Refuse,
 }
 
-fn regex_replace_lang_assign(script: &str, lang: &str) -> String {
-    // Simple state machine: language = "xx" or 'xx'
-    let mut out = String::new();
-    let bytes = script.as_bytes();
-    let mut i = 0;
-    let needle = "language";
-    while i < bytes.len() {
-        if script[i..].starts_with(needle) {
-            out.push_str(needle);
-            i += needle.len();
-            // skip spaces and =
-            while i < bytes.len() && (bytes[i] as char).is_whitespace() {
-                out.push(bytes[i] as char);
-                i += 1;
+fn skip_ws_bytes(s: &str, mut i: usize) -> usize {
+    let b = s.as_bytes();
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn at_ident_start(s: &str, i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let prev = s.as_bytes()[i - 1];
+    !(prev.is_ascii_alphanumeric() || prev == b'_')
+}
+
+fn exact_config_manager_lang_at(s: &str, i: usize) -> bool {
+    const NEEDLE: &str = "ConfigManager.lang";
+    if i + NEEDLE.len() > s.len() || !s[i..].starts_with(NEEDLE) || !at_ident_start(s, i) {
+        return false;
+    }
+    let after = i + NEEDLE.len();
+    if after < s.len() {
+        let n = s.as_bytes()[after];
+        if n.is_ascii_alphanumeric() || n == b'_' {
+            return false;
+        }
+    }
+    true
+}
+
+fn skip_comment_or_string(s: &str, i: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    if i >= b.len() {
+        return None;
+    }
+    if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+        let mut j = i + 2;
+        while j < b.len() && b[j] != b'\n' {
+            j += 1;
+        }
+        return Some(j);
+    }
+    if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+        let mut j = i + 2;
+        while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+            j += 1;
+        }
+        if j + 1 < b.len() {
+            j += 2;
+        } else {
+            j = b.len();
+        }
+        return Some(j);
+    }
+    if b[i] == b'"' || b[i] == b'\'' || b[i] == b'`' {
+        let q = b[i];
+        let mut j = i + 1;
+        while j < b.len() {
+            if b[j] == b'\\' {
+                j += 1;
+                if j < b.len() {
+                    j += 1;
+                }
+                continue;
             }
-            if i < bytes.len() && bytes[i] == b'=' {
-                out.push('=');
+            if b[j] == q {
+                j += 1;
+                break;
+            }
+            j += 1;
+        }
+        return Some(j);
+    }
+    None
+}
+
+fn scan_ascii_int(s: &str, i: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    if i >= b.len() {
+        return None;
+    }
+    let mut j = i;
+    if b[j] == b'-' || b[j] == b'+' {
+        j += 1;
+    }
+    if j >= b.len() || !b[j].is_ascii_digit() {
+        return None;
+    }
+    while j < b.len() && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j < b.len() {
+        let n = b[j];
+        if n == b'.' || n == b'e' || n == b'E' || n.is_ascii_alphabetic() || n == b'_' {
+            return None;
+        }
+    }
+    Some(j)
+}
+
+fn is_simple_assign_eq(s: &str, i: usize) -> bool {
+    let b = s.as_bytes();
+    if i >= b.len() || b[i] != b'=' {
+        return false;
+    }
+    if i > 0 {
+        let p = b[i - 1];
+        if matches!(
+            p,
+            b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^'
+        ) {
+            return false;
+        }
+    }
+    if i + 1 < b.len() && (b[i + 1] == b'=' || b[i + 1] == b'>') {
+        return false;
+    }
+    true
+}
+
+fn skip_quoted_payload(s: &str, mut i: usize, q: u8) -> Option<usize> {
+    let b = s.as_bytes();
+    while i < b.len() {
+        if b[i] == b'\\' {
+            i += 1;
+            if i < b.len() {
                 i += 1;
-                while i < bytes.len() && (bytes[i] as char).is_whitespace() {
-                    out.push(bytes[i] as char);
-                    i += 1;
-                }
-                if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-                    let q = bytes[i] as char;
-                    out.push(q);
-                    i += 1;
-                    while i < bytes.len() && bytes[i] as char != q {
-                        i += 1;
-                    }
-                    out.push_str(lang);
-                    if i < bytes.len() {
-                        out.push(q);
-                        i += 1;
-                    }
-                    continue;
-                }
             }
             continue;
         }
-        out.push(bytes[i] as char);
+        if b[i] == q {
+            return Some(i);
+        }
         i += 1;
     }
-    out
+    None
+}
+
+fn rewrite_lang_script(script: &str, lang: &str, index: i32) -> LangScriptRewrite {
+    let mut out = String::with_capacity(script.len() + lang.len() + 8);
+    let mut i = 0;
+    let mut saw = false;
+    while i < script.len() {
+        if let Some(n) = skip_comment_or_string(script, i) {
+            out.push_str(&script[i..n]);
+            i = n;
+            continue;
+        }
+        if script[i..].starts_with("I18N.language") && at_ident_start(script, i) {
+            out.push_str("I18N.language");
+            i += "I18N.language".len();
+            let ws1 = i;
+            i = skip_ws_bytes(script, i);
+            out.push_str(&script[ws1..i]);
+            if is_simple_assign_eq(script, i) {
+                out.push('=');
+                i += 1;
+                let ws2 = i;
+                i = skip_ws_bytes(script, i);
+                out.push_str(&script[ws2..i]);
+                if i < script.len()
+                    && (script.as_bytes()[i] == b'"' || script.as_bytes()[i] == b'\'')
+                {
+                    let q = script.as_bytes()[i];
+                    out.push(q as char);
+                    i += 1;
+                    let Some(close) = skip_quoted_payload(script, i, q) else {
+                        return LangScriptRewrite::Refuse;
+                    };
+                    i = close + 1;
+                    out.push_str(lang);
+                    out.push(q as char);
+                    saw = true;
+                    continue;
+                }
+                return LangScriptRewrite::Refuse;
+            }
+            continue;
+        }
+        if exact_config_manager_lang_at(script, i) {
+            out.push_str("ConfigManager.lang");
+            i += "ConfigManager.lang".len();
+            let ws1 = i;
+            i = skip_ws_bytes(script, i);
+            out.push_str(&script[ws1..i]);
+            if is_simple_assign_eq(script, i) {
+                out.push('=');
+                i += 1;
+                let ws2 = i;
+                i = skip_ws_bytes(script, i);
+                out.push_str(&script[ws2..i]);
+                let Some(end) = scan_ascii_int(script, i) else {
+                    return LangScriptRewrite::Refuse;
+                };
+                i = end;
+                out.push_str(&index.to_string());
+                saw = true;
+                continue;
+            }
+            return LangScriptRewrite::Refuse;
+        }
+        let ch = match script[i..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if saw {
+        LangScriptRewrite::Rewritten(out)
+    } else {
+        LangScriptRewrite::Unrelated(script.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -845,3 +1097,7 @@ this.drawText('中文', fx3, rect.y, segment, "center")
         assert!(!looks_like_language_choices(&["Yes".into(), "No".into()]));
     }
 }
+
+#[cfg(test)]
+#[path = "rpgmaker_lang_fix_tests.rs"]
+mod rpgmaker_lang_fix_tests;

@@ -265,6 +265,18 @@ fn test_colliding_filename_loose_translation_survives_and_report_reconciles() {
         "loose dialogue line was not extracted"
     );
 
+    let db = locust_core::database::Database::open_in_memory().unwrap();
+    db.save_entries(&entries).unwrap();
+    let loose = entries
+        .iter()
+        .find(|e| e.source.contains("Hello from the loose override"))
+        .unwrap();
+    assert_eq!(
+        db.get_entry(&loose.id).unwrap().unwrap().source,
+        loose.source,
+        "opening the extracted project must preserve the active loose override"
+    );
+
     // --- ASSIGN TRANSLATIONS to every entry ---
     for e in &mut entries {
         e.translation = Some(format!("[ES] {}", e.source));

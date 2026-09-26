@@ -1,3 +1,4 @@
+use locust_core::backup::RevisionOriginal;
 use std::collections::HashMap;
 use std::io::{Read as IoRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -192,6 +193,7 @@ impl RenPyPlugin {
                 }
             }
             return Ok(InjectionReport {
+                skip_reasons: Default::default(),
                 files_modified: if removed_stale { 1 } else { 0 },
                 strings_written,
                 strings_skipped,
@@ -227,6 +229,7 @@ impl RenPyPlugin {
         let _ = std::fs::remove_file(game_dir.join("zzz_locust_translate.rpyc"));
 
         Ok(InjectionReport {
+            skip_reasons: Default::default(),
             files_modified: 1,
             strings_written,
             strings_skipped,
@@ -286,20 +289,17 @@ impl RenPyPlugin {
             let _ = Self::extract_rpa(rpa_path, temp_dir);
         }
 
-        // Build a lookup: (filename, line_number) -> (source, translation)
+        // Build a lookup: (filename, line_number) -> (source, translation).
+        // The source is checked again against the current extracted script
+        // below, so stale database rows can never authorize a code-string edit.
         let mut line_translations: HashMap<(String, usize), (String, String)> = HashMap::new();
         for entry in entries {
             if let Some(ref t) = entry.translation {
                 if t != &entry.source {
-                    // Entry IDs are "filename.rpy#linenumber" or "archive.rpa#filename.rpy#linenumber"
-                    let parts: Vec<&str> = entry.id.split('#').collect();
-                    if parts.len() >= 2 {
-                        let filename = if parts.len() == 3 {
-                            parts[1].to_string() // archive.rpa#filename.rpy#line
-                        } else {
-                            parts[0].to_string() // filename.rpy#line
-                        };
-                        let line_str = parts.last().unwrap_or(&"0");
+                    // Entry IDs are "filename.rpy#linenumber" or
+                    // "archive.rpa#filename.rpy#linenumber".
+                    if let Some((prefix, line_str)) = entry.id.rsplit_once('#') {
+                        let filename = prefix.rsplit('#').next().unwrap_or(prefix).to_string();
                         if let Ok(line_num) = line_str.parse::<usize>() {
                             line_translations
                                 .insert((filename, line_num), (entry.source.clone(), t.clone()));
@@ -343,6 +343,14 @@ impl RenPyPlugin {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            let current_sources: std::collections::HashSet<(usize, String)> =
+                Self::extract_file(fpath)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry_line_number(&entry.id, &filename).map(|line| (line, entry.source))
+                    })
+                    .collect();
 
             let mut modified = false;
             let mut new_lines: Vec<String> = Vec::new();
@@ -358,14 +366,13 @@ impl RenPyPlugin {
                 let key = (filename.clone(), line_num);
 
                 if let Some((source, translation)) = line_translations.get(&key) {
-                    let trimmed = line.trim();
-                    // Only translate dialogue lines, not code
-                    if is_dialogue_line(trimmed) {
-                        let search = format!("\"{}\"", source);
-                        if line.contains(&search) {
-                            let safe_trans = escape_inner_quotes(translation);
-                            let replace = format!("\"{}\"", safe_trans);
-                            let new_line = line.replace(&search, &replace);
+                    // Re-run the same extractor against the current member and
+                    // require the same physical source at the same line. This
+                    // admits screen text/textbutton/tooltips as well as
+                    // dialogue, without admitting arbitrary code literals.
+                    if current_sources.contains(&(line_num, source.clone())) {
+                        if let Some(new_line) = replace_extracted_literal(line, source, translation)
+                        {
                             new_lines.push(new_line);
                             modified = true;
                             local_matched += 1;
@@ -424,7 +431,30 @@ impl RenPyPlugin {
             ));
         }
 
+        let no_translation = entries.iter().filter(|e| e.translation.is_none()).count();
+        let identity = entries
+            .iter()
+            .filter(|e| e.translation.as_deref() == Some(e.source.as_str()))
+            .count();
+        let unmatched = entries
+            .len()
+            .saturating_sub(strings_written + collision_skipped + no_translation + identity);
+        let mut skip_reasons = std::collections::BTreeMap::new();
+        if no_translation > 0 {
+            skip_reasons.insert("untranslated".to_string(), no_translation);
+        }
+        if identity > 0 {
+            skip_reasons.insert("unchanged".to_string(), identity);
+        }
+        if collision_skipped > 0 {
+            skip_reasons.insert("destination_collision".to_string(), collision_skipped);
+        }
+        if unmatched > 0 {
+            skip_reasons.insert("source_changed".to_string(), unmatched);
+        }
+
         Ok(InjectionReport {
+            skip_reasons,
             files_modified,
             strings_written,
             strings_skipped: entries.len().saturating_sub(strings_written),
@@ -539,6 +569,10 @@ impl RenPyPlugin {
 
     fn extract_file(file_path: &Path) -> Result<Vec<StringEntry>> {
         let content = std::fs::read_to_string(file_path)?;
+        Ok(Self::extract_content(file_path, &content))
+    }
+
+    fn extract_content(file_path: &Path, content: &str) -> Vec<StringEntry> {
         let filename = file_path
             .file_name()
             .unwrap_or_default()
@@ -755,7 +789,7 @@ impl RenPyPlugin {
             }
         }
 
-        Ok(entries)
+        entries
     }
 }
 
@@ -914,71 +948,6 @@ fn extract_say_statement(line: &str) -> Option<(Option<&str>, &str)> {
     }
 
     None
-}
-
-/// Check if a line is a dialogue line (say statement or menu choice) that should be translated.
-/// Returns true ONLY for lines like:
-///   - `character "dialogue text"` (say statement)
-///   - `"narrator text"` (narrator say)
-///   - `"menu choice":` (menu choice)
-///
-/// Returns false for everything else (code, screens, defines, labels, etc.)
-fn is_dialogue_line(trimmed: &str) -> bool {
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-        return false;
-    }
-
-    // Menu choice: `"Choice text":` (task #6 — the old condition listed the same
-    // ends_with twice, so any line starting with `"` that was not a menu choice
-    // still fell through to the overly-broad narrator branch).
-    if trimmed.starts_with('"') && trimmed.ends_with("\":") {
-        return true;
-    }
-
-    // Narrator say: a complete quoted string on its own line — must end with `"`
-    // and not be a screen language fragment (`textbutton "x" action ...`).
-    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.contains("action ")
-            || lower.contains("textbutton")
-            || lower.contains("sensitive ")
-            || lower.contains("hovered ")
-        {
-            return false;
-        }
-        // Exactly one opening and one closing quote (simple say, not multi-arg).
-        if trimmed.matches('"').count() == 2 {
-            return true;
-        }
-    }
-
-    // Character say: `identifier "text"`, `identifier expression "text"`, or `identifier"text"`
-    if let Some(quote_pos) = trimmed.find('"') {
-        if quote_pos > 0 {
-            let before_quote = trimmed[..quote_pos].trim_end();
-            let words: Vec<&str> = before_quote.split_whitespace().collect();
-            if !words.is_empty() {
-                let first = words[0];
-                if first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    && !is_renpy_keyword(first)
-                {
-                    let valid_middle = words[1..]
-                        .iter()
-                        .all(|w| w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
-                    if valid_middle {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    // centered "text"
-    if trimmed.starts_with("centered ") && trimmed.contains('"') {
-        return true;
-    }
-
-    false
 }
 
 fn is_renpy_keyword(word: &str) -> bool {
@@ -1342,6 +1311,65 @@ fn extract_screen_text(line: &str) -> Option<&str> {
         return Some(text);
     }
     None
+}
+
+fn entry_line_number(id: &str, filename: &str) -> Option<usize> {
+    let (prefix, line) = id.rsplit_once('#')?;
+    let id_filename = prefix.rsplit('#').next().unwrap_or(prefix);
+    (id_filename == filename)
+        .then(|| line.parse::<usize>().ok())
+        .flatten()
+}
+
+/// Return the exact literal slice selected by the source extractor for a line.
+/// The full-file extraction pass remains authoritative for stateful exclusions
+/// such as Python and multi-line define blocks; this locates only the literal
+/// that pass selected, so a duplicate action string later on the line is safe.
+fn extracted_literal_on_line<'a>(line: &'a str, expected: &str) -> Option<&'a str> {
+    let trimmed = line.trim();
+    let matches_expected = |candidate: Option<&'a str>| candidate.filter(|text| *text == expected);
+
+    matches_expected(extract_underscore_call(trimmed))
+        .or_else(|| matches_expected(extract_p_call(trimmed)))
+        .or_else(|| matches_expected(extract_character_name(trimmed)))
+        .or_else(|| matches_expected(extract_renpy_call(trimmed, "renpy.notify(")))
+        .or_else(|| matches_expected(extract_renpy_call(trimmed, "renpy.input(")))
+        .or_else(|| matches_expected(extract_define_string(trimmed)))
+        .or_else(|| matches_expected(extract_screen_text(trimmed)))
+        .or_else(|| {
+            matches_expected(
+                trimmed
+                    .strip_prefix("centered ")
+                    .and_then(|rest| extract_quoted_string(rest.trim()).map(|(text, _)| text)),
+            )
+        })
+        .or_else(|| matches_expected(extract_menu_choice(trimmed)))
+        .or_else(|| matches_expected(extract_say_statement(trimmed).map(|(_, text)| text)))
+}
+
+fn escape_renpy_double_quoted(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn replace_extracted_literal(line: &str, source: &str, translation: &str) -> Option<String> {
+    let literal = extracted_literal_on_line(line, source)?;
+
+    let start = literal.as_ptr() as usize - line.as_ptr() as usize;
+    let end = start.checked_add(literal.len())?;
+    let mut replaced = line.to_string();
+    replaced.replace_range(start..end, &escape_renpy_double_quoted(translation));
+    Some(replaced)
 }
 
 /// Check if a gui.xxx variable is non-translatable (colors, sizes, fonts, layout values).
@@ -2105,6 +2133,7 @@ impl FormatPlugin for RenPyPlugin {
         for entry in walkdir::WalkDir::new(&game_dir)
             .follow_links(false)
             .into_iter()
+            .filter_entry(crate::discovery::is_game_entry)
             .filter_map(|e| e.ok())
         {
             let fpath = entry.path();
@@ -2177,7 +2206,102 @@ impl FormatPlugin for RenPyPlugin {
             }
         }
 
+        // Keep archive rows for collision reporting, but persist active loose
+        // overrides last when their stable IDs overlap archived script rows.
+        // Database extraction uses upsert-by-ID, just as Ren'Py gives a loose
+        // file priority over the archived member of the same path.
+        all.sort_by_key(|entry| entry.file_path.extension().is_none_or(|ext| ext != "rpa"));
         Ok(all)
+    }
+
+    fn prepare_revision_entries(
+        &self,
+        entries: &mut [StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<()> {
+        let mut by_file: HashMap<PathBuf, Vec<&mut StringEntry>> = HashMap::new();
+        for entry in entries {
+            by_file
+                .entry(entry.file_path.clone())
+                .or_default()
+                .push(entry);
+        }
+        for (current_path, original_path) in originals {
+            let Some(file_entries) = by_file.get_mut(current_path) else {
+                continue;
+            };
+            // Compiled scripts and archive overlays have different identity
+            // rules; only exact loose-script line locators are supported here.
+            if current_path.extension().is_none_or(|ext| ext != "rpy") {
+                continue;
+            }
+            let filename = current_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let original = original_path.read_text()?;
+            let current = std::fs::read_to_string(current_path)?;
+            if original == current {
+                continue;
+            }
+            let old_rows = Self::extract_content(current_path, &original);
+            let new_rows = Self::extract_content(current_path, &current);
+            let old_lines: Vec<_> = original.lines().collect();
+            let new_lines: Vec<_> = current.lines().collect();
+            if old_lines.len() != new_lines.len() {
+                continue;
+            }
+            let index_lines = |rows: &[StringEntry]| {
+                let mut index: HashMap<usize, Option<usize>> = HashMap::new();
+                for (position, row) in rows.iter().enumerate() {
+                    if let Some(line) = entry_line_number(&row.id, &filename) {
+                        // Multiple extractor rows on one line remain ambiguous.
+                        index
+                            .entry(line)
+                            .and_modify(|value| *value = None)
+                            .or_insert(Some(position));
+                    }
+                }
+                index
+            };
+            let old_index = index_lines(&old_rows);
+            let new_index = index_lines(&new_rows);
+            for entry in file_entries {
+                let Some(line) = entry_line_number(&entry.id, &filename)
+                    .filter(|line| *line > 0 && *line <= old_lines.len())
+                else {
+                    continue;
+                };
+                let (Some(Some(old)), Some(Some(new))) =
+                    (old_index.get(&line), new_index.get(&line))
+                else {
+                    continue;
+                };
+                let (old, new) = (&old_rows[*old], &new_rows[*new]);
+                if entry.source == new.source || entry.source != old.source {
+                    continue;
+                }
+                // Prove this exact extractor-selected literal is the only
+                // change on the line; action/code literals are not candidates.
+                let old_line = old_lines[line - 1];
+                let new_line = new_lines[line - 1];
+                let (Some(old_literal), Some(new_literal)) = (
+                    extracted_literal_on_line(old_line, &old.source),
+                    extracted_literal_on_line(new_line, &new.source),
+                ) else {
+                    continue;
+                };
+                let old_start = old_literal.as_ptr() as usize - old_line.as_ptr() as usize;
+                let new_start = new_literal.as_ptr() as usize - new_line.as_ptr() as usize;
+                if old_line[..old_start] == new_line[..new_start]
+                    && old_line[old_start + old_literal.len()..]
+                        == new_line[new_start + new_literal.len()..]
+                {
+                    entry.source = new.source.clone();
+                }
+            }
+        }
+        Ok(())
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
@@ -2195,6 +2319,7 @@ impl FormatPlugin for RenPyPlugin {
         }
         if entries.is_empty() {
             return Ok(rpyc_report.unwrap_or(InjectionReport {
+                skip_reasons: Default::default(),
                 files_modified: 0,
                 strings_written: 0,
                 strings_skipped: 0,
@@ -2214,7 +2339,6 @@ impl FormatPlugin for RenPyPlugin {
             .partition(|e| e.file_path.extension().is_some_and(|ext| ext == "rpa"));
 
         let mut warnings: Vec<String> = Vec::new();
-        let mut strings_skipped = 0usize;
 
         // Destination collision guard lives at the actual write site
         // (`inject_rpa_inner`), not here: the RPA write destination preserves
@@ -2261,70 +2385,51 @@ impl FormatPlugin for RenPyPlugin {
                 .to_string_lossy()
                 .to_string();
 
-            // Build lookup: line_num -> (translation, source). Entries without a
-            // translation are counted as skipped immediately; entries WITH a
-            // translation are only counted as written further below, once the
-            // expected source text is actually found and replaced — never
-            // up-front, since a stale line number or mismatched content means
-            // nothing was actually applied.
-            let mut line_translations: HashMap<usize, &str> = HashMap::new();
-            let mut source_lookup: HashMap<usize, &str> = HashMap::new();
+            // The current extraction pass is the write allow-list. It carries
+            // the extractor's stateful exclusions, so a stale row cannot turn
+            // an arbitrary code literal at the old line number into a target.
+            let current_sources: std::collections::HashSet<(usize, String)> =
+                Self::extract_file(file_path)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry_line_number(&entry.id, &filename).map(|line| (line, entry.source))
+                    })
+                    .collect();
+
+            // Entries are only counted as written after an exact current-source
+            // match and a replacement of the extractor-selected literal.
+            let mut line_translations: HashMap<usize, &StringEntry> = HashMap::new();
             for entry in file_entries {
-                let id_suffix = entry.id.strip_prefix(&format!("{}#", filename));
-                if let Some(num_str) = id_suffix {
-                    if let Ok(line_num) = num_str.parse::<usize>() {
-                        if let Some(ref t) = entry.translation {
-                            if t == &entry.source {
-                                // Identity translation: nothing would change at
-                                // runtime, so don't rewrite the file or force a
-                                // needless .rpyc recompile. Matches the guard
-                                // already applied to the other two partitions
-                                // (inject_rpyc_filter and inject_rpa_inner).
-                                strings_skipped += 1;
-                            } else {
-                                line_translations.insert(line_num, t.as_str());
-                                source_lookup.insert(line_num, entry.source.as_str());
-                            }
-                        } else {
-                            strings_skipped += 1;
-                        }
+                if let (Some(line_num), Some(translation)) = (
+                    entry_line_number(&entry.id, &filename),
+                    entry.translation.as_deref(),
+                ) {
+                    if translation != entry.source.as_str() {
+                        line_translations.insert(line_num, entry);
                     }
                 }
             }
 
-            let mut matched_lines: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
             let mut new_lines = Vec::new();
             let mut modified = false;
             for (line_idx, line) in content.lines().enumerate() {
                 let line_num = line_idx + 1;
                 let mut replaced_line = None;
-                if let Some(&translation) = line_translations.get(&line_num) {
-                    if let Some(&source) = source_lookup.get(&line_num) {
-                        let search = format!("\"{}\"", source);
-                        if line.contains(&search) {
-                            let safe_trans = escape_inner_quotes(translation);
-                            let replace = format!("\"{}\"", safe_trans);
-                            replaced_line = Some(line.replacen(&search, &replace, 1));
+                if let Some(entry) = line_translations.get(&line_num) {
+                    if current_sources.contains(&(line_num, entry.source.clone())) {
+                        if let Some(translation) = entry.translation.as_deref() {
+                            replaced_line =
+                                replace_extracted_literal(line, &entry.source, translation);
                         }
                     }
                 }
                 if let Some(new_line) = replaced_line {
                     new_lines.push(new_line);
-                    matched_lines.insert(line_num);
                     strings_written += 1;
                     modified = true;
                 } else {
                     new_lines.push(line.to_string());
-                }
-            }
-
-            // Translations that targeted a line number but never actually matched
-            // (stale line number, or source text no longer present) are honestly
-            // reported as skipped rather than silently dropped while claiming success.
-            for line_num in line_translations.keys() {
-                if !matched_lines.contains(line_num) {
-                    strings_skipped += 1;
                 }
             }
 
@@ -2341,12 +2446,39 @@ impl FormatPlugin for RenPyPlugin {
             }
         }
 
+        let loose_written = strings_written;
+        let loose_no_translation = loose_entries
+            .iter()
+            .filter(|entry| entry.translation.is_none())
+            .count();
+        let loose_identity = loose_entries
+            .iter()
+            .filter(|entry| entry.translation.as_deref() == Some(entry.source.as_str()))
+            .count();
+        let loose_unmatched = loose_entries
+            .len()
+            .saturating_sub(loose_written + loose_no_translation + loose_identity);
+        let mut strings_skipped = loose_entries.len().saturating_sub(loose_written);
+        let mut skip_reasons = std::collections::BTreeMap::new();
+        if loose_no_translation > 0 {
+            skip_reasons.insert("untranslated".to_string(), loose_no_translation);
+        }
+        if loose_identity > 0 {
+            skip_reasons.insert("unchanged".to_string(), loose_identity);
+        }
+        if loose_unmatched > 0 {
+            skip_reasons.insert("source_changed".to_string(), loose_unmatched);
+        }
+
         if let Some(r) = rpa_report {
             files_modified += r.files_modified;
             strings_written += r.strings_written;
             strings_skipped += r.strings_skipped;
             warnings.extend(r.warnings);
             files_written.extend(r.files_written);
+            for (reason, count) in r.skip_reasons {
+                *skip_reasons.entry(reason).or_default() += count;
+            }
         }
         if let Some(r) = rpyc_report {
             files_modified += r.files_modified;
@@ -2354,9 +2486,13 @@ impl FormatPlugin for RenPyPlugin {
             strings_skipped += r.strings_skipped;
             warnings.extend(r.warnings);
             files_written.extend(r.files_written);
+            for (reason, count) in r.skip_reasons {
+                *skip_reasons.entry(reason).or_default() += count;
+            }
         }
 
         Ok(InjectionReport {
+            skip_reasons,
             files_modified,
             strings_written,
             strings_skipped,
@@ -2556,6 +2692,7 @@ impl FormatPlugin for RenPyPlugin {
         }
 
         Ok(InjectionReport {
+            skip_reasons: Default::default(),
             files_modified: by_file.len() + 1,
             strings_written,
             strings_skipped,
@@ -2689,6 +2826,164 @@ init python:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn revision_refuses_mutated_original_before_retargeting_renpy() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("script.rpy");
+        let original = dir.path().join("original.rpy");
+        let source = "label start:\n    \"Hello traveler\"\n";
+        std::fs::write(&current, source).unwrap();
+        std::fs::write(&original, source).unwrap();
+        let plugin = RenPyPlugin::new();
+        let mut entries = RenPyPlugin::extract_file(&current).unwrap();
+        assert_eq!(entries.len(), 1);
+        let expected_source = entries[0].source.clone();
+        let originals = HashMap::from([(
+            current.clone(),
+            RevisionOriginal::capture(&original).unwrap(),
+        )]);
+        std::fs::write(&current, "label start:\n    \"Primera traducción\"\n").unwrap();
+        for changed in [
+            Some("label start:\n    \"Other traveler\"\n"),
+            Some("label start:\n    \"Longer changed original\"\n"),
+            Some("label start:\n    \"X\"\n"),
+            None,
+        ] {
+            match changed {
+                Some(text) => std::fs::write(&original, text).unwrap(),
+                None => std::fs::remove_file(&original).unwrap(),
+            }
+            assert!(plugin
+                .prepare_revision_entries(&mut entries, &originals)
+                .is_err());
+            assert_eq!(entries[0].source, expected_source);
+            assert_eq!(
+                std::fs::read_to_string(&current).unwrap(),
+                "label start:\n    \"Primera traducción\"\n"
+            );
+        }
+        std::fs::write(&original, source).unwrap();
+        plugin
+            .prepare_revision_entries(&mut entries, &originals)
+            .unwrap();
+        assert_eq!(entries[0].source, "Primera traducción");
+    }
+
+    #[test]
+    fn direct_revision_preserves_other_lines_and_handles_quoted_text_and_identity() {
+        let game = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let current = game.path().join("script.rpy");
+        let original = backup.path().join("script.rpy");
+        let content = "label start:\n    \"Hello traveler\"\n    \"Hello traveler\"\n    return\n";
+        std::fs::write(&current, content).unwrap();
+        std::fs::write(&original, content).unwrap();
+        let plugin = RenPyPlugin::new();
+        let mut entries = RenPyPlugin::extract_file(&current).unwrap();
+        assert_eq!(entries.len(), 2);
+        let originals = HashMap::from([(
+            current.clone(),
+            RevisionOriginal::capture(&original).unwrap(),
+        )]);
+        entries[0].translation = Some("Primera frase".into());
+        entries[1].translation = Some("Dijo \"hola\".".into());
+        assert_eq!(
+            plugin
+                .inject(game.path(), &entries)
+                .unwrap()
+                .strings_written,
+            2
+        );
+        let mut revised = vec![entries[1].clone()];
+        revised[0].translation = Some("Frase corregida".into());
+        plugin
+            .prepare_revision_entries(&mut revised, &originals)
+            .unwrap();
+        assert_eq!(
+            plugin
+                .inject(game.path(), &revised)
+                .unwrap()
+                .strings_written,
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(&current).unwrap(),
+            "label start:\n    \"Primera frase\"\n    \"Frase corregida\"\n    return"
+        );
+        let mut revert = vec![entries[1].clone()];
+        revert[0].translation = Some(revert[0].source.clone());
+        plugin
+            .prepare_revision_entries(&mut revert, &originals)
+            .unwrap();
+        assert_eq!(
+            plugin.inject(game.path(), &revert).unwrap().strings_written,
+            1
+        );
+        let expected = "label start:\n    \"Primera frase\"\n    \"Hello traveler\"\n    return";
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), expected);
+        let mut fresh = RenPyPlugin::extract_file(&current).unwrap();
+        for entry in &mut fresh {
+            entry.translation = Some(entry.source.clone());
+        }
+        plugin
+            .prepare_revision_entries(&mut fresh, &originals)
+            .unwrap();
+        assert_eq!(
+            plugin.inject(game.path(), &fresh).unwrap().strings_written,
+            0
+        );
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), expected);
+        assert_eq!(std::fs::read_to_string(original).unwrap(), content);
+
+        let mut mixed = entries.clone();
+        mixed[0].source = "Unknown original".into();
+        mixed[0].translation = Some("Debe omitirse".into());
+        mixed[1].translation = Some("Cambio permitido".into());
+        plugin
+            .prepare_revision_entries(&mut mixed, &originals)
+            .unwrap();
+        let report = plugin.inject(game.path(), &mixed).unwrap();
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+        assert_eq!(
+            std::fs::read_to_string(&current).unwrap(),
+            "label start:\n    \"Primera frase\"\n    \"Cambio permitido\"\n    return"
+        );
+    }
+
+    #[test]
+    fn revision_does_not_retarget_a_changed_script_statement() {
+        let game = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let current = game.path().join("script.rpy");
+        let original = backup.path().join("script.rpy");
+        let content = "label start:\n    \"Hello traveler\"\n";
+        std::fs::write(&current, content).unwrap();
+        std::fs::write(&original, content).unwrap();
+        let plugin = RenPyPlugin::new();
+        let mut entries = RenPyPlugin::extract_file(&current).unwrap();
+        entries[0].translation = Some("Texto corregido".into());
+        let changed = "label start:\n    narrator \"Texto previo\"\n";
+        std::fs::write(&current, changed).unwrap();
+        plugin
+            .prepare_revision_entries(
+                &mut entries,
+                &HashMap::from([(
+                    current.clone(),
+                    RevisionOriginal::capture(&original).unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(
+            plugin
+                .inject(game.path(), &entries)
+                .unwrap()
+                .strings_written,
+            0
+        );
+        assert_eq!(std::fs::read_to_string(current).unwrap(), changed);
+    }
+
     use super::*;
     use std::fs;
 
@@ -2765,23 +3060,6 @@ mod tests {
         assert!(!is_renpy_dialogue_like("store.thing"));
         assert!(!is_renpy_dialogue_like("game/kNPCs/npc_paula.rpy"));
         assert!(!is_renpy_dialogue_like("some_variable_name"));
-    }
-
-    #[test]
-    fn test_is_dialogue_line_menu_narrator_and_rejects_screen_lang() {
-        // Menu choices
-        assert!(is_dialogue_line("\"Yes\":"));
-        assert!(is_dialogue_line("\"Leave the room\":"));
-        // Narrator say (complete quoted line)
-        assert!(is_dialogue_line("\"Hello, world.\""));
-        // Character say
-        assert!(is_dialogue_line("e \"What are you doing?\""));
-        // Screen language / code — must NOT be harvested as dialogue (task #6)
-        assert!(!is_dialogue_line("textbutton \"OK\" action Return()"));
-        assert!(!is_dialogue_line("\"OK\" action Return()"));
-        assert!(!is_dialogue_line("define e = Character(\"Eileen\")"));
-        assert!(!is_dialogue_line("label start:"));
-        assert!(!is_dialogue_line("# \"commented dialogue\""));
     }
 
     #[test]

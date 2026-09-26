@@ -1601,6 +1601,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
+        let mut skip_reasons = std::collections::BTreeMap::new();
         let warnings = Vec::new();
         let mut files_written: Vec<PathBuf> = Vec::new();
 
@@ -1625,10 +1626,24 @@ impl FormatPlugin for RpgMakerMvPlugin {
         for (filename, file_entries) in &by_file {
             let file_path = data_dir.join(filename);
             if !file_path.exists() {
+                strings_skipped += file_entries.len();
+                *skip_reasons.entry("missing_target".into()).or_default() += file_entries.len();
                 continue;
             }
 
             let mut json = Self::read_data_json(&file_path)?;
+            // Resolve all expected values from the untouched file before any
+            // message-block splice changes command indices.
+            let current_entries = if Self::is_iavra_lang_pack_name(filename) {
+                Self::extract_iavra_pack_file(&file_path)?
+            } else {
+                Self::extract_file(&file_path)?
+            };
+            let current_by_id: HashMap<String, String> = current_entries
+                .into_iter()
+                .map(|entry| (entry.id, entry.source))
+                .collect();
+            let mut file_changed = false;
 
             // Message-block splices change command counts, so apply from the
             // bottom of each event list up: earlier indices stay valid.
@@ -1637,23 +1652,43 @@ impl FormatPlugin for RpgMakerMvPlugin {
 
             for entry in ordered {
                 if let Some(ref translation) = entry.translation {
+                    let Some(current) = current_by_id.get(&entry.id) else {
+                        strings_skipped += 1;
+                        *skip_reasons.entry("missing_target".into()).or_default() += 1;
+                        continue;
+                    };
+                    if current != &entry.source {
+                        strings_skipped += 1;
+                        *skip_reasons.entry("source_changed".into()).or_default() += 1;
+                        continue;
+                    }
+                    if translation == &entry.source {
+                        strings_skipped += 1;
+                        *skip_reasons.entry("unchanged".into()).or_default() += 1;
+                        continue;
+                    }
                     // Replace mode reaches Iavra packs and multi-line database
                     // `description` fields too, so restore line width here —
                     // `apply_message_block` re-flattens what it handles.
                     let translation = rewrap_to_source_width(&entry.source, translation);
                     Self::apply_translation(&mut json, filename, &entry.id, &translation);
                     strings_written += 1;
+                    file_changed = true;
                 } else {
                     strings_skipped += 1;
+                    *skip_reasons.entry("untranslated".into()).or_default() += 1;
                 }
             }
 
-            Self::write_data_file(&file_path, &json)?;
-            files_modified += 1;
-            files_written.push(file_path.clone());
+            if file_changed {
+                Self::write_data_file(&file_path, &json)?;
+                files_modified += 1;
+                files_written.push(file_path.clone());
+            }
         }
 
         Ok(InjectionReport {
+            skip_reasons,
             files_modified,
             strings_written,
             strings_skipped,
@@ -1746,6 +1781,7 @@ impl FormatPlugin for RpgMakerMvPlugin {
         }
 
         Ok(InjectionReport {
+            skip_reasons: Default::default(),
             files_modified: 1,
             strings_written,
             strings_skipped,
@@ -1881,6 +1917,7 @@ impl RpgMakerMvPlugin {
         }
 
         Ok(InjectionReport {
+            skip_reasons: Default::default(),
             files_modified,
             strings_written,
             strings_skipped,
@@ -2242,6 +2279,47 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         let name = json[1]["name"].as_str().unwrap();
         assert_eq!(name, "Héroe");
+    }
+
+    #[test]
+    fn test_inject_replace_rejects_stale_id_without_rewriting_file() {
+        let game_dir = temp_game_dir();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&game_dir).unwrap();
+        let selected = entries
+            .iter_mut()
+            .find(|entry| entry.id == "Actors.json#1#name")
+            .unwrap();
+        selected.translation = Some("Héroe".into());
+
+        let actors = game_dir.join("data").join("Actors.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&actors).unwrap()).unwrap();
+        json[1]["name"] = serde_json::json!("Changed after extraction");
+        let stale_bytes = serde_json::to_vec_pretty(&json).unwrap();
+        fs::write(&actors, &stale_bytes).unwrap();
+
+        let report = plugin.inject(&game_dir, &entries).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.files_modified, 0);
+        assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+        assert_eq!(fs::read(&actors).unwrap(), stale_bytes);
+    }
+
+    #[test]
+    fn test_inject_replace_identity_is_not_counted_as_write() {
+        let game_dir = temp_game_dir();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&game_dir).unwrap();
+        let selected = entries
+            .iter_mut()
+            .find(|entry| entry.id == "Actors.json#1#name")
+            .unwrap();
+        selected.translation = Some(selected.source.clone());
+        let report = plugin.inject(&game_dir, &entries).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.files_modified, 0);
+        assert_eq!(report.skip_reasons.get("unchanged"), Some(&1));
     }
 
     #[test]

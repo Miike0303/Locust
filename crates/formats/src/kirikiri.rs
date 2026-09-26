@@ -101,6 +101,7 @@ impl KirikiriPlugin {
         for entry in walkdir::WalkDir::new(root)
             .follow_links(false)
             .into_iter()
+            .filter_entry(crate::discovery::is_game_entry)
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
@@ -1100,6 +1101,7 @@ impl FormatPlugin for KirikiriPlugin {
         }
 
         Ok(InjectionReport {
+            skip_reasons: Default::default(),
             files_modified,
             strings_written,
             strings_skipped,

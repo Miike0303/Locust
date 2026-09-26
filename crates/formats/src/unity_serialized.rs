@@ -1,6 +1,7 @@
 //! Unity SerializedFile container — slices 1–2:
 //! - **Slice 1:** header, type table, object table, TextAsset (class_id 49)
-//!   `m_Name` / `m_Script` reads + in-place rewrite (payload pad with `0x20`;
+//!   `m_Name` / `m_Script` reads + validated variable-length reconstruction.
+//!   Legacy fixed-slot rewrite remains available (payload pad with `0x20`;
 //!   length-prefix u32 left byte-identical so BE assets stay valid).
 //! - **Slice 2:** skip type-tree blobs (no field interpretation), MonoBehaviour
 //!   (class_id 114 **or negative** script-type ids) base layout (`m_GameObject`,
@@ -9,8 +10,8 @@
 //!   `List<string>` as i32 count + N aligned strings when count is small);
 //!   **TextMesh** (class_id 141) `m_Text` after `m_GameObject` PPtr; **GUIText**
 //!   (class_id 132) `m_Text` after Behaviour base + `m_PixelOffset`. Heuristic
-//!   scan also **skips MonoScript (115) + Shader (48)** ranges (type-name / HLSL
-//!   noise). Full type-tree walks remain out of scope.
+//!   scan also skips MonoScript (115), Shader (48) and InputManager (13)
+//!   ranges (type names, HLSL and input bindings). Full type-tree walks remain out of scope.
 //!
 //! # Format (AssetStudio / AssetsTools.NET conventions)
 //! Header fields through `data_offset` are **big-endian**. From version ≥ 9 the
@@ -40,6 +41,11 @@ use std::path::Path;
 pub const CLASS_ID_TEXT_ASSET: i32 = 49;
 /// Unity class ID for Shader (HLSL source — not player-facing text).
 pub const CLASS_ID_SHADER: i32 = 48;
+/// InputManager stores control/axis identifiers, not localized UI labels.
+pub const CLASS_ID_INPUT_MANAGER: i32 = 13;
+/// Tag/layer and shader registry identifiers are runtime configuration.
+pub const CLASS_ID_TAG_MANAGER: i32 = 78;
+pub const CLASS_ID_SHADER_NAME_REGISTRY: i32 = 94;
 /// Unity class ID for MonoBehaviour.
 pub const CLASS_ID_MONO_BEHAVIOUR: i32 = 114;
 /// Unity class ID for MonoScript (assembly type metadata — heuristic noise).
@@ -63,6 +69,9 @@ pub fn is_monobehaviour_class(class_id: i32) -> bool {
 /// SerializedFile format versions we fully support for slices 1–2.
 pub const MIN_SUPPORTED_VERSION: u32 = 17;
 pub const MAX_SUPPORTED_VERSION: u32 = 22;
+/// Shared with core's explicit serialized-v1 capability contract.
+pub const MAX_REBUILT_TEXT_ASSET_BYTES: usize = 1024 * 1024;
+const MAX_REBUILT_FILE_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct SerializedError {
@@ -115,6 +124,8 @@ pub struct ObjectInfo {
     pub data_abs: u64,
     pub byte_size: u32,
     pub type_index: i32,
+    /// Absolute metadata position of byte_start followed by byte_size.
+    pub table_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +136,8 @@ pub struct TextAssetData {
     /// Absolute file offset of the `m_Script` length prefix (u32).
     pub script_len_offset: usize,
     /// Original `m_Script` string byte length (not including length prefix / align).
+    /// Loc-line and CSV cells extracted from this asset share this whole-blob
+    /// capacity; they must not be given per-cell budgets.
     pub script_byte_len: usize,
 }
 
@@ -330,9 +343,25 @@ impl SerializedFile {
             endian,
         };
 
+        if file_size != data.len() as u64
+            || data_offset < hr.pos as u64
+            || data_offset > file_size
+            || endian_byte > 1
+        {
+            return Err(err(
+                &label,
+                "invalid SerializedFile header bounds or endianness",
+            ));
+        }
+        let metadata_end = hr
+            .pos
+            .checked_add(metadata_size as usize)
+            .filter(|&end| end <= data_offset as usize)
+            .ok_or_else(|| err(&label, "metadata overlaps object data"))?;
+
         // Metadata uses file endian.
         let mut r = R {
-            data: &data,
+            data: &data[..metadata_end],
             pos: hr.pos,
             file: &label,
             endian,
@@ -346,6 +375,7 @@ impl SerializedFile {
         if !(0..=100_000).contains(&type_count) {
             return Err(err(&label, format!("implausible type count {type_count}")));
         }
+        r.need(type_count as usize * 23)?;
         let mut types = Vec::with_capacity(type_count as usize);
         for _ in 0..type_count {
             let class_id = r.i32()?;
@@ -361,6 +391,16 @@ impl SerializedFile {
             // Slice 2: skip type-tree blobs without interpreting nodes.
             if enable_type_tree {
                 skip_type_tree_blob(&mut r, version)?;
+                if version >= 21 {
+                    let count = r.i32()?;
+                    if count < 0 {
+                        return Err(err(&label, "negative type dependency count"));
+                    }
+                    let bytes = (count as usize)
+                        .checked_mul(4)
+                        .ok_or_else(|| err(&label, "type dependency size overflow"))?;
+                    r.take(bytes)?;
+                }
             }
             types.push(SerializedType {
                 class_id,
@@ -377,10 +417,12 @@ impl SerializedFile {
                 format!("implausible object count {object_count}"),
             ));
         }
+        r.need(object_count as usize * if version >= 22 { 24 } else { 20 })?;
         let mut objects = Vec::with_capacity(object_count as usize);
         for _ in 0..object_count {
             r.align4();
             let path_id = r.i64()?;
+            let table_offset = r.pos;
             let byte_start = if version >= 22 {
                 r.u64()?
             } else {
@@ -415,6 +457,7 @@ impl SerializedFile {
                 data_abs,
                 byte_size,
                 type_index: type_id,
+                table_offset,
             });
         }
 
@@ -432,6 +475,150 @@ impl SerializedFile {
         let label = path.display().to_string();
         let data = std::fs::read(path).map_err(|e| err(&label, format!("read failed: {e}")))?;
         Self::parse(data, path)
+    }
+
+    /// Check every object span before advertising structural relocation. Other
+    /// objects and all uninterpreted metadata remain opaque to the writer.
+    fn relocation_order(&self) -> Result<Vec<&ObjectInfo>, SerializedError> {
+        let label = self.path.display().to_string();
+        if self.data.len() > MAX_REBUILT_FILE_BYTES {
+            return Err(err(&label, "SerializedFile exceeds 1 GiB rewrite limit"));
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut order: Vec<_> = self.objects.iter().collect();
+        order.sort_by_key(|o| (o.data_abs, o.byte_size));
+        let mut cursor = self.header.data_offset;
+        for obj in &order {
+            if !ids.insert(obj.path_id) || obj.data_abs < cursor {
+                return Err(err(
+                    &label,
+                    "duplicate object ID or overlapping object spans",
+                ));
+            }
+            cursor = obj
+                .data_abs
+                .checked_add(u64::from(obj.byte_size))
+                .filter(|&end| end <= self.data.len() as u64)
+                .ok_or_else(|| err(&label, "object span exceeds SerializedFile"))?;
+        }
+        Ok(order)
+    }
+
+    /// Only the fully consumed release TextAsset Name+Script layout is known.
+    /// Unknown trailing fields, invalid UTF-8, and oversized scripts keep their
+    /// fixed-slot behavior and never receive a resize capability.
+    pub fn rewriteable_text_assets(
+        &self,
+    ) -> Result<std::collections::BTreeMap<i64, TextAssetData>, SerializedError> {
+        self.relocation_order()?;
+        let mut assets = std::collections::BTreeMap::new();
+        for obj in self.text_asset_objects() {
+            let Ok(ta) = self.read_text_asset_object(obj) else {
+                continue;
+            };
+            let end = ta.script_len_offset + 4 + ta.script_byte_len;
+            let aligned_end = (end + 3) & !3;
+            if aligned_end != obj.data_abs as usize + obj.byte_size as usize
+                || ta.script_byte_len > MAX_REBUILT_TEXT_ASSET_BYTES
+                || std::str::from_utf8(&self.data[ta.script_len_offset + 4..end]).is_err()
+            {
+                continue;
+            }
+            assets.insert(obj.path_id, ta);
+        }
+        Ok(assets)
+    }
+
+    /// Relocate a plan of TextAsset replacements in one pass. Callers must
+    /// finish every edit using original byte offsets before invoking this.
+    pub fn rewrite_text_assets(
+        self,
+        replacements: &std::collections::BTreeMap<i64, String>,
+    ) -> Result<Vec<u8>, SerializedError> {
+        if replacements.is_empty() {
+            return Ok(self.data);
+        }
+        let label = self.path.display().to_string();
+        let assets = self.rewriteable_text_assets()?;
+        let order = self.relocation_order()?;
+        let mut upper = self.data.len();
+        for (id, text) in replacements {
+            if !assets.contains_key(id) {
+                return Err(err(
+                    &label,
+                    format!("TextAsset {id} has no supported complete layout"),
+                ));
+            }
+            if text.len() > MAX_REBUILT_TEXT_ASSET_BYTES {
+                return Err(err(&label, "TextAsset replacement exceeds 1 MiB"));
+            }
+            upper = upper
+                .checked_add(text.len() + 7)
+                .filter(|&n| n <= MAX_REBUILT_FILE_BYTES)
+                .ok_or_else(|| err(&label, "SerializedFile rewrite exceeds 1 GiB"))?;
+        }
+        let mut out = Vec::with_capacity(upper);
+        let mut cursor = 0usize;
+        for obj in order {
+            let start = obj.data_abs as usize;
+            let end = start + obj.byte_size as usize;
+            out.extend_from_slice(&self.data[cursor..start]);
+            // Preserve the original alignment modulo 8, including unusual but
+            // readable source alignment, without interpreting unknown bodies.
+            let pad = (start.wrapping_sub(out.len())) & 7;
+            out.resize(out.len() + pad, 0);
+            let new_start = out.len();
+            if let Some(text) = replacements.get(&obj.path_id) {
+                let ta = &assets[&obj.path_id];
+                out.extend_from_slice(&self.data[start..ta.script_len_offset]);
+                let len = text.len() as u32;
+                let encoded = match self.header.endian {
+                    Endian::Little => len.to_le_bytes(),
+                    Endian::Big => len.to_be_bytes(),
+                };
+                out.extend_from_slice(&encoded);
+                out.extend_from_slice(text.as_bytes());
+                let aligned = (out.len() + 3) & !3;
+                out.resize(aligned, 0);
+            } else {
+                out.extend_from_slice(&self.data[start..end]);
+            }
+            let size = u32::try_from(out.len() - new_start)
+                .map_err(|_| err(&label, "object size overflow"))?;
+            let relative = (new_start as u64) - self.header.data_offset;
+            let at = obj.table_offset;
+            let size_at = if self.header.version >= 22 {
+                let bytes = match self.header.endian {
+                    Endian::Little => relative.to_le_bytes(),
+                    Endian::Big => relative.to_be_bytes(),
+                };
+                out[at..at + 8].copy_from_slice(&bytes);
+                at + 8
+            } else {
+                let relative =
+                    u32::try_from(relative).map_err(|_| err(&label, "object offset overflow"))?;
+                let bytes = match self.header.endian {
+                    Endian::Little => relative.to_le_bytes(),
+                    Endian::Big => relative.to_be_bytes(),
+                };
+                out[at..at + 4].copy_from_slice(&bytes);
+                at + 4
+            };
+            let encoded = match self.header.endian {
+                Endian::Little => size.to_le_bytes(),
+                Endian::Big => size.to_be_bytes(),
+            };
+            out[size_at..size_at + 4].copy_from_slice(&encoded);
+            cursor = end;
+        }
+        out.extend_from_slice(&self.data[cursor..]);
+        let file_size = out.len() as u64;
+        if self.header.version >= 22 {
+            out[24..32].copy_from_slice(&file_size.to_be_bytes());
+        } else {
+            out[4..8].copy_from_slice(&(file_size as u32).to_be_bytes());
+        }
+        Ok(out)
     }
 
     pub fn text_asset_objects(&self) -> impl Iterator<Item = &ObjectInfo> {
@@ -467,6 +654,16 @@ impl SerializedFile {
             .find(|o| o.path_id == path_id && o.class_id == CLASS_ID_TEXT_ASSET)
             .ok_or_else(|| err(&label, format!("no TextAsset with path_id={path_id}")))?;
 
+        self.read_text_asset_object(obj)
+    }
+
+    /// Avoid a repeated whole-table search while walking TextAsset objects.
+    pub(crate) fn read_text_asset_object(
+        &self,
+        obj: &ObjectInfo,
+    ) -> Result<TextAssetData, SerializedError> {
+        let label = self.path.display().to_string();
+
         let start = obj.data_abs as usize;
         let end = start + obj.byte_size as usize;
         let mut r = R {
@@ -478,7 +675,7 @@ impl SerializedFile {
         let (name, _, _) = r.aligned_string()?;
         let (script, script_len_offset, script_byte_len) = r.aligned_string()?;
         Ok(TextAssetData {
-            path_id,
+            path_id: obj.path_id,
             name,
             script,
             script_len_offset,
@@ -710,7 +907,7 @@ impl SerializedFile {
 
     /// Ranges the heuristic length-prefix scan must not re-read: structural
     /// extract classes **plus** known non-text blobs (MonoScript type names,
-    /// Shader source) that flood extracts with engine identifiers.
+    /// Shader source and input configuration) that contain engine identifiers.
     pub fn heuristic_skip_byte_ranges(&self) -> Vec<(usize, usize)> {
         self.objects
             .iter()
@@ -735,10 +932,18 @@ pub fn is_structural_extract_class(class_id: i32) -> bool {
 }
 
 /// Classes that are never player-facing dialogue but often contain length-prefixed
-/// ASCII identifiers (type names, HLSL). Heuristic scan skips their byte ranges.
+/// ASCII identifiers (type names, HLSL, control bindings). The heuristic scan
+/// skips their byte ranges; old heuristic injection targets are rejected too.
 #[inline]
 pub fn is_heuristic_noise_class(class_id: i32) -> bool {
-    class_id == CLASS_ID_MONO_SCRIPT || class_id == CLASS_ID_SHADER
+    matches!(
+        class_id,
+        CLASS_ID_MONO_SCRIPT
+            | CLASS_ID_SHADER
+            | CLASS_ID_INPUT_MANAGER
+            | CLASS_ID_TAG_MANAGER
+            | CLASS_ID_SHADER_NAME_REGISTRY
+    )
 }
 
 /// Try reading Unity `string[]` / `List<string>`: i32/u32 count already at `r.pos`,
@@ -845,8 +1050,10 @@ fn mono_name_worth_extracting(s: &str) -> bool {
     if is_mono_engine_noise(t) {
         return false;
     }
-    // Need ≥2 letters so crumbs like `v'` / `A!` don't slip through.
+    // A single CJK character can be a complete UI label (是/否/存). Keep the
+    // two-letter floor for other scripts so crumbs like `v'` / `A!` stay out.
     t.chars().filter(|c| c.is_alphabetic()).count() >= 2
+        || (t.chars().count() == 1 && t.chars().all(crate::unity::is_cjk_script_char))
 }
 
 /// High-precision engine metadata that floods MonoBehaviour walks (BOXMAN/Naninovel).
@@ -1764,6 +1971,41 @@ mod tests {
     }
 
     #[test]
+    fn mono_reextracts_single_cjk_labels_with_original_padding_and_capacity() {
+        for (source, target) in [
+            ("Quit", "退"),
+            ("Yes", "是"),
+            ("Save", "存"),
+            ("Continue", "继续"),
+        ] {
+            let bytes = write_v17_mono_fixture("Box", &[source]);
+            let sf = SerializedFile::parse(bytes.clone(), "m.assets").unwrap();
+            let fields = sf.read_mono_strings(10).unwrap();
+            let original = fields.iter().find(|field| field.text == source).unwrap();
+            let mut patched = bytes;
+            rewrite_text_asset_script_inplace(
+                &mut patched,
+                original.len_offset,
+                original.byte_len,
+                target,
+                "m.assets",
+            )
+            .unwrap();
+            let parsed = SerializedFile::parse(patched, "m.assets").unwrap();
+            let fields = parsed.read_mono_strings(10).unwrap();
+            let translated = fields
+                .iter()
+                .find(|field| field.field_index == original.field_index)
+                .unwrap();
+            assert_eq!(translated.text.trim_end_matches(' '), target);
+            assert_eq!(translated.byte_len, original.byte_len);
+            assert_eq!(translated.len_offset, original.len_offset);
+        }
+        assert!(!mono_name_worth_extracting("A!"));
+        assert!(!mono_name_worth_extracting("◆"));
+    }
+
+    #[test]
     fn is_monobehaviour_class_accepts_114_and_negative() {
         assert!(is_monobehaviour_class(CLASS_ID_MONO_BEHAVIOUR));
         assert!(is_monobehaviour_class(-1));
@@ -1774,9 +2016,10 @@ mod tests {
     }
 
     #[test]
-    fn is_heuristic_noise_class_monoscript_and_shader() {
+    fn is_heuristic_noise_class_excludes_runtime_configuration() {
         assert!(is_heuristic_noise_class(CLASS_ID_MONO_SCRIPT));
         assert!(is_heuristic_noise_class(CLASS_ID_SHADER));
+        assert!(is_heuristic_noise_class(CLASS_ID_INPUT_MANAGER));
         assert!(!is_heuristic_noise_class(CLASS_ID_TEXT_ASSET));
         assert!(!is_heuristic_noise_class(CLASS_ID_MONO_BEHAVIOUR));
         assert!(!is_heuristic_noise_class(1)); // GameObject — may still be scanned
@@ -2981,6 +3224,11 @@ pub fn write_v17_mono_fixture_with_int_gap(
 /// string that must be covered by [`SerializedFile::heuristic_skip_byte_ranges`].
 #[cfg(test)]
 pub fn write_v17_monoscript_noise_fixture() -> Vec<u8> {
+    write_v17_technical_noise_fixture(CLASS_ID_MONO_SCRIPT, &["Naninovel", "QuaternionTween"])
+}
+
+#[cfg(test)]
+pub fn write_v17_technical_noise_fixture(class_id: i32, strings: &[&str]) -> Vec<u8> {
     fn align4(n: usize) -> usize {
         (n + 3) & !3
     }
@@ -2996,10 +3244,11 @@ pub fn write_v17_monoscript_noise_fixture() -> Vec<u8> {
     write_aligned_string(&mut text_payload, "Note");
     write_aligned_string(&mut text_payload, "Hello traveler welcome!");
 
-    // Fake MonoScript-ish aligned strings (class names flood heuristics).
+    // Representative length-prefixed strings from a technical object.
     let mut ms_payload = Vec::new();
-    write_aligned_string(&mut ms_payload, "Naninovel");
-    write_aligned_string(&mut ms_payload, "QuaternionTween");
+    for text in strings {
+        write_aligned_string(&mut ms_payload, text);
+    }
 
     let mut meta = Vec::new();
     meta.extend_from_slice(b"2019.4.0f1\0");
@@ -3011,8 +3260,8 @@ pub fn write_v17_monoscript_noise_fixture() -> Vec<u8> {
     meta.push(0);
     meta.extend_from_slice(&(-1i16).to_le_bytes());
     meta.extend_from_slice(&[0u8; 16]);
-    // type 1: MonoScript
-    meta.extend_from_slice(&CLASS_ID_MONO_SCRIPT.to_le_bytes());
+    // type 1: selected technical class
+    meta.extend_from_slice(&class_id.to_le_bytes());
     meta.push(0);
     meta.extend_from_slice(&(-1i16).to_le_bytes());
     meta.extend_from_slice(&[0u8; 16]);
@@ -3054,3 +3303,7 @@ pub fn write_v17_monoscript_noise_fixture() -> Vec<u8> {
     out.extend_from_slice(&ms_payload);
     out
 }
+
+#[cfg(test)]
+#[path = "unity_growth_tests.rs"]
+mod growth_tests;

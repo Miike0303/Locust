@@ -1,0 +1,45 @@
+{
+  "generated_by": "retoc pack-raw",
+  "reference_version": "0.1.5",
+  "reference_repository": "https://github.com/trumank/retoc",
+  "reference_commit": "885a8dae740cb1ce1e41ff2e74f67f9f0c118237",
+  "verification": "retoc verify and list --path passed for TOC v5, v7 and v8",
+  "content": "One synthetic neutral LocRes, independently serialized into IoStore; no original game assets",
+  "files": [
+    {
+      "file": "expected.locres",
+      "bytes": 109,
+      "sha256": "6f1b1e318a2d2e4dbc50b7f323e81a37897a6411d4995e911ea6f8cfa9b52807"
+    },
+    {
+      "file": "retoc-v5.ucas",
+      "bytes": 109,
+      "sha256": "6f1b1e318a2d2e4dbc50b7f323e81a37897a6411d4995e911ea6f8cfa9b52807"
+    },
+    {
+      "file": "retoc-v5.utoc",
+      "bytes": 422,
+      "sha256": "6873cb98ea9dc461b42bd6f5656d843e7b82c27061fd0f32715bcd2f077a5199"
+    },
+    {
+      "file": "retoc-v7.ucas",
+      "bytes": 109,
+      "sha256": "6f1b1e318a2d2e4dbc50b7f323e81a37897a6411d4995e911ea6f8cfa9b52807"
+    },
+    {
+      "file": "retoc-v7.utoc",
+      "bytes": 422,
+      "sha256": "4d4669963db28af02bd04e811ad01195ea015af45ace71054414183ffeb23b8f"
+    },
+    {
+      "file": "retoc-v8.ucas",
+      "bytes": 109,
+      "sha256": "6f1b1e318a2d2e4dbc50b7f323e81a37897a6411d4995e911ea6f8cfa9b52807"
+    },
+    {
+      "file": "retoc-v8.utoc",
+      "bytes": 413,
+      "sha256": "36247e6f4ea3af823d65a1f7188afe751cc5e58ca26be16f07bd1c5d10b5cbc4"
+    }
+  ]
+}
