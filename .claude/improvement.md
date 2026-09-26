@@ -73,6 +73,14 @@ Owned by no lane; Claude applies these after the writers finish.
   `api.ts:41` hard-codes 7842 while the CLI defaults to 3000 (`crates/cli/src/main.rs:275`).
   Vite dev runs on 1420 and proxies `/api` to 7842. Folder pickers fall back to
   `window.prompt`, so headless QA must answer `dialog` events.
+- **Codex's sandbox cannot run the full suite.** `workspace-write` cannot write
+  the per-user game-lock dir (`%LOCALAPPDATA%\locust-patch-locks-v1`), so about
+  111 core tests fail, and it cannot open loopback sockets (server integration
+  tests). Ask Codex for targeted tests only, and run the full gates yourself.
+- **Cursor `cursor-ask` returned empty stdout (exit 0) on a long research brief**
+  in `plan` mode twice (models cursor-grok-4.6-xhigh and grok-4.7-high). Short
+  prompts work. Check the output size and never count an empty answer as a
+  proposal.
 - Playwright is available as `py -3.13` with its bundled Chromium. The default
   `python` has no Playwright.
 - A new placeholder syntax needs a detector in

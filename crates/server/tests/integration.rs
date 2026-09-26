@@ -225,9 +225,18 @@ async fn test_full_rpgmaker_mv_flow() {
         );
         if src.len() >= 12 {
             assert!(
-                t.starts_with("[MOCK:es]"),
+                t.contains("[MOCK:es]"),
                 "long mock should keep tag, got: {t}"
             );
+            for n in 1..=9 {
+                let token = format!("%{n}");
+                if src.contains(&token) {
+                    assert!(
+                        t.contains(&token),
+                        "long mock should keep placeholder {token}, got: {t}"
+                    );
+                }
+            }
         }
     }
 

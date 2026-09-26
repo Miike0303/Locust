@@ -243,6 +243,11 @@ impl PlaceholderProcessor {
         while i < len {
             if bytes[i] == b'%' && i + 1 < len {
                 let next = bytes[i + 1];
+                // %% is an escaped literal percent, including in %%1.
+                if next == b'%' {
+                    i += 2;
+                    continue;
+                }
                 // %(name)s style
                 if next == b'(' {
                     if let Some(close) = source[i + 2..].find(')') {
@@ -260,8 +265,11 @@ impl PlaceholderProcessor {
                         }
                     }
                 }
-                // %s, %d, %i, %f
-                if b"sdif".contains(&next) {
+                // %s, %d, %i, %f and RPG Maker's single-digit %1..%9.
+                if b"sdif".contains(&next)
+                    || ((b'1'..=b'9').contains(&next)
+                        && !bytes.get(i + 2).is_some_and(u8::is_ascii_digit))
+                {
                     matches.push(PatternMatch {
                         start: i,
                         end: i + 2,
@@ -628,6 +636,94 @@ mod tests {
         assert_eq!(placeholders[0].original, r"\c[2]");
         assert_eq!(placeholders[1].original, r"\n[1]");
         assert_eq!(placeholders[2].original, r"\v[10]");
+    }
+
+    #[test]
+    fn test_validate_rpgmaker_positional_missing() {
+        assert_eq!(
+            PlaceholderProcessor::validate("%1 took %2 damage!", "%1 took"),
+            vec![PlaceholderMismatch {
+                kind: MismatchKind::Missing,
+                placeholder: "%2".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_validate_rpgmaker_positional_reordered() {
+        assert!(
+            PlaceholderProcessor::validate("%1 took %2 damage!", "%2 recibe %1 de daño").is_empty()
+        );
+    }
+
+    #[test]
+    fn test_validate_rpgmaker_positional_extra() {
+        assert_eq!(
+            PlaceholderProcessor::validate("%1 took %2 damage!", "%1 took %2 %3"),
+            vec![PlaceholderMismatch {
+                kind: MismatchKind::Extra,
+                placeholder: "%3".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_extract_rpgmaker_positional_round_trip() {
+        let source = "%1 took %2 damage!";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        assert_eq!(placeholders.len(), 2);
+        assert_eq!(sanitized, "{PL_0} took {PL_1} damage!");
+        assert_eq!(placeholders[0].original, "%1");
+        assert_eq!(placeholders[1].original, "%2");
+        assert_eq!(
+            PlaceholderProcessor::restore(&sanitized, &placeholders).unwrap(),
+            source
+        );
+        assert!(PlaceholderProcessor::restore("{PL_0} took damage!", &placeholders).is_err());
+    }
+
+    #[test]
+    fn test_extract_rpgmaker_positional_literals() {
+        for source in ["100% sure", "%12 items", "%0", "%%1", "%90", "%%", "%"] {
+            let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+            assert!(placeholders.is_empty(), "{source}");
+            assert_eq!(sanitized, source);
+        }
+    }
+
+    #[test]
+    fn test_extract_rpgmaker_positional_boundaries() {
+        for digit in 1..=9 {
+            let original = format!("%{digit}");
+            for source in [
+                original.clone(),
+                format!("é{original} daño"),
+                format!("{original}猫"),
+            ] {
+                let (sanitized, placeholders) = PlaceholderProcessor::extract(&source);
+                assert_eq!(placeholders.len(), 1, "{source}");
+                assert_eq!(placeholders[0].original, original);
+                assert_eq!(
+                    PlaceholderProcessor::restore(&sanitized, &placeholders).unwrap(),
+                    source
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_python_format_with_rpgmaker_positional() {
+        let source = "%s %d %i %f %(name)s %%1 %%%9";
+        let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
+        assert_eq!(sanitized, "{PL_0} {PL_1} {PL_2} {PL_3} {PL_4} %%1 %%{PL_5}");
+        assert_eq!(placeholders.len(), 6);
+        assert!(placeholders
+            .iter()
+            .all(|ph| matches!(ph.pattern_type, PlaceholderKind::PythonFormat)));
+        assert_eq!(
+            PlaceholderProcessor::restore(&sanitized, &placeholders).unwrap(),
+            source
+        );
     }
 
     #[test]
