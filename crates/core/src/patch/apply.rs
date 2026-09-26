@@ -1,10 +1,9 @@
 //! Journaled patch apply transaction.
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use zip::ZipArchive;
 
 use crate::database::sha256_path;
 use crate::error::{LocustError, Result};
@@ -13,16 +12,26 @@ use super::manifest::{
     ApplyPlan, BackupBaseline, BackupManifest, Journal, JournalState, PatchManifest, Receipt,
     ReceiptAdded, ReceiptReplaced, VerificationTier,
 };
-use super::rollback::{rollback, RollbackOptions};
+use super::rollback::{rollback_under_lock, RollbackOptions};
 use super::store::{PatchStatus, PatchStore};
-use super::stream::{charge_declared, stream_and_hash, stream_to_file, StagingDir};
-use super::verify::{classify_files, verify, VerificationOutcome, VerificationReport};
-use super::zipsec::{normalize_entry_name, safe_entry_path};
+use super::stream::StagingDir;
+use super::verify::{
+    classify_files, open_archive, scan_zip_entries, verify_scanned, VerificationOutcome,
+    VerificationReport, ZipEntryMeta,
+};
 
-/// Staged zip content (on disk under `.locust/staging-*/`, same volume as game).
+/// Staged ZIP content in an operation-owned `.locust-stage-*/` directory.
 struct StagedContent {
     path: PathBuf,
     sha256: String,
+}
+
+/// Immutable staged archive content and the canonical manifest authorized by
+/// verification. Kept alive across patch switches; never reopened from a path.
+struct PreparedPatch {
+    entries: Vec<ZipEntryMeta>,
+    manifest: Option<PatchManifest>,
+    files: std::collections::HashMap<String, StagedContent>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,11 +74,49 @@ pub fn apply<F>(
 where
     F: FnMut(PatchProgress),
 {
+    let game_lock = super::lock::GameLock::acquire(game_root)?;
+    crate::injection_transaction::ensure_no_pending_under_lock(&game_lock)?;
+    let game_root = game_lock.root();
     let store = PatchStore::new(game_root);
 
-    // Step 1: verify (read-only).
-    let report = verify(game_root, zip_path)?;
-    enforce_verify_gates(&report, &opts, &store)?;
+    super::zipsec::ensure_safe_store(game_root)?;
+    if matches!(store.status()?, PatchStatus::Interrupted(_)) {
+        return Err(LocustError::PatchInterrupted(
+            "run patch-rollback first".into(),
+        ));
+    }
+    // Stage and validate once BEFORE rollback or any asset/receipt mutation.
+    // The operation-owned directory is outside .locust so rollback cannot
+    // erase incoming content, and replacing the source ZIP cannot alter it.
+    let _staging = StagingDir::create_prepared(game_root)?;
+    let mut archive = open_archive(zip_path)?;
+    let entries = scan_zip_entries(&mut archive, Some(&_staging))?;
+    drop(archive);
+    let report = verify_scanned(game_root, &entries)?;
+    let files = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .rel
+                .as_ref()
+                .zip(entry.staged_path.as_ref())
+                .map(|(rel, path)| {
+                    (
+                        rel.to_string_lossy().replace('\\', "/"),
+                        StagedContent {
+                            path: path.clone(),
+                            sha256: entry.content_sha256.clone(),
+                        },
+                    )
+                })
+        })
+        .collect();
+    let prepared = PreparedPatch {
+        entries,
+        manifest: report.manifest.clone(),
+        files,
+    };
+    enforce_verify_gates(&report, &opts)?;
 
     // R2: only a strict-tier Clean verify may authorize discarding a
     // manifest-less backup/ (design rev 4). Status alone is wrong — presence
@@ -93,18 +140,19 @@ where
                     m.files.iter().map(|f| f.path.clone()).collect();
                 if prior_set != incoming_set {
                     // File-set drift → rollback-then-fresh.
+                    reject_dry_run_rollback(&opts)?;
                     require_full_rollback(
-                        game_root,
+                        &game_lock,
                         RollbackOptions {
                             delete_modified_added: true,
                         },
                     )?;
                     // After a full rollback the game is pristine → allow R2 discard.
-                    return apply_fresh(game_root, zip_path, &opts, &mut on_progress, None, true);
+                    return apply_after_rollback(game_root, &prepared, &opts, &mut on_progress);
                 }
                 return apply_fresh(
                     game_root,
-                    zip_path,
+                    &prepared,
                     &opts,
                     &mut on_progress,
                     Some(prior),
@@ -121,12 +169,14 @@ where
                         incoming: m.patch_version.clone(),
                     });
                 }
+                check_transition_baseline(game_root, &store, m, &prior, &opts)?;
                 // Upgrade or forced downgrade / different patch_id → rollback then fresh.
+                reject_dry_run_rollback(&opts)?;
                 if store.backup_manifest_valid() {
                     // Soft-abort on edited added files must NOT continue into
                     // apply_fresh on a still-patched tree (CRITICAL review finding).
                     require_full_rollback(
-                        game_root,
+                        &game_lock,
                         RollbackOptions {
                             delete_modified_added: opts.force,
                         },
@@ -138,14 +188,14 @@ where
                             .into(),
                     ));
                 }
-                return apply_fresh(game_root, zip_path, &opts, &mut on_progress, None, true);
+                return apply_after_rollback(game_root, &prepared, &opts, &mut on_progress);
             }
         }
     }
 
     apply_fresh(
         game_root,
-        zip_path,
+        &prepared,
         &opts,
         &mut on_progress,
         None,
@@ -153,11 +203,80 @@ where
     )
 }
 
+/// Do not discard an installed patch merely to discover afterward that the
+/// incoming strict patch targets a different pristine game or dirty loose file.
+fn check_transition_baseline(
+    game_root: &Path,
+    store: &PatchStore,
+    incoming: &PatchManifest,
+    prior: &Receipt,
+    opts: &ApplyOptions,
+) -> Result<()> {
+    if opts.force || !incoming.supports_strict_tier() {
+        return Ok(());
+    }
+    let backup = store.read_backup_manifest()?.ok_or_else(|| {
+        LocustError::PatchBackupIncomplete("transition has no backup manifest".into())
+    })?;
+    for file in &incoming.files {
+        let future_hash = if let Some(original) = backup.files.iter().find(|b| b.path == file.path)
+        {
+            Some(original.sha256.clone())
+        } else if prior.added.iter().any(|a| a.path == file.path) {
+            None
+        } else {
+            let path = game_root.join(&file.path);
+            if path.is_file() {
+                Some(sha256_path(&path)?)
+            } else {
+                None
+            }
+        };
+        let expected = file.original_sha256.as_deref().filter(|h| !h.is_empty());
+        if future_hash.as_deref() != expected {
+            return Err(LocustError::PatchVerificationFailed(format!("incoming patch does not match the rollback baseline at {}; installed patch was preserved",file.path)));
+        }
+    }
+    Ok(())
+}
+
+fn apply_after_rollback<F>(
+    game_root: &Path,
+    prepared: &PreparedPatch,
+    opts: &ApplyOptions,
+    on_progress: &mut F,
+) -> Result<ApplyReport>
+where
+    F: FnMut(PatchProgress),
+{
+    // Re-check the baseline restored by rollback, using the SAME staged data.
+    let report = verify_scanned(game_root, &prepared.entries)?;
+    enforce_verify_gates(&report, opts)?;
+    let clean = report.outcome == VerificationOutcome::Clean
+        && report.tier == Some(VerificationTier::Strict);
+    apply_fresh(game_root, prepared, opts, on_progress, None, clean)
+}
+
+// A preview must never restore/delete the currently installed patch. Until a
+// virtual-baseline planner exists, explicitly reject transitions requiring a
+// rollback instead of reporting a misleading dry-run over the patched tree.
+fn reject_dry_run_rollback(opts: &ApplyOptions) -> Result<()> {
+    if opts.dry_run {
+        return Err(LocustError::PatchVerificationFailed(
+            "dry-run cannot preview a patch transition that requires rollback; \
+             no files changed. Run verify to inspect the incoming version, or \
+             apply without dry-run when ready to replace the installed patch."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Rollback that must fully succeed before a subsequent apply. A soft abort
 /// (user-edited added files without force) is an error so callers cannot
 /// treat it as "pristine enough" and continue writing.
-fn require_full_rollback(game_root: &Path, opts: RollbackOptions) -> Result<()> {
-    let report = rollback(game_root, opts)?;
+fn require_full_rollback(game_lock: &super::lock::GameLock, opts: RollbackOptions) -> Result<()> {
+    let report = rollback_under_lock(game_lock, opts)?;
     if !report.aborted_edited.is_empty() {
         return Err(LocustError::PatchVerificationFailed(format!(
             "rollback aborted before reapply — {} added file(s) were edited after the \
@@ -169,11 +288,10 @@ fn require_full_rollback(game_root: &Path, opts: RollbackOptions) -> Result<()> 
     Ok(())
 }
 
-fn enforce_verify_gates(
-    report: &VerificationReport,
-    opts: &ApplyOptions,
-    store: &PatchStore,
-) -> Result<()> {
+/// Apply the install policy to a verification report before expensive work
+/// such as copying a game. This does not authorize a later write: `apply`
+/// validates the actual target and archive again under its own game lock.
+pub fn enforce_verify_gates(report: &VerificationReport, opts: &ApplyOptions) -> Result<()> {
     match &report.outcome {
         VerificationOutcome::Interrupted => {
             return Err(LocustError::PatchInterrupted(
@@ -227,7 +345,6 @@ fn enforce_verify_gates(
         && !opts.confirm_legacy
         && !matches!(report.outcome, VerificationOutcome::AlreadyApplied)
     {
-        let _ = store;
         return Err(LocustError::PatchLegacyUnconfirmed(
             "structural-tier patch (no original hashes) requires --confirm-legacy or --force"
                 .into(),
@@ -239,7 +356,7 @@ fn enforce_verify_gates(
 
 fn apply_fresh<F>(
     game_root: &Path,
-    zip_path: &Path,
+    prepared: &PreparedPatch,
     opts: &ApplyOptions,
     on_progress: &mut F,
     prior_receipt: Option<Receipt>,
@@ -249,77 +366,9 @@ where
     F: FnMut(PatchProgress),
 {
     let store = PatchStore::new(game_root);
-    // If we only ever created staging and then abort/dry-run, drop this last so
-    // an empty `.locust/` does not flip status to Unknown.
     let _empty_locust_guard = EmptyLocustGuard(game_root.to_path_buf());
-    // Staging lives under game_root/.locust/ so rename-to-dest stays same-volume.
-    // Cleaned on drop (error, dry-run, or after successful renames).
-    let staging = StagingDir::create(game_root)?;
-    let file = File::open(zip_path)?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|e| LocustError::PatchError(format!("open zip: {e}")))?;
-
-    // Stream each content entry to a staging file; hash while streaming.
-    // Manifest is small and kept in RAM (same meta cap idea as verify).
-    let mut zip_files: std::collections::HashMap<String, StagedContent> =
-        std::collections::HashMap::new();
-    let mut manifest: Option<PatchManifest> = None;
-    let mut total_bytes = 0u64;
-    let mut stage_idx = 0u32;
-    const MAX_META_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
-
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| LocustError::PatchError(format!("zip: {e}")))?;
-        if entry.is_dir() {
-            continue;
-        }
-        let original = entry.name().to_string();
-        let normalized = normalize_entry_name(&original);
-        let declared = entry.size();
-        total_bytes = charge_declared(&original, declared, total_bytes)?;
-
-        if normalized == PatchManifest::FILENAME {
-            if declared > MAX_META_BUFFER_BYTES {
-                return Err(LocustError::PatchError(format!(
-                    "zip meta entry \"{original}\" declares {declared} bytes \
-                     (limit {MAX_META_BUFFER_BYTES}) — refusing to buffer"
-                )));
-            }
-            let mut data = Vec::new();
-            stream_and_hash(
-                &mut entry,
-                declared.min(MAX_META_BUFFER_BYTES),
-                &original,
-                Some(&mut data),
-            )?;
-            manifest = Some(
-                serde_json::from_slice(&data)
-                    .map_err(|e| LocustError::PatchError(format!("manifest parse: {e}")))?,
-            );
-            continue;
-        }
-        if normalized.eq_ignore_ascii_case("readme.txt") {
-            // Discard while still enforcing actual ≤ declared.
-            let mut sink = std::io::sink();
-            stream_and_hash(&mut entry, declared, &original, Some(&mut sink))?;
-            continue;
-        }
-        let rel = safe_entry_path(&normalized, &original)?;
-        let key = rel.to_string_lossy().replace('\\', "/");
-        let staged_path = staging.child(&format!("e{stage_idx:05}"));
-        stage_idx += 1;
-        let streamed = stream_to_file(&mut entry, declared, &original, &staged_path)?;
-        zip_files.insert(
-            key,
-            StagedContent {
-                path: staged_path,
-                sha256: streamed.sha256_hex,
-            },
-        );
-    }
-    let _ = total_bytes;
+    let manifest = &prepared.manifest;
+    let zip_files = &prepared.files;
 
     // Build plan.
     let (mut replaced, mut added, mut user_edits) = if let Some(ref m) = manifest {
@@ -328,7 +377,7 @@ where
         // Legacy: every existing path replaced, absent = added.
         let mut replaced = Vec::new();
         let mut added = Vec::new();
-        for (path, staged) in &zip_files {
+        for (path, staged) in zip_files {
             let target = game_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
             let patched = staged.sha256.clone();
             if target.is_file() {
@@ -430,13 +479,8 @@ where
             .read_backup_manifest()?
             .map(|m| m.baseline)
             .unwrap_or(BackupBaseline::Pristine)
-    } else if tier == VerificationTier::Strict
-        && (matches!(store.status()?, PatchStatus::NotPatched) || !opts.force)
-    {
+    } else if tier == VerificationTier::Strict && r2_allow_discard {
         BackupBaseline::Pristine
-    } else if tier == VerificationTier::Strict && opts.force {
-        // Force on a tree that is not a clean NotPatched game (Unknown, etc.).
-        BackupBaseline::Unverified
     } else {
         BackupBaseline::Unverified
     };
@@ -570,38 +614,23 @@ where
         let staged = zip_files
             .get(&path)
             .ok_or_else(|| LocustError::PatchError(format!("zip missing path {path}")))?;
+        super::zipsec::ensure_no_links(game_root, &super::zipsec::safe_stored_rel(&path)?)?;
         let dest = game_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        // Move staged file to a sibling *.locust-tmp next to dest (same volume),
-        // then PatchStore::replace_file (W3: .locust-old aside on Windows).
-        let tmp = {
-            let mut t = dest.as_os_str().to_owned();
-            t.push(".locust-tmp");
-            PathBuf::from(t)
-        };
-        if tmp.exists() {
-            let _ = fs::remove_file(&tmp);
-        }
-        fs::rename(&staged.path, &tmp).map_err(|e| {
-            LocustError::PatchError(format!(
-                "stage → tmp {} → {}: {e}",
-                staged.path.display(),
-                tmp.display()
-            ))
-        })?;
         if dest.is_file() {
             let meta = fs::metadata(&dest)?;
             if meta.permissions().readonly() {
-                let _ = fs::remove_file(&tmp);
                 return Err(LocustError::GameDirNotWritable(format!(
                     "read-only file: {}",
                     dest.display()
                 )));
             }
         }
-        PatchStore::replace_file(&tmp, &dest)?;
+        // The prepared file is already durable and on the game volume. Never
+        // claim a predictable sibling name that may contain user-owned data.
+        PatchStore::replace_file(&staged.path, &dest)?;
     }
 
     // Step 7: receipt, delete journal.

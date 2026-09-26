@@ -2,10 +2,15 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub const INJECTION_SOURCE_METADATA_KEY: &str = "locust_injection_source";
+pub const INJECTION_CAPACITY_METADATA_KEY: &str = "locust_injection_capacity";
+pub const STALE_TRANSLATION_METADATA_KEY: &str = "locust_stale_translation";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StringEntry {
@@ -16,6 +21,10 @@ pub struct StringEntry {
     pub context: Option<String>,
     pub tags: Vec<String>,
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Immutable physical TextAsset shared by its localization rows. Persisted
+    /// separately by Database; JSON carries only its content-addressed reference.
+    #[serde(skip)]
+    pub textasset_original: Option<Arc<TextAssetOriginal>>,
     pub status: StringStatus,
     pub provider_used: Option<String>,
     pub char_limit: Option<usize>,
@@ -34,6 +43,7 @@ impl StringEntry {
             context: None,
             tags: Vec::new(),
             metadata: HashMap::new(),
+            textasset_original: None,
             status: StringStatus::Pending,
             provider_used: None,
             char_limit: None,
@@ -64,6 +74,122 @@ impl StringEntry {
         hex::encode(hasher.finalize())
     }
 
+    /// Re-extraction may retain an old translation for review, but it must not
+    /// become an injected translation or a new pivot source without acceptance.
+    /// Legacy rows without this provenance marker remain compatible regardless
+    /// of their status. Any malformed marker also fails closed.
+    pub fn require_current_translation(&self) -> std::result::Result<(), String> {
+        let Some(marker) = self.metadata.get(STALE_TRANSLATION_METADATA_KEY) else {
+            return Ok(());
+        };
+        let hash_is_valid = |key| {
+            marker
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|hash| {
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+        };
+        let valid = marker.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+            && hash_is_valid("translated_source_sha256")
+            && hash_is_valid("current_source_sha256")
+            && marker
+                .get("current_source_sha256")
+                .and_then(serde_json::Value::as_str)
+                == Some(self.source_hash().as_str());
+        if valid {
+            Err(format!("stale translation for entry '{}': source changed after translation; translate again or explicitly mark Reviewed/Approved after checking the current source", self.id))
+        } else {
+            Err(format!("entry '{}' has malformed {STALE_TRANSLATION_METADATA_KEY} metadata; save a current translation or explicitly review it before injection or pivot", self.id))
+        }
+    }
+
+    /// Validate controls against both the semantic request source and the
+    /// immutable physical baseline. A pivot must not hide a control lost by an
+    /// earlier translation. None is pending; Some("") still deletes controls.
+    pub fn translation_control_mismatches(
+        &self,
+    ) -> std::result::Result<Vec<crate::placeholder::PlaceholderMismatch>, String> {
+        let Some(translation) = self.translation.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let physical = self.injection_source()?;
+        let mut mismatches =
+            crate::placeholder::PlaceholderProcessor::validate(&self.source, translation);
+        if physical != self.source {
+            for mismatch in
+                crate::placeholder::PlaceholderProcessor::validate(physical, translation)
+            {
+                if !mismatches.contains(&mismatch) {
+                    mismatches.push(mismatch);
+                }
+            }
+        }
+        Ok(mismatches)
+    }
+
+    /// Gate for pivot/insertion callers; invoke before changing `source` from
+    /// its semantic value to physical bytes and before writing backup/game data.
+    pub fn require_preserved_translation_controls(&self) -> std::result::Result<(), String> {
+        let mismatches = self.translation_control_mismatches()?;
+        if mismatches.is_empty() {
+            return Ok(());
+        }
+        let details = mismatches
+            .iter()
+            .map(|m| format!("{:?}: {}", m.kind, m.placeholder))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(format!("translation for entry '{}' changed protected controls relative to its semantic or physical source: {details}", self.id))
+    }
+
+    /// Text that must exist in the untouched game when this row is injected.
+    /// Pivoted projects keep their translated `source` for translation/export,
+    /// while this value remains anchored to the first extracted baseline.
+    pub fn injection_source(&self) -> std::result::Result<&str, String> {
+        match self.metadata.get(INJECTION_SOURCE_METADATA_KEY) {
+            None => Ok(&self.source),
+            Some(serde_json::Value::String(source)) if !source.is_empty() => Ok(source),
+            Some(_) => Err(format!(
+                "entry '{}' has malformed {} metadata",
+                self.id, INJECTION_SOURCE_METADATA_KEY
+            )),
+        }
+    }
+
+    /// Explicit immutable binary capacity recorded by the first pivot.
+    pub fn injection_capacity(&self) -> std::result::Result<Option<(&str, usize)>, String> {
+        let Some(value) = self.metadata.get(INJECTION_CAPACITY_METADATA_KEY) else {
+            return Ok(None);
+        };
+        let Some(object) = value.as_object() else {
+            return Err(format!(
+                "entry '{}' has malformed {} metadata",
+                self.id, INJECTION_CAPACITY_METADATA_KEY
+            ));
+        };
+        let Some(encoding) = object.get("encoding").and_then(|v| v.as_str()) else {
+            return Err(format!(
+                "entry '{}' has malformed {}.encoding metadata",
+                self.id, INJECTION_CAPACITY_METADATA_KEY
+            ));
+        };
+        let Some(bytes) = object
+            .get("bytes")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| usize::try_from(n).ok())
+        else {
+            return Err(format!(
+                "entry '{}' has malformed {}.bytes metadata",
+                self.id, INJECTION_CAPACITY_METADATA_KEY
+            ));
+        };
+        Ok(Some((encoding, bytes)))
+    }
+
     pub fn is_translatable(&self) -> bool {
         !self.source.trim().is_empty() && self.status != StringStatus::Approved
     }
@@ -73,6 +199,36 @@ impl StringEntry {
             (Some(t), Some(limit)) => t.len() > limit,
             _ => false,
         }
+    }
+}
+
+/// Verified once when created or loaded; private fields keep the cached digest
+/// bound to immutable text. Cloning a StringEntry never duplicates the payload.
+#[derive(Clone, Debug)]
+pub struct TextAssetOriginal {
+    text: Arc<str>,
+    sha256: String,
+}
+
+impl TextAssetOriginal {
+    pub fn new(text: &str) -> std::result::Result<Self, String> {
+        if text.is_empty() || text.len() > crate::textasset_group::MAX_GROUP_ORIGINAL_BYTES {
+            return Err("TextAsset original must contain 1..=1048576 UTF-8 bytes".into());
+        }
+        Ok(Self {
+            text: Arc::from(text),
+            sha256: hex::encode(Sha256::digest(text.as_bytes())),
+        })
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn shared_text(&self) -> Arc<str> {
+        Arc::clone(&self.text)
+    }
+    pub fn sha256(&self) -> &str {
+        &self.sha256
     }
 }
 
@@ -177,6 +333,8 @@ pub enum ValidationKind {
     },
     EmptyTranslation,
     IdenticalToSource,
+    InvalidInjectionProvenance,
+    StaleTranslation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -190,6 +348,9 @@ pub enum ProgressEvent {
         completed: usize,
         total: usize,
         cost_so_far: f64,
+        /// False means the numeric amount is only the observed subtotal.
+        #[serde(default)]
+        cost_is_complete: bool,
         language: Option<String>,
     },
     StringTranslated {
@@ -204,8 +365,16 @@ pub enum ProgressEvent {
     Completed {
         total_translated: usize,
         total_cost: f64,
+        #[serde(default)]
+        cost_is_complete: bool,
         duration_secs: f64,
     },
+    /// Recoverable failure: remaining batches and provider fallbacks may continue.
+    BatchFailed {
+        entry_id: Option<String>,
+        error: String,
+    },
+    /// Terminal job failure; consumers may close the progress stream.
     Failed {
         entry_id: Option<String>,
         error: String,
@@ -273,6 +442,28 @@ mod tests {
     }
 
     #[test]
+    fn injection_provenance_accessors_are_fail_closed() {
+        let mut entry = StringEntry::new("id", "semantic", PathBuf::from("f"));
+        assert_eq!(entry.injection_source().unwrap(), "semantic");
+        entry.metadata.insert(
+            INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("physical"),
+        );
+        entry.metadata.insert(
+            INJECTION_CAPACITY_METADATA_KEY.into(),
+            serde_json::json!({"encoding": "utf8", "bytes": 12}),
+        );
+        assert_eq!(entry.injection_source().unwrap(), "physical");
+        assert_eq!(entry.injection_capacity().unwrap(), Some(("utf8", 12)));
+
+        entry.metadata.insert(
+            INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::Value::Null,
+        );
+        assert!(entry.injection_source().is_err());
+    }
+
+    #[test]
     fn test_status_roundtrip() {
         let variants = vec![
             StringStatus::Pending,
@@ -314,6 +505,7 @@ mod tests {
         let completed = ProgressEvent::Completed {
             total_translated: 50,
             total_cost: 1.23,
+            cost_is_complete: true,
             duration_secs: 45.0,
         };
         let json = serde_json::to_string(&completed).unwrap();
@@ -323,6 +515,7 @@ mod tests {
                 total_translated,
                 total_cost,
                 duration_secs,
+                ..
             } => {
                 assert_eq!(total_translated, 50);
                 assert!((total_cost - 1.23).abs() < f64::EPSILON);
@@ -364,5 +557,27 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+    #[test]
+    fn control_gate_distinguishes_pending_empty_and_physical_baseline() {
+        let mut entry = StringEntry::new("id", "Hello", PathBuf::from("script.rpy"));
+        entry.metadata.insert(
+            INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("JA {name}"),
+        );
+        assert!(entry.require_preserved_translation_controls().is_ok());
+        for target in ["", "   ", "Hola"] {
+            entry.translation = Some(target.into());
+            assert!(entry.require_preserved_translation_controls().is_err());
+        }
+        entry.source = "Hello {name}".into();
+        entry.translation = Some("Hola {name}".into());
+        assert!(entry.require_preserved_translation_controls().is_ok());
+        assert_eq!(entry.source, "Hello {name}");
+        assert_eq!(entry.injection_source().unwrap(), "JA {name}");
+        entry
+            .metadata
+            .insert(INJECTION_SOURCE_METADATA_KEY.into(), serde_json::json!(123));
+        assert!(entry.require_preserved_translation_controls().is_err());
     }
 }

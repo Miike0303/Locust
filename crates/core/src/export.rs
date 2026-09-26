@@ -224,69 +224,185 @@ pub fn export_xliff(entries: &[StringEntry], source_lang: &str, target_lang: &st
     xml
 }
 
+/// Import the plain-text XLIFF 1.2 emitted by Locust, with optional XML
+/// namespace prefixes and CDATA. Unsupported inline codes fail explicitly:
+/// silently flattening them would drop protected game controls.
 pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
+    use quick_xml::{events::Event, name::ResolveResult, NsReader};
+    use std::collections::HashSet;
 
-    let mut reader = Reader::from_str(content);
+    fn invalid(message: impl std::fmt::Display) -> LocustError {
+        LocustError::ParseError {
+            file: "xliff".into(),
+            message: format!("XLIFF parse error: {message}"),
+        }
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Element {
+        Root,
+        File,
+        Body,
+        Group,
+        Unit,
+        Source,
+        Target,
+        Other,
+    }
+    struct Unit {
+        id: String,
+        source: String,
+        target: String,
+        has_source: bool,
+        has_target: bool,
+    }
+    let mut reader = NsReader::from_str(content);
+    reader.config_mut().expand_empty_elements = true;
+    let mut stack = Vec::new();
+    let mut root_seen = false;
+    let mut root_namespaced = false;
+    let mut current: Option<Unit> = None;
+    let mut ids = HashSet::new();
     let mut units = Vec::new();
-    let mut current_id = String::new();
-    let mut current_source = String::new();
-    let mut current_target = String::new();
-    let mut in_source = false;
-    let mut in_target = false;
-    let mut in_trans_unit = false;
-
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) => match e.name().as_ref() {
-                b"trans-unit" => {
-                    in_trans_unit = true;
-                    current_id = String::new();
-                    current_source = String::new();
-                    current_target = String::new();
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"id" {
-                            current_id = String::from_utf8_lossy(&attr.value).to_string();
-                        }
+        let (namespace, event) = reader.read_resolved_event().map_err(invalid)?;
+        let namespaced = match namespace {
+            ResolveResult::Bound(ns) => ns.as_ref() == b"urn:oasis:names:tc:xliff:document:1.2",
+            ResolveResult::Unbound => false,
+            ResolveResult::Unknown(_) => return Err(invalid("undeclared XML namespace prefix")),
+        };
+        let is_xliff =
+            namespaced || (!root_namespaced && matches!(namespace, ResolveResult::Unbound));
+        match event {
+            Event::Start(element) => {
+                let name = element.local_name();
+                let parent = stack.last().copied();
+                if matches!(parent, Some(Element::Source | Element::Target)) {
+                    return Err(invalid("inline XLIFF elements are unsupported; export source and target as plain text with escaped game controls"));
+                }
+                // Check all attributes, including metadata, rather than silently
+                // ignoring duplicate attributes or broken entity references.
+                let mut id = None;
+                let mut version = None;
+                for attribute in element.attributes() {
+                    let attribute = attribute.map_err(invalid)?;
+                    let value = attribute.unescape_value().map_err(invalid)?.into_owned();
+                    match attribute.key.as_ref() {
+                        b"id" => id = Some(value),
+                        b"version" => version = Some(value),
+                        _ => {}
                     }
                 }
-                b"source" if in_trans_unit => in_source = true,
-                b"target" if in_trans_unit => in_target = true,
-                _ => {}
-            },
-            Ok(Event::Text(ref e)) => {
-                let text = e.unescape().unwrap_or_default().to_string();
-                if in_source {
-                    current_source.push_str(&text);
-                } else if in_target {
-                    current_target.push_str(&text);
+                let kind = if parent.is_none() {
+                    if root_seen || name.as_ref() != b"xliff" || !is_xliff {
+                        return Err(invalid("expected one XLIFF 1.2 document"));
+                    }
+                    if version.as_deref().is_some_and(|v| v != "1.2") {
+                        return Err(invalid("only XLIFF 1.2 is supported"));
+                    }
+                    root_seen = true;
+                    root_namespaced = namespaced;
+                    Element::Root
+                } else if is_xliff {
+                    match (name.as_ref(), parent) {
+                        (b"file", Some(Element::Root)) => Element::File,
+                        (b"body", Some(Element::File)) => Element::Body,
+                        (b"group", Some(Element::Body | Element::Group)) => Element::Group,
+                        (b"trans-unit", Some(Element::Body | Element::Group)) => {
+                            let id = id
+                                .filter(|id| !id.is_empty())
+                                .ok_or_else(|| invalid("translation unit has no id"))?;
+                            if !ids.insert(id.clone()) {
+                                return Err(invalid("duplicate translation unit id"));
+                            }
+                            current = Some(Unit {
+                                id,
+                                source: String::new(),
+                                target: String::new(),
+                                has_source: false,
+                                has_target: false,
+                            });
+                            Element::Unit
+                        }
+                        (b"source", Some(Element::Unit)) => {
+                            let unit = current
+                                .as_mut()
+                                .ok_or_else(|| invalid("source outside unit"))?;
+                            if unit.has_source {
+                                return Err(invalid("duplicate source in translation unit"));
+                            }
+                            unit.has_source = true;
+                            Element::Source
+                        }
+                        (b"target", Some(Element::Unit)) => {
+                            let unit = current
+                                .as_mut()
+                                .ok_or_else(|| invalid("target outside unit"))?;
+                            if unit.has_target {
+                                return Err(invalid("duplicate target in translation unit"));
+                            }
+                            unit.has_target = true;
+                            Element::Target
+                        }
+                        // Translation elements in a wrong position are not
+                        // metadata; refusing them avoids a false zero-row import.
+                        (b"trans-unit", _) => {
+                            return Err(invalid("translation unit outside a file body or group"))
+                        }
+                        _ => Element::Other,
+                    }
+                } else {
+                    Element::Other
+                };
+                stack.push(kind);
+            }
+            Event::Text(text) => {
+                let value = text.unescape().map_err(invalid)?;
+                match stack.last() {
+                    Some(Element::Source) => current.as_mut().unwrap().source.push_str(&value),
+                    Some(Element::Target) => current.as_mut().unwrap().target.push_str(&value),
+                    None if !value.trim().is_empty() => {
+                        return Err(invalid("text outside the document root"))
+                    }
+                    _ => {}
                 }
             }
-            Ok(Event::End(ref e)) => match e.name().as_ref() {
-                b"source" => in_source = false,
-                b"target" => in_target = false,
-                b"trans-unit" => {
-                    in_trans_unit = false;
+            Event::CData(text) => {
+                let value = std::str::from_utf8(text.as_ref()).map_err(invalid)?;
+                match stack.last() {
+                    Some(Element::Source) => current.as_mut().unwrap().source.push_str(value),
+                    Some(Element::Target) => current.as_mut().unwrap().target.push_str(value),
+                    None => return Err(invalid("CDATA outside the document root")),
+                    _ => {}
+                }
+            }
+            Event::End(_) => {
+                let kind = stack
+                    .pop()
+                    .ok_or_else(|| invalid("unmatched closing element"))?;
+                if kind == Element::Unit {
+                    let unit = current
+                        .take()
+                        .ok_or_else(|| invalid("missing translation unit"))?;
+                    if !unit.has_source {
+                        return Err(invalid("translation unit has no source"));
+                    }
                     units.push(XliffUnit {
-                        id: current_id.clone(),
-                        source: current_source.clone(),
-                        target: current_target.clone(),
+                        id: unit.id,
+                        source: unit.source,
+                        target: unit.target,
                     });
                 }
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                return Err(LocustError::ParseError {
-                    file: "xliff".to_string(),
-                    message: format!("XLIFF parse error: {}", e),
-                });
+            }
+            Event::DocType(_) => return Err(invalid("DOCTYPE declarations are unsupported")),
+            Event::Eof => {
+                if !root_seen || !stack.is_empty() || current.is_some() {
+                    return Err(invalid("empty or incomplete XLIFF document"));
+                }
+                break;
             }
             _ => {}
         }
     }
-
     Ok(units)
 }
 
@@ -298,8 +414,16 @@ pub struct XliffUnit {
 }
 
 /// Collect `(id, translation)` pairs for [`crate::database::Database::save_translations_batch`].
-/// Empty msgstr / missing id count toward `skipped` (unknown ids are counted after the batch).
-pub fn po_entries_for_batch(entries: &[PoEntry]) -> (Vec<(String, String)>, usize) {
+/// An import carries the source it was translated from, not only its row ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedTranslation {
+    pub id: String,
+    pub source: String,
+    pub translation: String,
+}
+
+/// Empty msgstr / missing id count toward `skipped`; the database checks source identity.
+pub fn po_entries_for_batch(entries: &[PoEntry]) -> (Vec<ImportedTranslation>, usize) {
     let mut skipped = 0usize;
     let mut updates = Vec::with_capacity(entries.len());
     for pe in entries {
@@ -311,13 +435,17 @@ pub fn po_entries_for_batch(entries: &[PoEntry]) -> (Vec<(String, String)>, usiz
             skipped += 1;
             continue;
         };
-        updates.push((id.clone(), pe.translation.clone()));
+        updates.push(ImportedTranslation {
+            id: id.clone(),
+            source: pe.source.clone(),
+            translation: pe.translation.clone(),
+        });
     }
     (updates, skipped)
 }
 
 /// Same as [`po_entries_for_batch`] for XLIFF units (empty target → skipped).
-pub fn xliff_units_for_batch(units: &[XliffUnit]) -> (Vec<(String, String)>, usize) {
+pub fn xliff_units_for_batch(units: &[XliffUnit]) -> (Vec<ImportedTranslation>, usize) {
     let mut skipped = 0usize;
     let mut updates = Vec::with_capacity(units.len());
     for unit in units {
@@ -325,7 +453,11 @@ pub fn xliff_units_for_batch(units: &[XliffUnit]) -> (Vec<(String, String)>, usi
             skipped += 1;
             continue;
         }
-        updates.push((unit.id.clone(), unit.target.clone()));
+        updates.push(ImportedTranslation {
+            id: unit.id.clone(),
+            source: unit.source.clone(),
+            translation: unit.target.clone(),
+        });
     }
     (updates, skipped)
 }
@@ -472,6 +604,66 @@ msgstr "Hola"
     }
 
     #[test]
+    fn xliff_prefixes_entities_cdata_and_whitespace_preserve_exact_text() {
+        let input = r#"<?xml version="1.0"?>
+<x:xliff xmlns:x="urn:oasis:names:tc:xliff:document:1.2" version="1.2">
+ <x:file><x:body><x:group><x:trans-unit id="entry&amp;日本語">
+  <x:source>  A &amp; B <![CDATA[<tag>]]>  </x:source>
+  <x:target><![CDATA[ Español <tag> ]]>&amp; &#x65E5;</x:target>
+ </x:trans-unit></x:group></x:body></x:file>
+</x:xliff>"#;
+        let units = import_xliff(input).unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].id, "entry&日本語");
+        assert_eq!(units[0].source, "  A & B <tag>  ");
+        assert_eq!(units[0].target, " Español <tag> & 日");
+    }
+
+    #[test]
+    fn xliff_rejects_incomplete_ambiguous_or_lossy_inputs_before_returning_any_units() {
+        let wrap =
+            |body: &str| format!("<xliff version=\"1.2\"><file><body>{body}</body></file></xliff>");
+        for input in [
+            String::new(),
+            "<other/>".into(),
+            "<xliff version=\"2.0\"/>".into(),
+            "<q:xliff/>".into(),
+            "<xliff xmlns=\"urn:not-xliff\"/>".into(),
+            "<xliff><file><body><trans-unit id=\"a\"><source>S</source><target>T</target>".into(),
+            "<xliff/><xliff/>".into(),
+            "<!DOCTYPE xliff><xliff/>".into(),
+            wrap("<trans-unit><source>S</source></trans-unit>"),
+            wrap("<trans-unit id=\"\"><source>S</source></trans-unit>"),
+            wrap("<trans-unit id=\"a\" id=\"b\"><source>S</source></trans-unit>"),
+            wrap("<trans-unit id=\"a\"><target>T</target></trans-unit>"),
+            wrap("<trans-unit id=\"a\"><source>S</source><target>A</target><target>B</target></trans-unit>"),
+            wrap("<trans-unit id=\"a\"><source>S</source><target>&unknown;</target></trans-unit>"),
+            wrap("<trans-unit id=\"a\"><source>S</source><target>Text <ph id=\"control\"/> lost</target></trans-unit>"),
+            wrap("<trans-unit id=\"a\"><source>S</source></trans-unit><trans-unit id=\"a\"><source>S</source></trans-unit>"),
+            "<xliff><trans-unit id=\"a\"><source>S</source></trans-unit></xliff>".into(),
+        ] {
+            assert!(import_xliff(&input).is_err(), "accepted lossy or invalid input: {input}");
+        }
+    }
+
+    #[test]
+    fn xliff_empty_targets_do_not_borrow_another_units_text() {
+        let units = import_xliff(
+            r#"<xliff><file><body>
+            <trans-unit id="a"><source/><target>Target</target></trans-unit>
+            <trans-unit id="b"><source>Source</source><target/></trans-unit>
+            <trans-unit id="c"><source>Third</source></trans-unit>
+        </body></file></xliff>"#,
+        )
+        .unwrap();
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0].source, "");
+        assert_eq!(units[0].target, "Target");
+        assert_eq!(units[1].target, "");
+        assert_eq!(units[2].target, "");
+    }
+
+    #[test]
     fn test_import_xliff_roundtrip() {
         let entries = make_entries();
         let xliff = export_xliff(&entries, "ja", "en");
@@ -507,7 +699,8 @@ msgstr "Hola"
         ];
         let (updates, pre_skipped) = po_entries_for_batch(&entries);
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].0, "a");
+        assert_eq!(updates[0].id, "a");
+        assert_eq!(updates[0].source, "A");
         assert_eq!(pre_skipped, 2);
         let (imported, skipped) = import_counts_after_batch(pre_skipped, updates.len(), 0);
         assert_eq!(imported, 0);
@@ -529,7 +722,14 @@ msgstr "Hola"
             },
         ];
         let (updates, pre_skipped) = xliff_units_for_batch(&units);
-        assert_eq!(updates, vec![("a".into(), "Á".into())]);
+        assert_eq!(
+            updates,
+            vec![ImportedTranslation {
+                id: "a".into(),
+                source: "A".into(),
+                translation: "Á".into()
+            }]
+        );
         assert_eq!(pre_skipped, 1);
         let (imported, skipped) = import_counts_after_batch(pre_skipped, 1, 1);
         assert_eq!((imported, skipped), (1, 1));

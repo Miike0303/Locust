@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -6,13 +7,117 @@ use walkdir::WalkDir;
 
 use crate::error::Result;
 
+pub(crate) fn read_font_data(path: &Path) -> Result<Vec<u8>> {
+    const LIMIT: u64 = 64 * 1024 * 1024;
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > LIMIT {
+        return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+            "font exceeds the 64 MiB safety limit"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+            "font exceeds the 64 MiB safety limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn required_characters(translations: &[&str]) -> Vec<char> {
+    // Deduplicate the translated corpus once, then reuse across every font face.
+    let mut unique_chars = HashSet::new();
+    for text in translations {
+        for ch in text.chars() {
+            if !ch.is_whitespace()
+                && !ch.is_control()
+                && !matches!(ch,
+                    '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' |
+                    '\u{2060}'..='\u{206F}' | '\u{FE00}'..='\u{FE0F}' |
+                    '\u{FEFF}' | '\u{E0100}'..='\u{E01EF}')
+            {
+                unique_chars.insert(ch);
+            }
+        }
+    }
+
+    let mut chars: Vec<char> = unique_chars.into_iter().collect();
+    chars.sort_unstable();
+    chars
+}
+
+fn is_active_font_tree_entry(entry: &walkdir::DirEntry) -> bool {
+    // Recovery copies are not engine resources. Keep depth zero so an explicit
+    // audit of a backup folder still examines the folder the caller selected.
+    entry.depth() == 0
+        || !entry.file_type().is_dir()
+        || ![".locust", ".locust-injections", ".git"]
+            .iter()
+            .any(|name| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(name)
+            })
+}
+
 pub struct FontValidator;
 
 impl FontValidator {
     pub fn check_coverage(font_path: &Path, translations: &[&str]) -> Result<FontCoverageReport> {
-        let font_data = std::fs::read(font_path)?;
-        let face = ttf_parser::Face::parse(&font_data, 0).map_err(|e| {
-            crate::error::LocustError::Other(anyhow::anyhow!("failed to parse font: {}", e))
+        let font_data = read_font_data(font_path)?;
+        Self::coverage_for_face(font_path, &font_data, 0, &required_characters(translations))
+    }
+
+    pub(crate) fn coverage_from_data(
+        font_path: &Path,
+        data: &[u8],
+        translations: &[&str],
+    ) -> Result<FontCoverageReport> {
+        Self::coverage_for_face(font_path, data, 0, &required_characters(translations))
+    }
+
+    /// A collection's faces are evaluated independently: their glyph sets are
+    /// never unioned because an engine may select only one face.
+    pub fn check_all_faces(
+        font_path: &Path,
+        translations: &[&str],
+    ) -> Result<Vec<FontCoverageReport>> {
+        Self::check_faces_for_characters(font_path, &required_characters(translations))
+    }
+
+    fn check_faces_for_characters(
+        font_path: &Path,
+        characters: &[char],
+    ) -> Result<Vec<FontCoverageReport>> {
+        let data = read_font_data(font_path)?;
+        let count = ttf_parser::fonts_in_collection(&data).unwrap_or(1);
+        if count == 0 || count > 1024 {
+            return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+                "invalid or excessive font collection face count: {count}"
+            )));
+        }
+        (0..count)
+            .map(|index| Self::coverage_for_face(font_path, &data, index, characters))
+            .collect()
+    }
+
+    fn coverage_for_face(
+        font_path: &Path,
+        data: &[u8],
+        face_index: u32,
+        characters: &[char],
+    ) -> Result<FontCoverageReport> {
+        if data.starts_with(b"wOFF") || data.starts_with(b"wOF2") {
+            return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+                "WOFF/WOFF2 coverage is unsupported; supply the original TTF/OTF for checking"
+            )));
+        }
+        let face = ttf_parser::Face::parse(data, face_index).map_err(|e| {
+            crate::error::LocustError::Other(anyhow::anyhow!(
+                "failed to parse font face {face_index}: {e}"
+            ))
         })?;
 
         let font_name = face
@@ -21,24 +126,15 @@ impl FontValidator {
             .find(|n| n.name_id == ttf_parser::name_id::FULL_NAME)
             .and_then(|n| n.to_string());
 
-        // Collect all unique chars
-        let mut unique_chars = HashSet::new();
-        for text in translations {
-            for ch in text.chars() {
-                unique_chars.insert(ch);
-            }
-        }
-
-        let total_unique_chars = unique_chars.len();
+        let total_unique_chars = characters.len();
         let mut missing_chars = Vec::new();
 
-        for &ch in &unique_chars {
+        for &ch in characters {
             if face.glyph_index(ch).is_none() {
                 missing_chars.push(ch);
             }
         }
 
-        missing_chars.sort();
         let missing_count = missing_chars.len();
         let coverage_percent = if total_unique_chars == 0 {
             100.0
@@ -49,6 +145,7 @@ impl FontValidator {
         Ok(FontCoverageReport {
             font_path: font_path.to_path_buf(),
             font_name,
+            face_index,
             total_unique_chars,
             missing_chars,
             missing_count,
@@ -58,12 +155,13 @@ impl FontValidator {
     }
 
     pub fn find_game_fonts(game_path: &Path) -> Vec<PathBuf> {
-        let font_extensions = ["ttf", "otf", "woff", "woff2"];
+        let font_extensions = ["ttf", "otf", "ttc", "otc", "woff", "woff2"];
         let mut fonts = Vec::new();
 
         for entry in WalkDir::new(game_path)
             .follow_links(false)
             .into_iter()
+            .filter_entry(is_active_font_tree_entry)
             .filter_map(|e| e.ok())
         {
             if entry.file_type().is_file() {
@@ -75,6 +173,7 @@ impl FontValidator {
             }
         }
 
+        fonts.sort();
         fonts
     }
 
@@ -82,17 +181,65 @@ impl FontValidator {
         game_path: &Path,
         translations: &[&str],
     ) -> Result<Vec<FontCoverageReport>> {
-        let fonts = Self::find_game_fonts(game_path);
-        let mut reports = Vec::new();
-        for font_path in &fonts {
-            match Self::check_coverage(font_path, translations) {
-                Ok(report) => reports.push(report),
-                Err(e) => {
-                    tracing::warn!("Failed to check font {}: {}", font_path.display(), e);
+        Ok(Self::audit_game_fonts(game_path, translations)?.fonts)
+    }
+
+    /// Returns failures alongside successful faces, so an empty result cannot
+    /// silently imply that unreadable or web fonts have full glyph coverage.
+    pub fn audit_game_fonts(game_path: &Path, translations: &[&str]) -> Result<FontAuditReport> {
+        if !game_path.is_dir() {
+            return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+                "game path is not a directory: {}",
+                game_path.display()
+            )));
+        }
+        let mut audit = FontAuditReport::default();
+        let mut characters = None;
+        for entry in WalkDir::new(game_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(is_active_font_tree_entry)
+        {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    audit.issues.push(FontAuditIssue {
+                        font_path: error.path().unwrap_or(game_path).into(),
+                        message: error.to_string(),
+                    });
+                    continue;
                 }
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let ext = entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !["ttf", "otf", "ttc", "otc", "woff", "woff2"].contains(&ext.as_str()) {
+                continue;
+            }
+            match Self::check_faces_for_characters(
+                entry.path(),
+                characters.get_or_insert_with(|| required_characters(translations)),
+            ) {
+                Ok(reports) => audit.fonts.extend(reports),
+                Err(error) => audit.issues.push(FontAuditIssue {
+                    font_path: entry.path().into(),
+                    message: error.to_string(),
+                }),
             }
         }
-        Ok(reports)
+        audit.fonts.sort_by(|a, b| {
+            a.font_path
+                .cmp(&b.font_path)
+                .then(a.face_index.cmp(&b.face_index))
+        });
+        audit.issues.sort_by(|a, b| a.font_path.cmp(&b.font_path));
+        Ok(audit)
     }
 }
 
@@ -100,11 +247,28 @@ impl FontValidator {
 pub struct FontCoverageReport {
     pub font_path: PathBuf,
     pub font_name: Option<String>,
+    pub face_index: u32,
     pub total_unique_chars: usize,
     pub missing_chars: Vec<char>,
     pub missing_count: usize,
     pub coverage_percent: f32,
     pub has_full_coverage: bool,
+}
+
+/// Coverage describes Unicode cmap presence only, not shaping, line fit,
+/// fallback selection, or Unity TextMeshPro's separately generated SDF atlas.
+pub const FONT_COVERAGE_LIMITATION: &str = "Coverage checks Unicode cmap entries only. Zero required characters do not establish coverage. Shaping, RTL order, line fit and engine font selection require runtime checks. Unity TextMeshPro needs its font asset/SDF atlas regenerated with the target glyphs or a configured TMP fallback asset; replacing a TTF does not update that atlas. Suggested families are candidates, not a guarantee of every required glyph; verify the actual font, especially for supplementary CJK characters.";
+
+#[derive(Debug, Default, Serialize)]
+pub struct FontAuditReport {
+    pub fonts: Vec<FontCoverageReport>,
+    pub issues: Vec<FontAuditIssue>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FontAuditIssue {
+    pub font_path: PathBuf,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,19 +288,45 @@ pub fn suggest_replacement_font(missing_chars: &[char]) -> Vec<FontSuggestion> {
             '\u{00C0}'..='\u{024F}' | '\u{1E00}'..='\u{1EFF}' => {
                 needed_scripts.insert("Latin Extended");
             }
-            '\u{0400}'..='\u{04FF}' => {
+            '\u{0400}'..='\u{052F}' | '\u{2DE0}'..='\u{2DFF}' | '\u{A640}'..='\u{A69F}' => {
                 needed_scripts.insert("Cyrillic");
             }
-            '\u{4E00}'..='\u{9FFF}'
-            | '\u{3040}'..='\u{309F}'
-            | '\u{30A0}'..='\u{30FF}'
-            | '\u{AC00}'..='\u{D7AF}' => {
+            // Unicode 17 block ranges, including supplementary ideographs.
+            // These trigger a candidate family, not guaranteed glyph coverage.
+            '\u{2E80}'..='\u{2EFF}'
+            | '\u{2F00}'..='\u{2FDF}'
+            | '\u{3000}'..='\u{303F}'
+            | '\u{3040}'..='\u{30FF}'
+            | '\u{3100}'..='\u{312F}'
+            | '\u{3130}'..='\u{318F}'
+            | '\u{3190}'..='\u{31BF}'
+            | '\u{31C0}'..='\u{33FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{1100}'..='\u{11FF}'
+            | '\u{A960}'..='\u{A97F}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{D7B0}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE30}'..='\u{FE4F}'
+            | '\u{FF00}'..='\u{FFEF}'
+            | '\u{1AFF0}'..='\u{1AFFF}'
+            | '\u{1B000}'..='\u{1B16F}'
+            | '\u{20000}'..='\u{2A6DF}'
+            | '\u{2A700}'..='\u{2EE5F}'
+            | '\u{2F800}'..='\u{2FA1F}'
+            | '\u{30000}'..='\u{3347F}' => {
                 needed_scripts.insert("CJK");
             }
-            '\u{0600}'..='\u{06FF}' => {
+            '\u{0600}'..='\u{06FF}'
+            | '\u{0750}'..='\u{077F}'
+            | '\u{0870}'..='\u{089F}'
+            | '\u{08A0}'..='\u{08FF}'
+            | '\u{FB50}'..='\u{FDFF}'
+            | '\u{FE70}'..='\u{FEFF}' => {
                 needed_scripts.insert("Arabic");
             }
-            '\u{0590}'..='\u{05FF}' => {
+            '\u{0590}'..='\u{05FF}' | '\u{FB1D}'..='\u{FB4F}' => {
                 needed_scripts.insert("Hebrew");
             }
             '\u{0E00}'..='\u{0E7F}' => {
@@ -149,25 +339,16 @@ pub fn suggest_replacement_font(missing_chars: &[char]) -> Vec<FontSuggestion> {
     if needed_scripts.contains("CJK") {
         suggestions.push(FontSuggestion {
             font_name: "Noto Sans CJK".to_string(),
-            covers_scripts: vec![
-                "CJK".to_string(),
-                "Latin Extended".to_string(),
-                "Cyrillic".to_string(),
-            ],
-            download_url: "https://github.com/googlefonts/noto-cjk/releases".to_string(),
+            covers_scripts: vec!["CJK".to_string()],
+            download_url: "https://github.com/notofonts/noto-cjk/releases".to_string(),
             license: "SIL Open Font License 1.1".to_string(),
         });
     }
 
-    if needed_scripts.contains("Latin Extended")
-        || needed_scripts.contains("Cyrillic")
-        || needed_scripts.contains("Arabic")
-        || needed_scripts.contains("Hebrew")
-        || needed_scripts.contains("Thai")
-    {
+    if needed_scripts.contains("Latin Extended") || needed_scripts.contains("Cyrillic") {
         let mut covers: Vec<String> = needed_scripts
             .iter()
-            .filter(|s| **s != "CJK")
+            .filter(|s| matches!(**s, "Latin Extended" | "Cyrillic"))
             .map(|s| s.to_string())
             .collect();
         covers.sort();
@@ -175,12 +356,25 @@ pub fn suggest_replacement_font(missing_chars: &[char]) -> Vec<FontSuggestion> {
             suggestions.push(FontSuggestion {
                 font_name: "Noto Sans".to_string(),
                 covers_scripts: covers,
-                download_url: "https://github.com/googlefonts/noto-fonts/releases".to_string(),
+                download_url: "https://github.com/notofonts/latin-greek-cyrillic".to_string(),
                 license: "SIL Open Font License 1.1".to_string(),
             });
         }
     }
 
+    for script in ["Arabic", "Hebrew", "Thai"] {
+        if needed_scripts.contains(script) {
+            suggestions.push(FontSuggestion {
+                font_name: format!("Noto Sans {script}"),
+                covers_scripts: vec![script.into()],
+                download_url: format!(
+                    "https://github.com/notofonts/{}/releases",
+                    script.to_ascii_lowercase()
+                ),
+                license: "SIL Open Font License 1.1".into(),
+            });
+        }
+    }
     suggestions
 }
 
@@ -515,6 +709,7 @@ mod tests {
         let fonts = vec![FontCoverageReport {
             font_path: PathBuf::from("a.ttf"),
             font_name: Some("A".into()),
+            face_index: 0,
             total_unique_chars: 2,
             missing_chars: vec!['ñ'],
             missing_count: 1,
@@ -526,5 +721,233 @@ mod tests {
         assert!(s.iter().any(|x| x.font_name.contains("Noto")));
         // Negative: empty missing → no shopping list
         assert!(suggestions_for_font_reports(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod font_audit_tests {
+    use super::*;
+
+    #[test]
+    fn ignores_spacing_controls_and_nonprinting_format_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let font = dir.path().join("font.ttf");
+        std::fs::write(&font, build_minimal_ascii_font()).unwrap();
+        let report =
+            FontValidator::check_coverage(&font, &["A \t\n\r\0\u{00a0}\u{200d}\u{2067}\u{fe0f}"])
+                .unwrap();
+        assert_eq!(report.total_unique_chars, 1);
+        assert!(report.has_full_coverage);
+        let report = FontValidator::check_coverage(&font, &[" \t\n"]).unwrap();
+        assert_eq!(report.total_unique_chars, 0);
+        assert_eq!(report.coverage_percent, 100.0);
+    }
+
+    #[test]
+    fn collection_faces_have_independent_coverage() {
+        let first = build_minimal_ascii_font();
+        let mut second = first.clone();
+        let tables = u16::from_be_bytes(second[4..6].try_into().unwrap()) as usize;
+        for index in 0..tables {
+            let record = 12 + index * 16;
+            if &second[record..record + 4] == b"cmap" {
+                let cmap = u32::from_be_bytes(second[record + 8..record + 12].try_into().unwrap())
+                    as usize;
+                second[cmap + 26..cmap + 28].copy_from_slice(&0x4e5eu16.to_be_bytes());
+                second[cmap + 32..cmap + 34].copy_from_slice(&0x4e00u16.to_be_bytes());
+                second[cmap + 36..cmap + 38].copy_from_slice(&(1i16 - 0x4e00).to_be_bytes());
+            }
+        }
+        let mut collection = b"ttcf\x00\x01\x00\x00\x00\x00\x00\x02".to_vec();
+        collection.extend_from_slice(&20u32.to_be_bytes());
+        collection.extend_from_slice(&(20u32 + first.len() as u32).to_be_bytes());
+        for mut font in [first, second] {
+            let offset = collection.len() as u32;
+            for index in 0..tables {
+                let record = 12 + index * 16 + 8;
+                let old = u32::from_be_bytes(font[record..record + 4].try_into().unwrap());
+                font[record..record + 4].copy_from_slice(&(old + offset).to_be_bytes());
+            }
+            collection.extend(font);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let font = dir.path().join("collection.ttc");
+        std::fs::write(&font, collection).unwrap();
+        let audit = FontValidator::audit_game_fonts(dir.path(), &["A一"]).unwrap();
+        assert!(audit.issues.is_empty());
+        assert_eq!(audit.fonts.len(), 2);
+        assert_eq!(audit.fonts[0].face_index, 0);
+        assert_eq!(audit.fonts[0].missing_chars, vec!['一']);
+        assert_eq!(audit.fonts[1].face_index, 1);
+        assert_eq!(audit.fonts[1].missing_chars, vec!['A']);
+    }
+
+    #[test]
+    fn audit_exposes_unreadable_and_web_fonts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("good.otf"), build_minimal_ascii_font()).unwrap();
+        std::fs::write(dir.path().join("bad.ttf"), b"broken").unwrap();
+        std::fs::write(dir.path().join("web.woff2"), b"wOF2broken").unwrap();
+        let audit = FontValidator::audit_game_fonts(dir.path(), &["abc"]).unwrap();
+        assert_eq!(audit.fonts.len(), 1);
+        assert_eq!(audit.issues.len(), 2);
+        assert!(audit.issues[1].message.contains("unsupported"));
+        assert!(FontValidator::audit_game_fonts(&dir.path().join("missing"), &[]).is_err());
+    }
+
+    #[test]
+    fn script_suggestions_name_actual_families() {
+        let suggestions = suggest_replacement_font(&['ا', 'א', 'ก']);
+        assert_eq!(suggestions.len(), 3);
+        assert!(suggestions
+            .iter()
+            .any(|s| s.font_name == "Noto Sans Arabic"));
+        assert!(!suggestions.iter().any(|s| s.font_name == "Noto Sans"));
+    }
+}
+
+#[test]
+fn font_audit_rejects_oversize_sparse_font_before_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversize.ttf");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(FontValidator::check_coverage(&path, &[])
+        .unwrap_err()
+        .to_string()
+        .contains("64 MiB"));
+    assert!(FontValidator::check_all_faces(&path, &[])
+        .unwrap_err()
+        .to_string()
+        .contains("64 MiB"));
+    let audit = FontValidator::audit_game_fonts(dir.path(), &[]).unwrap();
+    assert!(audit.fonts.is_empty());
+    assert_eq!(audit.issues.len(), 1);
+}
+
+#[cfg(test)]
+mod font_followup_tests {
+    use super::*;
+
+    #[test]
+    fn audit_skips_recovery_fonts_but_allows_an_explicit_backup_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".locust/backup/fonts")).unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("font.ttf"), build_minimal_ascii_font()).unwrap();
+        std::fs::write(
+            dir.path().join(".locust/backup/fonts/stale.ttf"),
+            b"bad font",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".git/not-a-game-font.ttf"), b"bad font").unwrap();
+        let audit = FontValidator::audit_game_fonts(dir.path(), &["a"]).unwrap();
+        assert_eq!(audit.fonts.len(), 1);
+        assert!(audit.issues.is_empty());
+        assert_eq!(FontValidator::find_game_fonts(dir.path()).len(), 1);
+        let explicit =
+            FontValidator::audit_game_fonts(&dir.path().join(".locust/backup"), &["a"]).unwrap();
+        assert_eq!(explicit.issues.len(), 1);
+    }
+
+    #[test]
+    fn audit_and_discovery_exclude_injection_recovery_but_keep_similar_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for folder in [
+            "fonts",
+            ".locust-injections/operations/id/work/fonts",
+            ".LOCUST-INJECTIONS/operations/id/work/fonts",
+            ".locust-injections-old/fonts",
+        ] {
+            let root = dir.path().join(folder);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("valid.ttf"), build_minimal_ascii_font()).unwrap();
+            std::fs::write(root.join("bad.woff2"), b"wOF2 unsupported font").unwrap();
+        }
+        let audit = FontValidator::audit_game_fonts(dir.path(), &["A"]).unwrap();
+        assert_eq!(
+            audit.fonts.len(),
+            2,
+            "only active and similarly named user folders"
+        );
+        assert_eq!(audit.issues.len(), 2);
+        assert_eq!(FontValidator::find_game_fonts(dir.path()).len(), 4);
+        for folder in [
+            ".locust-injections",
+            ".locust-injections/operations/id/work/fonts",
+        ] {
+            let root = dir.path().join(folder);
+            let explicit = FontValidator::audit_game_fonts(&root, &["A"]).unwrap();
+            assert_eq!(explicit.fonts.len(), 1);
+            assert_eq!(explicit.issues.len(), 1);
+            assert_eq!(FontValidator::find_game_fonts(&root).len(), 2);
+        }
+    }
+
+    #[test]
+    fn shared_required_characters_keep_combining_marks_and_supplementary_glyphs() {
+        let chars = required_characters(&["A\u{301}\u{20000}", "A A\u{301}\n\u{fe0f}"]);
+        assert_eq!(chars, vec!['A', '\u{301}', '\u{20000}']);
+        let font = build_minimal_ascii_font();
+        let first =
+            FontValidator::coverage_for_face(Path::new("one.ttf"), &font, 0, &chars).unwrap();
+        let second =
+            FontValidator::coverage_from_data(Path::new("two.ttf"), &font, &["A\u{301}\u{20000}"])
+                .unwrap();
+        assert_eq!(first.missing_chars, second.missing_chars);
+        assert_eq!(first.missing_chars, vec!['\u{301}', '\u{20000}']);
+    }
+
+    #[test]
+    fn cjk_extension_and_compatibility_characters_get_candidate_family() {
+        for ch in [
+            '\u{3400}',
+            '\u{20000}',
+            '\u{2A700}',
+            '\u{2EE5F}',
+            '\u{2F800}',
+            '\u{30000}',
+            '\u{31350}',
+            '\u{323B0}',
+            '\u{F900}',
+            '\u{1B000}',
+        ] {
+            let suggestions = suggest_replacement_font(&[ch]);
+            assert_eq!(suggestions.len(), 1, "{ch:?}");
+            assert_eq!(suggestions[0].font_name, "Noto Sans CJK");
+            assert_eq!(suggestions[0].covers_scripts, vec!["CJK"]);
+            assert_eq!(
+                suggestions[0].download_url,
+                "https://github.com/notofonts/noto-cjk/releases"
+            );
+        }
+        for ch in [
+            '\u{2A6E0}',
+            '\u{2FA20}',
+            '\u{33480}',
+            '\u{1B170}',
+            '\u{1F600}',
+        ] {
+            assert!(suggest_replacement_font(&[ch]).is_empty(), "{ch:?}");
+        }
+    }
+
+    #[test]
+    fn script_families_have_specific_sources_and_presentation_forms() {
+        let suggestions = suggest_replacement_font(&['\u{FB50}', '\u{FB1D}', '\u{0E01}']);
+        let names: Vec<_> = suggestions.iter().map(|s| s.font_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Noto Sans Arabic", "Noto Sans Hebrew", "Noto Sans Thai"]
+        );
+        for (suggestion, script) in suggestions.iter().zip(["arabic", "hebrew", "thai"]) {
+            assert_eq!(
+                suggestion.download_url,
+                format!("https://github.com/notofonts/{script}/releases")
+            );
+            assert_eq!(suggestion.covers_scripts.len(), 1);
+        }
     }
 }

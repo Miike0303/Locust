@@ -1,7 +1,8 @@
 //! Read-only patch verification against a game tree.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -12,8 +13,7 @@ use crate::error::{LocustError, Result};
 
 use super::manifest::{PatchFileEntry, PatchManifest, Receipt, VerificationTier};
 use super::store::{PatchStatus, PatchStore};
-use super::stream::{charge_declared, stream_and_hash, stream_hash_only};
-use super::zipsec::{case_fold_key, normalize_entry_name, safe_entry_path};
+use super::stream::{charge_declared, stream_and_hash, stream_hash_only, StagingDir};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationOutcome {
@@ -51,6 +51,19 @@ pub struct VerificationReport {
 
 /// Open the zip, scan security, parse optional manifest, compare to game.
 pub fn verify(game_root: &Path, zip_path: &Path) -> Result<VerificationReport> {
+    let game_lock = super::lock::GameLock::acquire(game_root)?;
+    verify_with_lock(&game_lock, zip_path)
+}
+
+/// Verify while retaining an already acquired game lock, for example before
+/// copying a game snapshot. The caller must keep this guard through its read
+/// operation. Installation still performs its own fresh verification.
+pub fn verify_with_lock(
+    game_lock: &super::GameLock,
+    zip_path: &Path,
+) -> Result<VerificationReport> {
+    let game_root = game_lock.root();
+    super::zipsec::ensure_safe_store(game_root)?;
     let store = PatchStore::new(game_root);
 
     // Interrupted always wins — force never overrides.
@@ -69,13 +82,75 @@ pub fn verify(game_root: &Path, zip_path: &Path) -> Result<VerificationReport> {
         });
     }
 
-    let file = File::open(zip_path)?;
-    let mut archive = ZipArchive::new(file).map_err(|e| {
-        LocustError::PatchError(format!("cannot open patch zip {}: {e}", zip_path.display()))
-    })?;
+    let mut archive = open_archive(zip_path)?;
 
-    let entries = scan_zip_entries(&mut archive)?;
-    let manifest = load_manifest_from_entries(&entries)?;
+    let entries = scan_zip_entries(&mut archive, None)?;
+    verify_scanned(game_root, &entries)
+}
+
+/// zip 2.x collapses exact duplicate central-directory names before exposing
+/// `len`/`by_index`. Count the raw headers on the same open file, without loading
+/// payloads or interpreting their compression, so hidden entries are rejected.
+pub(super) fn open_archive(path: &Path) -> Result<ZipArchive<File>> {
+    let mut raw = File::open(path)?;
+    let archive = ZipArchive::new(raw.try_clone()?).map_err(|e| {
+        LocustError::PatchError(format!("cannot open patch zip {}: {e}", path.display()))
+    })?;
+    let length = raw.metadata()?.len();
+    let mut position = archive.central_directory_start();
+    let mut count = 0usize;
+    loop {
+        raw.seek(SeekFrom::Start(position))?;
+        let mut signature = [0; 4];
+        raw.read_exact(&mut signature)?;
+        if signature != [0x50, 0x4b, 0x01, 0x02] {
+            break;
+        }
+        let mut header = [0; 42];
+        raw.read_exact(&mut header)?;
+        let variable = [24, 26, 28]
+            .into_iter()
+            .map(|i| u16::from_le_bytes([header[i], header[i + 1]]) as u64)
+            .sum::<u64>();
+        position = position
+            .checked_add(46)
+            .and_then(|p| p.checked_add(variable))
+            .filter(|p| *p <= length)
+            .ok_or_else(|| LocustError::PatchError("central-directory range past EOF".into()))?;
+        count += 1;
+        if count > archive.len() {
+            return Err(LocustError::PatchUnsafeEntry(
+                "duplicate or hidden central-directory entry".into(),
+            ));
+        }
+    }
+    if count != archive.len() {
+        return Err(LocustError::PatchError(
+            "central-directory entry count mismatch".into(),
+        ));
+    }
+    Ok(archive)
+}
+
+/// Verify the exact archive snapshot already scanned/staged by apply.
+pub(super) fn verify_scanned(
+    game_root: &Path,
+    entries: &[ZipEntryMeta],
+) -> Result<VerificationReport> {
+    super::zipsec::ensure_safe_store(game_root)?;
+    let store = PatchStore::new(game_root);
+    let manifest = load_manifest_from_entries(entries)?;
+    for entry in entries {
+        if let Some(rel) = &entry.rel {
+            super::zipsec::ensure_no_links(game_root, rel)?;
+        }
+    }
+    if let Some(manifest) = &manifest {
+        for file in &manifest.files {
+            let rel = super::zipsec::safe_stored_rel(&file.path)?;
+            super::zipsec::ensure_no_links(game_root, &rel)?;
+        }
+    }
 
     // Writability is part of verify (design step 3) — probe then clean up.
     check_writable(game_root)?;
@@ -86,22 +161,24 @@ pub fn verify(game_root: &Path, zip_path: &Path) -> Result<VerificationReport> {
 
     match manifest {
         Some(m) => {
-            verify_with_manifest(game_root, &entries, m, receipt.as_ref(), backup_compromised)
+            verify_with_manifest(game_root, entries, m, receipt.as_ref(), backup_compromised)
         }
-        None => verify_legacy(game_root, &entries, backup_compromised),
+        None => verify_legacy(game_root, entries, backup_compromised),
     }
 }
 
-struct ZipEntryMeta {
+pub(super) struct ZipEntryMeta {
     /// Original name in the archive (for error messages / unsafe-entry reports).
     #[allow(dead_code)]
     original: String,
     /// Normalized name.
     normalized: String,
     /// Safe relative path under game root, if this is a content file.
-    rel: Option<PathBuf>,
+    pub(super) rel: Option<PathBuf>,
     /// SHA-256 of entry payload (streamed; not kept in RAM for content files).
-    content_sha256: String,
+    pub(super) content_sha256: String,
+    pub(super) actual_len: u64,
+    pub(super) staged_path: Option<PathBuf>,
     /// Small meta payloads only (manifest / readme). Empty for content files.
     meta_data: Vec<u8>,
     is_dir: bool,
@@ -111,91 +188,92 @@ struct ZipEntryMeta {
 /// same bomb checks. Cap so a malicious "manifest" cannot fill memory.
 const MAX_META_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
 
-fn scan_zip_entries(archive: &mut ZipArchive<File>) -> Result<Vec<ZipEntryMeta>> {
+pub(super) fn scan_zip_entries(
+    archive: &mut ZipArchive<File>,
+    staging: Option<&StagingDir>,
+) -> Result<Vec<ZipEntryMeta>> {
     let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen = HashSet::new();
     let mut total_bytes = 0u64;
-
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LocustError::PatchError(format!("zip entry {i}: {e}")))?;
         let original = entry.name().to_string();
-        // Symlink entries (unix external attrs) — zip crate exposes is_symlink on ZipFile in v2.
         if entry.is_symlink() {
             return Err(LocustError::PatchUnsafeEntry(original));
         }
-        let is_dir = entry.is_dir() || original.ends_with('/');
-        let normalized = normalize_entry_name(&original);
+        let normalized = super::zipsec::canonical_archive_name(&original)?;
+        let key = normalized.to_lowercase();
+        // Metadata and directory entries share the same collision registry as
+        // payloads. Never let verify and apply select different manifests.
+        if !seen.insert(key.clone()) {
+            return Err(LocustError::PatchUnsafeEntry(format!(
+                "case-insensitive duplicate path (including metadata): {original}"
+            )));
+        }
+        let is_dir = entry.is_dir();
+        let is_meta = key == PatchManifest::FILENAME || key == "readme.txt";
         if is_dir {
+            if is_meta {
+                return Err(LocustError::PatchUnsafeEntry(format!(
+                    "metadata entry is a directory: {original}"
+                )));
+            }
             out.push(ZipEntryMeta {
                 original,
                 normalized,
                 rel: None,
                 content_sha256: String::new(),
+                actual_len: 0,
+                staged_path: None,
                 meta_data: vec![],
                 is_dir: true,
             });
             continue;
         }
-        // Skip the manifest file from the content plan later.
-        let is_meta =
-            normalized == PatchManifest::FILENAME || normalized.eq_ignore_ascii_case("readme.txt");
+        let declared = entry.size();
+        total_bytes = charge_declared(&original, declared, total_bytes)?;
+        let mut meta_data = Vec::new();
+        let mut staged_path = None;
+        let streamed = if is_meta {
+            if declared > MAX_META_BUFFER_BYTES {
+                return Err(LocustError::PatchError(format!(
+                    "zip meta entry {original} exceeds {MAX_META_BUFFER_BYTES} byte limit"
+                )));
+            }
+            stream_and_hash(&mut entry, declared, &original, Some(&mut meta_data))?
+        } else if let Some(staging) = staging {
+            let path = staging.child(&format!("e{i:08}"));
+            let mut file = staging.create_file(&format!("e{i:08}"))?;
+            let streamed = stream_and_hash(&mut entry, declared, &original, Some(&mut file))?;
+            file.sync_all()?;
+            staged_path = Some(path);
+            streamed
+        } else {
+            stream_hash_only(&mut entry, declared, &original)?
+        };
+        if streamed.actual_len != declared {
+            return Err(LocustError::PatchError(format!(
+                "zip entry actual length differs from declared size for {original}"
+            )));
+        }
         let rel = if is_meta {
             None
         } else {
-            Some(safe_entry_path(&normalized, &original)?)
+            Some(PathBuf::from(&normalized))
         };
-
-        if let Some(ref r) = rel {
-            let key = case_fold_key(r);
-            if !seen.insert(key) {
-                return Err(LocustError::PatchUnsafeEntry(format!(
-                    "case-insensitive duplicate path: {original}"
-                )));
-            }
-        }
-
-        let declared = entry.size();
-        // Declared size against zip-wide ceiling before any streaming.
-        total_bytes = charge_declared(&original, declared, total_bytes)?;
-
-        let (content_sha256, meta_data) = if is_meta {
-            if declared > MAX_META_BUFFER_BYTES {
-                return Err(LocustError::PatchError(format!(
-                    "zip meta entry \"{original}\" declares {declared} bytes \
-                     (limit {MAX_META_BUFFER_BYTES}) — refusing to buffer"
-                )));
-            }
-            let mut buf = Vec::new();
-            let streamed = stream_and_hash(
-                &mut entry,
-                declared.min(MAX_META_BUFFER_BYTES),
-                &original,
-                Some(&mut buf),
-            )?;
-            if streamed.actual_len > MAX_META_BUFFER_BYTES {
-                return Err(LocustError::PatchError(format!(
-                    "zip meta entry \"{original}\" exceeded meta buffer limit"
-                )));
-            }
-            (streamed.sha256_hex, buf)
-        } else {
-            // Content: hash while streaming; discard bytes (multi‑GB safe).
-            let streamed = stream_hash_only(&mut entry, declared, &original)?;
-            (streamed.sha256_hex, vec![])
-        };
-
         out.push(ZipEntryMeta {
             original,
-            normalized,
+            normalized: if is_meta { key } else { normalized },
             rel,
-            content_sha256,
+            content_sha256: streamed.sha256_hex,
+            actual_len: streamed.actual_len,
+            staged_path,
             meta_data,
             is_dir: false,
         });
     }
-    let _ = total_bytes;
     Ok(out)
 }
 
@@ -218,27 +296,18 @@ fn check_writable(game_root: &Path) -> Result<()> {
             game_root.display()
         )));
     }
-    let probe = game_root.join(format!(
-        ".locust-probe-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    match fs::write(&probe, b"ok") {
-        Ok(()) => {
-            let _ = fs::remove_file(&probe);
-            Ok(())
-        }
-        Err(e) => Err(LocustError::GameDirNotWritable(format!(
-            "{} ({e})",
-            game_root.display()
-        ))),
-    }
+    let probe = (|| -> Result<()> {
+        let staging = StagingDir::create_prepared(game_root)?;
+        staging.create_file("probe")?;
+        Ok(())
+    })();
+    probe.map_err(|e| LocustError::GameDirNotWritable(format!("{} ({e})", game_root.display())))
 }
 
 fn verify_with_manifest(
     game_root: &Path,
     entries: &[ZipEntryMeta],
-    manifest: PatchManifest,
+    mut manifest: PatchManifest,
     receipt: Option<&Receipt>,
     backup_compromised: bool,
 ) -> Result<VerificationReport> {
@@ -250,24 +319,44 @@ fn verify_with_manifest(
         }
     }
 
-    // Ensure every manifest path is present and safe in the zip.
-    for f in &manifest.files {
-        let n = normalize_entry_name(&f.path);
-        let rel = safe_entry_path(&n, &f.path)?;
-        let key = rel.to_string_lossy().replace('\\', "/");
+    if manifest.schema_version != PatchManifest::SCHEMA_VERSION {
+        return Err(LocustError::PatchError(format!(
+            "unsupported patch manifest schema {}",
+            manifest.schema_version
+        )));
+    }
+    let mut listed = HashSet::new();
+    // Normalize once, then keep precisely this plan for verification, apply,
+    // journal and receipt. Every regular payload must be listed exactly once.
+    for f in &mut manifest.files {
+        let key = super::zipsec::canonical_archive_name(&f.path)?;
+        if !listed.insert(key.to_lowercase()) {
+            return Err(LocustError::PatchUnsafeEntry(format!(
+                "duplicate manifest target: {}",
+                f.path
+            )));
+        }
         let Some(ze) = zip_by_path.get(&key) else {
             return Err(LocustError::PatchError(format!(
-                "manifest lists {} but zip has no such entry",
+                "manifest lists {} but zip has no such content entry",
                 f.path
             )));
         };
-        let hash = &ze.content_sha256;
-        if hash != &f.patched_sha256 {
+        if ze.content_sha256 != f.patched_sha256 || ze.actual_len != f.size {
             return Err(LocustError::PatchError(format!(
-                "zip content hash mismatch for {}: manifest says {}, zip has {}",
-                f.path, f.patched_sha256, hash
+                "zip content hash or size mismatch for {}",
+                f.path
             )));
         }
+        f.path = key;
+    }
+    if zip_by_path
+        .keys()
+        .any(|key| !listed.contains(&key.to_lowercase()))
+    {
+        return Err(LocustError::PatchError(
+            "zip contains an unlisted regular payload".into(),
+        ));
     }
 
     // Receipt version / id comparison (before content tier).

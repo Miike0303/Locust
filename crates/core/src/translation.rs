@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::database::Database;
+use crate::database::{Database, TranslationSaveGuard};
 use crate::error::{LocustError, Result};
 use crate::glossary::Glossary;
 use crate::models::{
@@ -46,6 +46,12 @@ pub struct TranslationOptions {
     pub use_glossary: bool,
     pub use_memory: bool,
     pub skip_approved: bool,
+    /// Approximate input budget: source/context bytes divided by 3, plus overhead.
+    #[serde(default = "default_max_batch_tokens")]
+    pub max_batch_tokens: Option<usize>,
+    /// Explicit opt-in: mechanical shortening can destroy meaning.
+    #[serde(default)]
+    pub allow_lossy_binary_fit: bool,
 }
 
 impl Default for TranslationOptions {
@@ -62,8 +68,105 @@ impl Default for TranslationOptions {
             use_glossary: true,
             use_memory: true,
             skip_approved: true,
+            max_batch_tokens: default_max_batch_tokens(),
+            allow_lossy_binary_fit: false,
         }
     }
+}
+
+fn translation_fits_entry(entry: &StringEntry, translation: &str) -> bool {
+    if translation.trim().is_empty()
+        || !PlaceholderProcessor::validate(&entry.source, translation).is_empty()
+    {
+        return false;
+    }
+    if crate::textasset_group::is_grouped_entry(entry) {
+        return false;
+    }
+    match crate::validation::binary_slot_budget(entry) {
+        Ok(Some((slot, budget))) => {
+            return crate::validation::encoded_byte_len(&slot, translation)
+                .is_some_and(|size| size <= budget);
+        }
+        Err(_) => return false,
+        Ok(None) => {}
+    }
+    true
+}
+
+fn default_max_batch_tokens() -> Option<usize> {
+    Some(6000)
+}
+
+fn translation_batches<'a>(
+    entries: &'a [StringEntry],
+    opts: &TranslationOptions,
+) -> Vec<&'a [StringEntry]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut tokens = 0usize;
+    for (index, entry) in entries.iter().enumerate() {
+        let estimate = entry
+            .source
+            .len()
+            .saturating_add(entry.context.as_ref().map_or(0, String::len))
+            .saturating_add(opts.game_context.as_ref().map_or(0, String::len))
+            .div_ceil(3)
+            .saturating_add(128);
+        if index > start
+            && (index - start >= opts.batch_size
+                || opts
+                    .max_batch_tokens
+                    .is_some_and(|limit| tokens.saturating_add(estimate) > limit))
+        {
+            batches.push(&entries[start..index]);
+            start = index;
+            tokens = 0;
+        }
+        tokens = tokens.saturating_add(estimate);
+    }
+    if start < entries.len() {
+        batches.push(&entries[start..]);
+    }
+    batches
+}
+
+fn group_retry_batches<'a>(
+    requests: &'a [TranslationRequest],
+    opts: &TranslationOptions,
+) -> std::result::Result<Vec<&'a [TranslationRequest]>, &'static str> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut tokens = 0usize;
+    for (index, request) in requests.iter().enumerate() {
+        let estimate = request
+            .source
+            .len()
+            .saturating_add(request.context.as_ref().map_or(0, String::len))
+            .saturating_add(request.glossary_hint.as_ref().map_or(0, String::len))
+            .div_ceil(3)
+            .saturating_add(128);
+        if opts.max_batch_tokens.is_some_and(|limit| estimate > limit) {
+            return Err(
+                "shared TextAsset retry exceeds the request token budget; entries remain pending",
+            );
+        }
+        if index > start
+            && (index - start >= opts.batch_size
+                || opts
+                    .max_batch_tokens
+                    .is_some_and(|limit| tokens.saturating_add(estimate) > limit))
+        {
+            batches.push(&requests[start..index]);
+            start = index;
+            tokens = 0;
+        }
+        tokens = tokens.saturating_add(estimate);
+    }
+    if start < requests.len() {
+        batches.push(&requests[start..]);
+    }
+    Ok(batches)
 }
 
 /// Restore placeholder tokens in a provider result (best-effort on failure).
@@ -101,6 +204,127 @@ const TIGHT_BINARY_SLOT_BYTES: usize = 12;
 /// original batch call). Two retries help very tight UI labels (e.g. 7–9 byte
 /// slots) when the first shortening still misses by 1 byte.
 const MAX_BINARY_SLOT_LENGTH_RETRIES: usize = 2;
+
+struct GroupAccumulator {
+    selected: HashMap<String, Vec<String>>,
+    group_by_entry: HashMap<String, String>,
+    changed_groups: HashSet<String>,
+    results: HashMap<String, TranslationResult>,
+    requests: HashMap<String, TranslationRequest>,
+    placeholders: HashMap<String, Vec<Placeholder>>,
+    failed: HashSet<String>,
+    finalized: HashSet<String>,
+}
+
+impl GroupAccumulator {
+    fn from_entries(entries: &[StringEntry]) -> Self {
+        let mut selected: HashMap<String, Vec<String>> = HashMap::new();
+        let mut group_by_entry = HashMap::new();
+        for entry in entries {
+            if let Ok(meta) = crate::textasset_group::parse_group_meta(entry) {
+                group_by_entry.insert(entry.id.clone(), meta.id.clone());
+                selected.entry(meta.id).or_default().push(entry.id.clone());
+            }
+        }
+        Self {
+            selected,
+            group_by_entry,
+            changed_groups: HashSet::new(),
+            results: HashMap::new(),
+            requests: HashMap::new(),
+            placeholders: HashMap::new(),
+            failed: HashSet::new(),
+            finalized: HashSet::new(),
+        }
+    }
+
+    fn is_grouped(&self, id: &str) -> bool {
+        self.group_by_entry.contains_key(id)
+    }
+
+    fn mark_changed(&mut self, id: &str) {
+        if let Some(group_id) = self.group_by_entry.get(id) {
+            self.changed_groups.insert(group_id.clone());
+        }
+    }
+
+    fn ready_group_ids(&mut self) -> Vec<String> {
+        self.changed_groups
+            .drain()
+            .filter(|gid| {
+                !self.finalized.contains(gid)
+                    && self.selected[gid]
+                        .iter()
+                        .all(|id| self.results.contains_key(id) || self.failed.contains(id))
+            })
+            .collect()
+    }
+
+    fn abandon_missing(&mut self) {
+        for (group_id, ids) in &self.selected {
+            if self.finalized.contains(group_id) {
+                continue;
+            }
+            self.changed_groups.insert(group_id.clone());
+            for id in ids {
+                if !self.results.contains_key(id) {
+                    self.failed.insert(id.clone());
+                }
+            }
+        }
+    }
+}
+
+fn collect_group_owned_patches(
+    meta: &crate::textasset_group::GroupMeta,
+    selected_ids: &[String],
+    results: &HashMap<String, TranslationResult>,
+    entries_by_id: &HashMap<String, StringEntry>,
+    db_groups: &HashMap<String, Vec<StringEntry>>,
+) -> Vec<(StringEntry, String)> {
+    let mut owned = Vec::new();
+    let mut seen = HashSet::new();
+    for id in selected_ids {
+        if let (Some(entry), Some(result)) = (entries_by_id.get(id), results.get(id)) {
+            owned.push((entry.clone(), result.translation.clone()));
+            seen.insert(id.clone());
+        }
+    }
+    for sibling in db_groups.get(&meta.id).into_iter().flatten() {
+        let Ok(sibling_meta) = crate::textasset_group::parse_group_meta(sibling) else {
+            continue;
+        };
+        if sibling_meta != *meta || seen.contains(&sibling.id) {
+            continue;
+        }
+        let Some(translation) = sibling.translation.as_deref() else {
+            continue;
+        };
+        if translation.is_empty() || translation == sibling.source {
+            continue;
+        }
+        seen.insert(sibling.id.clone());
+        owned.push((sibling.clone(), translation.to_string()));
+    }
+    owned
+}
+
+async fn refuse_group(
+    tx: &mpsc::Sender<ProgressEvent>,
+    selected_ids: &[String],
+    oversize_after_retry: &mut usize,
+    error: &str,
+) {
+    for id in selected_ids {
+        *oversize_after_retry += 1;
+        let _ = tx
+            .send(ProgressEvent::BatchFailed {
+                entry_id: Some(id.clone()),
+                error: error.to_string(),
+            })
+            .await;
+    }
+}
 
 /// First-pass context hint for binary-slot inject budgets.
 /// When `source` is set and the budget is tight, quote the source so the model
@@ -202,7 +426,25 @@ where
             }
         }
 
-        match operation().await {
+        // Bound the in-flight request too, not just the delay between attempts.
+        // Dropping the future cancels the local HTTP wait when the job is stopped.
+        let outcome = tokio::select! {
+            biased;
+            _ = async {
+                match &config.cancel {
+                    Some(cancel) => cancel.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => return Err(LocustError::ProviderError("cancelled".into())),
+            _ = async {
+                match deadline {
+                    Some(dl) => tokio::time::sleep_until(dl).await,
+                    None => std::future::pending().await,
+                }
+            } => return Err(LocustError::ProviderError("provider request timeout: retry deadline exceeded".into())),
+            outcome = operation() => outcome,
+        };
+        match outcome {
             Ok(v) => return Ok(v),
             Err(e) => {
                 if is_retryable(&e) && attempt < config.max_attempts - 1 {
@@ -399,33 +641,62 @@ pub fn rate_limiter_for(provider_id: &str) -> Arc<RateLimiter> {
         .clone()
 }
 
+struct ProviderCall {
+    results: Vec<TranslationResult>,
+    attempts: usize,
+}
+
 async fn call_provider(
     provider: Arc<dyn TranslationProvider>,
     requests: &[TranslationRequest],
     retry: &RetryConfig,
     cancel: &CancellationToken,
-) -> Result<Vec<TranslationResult>> {
+) -> Result<ProviderCall> {
+    let limiter = rate_limiter_for(provider.id());
+    call_provider_with_limiter(provider, requests, retry, cancel, limiter).await
+}
+
+async fn call_provider_with_limiter(
+    provider: Arc<dyn TranslationProvider>,
+    requests: &[TranslationRequest],
+    retry: &RetryConfig,
+    cancel: &CancellationToken,
+    limiter: Arc<RateLimiter>,
+) -> Result<ProviderCall> {
     if cancel.is_cancelled() {
         return Err(LocustError::ProviderError("cancelled".into()));
     }
-    let limiter = rate_limiter_for(provider.id());
+    // Queueing for the first allowance is not HTTP latency. Slow provider
+    // quotas may legitimately require more than the request deadline.
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => {
-            return Err(LocustError::ProviderError("cancelled".into()));
-        }
+        _ = cancel.cancelled() => return Err(LocustError::ProviderError("cancelled".into())),
         _ = limiter.acquire() => {}
     }
     let mut cfg = retry.clone();
     cfg.cancel = Some(cancel.clone());
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let provider = provider.clone();
     let requests = requests.to_vec();
-    with_retry(&cfg, move || {
+    let attempts_for_call = attempts.clone();
+    let results = with_retry(&cfg, move || {
         let provider = provider.clone();
         let requests = requests.clone();
-        async move { provider.translate(&requests).await }
+        let limiter = limiter.clone();
+        let is_retry = attempts_for_call.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0;
+        async move {
+            // Every HTTP attempt consumes rate allowance, including retries.
+            if is_retry {
+                limiter.acquire().await;
+            }
+            provider.translate(&requests).await
+        }
     })
-    .await
+    .await?;
+    Ok(ProviderCall {
+        results,
+        attempts: attempts.load(std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 pub struct TranslationManager {
@@ -441,17 +712,340 @@ impl TranslationManager {
         db: Arc<Database>,
         glossary: Arc<Glossary>,
     ) -> Self {
+        let mut retry = RetryConfig::default();
+        // Reasoning models can legitimately take longer than one minute for
+        // game-dialogue batches. Cancellation remains immediate and bounded.
+        if matches!(provider.id(), "grok" | "grok-sub") {
+            retry.overall_deadline = Some(Duration::from_secs(180));
+        }
         Self {
             provider,
             db,
             glossary,
-            retry: RetryConfig::default(),
+            retry,
         }
     }
 
     pub fn with_retry_config(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
         self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_ready_textasset_groups(
+        &self,
+        acc: &mut GroupAccumulator,
+        entries_by_id: &HashMap<String, StringEntry>,
+        db_groups: &HashMap<String, Vec<StringEntry>>,
+        opts: &TranslationOptions,
+        tx: &mpsc::Sender<ProgressEvent>,
+        cancel: &CancellationToken,
+        lang_pair: &str,
+        sources_by_id: &HashMap<String, String>,
+        save_guards: &HashMap<String, TranslationSaveGuard>,
+        observed_cost: &mut ObservedCost,
+        budget_error: &mut Option<LocustError>,
+        oversize_after_retry: &mut usize,
+        retried_ok: &mut usize,
+        completed: &mut usize,
+        total_tokens: &mut u64,
+        total_input_tokens: &mut u64,
+        total_output_tokens: &mut u64,
+    ) -> Result<()> {
+        'groups: for group_id in acc.ready_group_ids() {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            acc.finalized.insert(group_id.clone());
+            let selected_ids = acc.selected.get(&group_id).cloned().unwrap_or_default();
+            let Some(head) = selected_ids.iter().find_map(|id| entries_by_id.get(id)) else {
+                continue;
+            };
+            let Ok(meta) = crate::textasset_group::parse_group_meta(head) else {
+                continue;
+            };
+            let mut attempts = 0usize;
+            'rounds: loop {
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                let owned = collect_group_owned_patches(
+                    &meta,
+                    &selected_ids,
+                    &acc.results,
+                    entries_by_id,
+                    db_groups,
+                );
+                let mut patches = Vec::new();
+                let mut selected_patched = 0usize;
+                let selected_with_results = selected_ids
+                    .iter()
+                    .filter(|id| acc.results.contains_key(*id))
+                    .count();
+                let mut reconstruct_ok = true;
+                for (entry, text) in &owned {
+                    match crate::textasset_group::patch_from_entry(entry, text) {
+                        Ok(patch) => {
+                            if acc.results.contains_key(&entry.id) {
+                                selected_patched += 1;
+                            }
+                            patches.push(patch);
+                        }
+                        Err(_) => {
+                            reconstruct_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !reconstruct_ok || selected_patched != selected_with_results {
+                    refuse_group(
+                        tx,
+                        &selected_ids,
+                        oversize_after_retry,
+                        "translation exceeds the shared TextAsset capacity; entries remain pending (no automatic truncation)",
+                    )
+                    .await;
+                    break;
+                }
+                match crate::textasset_group::reconstructed_fits(&meta, &patches) {
+                    Ok(true) => {
+                        let to_save: Vec<TranslationResult> = selected_ids
+                            .iter()
+                            .filter_map(|id| acc.results.get(id).cloned())
+                            .collect();
+                        if to_save.is_empty() {
+                            break;
+                        }
+                        if cancel.is_cancelled() {
+                            return Ok(());
+                        }
+                        self.db
+                            .save_translation_results_guarded(&to_save, save_guards)
+                            .await?;
+                        if attempts > 0 {
+                            *retried_ok += to_save.len();
+                        }
+                        for result in &to_save {
+                            if opts.use_memory && result.provider != "mock" {
+                                if let Some(source) = sources_by_id.get(&result.entry_id) {
+                                    use sha2::{Digest, Sha256};
+                                    let hash = hex::encode(Sha256::digest(source.as_bytes()));
+                                    let _ = self
+                                        .db
+                                        .save_memory(&hash, source, &result.translation, lang_pair)
+                                        .await;
+                                }
+                            }
+                            let _ = tx
+                                .send(ProgressEvent::StringTranslated {
+                                    entry_id: result.entry_id.clone(),
+                                    translation: result.translation.clone(),
+                                })
+                                .await;
+                            *completed += 1;
+                        }
+                        break;
+                    }
+                    Ok(false) if attempts < MAX_BINARY_SLOT_LENGTH_RETRIES => {
+                        let actual = crate::textasset_group::reconstructed_len(&meta, &patches)
+                            .unwrap_or(meta.capacity.saturating_add(1));
+                        let retry_reqs: Vec<TranslationRequest> = selected_ids
+                            .iter()
+                            .filter_map(|id| acc.requests.get(id).cloned())
+                            .map(|mut req| {
+                                let prev = acc
+                                    .results
+                                    .get(&req.entry_id)
+                                    .map(|r| r.translation.as_str())
+                                    .unwrap_or("");
+                                let correction = crate::textasset_group::retry_correction(
+                                    meta.capacity,
+                                    actual,
+                                    prev,
+                                );
+                                req.context = Some(match req.context {
+                                    Some(c) => format!("{c} | {correction}"),
+                                    None => correction,
+                                });
+                                req
+                            })
+                            .collect();
+                        if retry_reqs.is_empty() {
+                            refuse_group(
+                                tx,
+                                &selected_ids,
+                                oversize_after_retry,
+                                "translation exceeds the shared TextAsset capacity; entries remain pending (no automatic truncation)",
+                            )
+                            .await;
+                            break;
+                        }
+                        let retry_batches = match group_retry_batches(&retry_reqs, opts) {
+                            Ok(batches) => batches,
+                            Err(message) => {
+                                refuse_group(tx, &selected_ids, oversize_after_retry, message)
+                                    .await;
+                                break;
+                            }
+                        };
+                        attempts += 1;
+                        for retry_reqs in retry_batches {
+                            if cancel.is_cancelled() {
+                                return Ok(());
+                            }
+                            if budget_error.is_some() {
+                                refuse_group(
+                                tx,
+                                &selected_ids,
+                                oversize_after_retry,
+                                "translation exceeds the shared TextAsset capacity; entries remain pending (no automatic truncation)",
+                            )
+                            .await;
+                                continue 'groups;
+                            }
+                            if let Some(limit) = opts.cost_limit_usd {
+                                if !observed_cost.complete {
+                                    *budget_error = Some(LocustError::ProviderError(
+                                    "cannot enforce a cost limit: preceding calls have unknown cost"
+                                        .into(),
+                                ));
+                                    refuse_group(
+                                    tx,
+                                    &selected_ids,
+                                    oversize_after_retry,
+                                    "translation exceeds the shared TextAsset capacity; entries remain pending (no automatic truncation)",
+                                )
+                                .await;
+                                    continue 'groups;
+                                }
+                                let chars: usize = retry_reqs
+                                    .iter()
+                                    .map(|r| {
+                                        r.source.len()
+                                            + r.context.as_ref().map_or(0, String::len)
+                                            + r.glossary_hint.as_ref().map_or(0, String::len)
+                                    })
+                                    .sum();
+                                match self.provider.estimate_cost(chars, &opts.target_lang).await {
+                                    Some(estimate) if estimate.is_finite() && estimate >= 0.0 => {
+                                        if observed_cost.amount + estimate > limit {
+                                            *budget_error = Some(LocustError::CostLimitExceeded {
+                                                estimated: observed_cost.amount + estimate,
+                                                limit,
+                                            });
+                                        }
+                                    }
+                                    None if self.provider.is_free() => {}
+                                    _ => {
+                                        *budget_error = Some(LocustError::ProviderError(
+                                        "cannot enforce a cost limit: this provider has no valid cost estimate".into(),
+                                    ));
+                                    }
+                                }
+                                if budget_error.is_some() {
+                                    refuse_group(
+                                    tx,
+                                    &selected_ids,
+                                    oversize_after_retry,
+                                    "translation exceeds the shared TextAsset capacity; entries remain pending (no automatic truncation)",
+                                )
+                                .await;
+                                    continue 'groups;
+                                }
+                            }
+                            match call_provider(
+                                self.provider.clone(),
+                                retry_reqs,
+                                &self.retry,
+                                cancel,
+                            )
+                            .await
+                            {
+                                Ok(retry_call) => {
+                                    let ProviderCall {
+                                        mut results,
+                                        attempts: transport_attempts,
+                                    } = retry_call;
+                                    observed_cost.observe_batch(
+                                        results.iter().map(|r| r.cost_usd),
+                                        self.provider.is_free(),
+                                    );
+                                    if transport_attempts > 1 && !self.provider.is_free() {
+                                        observed_cost.complete = false;
+                                    }
+                                    if budget_error.is_none() {
+                                        *budget_error = observed_budget_error(
+                                            *observed_cost,
+                                            opts.cost_limit_usd,
+                                        );
+                                    }
+                                    for usage in &results {
+                                        *total_tokens += usage.tokens_used.unwrap_or(0) as u64;
+                                        *total_input_tokens +=
+                                            usage.input_tokens.unwrap_or(0) as u64;
+                                        *total_output_tokens +=
+                                            usage.output_tokens.unwrap_or(0) as u64;
+                                    }
+                                    let expected: HashSet<_> =
+                                        retry_reqs.iter().map(|r| r.entry_id.as_str()).collect();
+                                    let actual_ids: HashSet<_> =
+                                        results.iter().map(|r| r.entry_id.as_str()).collect();
+                                    if results.len() != retry_reqs.len()
+                                        || actual_ids.len() != results.len()
+                                        || actual_ids != expected
+                                    {
+                                        continue 'rounds;
+                                    }
+                                    for result in &mut results {
+                                        restore_placeholders_in_result(result, &acc.placeholders);
+                                        if let Some(source) = sources_by_id.get(&result.entry_id) {
+                                            if result.translation.trim().is_empty()
+                                                || !PlaceholderProcessor::validate(
+                                                    source,
+                                                    &result.translation,
+                                                )
+                                                .is_empty()
+                                            {
+                                                continue;
+                                            }
+                                        }
+                                        acc.results.insert(result.entry_id.clone(), result.clone());
+                                    }
+                                }
+                                Err(_) => {
+                                    observed_cost.complete &= self.provider.is_free();
+                                    if budget_error.is_none() {
+                                        *budget_error = observed_budget_error(
+                                            *observed_cost,
+                                            opts.cost_limit_usd,
+                                        );
+                                    }
+                                    refuse_group(
+                                    tx,
+                                    &selected_ids,
+                                    oversize_after_retry,
+                                    "translation exceeds the shared TextAsset capacity; entries remain pending (no automatic truncation)",
+                                )
+                                .await;
+                                    continue 'groups;
+                                }
+                            }
+                        }
+                    }
+                    Ok(false) | Err(_) => {
+                        refuse_group(
+                            tx,
+                            &selected_ids,
+                            oversize_after_retry,
+                            "translation exceeds the shared TextAsset capacity; entries remain pending (no automatic truncation)",
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn translate_entries(
@@ -477,7 +1071,44 @@ impl TranslationManager {
         cancel: CancellationToken,
         emit_lifecycle: bool,
     ) -> Result<()> {
+        self.translate_entries_accounted(
+            entries,
+            opts,
+            tx,
+            job_id,
+            cancel,
+            emit_lifecycle,
+            &mut ObservedCost::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn translate_entries_accounted(
+        &self,
+        entries: Vec<StringEntry>,
+        opts: TranslationOptions,
+        tx: mpsc::Sender<ProgressEvent>,
+        job_id: String,
+        cancel: CancellationToken,
+        emit_lifecycle: bool,
+        cumulative_cost: &mut ObservedCost,
+    ) -> Result<()> {
         let start = Instant::now();
+
+        if opts.batch_size == 0 || opts.max_batch_tokens == Some(0) {
+            return Err(LocustError::ProviderError(
+                "batch size and token budget must be greater than zero".into(),
+            ));
+        }
+        if opts
+            .cost_limit_usd
+            .is_some_and(|n| !n.is_finite() || n < 0.0)
+        {
+            return Err(LocustError::ProviderError(
+                "cost limit must be finite and non-negative".into(),
+            ));
+        }
 
         // 1. Filter translatable entries
         let mut translatable: Vec<StringEntry> = entries
@@ -486,8 +1117,22 @@ impl TranslationManager {
                 e.is_translatable() && !(opts.skip_approved && e.status == StringStatus::Approved)
             })
             .collect();
+        // Fail before memory/glossary/provider work if immutable pivot capacity
+        // metadata is malformed; silently deriving a weaker budget is unsafe.
+        for entry in &translatable {
+            crate::validation::binary_slot_budget(entry)?;
+            crate::textasset_group::require_valid_metadata(entry)?;
+        }
 
         let total = translatable.len();
+        let sources_by_id: HashMap<_, _> = translatable
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.source.clone()))
+            .collect();
+        let save_guards: HashMap<_, _> = translatable
+            .iter()
+            .map(|entry| (entry.id.clone(), TranslationSaveGuard::from(entry)))
+            .collect();
 
         // 2. Send Started
         if emit_lifecycle {
@@ -504,7 +1149,7 @@ impl TranslationManager {
         let mut oversize_after_retry = 0usize;
         // Binary-slot entries that fit only after the length-aware retry.
         let mut retried_ok = 0usize;
-        let mut total_cost = 0.0f64;
+        let mut observed_cost = ObservedCost::default();
         let mut total_tokens = 0u64;
         let mut total_input_tokens = 0u64;
         let mut total_output_tokens = 0u64;
@@ -517,8 +1162,12 @@ impl TranslationManager {
             for entry in translatable.drain(..) {
                 let hash = entry.source_hash();
                 if let Ok(Some(cached)) = self.db.lookup_memory(&hash, &lang_pair) {
+                    if !translation_fits_entry(&entry, &cached) {
+                        remaining.push(entry);
+                        continue;
+                    }
                     self.db
-                        .save_translation(&entry.id, &cached, "memory")
+                        .save_translation_guarded(&entry, &cached, "memory")
                         .await?;
                     let _ = tx
                         .send(ProgressEvent::StringTranslated {
@@ -547,20 +1196,13 @@ impl TranslationManager {
                     still.push(entry);
                     continue;
                 };
-                // Binary-slot: only apply when the glossary form fits the budget.
-                if let Some(slot) = entry.metadata.get("binary_slot").and_then(|v| v.as_str()) {
-                    if let Some(budget) = crate::validation::encoded_byte_len(slot, &entry.source) {
-                        if crate::validation::encoded_byte_len(slot, &term)
-                            .map(|n| n > budget)
-                            .unwrap_or(true)
-                        {
-                            still.push(entry);
-                            continue;
-                        }
-                    }
+                // Exact glossary hits obey the same integrity rules as memory.
+                if !translation_fits_entry(&entry, &term) {
+                    still.push(entry);
+                    continue;
                 }
                 self.db
-                    .save_translation(&entry.id, &term, "glossary")
+                    .save_translation_guarded(&entry, &term, "glossary")
                     .await?;
                 let _ = tx
                     .send(ProgressEvent::StringTranslated {
@@ -571,6 +1213,33 @@ impl TranslationManager {
                 completed += 1;
             }
             remaining = still;
+        }
+
+        let entries_by_id: HashMap<String, StringEntry> = remaining
+            .iter()
+            .cloned()
+            .map(|entry| (entry.id.clone(), entry))
+            .collect();
+        let mut group_acc = GroupAccumulator::from_entries(&remaining);
+        let mut db_groups: HashMap<String, Vec<StringEntry>> = HashMap::new();
+        if !group_acc.selected.is_empty() {
+            for entry in self
+                .db
+                .get_entries(&crate::database::EntryFilter::default())?
+            {
+                if let Some(group_id) = entry
+                    .metadata
+                    .get(crate::textasset_group::GROUP_ID_KEY)
+                    .and_then(|v| v.as_str())
+                {
+                    if group_acc.selected.contains_key(group_id) {
+                        db_groups
+                            .entry(group_id.to_owned())
+                            .or_default()
+                            .push(entry);
+                    }
+                }
+            }
         }
 
         // 5. Process remaining in chunks — up to `max_concurrent` provider calls
@@ -589,11 +1258,13 @@ impl TranslationManager {
             Vec<TranslationRequest>,
             std::collections::HashMap<String, Vec<Placeholder>>,
             std::collections::HashMap<String, SlotBudget>,
-            Result<Vec<TranslationResult>>,
+            Result<ProviderCall>,
         );
         let mut in_flight: tokio::task::JoinSet<BatchOutcome> = tokio::task::JoinSet::new();
-        let mut chunk_iter = remaining.chunks(opts.batch_size);
+        let chunks = translation_batches(&remaining, &opts);
+        let mut chunk_iter = chunks.into_iter();
         let mut cancelled = false;
+        let mut budget_error = None;
 
         loop {
             // 5a. Fill the in-flight window
@@ -609,18 +1280,37 @@ impl TranslationManager {
 
                 // 5b. Check cost limit
                 if let Some(limit) = opts.cost_limit_usd {
+                    if !observed_cost.complete {
+                        budget_error = Some(LocustError::ProviderError(
+                            "cannot enforce a cost limit: preceding calls have unknown cost".into(),
+                        ));
+                        break;
+                    }
                     let char_count: usize = chunk.iter().map(|e| e.source.len()).sum();
                     if let Some(estimated) = self
                         .provider
                         .estimate_cost(char_count, &opts.target_lang)
                         .await
                     {
-                        if total_cost + estimated > limit {
-                            return Err(LocustError::CostLimitExceeded {
-                                estimated: total_cost + estimated,
+                        if !estimated.is_finite() || estimated < 0.0 {
+                            budget_error = Some(LocustError::ProviderError(
+                                "cannot enforce a cost limit: this provider has no valid cost estimate".into(),
+                            ));
+                            break;
+                        }
+                        if observed_cost.amount + estimated > limit {
+                            budget_error = Some(LocustError::CostLimitExceeded {
+                                estimated: observed_cost.amount + estimated,
                                 limit,
                             });
+                            break;
                         }
+                    } else if !self.provider.is_free() {
+                        budget_error = Some(LocustError::ProviderError(
+                            "cannot enforce a cost limit: this provider has no cost estimate"
+                                .into(),
+                        ));
+                        break;
                     }
                 }
 
@@ -641,21 +1331,33 @@ impl TranslationManager {
                         };
                         // Binary-slot engines (Unity/Unreal/Wolf): hint the model to stay
                         // within the inject byte budget for this string.
-                        let mut slot_budget: Option<(&str, usize)> = None;
-                        if let Some(slot) =
-                            entry.metadata.get("binary_slot").and_then(|v| v.as_str())
+                        let mut slot_budget: Option<(String, usize)> = None;
+                        if let Some((slot, budget)) = crate::validation::binary_slot_budget(entry)
+                            .expect("binary slot metadata prevalidated")
                         {
-                            if let Some(budget) =
-                                crate::validation::encoded_byte_len(slot, &entry.source)
-                            {
-                                budgets_by_id.insert(entry.id.clone(), (slot.to_string(), budget));
-                                slot_budget = Some((slot, budget));
-                                let hint = binary_slot_length_hint(slot, budget, &entry.source);
-                                context = Some(match context {
-                                    Some(c) => format!("{c} | {hint}"),
-                                    None => hint,
-                                });
-                            }
+                            budgets_by_id.insert(entry.id.clone(), (slot.clone(), budget));
+                            slot_budget = Some((slot.clone(), budget));
+                            let hint = binary_slot_length_hint(&slot, budget, &entry.source);
+                            context = Some(match context {
+                                Some(c) => format!("{c} | {hint}"),
+                                None => hint,
+                            });
+                        }
+                        if let Ok(meta) = crate::textasset_group::parse_group_meta(entry) {
+                            let selected = group_acc
+                                .selected
+                                .get(&meta.id)
+                                .map(|ids| ids.len())
+                                .unwrap_or(1)
+                                .max(1);
+                            let hint = crate::textasset_group::first_pass_hint(&meta, selected);
+                            context = Some(match context {
+                                Some(c) => format!("{c} | {hint}"),
+                                None => hint,
+                            });
+                            // Remaining shared bytes are not a per-cell limit; keep
+                            // glossary unbudgeted so a long term can still share the blob.
+                            slot_budget = None;
                         }
                         let (sanitized, phs) = PlaceholderProcessor::extract(&entry.source);
                         placeholders_by_id.insert(entry.id.clone(), phs);
@@ -666,7 +1368,9 @@ impl TranslationManager {
                                 &opts.source_lang,
                                 &opts.target_lang,
                                 &entry.source,
-                                slot_budget,
+                                slot_budget
+                                    .as_ref()
+                                    .map(|(encoding, bytes)| (encoding.as_str(), *bytes)),
                             )
                         } else {
                             None
@@ -699,13 +1403,60 @@ impl TranslationManager {
             let (requests, placeholders_by_id, budgets_by_id, batch_result) = match joined {
                 Ok(outcome) => outcome,
                 Err(e) => {
+                    observed_cost.complete &= self.provider.is_free();
                     tracing::error!("Translation batch task panicked: {}", e);
+                    if budget_error.is_none() {
+                        budget_error = observed_budget_error(observed_cost, opts.cost_limit_usd);
+                    }
+                    if budget_error.is_some() {
+                        break;
+                    }
                     continue;
                 }
             };
 
             match batch_result {
-                Ok(mut results) => {
+                Ok(call) => {
+                    let ProviderCall {
+                        mut results,
+                        attempts,
+                    } = call;
+                    observed_cost
+                        .observe_batch(results.iter().map(|r| r.cost_usd), self.provider.is_free());
+                    if attempts > 1 && !self.provider.is_free() {
+                        // A successful response describes the final attempt only.
+                        // Earlier transport attempts may have been processed remotely.
+                        observed_cost.complete = false;
+                    }
+                    if budget_error.is_none() {
+                        budget_error = observed_budget_error(observed_cost, opts.cost_limit_usd);
+                    }
+                    let expected: std::collections::HashSet<_> =
+                        requests.iter().map(|r| r.entry_id.as_str()).collect();
+                    let actual: std::collections::HashSet<_> =
+                        results.iter().map(|r| r.entry_id.as_str()).collect();
+                    if results.len() != requests.len()
+                        || actual.len() != results.len()
+                        || actual != expected
+                    {
+                        // Invalid IDs prevent storage, not billing: account for
+                        // the provider usage before considering another batch.
+                        for result in &results {
+                            total_tokens += result.tokens_used.unwrap_or(0) as u64;
+                            total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
+                            total_output_tokens += result.output_tokens.unwrap_or(0) as u64;
+                        }
+                        let _ = tx
+                            .send(ProgressEvent::BatchFailed {
+                                entry_id: None,
+                                error: "provider returned mismatched or duplicate entry IDs".into(),
+                            })
+                            .await;
+                        if budget_error.is_some() {
+                            break;
+                        }
+                        continue;
+                    }
                     // Restore placeholders in translations before saving
                     for result in &mut results {
                         restore_placeholders_in_result(result, &placeholders_by_id);
@@ -744,6 +1495,48 @@ impl TranslationManager {
                                 None => correction,
                             });
 
+                            // Length corrections are paid calls too. Stop before
+                            // dispatch when the same run budget cannot cover them.
+                            if budget_error.is_some() {
+                                break;
+                            }
+                            if let Some(limit) = opts.cost_limit_usd {
+                                if !observed_cost.complete {
+                                    budget_error = Some(LocustError::ProviderError(
+                                        "cannot enforce a cost limit: preceding calls have unknown cost".into(),
+                                    ));
+                                    break;
+                                }
+                                let chars = retry_req
+                                    .source
+                                    .len()
+                                    .saturating_add(
+                                        retry_req.context.as_ref().map_or(0, String::len),
+                                    )
+                                    .saturating_add(
+                                        retry_req.glossary_hint.as_ref().map_or(0, String::len),
+                                    );
+                                match self.provider.estimate_cost(chars, &opts.target_lang).await {
+                                    Some(estimate) if estimate.is_finite() && estimate >= 0.0 => {
+                                        if observed_cost.amount + estimate > limit {
+                                            budget_error = Some(LocustError::CostLimitExceeded {
+                                                estimated: observed_cost.amount + estimate,
+                                                limit,
+                                            });
+                                        }
+                                    }
+                                    None if self.provider.is_free() => {}
+                                    _ => {
+                                        budget_error = Some(LocustError::ProviderError(
+                                            "cannot enforce a cost limit: this provider has no valid cost estimate".into(),
+                                        ));
+                                    }
+                                }
+                                if budget_error.is_some() {
+                                    break;
+                                }
+                            }
+
                             match call_provider(
                                 self.provider.clone(),
                                 std::slice::from_ref(&retry_req),
@@ -752,41 +1545,69 @@ impl TranslationManager {
                             )
                             .await
                             {
-                                Ok(mut retry_batch) => {
-                                    let mut retry_result = match retry_batch
-                                        .iter()
-                                        .position(|r| r.entry_id == result.entry_id)
+                                Ok(retry_call) => {
+                                    let ProviderCall {
+                                        results: mut retry_batch,
+                                        attempts,
+                                    } = retry_call;
+                                    observed_cost.observe_batch(
+                                        retry_batch.iter().map(|r| r.cost_usd),
+                                        self.provider.is_free(),
+                                    );
+                                    if attempts > 1 && !self.provider.is_free() {
+                                        observed_cost.complete = false;
+                                    }
+                                    if budget_error.is_none() {
+                                        budget_error = observed_budget_error(
+                                            observed_cost,
+                                            opts.cost_limit_usd,
+                                        );
+                                    }
+                                    // Account every returned retry result, even when its IDs
+                                    // are invalid. The original result retains original usage.
+                                    for usage in &retry_batch {
+                                        total_tokens += usage.tokens_used.unwrap_or(0) as u64;
+                                        total_input_tokens +=
+                                            usage.input_tokens.unwrap_or(0) as u64;
+                                        total_output_tokens +=
+                                            usage.output_tokens.unwrap_or(0) as u64;
+                                    }
+                                    if retry_batch.len() != 1
+                                        || retry_batch[0].entry_id != result.entry_id
                                     {
-                                        Some(i) => retry_batch.swap_remove(i),
-                                        None => match retry_batch.pop() {
-                                            Some(r) => r,
-                                            None => {
-                                                tracing::warn!(
-                                                    entry_id = %result.entry_id,
-                                                    attempt,
-                                                    "length retry returned no result; keeping best attempt"
-                                                );
-                                                break;
-                                            }
-                                        },
-                                    };
+                                        let _ = tx.send(ProgressEvent::BatchFailed {
+                                            entry_id: Some(result.entry_id.clone()),
+                                            error: "length retry returned mismatched or duplicate entry IDs; previous text preserved".into(),
+                                        }).await;
+                                        continue;
+                                    }
+                                    let mut retry_result = retry_batch.remove(0);
                                     restore_placeholders_in_result(
                                         &mut retry_result,
                                         &placeholders_by_id,
                                     );
+                                    if retry_result.translation.trim().is_empty()
+                                        || sources_by_id.get(&result.entry_id).is_some_and(
+                                            |source| {
+                                                !PlaceholderProcessor::validate(
+                                                    source,
+                                                    &retry_result.translation,
+                                                )
+                                                .is_empty()
+                                            },
+                                        )
+                                    {
+                                        let _ = tx.send(ProgressEvent::BatchFailed {
+                                            entry_id: Some(result.entry_id.clone()),
+                                            error: "length retry is empty or changed protected placeholders; previous text preserved".into(),
+                                        }).await;
+                                        continue;
+                                    }
                                     let new_len = crate::validation::encoded_byte_len(
                                         slot,
                                         &retry_result.translation,
                                     )
                                     .unwrap_or(usize::MAX);
-
-                                    if let Some(c) = retry_result.cost_usd {
-                                        result.cost_usd = Some(result.cost_usd.unwrap_or(0.0) + c);
-                                    }
-                                    if let Some(t) = retry_result.tokens_used {
-                                        result.tokens_used =
-                                            Some(result.tokens_used.unwrap_or(0) + t);
-                                    }
 
                                     if new_len <= *budget {
                                         result.translation = retry_result.translation;
@@ -822,6 +1643,13 @@ impl TranslationManager {
                                     );
                                 }
                                 Err(e) => {
+                                    observed_cost.complete &= self.provider.is_free();
+                                    if budget_error.is_none() {
+                                        budget_error = observed_budget_error(
+                                            observed_cost,
+                                            opts.cost_limit_usd,
+                                        );
+                                    }
                                     tracing::warn!(
                                         entry_id = %result.entry_id,
                                         attempt,
@@ -836,7 +1664,7 @@ impl TranslationManager {
                             }
                         }
 
-                        if !fitted {
+                        if !fitted && opts.allow_lossy_binary_fit {
                             // Deterministic last resort: accent-fold / despace / truncate.
                             if let Some(fitted_text) = crate::validation::mechanical_fit_binary_slot(
                                 slot,
@@ -864,6 +1692,10 @@ impl TranslationManager {
                         }
                         if !fitted {
                             oversize_after_retry += 1;
+                            let _ = tx.send(ProgressEvent::BatchFailed {
+                                entry_id: Some(result.entry_id.clone()),
+                                error: "translation exceeds the binary slot; full text preserved for review (no automatic truncation)".into(),
+                            }).await;
                             tracing::warn!(
                                 entry_id = %result.entry_id,
                                 best_len,
@@ -874,32 +1706,90 @@ impl TranslationManager {
                         }
                     }
 
-                    // 5e. Process results
-                    for result in &results {
-                        let _ = self
-                            .db
-                            .save_translation(
-                                &result.entry_id,
-                                &result.translation,
-                                &result.provider,
-                            )
-                            .await;
-
-                        // Don't cache mock translations in memory
-                        if opts.use_memory && result.provider != "mock" {
-                            if let Some(req) =
+                    // Reject broken variables, including damage from length fitting.
+                    // Leave those entries pending so they can be retried/reviewed.
+                    let mut valid = Vec::with_capacity(results.len());
+                    for result in results {
+                        group_acc.mark_changed(&result.entry_id);
+                        // Usage includes invalid answers too: those calls were made.
+                        total_tokens += result.tokens_used.unwrap_or(0) as u64;
+                        total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
+                        total_output_tokens += result.output_tokens.unwrap_or(0) as u64;
+                        if result.translation.trim().is_empty() {
+                            let _ = tx
+                                .send(ProgressEvent::BatchFailed {
+                                    entry_id: Some(result.entry_id.clone()),
+                                    error: "translation is empty; entry remains pending".into(),
+                                })
+                                .await;
+                            if group_acc.is_grouped(&result.entry_id) {
+                                group_acc.failed.insert(result.entry_id.clone());
+                            }
+                            continue;
+                        }
+                        if let Some(source) = sources_by_id.get(&result.entry_id) {
+                            if !PlaceholderProcessor::validate(source, &result.translation)
+                                .is_empty()
+                            {
+                                let _ = tx.send(ProgressEvent::BatchFailed {
+                                    entry_id: Some(result.entry_id.clone()),
+                                    error: "translation changed protected placeholders; entry remains pending".into(),
+                                }).await;
+                                if group_acc.is_grouped(&result.entry_id) {
+                                    group_acc.failed.insert(result.entry_id.clone());
+                                }
+                                continue;
+                            }
+                        }
+                        if group_acc.is_grouped(&result.entry_id) {
+                            if let Some(orig_req) =
                                 requests.iter().find(|r| r.entry_id == result.entry_id)
                             {
+                                group_acc
+                                    .requests
+                                    .insert(result.entry_id.clone(), orig_req.clone());
+                            }
+                            if let Some(phs) = placeholders_by_id.get(&result.entry_id) {
+                                group_acc
+                                    .placeholders
+                                    .insert(result.entry_id.clone(), phs.clone());
+                            }
+                            group_acc.results.insert(result.entry_id.clone(), result);
+                            continue;
+                        }
+                        valid.push(result);
+                    }
+                    let results = valid;
+                    // One transaction per batch, before publishing any success.
+                    if let Err(error) = self
+                        .db
+                        .save_translation_results_guarded(&results, &save_guards)
+                        .await
+                    {
+                        budget_error = Some(error);
+                        if !in_flight.is_empty() {
+                            observed_cost.complete &= self.provider.is_free();
+                        }
+                        in_flight.abort_all();
+                        break;
+                    }
+                    for result in &results {
+                        // Don't cache mock translations in memory
+                        if opts.use_memory
+                            && result.provider != "mock"
+                            && budgets_by_id
+                                .get(&result.entry_id)
+                                .is_none_or(|(slot, budget)| {
+                                    crate::validation::encoded_byte_len(slot, &result.translation)
+                                        .is_some_and(|n| n <= *budget)
+                                })
+                        {
+                            if let Some(source) = sources_by_id.get(&result.entry_id) {
                                 use sha2::{Digest, Sha256};
-                                let hash = hex::encode(Sha256::digest(req.source.as_bytes()));
+                                let hash = hex::encode(Sha256::digest(source.as_bytes()));
                                 let _ = self
                                     .db
-                                    .save_memory(
-                                        &hash,
-                                        &req.source,
-                                        &result.translation,
-                                        &lang_pair,
-                                    )
+                                    .save_memory(&hash, source, &result.translation, &lang_pair)
                                     .await;
                             }
                         }
@@ -911,29 +1801,53 @@ impl TranslationManager {
                             })
                             .await;
 
-                        if let Some(cost) = result.cost_usd {
-                            total_cost += cost;
-                        }
-                        if let Some(tokens) = result.tokens_used {
-                            total_tokens += tokens as u64;
-                        }
-                        if let Some(t) = result.input_tokens {
-                            total_input_tokens += t as u64;
-                        }
-                        if let Some(t) = result.output_tokens {
-                            total_output_tokens += t as u64;
-                        }
                         completed += 1;
+                    }
+                    if let Err(error) = self
+                        .finalize_ready_textasset_groups(
+                            &mut group_acc,
+                            &entries_by_id,
+                            &db_groups,
+                            &opts,
+                            &tx,
+                            &cancel,
+                            &lang_pair,
+                            &sources_by_id,
+                            &save_guards,
+                            &mut observed_cost,
+                            &mut budget_error,
+                            &mut oversize_after_retry,
+                            &mut retried_ok,
+                            &mut completed,
+                            &mut total_tokens,
+                            &mut total_input_tokens,
+                            &mut total_output_tokens,
+                        )
+                        .await
+                    {
+                        budget_error = Some(error);
+                        if !in_flight.is_empty() {
+                            observed_cost.complete &= self.provider.is_free();
+                        }
+                        in_flight.abort_all();
+                        break;
                     }
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(ProgressEvent::Failed {
+                        .send(ProgressEvent::BatchFailed {
                             entry_id: None,
                             error: e.to_string(),
                         })
                         .await;
+                    observed_cost.complete &= self.provider.is_free();
+                    if budget_error.is_none() {
+                        budget_error = observed_budget_error(observed_cost, opts.cost_limit_usd);
+                    }
                     tracing::error!("Batch translation failed: {}", e);
+                    if budget_error.is_some() {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -943,17 +1857,42 @@ impl TranslationManager {
                 .send(ProgressEvent::BatchCompleted {
                     completed,
                     total,
-                    cost_so_far: total_cost,
+                    cost_so_far: cumulative_cost.amount + observed_cost.amount,
+                    cost_is_complete: cumulative_cost.complete && observed_cost.complete,
                     language: None,
                 })
                 .await;
+            if budget_error.is_some() {
+                break;
+            }
         }
 
-        if cancelled {
-            if emit_lifecycle {
-                let _ = tx.send(ProgressEvent::Paused).await;
+        group_acc.abandon_missing();
+        if budget_error.is_none() {
+            if let Err(error) = self
+                .finalize_ready_textasset_groups(
+                    &mut group_acc,
+                    &entries_by_id,
+                    &db_groups,
+                    &opts,
+                    &tx,
+                    &cancel,
+                    &lang_pair,
+                    &sources_by_id,
+                    &save_guards,
+                    &mut observed_cost,
+                    &mut budget_error,
+                    &mut oversize_after_retry,
+                    &mut retried_ok,
+                    &mut completed,
+                    &mut total_tokens,
+                    &mut total_input_tokens,
+                    &mut total_output_tokens,
+                )
+                .await
+            {
+                budget_error = Some(error);
             }
-            return Ok(());
         }
 
         // ProgressEvent / return type live outside this file; surface counters via log.
@@ -973,19 +1912,21 @@ impl TranslationManager {
             }
         }
 
+        // Cancelled in-flight calls can have an unknown server-side charge.
+        if cancelled {
+            observed_cost.complete &= self.provider.is_free();
+        }
+        cumulative_cost.add(observed_cost);
+
         // 6. Send Completed and record the run in the project ledger
         let duration = start.elapsed().as_secs_f64();
-        if emit_lifecycle {
-            let _ = tx
-                .send(ProgressEvent::Completed {
-                    total_translated: completed,
-                    total_cost,
-                    duration_secs: duration,
-                })
-                .await;
-        }
-
-        if completed > 0 {
+        if completed > 0
+            || total_tokens > 0
+            || total_input_tokens > 0
+            || total_output_tokens > 0
+            || observed_cost.amount > 0.0
+            || !observed_cost.complete
+        {
             let run = crate::database::TranslationRun {
                 id: 0,
                 started_at,
@@ -997,11 +1938,31 @@ impl TranslationManager {
                 tokens_used: total_tokens,
                 input_tokens: total_input_tokens,
                 output_tokens: total_output_tokens,
-                cost_usd: total_cost,
+                cost_usd: observed_cost.amount,
+                cost_is_complete: observed_cost.complete,
             };
             if let Err(e) = self.db.record_translation_run(&run).await {
                 tracing::warn!("failed to record translation run: {}", e);
             }
+        }
+
+        // Preserve observed usage on partial/cancelled runs before emitting a
+        // terminal event. Cancellation cannot undo charges already incurred.
+        if let Some(error) = budget_error {
+            return Err(error);
+        }
+        if emit_lifecycle {
+            let event = if cancelled {
+                ProgressEvent::Paused
+            } else {
+                ProgressEvent::Completed {
+                    total_translated: completed,
+                    total_cost: cumulative_cost.amount,
+                    cost_is_complete: cumulative_cost.complete,
+                    duration_secs: duration,
+                }
+            };
+            let _ = tx.send(event).await;
         }
 
         Ok(())
@@ -1050,6 +2011,19 @@ pub async fn run_fallback_chain(
     job_id: String,
     cancel: CancellationToken,
 ) -> Result<()> {
+    if opts.batch_size == 0 || opts.max_batch_tokens == Some(0) {
+        return Err(LocustError::ProviderError(
+            "batch size and token budget must be greater than zero".into(),
+        ));
+    }
+    if opts
+        .cost_limit_usd
+        .is_some_and(|n| !n.is_finite() || n < 0.0)
+    {
+        return Err(LocustError::ProviderError(
+            "cost limit must be finite and non-negative".into(),
+        ));
+    }
     let start = Instant::now();
     let initial = load_pending_entries(&db)?;
     let initial_total = initial.len();
@@ -1066,6 +2040,7 @@ pub async fn run_fallback_chain(
             .send(ProgressEvent::Completed {
                 total_translated: 0,
                 total_cost: 0.0,
+                cost_is_complete: true,
                 duration_secs: start.elapsed().as_secs_f64(),
             })
             .await;
@@ -1073,6 +2048,7 @@ pub async fn run_fallback_chain(
     }
 
     let mut cumulative_completed = 0usize;
+    let mut cumulative_cost = ObservedCost::default();
 
     for (i, id) in chain.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -1103,17 +2079,41 @@ pub async fn run_fallback_chain(
 
         let manager = TranslationManager::new(provider, db.clone(), glossary.clone());
         // Intermediate pass: no lifecycle events (we own Started/Completed).
+        let mut pass_opts = opts.clone();
+        if let Some(limit) = pass_opts.cost_limit_usd {
+            if !cumulative_cost.complete {
+                return Err(LocustError::ProviderError(
+                    "cannot enforce a cost limit: preceding calls have unknown cost".into(),
+                ));
+            }
+            pass_opts.cost_limit_usd = Some((limit - cumulative_cost.amount).max(0.0));
+        }
         if let Err(e) = manager
-            .translate_entries_inner(
+            .translate_entries_accounted(
                 pending,
-                opts.clone(),
+                pass_opts,
                 tx.clone(),
                 job_id.clone(),
                 cancel.clone(),
                 false,
+                &mut cumulative_cost,
             )
             .await
         {
+            if matches!(
+                &e,
+                LocustError::CostLimitExceeded { .. } | LocustError::DatabaseError(_)
+            ) || matches!(&e, LocustError::ValidationError { message, .. } if message.starts_with("translation_conflict:"))
+                || e.to_string().contains("cannot enforce a cost limit")
+            {
+                return Err(e);
+            }
+            let _ = tx
+                .send(ProgressEvent::BatchFailed {
+                    entry_id: None,
+                    error: e.to_string(),
+                })
+                .await;
             tracing::warn!(provider = %id, error = %e, "provider pass failed; trying next in chain");
         }
 
@@ -1140,12 +2140,74 @@ pub async fn run_fallback_chain(
     let _ = tx
         .send(ProgressEvent::Completed {
             total_translated,
-            total_cost: 0.0, // per-pass cost is on BatchCompleted; chain total not aggregated
+            total_cost: cumulative_cost.amount,
+            cost_is_complete: cumulative_cost.complete,
             duration_secs: start.elapsed().as_secs_f64(),
         })
         .await;
 
     Ok(())
+}
+
+/// Known subtotal plus whether every observed call reported a valid cost.
+/// An empty job has known zero cost; missing/invalid provider costs do not.
+#[derive(Clone, Copy, Debug)]
+struct ObservedCost {
+    amount: f64,
+    complete: bool,
+}
+
+impl Default for ObservedCost {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            complete: true,
+        }
+    }
+}
+
+impl ObservedCost {
+    fn observe(&mut self, cost: Option<f64>) {
+        match cost {
+            Some(value) if value.is_finite() && value >= 0.0 => self.amount += value,
+            _ => self.complete = false,
+        }
+    }
+
+    // Providers attach batch-wide usage to one result (normally the first).
+    // None on its siblings is not another unpriced request. Sum all reported
+    // amounts once; an entirely unpriced paid batch remains unknown.
+    fn observe_batch(&mut self, costs: impl IntoIterator<Item = Option<f64>>, free: bool) {
+        let mut reported = false;
+        for value in costs.into_iter().flatten() {
+            reported = true;
+            self.observe(Some(value));
+        }
+        if !reported && !free {
+            self.complete = false;
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.amount += other.amount;
+        self.complete &= other.complete;
+    }
+}
+
+fn observed_budget_error(cost: ObservedCost, limit: Option<f64>) -> Option<LocustError> {
+    let limit = limit?;
+    if cost.amount > limit {
+        return Some(LocustError::CostLimitExceeded {
+            estimated: cost.amount,
+            limit,
+        });
+    }
+    if !cost.complete {
+        return Some(LocustError::ProviderError(
+            "cannot enforce a cost limit: observed calls have unknown cost".into(),
+        ));
+    }
+    None
 }
 
 pub struct ProviderRegistry {
@@ -1309,7 +2371,7 @@ mod tests {
                 .iter()
                 .map(|r| TranslationResult {
                     entry_id: r.entry_id.clone(),
-                    translation: format!("[{}] {}", r.target_lang, r.source),
+                    translation: format!("{}: {}", r.target_lang, r.source),
                     detected_source_lang: None,
                     provider: "mock".to_string(),
                     tokens_used: None,
@@ -1365,7 +2427,7 @@ mod tests {
                 .iter()
                 .map(|r| TranslationResult {
                     entry_id: r.entry_id.clone(),
-                    translation: format!("[translated] {}", r.source),
+                    translation: format!("translated: {}", r.source),
                     detected_source_lang: None,
                     provider: "fail-once".to_string(),
                     tokens_used: None,
@@ -1393,6 +2455,33 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_rate_limit_queue_does_not_consume_http_deadline() {
+        let provider = Arc::new(MockProvider::new());
+        let limiter = Arc::new(RateLimiter::new(1));
+        let request = TranslationRequest {
+            entry_id: "rate".into(),
+            source: "Hello".into(),
+            source_lang: "en".into(),
+            target_lang: "es".into(),
+            context: None,
+            glossary_hint: None,
+        };
+        let cancel = CancellationToken::new();
+        for _ in 0..2 {
+            call_provider_with_limiter(
+                provider.clone(),
+                std::slice::from_ref(&request),
+                &RetryConfig::default(),
+                &cancel,
+                limiter.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
     }
 
     fn setup() -> (Arc<Database>, Arc<Glossary>) {
@@ -1681,7 +2770,7 @@ mod tests {
 
         assert!(events
             .iter()
-            .any(|e| matches!(e, ProgressEvent::Failed { .. })));
+            .any(|e| matches!(e, ProgressEvent::BatchFailed { .. })));
         assert!(events
             .iter()
             .any(|e| matches!(e, ProgressEvent::StringTranslated { .. })));
@@ -1955,8 +3044,21 @@ mod tests {
             "binary_slot".to_string(),
             serde_json::Value::String("utf8".to_string()),
         );
+        let mut pivoted =
+            StringEntry::new("pivot_slot", "English", PathBuf::from("resources.assets"));
+        pivoted
+            .metadata
+            .insert("binary_slot".into(), serde_json::json!("utf8"));
+        pivoted.metadata.insert(
+            crate::models::INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("日本語文"),
+        );
+        pivoted.metadata.insert(
+            crate::models::INJECTION_CAPACITY_METADATA_KEY.into(),
+            serde_json::json!({"encoding": "utf8", "bytes": 12}),
+        );
         let without = StringEntry::new("no_slot", "World", PathBuf::from("script.txt"));
-        db.save_entries(&[with_slot.clone(), without.clone()])
+        db.save_entries(&[with_slot.clone(), pivoted.clone(), without.clone()])
             .unwrap();
 
         let provider = Arc::new(ContextById {
@@ -1974,7 +3076,7 @@ mod tests {
 
         manager
             .translate_entries(
-                vec![with_slot, without],
+                vec![with_slot, pivoted, without],
                 opts,
                 tx,
                 "job-slot-ctx".into(),
@@ -2010,6 +3112,15 @@ mod tests {
         assert!(
             !slotted.contains("encoded as utf8"),
             "tight path should not use the longer-line phrasing: {slotted}"
+        );
+        let pivot_context = map
+            .get("pivot_slot")
+            .and_then(|context| context.as_ref())
+            .expect("pivoted binary slot context");
+        assert!(
+            pivot_context.contains("HARD MAX 12 bytes")
+                && pivot_context.contains("Source: «English»"),
+            "semantic source must use immutable physical capacity: {pivot_context}"
         );
 
         let plain = map.get("no_slot").cloned().flatten();
@@ -2261,6 +3372,7 @@ mod tests {
         let manager = TranslationManager::new(provider, db.clone(), glossary);
         let (tx, mut rx) = mpsc::channel(100);
         let opts = TranslationOptions {
+            allow_lossy_binary_fit: true,
             use_memory: false,
             use_glossary: false,
             ..Default::default()
@@ -2315,6 +3427,7 @@ mod tests {
         let manager = TranslationManager::new(provider, db.clone(), glossary);
         let (tx, mut rx) = mpsc::channel(100);
         let opts = TranslationOptions {
+            allow_lossy_binary_fit: true,
             use_memory: false,
             use_glossary: false,
             ..Default::default()
@@ -2544,7 +3657,7 @@ mod tests {
                 if n < self.max {
                     out.push(TranslationResult {
                         entry_id: r.entry_id.clone(),
-                        translation: format!("[{}] {}", self.id, r.source),
+                        translation: format!("{}: {}", self.id, r.source),
                         detected_source_lang: None,
                         provider: self.id.clone(),
                         tokens_used: None,
@@ -2631,9 +3744,15 @@ mod tests {
                     switched += 1;
                 }
                 ProgressEvent::Completed {
-                    total_translated, ..
+                    total_translated,
+                    total_cost,
+                    cost_is_complete,
+                    ..
                 } => {
                     assert_eq!(total_translated, 3);
+                    // Primary billed one rejected partial result; fallback billed three.
+                    assert!((total_cost - 0.004).abs() < 1e-9);
+                    assert!(cost_is_complete);
                     completed_evt = true;
                 }
                 _ => {}
@@ -2962,7 +4081,7 @@ mod tests {
             .unwrap();
         let mut saw_failed = false;
         while let Some(ev) = rx.recv().await {
-            if matches!(ev, ProgressEvent::Failed { .. }) {
+            if matches!(ev, ProgressEvent::BatchFailed { .. }) {
                 saw_failed = true;
             }
         }
@@ -2970,5 +4089,765 @@ mod tests {
         assert!(saw_failed, "auth error must be surfaced");
         let entry = db.get_entry("e0").unwrap().unwrap();
         assert_ne!(entry.status, StringStatus::Translated);
+    }
+
+    #[test]
+    fn batch_budget_preserves_order_and_isolates_long_entries() {
+        let entries: Vec<_> = [
+            "short",
+            "a very long entry that must fit alone",
+            "tail",
+            "end",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, text)| StringEntry::new(i.to_string(), *text, PathBuf::from("game")))
+        .collect();
+        let opts = TranslationOptions {
+            batch_size: 3,
+            max_batch_tokens: Some(270),
+            ..Default::default()
+        };
+        let batches = translation_batches(&entries, &opts);
+        assert_eq!(
+            batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
+            vec![1, 1, 2]
+        );
+        assert_eq!(
+            batches
+                .into_iter()
+                .flatten()
+                .map(|e| &e.id)
+                .collect::<Vec<_>>(),
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn default_preserves_oversized_translation_for_review_without_lossy_cache() {
+        let (db, glossary) = setup();
+        let entry = binary_utf8_entry("no-loss", "Hi");
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let provider = Arc::new(ScriptedLengthProvider::new(&["Hello", "Hola", "Buenas"]));
+        let manager = TranslationManager::new(provider, db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        manager
+            .translate_entries(
+                vec![entry.clone()],
+                TranslationOptions::default(),
+                tx,
+                "no-loss".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap();
+        assert_eq!(saved[0].translation.as_deref(), Some("Hola"));
+        assert!(db
+            .lookup_memory(&entry.source_hash(), "ja-en")
+            .unwrap()
+            .is_none());
+        let mut warned = false;
+        while let Some(event) = rx.recv().await {
+            if let ProgressEvent::BatchFailed { error, .. } = event {
+                warned |= error.contains("no automatic truncation");
+            }
+        }
+        assert!(warned);
+    }
+
+    struct GroupMapProvider {
+        calls: AtomicUsize,
+        scripts: Vec<HashMap<String, String>>,
+        contexts: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        batch_sizes: std::sync::Mutex<Vec<usize>>,
+        cancel_on_call: Option<(CancellationToken, usize)>,
+        cost_usd: Option<f64>,
+        is_free: bool,
+    }
+
+    impl GroupMapProvider {
+        fn new(scripts: Vec<HashMap<String, String>>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                scripts,
+                contexts: std::sync::Mutex::new(Vec::new()),
+                batch_sizes: std::sync::Mutex::new(Vec::new()),
+                cancel_on_call: None,
+                cost_usd: None,
+                is_free: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranslationProvider for GroupMapProvider {
+        fn id(&self) -> &str {
+            "group-map"
+        }
+        fn name(&self) -> &str {
+            "Group Map"
+        }
+        fn is_free(&self) -> bool {
+            self.is_free
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.batch_sizes.lock().unwrap().push(requests.len());
+            if let Some((cancel, call)) = &self.cancel_on_call {
+                if n == *call {
+                    cancel.cancel();
+                }
+            }
+            let map = self
+                .scripts
+                .get(n.min(self.scripts.len().saturating_sub(1)));
+            {
+                let mut ctxs = self.contexts.lock().unwrap();
+                for r in requests {
+                    ctxs.push((r.entry_id.clone(), r.context.clone()));
+                }
+            }
+            Ok(requests
+                .iter()
+                .map(|r| TranslationResult {
+                    entry_id: r.entry_id.clone(),
+                    translation: map
+                        .and_then(|m| m.get(&r.entry_id).cloned())
+                        .unwrap_or_else(|| r.source.clone()),
+                    detected_source_lang: None,
+                    provider: self.id().into(),
+                    tokens_used: Some(4),
+                    input_tokens: Some(2),
+                    output_tokens: Some(2),
+                    cost_usd: self.cost_usd,
+                })
+                .collect())
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            self.cost_usd
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn grouped_loc_entries(original: &str, rows: &[(&str, &str, &str)]) -> Vec<StringEntry> {
+        let mut members: Vec<StringEntry> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (id, key, value))| {
+                let mut entry =
+                    StringEntry::new(*id, *value, PathBuf::from("sharedassets0.assets"));
+                entry.metadata.insert(
+                    "extraction_method".into(),
+                    serde_json::json!("textasset_loc_line"),
+                );
+                entry
+                    .metadata
+                    .insert("loc_key".into(), serde_json::json!(key));
+                entry
+                    .metadata
+                    .insert("line_index".into(), serde_json::json!(index));
+                entry
+                    .metadata
+                    .insert("binary_slot".into(), serde_json::json!("utf8"));
+                entry
+            })
+            .collect();
+        crate::textasset_group::attach_to_entries(
+            &mut members,
+            crate::textasset_group::GroupKind::LocLine,
+            original,
+            original.len(),
+            "g-test",
+        );
+        members
+    }
+
+    fn group_script(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    async fn run_group_job(
+        db: Arc<Database>,
+        provider: Arc<dyn TranslationProvider>,
+        entries: Vec<StringEntry>,
+        opts: TranslationOptions,
+    ) {
+        let glossary = Arc::new(Glossary::new(db.clone()));
+        let (tx, mut rx) = mpsc::channel(100);
+        TranslationManager::new(provider, db, glossary)
+            .translate_entries(
+                entries,
+                opts,
+                tx,
+                "group-job".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn grouped_textasset_fits_when_one_cell_is_longer() {
+        let (db, _glossary) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Hello\n";
+        let entries =
+            grouped_loc_entries(original, &[("a", "Menu.A", "Hi"), ("b", "Menu.B", "Hello")]);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(GroupMapProvider::new(vec![group_script(&[
+            ("a", "Hola"),
+            ("b", "Hey"),
+        ])]));
+        let capture = provider.clone();
+        run_group_job(
+            db.clone(),
+            provider,
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(capture.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().translation.as_deref(),
+            Some("Hola")
+        );
+        assert_eq!(
+            db.get_entry("b").unwrap().unwrap().translation.as_deref(),
+            Some("Hey")
+        );
+        let ctxs = capture.contexts.lock().unwrap();
+        assert!(
+            ctxs.iter().any(|(_, ctx)| ctx
+                .as_ref()
+                .is_some_and(|c| c.contains("SHARED TEXTASSET BUDGET"))),
+            "{ctxs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_shared_textasset_partial_translation_retains_unselected_japanese() {
+        let (db, _) = setup();
+        let rows: Vec<_> = (0..256)
+            .map(|i| {
+                (
+                    format!("row{i}"),
+                    format!("Menu.K{i}"),
+                    format!("日本語{}", "あ".repeat(50)),
+                )
+            })
+            .collect();
+        let original: String = rows
+            .iter()
+            .map(|(_, key, value)| format!("{key}: {value}\n"))
+            .collect();
+        assert!(original.len() > 32_768);
+        let refs: Vec<_> = rows
+            .iter()
+            .map(|(id, key, value)| (id.as_str(), key.as_str(), value.as_str()))
+            .collect();
+        let entries = grouped_loc_entries(&original, &refs);
+        db.save_entries(&entries).unwrap();
+        let selected = db
+            .get_entries(&crate::database::EntryFilter {
+                offset: Some(254),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        let answers: HashMap<_, _> = selected
+            .iter()
+            .map(|entry| (entry.id.clone(), "Texto español".to_string()))
+            .collect();
+        let provider = Arc::new(GroupMapProvider::new(vec![answers]));
+        run_group_job(
+            db.clone(),
+            provider,
+            selected.clone(),
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        let loaded = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap();
+        assert_eq!(loaded.iter().filter(|e| e.translation.is_some()).count(), 2);
+        assert!(crate::textasset_group::group_validation_issues(&loaded).is_empty());
+        for selected in selected {
+            let entry = db.get_entry(&selected.id).unwrap().unwrap();
+            assert_eq!(entry.translation.as_deref(), Some("Texto español"));
+            assert_eq!(
+                crate::textasset_group::original_textasset(&entry),
+                Some(original.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn structural_textasset_capability_allows_growth_without_shortening_retry() {
+        let (db, _) = setup();
+        let mut entries = grouped_loc_entries("Menu.A: Hi\n", &[("a", "Menu.A", "Hi")]);
+        entries[0].metadata.insert(
+            "textasset_rewrite".into(),
+            serde_json::json!("serialized-v1"),
+        );
+        entries[0]
+            .metadata
+            .insert("unity_serialized_version".into(), serde_json::json!(22));
+        db.save_entries(&entries).unwrap();
+        let translation = "Una traducción española más larga que el original";
+        let provider = Arc::new(GroupMapProvider::new(vec![group_script(&[(
+            "a",
+            translation,
+        )])]));
+        let capture = provider.clone();
+        run_group_job(
+            db.clone(),
+            provider,
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(capture.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().translation.as_deref(),
+            Some(translation)
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_textasset_retry_makes_oversize_group_fit() {
+        let (db, _glossary) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Go\n      ";
+        let entries =
+            grouped_loc_entries(original, &[("a", "Menu.A", "Hi"), ("b", "Menu.B", "Go")]);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(GroupMapProvider::new(vec![
+            group_script(&[("a", "Hola!!!!"), ("b", "Vamos")]),
+            group_script(&[("a", "Hola"), ("b", "Hey")]),
+        ]));
+        let capture = provider.clone();
+        run_group_job(
+            db.clone(),
+            provider,
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(capture.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().translation.as_deref(),
+            Some("Hola")
+        );
+        assert_eq!(
+            db.get_entry("b").unwrap().unwrap().status,
+            StringStatus::Translated
+        );
+        let ctxs = capture.contexts.lock().unwrap();
+        assert!(
+            ctxs.iter().any(|(_, ctx)| {
+                ctx.as_ref()
+                    .is_some_and(|c| c.contains("PREVIOUS RECONSTRUCTED BLOB WAS"))
+            }),
+            "{ctxs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_textasset_still_oversize_refuses_without_saving() {
+        let (db, _glossary) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Go\n";
+        let entries =
+            grouped_loc_entries(original, &[("a", "Menu.A", "Hi"), ("b", "Menu.B", "Go")]);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(GroupMapProvider::new(vec![group_script(&[
+            ("a", "XXXXXXXX"),
+            ("b", "YYYYYYYY"),
+        ])]));
+        let capture = provider.clone();
+        run_group_job(
+            db.clone(),
+            provider,
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            capture.calls.load(Ordering::SeqCst),
+            1 + MAX_BINARY_SLOT_LENGTH_RETRIES
+        );
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().status,
+            StringStatus::Pending
+        );
+        assert!(db.get_entry("a").unwrap().unwrap().translation.is_none());
+    }
+
+    #[tokio::test]
+    async fn grouped_textasset_partial_selection_and_batch_span() {
+        let (db, _glossary) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Hello\n   ";
+        let entries =
+            grouped_loc_entries(original, &[("a", "Menu.A", "Hi"), ("b", "Menu.B", "Hello")]);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(GroupMapProvider::new(vec![group_script(&[("a", "Hola")])]));
+        let capture = provider.clone();
+        run_group_job(
+            db.clone(),
+            provider,
+            vec![entries[0].clone()],
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                batch_size: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(capture.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().translation.as_deref(),
+            Some("Hola")
+        );
+        assert!(db.get_entry("b").unwrap().unwrap().translation.is_none());
+
+        // Separate extraction: the same physical group cannot legitimately have
+        // two independent sets of ids for the same cells in one database.
+        let (db, _glossary) = setup();
+        let entries =
+            grouped_loc_entries(original, &[("c", "Menu.A", "Hi"), ("d", "Menu.B", "Hello")]);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(GroupMapProvider::new(vec![
+            group_script(&[("c", "Hola")]),
+            group_script(&[("d", "Hey")]),
+        ]));
+        let capture = provider.clone();
+        run_group_job(
+            db.clone(),
+            provider,
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                batch_size: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(capture.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            db.get_entry("c").unwrap().unwrap().translation.as_deref(),
+            Some("Hola")
+        );
+        assert_eq!(
+            db.get_entry("d").unwrap().unwrap().translation.as_deref(),
+            Some("Hey")
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_textasset_retry_respects_single_entry_batches() {
+        let (db, _) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Go\n      ";
+        let entries =
+            grouped_loc_entries(original, &[("a", "Menu.A", "Hi"), ("b", "Menu.B", "Go")]);
+        db.save_entries(&entries).unwrap();
+        let long = group_script(&[("a", "This is much too long"), ("b", "Also much too long")]);
+        let short = group_script(&[("a", "Hola"), ("b", "Hey")]);
+        let provider = Arc::new(GroupMapProvider::new(vec![long.clone(), long, short]));
+        run_group_job(
+            db.clone(),
+            provider.clone(),
+            entries,
+            TranslationOptions {
+                batch_size: 1,
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(*provider.batch_sizes.lock().unwrap(), vec![1, 1, 1, 1]);
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().translation.as_deref(),
+            Some("Hola")
+        );
+        assert_eq!(
+            db.get_entry("b").unwrap().unwrap().translation.as_deref(),
+            Some("Hey")
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_textasset_cancel_during_retry_does_not_save_staged_results() {
+        let (db, glossary) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Go\n      ";
+        let entries =
+            grouped_loc_entries(original, &[("a", "Menu.A", "Hi"), ("b", "Menu.B", "Go")]);
+        db.save_entries(&entries).unwrap();
+        let cancel = CancellationToken::new();
+        let mut provider = GroupMapProvider::new(vec![
+            group_script(&[("a", "This is much too long"), ("b", "Also much too long")]),
+            group_script(&[("a", "Hola"), ("b", "Hey")]),
+        ]);
+        provider.cancel_on_call = Some((cancel.clone(), 1));
+        let provider = Arc::new(provider);
+        let (tx, mut rx) = mpsc::channel(100);
+        TranslationManager::new(provider.clone(), db.clone(), glossary)
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "cancel-group".into(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(cancel.is_cancelled());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        for id in ["a", "b"] {
+            assert!(db.get_entry(id).unwrap().unwrap().translation.is_none());
+        }
+        rx.close();
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(event, ProgressEvent::StringTranslated { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_textasset_failed_group_does_not_block_other_asset() {
+        let (db, _) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Go\n      ";
+        let mut entries =
+            grouped_loc_entries(original, &[("a", "Menu.A", "Hi"), ("b", "Menu.B", "Go")]);
+        let mut second =
+            grouped_loc_entries(original, &[("c", "Menu.A", "Hi"), ("d", "Menu.B", "Go")]);
+        for entry in &mut second {
+            entry.file_path = PathBuf::from("sharedassets1.assets");
+            entry.metadata.insert(
+                crate::textasset_group::GROUP_ID_KEY.into(),
+                serde_json::json!("second-asset"),
+            );
+        }
+        entries.extend(second);
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(GroupMapProvider::new(vec![group_script(&[
+            ("a", "This will never fit"),
+            ("b", "Also too long"),
+            ("c", "Hola"),
+            ("d", "Hey"),
+        ])]));
+        run_group_job(
+            db.clone(),
+            provider,
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(db.get_entry("a").unwrap().unwrap().translation.is_none());
+        assert!(db.get_entry("b").unwrap().unwrap().translation.is_none());
+        assert_eq!(
+            db.get_entry("c").unwrap().unwrap().translation.as_deref(),
+            Some("Hola")
+        );
+        assert_eq!(
+            db.get_entry("d").unwrap().unwrap().translation.as_deref(),
+            Some("Hey")
+        );
+    }
+
+    #[test]
+    fn grouped_textasset_retry_budget_counts_context_and_glossary() {
+        let request = TranslationRequest {
+            entry_id: "a".into(),
+            source: "Hello".into(),
+            source_lang: "en".into(),
+            target_lang: "es".into(),
+            context: Some("x".repeat(180)),
+            glossary_hint: Some("y".repeat(120)),
+        };
+        let requests = vec![request.clone(), request];
+        let opts = TranslationOptions {
+            batch_size: 10,
+            max_batch_tokens: Some(300),
+            ..Default::default()
+        };
+        let batches = group_retry_batches(&requests, &opts).unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        let opts = TranslationOptions {
+            max_batch_tokens: Some(200),
+            ..opts
+        };
+        assert!(group_retry_batches(&requests, &opts).is_err());
+    }
+
+    #[tokio::test]
+    async fn grouped_malformed_metadata_fails_before_provider() {
+        let (db, glossary) = setup();
+        let mut entry = StringEntry::new("x", "Hi", PathBuf::from("x.assets"));
+        entry.metadata.insert(
+            "extraction_method".into(),
+            serde_json::json!("textasset_loc_line"),
+        );
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let provider = Arc::new(GroupMapProvider::new(vec![group_script(&[("x", "Hola")])]));
+        let capture = provider.clone();
+        let (tx, mut rx) = mpsc::channel(100);
+        let err = TranslationManager::new(provider, db, glossary)
+            .translate_entries(
+                vec![entry],
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "malformed".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        rx.close();
+        while rx.recv().await.is_some() {}
+        assert!(
+            err.to_string().contains("textasset_group")
+                || err.to_string().contains("shared TextAsset")
+                || err.to_string().contains("missing"),
+            "{err}"
+        );
+        assert_eq!(capture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn grouped_oversize_retry_cost_is_recorded_when_refused() {
+        let (db, _glossary) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Go\n";
+        let entries =
+            grouped_loc_entries(original, &[("a", "Menu.A", "Hi"), ("b", "Menu.B", "Go")]);
+        db.save_entries(&entries).unwrap();
+        let mut provider =
+            GroupMapProvider::new(vec![group_script(&[("a", "XXXXXXXX"), ("b", "YYYYYYYY")])]);
+        provider.cost_usd = Some(0.01);
+        provider.is_free = false;
+        let provider = Arc::new(provider);
+        run_group_job(
+            db.clone(),
+            provider,
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        let runs = db.get_translation_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].cost_usd > 0.0, "{:?}", runs[0]);
+        assert_eq!(runs[0].strings_translated, 0);
+        assert_eq!(
+            db.get_entry("a").unwrap().unwrap().status,
+            StringStatus::Pending
+        );
+    }
+}
+
+#[cfg(test)]
+mod observed_cost_tests {
+    use super::ObservedCost;
+    #[test]
+    fn batch_usage_on_first_result_is_complete_without_double_counting() {
+        let mut cost = ObservedCost::default();
+        cost.observe_batch([Some(0.25), None, None], false);
+        assert_eq!(cost.amount, 0.25);
+        assert!(cost.complete);
+        cost.observe_batch([None, None], false);
+        assert_eq!(cost.amount, 0.25);
+        assert!(!cost.complete);
+    }
+    #[test]
+    fn free_unpriced_batch_is_known_zero_but_invalid_price_is_not() {
+        let mut cost = ObservedCost::default();
+        cost.observe_batch([None, None], true);
+        assert_eq!(cost.amount, 0.0);
+        assert!(cost.complete);
+        cost.observe_batch([Some(0.25), Some(f64::NAN), None], false);
+        assert_eq!(cost.amount, 0.25);
+        assert!(!cost.complete);
+    }
+    #[test]
+    fn unknown_retry_cannot_become_known_when_another_attempt_reports_cost() {
+        let mut cost = ObservedCost::default();
+        cost.observe(None);
+        cost.observe(Some(0.25));
+        assert_eq!(cost.amount, 0.25);
+        assert!(!cost.complete);
+    }
+    #[test]
+    fn chain_accumulates_subtotals_and_incompleteness() {
+        let mut cost = ObservedCost::default();
+        cost.add(ObservedCost {
+            amount: 0.1,
+            complete: true,
+        });
+        cost.add(ObservedCost {
+            amount: 0.2,
+            complete: false,
+        });
+        assert!((cost.amount - 0.3).abs() < 1e-9);
+        assert!(!cost.complete);
+    }
+    #[test]
+    fn invalid_provider_prices_never_poison_serialized_totals() {
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            let mut cost = ObservedCost::default();
+            cost.observe(Some(bad));
+            assert_eq!(cost.amount, 0.0);
+            assert!(!cost.complete);
+        }
     }
 }

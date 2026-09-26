@@ -55,7 +55,11 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let config: AppConfig = serde_json::from_str(&contents)?;
+                let value: serde_json::Value = serde_json::from_str(&contents)?;
+                if !value.is_object() {
+                    return Err(anyhow::anyhow!("configuration must be a JSON object").into());
+                }
+                let config: AppConfig = serde_json::from_value(value)?;
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -64,15 +68,121 @@ impl AppConfig {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        use std::io::Write;
+        let json = serde_json::to_vec_pretty(self)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let parent = parent.canonicalize()?;
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "configuration path has no filename",
+            )
+        })?;
+        crate::patch::zipsec::ensure_no_links(&parent, Path::new(name))?;
+        let target = parent.join(name);
+        let permissions = match std::fs::symlink_metadata(&target) {
+            Ok(meta) if !meta.is_file() || meta.permissions().readonly() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "configuration destination is not a writable regular file",
+                )
+                .into());
+            }
+            Ok(meta) => {
+                // Defaults loaded after a read failure must never overwrite a
+                // damaged file that may still contain recoverable credentials.
+                Self::load(&target).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "existing configuration is unreadable or invalid; repair it before saving",
+                    )
+                })?;
+                Some(meta.permissions())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let stage = crate::patch::stream::StagingDir::create_prepared(&parent)?;
+        let mut file = stage.create_file("config.json")?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
         }
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+        drop(file);
+        // Keep the old generation readable until the complete new one replaces
+        // it. Do not truncate credentials in place or rename the old file away.
+        std::fs::rename(stage.child("config.json"), target)?;
         Ok(())
     }
 
+    /// Public UI representation. Never echo stored API keys in save responses.
+    pub fn redacted_json(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("AppConfig is serializable");
+        if let Some(providers) = value.get_mut("providers").and_then(|v| v.as_object_mut()) {
+            for provider in providers.values_mut() {
+                if provider
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    provider["api_key"] = "***".into();
+                }
+            }
+        }
+        value
+    }
+
+    /// Merge a UI partial without turning a redacted credential into a new key.
+    /// Omitted provider fields stay intact; null/empty API keys explicitly clear.
+    pub fn patched(&self, mut partial: serde_json::Value) -> Result<Self> {
+        if !partial.is_object() {
+            return Err(anyhow::anyhow!("configuration update must be an object").into());
+        }
+        if let Some(providers) = partial.get_mut("providers").and_then(|v| v.as_object_mut()) {
+            for provider in providers.values_mut() {
+                if provider.get("api_key").and_then(|v| v.as_str()) == Some("***") {
+                    if let Some(fields) = provider.as_object_mut() {
+                        fields.remove("api_key");
+                    }
+                }
+            }
+        }
+        fn merge(current: &mut serde_json::Value, partial: serde_json::Value) {
+            if let (Some(current), Some(partial)) = (current.as_object_mut(), partial.as_object()) {
+                for (key, value) in partial {
+                    merge(
+                        current
+                            .entry(key.clone())
+                            .or_insert(serde_json::Value::Null),
+                        value.clone(),
+                    );
+                }
+            } else {
+                *current = partial;
+            }
+        }
+        let mut value = serde_json::to_value(self)?;
+        merge(&mut value, partial);
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Persistent state root. A nonempty LOCUST_DATA_DIR selects an isolated
+    /// profile for portable installs, automated checks, and parallel instances.
     pub fn config_dir() -> PathBuf {
+        if let Some(path) = std::env::var_os("LOCUST_DATA_DIR").filter(|p| !p.is_empty()) {
+            return PathBuf::from(path);
+        }
         #[cfg(target_os = "windows")]
         {
             dirs::data_local_dir()
@@ -223,6 +333,88 @@ mod tests {
     }
 
     #[test]
+    fn redacted_provider_updates_preserve_keys_and_other_provider_fields() {
+        let config = AppConfig::default().patched(serde_json::json!({
+            "providers": {
+                "xai": { "api_key": "fixture-key-one", "model": "before", "free_tier": false, "extra": {"setting": "1"} },
+                "second": { "api_key": "fixture-key-two", "free_tier": false }
+            }
+        })).unwrap();
+        let mut public = config.redacted_json();
+        assert!(!public.to_string().contains("fixture-key"));
+        public["providers"]["xai"]["model"] = "after".into();
+        let next = config
+            .patched(serde_json::json!({ "providers": public["providers"] }))
+            .unwrap();
+        assert_eq!(
+            next.providers["xai"].api_key.as_deref(),
+            Some("fixture-key-one")
+        );
+        assert_eq!(
+            next.providers["second"].api_key.as_deref(),
+            Some("fixture-key-two")
+        );
+        let partial = next
+            .patched(serde_json::json!({ "providers": {"xai": {"model": "third"}} }))
+            .unwrap();
+        assert_eq!(partial.providers["xai"].model.as_deref(), Some("third"));
+        assert_eq!(partial.providers["xai"].extra["setting"], "1");
+        assert!(partial.providers.contains_key("second"));
+        let cleared = partial
+            .patched(serde_json::json!({ "providers": {"xai": {"api_key": null}} }))
+            .unwrap();
+        assert!(cleared.providers["xai"].api_key.is_none());
+        assert!(partial.patched(serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn failed_config_save_preserves_previous_bytes_and_cleans_owned_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        AppConfig::default().save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut readonly = permissions.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&path, readonly).unwrap();
+        let next = AppConfig {
+            default_target_lang: "es".into(),
+            ..Default::default()
+        };
+        assert!(next.save(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        next.save(&path).unwrap();
+        assert_eq!(AppConfig::load(&path).unwrap().default_target_lang, "es");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn config_readers_always_observe_a_complete_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        AppConfig::default().save(&path).unwrap();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                for _ in 0..200 {
+                    let bytes = std::fs::read(&path).unwrap();
+                    let _: AppConfig = serde_json::from_slice(&bytes).unwrap();
+                }
+            });
+            for count in 1..20 {
+                AppConfig {
+                    default_batch_size: count,
+                    ..Default::default()
+                }
+                .save(&path)
+                .unwrap();
+            }
+            reader.join().unwrap();
+        });
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn test_default_config_fields() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.default_source_lang, "ja");
@@ -261,6 +453,24 @@ mod tests {
         let path = tmp.join("bad.json");
         std::fs::write(&path, "not json at all!!!").unwrap();
         assert!(AppConfig::load(&path).is_err());
+    }
+
+    #[test]
+    fn config_save_preserves_unreadable_or_invalid_existing_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        for damaged in [
+            b"{\"providers\":{\"grok\":{\"api_key\":\"secret".as_slice(),
+            b"\xff\xfe\x80",
+            b"[]",
+        ] {
+            std::fs::write(&path, damaged).unwrap();
+            let error = AppConfig::default().save(&path).unwrap_err().to_string();
+            assert!(error.contains("repair it before saving"));
+            assert!(!error.contains("secret"));
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+        }
     }
 
     #[test]

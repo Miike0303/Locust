@@ -8,11 +8,49 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{LocustError, Result};
-use crate::models::{StringEntry, StringStatus, ValidationIssue, ValidationKind};
+use crate::models::{
+    StringEntry, StringStatus, TranslationResult, ValidationIssue, ValidationKind,
+    INJECTION_CAPACITY_METADATA_KEY, INJECTION_SOURCE_METADATA_KEY, STALE_TRANSLATION_METADATA_KEY,
+};
 
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
     path: Mutex<PathBuf>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ImportApplyReport {
+    pub imported: usize,
+    pub stale_sources: usize,
+    pub unknown_ids: usize,
+}
+
+/// Semantic row state used to compute an automatic translation. Physical pivot
+/// source metadata is deliberately excluded: `source` is the request language.
+#[derive(Clone, Debug)]
+pub(crate) struct TranslationSaveGuard {
+    source: String,
+    translation: Option<String>,
+    status: String,
+    provider: Option<String>,
+}
+
+impl From<&StringEntry> for TranslationSaveGuard {
+    fn from(entry: &StringEntry) -> Self {
+        Self {
+            source: entry.source.clone(),
+            translation: entry.translation.clone(),
+            status: entry.status.to_string(),
+            provider: entry.provider_used.clone(),
+        }
+    }
+}
+
+fn translation_save_conflict(id: &str) -> LocustError {
+    LocustError::ValidationError {
+        entry_id: id.to_owned(),
+        message: "translation_conflict: source or translation changed while this result was being computed (or the entry was removed); no results from this batch were saved; refresh and retry".into(),
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -42,7 +80,10 @@ pub struct TranslationRun {
     pub tokens_used: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Sum of observed costs; not necessarily the full charge.
     pub cost_usd: f64,
+    #[serde(default)]
+    pub cost_is_complete: bool,
 }
 
 /// Result of [`Database::merge_entries`] — counts for the open-project UI.
@@ -111,16 +152,29 @@ pub struct RecordedFile {
     pub size: u64,
 }
 
+/// Exact pre-injection copy associated with a committed recording.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedBackup {
+    pub id: String,
+    pub source_path: PathBuf,
+    /// Absolute store location, independent of the caller's current profile.
+    /// Older recordings resolve their ID in the caller's configured store.
+    #[serde(default)]
+    pub storage_root: Option<PathBuf>,
+}
+
 /// Everything one `locust inject` run recorded for one language key: the
 /// absolutized root of the tree it wrote into and the files it wrote there.
 /// `lang: None` is the reserved language-unspecified key (`--direct` without
 /// `-l`), rendered as "(unspecified)" and matched only by `patch` without `-l`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InjectionRecording {
     pub lang: Option<String>,
     pub root: PathBuf,
     pub files: Vec<RecordedFile>,
     pub recorded_at: String,
+    #[serde(default)]
+    pub pristine_backup: Option<RecordedBackup>,
 }
 
 /// Lowercase hex SHA-256 of `bytes` — the hash stored in injection recordings.
@@ -271,7 +325,7 @@ pub fn rel_under_root(file: &Path, root: &Path) -> Option<String> {
 
 /// Resolved, case-folded identity key for one physical file — two spellings
 /// of the same file compare equal, two different files never do.
-fn path_identity_key(p: &Path) -> String {
+pub(crate) fn path_identity_key(p: &Path) -> String {
     resolved_parts(p)
         .iter()
         .map(|(k, _)| k.as_str())
@@ -308,6 +362,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
         PRAGMA synchronous = NORMAL;
         PRAGMA foreign_keys = ON;
 
+        CREATE TABLE IF NOT EXISTS project_metadata (
+            key TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS textasset_originals (
+            sha256 TEXT PRIMARY KEY NOT NULL,
+            byte_len INTEGER NOT NULL CHECK(byte_len > 0 AND byte_len <= 1048576),
+            payload TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS strings (
             id TEXT PRIMARY KEY,
             source TEXT NOT NULL,
@@ -379,6 +442,21 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+    // Preserve older recordings; absent provenance must never be guessed.
+    let has_pristine_backup = {
+        let mut stmt = conn.prepare("PRAGMA table_info(injected_files)")?;
+        let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        names
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "pristine_backup")
+    };
+    if !has_pristine_backup {
+        conn.execute(
+            "ALTER TABLE injected_files ADD COLUMN pristine_backup TEXT",
+            [],
+        )?;
+    }
     // Migrate older DBs that predate the input/output token columns.
     // ADD COLUMN errors if the column already exists — ignore that.
     let _ = conn.execute(
@@ -389,6 +467,21 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE translation_runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Missing historical metadata cannot prove a zero or complete bill.
+    let has_cost_completeness = {
+        let mut stmt = conn.prepare("PRAGMA table_info(translation_runs)")?;
+        let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        names
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "cost_is_complete")
+    };
+    if !has_cost_completeness {
+        conn.execute(
+            "ALTER TABLE translation_runs ADD COLUMN cost_is_complete INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -436,6 +529,24 @@ impl Database {
         Ok(())
     }
 
+    pub fn get_project_metadata(&self, key: &str) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM project_metadata WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(serde_json::from_str(&row.get::<_, String>(0)?)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_project_metadata(&self, key: &str, value: &serde_json::Value) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO project_metadata(key, value) VALUES (?1, ?2)",
+            params![key, serde_json::to_string(value)?],
+        )?;
+        Ok(())
+    }
+
     pub fn save_entries(&self, entries: &[StringEntry]) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         // Single transaction: per-row implicit transactions fsync each insert,
@@ -450,9 +561,11 @@ impl Database {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
         let mut count = 0usize;
+        let mut originals = OriginalCache::new();
         for entry in entries {
             let tags_json = serde_json::to_string(&entry.tags)?;
-            let metadata_json = serde_json::to_string(&entry.metadata)?;
+            let metadata_json =
+                serde_json::to_string(&persist_original_metadata(&tx, entry, &mut originals)?)?;
             let status_str = entry.status.to_string();
             let file_path_str = entry.file_path.to_string_lossy().to_string();
             let created_at_str = entry.created_at.to_rfc3339();
@@ -542,9 +655,10 @@ impl Database {
         })?;
 
         let mut entries = Vec::new();
+        let mut originals = OriginalCache::new();
         for row in rows {
             let raw = row?;
-            entries.push(raw_to_entry(raw)?);
+            entries.push(raw_to_entry(raw, &conn, &mut originals)?);
         }
         Ok(entries)
     }
@@ -573,7 +687,7 @@ impl Database {
         })?;
 
         match rows.next() {
-            Some(row) => Ok(Some(raw_to_entry(row?)?)),
+            Some(row) => Ok(Some(raw_to_entry(row?, &conn, &mut OriginalCache::new())?)),
             None => Ok(None),
         }
     }
@@ -635,8 +749,9 @@ impl Database {
             })
         })?;
         let mut entries = Vec::new();
+        let mut originals = OriginalCache::new();
         for row in rows {
-            entries.push(raw_to_entry(row?)?);
+            entries.push(raw_to_entry(row?, &conn, &mut originals)?);
         }
         Ok(entries)
     }
@@ -655,6 +770,16 @@ impl Database {
         let entries = self.entries_with_nonempty_translation()?;
         let mut pivoted: Vec<StringEntry> = Vec::with_capacity(entries.len());
         for e in entries {
+            e.require_current_translation()
+                .map_err(|message| LocustError::Other(anyhow::anyhow!(message)))?;
+            e.require_preserved_translation_controls()
+                .map_err(|message| LocustError::Other(anyhow::anyhow!(message)))?;
+            let injection_source = e
+                .injection_source()
+                .map_err(|message| LocustError::Other(anyhow::anyhow!(message)))?
+                .to_string();
+            let grouped = crate::textasset_group::is_grouped_entry(&e);
+            let capacity = crate::validation::binary_slot_budget(&e)?;
             let Some(translation) = e.translation.filter(|t| !t.trim().is_empty()) else {
                 continue;
             };
@@ -663,6 +788,19 @@ impl Database {
             ne.tags = e.tags;
             ne.char_limit = e.char_limit;
             ne.metadata = e.metadata;
+            ne.textasset_original = e.textasset_original;
+            ne.metadata.insert(
+                INJECTION_SOURCE_METADATA_KEY.to_string(),
+                serde_json::Value::String(injection_source),
+            );
+            if !grouped && crate::textasset_group::structural_textasset_capacity(&ne).is_none() {
+                if let Some((encoding, bytes)) = capacity {
+                    ne.metadata.insert(
+                        INJECTION_CAPACITY_METADATA_KEY.to_string(),
+                        serde_json::json!({"encoding": encoding, "bytes": bytes}),
+                    );
+                }
+            }
             pivoted.push(ne);
         }
 
@@ -675,6 +813,17 @@ impl Database {
 
         let out_db = Database::open(output)?;
         let count = out_db.save_entries(&pivoted)?;
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT key, value FROM project_metadata")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (key, value) = row?;
+                out_db.set_project_metadata(&key, &serde_json::from_str(&value)?)?;
+            }
+        }
         Ok(PivotResult {
             database_path: output.to_string_lossy().into_owned(),
             entries: count,
@@ -728,8 +877,8 @@ impl Database {
             let conn = conn.lock().unwrap();
             let now = Utc::now().to_rfc3339();
             let n = conn.execute(
-                "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3 WHERE id = ?4",
-                params![translation, provider, now, entry_id],
+                "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4",
+                params![translation, provider, now, entry_id, !translation.trim().is_empty()],
             )?;
             Ok(n > 0)
         })
@@ -757,10 +906,10 @@ impl Database {
             let mut applied = 0usize;
             {
                 let mut stmt = tx.prepare_cached(
-                    "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3 WHERE id = ?4",
+                    "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4",
                 )?;
                 for (id, translation) in &updates {
-                    let n = stmt.execute(params![translation, provider, now, id])?;
+                    let n = stmt.execute(params![translation, provider, now, id, !translation.trim().is_empty()])?;
                     if n > 0 {
                         applied += 1;
                     }
@@ -773,6 +922,146 @@ impl Database {
         .unwrap()
     }
 
+    /// Apply imports only to the exact semantic source they were translated
+    /// from. Check and write inside one SQLite transaction, including pivots.
+    /// Stale/unknown rows remain untouched, including their review metadata.
+    pub async fn save_imported_translations_batch(
+        &self,
+        updates: Vec<crate::export::ImportedTranslation>,
+    ) -> Result<ImportApplyReport> {
+        let mut seen = std::collections::HashSet::new();
+        for entry in &updates {
+            if !seen.insert(&entry.id) {
+                return Err(LocustError::ValidationError {
+                    entry_id: entry.id.clone(),
+                    message: "duplicate import id; no translations were saved".into(),
+                });
+            }
+        }
+        if updates.is_empty() {
+            return Ok(ImportApplyReport::default());
+        }
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let tx = conn.unchecked_transaction()?;
+            let now = Utc::now().to_rfc3339();
+            let mut report = ImportApplyReport::default();
+            {
+                let mut write = tx.prepare_cached(
+                    "UPDATE strings SET translation = ?1, status = 'translated', provider_used = 'import', translated_at = ?2, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?3 AND source = ?4",
+                )?;
+                let mut exists = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM strings WHERE id = ?1)")?;
+                for entry in updates {
+                    if write.execute(params![entry.translation, now, entry.id, entry.source, !entry.translation.trim().is_empty()])? > 0 {
+                        report.imported += 1;
+                    } else if exists.query_row(params![entry.id], |row| row.get::<_, bool>(0))? {
+                        report.stale_sources += 1;
+                    } else {
+                        report.unknown_ids += 1;
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(report)
+        }).await.map_err(|e| LocustError::Other(anyhow::anyhow!("import save task failed: {e}")))?
+    }
+
+    /// Commit a provider batch atomically. Unlike an import, a missing entry is
+    /// an error: the caller must never announce translations that were not saved.
+    pub async fn save_translation_results(&self, results: &[TranslationResult]) -> Result<()> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        let results = results.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let tx = conn.unchecked_transaction()?;
+            let now = Utc::now().to_rfc3339();
+            {
+                let mut stmt = tx.prepare_cached(
+                    "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4",
+                )?;
+                for result in results {
+                    if stmt.execute(params![result.translation, result.provider, now, result.entry_id, !result.translation.trim().is_empty()])? != 1 {
+                        return Err(LocustError::DatabaseError(rusqlite::Error::QueryReturnedNoRows));
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        }).await.map_err(|e| LocustError::ProviderError(format!("translation save task failed: {e}")))?
+    }
+
+    /// Automatic provider/cache saves compare their request snapshot in the
+    /// same write transaction. One missing or changed row rolls back the entire
+    /// batch, including stale-marker removal. Explicit editing APIs stay unconditional.
+    pub(crate) async fn save_translation_results_guarded(
+        &self,
+        results: &[TranslationResult],
+        expected: &HashMap<String, TranslationSaveGuard>,
+    ) -> Result<()> {
+        let mut updates = Vec::with_capacity(results.len());
+        let mut ids = std::collections::HashSet::new();
+        for result in results {
+            if !ids.insert(&result.entry_id) {
+                return Err(translation_save_conflict(&result.entry_id));
+            }
+            let guard = expected
+                .get(&result.entry_id)
+                .ok_or_else(|| translation_save_conflict(&result.entry_id))?;
+            updates.push((
+                result.entry_id.clone(),
+                result.translation.clone(),
+                result.provider.clone(),
+                guard.clone(),
+            ));
+        }
+        self.save_guarded_updates(updates).await
+    }
+
+    pub(crate) async fn save_translation_guarded(
+        &self,
+        entry: &StringEntry,
+        translation: &str,
+        provider: &str,
+    ) -> Result<()> {
+        self.save_guarded_updates(vec![(
+            entry.id.clone(),
+            translation.into(),
+            provider.into(),
+            TranslationSaveGuard::from(entry),
+        )])
+        .await
+    }
+
+    async fn save_guarded_updates(
+        &self,
+        updates: Vec<(String, String, String, TranslationSaveGuard)>,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let tx = conn.unchecked_transaction()?;
+            let now = Utc::now().to_rfc3339();
+            {
+                let mut statement = tx.prepare_cached(
+                    "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4 AND source = ?6 AND translation IS ?7 AND status = ?8 AND provider_used IS ?9"
+                )?;
+                for (id, translation, provider, guard) in updates {
+                    let changed = statement.execute(params![translation, provider, now, id, !translation.trim().is_empty(), guard.source, guard.translation, guard.status, guard.provider])?;
+                    if changed != 1 { return Err(translation_save_conflict(&id)); }
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        }).await.map_err(|e| LocustError::ProviderError(format!("translation save task failed: {e}")))?
+    }
+
     pub async fn update_entry_status(&self, entry_id: &str, status: StringStatus) -> Result<()> {
         let conn = self.conn.clone();
         let entry_id = entry_id.to_string();
@@ -780,7 +1069,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             conn.execute(
-                "UPDATE strings SET status = ?1 WHERE id = ?2",
+                "UPDATE strings SET status = ?1, metadata = CASE WHEN ?1 IN ('reviewed', 'approved') THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END, reviewed_at = CASE WHEN ?1 IN ('reviewed', 'approved') THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE reviewed_at END WHERE id = ?2",
                 params![status_str, entry_id],
             )?;
             Ok(())
@@ -841,8 +1130,8 @@ impl Database {
             conn.execute(
                 "INSERT INTO translation_runs
                  (started_at, duration_secs, provider, source_lang, target_lang,
-                  strings_translated, tokens_used, input_tokens, output_tokens, cost_usd)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  strings_translated, tokens_used, input_tokens, output_tokens, cost_usd, cost_is_complete)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     run.started_at,
                     run.duration_secs,
@@ -854,6 +1143,7 @@ impl Database {
                     run.input_tokens as i64,
                     run.output_tokens as i64,
                     run.cost_usd,
+                    run.cost_is_complete,
                 ],
             )?;
             Ok(())
@@ -886,9 +1176,22 @@ impl Database {
         root: &Path,
         written: &[PathBuf],
     ) -> Result<()> {
+        self.record_injection_with_backup(lang, root, written, None)
+    }
+
+    /// Persist output hashes and their exact backup in one SQLite transaction.
+    /// A no-op preserves both; a new legacy recording clears old provenance.
+    pub fn record_injection_with_backup(
+        &self,
+        lang: Option<&str>,
+        root: &Path,
+        written: &[PathBuf],
+        pristine_backup: Option<&RecordedBackup>,
+    ) -> Result<()> {
         if written.is_empty() {
             return Ok(());
         }
+        let pristine_backup = pristine_backup.map(serde_json::to_string).transpose()?;
         let root_abs = std::path::absolute(root)?;
         let mut seen: HashMap<String, (String, PathBuf)> = HashMap::new();
         let mut rows: Vec<(String, String, u64)> = Vec::new();
@@ -945,11 +1248,19 @@ impl Database {
         // (Unreal/Unity injects can record hundreds of written paths).
         {
             let mut insert = tx.prepare_cached(
-                "INSERT INTO injected_files (lang, root, rel, hash, size, recorded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO injected_files (lang, root, rel, hash, size, recorded_at, pristine_backup)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for (rel, hash, size) in &rows {
-                insert.execute(params![lang, root_str, rel, hash, *size as i64, now])?;
+                insert.execute(params![
+                    lang,
+                    root_str,
+                    rel,
+                    hash,
+                    *size as i64,
+                    now,
+                    pristine_backup
+                ])?;
             }
         }
         tx.commit()?;
@@ -962,7 +1273,7 @@ impl Database {
     pub fn get_injection(&self, lang: Option<&str>) -> Result<Option<InjectionRecording>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT root, rel, hash, size, recorded_at FROM injected_files
+            "SELECT root, rel, hash, size, recorded_at, pristine_backup FROM injected_files
              WHERE lang IS ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![lang], |row| {
@@ -972,13 +1283,26 @@ impl Database {
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
+        let mut backup_json: Option<Option<String>> = None;
         let mut root = None;
         let mut recorded_at = String::new();
         let mut files = Vec::new();
         for row in rows {
-            let (r, rel, hash, size, at) = row?;
+            let (r, rel, hash, size, at, backup) = row?;
+            if backup_json
+                .as_ref()
+                .is_some_and(|previous| previous != &backup)
+                || root.as_ref().is_some_and(|previous| previous != &r)
+                || (!recorded_at.is_empty() && recorded_at != at)
+            {
+                return Err(LocustError::InjectionError(
+                    "inconsistent injection recording provenance".into(),
+                ));
+            }
+            backup_json.get_or_insert(backup);
             root.get_or_insert(r);
             recorded_at = at;
             files.push(RecordedFile {
@@ -993,6 +1317,10 @@ impl Database {
                 root: PathBuf::from(r),
                 files,
                 recorded_at,
+                pristine_backup: backup_json
+                    .flatten()
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?,
             })),
             None => Ok(None),
         }
@@ -1020,7 +1348,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, started_at, duration_secs, provider, source_lang, target_lang,
-                    strings_translated, tokens_used, input_tokens, output_tokens, cost_usd
+                    strings_translated, tokens_used, input_tokens, output_tokens, cost_usd, cost_is_complete
              FROM translation_runs ORDER BY started_at ASC, id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1036,6 +1364,7 @@ impl Database {
                 input_tokens: row.get::<_, i64>(8)? as u64,
                 output_tokens: row.get::<_, i64>(9)? as u64,
                 cost_usd: row.get(10)?,
+                cost_is_complete: row.get(11)?,
             })
         })?;
         let mut runs = Vec::new();
@@ -1205,14 +1534,31 @@ impl Database {
 
     /// Merge a fresh extract into the live `strings` table without wiping
     /// translations. Existing ids keep translation / status / timestamps /
-    /// provider; a changed `source` keeps the translation but forces
-    /// `pending`. Ids missing from `entries` are deleted. One transaction.
+    /// provider; a changed `source` keeps the translation but forces `pending`.
+    /// Pivot DBs instead validate incoming physical sources atomically, retain
+    /// semantic sources/provenance, and only refresh valid locators.
+    /// Ids missing from `entries` are deleted. One transaction.
     pub fn merge_entries(&self, entries: &[StringEntry]) -> Result<MergeStats> {
+        self.merge_entries_impl(entries, false)
+    }
+
+    /// Merge an explicitly partial extraction without deleting unread resources.
+    /// Matching pivot rows must still prove their physical source is unchanged.
+    pub fn merge_entries_preserving_missing(&self, entries: &[StringEntry]) -> Result<MergeStats> {
+        self.merge_entries_impl(entries, true)
+    }
+
+    fn merge_entries_impl(
+        &self,
+        entries: &[StringEntry],
+        preserve_missing: bool,
+    ) -> Result<MergeStats> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
 
         struct Stored {
             source: String,
+            metadata: HashMap<String, serde_json::Value>,
             translation: Option<String>,
             status: String,
             provider_used: Option<String>,
@@ -1224,33 +1570,124 @@ impl Database {
         let mut existing: HashMap<String, Stored> = HashMap::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT id, source, translation, status, provider_used,
+                "SELECT id, source, metadata, translation, status, provider_used,
                         created_at, translated_at, reviewed_at
                  FROM strings",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    Stored {
-                        source: row.get(1)?,
-                        translation: row.get(2)?,
-                        status: row.get(3)?,
-                        provider_used: row.get(4)?,
-                        created_at: row.get(5)?,
-                        translated_at: row.get(6)?,
-                        reviewed_at: row.get(7)?,
-                    },
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })?;
             for row in rows {
-                let (id, stored) = row?;
-                existing.insert(id, stored);
+                let (
+                    id,
+                    source,
+                    metadata_json,
+                    translation,
+                    status,
+                    provider_used,
+                    created_at,
+                    translated_at,
+                    reviewed_at,
+                ) = row?;
+                let metadata = serde_json::from_str(&metadata_json).map_err(|error| {
+                    LocustError::Other(anyhow::anyhow!(
+                        "entry '{id}' has malformed metadata: {error}"
+                    ))
+                })?;
+                existing.insert(
+                    id,
+                    Stored {
+                        source,
+                        metadata,
+                        translation,
+                        status,
+                        provider_used,
+                        created_at,
+                        translated_at,
+                        reviewed_at,
+                    },
+                );
             }
         }
 
         let mut incoming: HashMap<&str, &StringEntry> = HashMap::new();
+        let mut originals = OriginalCache::new();
         for entry in entries {
             incoming.insert(entry.id.as_str(), entry);
+        }
+
+        // A pivot DB's source is semantic text, so a fresh extraction may only
+        // refresh locators after every existing row proves the same untouched
+        // physical baseline. Validate the complete overlap before DELETE/UPDATE.
+        let database_is_pivoted = existing
+            .values()
+            .any(|stored| stored.metadata.contains_key(INJECTION_SOURCE_METADATA_KEY));
+        if database_is_pivoted {
+            let mut validation_originals = OriginalCache::new();
+            let mut matched = 0usize;
+            for (id, entry) in &incoming {
+                let Some(old) = existing.get(*id) else {
+                    continue; // no semantic pivot source exists for a newly extracted row
+                };
+                let expected = match old.metadata.get(INJECTION_SOURCE_METADATA_KEY) {
+                    Some(serde_json::Value::String(value)) if !value.is_empty() => value,
+                    _ => {
+                        return Err(LocustError::Other(anyhow::anyhow!(
+                            "pivot entry '{id}' has malformed {INJECTION_SOURCE_METADATA_KEY} metadata"
+                        )));
+                    }
+                };
+                if entry.source != expected.as_str() {
+                    return Err(LocustError::Other(anyhow::anyhow!(
+                        "source_changed for pivot entry '{id}': selected game does not match the original extraction baseline; extract a fresh project for this game copy"
+                    )));
+                }
+                if let Some(original_hash) = old.metadata.get("locres_source_hash") {
+                    if entry.metadata.get("locres_source_hash") != Some(original_hash) {
+                        return Err(LocustError::Other(anyhow::anyhow!(
+                            "source_changed for pivot locres entry '{id}': Unreal source hash no longer matches the original baseline"
+                        )));
+                    }
+                }
+                if old
+                    .metadata
+                    .contains_key(crate::textasset_group::GROUP_ORIGINAL_REF_KEY)
+                    || old
+                        .metadata
+                        .contains_key(crate::textasset_group::GROUP_ORIGINAL_KEY)
+                {
+                    let mut old_entry = StringEntry::new(*id, &old.source, PathBuf::new());
+                    old_entry.metadata = old.metadata.clone();
+                    hydrate_original(&tx, &mut old_entry, &mut validation_originals)?;
+                    let expected = crate::textasset_group::shared_original(&old_entry)
+                        .map_err(original_error)?;
+                    let actual =
+                        crate::textasset_group::shared_original(entry).map_err(original_error)?;
+                    if expected.as_ref().map(|o| o.sha256()) != actual.as_ref().map(|o| o.sha256())
+                    {
+                        return Err(original_error(format!("source_changed for pivot TextAsset '{id}': original blob no longer matches the physical baseline")));
+                    }
+                }
+                matched += 1;
+            }
+            if !preserve_missing && matched != existing.len() {
+                return Err(LocustError::Other(anyhow::anyhow!(
+                    "source_changed: extraction is missing entries from this pivot's original baseline; extract a fresh project for this game copy"
+                )));
+            }
+            // Do not mix newly extracted physical-language rows into a DB whose
+            // source language is the prior pivot translation.
+            incoming.retain(|id, _| existing.contains_key(*id));
         }
 
         let mut stats = MergeStats::default();
@@ -1258,7 +1695,7 @@ impl Database {
         {
             let mut delete = tx.prepare_cached("DELETE FROM strings WHERE id = ?1")?;
             for id in existing.keys() {
-                if !incoming.contains_key(id.as_str()) {
+                if !preserve_missing && !incoming.contains_key(id.as_str()) {
                     delete.execute(params![id])?;
                     stats.removed += 1;
                 }
@@ -1291,24 +1728,73 @@ impl Database {
 
             for (id, entry) in incoming {
                 let tags_json = serde_json::to_string(&entry.tags)?;
-                let metadata_json = serde_json::to_string(&entry.metadata)?;
                 let file_path_str = entry.file_path.to_string_lossy().to_string();
                 let char_limit = entry.char_limit.map(|l| l as i64);
 
                 if let Some(old) = existing.get(id) {
-                    let source_changed = old.source != entry.source;
+                    let pivoted = old.metadata.contains_key(INJECTION_SOURCE_METADATA_KEY);
+                    let source_changed = !pivoted && old.source != entry.source;
                     let status = if source_changed {
                         stats.stale_source_reset += 1;
                         StringStatus::Pending.to_string()
                     } else {
                         old.status.clone()
                     };
+                    let source = if pivoted {
+                        old.source.as_str()
+                    } else {
+                        entry.source.as_str()
+                    };
+                    let mut metadata = persist_original_metadata(&tx, entry, &mut originals)?;
+                    if let Some(marker) = old.metadata.get(STALE_TRANSLATION_METADATA_KEY) {
+                        // Refreshing locators must never silently accept an old
+                        // translation. Preserve its first source hash over any
+                        // number of edits; corrupt/unknown markers remain errors.
+                        let mut marker = marker.clone();
+                        if source_changed
+                            && marker.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+                        {
+                            if let Some(object) = marker.as_object_mut() {
+                                object.insert(
+                                    "current_source_sha256".into(),
+                                    serde_json::json!(sha256_hex(source.as_bytes())),
+                                );
+                            }
+                        }
+                        metadata.insert(STALE_TRANSLATION_METADATA_KEY.into(), marker);
+                    } else if source_changed
+                        && old
+                            .translation
+                            .as_deref()
+                            .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        metadata.insert(
+                            STALE_TRANSLATION_METADATA_KEY.into(),
+                            serde_json::json!({
+                                "version": 1,
+                                "translated_source_sha256": sha256_hex(old.source.as_bytes()),
+                                "current_source_sha256": sha256_hex(source.as_bytes()),
+                            }),
+                        );
+                    }
+                    if pivoted {
+                        for key in [
+                            INJECTION_SOURCE_METADATA_KEY,
+                            INJECTION_CAPACITY_METADATA_KEY,
+                            "locres_source_hash",
+                        ] {
+                            if let Some(value) = old.metadata.get(key) {
+                                metadata.insert(key.to_string(), value.clone());
+                            }
+                        }
+                    }
+                    let metadata_json = serde_json::to_string(&metadata)?;
                     if old.translation.as_ref().is_some_and(|t| !t.is_empty()) {
                         stats.preserved_translations += 1;
                     }
                     stats.updated += 1;
                     update.execute(params![
-                        entry.source,
+                        source,
                         file_path_str,
                         entry.context,
                         tags_json,
@@ -1323,6 +1809,11 @@ impl Database {
                         entry.id,
                     ])?;
                 } else {
+                    let metadata_json = serde_json::to_string(&persist_original_metadata(
+                        &tx,
+                        entry,
+                        &mut originals,
+                    )?)?;
                     stats.added += 1;
                     let created_at = entry.created_at.to_rfc3339();
                     insert.execute(params![
@@ -1524,11 +2015,133 @@ struct RawEntry {
     reviewed_at: Option<String>,
 }
 
-fn raw_to_entry(raw: RawEntry) -> Result<StringEntry> {
+type OriginalCache = HashMap<String, Arc<crate::models::TextAssetOriginal>>;
+
+fn original_error(message: String) -> LocustError {
+    LocustError::Other(anyhow::anyhow!(message))
+}
+
+fn load_original(
+    conn: &Connection,
+    reference: &str,
+    cache: &mut OriginalCache,
+) -> Result<Option<Arc<crate::models::TextAssetOriginal>>> {
+    if let Some(original) = cache.get(reference) {
+        return Ok(Some(Arc::clone(original)));
+    }
+    if reference.len() != 64
+        || !reference
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(original_error(
+            "malformed TextAsset SHA256 reference".into(),
+        ));
+    }
+    let mut stmt = conn.prepare("SELECT byte_len, CASE WHEN length(CAST(payload AS BLOB)) <= 1048576 THEN payload ELSE NULL END FROM textasset_originals WHERE sha256 = ?1")?;
+    let mut rows = stmt.query(params![reference])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let byte_len: i64 = row.get(0)?;
+    let payload: Option<String> = row.get(1)?;
+    let payload =
+        payload.ok_or_else(|| original_error("oversized TextAsset original in database".into()))?;
+    let original =
+        Arc::new(crate::models::TextAssetOriginal::new(&payload).map_err(original_error)?);
+    if byte_len != payload.len() as i64 || original.sha256() != reference {
+        return Err(original_error(
+            "corrupt shared TextAsset original: digest or byte length mismatch".into(),
+        ));
+    }
+    cache.insert(reference.to_owned(), Arc::clone(&original));
+    Ok(Some(original))
+}
+
+fn hydrate_original(
+    conn: &Connection,
+    entry: &mut StringEntry,
+    cache: &mut OriginalCache,
+) -> Result<()> {
+    use crate::textasset_group as group;
+    if entry.textasset_original.is_none() && !entry.metadata.contains_key(group::GROUP_ORIGINAL_KEY)
+    {
+        if let Some(value) = entry.metadata.get(group::GROUP_ORIGINAL_REF_KEY) {
+            let reference = value
+                .as_str()
+                .ok_or_else(|| original_error("malformed TextAsset reference".into()))?;
+            entry.textasset_original =
+                Some(load_original(conn, reference, cache)?.ok_or_else(|| {
+                    original_error(format!("missing shared TextAsset original {reference}"))
+                })?);
+        }
+    }
+    if let Some(original) = group::shared_original(entry).map_err(original_error)? {
+        let shared = cache
+            .entry(original.sha256().to_owned())
+            .or_insert(original);
+        group::attach_shared_original(entry, Arc::clone(shared));
+    }
+    Ok(())
+}
+
+fn persist_original_metadata(
+    conn: &Connection,
+    entry: &StringEntry,
+    cache: &mut OriginalCache,
+) -> Result<HashMap<String, serde_json::Value>> {
+    use crate::textasset_group as group;
+    // Skip legacy payload before cloning metadata: normalization must not make
+    // another full original copy merely to remove it again.
+    let mut normalized = StringEntry::new(&entry.id, "", PathBuf::new());
+    normalized.metadata = entry
+        .metadata
+        .iter()
+        .filter(|(key, _)| key.as_str() != group::GROUP_ORIGINAL_KEY)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if entry.textasset_original.is_none() && !entry.metadata.contains_key(group::GROUP_ORIGINAL_KEY)
+    {
+        hydrate_original(conn, &mut normalized, cache)?;
+    } else {
+        normalized.textasset_original = group::shared_original(entry).map_err(original_error)?;
+    }
+    if let Some(original) = &normalized.textasset_original {
+        if !cache.contains_key(original.sha256())
+            && load_original(conn, original.sha256(), cache)?.is_none()
+        {
+            conn.execute(
+                "INSERT INTO textasset_originals(sha256, byte_len, payload) VALUES (?1, ?2, ?3)",
+                params![
+                    original.sha256(),
+                    original.text().len() as i64,
+                    original.text()
+                ],
+            )?;
+            cache.insert(original.sha256().to_owned(), Arc::clone(original));
+        }
+        let original = Arc::clone(original);
+        group::attach_shared_original(&mut normalized, original);
+    } else {
+        hydrate_original(conn, &mut normalized, cache)?;
+    }
+    Ok(normalized.metadata)
+}
+
+fn raw_to_entry(
+    raw: RawEntry,
+    conn: &Connection,
+    originals: &mut OriginalCache,
+) -> Result<StringEntry> {
     let status: StringStatus = raw.status.parse().unwrap_or(StringStatus::Pending);
     let tags: Vec<String> = serde_json::from_str(&raw.tags).unwrap_or_default();
-    let metadata: HashMap<String, serde_json::Value> =
-        serde_json::from_str(&raw.metadata).unwrap_or_default();
+    let metadata: HashMap<String, serde_json::Value> = serde_json::from_str(&raw.metadata)
+        .map_err(|error| {
+            LocustError::Other(anyhow::anyhow!(
+                "entry '{}' has malformed metadata: {error}",
+                raw.id
+            ))
+        })?;
     let created_at: DateTime<Utc> = DateTime::parse_from_rfc3339(&raw.created_at)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
@@ -1541,7 +2154,7 @@ fn raw_to_entry(raw: RawEntry) -> Result<StringEntry> {
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|d| d.with_timezone(&Utc));
 
-    Ok(StringEntry {
+    let mut entry = StringEntry {
         id: raw.id,
         source: raw.source,
         translation: raw.translation,
@@ -1549,13 +2162,16 @@ fn raw_to_entry(raw: RawEntry) -> Result<StringEntry> {
         context: raw.context,
         tags,
         metadata,
+        textasset_original: None,
         status,
         provider_used: raw.provider_used,
         char_limit: raw.char_limit.map(|l| l as usize),
         created_at,
         translated_at,
         reviewed_at,
-    })
+    };
+    hydrate_original(conn, &mut entry, originals)?;
+    Ok(entry)
 }
 
 #[cfg(test)]
@@ -1570,6 +2186,282 @@ mod tests {
     fn test_open_in_memory() {
         let db = Database::open_in_memory().unwrap();
         assert!(db.get_entries(&EntryFilter::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn partial_extract_preserves_absent_rows_and_pivot_provenance() {
+        let db = Database::open_in_memory().unwrap();
+        let mut a = make_entry("a", "日本語A");
+        a.translation = Some("English A".into());
+        let mut b = make_entry("b", "日本語B");
+        b.translation = Some("English B".into());
+        db.save_entries(&[a.clone(), b]).unwrap();
+        let stats = db.merge_entries_preserving_missing(&[a.clone()]).unwrap();
+        assert_eq!(stats.removed, 0);
+        assert_eq!(
+            db.get_entry("b").unwrap().unwrap().translation.as_deref(),
+            Some("English B")
+        );
+        db.set_project_metadata(
+            "extraction_warnings",
+            &serde_json::json!(["Unread encrypted TOC"]),
+        )
+        .unwrap();
+        let dir = recording_tempdir();
+        let path = dir.join("partial-pivot.db");
+        db.pivot_to(&path).unwrap();
+        let pivot = Database::open(&path).unwrap();
+        assert_eq!(
+            pivot.get_project_metadata("extraction_warnings").unwrap(),
+            Some(serde_json::json!(["Unread encrypted TOC"]))
+        );
+        pivot.merge_entries_preserving_missing(&[a]).unwrap();
+        assert_eq!(pivot.get_entry("b").unwrap().unwrap().source, "English B");
+        assert!(pivot
+            .merge_entries_preserving_missing(&[make_entry("a", "changed")])
+            .is_err());
+        assert_eq!(pivot.get_entry("a").unwrap().unwrap().source, "English A");
+        assert!(pivot.merge_entries(&[]).is_err());
+        assert_eq!(db.merge_entries(&[]).unwrap().removed, 2);
+    }
+
+    #[test]
+    fn project_metadata_roundtrips_reopen_and_update() {
+        let dir = recording_tempdir();
+        let path = dir.join("metadata.db");
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.get_project_metadata("missing").unwrap(), None);
+        db.set_project_metadata("key", &serde_json::json!({"日本語": [1, false]}))
+            .unwrap();
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(
+            db.get_project_metadata("key").unwrap(),
+            Some(serde_json::json!({"日本語": [1, false]}))
+        );
+        db.set_project_metadata("key", &serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(
+            db.get_project_metadata("key").unwrap(),
+            Some(serde_json::Value::Null)
+        );
+    }
+
+    fn shared_textasset_rows(count: usize) -> (String, Vec<StringEntry>) {
+        let mut original = String::new();
+        let mut entries = Vec::new();
+        for i in 0..count {
+            let key = format!("Menu.K{i}");
+            let value = format!("日本語の文章{i}{}", "あ".repeat(50));
+            original.push_str(&format!("{key}: {value}\n"));
+            let mut entry = make_entry(&format!("row{i:05}"), &value);
+            entry.metadata.insert(
+                "extraction_method".into(),
+                serde_json::json!("textasset_loc_line"),
+            );
+            entry
+                .metadata
+                .insert("loc_key".into(), serde_json::json!(key));
+            entry
+                .metadata
+                .insert("line_index".into(), serde_json::json!(i));
+            entries.push(entry);
+        }
+        original.push_str("   ");
+        crate::textasset_group::attach_to_entries(
+            &mut entries,
+            crate::textasset_group::GroupKind::LocLine,
+            &original,
+            original.len(),
+            "shared-group",
+        );
+        (original, entries)
+    }
+
+    #[test]
+    fn shared_textasset_database_large_roundtrip_has_one_blob_and_shared_memory() {
+        let dir = recording_tempdir();
+        let path = dir.join("shared.db");
+        let (original, entries) = shared_textasset_rows(512);
+        assert!(original.len() > 32_768);
+        let db = Database::open(&path).unwrap();
+        db.save_entries(&entries).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM textasset_originals", [], |r| r.get(0))
+            .unwrap();
+        let metadata_size: usize = conn
+            .query_row("SELECT MAX(length(metadata)) FROM strings", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(metadata_size < 1024);
+        drop(conn);
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        let loaded = db.get_entries(&EntryFilter::default()).unwrap();
+        let head = loaded[0].textasset_original.as_ref().unwrap();
+        for row in &loaded {
+            assert!(Arc::ptr_eq(head, row.textasset_original.as_ref().unwrap()));
+            assert_eq!(
+                crate::textasset_group::original_textasset(row),
+                Some(original.as_str())
+            );
+            assert!(crate::textasset_group::parse_group_meta(row).is_ok());
+        }
+        // JSON carries the digest only; saving back into its owning DB rehydrates.
+        let serialized = serde_json::to_string(&loaded[0]).unwrap();
+        let detached: StringEntry = serde_json::from_str(&serialized).unwrap();
+        assert!(detached.textasset_original.is_none());
+        db.save_entries(&[detached]).unwrap();
+    }
+
+    #[test]
+    fn shared_textasset_partial_pivot_and_merge_preserve_physical_blob_without_leader() {
+        let dir = recording_tempdir();
+        let (original, mut entries) = shared_textasset_rows(256);
+        // Only the final row is translated: the group's first row never enters
+        // either pivot, so blob ownership cannot depend on a leader row.
+        entries.last_mut().unwrap().translation = Some("English last row".into());
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&entries).unwrap();
+        let path = dir.join("pivot-one.db");
+        db.pivot_to(&path).unwrap();
+        let pivot = Database::open(&path).unwrap();
+        let id = entries.last().unwrap().id.clone();
+        let mut row = pivot.get_entry(&id).unwrap().unwrap();
+        assert_eq!(row.source, "English last row");
+        assert_eq!(
+            crate::textasset_group::original_textasset(&row),
+            Some(original.as_str())
+        );
+        assert_eq!(
+            row.injection_source().unwrap(),
+            entries.last().unwrap().source
+        );
+        row.translation = Some("Última fila española".into());
+        pivot.save_entries(&[row]).unwrap();
+        let path2 = dir.join("pivot-two.db");
+        pivot.pivot_to(&path2).unwrap();
+        let pivot2 = Database::open(&path2).unwrap();
+        pivot2.merge_entries(&entries).unwrap();
+        let row = pivot2.get_entry(&id).unwrap().unwrap();
+        assert_eq!(row.source, "Última fila española");
+        assert_eq!(
+            crate::textasset_group::original_textasset(&row),
+            Some(original.as_str())
+        );
+        let patch = crate::textasset_group::patch_from_entry(&row, "Texto final").unwrap();
+        let meta = crate::textasset_group::parse_group_meta(&row).unwrap();
+        let rebuilt = crate::textasset_group::apply_patches(&meta.original, meta.kind, &[patch]);
+        assert!(rebuilt.outcomes[0].1.is_ok());
+        assert!(rebuilt.text.starts_with("Menu.K0: 日本語"));
+        assert!(rebuilt.text.contains("Menu.K255: Texto final"));
+        // Change only an unselected row/padding, keeping the pivot row's source.
+        let changed_original = original.replace("Menu.K0:", "Menu.X0:");
+        crate::textasset_group::attach_to_entries(
+            &mut entries,
+            crate::textasset_group::GroupKind::LocLine,
+            &changed_original,
+            changed_original.len(),
+            "shared-group",
+        );
+        assert!(pivot2
+            .merge_entries(&entries)
+            .unwrap_err()
+            .to_string()
+            .contains("source_changed"));
+        assert_eq!(
+            crate::textasset_group::original_textasset(&pivot2.get_entry(&id).unwrap().unwrap()),
+            Some(original.as_str())
+        );
+    }
+
+    #[test]
+    fn shared_textasset_legacy_inline_database_is_readable_and_migrates_on_save() {
+        use crate::textasset_group as group;
+        let db = Database::open_in_memory().unwrap();
+        let (original, entries) = shared_textasset_rows(2);
+        db.save_entries(&entries).unwrap();
+        let mut legacy_metadata = entries[0].metadata.clone();
+        legacy_metadata.remove(group::GROUP_ORIGINAL_REF_KEY);
+        legacy_metadata.remove(group::GROUP_ORIGINAL_BYTES_KEY);
+        legacy_metadata.insert(
+            group::GROUP_ORIGINAL_KEY.into(),
+            serde_json::json!(original),
+        );
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE strings SET metadata=?1",
+                params![serde_json::to_string(&legacy_metadata).unwrap()],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM textasset_originals", []).unwrap();
+        }
+        let loaded = db.get_entries(&EntryFilter::default()).unwrap();
+        assert!(Arc::ptr_eq(
+            loaded[0].textasset_original.as_ref().unwrap(),
+            loaded[1].textasset_original.as_ref().unwrap()
+        ));
+        db.save_entries(&loaded).unwrap();
+        let conn = db.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM textasset_originals", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert!(!conn
+            .query_row("SELECT metadata FROM strings LIMIT 1", [], |r| r
+                .get::<_, String>(0))
+            .unwrap()
+            .contains("日本語"));
+    }
+
+    #[test]
+    fn shared_textasset_corrupt_missing_and_oversized_blobs_fail_closed() {
+        for attack in ["payload", "length", "missing", "oversized", "reference"] {
+            let db = Database::open_in_memory().unwrap();
+            let (_, entries) = shared_textasset_rows(2);
+            db.save_entries(&entries).unwrap();
+            {
+                let conn = db.conn.lock().unwrap();
+                match attack {
+                    "payload" => {
+                        conn.execute("UPDATE textasset_originals SET payload='corrupt'", [])
+                            .unwrap();
+                    }
+                    "length" => {
+                        conn.execute("UPDATE textasset_originals SET byte_len=1", [])
+                            .unwrap();
+                    }
+                    "missing" => {
+                        conn.execute("DELETE FROM textasset_originals", []).unwrap();
+                    }
+                    "oversized" => {
+                        conn.execute(
+                            "UPDATE textasset_originals SET payload=?1",
+                            params!["x".repeat(1_048_577)],
+                        )
+                        .unwrap();
+                    }
+                    "reference" => {
+                        conn.execute("UPDATE strings SET metadata=json_set(metadata, '$.textasset_group_original_ref', 'bad')", []).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(db.get_entry(&entries[0].id).is_err(), "{attack}");
+            assert!(db.get_entries(&EntryFilter::default()).is_err(), "{attack}");
+            if attack != "missing" && attack != "reference" {
+                assert!(
+                    db.save_entries(&entries).is_err(),
+                    "save must not hide corrupt existing blob: {attack}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2223,14 +3115,87 @@ mod tests {
 
         let (updates, pre_skipped) = crate::export::po_entries_for_batch(&imported);
         let attempted = updates.len();
-        let applied = db.save_translations_batch(updates, "import").await.unwrap();
+        let report = db.save_imported_translations_batch(updates).await.unwrap();
         let (imported_n, missed) =
-            crate::export::import_counts_after_batch(pre_skipped, attempted, applied);
+            crate::export::import_counts_after_batch(pre_skipped, attempted, report.imported);
         assert_eq!(imported_n, 1);
         assert_eq!(missed, 0);
         let again = db.get_entry(id).unwrap().unwrap();
         assert_eq!(again.translation.as_deref(), Some("Hola alli"));
         assert_eq!(again.status, StringStatus::Translated);
+    }
+
+    #[tokio::test]
+    async fn imports_skip_stale_sources_without_clearing_review_or_physical_metadata() {
+        use crate::export::ImportedTranslation;
+        let db = Database::open_in_memory().unwrap();
+        let mut stale = StringEntry::new("stale", "Current English source", "story.html".into());
+        stale.translation = Some("Reviewed current translation".into());
+        stale.status = StringStatus::Approved;
+        stale.metadata.insert(
+            STALE_TRANSLATION_METADATA_KEY.into(),
+            serde_json::json!("needs review"),
+        );
+        stale.metadata.insert(
+            INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("日本語"),
+        );
+        let current = StringEntry::new("current", "Fresh source", "story.html".into());
+        db.save_entries(&[stale, current]).unwrap();
+        let before = serde_json::to_value(db.get_entry("stale").unwrap().unwrap()).unwrap();
+        let report = db
+            .save_imported_translations_batch(vec![
+                ImportedTranslation {
+                    id: "stale".into(),
+                    source: "Previous English source".into(),
+                    translation: "Wrong old translation".into(),
+                },
+                ImportedTranslation {
+                    id: "current".into(),
+                    source: "Fresh source".into(),
+                    translation: "Traducción actual".into(),
+                },
+                ImportedTranslation {
+                    id: "unknown".into(),
+                    source: "Unknown".into(),
+                    translation: "Unknown translation".into(),
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.imported, report.stale_sources, report.unknown_ids),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            serde_json::to_value(db.get_entry("stale").unwrap().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            db.get_entry("current")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Traducción actual")
+        );
+        let duplicate = ImportedTranslation {
+            id: "current".into(),
+            source: "Fresh source".into(),
+            translation: "Must not overwrite".into(),
+        };
+        assert!(db
+            .save_imported_translations_batch(vec![duplicate.clone(), duplicate])
+            .await
+            .is_err());
+        assert_eq!(
+            db.get_entry("current")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Traducción actual")
+        );
     }
 
     #[test]
@@ -2434,6 +3399,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_complete: true,
             })
             .await
             .unwrap();
@@ -2449,6 +3415,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_complete: true,
             })
             .await
             .unwrap();
@@ -2543,6 +3510,7 @@ mod tests {
         assert_eq!(entries[0].context.as_deref(), Some("npc"));
         assert_eq!(entries[0].tags, vec!["dialogue".to_string()]);
         assert_eq!(entries[0].char_limit, Some(20));
+        assert_eq!(entries[0].injection_source().unwrap(), "Hello");
 
         let original = src.get_entries(&EntryFilter::default()).unwrap();
         assert_eq!(original.len(), 3);
@@ -2553,6 +3521,158 @@ mod tests {
         let world = original.iter().find(|e| e.id == "b").unwrap();
         assert_eq!(world.source, "World");
         assert!(world.translation.is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_pivot_keeps_original_source_and_binary_capacity() {
+        let src = Database::open_in_memory().unwrap();
+        let mut japanese = translated_entry("slot", "日本語文", "resources.assets", "English");
+        japanese
+            .metadata
+            .insert("binary_slot".into(), serde_json::json!("utf8"));
+        src.save_entries(&[japanese]).unwrap();
+
+        let dir = recording_tempdir();
+        let first_path = dir.join("en.locust.db");
+        src.pivot_to(&first_path).unwrap();
+        let first = Database::open(&first_path).unwrap();
+        let first_entry = first.get_entry("slot").unwrap().unwrap();
+        assert_eq!(first_entry.source, "English");
+        assert_eq!(first_entry.injection_source().unwrap(), "日本語文");
+        assert_eq!(
+            first_entry.injection_capacity().unwrap(),
+            Some(("utf8", 12))
+        );
+        first
+            .save_translation("slot", "1234567890", "manual")
+            .await
+            .unwrap();
+
+        let second_path = dir.join("es.locust.db");
+        first.pivot_to(&second_path).unwrap();
+        let second = Database::open(&second_path)
+            .unwrap()
+            .get_entry("slot")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.source, "1234567890");
+        assert_eq!(second.injection_source().unwrap(), "日本語文");
+        assert_eq!(second.injection_capacity().unwrap(), Some(("utf8", 12)));
+    }
+
+    #[test]
+    fn pivot_preserves_grouped_textasset_original_and_does_not_invent_cell_capacity() {
+        let src = Database::open_in_memory().unwrap();
+        let original = "Menu.A: 日本語\nMenu.B: 行く\n";
+        let mut a = translated_entry("a", "日本語", "resources.assets", "English A");
+        let mut b = translated_entry("b", "行く", "resources.assets", "Go");
+        for (entry, key, index) in [(&mut a, "Menu.A", 0usize), (&mut b, "Menu.B", 1usize)] {
+            entry.metadata.insert(
+                "extraction_method".into(),
+                serde_json::json!("textasset_loc_line"),
+            );
+            entry
+                .metadata
+                .insert("loc_key".into(), serde_json::json!(key));
+            entry
+                .metadata
+                .insert("line_index".into(), serde_json::json!(index));
+            entry
+                .metadata
+                .insert("binary_slot".into(), serde_json::json!("utf8"));
+        }
+        let mut members = vec![a, b];
+        crate::textasset_group::attach_to_entries(
+            &mut members,
+            crate::textasset_group::GroupKind::LocLine,
+            original,
+            original.len(),
+            "g-pivot",
+        );
+        src.save_entries(&members).unwrap();
+
+        let dir = recording_tempdir();
+        let out = dir.join("pivot-group.locust.db");
+        src.pivot_to(&out).unwrap();
+        let pivoted = Database::open(&out).unwrap();
+        let first = pivoted.get_entry("a").unwrap().unwrap();
+        assert_eq!(first.source, "English A");
+        assert_eq!(first.injection_source().unwrap(), "日本語");
+        assert!(first.injection_capacity().unwrap().is_none());
+        assert_eq!(
+            crate::textasset_group::original_textasset(&first),
+            Some(original)
+        );
+        assert_eq!(
+            first
+                .metadata
+                .get(crate::textasset_group::GROUP_CAPACITY_KEY)
+                .and_then(|v| v.as_u64()),
+            Some(original.len() as u64)
+        );
+        assert_eq!(crate::validation::binary_slot_budget(&first).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn pivot_merge_preserves_semantic_source_and_rejects_changed_baseline_atomically() {
+        let src = Database::open_in_memory().unwrap();
+        src.save_entries(&[
+            translated_entry("a", "日本語A", "old-a", "English A"),
+            translated_entry("b", "日本語B", "old-b", "English B"),
+        ])
+        .unwrap();
+        let dir = recording_tempdir();
+        let pivot_path = dir.join("merge.locust.db");
+        src.pivot_to(&pivot_path).unwrap();
+        let pivot = Database::open(&pivot_path).unwrap();
+        pivot
+            .save_translation("a", "Español A", "manual")
+            .await
+            .unwrap();
+
+        let mut same_a = make_entry("a", "日本語A");
+        same_a.file_path = PathBuf::from("new-a");
+        same_a
+            .metadata
+            .insert("fresh_locator".into(), serde_json::json!(7));
+        let mut same_b = make_entry("b", "日本語B");
+        same_b.file_path = PathBuf::from("new-b");
+        pivot.merge_entries(&[same_a, same_b]).unwrap();
+        let kept = pivot.get_entry("a").unwrap().unwrap();
+        assert_eq!(kept.source, "English A");
+        assert_eq!(kept.translation.as_deref(), Some("Español A"));
+        assert_eq!(kept.injection_source().unwrap(), "日本語A");
+        assert_eq!(kept.file_path, PathBuf::from("new-a"));
+        assert_eq!(
+            kept.metadata.get("fresh_locator"),
+            Some(&serde_json::json!(7))
+        );
+
+        let before_a = pivot.get_entry("a").unwrap().unwrap();
+        let before_b = pivot.get_entry("b").unwrap().unwrap();
+        let mut would_update_a = make_entry("a", "日本語A");
+        would_update_a.file_path = PathBuf::from("must-not-write");
+        let changed_b = make_entry("b", "different baseline");
+        let error = pivot
+            .merge_entries(&[would_update_a, changed_b])
+            .expect_err("changed physical baseline must fail before writes");
+        assert!(error.to_string().contains("source_changed"));
+        assert_eq!(
+            pivot.get_entry("a").unwrap().unwrap().file_path,
+            before_a.file_path
+        );
+        assert_eq!(
+            pivot.get_entry("b").unwrap().unwrap().file_path,
+            before_b.file_path
+        );
+        // Some formats encode source text in IDs. A changed baseline may
+        // therefore look like a missing row, not an overlapping changed source.
+        let error = pivot
+            .merge_entries(&[make_entry("a", "日本語A")])
+            .expect_err("a missing physical slot must not delete a pivot translation");
+        assert!(error.to_string().contains("missing entries"));
+        assert_eq!(pivot.get_entry("a").unwrap().unwrap().source, "English A");
+        assert!(pivot.get_entry("b").unwrap().is_some());
     }
 
     /// Pin: pivot's source query must not materialize the pending bulk that
@@ -2612,5 +3732,53 @@ mod tests {
             "{err}"
         );
         assert!(!out.exists(), "must not create an empty output db");
+    }
+    #[test]
+    fn control_repro_pivot_refuses_missing_controls_before_creating_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("source.db")).unwrap();
+        let mut entry = StringEntry::new("line", "JA {name}", PathBuf::from("script.rpy"));
+        entry.translation = Some("Hello".into());
+        db.save_entries(&[entry]).unwrap();
+        let output = temp.path().join("pivot.db");
+        assert!(
+            db.pivot_to(&output).is_err(),
+            "invalid English must not become a pivot source"
+        );
+        assert!(!output.exists());
+    }
+    #[tokio::test]
+    async fn control_manual_and_imported_results_remain_reportable_and_block_pivot() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("source.db")).unwrap();
+        let entry = StringEntry::new("line", r"JA \V[1]", PathBuf::from("data.json"));
+        db.save_entries(&[entry]).unwrap();
+        db.save_translation("line", "Hello", "manual")
+            .await
+            .unwrap();
+        let saved = db.get_entries(&EntryFilter::default()).unwrap().remove(0);
+        assert!(!crate::validation::Validator::validate_entry(&saved).is_empty());
+        assert!(db.pivot_to(&temp.path().join("invalid.db")).is_err());
+        // Batch import shares the same report/gate, while allowing stored draft
+        // work to be repaired explicitly rather than deleting the user's text.
+        db.save_translations_batch(vec![("line".into(), r"Hello \V[1]".into())], "import")
+            .await
+            .unwrap();
+        let es = temp.path().join("es.db");
+        let fr = temp.path().join("fr.db");
+        db.pivot_to(&es).unwrap();
+        db.pivot_to(&fr).unwrap();
+        let es = Database::open(&es).unwrap();
+        let fr = Database::open(&fr).unwrap();
+        es.save_translation("line", r"Hola \V[1]", "manual")
+            .await
+            .unwrap();
+        let saved = es.get_entries(&EntryFilter::default()).unwrap().remove(0);
+        assert!(saved.require_preserved_translation_controls().is_ok());
+        assert_eq!(saved.source, r"Hello \V[1]");
+        assert_eq!(saved.injection_source().unwrap(), r"JA \V[1]");
+        assert!(fr.get_entries(&EntryFilter::default()).unwrap()[0]
+            .translation
+            .is_none());
     }
 }

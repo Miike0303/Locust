@@ -1,7 +1,8 @@
 //! Automatic patch application engine.
 //!
-//! Shared by CLI, Axum server, and external patchers. Verification is always
-//! read-only and runs before any write. Apply is journaled (not atomic) —
+//! Shared by CLI, Axum server, and external patchers. Verification never writes
+//! the game and runs before any asset write. Each public operation holds one
+//! cross-process game lock in per-user OS data storage. Apply is journaled —
 //! recovery is always rollback-to-pristine via `.locust/backup/`.
 //!
 //! Authoritative rules (design rev 4):
@@ -14,6 +15,7 @@
 //!   any version/id/file-set change is rollback-then-fresh.
 
 pub mod apply;
+mod lock;
 pub mod manifest;
 pub mod pack;
 pub mod rollback;
@@ -23,8 +25,12 @@ pub mod verify;
 pub mod zipsec;
 
 pub use apply::{apply, ApplyOptions, ApplyReport, PatchProgress};
+pub use lock::GameLock;
 pub use manifest::{BackupBaseline, BackupManifest, PatchFileEntry, PatchManifest, Receipt};
-pub use pack::{pack_injection_recording, PackOptions, PackReport};
+pub use pack::{
+    ensure_pack_output_outside, pack_injection_recording, pack_recorded_generation,
+    pack_with_pristine_backup, PackOptions, PackReport,
+};
 pub use rollback::{rollback, RollbackOptions, RollbackReport};
 pub use store::{PatchStatus, PatchStore};
 pub use verify::{verify, FileMismatch, VerificationOutcome, VerificationReport};

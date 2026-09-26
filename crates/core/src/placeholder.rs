@@ -22,7 +22,7 @@ pub enum PlaceholderKind {
     CustomBracket,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlaceholderMismatch {
     pub kind: MismatchKind,
     pub placeholder: String,
@@ -32,6 +32,7 @@ pub struct PlaceholderMismatch {
 pub enum MismatchKind {
     Missing,
     Extra,
+    Unbalanced,
 }
 
 struct PatternMatch {
@@ -149,6 +150,17 @@ impl PlaceholderProcessor {
             }
         }
 
+        // Only impose nesting when the original contains balanced, recognized
+        // paired Ren'Py tags. Partial strings and literal {i} format fields do
+        // not acquire a new balancing requirement from this generic processor.
+        if renpy_tags_balanced(&orig_phs) == Some(true)
+            && renpy_tags_balanced(&trans_phs) == Some(false)
+        {
+            mismatches.push(PlaceholderMismatch {
+                kind: MismatchKind::Unbalanced,
+                placeholder: "Ren'Py formatting tags must retain valid nesting".into(),
+            });
+        }
         mismatches
     }
 
@@ -159,12 +171,13 @@ impl PlaceholderProcessor {
         let mut i = 0;
         while i < len {
             if bytes[i] == b'\\' && i + 1 < len {
-                let next = bytes[i + 1];
+                let next = bytes[i + 1].to_ascii_lowercase();
+                if next == b'\\' {
+                    i += 2;
+                    continue;
+                }
                 // Codes with brackets: \c[N], \v[N], \n[N], \p[N]
-                if (next == b'c' || next == b'v' || next == b'n' || next == b'p')
-                    && i + 2 < len
-                    && bytes[i + 2] == b'['
-                {
+                if b"cvnpi".contains(&next) && i + 2 < len && bytes[i + 2] == b'[' {
                     if let Some(close) = source[i + 3..].find(']') {
                         let end = i + 3 + close + 1;
                         matches.push(PatternMatch {
@@ -269,6 +282,11 @@ impl PlaceholderProcessor {
         let mut i = 0;
         while i < len {
             if bytes[i] == b'{' {
+                // Double opening braces escape a literal brace in Ren'Py and format strings.
+                if bytes.get(i + 1) == Some(&b'{') {
+                    i += 2;
+                    continue;
+                }
                 // Check for PL_ tokens — skip those
                 if source[i..].starts_with("{PL_") {
                     i += 1;
@@ -301,6 +319,10 @@ impl PlaceholderProcessor {
         while i < len {
             if bytes[i] == b'\\' && i + 1 < len {
                 let next = bytes[i + 1];
+                if next == b'\\' {
+                    i += 2;
+                    continue;
+                }
                 if next == b'n' || next == b't' {
                     // Don't match if already captured by RPG Maker (e.g. \n[1])
                     if next == b'n' && i + 2 < len && bytes[i + 2] == b'[' {
@@ -323,17 +345,17 @@ impl PlaceholderProcessor {
 
     fn find_custom_brackets(source: &str, matches: &mut Vec<PatternMatch>) {
         let bytes = source.as_bytes();
-        let len = bytes.len();
         let mut i = 0;
-        while i < len {
+        while i < bytes.len() {
             if bytes[i] == b'[' {
-                if let Some(close) = source[i..].find(']') {
-                    let end = i + close + 1;
+                // Ren'Py [[ spells a literal opening bracket.
+                if bytes.get(i + 1) == Some(&b'[') {
+                    i += 2;
+                    continue;
+                }
+                if let Some(end) = bracket_end(source, i) {
                     let inner = &source[i + 1..end - 1];
-                    // Must be alpha/underscore identifier, not numbers (those are RPG Maker)
-                    if !inner.is_empty()
-                        && inner.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
-                    {
+                    if is_renpy_interpolation(inner) {
                         matches.push(PatternMatch {
                             start: i,
                             end,
@@ -343,6 +365,10 @@ impl PlaceholderProcessor {
                         i = end;
                         continue;
                     }
+                    // Do not reinterpret an inner bracket of an unsupported
+                    // expression as an independent variable.
+                    i = end;
+                    continue;
                 }
             }
             i += 1;
@@ -370,6 +396,11 @@ impl PlaceholderProcessor {
 /// letters (`{P}`, `{F}`, `{G}`) that dominate Unreal/Unity heuristic dumps and
 /// only produce restore-fail noise under mock/length-safe translate.
 fn is_rust_format_inner(inner: &str) -> bool {
+    if let Some((name, argument)) = inner.split_once('=') {
+        return renpy_parameter_tag(name)
+            && !argument.is_empty()
+            && !argument.contains(['{', '}', '\n', '\r']);
+    }
     // Ren'Py closing tag: same rules on the name after the leading '/'.
     if let Some(rest) = inner.strip_prefix('/') {
         return !rest.is_empty() && is_rust_format_name(rest);
@@ -394,6 +425,194 @@ fn is_rust_format_name(name: &str) -> bool {
     }
     // n == 1: lowercase Ren'Py-style only
     name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+}
+
+// Accommodate known parameterized Ren'Py tags without treating arbitrary
+// prose assignments/JSON inside braces as engine controls.
+fn renpy_parameter_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "a" | "alpha"
+            | "color"
+            | "cps"
+            | "font"
+            | "size"
+            | "outlinecolor"
+            | "plain"
+            | "k"
+            | "image"
+            | "space"
+            | "vspace"
+            | "w"
+            | "p"
+    )
+}
+
+fn renpy_paired_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "a" | "alpha"
+            | "b"
+            | "i"
+            | "u"
+            | "s"
+            | "color"
+            | "cps"
+            | "font"
+            | "size"
+            | "outlinecolor"
+            | "plain"
+            | "k"
+            | "rb"
+            | "rt"
+    )
+}
+
+fn renpy_tags_balanced(placeholders: &[Placeholder]) -> Option<bool> {
+    let mut stack = Vec::new();
+    let mut saw_tag = false;
+    for ph in placeholders {
+        let Some(inner) = ph
+            .original
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+        else {
+            continue;
+        };
+        let (closing, body) = inner
+            .strip_prefix('/')
+            .map_or((false, inner), |body| (true, body));
+        let name = body.split('=').next().unwrap_or(body);
+        if !renpy_paired_tag(name) {
+            continue;
+        }
+        saw_tag = true;
+        if closing {
+            if stack.pop() != Some(name) {
+                return Some(false);
+            }
+        } else {
+            stack.push(name);
+        }
+    }
+    saw_tag.then_some(stack.is_empty())
+}
+
+fn bracket_end(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+        } else {
+            match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'[' => {
+                    depth += 1;
+                    if depth > 16 {
+                        return None;
+                    }
+                }
+                b']' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                b'\n' | b'\r' => return None,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn quoted_subscript_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    let Some(&quote) = bytes.first() else {
+        return false;
+    };
+    if !matches!(quote, b'\'' | b'"') {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            return i + 1 == bytes.len();
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Deliberately bounded interpolation grammar: identifier, dotted attributes,
+/// numeric/quoted-key subscripts and optional Ren'Py conversion flags. Function
+/// calls, arithmetic and arbitrary Python expressions are not guessed here.
+fn is_renpy_interpolation(inner: &str) -> bool {
+    fn ident(bytes: &[u8], cursor: &mut usize) -> bool {
+        if !bytes
+            .get(*cursor)
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        {
+            return false;
+        }
+        *cursor += 1;
+        while bytes
+            .get(*cursor)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            *cursor += 1;
+        }
+        true
+    }
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    if !ident(bytes, &mut i) {
+        return false;
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' => {
+                i += 1;
+                if !ident(bytes, &mut i) {
+                    return false;
+                }
+            }
+            b'[' => {
+                let Some(end) = bracket_end(inner, i) else {
+                    return false;
+                };
+                let key = &inner[i + 1..end - 1];
+                let number = key.strip_prefix('-').unwrap_or(key);
+                let numeric = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
+                let quoted = quoted_subscript_key(key);
+                if !(numeric || quoted) {
+                    return false;
+                }
+                i = end;
+            }
+            b'!' => {
+                let flags = &bytes[i + 1..];
+                return !flags.is_empty() && flags.iter().all(|b| b"sraqtulc".contains(b));
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -564,5 +783,92 @@ mod tests {
         // Restore should give back original
         let restored = PlaceholderProcessor::restore(&sanitized, &placeholders).unwrap();
         assert_eq!(restored, source);
+    }
+    #[test]
+    fn control_repro_rpg_uppercase_and_icon_currency_are_protected() {
+        let source = r"\C[2]\V[1]\N[3]\P[1]\I[2]\G";
+        let (safe, controls) = PlaceholderProcessor::extract(source);
+        assert_eq!(controls.len(), 6);
+        assert_eq!(
+            PlaceholderProcessor::restore(&safe, &controls).unwrap(),
+            source
+        );
+        assert!(!PlaceholderProcessor::validate(source, "Oro").is_empty());
+    }
+
+    #[test]
+    fn control_repro_renpy_expressions_and_parameter_tags_are_protected() {
+        let source = "{color=#fff}Hello [player.name] [values[0]!q]{/color}";
+        let (safe, controls) = PlaceholderProcessor::extract(source);
+        assert_eq!(controls.len(), 4);
+        assert_eq!(
+            PlaceholderProcessor::restore(&safe, &controls).unwrap(),
+            source
+        );
+        assert!(!PlaceholderProcessor::validate(source, "Hola{/color}").is_empty());
+    }
+
+    #[test]
+    fn control_repro_changed_nesting_is_rejected_but_words_can_move() {
+        let source = "{color=#fff}{i}Hello{/i}{/color}";
+        assert!(
+            !PlaceholderProcessor::validate(source, "{color=#fff}{i}Hola{/color}{/i}").is_empty()
+        );
+        assert!(
+            !PlaceholderProcessor::validate(source, "{/color}{i}Hola{/i}{color=#fff}").is_empty()
+        );
+        assert!(
+            PlaceholderProcessor::validate(source, "Hola {color=#fff}{i}amigo{/i}{/color}")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn control_repro_escaped_and_literal_syntax_is_not_overprotected() {
+        for source in [
+            r"literal \\V[1]",
+            "literal [[player.name]",
+            "literal {{color=#fff}",
+            "[not an expression]",
+            "[1, 2]",
+            "{answer=42}",
+            "{P}",
+        ] {
+            assert!(
+                PlaceholderProcessor::extract(source).1.is_empty(),
+                "overprotected {source}"
+            );
+        }
+    }
+    #[test]
+    fn control_renpy_partial_tags_and_supported_expression_boundaries() {
+        // Strings can be fragments of a larger styled message: preserve their
+        // tokens without demanding a closer absent from the original itself.
+        assert!(PlaceholderProcessor::validate("{color=#fff}Hello", "{color=#fff}Hola").is_empty());
+        for expression in [
+            "[player_name2]",
+            "[player.name]",
+            "[items[0]]",
+            "[items['name']]",
+            "[items[\"name\"]!q]",
+            "[player.name!rq]",
+        ] {
+            let (_, controls) = PlaceholderProcessor::extract(expression);
+            assert_eq!(controls.len(), 1, "{expression}");
+            assert_eq!(controls[0].original, expression);
+        }
+        for literal in [
+            "[[player]",
+            "{{name}",
+            r"\\n",
+            "[call()]",
+            "[a + b]",
+            "[items['a' + name + 'b']]",
+        ] {
+            assert!(
+                PlaceholderProcessor::extract(literal).1.is_empty(),
+                "{literal}"
+            );
+        }
     }
 }

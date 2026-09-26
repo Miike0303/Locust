@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::database::{copy_path_chunked, paths_identical, sha256_file, Database};
+use crate::database::{paths_identical, sha256_file, Database, InjectionRecording};
 use crate::error::{LocustError, Result};
 use crate::models::StringStatus;
 use crate::patch::manifest::{PatchFileEntry, PatchManifest};
 use crate::patch::store::PatchStore;
+use crate::patch::stream::{stream_bounded, StreamError};
 
 /// Options for [`pack_injection_recording`].
 #[derive(Debug, Clone)]
@@ -61,6 +62,22 @@ fn pack_err(msg: impl Into<String>) -> LocustError {
     LocustError::PatchError(msg.into())
 }
 
+/// Hash a pristine original for the manifest.
+///
+/// `NotFound` is a legitimate added file (`None`). Any other I/O failure
+/// (sharing, permission, directory/non-file) is an error with path context.
+fn hash_original_file(root: &Path, rel: &Path) -> Result<Option<String>> {
+    let path = root.join(rel.components().collect::<PathBuf>());
+    match sha256_file(&path) {
+        Ok((hash, _)) => Ok(Some(hash)),
+        Err(LocustError::IoError(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(pack_err(format!(
+            "cannot hash original {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
 /// Appended to advice that names a `--direct` re-run. Every registered
 /// format writes in place, so a legacy database on an already-injected
 /// game would loop on the identical error forever without this note.
@@ -78,13 +95,176 @@ fn maybe_mutated_note(engine: Option<&str>) -> &'static str {
     }
 }
 
+/// Resolve existing ancestors (including links) while allowing a new output leaf.
+fn resolved_destination(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                resolved.push(name);
+                match std::fs::canonicalize(&resolved) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    Ok(resolved)
+}
+
+/// Refuse publishing an archive inside a game, pristine tree or backup store.
+/// Must run before creating output directories or temporary files.
+pub fn ensure_pack_output_outside(output: &Path, protected_root: &Path) -> Result<()> {
+    let output = resolved_destination(output)?;
+    let root = resolved_destination(protected_root)?;
+    if output.starts_with(&root) {
+        return Err(pack_err(format!(
+            "patch output must be outside the game and backup trees: {}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Pack a patch zip from the injection recording stored in `db`.
 pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<PackReport> {
-    let game_path = opts.game_path;
-    let project = opts.project;
-    let engine_id = opts.engine.clone();
-    let lang = opts.lang;
-    let mut messages = Vec::new();
+    pack_recording(db, opts, None)
+}
+
+#[cfg(test)]
+type SelectionHook = Box<dyn FnOnce(&Database)>;
+
+#[cfg(test)]
+type PristineHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_BACKUP_SELECTION: std::cell::RefCell<Option<SelectionHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static AFTER_PRISTINE_VALIDATION: std::cell::RefCell<Option<PristineHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static BEFORE_PAYLOAD_STREAM: std::cell::RefCell<Option<PristineHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn run_selection_hook(db: &Database) {
+    let hook = AFTER_BACKUP_SELECTION.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(db);
+    }
+}
+
+/// Resolve the exact backup associated with the selected recording, including
+/// its original store when the project moves between CLI and desktop profiles.
+/// Explicit pristine trees take precedence. Missing recorded backups fail closed.
+pub fn pack_with_pristine_backup(
+    db: &Database,
+    mut opts: PackOptions,
+    fallback_store: &crate::backup::BackupManager,
+    requested_backup: Option<&str>,
+    use_recorded_backup: bool,
+) -> Result<PackReport> {
+    if requested_backup.is_some() && opts.pristine.is_some() {
+        return Err(pack_err("choose either a backup ID or a pristine folder"));
+    }
+    let selection = opts.game_path.clone();
+    if opts.game_path.is_file() {
+        opts.game_path = std::path::absolute(&opts.game_path)?
+            .parent()
+            .ok_or_else(|| pack_err("game file has no parent"))?
+            .to_path_buf();
+    }
+    // Select once: an absent recording must not become a new generation after
+    // backup resolution, silently dropping the original hashes from its ZIP.
+    let selected = select_pack_recording(db, &opts);
+    #[cfg(test)]
+    run_selection_hook(db);
+    let (recording, translated) = selected?;
+    let recorded = recording.pristine_backup.as_ref();
+    if let (Some(requested), Some(recorded)) = (requested_backup, recorded) {
+        if requested != recorded.id {
+            return Err(pack_err("selected backup does not match the recorded injection; reopen Pack to use its original backup"));
+        }
+    }
+    let stored_root = recorded.and_then(|backup| backup.storage_root.as_ref());
+    if stored_root.is_some_and(|root| !root.is_absolute()) {
+        return Err(pack_err("recorded backup store must be absolute"));
+    }
+    ensure_pack_output_outside(&opts.output, fallback_store.root())?;
+    if let Some(root) = stored_root {
+        ensure_pack_output_outside(&opts.output, root)?;
+    }
+    let chosen = requested_backup.or_else(|| {
+        if use_recorded_backup && opts.pristine.is_none() {
+            recorded.map(|backup| backup.id.as_str())
+        } else {
+            None
+        }
+    });
+    let origin = recorded
+        .map(|backup| backup.source_path.as_path())
+        .unwrap_or(&selection);
+    let original_store = stored_root.map(|root| crate::backup::BackupManager::new(root.clone()));
+    let store = original_store.as_ref().unwrap_or(fallback_store);
+    if let Some(id) = chosen {
+        store.with_verified_pristine_tree(id, origin, |tree| {
+            #[cfg(test)]
+            {
+                let hook = AFTER_PRISTINE_VALIDATION.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook(tree.root());
+                }
+            }
+            opts.pristine = Some(tree.root().to_path_buf());
+            pack_selected_recording(db, opts, &recording, translated, Some(&tree))
+        })
+    } else {
+        pack_selected_recording(db, opts, &recording, translated, None)
+    }
+}
+
+/// Pack only the generation used to select its original backup. A concurrent
+/// injection must not pair new output files with a previous generation's backup.
+pub fn pack_recorded_generation(
+    db: &Database,
+    opts: PackOptions,
+    expected: &crate::database::InjectionRecording,
+) -> Result<PackReport> {
+    pack_recording(db, opts, Some(expected))
+}
+
+fn pack_recording(
+    db: &Database,
+    opts: PackOptions,
+    expected: Option<&crate::database::InjectionRecording>,
+) -> Result<PackReport> {
+    let (recording, translated) = select_pack_recording(db, &opts)?;
+    if expected.is_some_and(|expected| expected != &recording) {
+        return Err(pack_err(
+            "injection recording changed while selecting its backup; reopen Pack and retry",
+        ));
+    }
+    pack_selected_recording(db, opts, &recording, translated, None)
+}
+
+/// Apply the same language/root selection and diagnostics to every entry point.
+/// The caller must retain this concrete generation through backup resolution.
+fn select_pack_recording(db: &Database, opts: &PackOptions) -> Result<(InjectionRecording, usize)> {
+    let game_path = &opts.game_path;
+    let project = &opts.project;
+    let engine_id = &opts.engine;
+    let lang = &opts.lang;
 
     // Friendly pre-check: no translations → nothing to pack.
     let entries = db.get_entries(&crate::database::EntryFilter::default())?;
@@ -135,7 +315,7 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
                     let Some(rec) = db.get_injection(k.as_deref())? else {
                         continue;
                     };
-                    if !paths_identical(&game_path, &rec.root) {
+                    if !paths_identical(game_path, &rec.root) {
                         continue;
                     }
                     match k {
@@ -180,7 +360,7 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
                     };
                     listed.push_str(&format!("\n  {} → {}", key_label(k), rec.root.display()));
                     if let Some(kk) = k {
-                        if example.is_none() && paths_identical(&game_path, &rec.root) {
+                        if example.is_none() && paths_identical(game_path, &rec.root) {
                             example = Some(format!(
                                 "locust patch \"{}\" -P \"{}\" -l {kk}",
                                 game_path.display(),
@@ -225,7 +405,7 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
         }
     };
 
-    if !paths_identical(&game_path, &recording.root) {
+    if !paths_identical(game_path, &recording.root) {
         return Err(pack_err(format!(
             "the recorded injection for {} wrote into \"{}\", not \"{}\". \
              Packing from a different tree is refused. Point game_path at the recorded root.",
@@ -235,7 +415,48 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
         )));
     }
 
+    Ok((recording, translated))
+}
+
+fn pack_selected_recording(
+    db: &Database,
+    opts: PackOptions,
+    recording: &InjectionRecording,
+    translated: usize,
+    verified_pristine: Option<&crate::backup::VerifiedPristine<'_>>,
+) -> Result<PackReport> {
+    let game_path = opts.game_path;
+    let lang = opts.lang;
+    let mut messages = Vec::new();
+
+    // A recorded generation must remain stable through hashing, streaming and
+    // ZIP publication while another process injects, applies or restores files.
+    let _game_lock = super::GameLock::acquire(&recording.root)?;
+    crate::injection_transaction::ensure_no_pending_under_lock(&_game_lock)?;
+    if db.get_injection(recording.lang.as_deref())?.as_ref() != Some(recording) {
+        return Err(pack_err(
+            "injection recording changed while selecting its backup; reopen Pack and retry",
+        ));
+    }
+
     let out = opts.output;
+    ensure_pack_output_outside(&out, &recording.root)?;
+    if let Some(pristine) = &opts.pristine {
+        ensure_pack_output_outside(&out, pristine)?;
+    }
+    let database = db.path();
+    if database != Path::new(":memory:") {
+        let resolved_output = resolved_destination(&out)?;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut protected = database.as_os_str().to_os_string();
+            protected.push(suffix);
+            if resolved_output == resolved_destination(Path::new(&protected))? {
+                return Err(pack_err(
+                    "patch output would overwrite the project database",
+                ));
+            }
+        }
+    }
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -304,34 +525,69 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
             )));
         }
         let src = recording.root.join(rel.components().collect::<PathBuf>());
-        // Hash on disk in 1 MiB chunks — never `fs::read` a multi-GB pak.
-        let (hash, size) = match sha256_file(&src) {
-            Ok(v) => v,
+        // Open once, then hash the exact 1 MiB chunks written to ZIP. A separate
+        // hash/read pass could certify different bytes after an external edit.
+        let mut input = match std::fs::File::open(&src) {
+            Ok(file) => file,
             Err(_) => {
                 missing.push(src);
                 continue;
             }
         };
-        if size != f.size || hash != f.hash {
+        let size = match input.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            Ok(_) | Err(_) => {
+                missing.push(src);
+                continue;
+            }
+        };
+        if size != f.size {
             changed.push(f.rel.clone());
             continue;
         }
-        let original_sha256 = pristine_root.as_ref().and_then(|root| {
-            let p = root.join(rel.components().collect::<PathBuf>());
-            sha256_file(&p).ok().map(|(h, _)| h)
-        });
+        let original_sha256 = match &pristine_root {
+            Some(root) => hash_original_file(root, rel)?,
+            None => None,
+        };
+        if let Some(pristine) = verified_pristine {
+            if original_sha256.as_deref() != pristine.original_sha256(rel)? {
+                return Err(pack_err(format!(
+                    "injection backup changed after validation at {}; packing refused",
+                    rel.display()
+                )));
+            }
+        }
+        // ZIP64 for entries at/over 4 GiB (multi-GB Unreal base paks).
+        let entry_opts = zip_opts.large_file(size >= 0xFFFF_FFFF);
+        zip.start_file(f.rel.clone(), entry_opts)
+            .map_err(|e| pack_err(format!("zip start_file {}: {e}", f.rel)))?;
+        #[cfg(test)]
+        {
+            let hook = BEFORE_PAYLOAD_STREAM.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook(&src);
+            }
+        }
+        match stream_bounded(&mut input, f.size, Some(&mut zip)) {
+            Ok(streamed) if streamed.actual_len == f.size && streamed.sha256_hex == f.hash => {}
+            Ok(_) | Err(StreamError::TooLong) => {
+                changed.push(f.rel.clone());
+                continue;
+            }
+            Err(StreamError::Read(_)) => {
+                missing.push(src);
+                continue;
+            }
+            Err(StreamError::Write(error)) => {
+                return Err(pack_err(format!("zip write {}: {error}", f.rel)));
+            }
+        }
         manifest_files.push(PatchFileEntry {
             path: f.rel.clone(),
             patched_sha256: f.hash.clone(),
             size: f.size,
             original_sha256,
         });
-        // ZIP64 for entries at/over 4 GiB (multi-GB Unreal base paks).
-        let entry_opts = zip_opts.large_file(size >= 0xFFFF_FFFF);
-        zip.start_file(f.rel.clone(), entry_opts)
-            .map_err(|e| pack_err(format!("zip start_file {}: {e}", f.rel)))?;
-        copy_path_chunked(&src, &mut zip)
-            .map_err(|e| pack_err(format!("zip write {}: {e}", f.rel)))?;
         added += 1;
     }
 
@@ -358,7 +614,9 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
         }
         return Err(pack_err(format!(
             "{} of {} recorded file(s) no longer match what injection wrote:{detail}\n\
-             Re-run inject --direct{lang_flag} to refresh the recording, then re-run pack.",
+             Keep any external edits separately. Restore the last recorded injected files \
+             before packing; Direct reinjection also refuses a changed recording. \
+             To start over, use a separate project and a pristine game copy.",
             missing.len() + changed.len(),
             recording.files.len(),
         )));
@@ -400,8 +658,8 @@ pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<Pack
         Preferred apply:  locust apply <game> <this.zip>\n\
         Manual apply:     extract over your game folder, replacing files.\n\
         Back up your game folder first (locust apply does this for you).\n\n\
-        This patch contains translated text only. Get the game itself from the\n\
-        original creator.\n";
+        This patch contains modified game files, which may include complete\n\
+        asset bundles. Get the base game from the original creator.\n";
     zip.start_file("README.txt", zip_opts)
         .map_err(|e| pack_err(format!("zip readme: {e}")))?;
     zip.write_all(readme.as_bytes())?;
@@ -468,6 +726,303 @@ mod tests {
         dir
     }
 
+    fn live_payload_changed_before_stream(change: &str) {
+        let base = tempfile::tempdir().unwrap();
+        let game = base.path().join("game");
+        let pristine = base.path().join("pristine");
+        fs::create_dir(&game).unwrap();
+        fs::create_dir(&pristine).unwrap();
+        let source = game.join("story.bin");
+        fs::write(pristine.join("story.bin"), "Original Japanese").unwrap();
+        let recorded: Vec<u8> = (0..(2 * 1024 * 1024 + 37))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        fs::write(&source, &recorded).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = StringEntry::new("line", "Original Japanese", source.clone());
+        entry.translation = Some("Texto traducido".into());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+        db.record_injection(Some("es"), &game, std::slice::from_ref(&source))
+            .unwrap();
+        let saved_recording = db.get_injection(Some("es")).unwrap();
+        let output = base.path().join("existing.zip");
+        fs::write(&output, "existing archive").unwrap();
+        let options = PackOptions {
+            game_path: game.clone(),
+            lang: Some("es".into()),
+            output: output.clone(),
+            pristine: Some(pristine.clone()),
+            engine: None,
+            project: base.path().join("project.db"),
+            require_pristine: true,
+        };
+        let mut edited = recorded.clone();
+        match change {
+            "same-length" => edited[1024 * 1024 + 3] ^= 0xff,
+            "longer" => edited.push(42),
+            "shorter" => edited.truncate(1024 * 1024 + 9),
+            _ => unreachable!(),
+        }
+        let new_bytes = edited.clone();
+        BEFORE_PAYLOAD_STREAM.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path| fs::write(path, new_bytes).unwrap()));
+        });
+        let result = pack_injection_recording(&db, options.clone());
+        assert!(BEFORE_PAYLOAD_STREAM.with(|slot| slot.borrow().is_none()));
+        let error = result
+            .expect_err("must not publish bytes different from recording")
+            .to_string();
+        assert!(error.contains("no longer match"), "{error}");
+        assert_eq!(fs::read_to_string(&output).unwrap(), "existing archive");
+        assert_eq!(fs::read(&source).unwrap(), edited);
+        assert_eq!(db.get_injection(Some("es")).unwrap(), saved_recording);
+        assert!(!fs::read_dir(base.path()).unwrap().any(|p| p
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("existing.zip.tmp-")));
+
+        // Once the recorded bytes are restored, every byte in the produced
+        // ZIP must verify, apply and roll back against the actual original.
+        fs::write(&source, &recorded).unwrap();
+        pack_injection_recording(&db, options).unwrap();
+        let verified = crate::patch::verify(&pristine, &output).unwrap();
+        assert_eq!(verified.outcome, crate::patch::VerificationOutcome::Clean);
+        crate::patch::apply(&pristine, &output, Default::default(), |_| {}).unwrap();
+        assert_eq!(fs::read(pristine.join("story.bin")).unwrap(), recorded);
+        crate::patch::rollback(&pristine, Default::default()).unwrap();
+        assert_eq!(
+            fs::read_to_string(pristine.join("story.bin")).unwrap(),
+            "Original Japanese"
+        );
+    }
+
+    #[test]
+    fn pack_refuses_live_payload_rewritten_before_stream() {
+        live_payload_changed_before_stream("same-length");
+    }
+
+    #[test]
+    fn pack_refuses_live_payload_grown_before_stream() {
+        live_payload_changed_before_stream("longer");
+    }
+
+    #[test]
+    fn pack_refuses_live_payload_shrunk_before_stream() {
+        live_payload_changed_before_stream("shorter");
+    }
+
+    fn pristine_changed_after_validation(change: &str) {
+        use crate::backup::BackupManager;
+        use crate::database::RecordedBackup;
+
+        let base = tempfile::tempdir().unwrap();
+        let game = base.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let source = game.join("story.txt");
+        let added = game.join("added.txt");
+        fs::write(&source, "Original Japanese").unwrap();
+        let store = BackupManager::new(base.path().join("backups"));
+        let backup = store.create_backup(&game).unwrap();
+        let provenance = RecordedBackup {
+            id: backup.id.clone(),
+            source_path: backup.source_path.clone(),
+            storage_root: Some(store.root().to_path_buf()),
+        };
+        fs::write(&source, "Texto traducido").unwrap();
+        fs::write(&added, "Generated translation overlay").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = StringEntry::new("line", "Original Japanese", source.clone());
+        entry.translation = Some("Texto traducido".into());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+        db.record_injection_with_backup(
+            Some("es"),
+            &game,
+            &[source.clone(), added.clone()],
+            Some(&provenance),
+        )
+        .unwrap();
+        let recording = db.get_injection(Some("es")).unwrap();
+        let output = base.path().join("existing.zip");
+        fs::write(&output, "existing archive").unwrap();
+        let options = PackOptions {
+            game_path: game.clone(),
+            lang: Some("es".into()),
+            output: output.clone(),
+            pristine: None,
+            engine: None,
+            project: base.path().join("project.db"),
+            require_pristine: false,
+        };
+        let change = change.to_owned();
+        AFTER_PRISTINE_VALIDATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |tree| match change.as_str() {
+                "changed" => fs::write(tree.join("story.txt"), "Changed original").unwrap(),
+                "missing" => fs::remove_file(tree.join("story.txt")).unwrap(),
+                "added" => fs::write(tree.join("added.txt"), "Not in original backup").unwrap(),
+                _ => unreachable!(),
+            }));
+        });
+        let result = pack_with_pristine_backup(&db, options.clone(), &store, None, true);
+        assert!(AFTER_PRISTINE_VALIDATION.with(|slot| slot.borrow().is_none()));
+        let error = result
+            .expect_err("changed backup must not replace original hashes")
+            .to_string();
+        assert!(error.contains("backup changed"), "{error}");
+        assert_eq!(fs::read_to_string(&output).unwrap(), "existing archive");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "Texto traducido");
+        assert_eq!(
+            fs::read_to_string(&added).unwrap(),
+            "Generated translation overlay"
+        );
+        assert_eq!(db.get_injection(Some("es")).unwrap(), recording);
+        assert!(!fs::read_dir(base.path()).unwrap().any(|p| p
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("existing.zip.tmp-")));
+
+        // Restore only this test's intentionally changed backup and prove retry.
+        let payload = backup.path.join("payload");
+        fs::write(payload.join("story.txt"), "Original Japanese").unwrap();
+        if payload.join("added.txt").exists() {
+            fs::remove_file(payload.join("added.txt")).unwrap();
+        }
+        let report = pack_with_pristine_backup(&db, options, &store, None, true).unwrap();
+        assert_eq!(report.tier, "strict");
+        let original = base.path().join("original");
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("story.txt"), "Original Japanese").unwrap();
+        let verified = crate::patch::verify(&original, &output).unwrap();
+        assert_eq!(verified.outcome, crate::patch::VerificationOutcome::Clean);
+    }
+
+    #[test]
+    fn pack_refuses_backup_original_changed_after_validation() {
+        pristine_changed_after_validation("changed");
+    }
+
+    #[test]
+    fn pack_refuses_backup_original_missing_after_validation() {
+        pristine_changed_after_validation("missing");
+    }
+
+    #[test]
+    fn pack_refuses_backup_counterpart_added_after_validation() {
+        pristine_changed_after_validation("added");
+    }
+
+    fn recording_changed_during_backup_selection(lang: Option<&str>, initially_recorded: bool) {
+        use crate::backup::BackupManager;
+        use crate::database::RecordedBackup;
+
+        let base = tempfile::tempdir().unwrap();
+        let game = base.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let source = game.join("story.txt");
+        fs::write(&source, "Original Japanese").unwrap();
+        let store = BackupManager::new(base.path().join("backups"));
+        let backup = store.create_backup(&game).unwrap();
+        let provenance = RecordedBackup {
+            id: backup.id,
+            source_path: backup.source_path,
+            storage_root: Some(store.root().to_path_buf()),
+        };
+        fs::write(&source, "Texto traducido").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = StringEntry::new("line", "Original Japanese", source.clone());
+        entry.translation = Some("Texto traducido".into());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+        if initially_recorded {
+            db.record_injection_with_backup(
+                lang,
+                &game,
+                std::slice::from_ref(&source),
+                Some(&provenance),
+            )
+            .unwrap();
+        }
+        let output = base.path().join("existing.zip");
+        fs::write(&output, "existing archive").unwrap();
+        let options = PackOptions {
+            game_path: game.clone(),
+            lang: lang.map(str::to_owned),
+            output: output.clone(),
+            pristine: None,
+            engine: None,
+            project: base.path().join("project.db"),
+            require_pristine: false,
+        };
+        let record_game = game.clone();
+        let record_source = source.clone();
+        let record_lang = lang.map(str::to_owned);
+        AFTER_BACKUP_SELECTION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |db| {
+                fs::write(&record_source, "Nueva traduccion").unwrap();
+                db.record_injection_with_backup(
+                    record_lang.as_deref(),
+                    &record_game,
+                    &[record_source],
+                    Some(&provenance),
+                )
+                .unwrap();
+            }));
+        });
+        let result = pack_with_pristine_backup(&db, options.clone(), &store, None, true);
+        assert!(AFTER_BACKUP_SELECTION.with(|slot| slot.borrow().is_none()));
+        assert!(db.get_injection(lang).unwrap().is_some());
+        let error = result
+            .expect_err("must refuse the stale snapshot")
+            .to_string();
+        assert!(
+            error.contains(if initially_recorded {
+                "recording changed"
+            } else {
+                "no injection has been recorded"
+            }),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "existing archive");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "Nueva traduccion");
+
+        // A fresh attempt must deliberately select the new generation and its
+        // original backup, never silently downgrade it to structural packing.
+        let report = pack_with_pristine_backup(&db, options, &store, None, true).unwrap();
+        assert_eq!(report.tier, "strict");
+        let original = base.path().join("original");
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("story.txt"), "Original Japanese").unwrap();
+        let verified = crate::patch::verify(&original, &output).unwrap();
+        assert_eq!(verified.outcome, crate::patch::VerificationOutcome::Clean);
+        assert_eq!(
+            verified.manifest.unwrap().files[0].original_sha256,
+            Some(crate::database::sha256_hex(b"Original Japanese"))
+        );
+    }
+
+    #[test]
+    fn pack_refuses_first_named_recording_appearing_during_backup_selection() {
+        recording_changed_during_backup_selection(Some("es"), false);
+    }
+
+    #[test]
+    fn pack_refuses_first_unspecified_recording_appearing_during_backup_selection() {
+        recording_changed_during_backup_selection(None, false);
+    }
+
+    #[test]
+    fn pack_refuses_named_recording_replaced_during_backup_selection() {
+        recording_changed_during_backup_selection(Some("es"), true);
+    }
+
+    #[test]
+    fn pack_refuses_unspecified_recording_replaced_during_backup_selection() {
+        recording_changed_during_backup_selection(None, true);
+    }
+
     #[test]
     fn temp_file_guard_removes_on_drop_and_survives_disarm() {
         let dir = tempdir();
@@ -491,6 +1046,88 @@ mod tests {
             kept.exists(),
             "disarmed guard must leave the destination alone"
         );
+    }
+
+    #[test]
+    fn pack_refuses_database_and_sidecar_destinations() {
+        let base = tempfile::tempdir().unwrap();
+        let game = base.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let script = game.join("script.rpy");
+        fs::write(&script, "Hola").unwrap();
+        let project = base.path().join("project.db");
+        let db = Database::open(&project).unwrap();
+        let mut entry = StringEntry::new("line", "Hello", script.clone());
+        entry.translation = Some("Hola".into());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+        db.record_injection(Some("es"), &game, &[script]).unwrap();
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let output = base.path().join(format!("project.db{suffix}"));
+            let before = fs::read(&output).ok();
+            let result = pack_injection_recording(
+                &db,
+                PackOptions {
+                    game_path: game.clone(),
+                    lang: Some("es".into()),
+                    output: output.clone(),
+                    pristine: None,
+                    engine: Some("renpy".into()),
+                    project: base.path().join("wrong-label.db"),
+                    require_pristine: false,
+                },
+            );
+            assert!(result.unwrap_err().to_string().contains("project database"));
+            assert_eq!(fs::read(&output).ok(), before);
+        }
+        assert_eq!(db.get_entries(&Default::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pack_refuses_output_in_game_or_pristine_before_writing() {
+        for protected in ["game", "pristine"] {
+            let base = tempfile::tempdir().unwrap();
+            let game = base.path().join("game");
+            let pristine = base.path().join("pristine");
+            fs::create_dir(&game).unwrap();
+            fs::create_dir(&pristine).unwrap();
+            let script = game.join("script.rpy");
+            fs::write(&script, "Hola").unwrap();
+            fs::write(pristine.join("script.rpy"), "Hello").unwrap();
+            let db = Database::open_in_memory().unwrap();
+            let mut entry = StringEntry::new("line", "Hello", script.clone());
+            entry.translation = Some("Hola".into());
+            entry.status = StringStatus::Translated;
+            db.save_entries(&[entry]).unwrap();
+            db.record_injection(Some("es"), &game, std::slice::from_ref(&script))
+                .unwrap();
+            for suffix in ["script.rpy", "new/nested/patch.zip", "absent/../script.rpy"] {
+                let output = base.path().join(protected).join(suffix);
+                let result = pack_injection_recording(
+                    &db,
+                    PackOptions {
+                        game_path: game.clone(),
+                        lang: Some("es".into()),
+                        output,
+                        pristine: Some(pristine.clone()),
+                        engine: Some("renpy".into()),
+                        project: base.path().join("project.db"),
+                        require_pristine: true,
+                    },
+                );
+                assert!(
+                    result.is_err(),
+                    "must refuse output inside {protected}: {suffix}"
+                );
+                assert_eq!(fs::read_to_string(&script).unwrap(), "Hola");
+                assert_eq!(
+                    fs::read_to_string(pristine.join("script.rpy")).unwrap(),
+                    "Hello"
+                );
+                assert!(!base.path().join(protected).join("new").exists());
+                assert!(!base.path().join(protected).join("absent").exists());
+            }
+        }
     }
 
     #[test]
@@ -538,6 +1175,40 @@ mod tests {
             assert_eq!(read_back, contents);
         }
         assert!(archive.by_name(PatchManifest::FILENAME).is_ok());
+    }
+
+    #[test]
+    fn pack_refuses_busy_game_before_creating_output() {
+        let base = tempfile::tempdir().unwrap();
+        let game = base.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let script = game.join("script.rpy");
+        fs::write(&script, "Hola").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = StringEntry::new("line", "Hello", script.clone());
+        entry.translation = Some("Hola".into());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+        db.record_injection(Some("es"), &game, &[script]).unwrap();
+        let out = base.path().join("new/output.zip");
+        let options = PackOptions {
+            game_path: game.clone(),
+            lang: Some("es".into()),
+            output: out.clone(),
+            pristine: None,
+            engine: Some("renpy".into()),
+            project: base.path().join("project.db"),
+            require_pristine: false,
+        };
+        let guard = super::super::GameLock::acquire(&game).unwrap();
+        assert!(pack_injection_recording(&db, options.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("game busy"));
+        assert!(!out.parent().unwrap().exists());
+        drop(guard);
+        assert!(pack_injection_recording(&db, options).is_ok());
+        assert!(out.exists());
     }
 
     #[test]
@@ -668,5 +1339,183 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("pristine"), "{err}");
+    }
+
+    fn pack_opts(
+        game: PathBuf,
+        output: PathBuf,
+        pristine: PathBuf,
+        project: PathBuf,
+    ) -> PackOptions {
+        PackOptions {
+            game_path: game,
+            lang: Some("es".into()),
+            output,
+            pristine: Some(pristine),
+            engine: Some("renpy".into()),
+            project,
+            require_pristine: true,
+        }
+    }
+
+    fn read_manifest(zip_path: &Path) -> PatchManifest {
+        let file = fs::File::open(zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut zf = archive.by_name(PatchManifest::FILENAME).unwrap();
+        let mut json = String::new();
+        zf.read_to_string(&mut json).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn pack_pristine_hashes_present_originals_and_nulls_additions() {
+        let base = tempfile::tempdir().unwrap();
+        let game = base.path().join("game");
+        let pristine = base.path().join("pristine");
+        fs::create_dir(&game).unwrap();
+        fs::create_dir(&pristine).unwrap();
+        let replaced = game.join("script.rpy");
+        let added = game.join("extra.txt");
+        fs::write(&replaced, "Hola").unwrap();
+        fs::write(&added, "nuevo").unwrap();
+        fs::write(pristine.join("script.rpy"), "Hello").unwrap();
+        let expected_original = sha256_file(&pristine.join("script.rpy")).unwrap().0;
+        let db = Database::open_in_memory().unwrap();
+        for (id, source, dest, translation) in [
+            ("line", "Hello", replaced.clone(), "Hola"),
+            ("extra", "nuevo", added.clone(), "nuevo"),
+        ] {
+            let mut entry = StringEntry::new(id, source, dest);
+            entry.translation = Some(translation.into());
+            entry.status = StringStatus::Translated;
+            db.save_entries(&[entry]).unwrap();
+        }
+        db.record_injection(Some("es"), &game, &[replaced, added])
+            .unwrap();
+
+        let output = base.path().join("out.zip");
+        let report = pack_injection_recording(
+            &db,
+            pack_opts(
+                game,
+                output.clone(),
+                pristine,
+                base.path().join("project.db"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(report.files_packed, 2);
+        assert_eq!(report.tier, "strict");
+
+        let manifest = read_manifest(&output);
+        let replaced_entry = manifest
+            .files
+            .iter()
+            .find(|f| f.path == "script.rpy")
+            .unwrap();
+        let added_entry = manifest
+            .files
+            .iter()
+            .find(|f| f.path == "extra.txt")
+            .unwrap();
+        assert_eq!(
+            replaced_entry.original_sha256.as_deref(),
+            Some(expected_original.as_str())
+        );
+        assert_eq!(added_entry.original_sha256, None);
+    }
+
+    #[test]
+    fn pack_non_file_original_fails_and_keeps_existing_zip() {
+        let base = tempfile::tempdir().unwrap();
+        let game = base.path().join("game");
+        let pristine = base.path().join("pristine");
+        fs::create_dir(&game).unwrap();
+        fs::create_dir(&pristine).unwrap();
+        let script = game.join("script.rpy");
+        fs::write(&script, "Hola").unwrap();
+        fs::create_dir(pristine.join("script.rpy")).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = StringEntry::new("line", "Hello", script.clone());
+        entry.translation = Some("Hola".into());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+        db.record_injection(Some("es"), &game, std::slice::from_ref(&script))
+            .unwrap();
+
+        let output = base.path().join("out.zip");
+        let sentinel = b"existing-patch-sentinel";
+        fs::write(&output, sentinel).unwrap();
+
+        let err = pack_injection_recording(
+            &db,
+            pack_opts(
+                game,
+                output.clone(),
+                pristine,
+                base.path().join("project.db"),
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("script.rpy") && err.contains("cannot hash original"),
+            "{err}"
+        );
+        assert_eq!(fs::read(&output).unwrap(), sentinel);
+        assert_eq!(fs::read_to_string(&script).unwrap(), "Hola");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pack_share_locked_original_fails_and_keeps_existing_zip() {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let game = base.path().join("game");
+        let pristine = base.path().join("pristine");
+        fs::create_dir(&game).unwrap();
+        fs::create_dir(&pristine).unwrap();
+        let script = game.join("script.rpy");
+        let original = pristine.join("script.rpy");
+        fs::write(&script, "Hola").unwrap();
+        fs::write(&original, "Hello").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = StringEntry::new("line", "Hello", script.clone());
+        entry.translation = Some("Hola".into());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+        db.record_injection(Some("es"), &game, std::slice::from_ref(&script))
+            .unwrap();
+
+        let output = base.path().join("out.zip");
+        let sentinel = b"existing-patch-sentinel";
+        fs::write(&output, sentinel).unwrap();
+
+        let err = {
+            let _exclusive = OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&original)
+                .unwrap();
+            pack_injection_recording(
+                &db,
+                pack_opts(
+                    game,
+                    output.clone(),
+                    pristine,
+                    base.path().join("project.db"),
+                ),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(
+            err.contains("script.rpy") && err.contains("cannot hash original"),
+            "{err}"
+        );
+        assert_eq!(fs::read(&output).unwrap(), sentinel);
+        assert_eq!(fs::read_to_string(&original).unwrap(), "Hello");
     }
 }

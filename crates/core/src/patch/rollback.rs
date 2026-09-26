@@ -25,15 +25,47 @@ pub struct RollbackReport {
     /// Added files that looked user-edited (receipt path) and were kept because
     /// confirmation was required and not given.
     pub aborted_edited: Vec<String>,
-    /// Added files deleted as torn-by-interrupted-apply (journal path).
+    /// Changed added files explicitly authorized for deletion after an
+    /// interrupted operation. The field name is retained for API compatibility;
+    /// a hash mismatch alone cannot distinguish torn bytes from a user edit.
     pub torn_deleted: Vec<String>,
 }
 
 /// Roll a game back using the backup manifest as the sole restore authority.
 pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackReport> {
-    let store = PatchStore::new(game_root);
+    let game_lock = super::lock::GameLock::acquire(game_root)?;
+    rollback_under_lock(&game_lock, opts)
+}
 
-    match store.status()? {
+/// Caller must hold GameLock for this canonical root across the complete
+/// rollback-and-reapply transition. Never reenter the public locking wrapper.
+pub(super) fn rollback_under_lock(
+    game_lock: &super::lock::GameLock,
+    opts: RollbackOptions,
+) -> Result<RollbackReport> {
+    crate::injection_transaction::ensure_no_pending_under_lock(game_lock)?;
+    let game_root = game_lock.root();
+    super::zipsec::ensure_safe_store(game_root)?;
+    let store = PatchStore::new(game_root);
+    let status = store.status()?;
+    // One immutable restore plan, validated in every state before the first
+    // added-file deletion, restored destination, or rolling-back marker.
+    let backup_manifest = store.read_backup_manifest()?;
+    if let Some(backup) = &backup_manifest {
+        store.preflight_restore(backup)?;
+    }
+    let (added, dirs) = match &status {
+        PatchStatus::Patched(receipt) => (&receipt.added[..], &receipt.created_dirs[..]),
+        PatchStatus::Interrupted(journal) => {
+            (&journal.plan.added[..], &journal.plan.created_dirs[..])
+        }
+        _ => (&[][..], &[][..]),
+    };
+    for path in added.iter().map(|file| &file.path).chain(dirs.iter()) {
+        super::zipsec::ensure_no_links(game_root, &safe_stored_rel(path)?)?;
+    }
+
+    match status {
         PatchStatus::NotPatched => Ok(RollbackReport {
             restored: 0,
             deleted: 0,
@@ -44,7 +76,7 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
         }),
         PatchStatus::Unknown => {
             // S6a: valid backup, no receipt → restore-only with force/confirm.
-            if let Some(bm) = store.read_backup_manifest()? {
+            if let Some(bm) = &backup_manifest {
                 if !opts.delete_modified_added {
                     return Err(LocustError::PatchVerificationFailed(
                         "backup exists but receipt is missing — added files cannot be identified. \
@@ -52,7 +84,7 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                             .into(),
                     ));
                 }
-                return restore_manifest_only(&store, &bm, vec![], true);
+                return restore_manifest_only(&store, bm, vec![], true);
             }
             Err(LocustError::PatchBackupIncomplete(
                 "no backup found — factory pristine is unrecoverable".into(),
@@ -60,17 +92,12 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
         }
         PatchStatus::Interrupted(journal) => {
             // Journal-driven path.
-            let Some(bm) = store.read_backup_manifest()? else {
+            let Some(bm) = &backup_manifest else {
                 return Err(LocustError::PatchBackupIncomplete(
                     "interrupted apply has no valid backup/manifest.json — refusing".into(),
                 ));
             };
-            // Write rolling-back journal state (best-effort marker).
-            let mut j = journal.clone();
-            j.state = JournalState::RollingBack;
-            store.write_journal(&j)?;
-
-            let mut torn = Vec::new();
+            let mut edited = Vec::new();
             let mut delete_set = Vec::new();
             let manifest_paths: std::collections::HashSet<_> =
                 bm.files.iter().map(|f| f.path.clone()).collect();
@@ -84,14 +111,34 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                 if target.is_file() {
                     let h = sha256_path(&target)?;
                     if h != a.patched_sha256 {
-                        // Torn by interrupted apply — delete without confirmation.
-                        torn.push(a.path.clone());
+                        // Interruption cannot prove ownership of changed bytes:
+                        // the user may have edited this file after the crash.
+                        edited.push(a.path.clone());
                     }
                     delete_set.push(a.path.clone());
                 } else {
                     // Already absent — fine.
                 }
             }
+
+            if !edited.is_empty() && !opts.delete_modified_added {
+                return Ok(RollbackReport {
+                    restored: 0,
+                    deleted: 0,
+                    baseline: Some(bm.baseline),
+                    messages: vec![format!(
+                        "abort: {} added file(s) differ from the interrupted patch — pass --force to delete them",
+                        edited.len()
+                    )],
+                    aborted_edited: edited,
+                    torn_deleted: vec![],
+                });
+            }
+
+            // Classification and restore preflight completed without mutation.
+            let mut j = journal.clone();
+            j.state = JournalState::RollingBack;
+            store.write_journal(&j)?;
 
             for p in &delete_set {
                 let rel = safe_stored_rel(p)?;
@@ -107,9 +154,6 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                 restored += 1;
             }
 
-            // Clean tmp strays.
-            clean_locust_tmps(game_root);
-
             let baseline = bm.baseline;
             store.remove_all()?;
 
@@ -119,11 +163,11 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                 baseline: Some(baseline),
                 messages: vec!["interrupted apply rolled back to backup baseline".into()],
                 aborted_edited: vec![],
-                torn_deleted: torn,
+                torn_deleted: edited,
             })
         }
         PatchStatus::Patched(receipt) => {
-            let Some(bm) = store.read_backup_manifest()? else {
+            let Some(bm) = &backup_manifest else {
                 // S8: receipt present, manifest missing — never force-overridable.
                 return Err(LocustError::PatchBackupIncomplete(
                     "receipt present but backup/manifest.json missing or invalid — nothing deleted. \
@@ -132,26 +176,6 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                         .into(),
                 ));
             };
-
-            // Preflight: every backup file present with matching hash.
-            for entry in &bm.files {
-                let src = store
-                    .backup_files_dir()
-                    .join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-                if !src.is_file() {
-                    return Err(LocustError::PatchBackupIncomplete(format!(
-                        "backup file missing: {}",
-                        entry.path
-                    )));
-                }
-                let h = sha256_path(&src)?;
-                if h != entry.sha256 {
-                    return Err(LocustError::PatchBackupIncomplete(format!(
-                        "backup file corrupt: {}",
-                        entry.path
-                    )));
-                }
-            }
 
             let manifest_paths: std::collections::HashSet<_> =
                 bm.files.iter().map(|f| f.path.clone()).collect();
@@ -217,7 +241,6 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
                 }
             }
 
-            clean_locust_tmps(game_root);
             let baseline = bm.baseline;
             store.remove_all()?;
 
@@ -279,21 +302,4 @@ fn restore_manifest_only(
         aborted_edited: vec![],
         torn_deleted: vec![],
     })
-}
-
-fn clean_locust_tmps(game_root: &Path) {
-    if let Ok(walk) = fs::read_dir(game_root) {
-        // Only clean direct children + one level; full walk is fine for tests.
-        let _ = walk;
-    }
-    // Walk shallow via walkdir if available — core already depends on walkdir.
-    for entry in walkdir::WalkDir::new(game_root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let name = entry.file_name().to_string_lossy();
-        if name.ends_with(".locust-tmp") || name.starts_with(".locust-probe-") {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
 }

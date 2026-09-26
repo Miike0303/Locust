@@ -5,7 +5,6 @@ use serde::Serialize;
 use crate::database::Database;
 use crate::error::Result;
 use crate::models::{StringEntry, StringStatus, ValidationIssue, ValidationKind};
-use crate::placeholder::PlaceholderProcessor;
 
 pub struct Validator;
 
@@ -25,6 +24,87 @@ pub fn encoded_byte_len(encoding: &str, text: &str) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+/// Effective per-entry binary capacity. A pivot records an explicit immutable
+/// value; older/non-pivot rows derive it from the physical injection source.
+/// Grouped Unity locale/CSV rows intentionally have no per-cell capacity
+/// because injection validates and pads their rebuilt blob as one unit.
+/// Whole-blob capacity lives in `textasset_group_*` metadata, never here.
+pub fn binary_slot_budget(entry: &StringEntry) -> Result<Option<(String, usize)>> {
+    let source = entry
+        .injection_source()
+        .map_err(|message| crate::error::LocustError::Other(anyhow::anyhow!(message)))?;
+    let grouped = crate::textasset_group::is_grouped_entry(entry);
+    let explicit_capacity = entry
+        .injection_capacity()
+        .map_err(|message| crate::error::LocustError::Other(anyhow::anyhow!(message)))?;
+    if grouped {
+        if let Some((encoding, bytes)) = explicit_capacity {
+            if bytes == 0 || encoded_byte_len(encoding, "").is_none() {
+                return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+                    "entry '{}' has invalid immutable binary capacity",
+                    entry.id
+                )));
+            }
+            if entry
+                .metadata
+                .get("binary_slot")
+                .and_then(|v| v.as_str())
+                .is_some_and(|slot| slot != encoding)
+            {
+                return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+                    "entry '{}' has conflicting binary slot encodings",
+                    entry.id
+                )));
+            }
+        }
+        return Ok(None);
+    }
+    if let Some((encoding, bytes)) = explicit_capacity {
+        if bytes == 0 || encoded_byte_len(encoding, "").is_none() {
+            return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+                "entry '{}' has invalid immutable binary capacity",
+                entry.id
+            )));
+        }
+        if entry
+            .metadata
+            .get("binary_slot")
+            .and_then(|v| v.as_str())
+            .is_some_and(|slot| slot != encoding)
+        {
+            return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+                "entry '{}' has conflicting binary slot encodings",
+                entry.id
+            )));
+        }
+        if encoded_byte_len(encoding, source) != Some(bytes) {
+            return Err(crate::error::LocustError::Other(anyhow::anyhow!(
+                "entry '{}' has binary capacity inconsistent with its physical source",
+                entry.id
+            )));
+        }
+        let capacity = if encoding == "utf8" {
+            crate::textasset_group::structural_textasset_capacity(entry).unwrap_or(bytes)
+        } else {
+            bytes
+        };
+        return Ok(Some((encoding.to_string(), capacity)));
+    }
+    if let Some(capacity) = crate::textasset_group::structural_textasset_capacity(entry) {
+        return Ok(Some(("utf8".to_owned(), capacity)));
+    }
+    let Some(encoding) = entry.metadata.get("binary_slot").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let bytes = encoded_byte_len(encoding, source).ok_or_else(|| {
+        crate::error::LocustError::Other(anyhow::anyhow!(
+            "entry '{}' binary source cannot be encoded as {encoding}",
+            entry.id
+        ))
+    })?;
+    Ok(Some((encoding.to_string(), bytes)))
 }
 
 /// Issues where translation exceeds a tagged binary inject slot
@@ -307,7 +387,32 @@ fn truncate_to_encoded_budget(encoding: &str, budget: usize, text: &str) -> Opti
 impl Validator {
     pub fn validate_entry(entry: &StringEntry) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
+        if let Err(message) = entry.require_current_translation() {
+            issues.push(ValidationIssue {
+                entry_id: entry.id.clone(),
+                kind: ValidationKind::StaleTranslation,
+                message,
+                source: None,
+            });
+        }
         let translation = entry.translation.as_deref().unwrap_or("");
+        let slot_budget = binary_slot_budget(entry);
+        if let Err(error) = &slot_budget {
+            issues.push(ValidationIssue {
+                entry_id: entry.id.clone(),
+                kind: ValidationKind::InvalidInjectionProvenance,
+                message: error.to_string(),
+                source: None,
+            });
+        }
+        if let Err(error) = crate::textasset_group::require_valid_metadata(entry) {
+            issues.push(ValidationIssue {
+                entry_id: entry.id.clone(),
+                kind: ValidationKind::InvalidInjectionProvenance,
+                message: error.to_string(),
+                source: None,
+            });
+        }
 
         // Check 1 — EmptyTranslation
         if translation.trim().is_empty() && entry.status == StringStatus::Translated {
@@ -342,41 +447,56 @@ impl Validator {
             }
         }
 
-        // Check 4 — Placeholder mismatches
-        if !translation.is_empty() {
-            let mismatches = PlaceholderProcessor::validate(&entry.source, translation);
-            for m in mismatches {
-                let kind = match m.kind {
-                    crate::placeholder::MismatchKind::Missing => {
-                        ValidationKind::MissingPlaceholder {
-                            placeholder: m.placeholder.clone(),
+        // Check 4 — Controls must agree with semantic AND physical sources.
+        match entry.translation_control_mismatches() {
+            Ok(mismatches) => {
+                for m in mismatches {
+                    let kind = match m.kind {
+                        crate::placeholder::MismatchKind::Missing
+                        | crate::placeholder::MismatchKind::Unbalanced => {
+                            ValidationKind::MissingPlaceholder {
+                                placeholder: m.placeholder.clone(),
+                            }
                         }
-                    }
-                    crate::placeholder::MismatchKind::Extra => ValidationKind::ExtraPlaceholder {
-                        placeholder: m.placeholder.clone(),
-                    },
-                };
-                issues.push(ValidationIssue {
-                    entry_id: entry.id.clone(),
-                    kind,
-                    message: format!("placeholder mismatch: {}", m.placeholder),
-                    source: None,
-                });
+                        crate::placeholder::MismatchKind::Extra => {
+                            ValidationKind::ExtraPlaceholder {
+                                placeholder: m.placeholder.clone(),
+                            }
+                        }
+                    };
+                    let message = if m.kind == crate::placeholder::MismatchKind::Unbalanced {
+                        format!("unbalanced control structure: {}", m.placeholder)
+                    } else {
+                        format!(
+                            "placeholder mismatch against semantic or physical source: {}",
+                            m.placeholder
+                        )
+                    };
+                    issues.push(ValidationIssue {
+                        entry_id: entry.id.clone(),
+                        kind,
+                        message,
+                        source: None,
+                    });
+                }
             }
+            Err(message) => issues.push(ValidationIssue {
+                entry_id: entry.id.clone(),
+                kind: ValidationKind::InvalidInjectionProvenance,
+                message,
+                source: None,
+            }),
         }
 
         // Check 5 — Binary inject slot (Unity UTF-8 / Unreal UTF-16LE / Wolf SJIS)
         if !translation.is_empty() {
-            if let Some(enc) = entry.metadata.get("binary_slot").and_then(|v| v.as_str()) {
-                if let (Some(src_len), Some(tr_len)) = (
-                    encoded_byte_len(enc, &entry.source),
-                    encoded_byte_len(enc, translation),
-                ) {
+            if let Ok(Some((enc, src_len))) = slot_budget {
+                if let Some(tr_len) = encoded_byte_len(&enc, translation) {
                     if tr_len > src_len {
                         issues.push(ValidationIssue {
                             entry_id: entry.id.clone(),
                             kind: ValidationKind::ExceedsBinarySlot {
-                                encoding: enc.to_string(),
+                                encoding: enc.clone(),
                                 limit: src_len,
                                 actual: tr_len,
                             },
@@ -394,7 +514,10 @@ impl Validator {
     }
 
     pub fn validate_all(entries: &[StringEntry]) -> Vec<ValidationIssue> {
-        entries.iter().flat_map(Self::validate_entry).collect()
+        let mut issues: Vec<ValidationIssue> =
+            entries.iter().flat_map(Self::validate_entry).collect();
+        issues.extend(crate::textasset_group::group_validation_issues(entries));
+        issues
     }
 
     pub async fn validate_and_save(
@@ -427,6 +550,8 @@ impl Validator {
                 ValidationKind::ExceedsBinarySlot { .. } => "ExceedsBinarySlot",
                 ValidationKind::EmptyTranslation => "EmptyTranslation",
                 ValidationKind::IdenticalToSource => "IdenticalToSource",
+                ValidationKind::InvalidInjectionProvenance => "InvalidInjectionProvenance",
+                ValidationKind::StaleTranslation => "StaleTranslation",
             };
             *by_kind.entry(kind_name.to_string()).or_insert(0) += 1;
         }
@@ -555,11 +680,141 @@ mod tests {
     }
 
     #[test]
+    fn pivot_capacity_remains_anchored_to_physical_source() {
+        let mut entry = make_entry("e1", "English", Some("Ten bytes!"));
+        entry.metadata.insert(
+            crate::models::INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("日本語文"),
+        );
+        entry.metadata.insert(
+            crate::models::INJECTION_CAPACITY_METADATA_KEY.into(),
+            serde_json::json!({"encoding": "utf8", "bytes": 12}),
+        );
+        entry
+            .metadata
+            .insert("binary_slot".into(), serde_json::json!("utf8"));
+        assert_eq!(
+            binary_slot_budget(&entry).unwrap(),
+            Some(("utf8".into(), 12))
+        );
+        assert!(!Validator::validate_entry(&entry)
+            .iter()
+            .any(|i| matches!(i.kind, ValidationKind::ExceedsBinarySlot { .. })));
+    }
+
+    #[test]
+    fn grouped_unity_rows_have_no_phantom_cell_budget() {
+        let original = "ID,NAME\n1,A\n2,B\n                    ";
+        let mut entry = make_entry("cell", "A", Some("Longer localized cell"));
+        entry
+            .metadata
+            .insert("binary_slot".into(), serde_json::json!("utf8"));
+        entry.metadata.insert(
+            "extraction_method".into(),
+            serde_json::json!("textasset_csv_cell"),
+        );
+        entry
+            .metadata
+            .insert("csv_row".into(), serde_json::json!(1));
+        entry
+            .metadata
+            .insert("csv_col".into(), serde_json::json!(1));
+        entry
+            .metadata
+            .insert("csv_header".into(), serde_json::json!("NAME"));
+        crate::textasset_group::attach_to_entries(
+            std::slice::from_mut(&mut entry),
+            crate::textasset_group::GroupKind::Csv,
+            original,
+            original.len(),
+            "g-csv-budget",
+        );
+        assert_eq!(binary_slot_budget(&entry).unwrap(), None);
+        assert!(!Validator::validate_entry(&entry).iter().any(|i| matches!(
+            i.kind,
+            ValidationKind::ExceedsBinarySlot { .. } | ValidationKind::InvalidInjectionProvenance
+        )));
+    }
+
+    #[test]
+    fn grouped_textasset_validate_all_flags_shared_oversize() {
+        let original = "Menu.A: Hi\nMenu.B: Go\n";
+        let mut a = make_entry("a", "Hi", Some("Hola!!!!"));
+        let mut b = make_entry("b", "Go", Some("Vamos"));
+        for (entry, key, index) in [(&mut a, "Menu.A", 0usize), (&mut b, "Menu.B", 1usize)] {
+            entry.metadata.insert(
+                "extraction_method".into(),
+                serde_json::json!("textasset_loc_line"),
+            );
+            entry
+                .metadata
+                .insert("loc_key".into(), serde_json::json!(key));
+            entry
+                .metadata
+                .insert("line_index".into(), serde_json::json!(index));
+            entry
+                .metadata
+                .insert("binary_slot".into(), serde_json::json!("utf8"));
+        }
+        let mut members = vec![a, b];
+        crate::textasset_group::attach_to_entries(
+            &mut members,
+            crate::textasset_group::GroupKind::LocLine,
+            original,
+            original.len(),
+            "g-oversize",
+        );
+        let issues = Validator::validate_all(&members);
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i.kind, ValidationKind::ExceedsBinarySlot { .. })),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn grouped_malformed_metadata_is_provenance_error() {
+        let mut entry = make_entry("cell", "A", Some("Bee"));
+        entry.metadata.insert(
+            "extraction_method".into(),
+            serde_json::json!("textasset_loc_line"),
+        );
+        assert!(binary_slot_budget(&entry).unwrap().is_none());
+        assert!(Validator::validate_entry(&entry)
+            .iter()
+            .any(|i| matches!(i.kind, ValidationKind::InvalidInjectionProvenance)));
+    }
+
+    #[test]
     fn test_encoded_byte_len_sjis() {
         let n = encoded_byte_len("sjis", "テスト").unwrap();
         assert_eq!(n, 6); // 3 CJK × 2 SJIS
         assert!(encoded_byte_len("utf16le", "テスト").unwrap() == 6);
         assert!(encoded_byte_len("utf8", "テスト").unwrap() == 9);
+    }
+
+    #[test]
+    fn malformed_pivot_provenance_is_reported_even_without_binary_slots() {
+        let mut entry = make_entry("html", "English", Some("Español"));
+        entry.metadata.insert(
+            crate::models::INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!(42),
+        );
+        assert!(binary_slot_budget(&entry).is_err());
+        assert!(Validator::validate_entry(&entry)
+            .iter()
+            .any(|issue| matches!(issue.kind, ValidationKind::InvalidInjectionProvenance)));
+
+        entry.metadata.insert(
+            crate::models::INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("日本語文"),
+        );
+        entry.metadata.insert(
+            crate::models::INJECTION_CAPACITY_METADATA_KEY.into(),
+            serde_json::json!({"encoding":"utf8", "bytes":100}),
+        );
+        assert!(binary_slot_budget(&entry).is_err());
     }
 
     #[test]
@@ -674,5 +929,20 @@ mod tests {
         assert_eq!(report.total_checked, 2);
         assert_eq!(report.issues_found, 1);
         assert_eq!(report.entries_with_issues, 1);
+    }
+    #[test]
+    fn control_repro_validation_checks_physical_source_even_when_english_lost_control() {
+        let mut entry = make_entry("line", "Hello", Some("Hola"));
+        entry.metadata.insert(
+            crate::models::INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("JA {name}"),
+        );
+        assert!(Validator::validate_entry(&entry)
+            .iter()
+            .any(|i| matches!(i.kind, ValidationKind::MissingPlaceholder { .. })));
+        entry.translation = Some(String::new());
+        assert!(Validator::validate_entry(&entry)
+            .iter()
+            .any(|i| matches!(i.kind, ValidationKind::MissingPlaceholder { .. })));
     }
 }

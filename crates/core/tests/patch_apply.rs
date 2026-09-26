@@ -679,3 +679,239 @@ fn identity_patch_on_pristine_game_is_clean_not_unknown() {
     assert_eq!(report.replaced, 1);
     let _ = fs::remove_dir_all(&game);
 }
+
+/// Compare every file and directory, including recovery markers and backup bytes.
+fn snapshot_patch_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let rel = entry.path().strip_prefix(root).unwrap().to_path_buf();
+            let bytes = entry
+                .file_type()
+                .is_file()
+                .then(|| fs::read(entry.path()).unwrap());
+            (rel, bytes)
+        })
+        .collect()
+}
+
+#[cfg(any(unix, windows))]
+fn link_directory(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "New-Item -ItemType Junction -Path $env:LOCUST_TEST_LINK -Target $env:LOCUST_TEST_TARGET -ErrorAction Stop | Out-Null"])
+            .env("LOCUST_TEST_LINK", link).env("LOCUST_TEST_TARGET", target)
+            .creation_flags(0x08000000).output().unwrap();
+        assert!(
+            output.status.success(),
+            "junction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn apply_and_rollback_reject_linked_game_directories() {
+    let game = tmp_game("linked_game");
+    let outside = tmp_game("linked_external");
+    write_file(&outside, "base.json", b"ORIGINAL");
+    link_directory(&outside, &game.join("data"));
+    let zip = game.join("patch.zip");
+    build_patch_zip(
+        &zip,
+        &[("data/base.json", b"PATCHED", Some(b"ORIGINAL"))],
+        "1.0.0",
+        "id1",
+    );
+    assert!(matches!(
+        apply(&game, &zip, ApplyOptions::default(), |_| {}),
+        Err(LocustError::PatchUnsafeEntry(_))
+    ));
+    assert_eq!(fs::read(outside.join("base.json")).unwrap(), b"ORIGINAL");
+    assert!(!game.join(".locust").exists());
+    // Remove the link itself, never recursively delete through the junction.
+    #[cfg(windows)]
+    fs::remove_dir(game.join("data")).unwrap();
+    #[cfg(unix)]
+    fs::remove_file(game.join("data")).unwrap();
+    write_file(&game, "data/base.json", b"ORIGINAL");
+    apply(&game, &zip, ApplyOptions::default(), |_| {}).unwrap();
+    fs::rename(game.join("data"), outside.join("installed-data")).unwrap();
+    link_directory(&outside.join("installed-data"), &game.join("data"));
+    let receipt = fs::read(game.join(".locust/receipt.json")).unwrap();
+    assert!(matches!(
+        rollback(&game, RollbackOptions::default()),
+        Err(LocustError::PatchUnsafeEntry(_))
+    ));
+    assert_eq!(
+        fs::read(outside.join("installed-data/base.json")).unwrap(),
+        b"PATCHED"
+    );
+    assert_eq!(
+        fs::read(game.join(".locust/receipt.json")).unwrap(),
+        receipt
+    );
+    #[cfg(windows)]
+    fs::remove_dir(game.join("data")).unwrap();
+    #[cfg(unix)]
+    fs::remove_file(game.join("data")).unwrap();
+    fs::remove_dir_all(game).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn selected_game_root_can_be_a_directory_link() {
+    let parent = tmp_game("linked_root_parent");
+    let game = tmp_game("linked_root_target");
+    write_file(&game, "base.json", b"ORIGINAL");
+    let link = parent.join("game");
+    link_directory(&game, &link);
+    let zip = parent.join("patch.zip");
+    build_patch_zip(
+        &zip,
+        &[("base.json", b"PATCHED", Some(b"ORIGINAL"))],
+        "1.0.0",
+        "id1",
+    );
+    apply(&link, &zip, ApplyOptions::default(), |_| {}).unwrap();
+    assert_eq!(fs::read(game.join("base.json")).unwrap(), b"PATCHED");
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_ne!(
+            fs::metadata(game.join(".locust"))
+                .unwrap()
+                .file_attributes()
+                & 0x2,
+            0
+        );
+    }
+    rollback(&link, RollbackOptions::default()).unwrap();
+    assert_eq!(fs::read(game.join("base.json")).unwrap(), b"ORIGINAL");
+    #[cfg(windows)]
+    fs::remove_dir(link).unwrap();
+    #[cfg(unix)]
+    fs::remove_file(link).unwrap();
+    fs::remove_dir_all(parent).unwrap();
+    fs::remove_dir_all(game).unwrap();
+}
+
+#[test]
+fn patch_cannot_overwrite_its_own_recovery_files() {
+    let game = tmp_game("reserved_store");
+    let zip = game.join("patch.zip");
+    build_patch_zip(
+        &zip,
+        &[(".locust/receipt.json", b"FAKE", None)],
+        "1.0.0",
+        "id1",
+    );
+    assert!(matches!(
+        apply(
+            &game,
+            &zip,
+            ApplyOptions {
+                force: true,
+                ..Default::default()
+            },
+            |_| {}
+        ),
+        Err(LocustError::PatchUnsafeEntry(_))
+    ));
+    assert!(!game.join(".locust").exists());
+    fs::remove_dir_all(game).unwrap();
+}
+
+#[test]
+fn dry_run_patch_transitions_preserve_installed_files_and_recovery_metadata() {
+    // Cover upgrade, forced downgrade, different patch id, and forced same-version
+    // reapply with a changed file set. Each used to enter rollback before dry_run.
+    for (name, incoming_version, incoming_id, force, drift) in [
+        ("upgrade", "2.0.0", "id1", false, false),
+        ("downgrade", "0.5.0", "id1", true, false),
+        ("different_id", "1.0.0", "id2", true, false),
+        ("file_set_drift", "1.0.0", "id1", true, true),
+    ] {
+        let game = tmp_game(name);
+        write_file(&game, "data/base.json", b"ORIGINAL");
+        let old_zip = game.join("old.zip");
+        build_patch_zip(
+            &old_zip,
+            &[
+                ("data/base.json", b"FIRST", Some(b"ORIGINAL")),
+                ("data/added.json", b"FIRST_ADD", None),
+            ],
+            "1.0.0",
+            "id1",
+        );
+        apply(&game, &old_zip, ApplyOptions::default(), |_| {}).unwrap();
+        let incoming_zip = game.join("incoming.zip");
+        let added_path = if drift {
+            "data/other.json"
+        } else {
+            "data/added.json"
+        };
+        build_patch_zip(
+            &incoming_zip,
+            &[
+                ("data/base.json", b"SECOND", Some(b"ORIGINAL")),
+                (added_path, b"SECOND_ADD", None),
+            ],
+            incoming_version,
+            incoming_id,
+        );
+        let before = snapshot_patch_tree(&game);
+        let err = apply(
+            &game,
+            &incoming_zip,
+            ApplyOptions {
+                dry_run: true,
+                force,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LocustError::PatchVerificationFailed(_)),
+            "{name}: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("dry-run cannot preview"),
+            "{name}: {err}"
+        );
+        assert_eq!(
+            snapshot_patch_tree(&game),
+            before,
+            "{name}: dry-run mutated game/recovery files"
+        );
+
+        // Normal transitions retain their existing behavior, including recovery.
+        apply(
+            &game,
+            &incoming_zip,
+            ApplyOptions {
+                force,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(fs::read(game.join("data/base.json")).unwrap(), b"SECOND");
+        let rb = rollback(&game, RollbackOptions::default()).unwrap();
+        assert!(rb.aborted_edited.is_empty());
+        assert_eq!(fs::read(game.join("data/base.json")).unwrap(), b"ORIGINAL");
+        assert!(!game.join("data/added.json").exists());
+        assert!(!game.join("data/other.json").exists());
+        assert!(!game.join(".locust").exists());
+        // Leave the fixture for diagnosis on failure; cleanup only after success.
+        fs::remove_dir_all(&game).unwrap();
+    }
+}

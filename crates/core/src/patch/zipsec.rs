@@ -9,8 +9,9 @@ use crate::error::{LocustError, Result};
 
 /// Windows reserved device names (case-insensitive), with or without extension.
 const RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+    "LPT9",
 ];
 
 /// Normalize a zip entry name before any security or extraction work.
@@ -55,7 +56,7 @@ fn is_reserved_device(name: &str) -> bool {
 /// NTFS ADS (`:`), reserved device names, and any resolution that would
 /// escape `game_root`.
 pub fn safe_entry_path(normalized: &str, original: &str) -> Result<PathBuf> {
-    if normalized.is_empty() || normalized == "/" {
+    if normalized.is_empty() || normalized.starts_with('/') {
         return Err(LocustError::PatchUnsafeEntry(original.to_string()));
     }
 
@@ -89,6 +90,13 @@ pub fn safe_entry_path(normalized: &str, original: &str) -> Result<PathBuf> {
     if components.is_empty() {
         return Err(LocustError::PatchUnsafeEntry(original.to_string()));
     }
+    if components[0].eq_ignore_ascii_case(".locust")
+        || components[0].eq_ignore_ascii_case(".locust-injections")
+    {
+        return Err(LocustError::PatchUnsafeEntry(format!(
+            "reserved recovery directory: {original}"
+        )));
+    }
 
     // First component must not itself be a root/prefix marker.
     if matches!(
@@ -99,6 +107,14 @@ pub fn safe_entry_path(normalized: &str, original: &str) -> Result<PathBuf> {
     }
 
     Ok(components.iter().collect())
+}
+
+/// Canonical game-relative ZIP key, used identically for metadata and content.
+pub(crate) fn canonical_archive_name(raw: &str) -> Result<String> {
+    let normalized = normalize_entry_name(raw);
+    Ok(safe_entry_path(&normalized, raw)?
+        .to_string_lossy()
+        .replace('\\', "/"))
 }
 
 /// Case-insensitive path key for detecting duplicate zip entries that would
@@ -114,6 +130,55 @@ pub fn case_fold_key(path: &Path) -> String {
 pub fn safe_stored_rel(rel: &str) -> Result<PathBuf> {
     let normalized = normalize_entry_name(rel);
     safe_entry_path(&normalized, rel)
+}
+
+/// Lexical zip checks are insufficient when a directory inside the game is a
+/// symlink or Windows junction. Refuse existing linked components, including
+/// dangling links, before reading/backing up/replacing a patch target.
+pub fn ensure_no_links(root: &Path, rel: &Path) -> Result<()> {
+    let mut path = root.to_path_buf();
+    check_not_link(&path)?;
+    for component in rel.components() {
+        let Component::Normal(name) = component else {
+            return Err(LocustError::PatchUnsafeEntry(rel.display().to_string()));
+        };
+        path.push(name);
+        check_not_link(&path)?;
+    }
+    Ok(())
+}
+
+fn check_not_link(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let linked = metadata.file_type().is_symlink();
+    #[cfg(windows)]
+    let linked = {
+        use std::os::windows::fs::MetadataExt;
+        linked || metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    };
+    if linked {
+        return Err(LocustError::PatchUnsafeEntry(format!(
+            "linked game path: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+pub fn ensure_safe_store(root: &Path) -> Result<()> {
+    ensure_no_links(root, Path::new(".locust"))?;
+    let store = root.join(".locust");
+    if store.exists() {
+        for entry in walkdir::WalkDir::new(&store).follow_links(false) {
+            let entry = entry.map_err(|e| LocustError::PatchError(e.to_string()))?;
+            check_not_link(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 // ── Uncompressed size budgets (zip-bomb / DoS) ─────────────────────────────
@@ -283,6 +348,16 @@ mod tests {
 
     #[test]
     fn rejects_absolute_and_drive() {
+        for path in [
+            "/etc/passwd",
+            "//server/share/file",
+            ".locust/receipt.json",
+            ".locust-injections/active.json",
+            ".LOCUST-INJECTIONS/store.json",
+            ".LOCUST/backup/files/game.json",
+        ] {
+            assert!(safe_entry_path(path, path).is_err(), "accepted {path}");
+        }
         let n = normalize_entry_name("C:/Windows/system32");
         // After normalize: C:/Windows/system32 — colon rejected.
         assert!(safe_entry_path(&n, "C:/Windows/system32").is_err());
@@ -296,10 +371,20 @@ mod tests {
 
     #[test]
     fn rejects_reserved_device() {
-        let n = normalize_entry_name("game/CON");
-        assert!(safe_entry_path(&n, "game/CON").is_err());
-        let n2 = normalize_entry_name("game/nul.txt");
-        assert!(safe_entry_path(&n2, "game/nul.txt").is_err());
+        for path in [
+            "game/CON",
+            "game/nul.txt",
+            "game/CONIN$",
+            "game/conout$",
+            "game/ConIn$.txt",
+            "game/sub/CONOUT$.log",
+        ] {
+            let normalized = normalize_entry_name(path);
+            assert!(
+                safe_entry_path(&normalized, path).is_err(),
+                "accepted reserved device {path}"
+            );
+        }
     }
 
     #[test]
