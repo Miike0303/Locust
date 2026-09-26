@@ -18,6 +18,19 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    pub(crate) fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
+    fn api_url(&self, path: &str) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") || base.ends_with("/openai") {
+            format!("{base}/{path}")
+        } else {
+            format!("{base}/v1/{path}")
+        }
+    }
     pub fn new(api_key: String, model: Option<String>, base_url: Option<String>) -> Self {
         Self {
             api_key,
@@ -105,14 +118,44 @@ pub(crate) fn parse_json_array(text: &str) -> std::result::Result<Vec<String>, S
     }
     // Lenient: find first [ and last ]
     if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
-        let substr = &text[start..=end];
-        if let Ok(arr) = serde_json::from_str::<Vec<String>>(substr) {
-            return Ok(arr);
+        if start <= end {
+            let substr = &text[start..=end];
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(substr) {
+                return Ok(arr);
+            }
         }
     }
     Err(format!(
         "could not parse JSON array from response: {}",
         text
+    ))
+}
+
+/// Keep the existing ordered-array response contract while carrying metadata
+/// for EVERY source. A short UI slot must not become the entire batch's limit.
+pub(crate) fn build_batch_prompt(requests: &[TranslationRequest]) -> Result<(String, String)> {
+    let Some(first) = requests.first() else {
+        return Err(LocustError::ProviderError("empty translation batch".into()));
+    };
+    if requests
+        .iter()
+        .any(|r| r.source_lang != first.source_lang || r.target_lang != first.target_lang)
+    {
+        return Err(LocustError::ProviderError(
+            "mixed languages in translation batch".into(),
+        ));
+    }
+    let mut shared = first.clone();
+    shared.context = None;
+    shared.glossary_hint = None;
+    let mut system = build_system_prompt(&shared);
+    system.push_str("\nInput is an array of records. Translate only each record's source. Its context and glossary apply only to that record. Return a JSON array of translated STRINGS in input order, one string per record; do not translate the metadata or return objects.");
+    let records: Vec<_> = requests.iter().enumerate().map(|(index, r)| {
+        serde_json::json!({"index": index, "source": r.source, "context": r.context, "glossary": r.glossary_hint})
+    }).collect();
+    Ok((
+        system,
+        serde_json::to_string(&records).map_err(|e| LocustError::ProviderError(e.to_string()))?,
     ))
 }
 
@@ -174,10 +217,7 @@ impl TranslationProvider for OpenAiProvider {
             return Ok(Vec::new());
         }
 
-        let system_prompt = build_system_prompt(&requests[0]);
-        let sources: Vec<&str> = requests.iter().map(|r| r.source.as_str()).collect();
-        let user_content = serde_json::to_string(&sources)
-            .map_err(|e| LocustError::ProviderError(e.to_string()))?;
+        let (system_prompt, user_content) = build_batch_prompt(requests)?;
 
         let body = ChatRequest {
             model: self.model.clone(),
@@ -195,7 +235,7 @@ impl TranslationProvider for OpenAiProvider {
 
         let resp = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
+            .post(self.api_url("chat/completions"))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&body)
             .send()
@@ -274,7 +314,8 @@ impl TranslationProvider for OpenAiProvider {
     async fn health_check(&self) -> Result<()> {
         let resp = self
             .client
-            .get(format!("{}/v1/models", self.base_url))
+            .get(self.api_url("models"))
+            .timeout(std::time::Duration::from_secs(30))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await
@@ -297,6 +338,81 @@ impl TranslationProvider for OpenAiProvider {
 mod tests {
     use super::*;
     use httpmock::prelude::*;
+
+    #[test]
+    fn malformed_brackets_return_an_error_instead_of_panicking() {
+        assert!(parse_json_array("] before [").is_err());
+        assert!(parse_json_array("nothing to parse").is_err());
+    }
+
+    #[test]
+    fn batch_keeps_different_contexts_and_glossaries_scoped_to_their_sources() {
+        let first = make_request(Some("HARD MAX 4 bytes"), Some("Play = Juga"));
+        let mut second = make_request(
+            Some("A long line of dialogue, no width restriction"),
+            Some("castle = castillo"),
+        );
+        second.entry_id = "e2".into();
+        second.source = "The castle is over the hill".into();
+        let (system, input) = build_batch_prompt(&[first, second]).unwrap();
+        assert!(!system.contains("HARD MAX"));
+        assert!(!system.contains("Play = Juga"));
+        let records: serde_json::Value = serde_json::from_str(&input).unwrap();
+        assert_eq!(records[0]["context"], "HARD MAX 4 bytes");
+        assert_eq!(records[1]["source"], "The castle is over the hill");
+        assert_eq!(records[1]["glossary"], "castle = castillo");
+        assert_eq!(
+            records[1]["context"],
+            "A long line of dialogue, no width restriction"
+        );
+    }
+
+    #[tokio::test]
+    async fn versioned_base_url_does_not_duplicate_v1() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(serde_json::json!({"choices":[{"message":{"content":"[\"Hola\"]"}}]}));
+        });
+        let provider = OpenAiProvider::new(
+            "test".into(),
+            None,
+            Some(format!("{}/v1/", server.base_url())),
+        );
+        let result = provider
+            .translate(&[make_request(None, None)])
+            .await
+            .unwrap();
+        assert_eq!(result[0].translation, "Hola");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn gemini_compatible_prefix_is_used_without_extra_v1() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1beta/openai/chat/completions");
+            then.status(200)
+                .json_body(serde_json::json!({"choices":[{"message":{"content":"[\"Hola\"]"}}]}));
+        });
+        let provider = OpenAiProvider::compatible(
+            "gemini".into(),
+            "Gemini".into(),
+            "test".into(),
+            format!("{}/v1beta/openai", server.base_url()),
+            "test-model".into(),
+        );
+        assert_eq!(
+            provider
+                .translate(&[make_request(None, None)])
+                .await
+                .unwrap()[0]
+                .translation,
+            "Hola"
+        );
+        mock.assert();
+    }
 
     fn make_provider(server: &MockServer) -> OpenAiProvider {
         OpenAiProvider::new("test-key".to_string(), None, Some(server.base_url()))

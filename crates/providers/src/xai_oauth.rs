@@ -331,6 +331,7 @@ async fn refresh(tokens: &TokenStore) -> Result<TokenStore> {
     let client = reqwest::Client::new();
     let resp = client
         .post(TOKEN_URL)
+        .timeout(Duration::from_secs(30))
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", tokens.refresh_token.as_str()),
@@ -365,19 +366,22 @@ async fn refresh(tokens: &TokenStore) -> Result<TokenStore> {
 /// an OpenAI-compatible client built with a fresh OAuth bearer token.
 pub struct GrokSubscriptionProvider {
     model: String,
+    client: reqwest::Client,
 }
 
 impl GrokSubscriptionProvider {
     pub fn new(model: Option<String>) -> Self {
         Self {
-            // Non-reasoning variant: ~8x faster and ~3.5x fewer tokens than the
-            // reasoning models for translation, with equivalent quality (Grok's
-            // chain-of-thought is wasted effort on straight translation).
-            model: model.unwrap_or_else(|| "grok-4.20-0309-non-reasoning".to_string()),
+            model: model.unwrap_or_else(|| "grok-4.6".to_string()),
+            client: reqwest::Client::new(),
         }
     }
 
     async fn delegate(&self) -> Result<OpenAiProvider> {
+        // Concurrent batches must not rotate the same refresh token at once.
+        // Re-read after acquiring the gate so later batches see the new token.
+        static REFRESH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let guard = REFRESH_GATE.lock().await;
         let tokens = load_tokens().ok_or_else(|| {
             LocustError::ProviderError(
                 "not logged in to xAI — run `locust auth grok` first".to_string(),
@@ -388,14 +392,15 @@ impl GrokSubscriptionProvider {
         } else {
             tokens
         };
-        // ponytail: builds a client per batch; batches take seconds, this is noise
+        drop(guard);
         Ok(OpenAiProvider::compatible(
             "grok-sub".to_string(),
             "Grok (subscription)".to_string(),
             tokens.access_token,
             API_BASE_URL.to_string(),
             self.model.clone(),
-        ))
+        )
+        .with_client(self.client.clone()))
     }
 }
 

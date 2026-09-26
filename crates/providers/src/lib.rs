@@ -54,7 +54,7 @@ pub const KEY_GATED_PROVIDERS: &[KeyGatedProviderDef] = &[
         id: "grok",
         name: "Grok (xAI)",
         is_free: false,
-        compatible_defaults: Some(("https://api.x.ai", "grok-4-1-fast")),
+        compatible_defaults: Some(("https://api.x.ai", "grok-4.6")),
     },
     KeyGatedProviderDef {
         id: "gemini",

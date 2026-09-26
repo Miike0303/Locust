@@ -23,7 +23,7 @@ impl ClaudeProvider {
     }
 }
 
-use crate::openai::{build_system_prompt, parse_json_array};
+use crate::openai::{build_batch_prompt, parse_json_array};
 
 #[derive(Serialize)]
 struct ClaudeRequest {
@@ -79,10 +79,7 @@ impl TranslationProvider for ClaudeProvider {
             return Ok(Vec::new());
         }
 
-        let system_prompt = build_system_prompt(&requests[0]);
-        let sources: Vec<&str> = requests.iter().map(|r| r.source.as_str()).collect();
-        let user_content = serde_json::to_string(&sources)
-            .map_err(|e| LocustError::ProviderError(e.to_string()))?;
+        let (system_prompt, user_content) = build_batch_prompt(requests)?;
 
         let body = ClaudeRequest {
             model: self.model.clone(),
