@@ -28,7 +28,7 @@ Wall-clock times on this machine:
 | Gate | Result | Time |
 |---|---|---|
 | `npm run build` | pass | 18s |
-| `npm run test:unit` | pass, 31 files | 337s |
+| `npm run test:unit` | pass, 31 files | 17s (was 337s before cycle 31) |
 | `cargo fmt --all --check` | pass | 6s |
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass | 76s |
 | `cargo test --workspace` | 1453 passed, 0 failed, 17 ignored, 59 suites | 104s (warm) |
