@@ -1,4 +1,8 @@
 use std::path::{Path, PathBuf};
+mod config_persistence;
+mod font_patch;
+mod injection_recovery;
+pub use config_persistence::{public_app_config, remember_open_project, update_app_config};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +28,8 @@ use locust_core::database::{
 use locust_core::export;
 use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
 use locust_core::font_validation::{
-    suggestions_for_font_reports, FontCoverageReport, FontValidator,
+    suggestions_for_font_reports, FontAuditIssue, FontAuditReport, FontValidator,
+    FONT_COVERAGE_LIMITATION,
 };
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
@@ -82,13 +87,22 @@ pub const PROJECT_BUSY_MESSAGE: &str =
 pub const INJECT_EMPTY_LANGUAGES_MESSAGE: &str =
     "inject requires at least one language (e.g. [\"es\"])";
 
-/// RAII counter: inject/pivot hold this so open cannot `Database::reopen` mid-op.
+/// Owns the live project until the operation (including detached work) exits.
 pub struct ProjectExclusiveGuard(Arc<AtomicUsize>);
 
 impl ProjectExclusiveGuard {
+    /// Legacy unconditional reservation. New operations should use
+    /// `try_project_operation` to atomically refuse conflicting work.
     pub fn enter(counter: &Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::SeqCst);
         Self(Arc::clone(counter))
+    }
+
+    pub fn try_enter(counter: &Arc<AtomicUsize>) -> Result<Self, &'static str> {
+        counter
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self(Arc::clone(counter)))
+            .map_err(|_| PROJECT_BUSY_MESSAGE)
     }
 }
 
@@ -132,9 +146,10 @@ pub fn active_patch_job_for_game(state: &AppState, game_path: &str) -> Option<St
 
 /// Id of an in-flight translation job, if any.
 ///
-/// Jobs linger in `active_jobs` for 30s after a terminal event so a
-/// reconnecting socket can replay. Only unfinished translations block a
-/// project switch. Patch-apply jobs never touch `state.db`.
+/// Jobs linger for replay after the worker's event stream ends. This is a UI
+/// status query, not admission: cancelled workers may still be draining SQLite
+/// writes and retain their project guard. Use `try_project_operation` to enter.
+/// Patch-apply jobs never touch `state.db`.
 pub fn active_translation_job(state: &AppState) -> Option<String> {
     for job in state.active_jobs.iter() {
         if !matches!(job.kind, JobKind::Translate) {
@@ -152,14 +167,30 @@ pub fn active_translation_job(state: &AppState) -> Option<String> {
     None
 }
 
-fn refuse_if_cannot_switch_project(state: &AppState) -> Result<(), ApiError> {
+/// Shared HTTP/Tauri admission. Acquire before awaiting project/provider state,
+/// and move the returned guard into any detached task that uses the live DB.
+pub fn try_project_operation(state: &AppState) -> Result<ProjectExclusiveGuard, String> {
     if active_translation_job(state).is_some() {
-        return Err(err(StatusCode::CONFLICT, TRANSLATION_IN_FLIGHT_MESSAGE));
+        return Err(TRANSLATION_IN_FLIGHT_MESSAGE.into());
     }
-    if state.project_exclusive.load(Ordering::SeqCst) > 0 {
-        return Err(err(StatusCode::CONFLICT, PROJECT_BUSY_MESSAGE));
-    }
-    Ok(())
+    ProjectExclusiveGuard::try_enter(&state.project_exclusive).map_err(str::to_owned)
+}
+
+/// Keep DB ownership through all awaited writes even if the HTTP/Tauri caller
+/// drops its response future. SQLite's blocking tasks cannot be cancelled.
+pub async fn run_owned_project_operation<T, F>(
+    guard: ProjectExclusiveGuard,
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _guard = guard;
+        operation.await
+    })
+    .await
 }
 
 fn publish_job_event(
@@ -168,9 +199,14 @@ fn publish_job_event(
     event: serde_json::Value,
 ) {
     if let Ok(mut log) = replay.lock() {
+        // Cancellation and the worker race to publish a terminal event. The
+        // first terminal result wins, including for reconnecting WebSockets.
+        if log.last().is_some_and(job_event_is_terminal) {
+            return;
+        }
         log.push(event.clone());
+        let _ = tx.send(event);
     }
-    let _ = tx.send(event);
 }
 
 fn apply_report_json(report: locust_core::patch::ApplyReport) -> serde_json::Value {
@@ -189,11 +225,19 @@ fn apply_report_json(report: locust_core::patch::ApplyReport) -> serde_json::Val
 
 // ─── State ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProjectInfo {
     pub path: PathBuf,
     pub format_id: String,
     pub name: String,
+    #[serde(default)]
+    pub extraction_warnings: Vec<String>,
+    #[serde(default)]
+    pub database_path: Option<PathBuf>,
+    #[serde(default)]
+    pub supported_modes: Vec<OutputMode>,
+    #[serde(default)]
+    pub persistence_warning: Option<String>,
 }
 
 pub struct AppState {
@@ -202,6 +246,10 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub glossary: Arc<Glossary>,
     pub config: Arc<RwLock<AppConfig>>,
+    /// Captured at state creation; tests never write the user's configuration.
+    pub config_path: PathBuf,
+    /// A fallback profile may be read, but never persisted over failed input.
+    pub config_load_failed: bool,
     pub backup_manager: Arc<BackupManager>,
     pub global_memory: Arc<GlobalMemoryDb>,
     pub active_jobs: Arc<DashMap<String, JobState>>,
@@ -212,7 +260,7 @@ pub struct AppState {
     /// Test override for the token endpoint. `None` uses production.
     pub xai_token_url: Arc<RwLock<Option<String>>>,
     pub current_project: Arc<RwLock<Option<ProjectInfo>>>,
-    /// Inject/pivot hold this so open cannot reopen the DB underneath them.
+    /// Atomic live-project admission shared by HTTP and desktop operations.
     pub project_exclusive: Arc<AtomicUsize>,
     /// Temp directory to clean up on drop (only set for test states)
     temp_backup_dir: Option<PathBuf>,
@@ -249,7 +297,8 @@ pub fn create_app_state() -> Arc<AppState> {
         tracing::warn!("Failed to clean old backups: {}", e);
     }
 
-    let config = AppConfig::load(&AppConfig::default_path()).unwrap_or_default();
+    let config_path = AppConfig::default_path();
+    let (config, config_load_failed) = config_persistence::load_startup_config(&config_path);
     let format_registry = locust_formats::default_registry();
     let provider_registry = locust_providers::default_registry(&config);
 
@@ -262,6 +311,8 @@ pub fn create_app_state() -> Arc<AppState> {
         db,
         glossary,
         config: Arc::new(RwLock::new(config)),
+        config_path,
+        config_load_failed,
         backup_manager: Arc::new(BackupManager::new(backup_root)),
         global_memory: Arc::new(global_memory),
         active_jobs: Arc::new(DashMap::new()),
@@ -299,6 +350,8 @@ fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
         db,
         glossary,
         config: Arc::new(RwLock::new(config)),
+        config_path: backup_root.join("config.json"),
+        config_load_failed: false,
         backup_manager: Arc::new(BackupManager::new(backup_root.clone())),
         global_memory: Arc::new(GlobalMemoryDb::open_in_memory().unwrap()),
         active_jobs: Arc::new(DashMap::new()),
@@ -335,6 +388,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/translate/cancel/:job_id", post(translate_cancel))
         .route("/api/translate/ws/:job_id", get(translate_ws))
         .route("/api/inject", post(inject))
+        .route("/api/inject/status", post(injection_recovery::status))
+        .route("/api/inject/recover", post(injection_recovery::recover))
         .route("/api/register-lang", post(register_lang))
         .route("/api/patch/verify", post(patch_verify))
         .route("/api/patch/apply", post(patch_apply))
@@ -343,6 +398,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/patch/rollback", post(patch_rollback))
         .route("/api/patch/status", post(patch_status))
         .route("/api/patch/pack", post(patch_pack))
+        .route("/api/patch/font", post(font_patch::generate))
         .route("/api/patch/recordings", get(patch_recordings))
         .route("/api/validate", post(validate))
         .route("/api/glossary", get(get_glossary).post(add_glossary))
@@ -375,10 +431,18 @@ pub async fn start_server(state: Arc<AppState>, port: u16) -> anyhow::Result<()>
 /// Bind the API on an explicit address (`127.0.0.1:7842` or `0.0.0.0:7842`).
 /// Prefer loopback unless the operator knowingly exposes the process.
 pub async fn start_server_on(state: Arc<AppState>, addr: impl AsRef<str>) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr.as_ref()).await?;
+    start_server_with_listener(state, listener).await
+}
+
+/// Serve an already-bound listener, preserving ownership of an OS-assigned
+/// port between desktop startup and the background runtime.
+pub async fn start_server_with_listener(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
     let app = create_router(state);
-    let addr = addr.as_ref();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Server listening on {addr}");
+    tracing::info!("Server listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -453,6 +517,11 @@ async fn provider_health(
 struct OpenProjectRequest {
     path: String,
     format_id: Option<String>,
+    /// Legacy recents without `database_path` set this to prefer an existing
+    /// project DB instead of extracting. Default false preserves explicit
+    /// Open Folder extract/merge.
+    #[serde(default)]
+    prefer_saved: bool,
 }
 
 #[derive(Serialize)]
@@ -469,6 +538,8 @@ struct ProjectOpenResponse {
     stale_source_reset: usize,
     removed: usize,
     preserved_translations: usize,
+    pub extraction_warnings: Vec<String>,
+    persistence_warning: Option<String>,
 }
 
 impl From<ProjectOpenOutcome> for ProjectOpenResponse {
@@ -486,17 +557,34 @@ impl From<ProjectOpenOutcome> for ProjectOpenResponse {
             stale_source_reset: o.stale_source_reset,
             removed: o.removed,
             preserved_translations: o.preserved_translations,
+            extraction_warnings: o.extraction_warnings,
+            persistence_warning: None,
         }
     }
 }
 
 fn map_open_err(e: locust_core::error::LocustError) -> ApiError {
     match e {
+        locust_core::error::LocustError::InjectionError(msg) => err(StatusCode::CONFLICT, msg),
+        locust_core::error::LocustError::PatchError(msg) if msg.starts_with("game busy:") => {
+            err(StatusCode::CONFLICT, msg)
+        }
         locust_core::error::LocustError::ProjectNotFound(_) => {
             err(StatusCode::BAD_REQUEST, "path not found")
         }
         locust_core::error::LocustError::UnsupportedFormat(msg) => {
             err(StatusCode::UNPROCESSABLE_ENTITY, msg)
+        }
+        locust_core::error::LocustError::IoError(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            err(
+                StatusCode::BAD_REQUEST,
+                locust_core::error::LocustError::IoError(io),
+            )
         }
         other => err(StatusCode::INTERNAL_SERVER_ERROR, other),
     }
@@ -506,36 +594,51 @@ async fn project_open(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenProjectRequest>,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
-    refuse_if_cannot_switch_project(&state)?;
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move { project_open_owned(state, req).await })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
+async fn project_open_owned(
+    state: Arc<AppState>,
+    req: OpenProjectRequest,
+) -> Result<Json<ProjectOpenResponse>, ApiError> {
     let raw_path = PathBuf::from(&req.path);
-    let outcome = project::open_project(
-        &state.db,
-        &state.format_registry,
-        &raw_path,
-        req.format_id.as_deref(),
-    )
+    let outcome = if req.prefer_saved {
+        project::open_recent_project(
+            &state.db,
+            &state.format_registry,
+            &raw_path,
+            req.format_id.as_deref(),
+        )
+    } else {
+        project::open_project(
+            &state.db,
+            &state.format_registry,
+            &raw_path,
+            req.format_id.as_deref(),
+        )
+    }
     .map_err(map_open_err)?;
 
+    let persistence_warning = remember_open_project(&state, &outcome, true).await;
     {
         let mut proj = state.current_project.write().await;
         *proj = Some(ProjectInfo {
             path: outcome.project_path.clone(),
             format_id: outcome.format_id.clone(),
             name: outcome.project_name.clone(),
+            extraction_warnings: outcome.extraction_warnings.clone(),
+            database_path: Some(outcome.database_path.clone()),
+            supported_modes: outcome.supported_modes.clone(),
+            persistence_warning: persistence_warning.clone(),
         });
     }
 
-    {
-        let mut config = state.config.write().await;
-        config.add_recent_project(
-            outcome.project_path.clone(),
-            outcome.project_name.clone(),
-            outcome.format_id.clone(),
-            None,
-        );
-    }
-
-    Ok(Json(ProjectOpenResponse::from(outcome)))
+    let mut response = ProjectOpenResponse::from(outcome);
+    response.persistence_warning = persistence_warning;
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -547,6 +650,10 @@ struct OpenProjectDbRequest {
 
 fn map_open_db_err(e: locust_core::error::LocustError) -> ApiError {
     let status = match &e {
+        locust_core::error::LocustError::InjectionError(_) => StatusCode::CONFLICT,
+        locust_core::error::LocustError::PatchError(msg) if msg.starts_with("game busy:") => {
+            StatusCode::CONFLICT
+        }
         locust_core::error::LocustError::UnsupportedFormat(_) => StatusCode::UNPROCESSABLE_ENTITY,
         locust_core::error::LocustError::ProjectNotFound(_)
         | locust_core::error::LocustError::IoError(_)
@@ -560,7 +667,19 @@ async fn project_open_db(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenProjectDbRequest>,
 ) -> Result<Json<ProjectOpenResponse>, ApiError> {
-    refuse_if_cannot_switch_project(&state)?;
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(
+        guard,
+        async move { project_open_db_owned(state, req).await },
+    )
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
+async fn project_open_db_owned(
+    state: Arc<AppState>,
+    req: OpenProjectDbRequest,
+) -> Result<Json<ProjectOpenResponse>, ApiError> {
     let outcome = project::open_project_db(
         &state.db,
         &state.format_registry,
@@ -570,26 +689,23 @@ async fn project_open_db(
     )
     .map_err(map_open_db_err)?;
 
+    let persistence_warning = remember_open_project(&state, &outcome, true).await;
     {
         let mut proj = state.current_project.write().await;
         *proj = Some(ProjectInfo {
             path: outcome.project_path.clone(),
             format_id: outcome.format_id.clone(),
             name: outcome.project_name.clone(),
+            extraction_warnings: outcome.extraction_warnings.clone(),
+            database_path: Some(outcome.database_path.clone()),
+            supported_modes: outcome.supported_modes.clone(),
+            persistence_warning: persistence_warning.clone(),
         });
     }
 
-    {
-        let mut config = state.config.write().await;
-        config.add_recent_project(
-            outcome.project_path.clone(),
-            outcome.project_name.clone(),
-            outcome.format_id.clone(),
-            Some(outcome.database_path.clone()),
-        );
-    }
-
-    Ok(Json(ProjectOpenResponse::from(outcome)))
+    let mut response = ProjectOpenResponse::from(outcome);
+    response.persistence_warning = persistence_warning;
+    Ok(Json(response))
 }
 
 async fn project_current(
@@ -611,11 +727,11 @@ async fn pivot_project(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PivotRequest>,
 ) -> Result<Json<PivotResult>, ApiError> {
+    let _exclusive = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
     // Pivot reads every translated row from the live DB — open must not reopen under it.
-    let _exclusive = ProjectExclusiveGuard::enter(&state.project_exclusive);
     let output = PathBuf::from(&req.output_path);
     state.db.pivot_to(&output).map(Json).map_err(|e| {
         let msg = e.to_string();
@@ -741,6 +857,20 @@ async fn patch_string(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<PatchStringRequest>,
 ) -> Result<Json<StringEntry>, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(
+        guard,
+        async move { patch_string_owned(state, id, req).await },
+    )
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
+async fn patch_string_owned(
+    state: Arc<AppState>,
+    id: String,
+    req: PatchStringRequest,
+) -> Result<Json<StringEntry>, ApiError> {
     if let Some(ref translation) = req.translation {
         state
             .db
@@ -783,6 +913,19 @@ fn default_batch_provider() -> String {
 async fn batch_patch_strings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<BatchPatchRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(
+        guard,
+        async move { batch_patch_strings_owned(state, req).await },
+    )
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
+async fn batch_patch_strings_owned(
+    state: Arc<AppState>,
+    req: BatchPatchRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if req.updates.len() > 50_000 {
         return Err(err(
@@ -852,6 +995,7 @@ pub async fn spawn_translation_job(
     fallback_provider_ids: Option<Vec<String>>,
     options: TranslationOptions,
 ) -> std::result::Result<String, String> {
+    let exclusive = try_project_operation(state)?;
     let reg = state.provider_registry.read().await;
     if reg.get(&provider_id).is_none() {
         return Err("provider not found".into());
@@ -882,7 +1026,7 @@ pub async fn spawn_translation_job(
     let replay_bridge = replay.clone();
 
     // Bridge mpsc → broadcast so WebSocket clients can subscribe.
-    // ProviderSwitched is non-terminal; only Completed / Failed end the stream.
+    // BatchFailed and ProviderSwitched are non-terminal; only Completed / Failed end the stream.
     let jobs = state.active_jobs.clone();
     let cleanup_job_id = job_id.clone();
     tokio::spawn(async move {
@@ -919,19 +1063,30 @@ pub async fn spawn_translation_job(
     let glossary = state.glossary.clone();
     let resolve_map = Arc::new(resolve_map);
     let handle = tokio::spawn(async move {
+        // Abort only requests cancellation. Keep ownership until this future
+        // actually exits/drops, even while a provider is executing synchronously.
+        let _exclusive = exclusive;
         let map = resolve_map;
         let resolve = |id: &str| map.get(id).cloned();
-        let _ = run_fallback_chain(
+        let result = run_fallback_chain(
             &chain,
             &resolve,
             db,
             glossary,
             options,
-            tx,
+            tx.clone(),
             job_id_clone,
             cancel_clone,
         )
         .await;
+        if let Err(error) = result {
+            let _ = tx
+                .send(ProgressEvent::Failed {
+                    entry_id: None,
+                    error: error.to_string(),
+                })
+                .await;
+        }
     });
 
     // Update with real abort handle
@@ -953,7 +1108,14 @@ async fn translate_start(
         req.options,
     )
     .await
-    .map_err(|m| err(StatusCode::NOT_FOUND, m))?;
+    .map_err(|m| {
+        let status = if m == PROJECT_BUSY_MESSAGE || m == TRANSLATION_IN_FLIGHT_MESSAGE {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        err(status, m)
+    })?;
     Ok(Json(TranslateStartResponse { job_id }))
 }
 
@@ -975,20 +1137,49 @@ fn cancel_job(state: &AppState, job_id: &str) -> Result<StatusCode, ApiError> {
             return Ok(StatusCode::OK);
         }
     }
-    if let Some((_, job)) = state.active_jobs.remove(job_id) {
+    // Preserve the patch endpoint's existing removal contract. Patch workers
+    // have their own game-folder lock and do not use the live project database.
+    let is_patch = state
+        .active_jobs
+        .get(job_id)
+        .is_some_and(|job| matches!(job.kind, JobKind::Patch));
+    if is_patch {
+        if let Some((_, job)) = state.active_jobs.remove(job_id) {
+            publish_job_event(
+                &job.progress_tx,
+                &job.replay,
+                serde_json::json!({"type": "error", "message": "cancelled"}),
+            );
+            job.cancel.cancel();
+            job.abort_handle.abort();
+            return Ok(StatusCode::OK);
+        }
+        return Err(err(StatusCode::NOT_FOUND, "job not found"));
+    }
+    if let Some(job) = state.active_jobs.get(job_id) {
         let terminal = match job.kind {
             JobKind::Translate => {
                 serde_json::json!({"type": "failed", "entry_id": null, "error": "cancelled"})
             }
             JobKind::Patch => serde_json::json!({"type": "error", "message": "cancelled"}),
         };
-        let _ = job.progress_tx.send(terminal);
+        publish_job_event(&job.progress_tx, &job.replay, terminal);
         job.cancel.cancel();
-        job.abort_handle.abort();
+        // A translation may be awaiting a SQLite spawn_blocking write, which
+        // cannot be aborted. Let cooperative cancellation drain those writes
+        // before its worker releases the project guard.
         Ok(StatusCode::OK)
     } else {
         Err(err(StatusCode::NOT_FOUND, "job not found"))
     }
+}
+
+/// Desktop cancellation uses the same token and terminal replay as HTTP.
+/// Acknowledgement is immediate; the worker still owns its project reservation.
+pub fn cancel_translation_job(state: &AppState, job_id: &str) -> Result<(), String> {
+    cancel_job(state, job_id)
+        .map(|_| ())
+        .map_err(|(_, message)| message)
 }
 
 async fn translate_ws(
@@ -1136,10 +1327,24 @@ async fn inject(
     if req.languages.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, INJECT_EMPTY_LANGUAGES_MESSAGE));
     }
+    if req.languages.len() > 1 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "One project database can inject only one target language. Use a separate pivot database for each target language.",
+        ));
+    }
 
     // Hold for the whole request (including awaits) so open cannot reopen mid-inject.
-    let _exclusive = ProjectExclusiveGuard::enter(&state.project_exclusive);
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move { inject_owned(state, req).await })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
 
+async fn inject_owned(
+    state: Arc<AppState>,
+    req: InjectRequest,
+) -> Result<Json<serde_json::Value>, ApiError> {
     if req.direct {
         let game_path = PathBuf::from(&req.project_path);
         let format_id = req.format_id.clone();
@@ -1406,6 +1611,9 @@ struct PatchPackRequest {
     /// Optional path to a pristine game tree for original hashes (overrides backup).
     #[serde(default)]
     pristine_path: Option<String>,
+    /// Exact BackupManager id returned by the injection being packaged.
+    #[serde(default)]
+    pristine_backup_id: Option<String>,
 }
 
 fn map_patch_err(e: locust_core::error::LocustError) -> ApiError {
@@ -1417,7 +1625,9 @@ fn map_patch_err(e: locust_core::error::LocustError) -> ApiError {
         | PatchLegacyUnconfirmed(_)
         | PatchVerificationFailed(_)
         | PatchBackupIncomplete(_) => StatusCode::CONFLICT,
-        PatchUnsafeEntry(_) | GameDirNotWritable(_) | PatchError(_) => StatusCode::BAD_REQUEST,
+        PatchUnsafeEntry(_) | GameDirNotWritable(_) | PatchError(_) | BackupError(_) => {
+            StatusCode::BAD_REQUEST
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     err(status, e)
@@ -1427,6 +1637,7 @@ async fn patch_pack(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PatchPackRequest>,
 ) -> Result<Json<locust_core::patch::PackReport>, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     if req.game_path.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "game_path required"));
     }
@@ -1443,6 +1654,14 @@ async fn patch_pack(
     let game_path = PathBuf::from(&req.game_path);
     let output = PathBuf::from(&req.output_path);
     let pristine = req.pristine_path.map(PathBuf::from);
+    if req.pristine_backup_id.is_some() && (pristine.is_some() || !req.pristine) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "select either a pristine path or an injection backup and require pristine hashes",
+        ));
+    }
+    let pristine_backup_id = req.pristine_backup_id;
+    let backups = state.backup_manager.clone();
     let require_pristine = req.pristine;
     let engine = locust_formats::default_registry()
         .detect(&game_path)
@@ -1451,7 +1670,10 @@ async fn patch_pack(
     let db = state.db.clone();
     let db_path_for_errors = db.path();
     let report = tokio::task::spawn_blocking(move || {
-        locust_core::patch::pack_injection_recording(
+        let _guard = guard;
+        // Extraction can target one file, while injection recordings are
+        // always rooted at its containing game directory.
+        locust_core::patch::pack_with_pristine_backup(
             &db,
             locust_core::patch::PackOptions {
                 game_path,
@@ -1462,6 +1684,9 @@ async fn patch_pack(
                 project: db_path_for_errors,
                 require_pristine,
             },
+            &backups,
+            pristine_backup_id.as_deref(),
+            require_pristine,
         )
     })
     .await
@@ -1475,6 +1700,8 @@ async fn patch_pack(
 struct PatchRecordingsResponse {
     /// Named keys first; JSON `null` is the language-unspecified recording.
     languages: Vec<Option<String>>,
+    /// Provenance is recorded; the payload is verified again when packing.
+    pristine_languages: Vec<Option<String>>,
 }
 
 async fn patch_recordings(
@@ -1483,13 +1710,30 @@ async fn patch_recordings(
     // Same leak guard as get_strings: leftover recordings from another session
     // must not surface without an open project.
     if state.current_project.read().await.is_none() {
-        return Ok(Json(PatchRecordingsResponse { languages: vec![] }));
+        return Ok(Json(PatchRecordingsResponse {
+            languages: vec![],
+            pristine_languages: vec![],
+        }));
     }
     let languages = state
         .db
         .list_recorded_langs()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(PatchRecordingsResponse { languages }))
+    let mut pristine_languages = Vec::new();
+    for language in &languages {
+        if state
+            .db
+            .get_injection(language.as_deref())
+            .map_err(map_patch_err)?
+            .is_some_and(|record| record.pristine_backup.is_some())
+        {
+            pristine_languages.push(language.clone());
+        }
+    }
+    Ok(Json(PatchRecordingsResponse {
+        languages,
+        pristine_languages,
+    }))
 }
 
 async fn patch_verify(
@@ -1767,8 +2011,13 @@ async fn patch_status(
 
 async fn validate(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
     // validate_and_save writes issue rows into the live DB — open must not reopen under it.
-    let _exclusive = ProjectExclusiveGuard::enter(&state.project_exclusive);
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move { validate_owned(state).await })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
 
+async fn validate_owned(state: Arc<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let entries = state
         .db
         .get_entries(&EntryFilter::default())
@@ -1777,23 +2026,78 @@ async fn validate(State(state): State<Arc<AppState>>) -> Result<Json<serde_json:
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let proj = state.current_project.read().await;
-    let fonts: Vec<FontCoverageReport> = if let Some(ref p) = *proj {
-        let translations: Vec<&str> = entries
-            .iter()
-            .filter_map(|e| e.translation.as_deref())
-            .collect();
-        FontValidator::check_game_fonts(&p.path, &translations).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let font_suggestions = suggestions_for_font_reports(&fonts);
+    let game_path = state
+        .current_project
+        .read()
+        .await
+        .as_ref()
+        .map(|p| p.path.clone());
+    let font_audit = audit_project_fonts(game_path, entries).await;
+    let font_suggestions = suggestions_for_font_reports(&font_audit.fonts);
 
     Ok(Json(serde_json::json!({
         "validation": validation,
-        "fonts": fonts,
+        "fonts": font_audit.fonts,
+        "font_issues": font_audit.issues,
+        "font_limitations": FONT_COVERAGE_LIMITATION,
         "font_suggestions": font_suggestions,
     })))
+}
+
+/// Shared by HTTP and Tauri. Font traversal/parsing must not block the async
+/// server, and unreadable fonts must remain visible in the validation result.
+pub async fn audit_project_fonts(
+    game_path: Option<PathBuf>,
+    entries: Vec<StringEntry>,
+) -> FontAuditReport {
+    let Some(game_path) = game_path else {
+        return FontAuditReport::default();
+    };
+    let error_path = game_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        // Match font-patch's projected visible corpus, including physical
+        // Japanese left untranslated in a database pivoted through English.
+        let visible_text: Vec<&str> = entries
+            .iter()
+            .map(|entry| {
+                let error = |message| locust_core::error::LocustError::ValidationError {
+                    entry_id: entry.id.clone(),
+                    message,
+                };
+                entry.require_current_translation().map_err(error)?;
+                match entry
+                    .translation
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    Some(text) => Ok(text),
+                    None => entry.injection_source().map_err(error),
+                }
+            })
+            .collect::<locust_core::error::Result<_>>()?;
+        // Single-file games (HTML, PAK, assets) can reference adjacent fonts.
+        let root = if game_path.is_file() {
+            game_path.parent().unwrap_or(&game_path)
+        } else {
+            &game_path
+        };
+        FontValidator::audit_game_fonts(root, &visible_text)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => report,
+        other => FontAuditReport {
+            fonts: Vec::new(),
+            issues: vec![FontAuditIssue {
+                font_path: error_path,
+                message: match other {
+                    Ok(Err(error)) => error.to_string(),
+                    Err(error) => format!("font audit task failed: {error}"),
+                    Ok(Ok(_)) => unreachable!(),
+                },
+            }],
+        },
+    }
 }
 
 #[derive(Deserialize)]
@@ -1849,6 +2153,9 @@ async fn export_po(
     State(state): State<Arc<AppState>>,
     Query(q): Query<LangQuery>,
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
+    // Export combines rows with translation-run language metadata. Both must
+    // belong to the same project, even across the config-lock await below.
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     let entries = state
         .db
         .get_entries(&EntryFilter::default())
@@ -1879,17 +2186,28 @@ async fn import_po(
     State(state): State<Arc<AppState>>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move { import_po_owned(state, body).await })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
+async fn import_po_owned(
+    state: Arc<AppState>,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let po_entries = export::import_po(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let (updates, pre_skipped) = export::po_entries_for_batch(&po_entries);
     let attempted = updates.len();
-    let applied = state
+    let report = state
         .db
-        .save_translations_batch(updates, "import")
+        .save_imported_translations_batch(updates)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let (imported, skipped) = export::import_counts_after_batch(pre_skipped, attempted, applied);
+    let (imported, skipped) =
+        export::import_counts_after_batch(pre_skipped, attempted, report.imported);
     Ok(Json(
-        serde_json::json!({"imported": imported, "skipped": skipped}),
+        serde_json::json!({"imported": imported, "skipped": skipped, "stale_sources": report.stale_sources, "unknown_ids": report.unknown_ids}),
     ))
 }
 
@@ -1897,6 +2215,7 @@ async fn export_xliff(
     State(state): State<Arc<AppState>>,
     Query(q): Query<LangQuery>,
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     let entries = state
         .db
         .get_entries(&EntryFilter::default())
@@ -1927,62 +2246,40 @@ async fn import_xliff(
     State(state): State<Arc<AppState>>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move { import_xliff_owned(state, body).await })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
+async fn import_xliff_owned(
+    state: Arc<AppState>,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let units = export::import_xliff(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let (updates, pre_skipped) = export::xliff_units_for_batch(&units);
     let attempted = updates.len();
-    let applied = state
+    let report = state
         .db
-        .save_translations_batch(updates, "import")
+        .save_imported_translations_batch(updates)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let (imported, skipped) = export::import_counts_after_batch(pre_skipped, attempted, applied);
+    let (imported, skipped) =
+        export::import_counts_after_batch(pre_skipped, attempted, report.imported);
     Ok(Json(
-        serde_json::json!({"imported": imported, "skipped": skipped}),
+        serde_json::json!({"imported": imported, "skipped": skipped, "stale_sources": report.stale_sources, "unknown_ids": report.unknown_ids}),
     ))
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let config = state.config.read().await;
-    let mut val = serde_json::to_value(&*config).unwrap_or_default();
-    // Redact API keys
-    if let Some(providers) = val.get_mut("providers").and_then(|v| v.as_object_mut()) {
-        for (_id, pc) in providers.iter_mut() {
-            if let Some(obj) = pc.as_object_mut() {
-                if obj
-                    .get("api_key")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| !s.is_empty())
-                {
-                    obj.insert(
-                        "api_key".to_string(),
-                        serde_json::Value::String("***".to_string()),
-                    );
-                }
-            }
-        }
-    }
-    Json(val)
+    Json(config_persistence::public_app_config(&state).await)
 }
 
 async fn patch_config(
     State(state): State<Arc<AppState>>,
     Json(partial): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut config = state.config.write().await;
-    // Merge partial into current
-    let mut current = serde_json::to_value(&*config).unwrap_or_default();
-    if let (Some(cur_obj), Some(patch_obj)) = (current.as_object_mut(), partial.as_object()) {
-        for (k, v) in patch_obj {
-            cur_obj.insert(k.clone(), v.clone());
-        }
-    }
-    *config =
-        serde_json::from_value(current.clone()).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    // Persist to disk
-    let _ = config.save(&AppConfig::default_path());
-    drop(config);
-    rebuild_provider_registry(&state).await;
-    Ok(Json(current))
+    update_app_config(&state, partial).await.map(Json)
 }
 
 /// Rebuild the in-process provider registry from the current config.
@@ -2224,9 +2521,10 @@ async fn memory_lang_pairs(
 async fn list_backups(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<BackupEntry>>, ApiError> {
-    state
-        .backup_manager
-        .list_backups()
+    let manager = state.backup_manager.clone();
+    tokio::task::spawn_blocking(move || manager.list_backups())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .map(Json)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
@@ -2235,11 +2533,25 @@ async fn restore_backup(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.backup_manager.restore(&id).map_err(|e| {
+    let exclusive = try_project_operation(&state).map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let manager = state.backup_manager.clone();
+    // The blocking task owns exclusion even if its HTTP caller disconnects.
+    tokio::task::spawn_blocking(move || {
+        let _exclusive = exclusive;
+        manager.restore(&id)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(|e| {
         let msg = e.to_string();
         // Missing origin or unreadable manifest: the user can re-open the
         // original game folder or discard the backup. Anything else is ours.
-        let status = if msg.contains("manifest.json") || msg.contains("no longer exists") {
+        let status = if matches!(&e, locust_core::LocustError::InjectionError(_))
+            || msg.starts_with("patch error: game busy:")
+            || msg.starts_with("game busy:")
+        {
+            StatusCode::CONFLICT
+        } else if msg.contains("manifest.json") || msg.contains("no longer exists") {
             StatusCode::BAD_REQUEST
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -2253,10 +2565,15 @@ async fn delete_backup(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .backup_manager
-        .delete_backup(&id)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let exclusive = try_project_operation(&state).map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let manager = state.backup_manager.clone();
+    tokio::task::spawn_blocking(move || {
+        let _exclusive = exclusive;
+        manager.delete_backup(&id)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2365,6 +2682,23 @@ mod tests {
         let s = state.clone();
         let (url, handle) = start_test_server(state).await;
         (url, handle, s)
+    }
+
+    #[test]
+    fn recoverable_batch_failure_keeps_job_stream_open() {
+        let event = serde_json::to_value(ProgressEvent::BatchFailed {
+            entry_id: None,
+            error: "provider unavailable; trying fallback".into(),
+        })
+        .unwrap();
+        assert_eq!(event["type"], "batch_failed");
+        assert!(!job_event_is_terminal(&event));
+        let terminal = serde_json::to_value(ProgressEvent::Failed {
+            entry_id: None,
+            error: "budget exhausted".into(),
+        })
+        .unwrap();
+        assert!(job_event_is_terminal(&terminal));
     }
 
     fn client() -> reqwest::Client {
@@ -2487,12 +2821,155 @@ mod tests {
         assert_eq!(resp.status(), 422);
     }
 
+    fn write_html_game(dir: &Path, body: &str) {
+        std::fs::write(dir.join("story.html"), format!("<p>{body}</p>")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prefer_saved_open_skips_extract_after_source_change() {
+        let game = tempfile::tempdir().unwrap();
+        write_html_game(game.path(), "Hello");
+        let (url, _h, state) = setup_with_state().await;
+        let first = client()
+            .post(format!("{url}/api/project/open"))
+            .json(&serde_json::json!({
+                "path": game.path(),
+                "format_id": "html-game"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 200);
+        let first_body: serde_json::Value = first.json().await.unwrap();
+        let db_path = first_body["database_path"].as_str().unwrap().to_string();
+        let hero = state
+            .db
+            .get_entries(&EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.source == "Hello")
+            .unwrap();
+        assert!(state
+            .db
+            .save_translation(&hero.id, "Hola", "mock")
+            .await
+            .unwrap());
+        state
+            .db
+            .update_entry_status(&hero.id, StringStatus::Approved)
+            .await
+            .unwrap();
+
+        write_html_game(game.path(), "Hello, traveler");
+        let saved = client()
+            .post(format!("{url}/api/project/open"))
+            .json(&serde_json::json!({
+                "path": game.path(),
+                "format_id": "html-game",
+                "prefer_saved": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), 200);
+        let saved_body: serde_json::Value = saved.json().await.unwrap();
+        assert_eq!(saved_body["stale_source_reset"], 0);
+        assert_eq!(saved_body["added"], 0);
+        assert_eq!(saved_body["database_path"], db_path);
+        let kept = state.db.get_entry(&hero.id).unwrap().unwrap();
+        assert_eq!(kept.source, "Hello");
+        assert_eq!(kept.translation.as_deref(), Some("Hola"));
+        assert_eq!(kept.status, StringStatus::Approved);
+
+        let explicit = client()
+            .post(format!("{url}/api/project/open"))
+            .json(&serde_json::json!({
+                "path": game.path(),
+                "format_id": "html-game"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(explicit.status(), 200);
+        let explicit_body: serde_json::Value = explicit.json().await.unwrap();
+        assert_eq!(explicit_body["stale_source_reset"], 1);
+        let reset = state.db.get_entry(&hero.id).unwrap().unwrap();
+        assert_eq!(reset.source, "Hello, traveler");
+        assert_eq!(reset.translation.as_deref(), Some("Hola"));
+        assert_eq!(reset.status, StringStatus::Pending);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn prefer_saved_missing_db_extracts() {
+        let missing = tempfile::tempdir().unwrap();
+        write_html_game(missing.path(), "Only extract");
+        let (url, _h) = setup().await;
+        let extracted = client()
+            .post(format!("{url}/api/project/open"))
+            .json(&serde_json::json!({
+                "path": missing.path(),
+                "format_id": "html-game",
+                "prefer_saved": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(extracted.status(), 200);
+        let extracted_body: serde_json::Value = extracted.json().await.unwrap();
+        assert!(extracted_body["added"].as_u64().unwrap() >= 1);
+        let extracted_db = extracted_body["database_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = std::fs::remove_file(&extracted_db);
+    }
+
+    #[tokio::test]
+    async fn prefer_saved_invalid_db_returns_400_without_extract() {
+        let invalid = tempfile::tempdir().unwrap();
+        write_html_game(invalid.path(), "Must not extract");
+        let stem = locust_core::project::sanitize_project_stem(
+            invalid.path().file_name().unwrap().to_str().unwrap(),
+        );
+        let adjacent = invalid
+            .path()
+            .parent()
+            .unwrap()
+            .join(format!("{stem}.locust.db"));
+        std::fs::write(&adjacent, b"not-a-sqlite-database").unwrap();
+        let (url, _h, state) = setup_with_state().await;
+        let resp = client()
+            .post(format!("{url}/api/project/open"))
+            .json(&serde_json::json!({
+                "path": invalid.path(),
+                "format_id": "html-game",
+                "prefer_saved": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let text = resp.text().await.unwrap().to_lowercase();
+        assert!(text.contains("not a locust project database"), "{text}");
+        assert_eq!(state.db.path(), PathBuf::from(":memory:"));
+        assert!(state
+            .db
+            .get_entries(&EntryFilter::default())
+            .unwrap()
+            .iter()
+            .all(|e| e.source != "Must not extract"));
+        let _ = std::fs::remove_file(&adjacent);
+    }
+
     async fn mark_project_open(state: &AppState) {
         let mut proj = state.current_project.write().await;
         *proj = Some(ProjectInfo {
             path: PathBuf::from("/tmp/locust-test-game"),
             format_id: "rpgmaker-mv".into(),
             name: "test-game".into(),
+            extraction_warnings: Vec::new(),
+            ..Default::default()
         });
     }
 
@@ -2802,6 +3279,14 @@ mod tests {
         let cur_body: serde_json::Value = cur.json().await.unwrap();
         assert_eq!(cur_body["name"], "SomeGame");
         assert_eq!(cur_body["format_id"], "rpgmaker-mv");
+        assert_eq!(cur_body["database_path"], body["database_path"]);
+        assert_eq!(cur_body["supported_modes"], body["supported_modes"]);
+        assert!(body["persistence_warning"].is_null());
+        let saved = AppConfig::load(&state.config_path).unwrap();
+        assert_eq!(
+            saved.recent_projects[0].database_path.as_ref(),
+            Some(&pivot)
+        );
 
         let live = state.db.get_entries(&EntryFilter::default()).unwrap();
         assert_eq!(live.len(), 1);
@@ -3378,6 +3863,7 @@ mod tests {
                 input_tokens: 60,
                 output_tokens: 40,
                 cost_usd: 0.0012,
+                cost_is_complete: true,
             })
             .await
             .unwrap();
@@ -3395,6 +3881,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 10,
                 cost_usd: 0.0001,
+                cost_is_complete: true,
             })
             .await
             .unwrap();
@@ -3431,6 +3918,7 @@ mod tests {
             "input_tokens",
             "output_tokens",
             "cost_usd",
+            "cost_is_complete",
         ] {
             assert!(body[0].get(key).is_some(), "missing {key}");
         }
@@ -3953,6 +4441,8 @@ mod xai_auth_tests {
                 path: game_b.clone(),
                 format_id: "rpgmaker-mv".into(),
                 name: "game-b".into(),
+                extraction_warnings: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -4068,3 +4558,9 @@ mod xai_auth_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod exclusion_tests;
+
+#[cfg(test)]
+mod backup_operation_tests;

@@ -606,7 +606,8 @@ async fn test_patch_pack_from_injection_recording() {
         bad_body
     );
 
-    // pristine without backup → 400 PatchError
+    // Replace now records its exact original backup. Strict packing resolves
+    // that provenance automatically, without a manually supplied backup id.
     let strict_zip = pack_out.path().join("strict.zip");
     let strict = client()
         .post(format!("{}/api/patch/pack", base_url))
@@ -619,13 +620,39 @@ async fn test_patch_pack_from_injection_recording() {
         .send()
         .await
         .unwrap();
-    assert_eq!(strict.status(), 400, "pristine without backup must fail");
+    let status = strict.status();
     let strict_body = strict.text().await.unwrap();
-    assert!(
-        strict_body.to_lowercase().contains("pristine"),
-        "expected pristine error, got: {}",
-        strict_body
+    assert_eq!(
+        status, 200,
+        "recorded Replace backup must resolve: {strict_body}"
     );
+    let verified: serde_json::Value = client()
+        .post(format!("{}/api/patch/verify", base_url))
+        .json(&serde_json::json!({"game_path":tmpdir.path(),"zip_path":strict_zip}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(verified["outcome"], "Clean", "{verified}");
+    let files = verified["manifest"]["files"].as_array().unwrap();
+    assert!(!files.is_empty());
+    for file in files {
+        let original = tmpdir.path().join(file["path"].as_str().unwrap());
+        assert_eq!(
+            file["original_sha256"],
+            locust_core::database::sha256_file(&original).unwrap().0
+        );
+    }
+    // An explicitly selected wrong backup must still fail and preserve the ZIP.
+    let saved = std::fs::read(&strict_zip).unwrap();
+    let wrong = client()
+        .post(format!("{}/api/patch/pack", base_url))
+        .json(&serde_json::json!({"game_path":recorded_root,"output_path":strict_zip,"languages":["es"],"pristine":true,"pristine_backup_id":"unrelated-backup"}))
+        .send().await.unwrap();
+    assert_eq!(wrong.status(), 400);
+    assert_eq!(std::fs::read(strict_zip).unwrap(), saved);
 }
 
 // ─── Ren'Py Add mode flow ──────────────────────────────────────────────────
@@ -670,7 +697,7 @@ async fn test_renpy_add_mode_flow() {
 
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    // Inject Add mode for es and fr
+    // One database cannot masquerade as translations in two languages.
     let resp = client()
         .post(format!("{}/api/inject", base_url))
         .json(&serde_json::json!({
@@ -682,13 +709,35 @@ async fn test_renpy_add_mode_flow() {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("separate pivot database"));
+    assert!(!tmpdir.path().join("game/tl").exists());
+
+    let resp = client()
+        .post(format!("{}/api/inject", base_url))
+        .json(&serde_json::json!({
+            "project_path": tmpdir.path().to_string_lossy(),
+            "format_id": "renpy",
+            "mode": "add",
+            "languages": ["es"]
+        }))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     // Verify tl dirs created
     let tl_es = tmpdir.path().join("game").join("tl").join("es");
     let tl_fr = tmpdir.path().join("game").join("tl").join("fr");
     assert!(tl_es.exists(), "tl/es/ should exist");
-    assert!(tl_fr.exists(), "tl/fr/ should exist");
+    assert!(
+        !tl_fr.exists(),
+        "Spanish translations must not be labelled French"
+    );
 
     // Check tl/es has a .rpy file with translate blocks
     let rpy_files: Vec<_> = std::fs::read_dir(&tl_es)

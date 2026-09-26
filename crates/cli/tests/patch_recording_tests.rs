@@ -12,6 +12,7 @@
 //! `locust import` uses.
 
 use assert_cmd::Command;
+use locust_core::database::Database;
 use predicates::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -181,12 +182,11 @@ fn replace_and_add_without_a_language_bail_loudly() {
 // ─── D11 family: --direct with several languages ────────────────────────────
 
 #[test]
-fn direct_inject_records_every_requested_language() {
-    // The old code recorded `languages.first()` only, silently orphaning
-    // `patch -l <second>`.
+fn direct_inject_rejects_mislabelling_one_translation_as_multiple_languages() {
     let base = base_dir();
     let (game, db) = html_game_project(&base);
-    locust()
+    let before = fs::read(game.join("index.html")).unwrap();
+    let result = locust()
         .arg("inject")
         .arg(&game)
         .arg("-P")
@@ -194,7 +194,9 @@ fn direct_inject_records_every_requested_language() {
         .arg("--direct")
         .args(["-l", "es", "fr"])
         .assert()
-        .success();
+        .failure();
+    assert!(stderr_of(result).contains("separate pivot database"));
+    assert_eq!(fs::read(game.join("index.html")).unwrap(), before);
 
     let zip_fr = base.join("fr.zip");
     locust()
@@ -206,11 +208,8 @@ fn direct_inject_records_every_requested_language() {
         .arg("-o")
         .arg(&zip_fr)
         .assert()
-        .success();
-    assert!(
-        zip_entry_string(&zip_fr, "index.html").contains("[MOCK:es]"),
-        "the second language's recording must pack the translated file"
-    );
+        .failure();
+    assert!(!zip_fr.exists());
 }
 
 // ─── R6: patch pointed at the ORIGINAL after a copy (Replace) inject ─────────
@@ -404,6 +403,76 @@ fn patch_without_lang_over_es_and_unspecified_keys_requires_a_choice() {
         .args(["-l", "es"])
         .assert()
         .success();
+    let first_translation = fs::read(game1.join("index.html")).unwrap();
+    // A database for another tree is rejected before any plugin can write.
+    locust()
+        .arg("inject")
+        .arg(&game2)
+        .arg("-P")
+        .arg(&db)
+        .arg("--direct")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("outside the selected game"));
+    assert_eq!(
+        fs::read(game1.join("index.html")).unwrap(),
+        first_translation
+    );
+    assert_eq!(
+        fs::read_to_string(game2.join("index.html")).unwrap(),
+        HTML_BODY
+    );
+    let project = locust_core::database::Database::open(&db).unwrap();
+    let previous = project.get_injection(Some("es")).unwrap().unwrap();
+    assert!(project.get_injection(None).unwrap().is_none());
+    let old_entries = project
+        .get_entries(&locust_core::database::EntryFilter::default())
+        .unwrap();
+    drop(project);
+
+    // Re-extract the pristine second copy; reuse translations only where
+    // source and byte-location metadata match. Keep the earlier es recording.
+    let fresh_db = base.join("game2.locust.db");
+    locust()
+        .arg("extract")
+        .arg(&game2)
+        .arg("-o")
+        .arg(&fresh_db)
+        .assert()
+        .success();
+    let fresh = locust_core::database::Database::open(&fresh_db).unwrap();
+    let mut fresh_entries = fresh
+        .get_entries(&locust_core::database::EntryFilter::default())
+        .unwrap();
+    assert_eq!(fresh_entries.len(), old_entries.len());
+    for entry in &mut fresh_entries {
+        assert!(entry.file_path.starts_with(&game2));
+        let matches: Vec<_> = old_entries
+            .iter()
+            .filter(|old| {
+                old.source == entry.source
+                    && old.metadata.get("html_start") == entry.metadata.get("html_start")
+                    && old.metadata.get("html_end") == entry.metadata.get("html_end")
+                    && old.metadata.get("html_raw") == entry.metadata.get("html_raw")
+                    && old.metadata.get("html_kind") == entry.metadata.get("html_kind")
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "translation reuse must have one verified location"
+        );
+        entry.translation = matches[0].translation.clone();
+        entry.status = matches[0].status.clone();
+    }
+    drop(fresh);
+    let project = locust_core::database::Database::open(&db).unwrap();
+    project.clear_entries().unwrap();
+    project.save_entries(&fresh_entries).unwrap();
+    let retained = project.get_injection(Some("es")).unwrap().unwrap();
+    assert_eq!(retained.root, previous.root);
+    assert_eq!(retained.files, previous.files);
+    drop(project);
     locust()
         .arg("inject")
         .arg(&game2)
@@ -412,6 +481,28 @@ fn patch_without_lang_over_es_and_unspecified_keys_requires_a_choice() {
         .arg("--direct")
         .assert()
         .success();
+    assert_eq!(
+        fs::read(game1.join("index.html")).unwrap(),
+        first_translation
+    );
+    assert!(fs::read_to_string(game2.join("index.html"))
+        .unwrap()
+        .contains("[MOCK:es]"));
+    let project = locust_core::database::Database::open(&db).unwrap();
+    assert_eq!(
+        project
+            .get_injection(None)
+            .unwrap()
+            .unwrap()
+            .root
+            .canonicalize()
+            .unwrap(),
+        game2.canonicalize().unwrap()
+    );
+    let retained = project.get_injection(Some("es")).unwrap().unwrap();
+    assert_eq!(retained.root, previous.root);
+    assert_eq!(retained.files, previous.files);
+    drop(project);
 
     let zip = base.join("patch.zip");
     let assert = locust()
@@ -506,25 +597,111 @@ fn a_database_with_no_recording_names_a_command_that_provably_unblocks() {
     assert!(zip_entry_string(&zip, "index.html").contains("[MOCK:es]"));
 }
 
-// ─── Decision 3: record-time containment (E5 Replace) ───────────────────────
+// ─── Entry-path writers: remap before dispatch, record the translated copy ──
+
+fn assert_copy_recording_and_patch_roundtrip(
+    base: &Path,
+    original_root: &Path,
+    copy: &Path,
+    db_path: &Path,
+    rel: &str,
+    original: &[u8],
+) {
+    let translated = fs::read(copy.join(rel)).unwrap();
+    assert_ne!(
+        translated, original,
+        "the output copy must actually be translated"
+    );
+    assert_eq!(
+        fs::read(original_root.join(rel)).unwrap(),
+        original,
+        "Replace must leave the original intact"
+    );
+    let project = locust_core::database::Database::open(db_path).unwrap();
+    let recording = project
+        .get_injection(Some("es"))
+        .unwrap()
+        .expect("copy must be recorded");
+    assert_eq!(
+        recording.root.canonicalize().unwrap(),
+        copy.canonicalize().unwrap()
+    );
+    let recorded = recording
+        .files
+        .iter()
+        .find(|file| file.rel == rel)
+        .expect("written file must be recorded");
+    assert_eq!(
+        recorded.hash,
+        locust_core::database::sha256_hex(&translated)
+    );
+    assert_eq!(recorded.size, translated.len() as u64);
+    drop(project);
+
+    let zip = base.join("es.zip");
+    let wrong = locust()
+        .arg("patch")
+        .arg(original_root)
+        .arg("-P")
+        .arg(db_path)
+        .args(["-l", "es"])
+        .arg("-o")
+        .arg(&zip)
+        .assert()
+        .failure();
+    assert!(
+        stderr_of(wrong).contains(&copy.display().to_string()),
+        "error must identify the recorded copy"
+    );
+    assert!(
+        !zip.exists(),
+        "untranslated original must never become the patch payload"
+    );
+    locust()
+        .arg("patch")
+        .arg(copy)
+        .arg("-P")
+        .arg(db_path)
+        .args(["-l", "es"])
+        .arg("-o")
+        .arg(&zip)
+        .arg("--pristine")
+        .arg(original_root)
+        .assert()
+        .success();
+    assert_eq!(
+        zip_entry_bytes(&zip, rel),
+        translated,
+        "ZIP bytes must exactly match the recording's translated output"
+    );
+
+    // Distribution and undo must preserve the same byte-level guarantee.
+    let consumer = base.join("consumer");
+    copy_dir(original_root, &consumer);
+    locust()
+        .arg("apply")
+        .arg(&consumer)
+        .arg(&zip)
+        .assert()
+        .success();
+    assert_eq!(fs::read(consumer.join(rel)).unwrap(), translated);
+    locust()
+        .arg("patch-rollback")
+        .arg(&consumer)
+        .assert()
+        .success();
+    assert_eq!(fs::read(consumer.join(rel)).unwrap(), original);
+    assert_eq!(fs::read(original_root.join(rel)).unwrap(), original);
+    assert_eq!(fs::read(copy.join(rel)).unwrap(), translated);
+}
 
 #[test]
-fn replace_that_writes_outside_its_root_records_nothing_and_the_remedy_unblocks() {
-    // Wolf RPG injects into `entry.file_path` — the ORIGINAL tree — even in
-    // Replace mode, so the per-language copy never receives the writes. The
-    // recording must refuse (hard error, nothing recorded) instead of
-    // pointing `patch` at a tree injection never targeted. The remedy must
-    // include restoring the original: a bare `--direct` re-run from this
-    // state writes nothing (the original bytes were already replaced) and
-    // records nothing — a closed loop.
+fn wolf_replace_records_the_copy_and_preserves_the_original() {
     let base = base_dir();
     let (game, db) = wolf_game_project(&base);
-    let pristine = base.join("pristine");
-    copy_dir(&game, &pristine);
+    let original = fs::read(game.join("Data/BasicData.wolf")).unwrap();
     let out = base.join("out");
-    let wolf_file = game.join("Data").join("BasicData.wolf");
-
-    let assert = locust()
+    locust()
         .arg("inject")
         .arg(&game)
         .arg("-P")
@@ -533,86 +710,25 @@ fn replace_that_writes_outside_its_root_records_nothing_and_the_remedy_unblocks(
         .arg("-o")
         .arg(&out)
         .assert()
-        .failure();
-    let stderr = stderr_of(assert);
-    assert!(
-        stderr.contains("OUTSIDE its target root"),
-        "the containment violation must be loud: {stderr}"
-    );
-    assert!(
-        stderr.contains(&wolf_file.display().to_string()),
-        "the escaping file must be named: {stderr}"
-    );
-    assert!(
-        stderr.contains("wolfgame-es"),
-        "the expected root (the Replace copy) must be named: {stderr}"
-    );
-    assert!(
-        stderr.contains("Nothing was recorded"),
-        "the user must know no recording exists: {stderr}"
-    );
-    assert!(
-        stderr.contains("Backup"),
-        "the original was already mutated when this fires — the backup must \
-         be pointed out: {stderr}"
-    );
-    assert!(stderr.contains("restore"), "{stderr}");
-    assert!(stderr.contains("--direct -l es"), "{stderr}");
-
-    // Nothing recorded → patch hits the no-recording error, never a silent
-    // wrong zip.
-    let zip = base.join("es.zip");
-    locust()
-        .arg("patch")
-        .arg(&game)
-        .arg("-P")
-        .arg(&db)
-        .args(["-l", "es"])
-        .arg("-o")
-        .arg(&zip)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("no injection has been recorded"));
-
-    // Follow the remedy verbatim: restore the original, then direct inject.
-    fs::remove_dir_all(&game).unwrap();
-    copy_dir(&pristine, &game);
-    locust()
-        .arg("inject")
-        .arg(&game)
-        .arg("-P")
-        .arg(&db)
-        .arg("--direct")
-        .args(["-l", "es"])
-        .assert()
         .success();
-    locust()
-        .arg("patch")
-        .arg(&game)
-        .arg("-P")
-        .arg(&db)
-        .args(["-l", "es"])
-        .arg("-o")
-        .arg(&zip)
-        .assert()
-        .success();
-    let bytes = zip_entry_bytes(&zip, "Data/BasicData.wolf");
+    let copy = out.join("wolfgame-es");
+    let translated = fs::read(copy.join("Data/BasicData.wolf")).unwrap();
     assert!(
-        bytes.windows(4).any(|w| w == b"test"),
-        "the packed wolf file must carry the injected translation bytes"
+        translated.windows(4).any(|w| w == b"test"),
+        "copy must contain the translated Wolf text"
+    );
+    assert_copy_recording_and_patch_roundtrip(
+        &base,
+        &game,
+        &copy,
+        &db,
+        "Data/BasicData.wolf",
+        &original,
     );
 }
 
-// ─── Ren'Py Replace containment: restore-first remedy ───────────────────────
-
 #[test]
-fn renpy_replace_containment_says_restore_first_and_the_remedy_unblocks() {
-    // Ren'Py writes loose scripts to `entry.file_path` — the ORIGINAL tree —
-    // even in Replace mode, so by the time the containment error fires the
-    // original scripts are already mutated. A bare `--direct` re-run skips
-    // every already-translated line (the source text is gone): zero writes
-    // for a loose-only game, or a recording that silently omits the loose
-    // translations for a mixed game. The remedy must lead with the restore.
+fn renpy_replace_records_the_copy_and_preserves_the_original() {
     let base = base_dir();
     let game = base.join("renpygame");
     let game_sub = game.join("game");
@@ -622,6 +738,7 @@ fn renpy_replace_containment_says_restore_first_and_the_remedy_unblocks() {
         "label start:\n    e \"Hello world, adventurer!\"\n    \"The journey begins now.\"\n",
     )
     .unwrap();
+    let original = fs::read(game_sub.join("script.rpy")).unwrap();
     let db = base.join("project.locust.db");
     locust()
         .arg("extract")
@@ -636,12 +753,8 @@ fn renpy_replace_containment_says_restore_first_and_the_remedy_unblocks() {
         .args(["-p", "mock", "-s", "en", "-t", "es"])
         .assert()
         .success();
-
-    let pristine = base.join("pristine");
-    copy_dir(&game, &pristine);
     let out = base.join("out");
-
-    let assert = locust()
+    locust()
         .arg("inject")
         .arg(&game)
         .arg("-P")
@@ -650,65 +763,18 @@ fn renpy_replace_containment_says_restore_first_and_the_remedy_unblocks() {
         .arg("-o")
         .arg(&out)
         .assert()
-        .failure();
-    let stderr = stderr_of(assert);
-    assert!(
-        stderr.contains("OUTSIDE its target root"),
-        "the containment violation must be loud: {stderr}"
-    );
-    // The judge's premise, proven on disk: the ORIGINAL loose script was
-    // already rewritten when the error fired.
-    let mutated = fs::read_to_string(game_sub.join("script.rpy")).unwrap();
-    assert!(
-        mutated.contains("[MOCK:es]"),
-        "the original loose script must already be mutated in this state"
-    );
-    assert!(
-        stderr.contains("restore"),
-        "the remedy must lead with restoring the original: {stderr}"
-    );
-    assert!(stderr.contains("-m add"), "{stderr}");
-    assert!(stderr.contains("--direct -l es"), "{stderr}");
-
-    // Nothing recorded → patch is blocked, never a silent wrong zip.
-    let zip = base.join("es.zip");
-    locust()
-        .arg("patch")
-        .arg(&game)
-        .arg("-P")
-        .arg(&db)
-        .args(["-l", "es"])
-        .arg("-o")
-        .arg(&zip)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("no injection has been recorded"));
-
-    // Follow the remedy verbatim: restore the original, then direct mode.
-    fs::remove_dir_all(&game).unwrap();
-    copy_dir(&pristine, &game);
-    locust()
-        .arg("inject")
-        .arg(&game)
-        .arg("-P")
-        .arg(&db)
-        .arg("--direct")
-        .args(["-l", "es"])
-        .assert()
         .success();
-    locust()
-        .arg("patch")
-        .arg(&game)
-        .arg("-P")
-        .arg(&db)
-        .args(["-l", "es"])
-        .arg("-o")
-        .arg(&zip)
-        .assert()
-        .success();
-    assert!(
-        zip_entry_string(&zip, "game/script.rpy").contains("[MOCK:es]"),
-        "the packed loose script must carry the translations"
+    let copy = out.join("renpygame-es");
+    assert!(fs::read_to_string(copy.join("game/script.rpy"))
+        .unwrap()
+        .contains("[MOCK:es]"));
+    assert_copy_recording_and_patch_roundtrip(
+        &base,
+        &game,
+        &copy,
+        &db,
+        "game/script.rpy",
+        &original,
     );
 }
 
@@ -925,7 +991,7 @@ fn a_first_direct_inject_that_writes_zero_files_explains_why_nothing_was_recorde
 // ─── Decision 8: hash verification at pack time ──────────────────────────────
 
 #[test]
-fn a_recorded_file_changed_since_injection_is_refused_and_reinject_unblocks() {
+fn a_changed_recording_refuses_pack_and_reinject_until_recorded_bytes_are_restored() {
     let base = base_dir();
     let (game, db) = html_game_project(&base);
     locust()
@@ -937,6 +1003,12 @@ fn a_recorded_file_changed_since_injection_is_refused_and_reinject_unblocks() {
         .args(["-l", "es"])
         .assert()
         .success();
+
+    let injected = fs::read(game.join("index.html")).unwrap();
+    let recording = Database::open(&db)
+        .unwrap()
+        .get_injection(Some("es"))
+        .unwrap();
 
     // The user re-copied the game: the original, untranslated file is back
     // and no longer matches the recorded hash.
@@ -954,13 +1026,13 @@ fn a_recorded_file_changed_since_injection_is_refused_and_reinject_unblocks() {
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("changed on disk since injection")
-                .and(predicate::str::contains("--direct -l es")),
+            predicate::str::contains("changed on disk since injection").and(
+                predicate::str::contains("Restore the last recorded injected files"),
+            ),
         );
     assert!(!zip.exists(), "unverified bytes must never ship");
 
-    // Execute the advice: re-inject (rewrites the file and refreshes the
-    // recording), then patch.
+    // Direct must not silently accept the external edits as a new baseline.
     locust()
         .arg("inject")
         .arg(&game)
@@ -969,7 +1041,24 @@ fn a_recorded_file_changed_since_injection_is_refused_and_reinject_unblocks() {
         .arg("--direct")
         .args(["-l", "es"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains(
+            "no longer matches its recorded hash/size",
+        ));
+    assert_eq!(
+        fs::read(game.join("index.html")).unwrap(),
+        HTML_BODY.as_bytes()
+    );
+    assert_eq!(
+        Database::open(&db)
+            .unwrap()
+            .get_injection(Some("es"))
+            .unwrap(),
+        recording
+    );
+
+    // Follow the recovery advice using the exact saved result, then pack.
+    fs::write(game.join("index.html"), &injected).unwrap();
     locust()
         .arg("patch")
         .arg(&game)
@@ -1070,4 +1159,61 @@ fn a_recording_made_with_relative_paths_packs_from_any_cwd() {
         .assert()
         .success();
     assert!(zip_entry_string(&zip, "index.html").contains("[MOCK:es]"));
+}
+
+#[test]
+fn replacing_another_project_never_prunes_a_recorded_direct_backup() {
+    let base = base_dir();
+    let backups = base.join("isolated-backups");
+    let first_base = base.join("first");
+    fs::create_dir(&first_base).unwrap();
+    let (first_game, first_db) = html_game_project(&first_base);
+    locust()
+        .env("LOCUST_BACKUP_ROOT", &backups)
+        .arg("inject")
+        .arg(&first_game)
+        .arg("-P")
+        .arg(&first_db)
+        .args(["--direct", "-l", "es"])
+        .assert()
+        .success();
+    let other_base = base.join("other");
+    fs::create_dir(&other_base).unwrap();
+    let (other_game, other_db) = html_game_project(&other_base);
+    for index in 0..5 {
+        locust()
+            .env("LOCUST_BACKUP_ROOT", &backups)
+            .arg("inject")
+            .arg(&other_game)
+            .arg("-P")
+            .arg(&other_db)
+            .args(["-l", "es", "-o"])
+            .arg(base.join(format!("copy-{index}")))
+            .assert()
+            .success();
+    }
+    let output = base.join("first.zip");
+    locust()
+        .env("LOCUST_BACKUP_ROOT", base.join("different-profile"))
+        .arg("patch")
+        .arg(&first_game)
+        .arg("-P")
+        .arg(&first_db)
+        .args(["-l", "es", "-o"])
+        .arg(&output)
+        .assert()
+        .success();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&zip_entry_bytes(&output, "locust-patch.json")).unwrap();
+    let file = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "index.html")
+        .unwrap();
+    assert_eq!(
+        file["original_sha256"],
+        locust_core::database::sha256_hex(HTML_BODY.as_bytes())
+    );
+    fs::remove_dir_all(base).unwrap();
 }

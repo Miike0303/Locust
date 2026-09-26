@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+mod injection_recovery;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -68,6 +69,15 @@ enum Commands {
         /// Number of batches sent to the provider in parallel
         #[arg(long)]
         concurrency: Option<usize>,
+        /// Approximate input-token budget per batch; long entries run alone
+        #[arg(long)]
+        max_batch_tokens: Option<usize>,
+        /// Bypass translation memory (useful for provider benchmarks)
+        #[arg(long)]
+        no_memory: bool,
+        /// Allow mechanical truncation/accent folding of oversized binary text
+        #[arg(long)]
+        allow_lossy_binary_fit: bool,
         /// Providers to fall back to (in order) when the primary stops making
         /// progress — e.g. --fallback deepseek,lmstudio
         #[arg(long, value_delimiter = ',')]
@@ -84,20 +94,47 @@ enum Commands {
         project: PathBuf,
         #[arg(short, long)]
         mode: Option<String>,
-        /// Target language(s). Selects the recording `locust patch` packs; also
-        /// names Replace output folders and Add-mode language files. Required for
-        /// Replace/Add; optional with --direct (the recording is then
-        /// language-unspecified and packed by `patch` without -l)
+        /// One target language for this project DB. Use a separate pivot/DB per
+        /// target language. Required for Replace/Add; optional with --direct
+        /// (the recording is then language-unspecified).
         #[arg(short, long, num_args = 1..)]
         languages: Vec<String>,
         #[arg(short, long)]
         output_dir: Option<PathBuf>,
-        /// Inject directly into game files without copying (fast, modifies originals)
+        /// Install translations in place using a recoverable private work copy
         #[arg(long)]
         direct: bool,
     },
     /// Validate translations
     Validate { project: PathBuf },
+    /// Audit TTF/OTF/TTC glyph coverage (WOFF and parse failures are reported)
+    FontCheck {
+        path: PathBuf,
+        #[arg(long)]
+        text_file: PathBuf,
+    },
+    /// Package a user-supplied font for one existing loose-font asset
+    FontPatch {
+        game_path: PathBuf,
+        #[arg(long)]
+        font: PathBuf,
+        /// Existing game-relative TTF/OTF path already referenced by the game
+        #[arg(long)]
+        target: String,
+        #[arg(long, value_parser = ["rpgmaker-mv", "rpgmaker-mz", "rpgmaker_mv", "rpgmaker_mz", "renpy", "html"])]
+        engine: String,
+        #[arg(long)]
+        lang: String,
+        /// UTF-8 file containing actual target-language text
+        #[arg(long)]
+        text_file: PathBuf,
+        /// Combine with a translation zip that verifies against this clean game
+        #[arg(long)]
+        base_patch: Option<PathBuf>,
+        /// A new output zip; existing files are never overwritten
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Find and replace text inside translations in a project DB
     Replace {
         project: PathBuf,
@@ -144,7 +181,8 @@ enum Commands {
         astro: Option<PathBuf>,
         /// Optional pristine (pre-inject) game tree used to fill original_sha256
         /// in the patch manifest. Enables strict-tier verification on apply.
-        /// Resolution order when omitted: <game>/.locust/backup/ if valid → none.
+        /// When omitted, use the recorded injection backup if available, then
+        /// <game>/.locust/backup/ if valid. Missing recorded backups are errors.
         #[arg(long)]
         pristine: Option<PathBuf>,
     },
@@ -177,6 +215,15 @@ enum Commands {
     },
     /// Show whether a game has a Locust patch applied
     PatchStatus { game_path: PathBuf },
+    /// Inspect an interrupted translation insertion and its recovery conflicts
+    InjectStatus { game_path: PathBuf },
+    /// Restore the original files after an interrupted translation insertion
+    InjectRecover {
+        game_path: PathBuf,
+        /// Preserve conflicting user bytes separately before restoring originals
+        #[arg(long)]
+        force: bool,
+    },
     /// Authenticate with a provider via OAuth (currently: grok)
     Auth {
         /// Provider to authenticate: grok
@@ -280,6 +327,9 @@ async fn main() -> anyhow::Result<()> {
             target,
             batch_size,
             concurrency,
+            max_batch_tokens,
+            no_memory,
+            allow_lossy_binary_fit,
             fallback,
             cost_limit,
             context,
@@ -292,6 +342,9 @@ async fn main() -> anyhow::Result<()> {
                 target,
                 batch_size,
                 concurrency,
+                max_batch_tokens,
+                no_memory,
+                allow_lossy_binary_fit,
                 fallback,
                 cost_limit,
                 context,
@@ -313,6 +366,59 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Validate { project } => cmd_validate(project)?,
+        Commands::FontCheck { path, text_file } => {
+            let text = std::fs::read_to_string(text_file)?;
+            let audit = if path.is_dir() {
+                locust_core::font_validation::FontValidator::audit_game_fonts(&path, &[&text])?
+            } else {
+                locust_core::font_validation::FontAuditReport {
+                    fonts: locust_core::font_validation::FontValidator::check_all_faces(
+                        &path,
+                        &[&text],
+                    )?,
+                    issues: Vec::new(),
+                }
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "fonts": audit.fonts, "issues": audit.issues,
+                    "limitations": locust_core::font_validation::FONT_COVERAGE_LIMITATION,
+                }))?
+            );
+        }
+        Commands::FontPatch {
+            game_path,
+            font,
+            target,
+            engine,
+            lang,
+            text_file,
+            base_patch,
+            output,
+        } => {
+            let text = std::fs::read_to_string(text_file)?;
+            let (mut archive, mut report) = locust_core::font_patch::build_font_patch(
+                &game_path,
+                &font,
+                &target,
+                &engine,
+                &lang,
+                &[&text],
+            )?;
+            if let Some(base) = base_patch {
+                archive = locust_core::font_patch::combine_font_patch(
+                    &game_path,
+                    &base,
+                    &archive,
+                    &mut report,
+                )?;
+            } else {
+                eprintln!("Standalone font patch: to include translated text, use --base-patch <translation.zip>. Locust tracks one applied patch per game; do not force a standalone font patch over an installed translation patch.");
+            }
+            locust_core::font_patch::write_font_patch(&output, &archive)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Commands::Replace {
             project,
             find,
@@ -340,6 +446,10 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_apply(game_path, zip, url, force, confirm_legacy, dry_run)?,
         Commands::PatchRollback { game_path, force } => cmd_patch_rollback(game_path, force)?,
         Commands::PatchStatus { game_path } => cmd_patch_status(game_path)?,
+        Commands::InjectStatus { game_path } => injection_recovery::status(&game_path)?,
+        Commands::InjectRecover { game_path, force } => {
+            injection_recovery::recover(&game_path, force)?
+        }
         Commands::Auth { provider } => cmd_auth(provider).await?,
         Commands::Providers => cmd_providers(&config)?,
         Commands::Formats => cmd_formats()?,
@@ -531,7 +641,7 @@ fn cmd_patch(
     astro: Option<PathBuf>,
     pristine: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    use locust_core::patch::{pack_injection_recording, PackOptions};
+    use locust_core::patch::{pack_with_pristine_backup, PackOptions};
 
     let db = Database::open(&project)?;
     let out = output.unwrap_or_else(|| {
@@ -541,7 +651,21 @@ fn cmd_patch(
     });
     let engine = detect_engine_label(&game_path);
 
-    let report = pack_injection_recording(
+    if let Some(path) = &astro {
+        validate_astro_output(path, &game_path, &project, &out, pristine.as_deref())?;
+        for language in db.list_recorded_langs()? {
+            if let Some(root) = db
+                .get_injection(language.as_deref())?
+                .and_then(|record| record.pristine_backup)
+                .and_then(|backup| backup.storage_root)
+            {
+                locust_core::patch::ensure_pack_output_outside(path, &root)?;
+            }
+        }
+    }
+
+    let backup_store = BackupManager::new(locust_backup_root());
+    let report = pack_with_pristine_backup(
         &db,
         PackOptions {
             game_path: game_path.clone(),
@@ -552,6 +676,9 @@ fn cmd_patch(
             project: project.clone(),
             require_pristine: false,
         },
+        &backup_store,
+        None,
+        true,
     )
     .map_err(|e| {
         // Preserve CLI remedies that mention inject paths when useful.
@@ -567,7 +694,7 @@ fn cmd_patch(
     }
 
     if let Some(astro_path) = astro {
-        write_astro_stub(&astro_path, &game_path, lang.as_deref())?;
+        write_astro_stub(&astro_path, &game_path, report.recording_lang.as_deref())?;
         println!("Astro stub written to {}", astro_path.display());
     }
 
@@ -584,7 +711,7 @@ fn cmd_patch(
     table.add_row(vec!["Recorded root", &report.recorded_root]);
     table.add_row(vec!["Files packed", &report.files_packed.to_string()]);
     table.add_row(vec![
-        "Translated strings",
+        "Stored translations",
         &report.translated_strings.to_string(),
     ]);
     table.add_row(vec![
@@ -599,8 +726,36 @@ fn cmd_patch(
     Ok(())
 }
 
-/// Write a starter rule95 content file. Fields we can infer are filled;
-/// the rest (creator, versions, mirrors after upload) are left as TODO.
+/// Validate the optional companion file before publishing any patch output.
+fn validate_astro_output(
+    path: &std::path::Path,
+    game_path: &std::path::Path,
+    project: &std::path::Path,
+    zip: &std::path::Path,
+    pristine: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use locust_core::patch::ensure_pack_output_outside;
+    if path.try_exists()? {
+        anyhow::bail!(
+            "Astro output already exists; choose a new file: {}",
+            path.display()
+        );
+    }
+    for protected in [game_path, project, zip, locust_backup_root().as_path()] {
+        ensure_pack_output_outside(path, protected)?;
+    }
+    if let Some(pristine) = pristine {
+        ensure_pack_output_outside(path, pristine)?;
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = project.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        ensure_pack_output_outside(path, std::path::Path::new(&sidecar))?;
+    }
+    Ok(())
+}
+
+/// Write a starter rule95 content file without replacing an existing file.
 fn write_astro_stub(
     path: &std::path::Path,
     game_path: &std::path::Path,
@@ -643,10 +798,17 @@ fn write_astro_stub(
          `locust patch-rollback <game>` undoes it.\n"
     );
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, md)?;
+    // Never truncate a destination (including one created after preflight).
+    // Publish only a complete file; a failed write leaves no partial stub.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut temporary, md.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist_noclobber(path)?;
     Ok(())
 }
 
@@ -802,13 +964,13 @@ fn cmd_patch_rollback(game_path: PathBuf, force: bool) -> anyhow::Result<()> {
         for p in &report.aborted_edited {
             println!("  {p}");
         }
-        return Ok(());
+        anyhow::bail!("rollback refused: modified added files were preserved; use --force to authorize deletion");
     }
     for m in &report.messages {
         println!("{m}");
     }
     if !report.torn_deleted.is_empty() {
-        println!("torn files deleted (interrupted apply):");
+        println!("changed files deleted with explicit force (interrupted apply):");
         for p in &report.torn_deleted {
             println!("  {p}");
         }
@@ -891,6 +1053,7 @@ fn cmd_stats(project: PathBuf) -> anyhow::Result<()> {
     ]);
     let (mut t_strings, mut t_tokens, mut t_in, mut t_out, mut t_cost, mut t_secs) =
         (0usize, 0u64, 0u64, 0u64, 0f64, 0f64);
+    let mut cost_is_complete = true;
     for run in &runs {
         table.add_row(vec![
             run.started_at.chars().take(16).collect::<String>(),
@@ -900,7 +1063,7 @@ fn cmd_stats(project: PathBuf) -> anyhow::Result<()> {
             run.tokens_used.to_string(),
             run.input_tokens.to_string(),
             run.output_tokens.to_string(),
-            format!("{:.4}", run.cost_usd),
+            format_observed_cost(run.cost_usd, run.cost_is_complete),
             format_duration(run.duration_secs),
         ]);
         t_strings += run.strings_translated;
@@ -908,6 +1071,7 @@ fn cmd_stats(project: PathBuf) -> anyhow::Result<()> {
         t_in += run.input_tokens;
         t_out += run.output_tokens;
         t_cost += run.cost_usd;
+        cost_is_complete &= run.cost_is_complete;
         t_secs += run.duration_secs;
     }
     table.add_row(vec![
@@ -918,11 +1082,21 @@ fn cmd_stats(project: PathBuf) -> anyhow::Result<()> {
         t_tokens.to_string(),
         t_in.to_string(),
         t_out.to_string(),
-        format!("{:.4}", t_cost),
+        format_observed_cost(t_cost, cost_is_complete),
         format_duration(t_secs),
     ]);
     println!("{table}");
     Ok(())
+}
+
+fn format_observed_cost(amount: f64, complete: bool) -> String {
+    if complete {
+        format!("${amount:.4}")
+    } else if amount > 0.0 {
+        format!(">= ${amount:.4} (partial; total unknown)")
+    } else {
+        "Unknown (not reported)".into()
+    }
 }
 
 fn format_duration(secs: f64) -> String {
@@ -961,6 +1135,7 @@ fn cmd_extract(
     format: Option<String>,
     output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let _source_lock = locust_core::project::lock_game_source(&path)?;
     let registry = locust_formats::default_registry();
 
     let plugin = if let Some(ref fmt) = format {
@@ -978,6 +1153,10 @@ fn cmd_extract(
 
     let entries = plugin.extract(&path)?;
     let total = entries.len();
+    let extraction_warnings = locust_core::project::extraction_warnings(&entries);
+    for warning in &extraction_warnings {
+        eprintln!("warning: partial extraction: {warning}");
+    }
 
     let db_path = output.unwrap_or_else(|| {
         let name = path
@@ -990,6 +1169,10 @@ fn cmd_extract(
 
     let db = Database::open(&db_path)?;
     db.save_entries(&entries)?;
+    db.set_project_metadata(
+        "extraction_warnings",
+        &serde_json::json!(extraction_warnings),
+    )?;
 
     let mut table = Table::new();
     table.set_header(vec!["Property", "Value"]);
@@ -1010,6 +1193,9 @@ async fn cmd_translate(
     target: String,
     batch_size: Option<usize>,
     concurrency: Option<usize>,
+    max_batch_tokens: Option<usize>,
+    no_memory: bool,
+    allow_lossy_binary_fit: bool,
     fallback: Vec<String>,
     cost_limit: Option<f64>,
     context: Option<String>,
@@ -1018,11 +1204,21 @@ async fn cmd_translate(
     let provider_reg = locust_providers::default_registry(&config);
     let glossary = Arc::new(Glossary::new(db.clone()));
 
+    // Measured with Grok 4.6: smaller batches avoid long reasoning deadlines.
+    // Explicit flags always take precedence; other providers retain their defaults.
+    let grok = matches!(provider_id.as_str(), "grok" | "grok-sub");
     let opts = TranslationOptions {
         source_lang: source,
         target_lang: target,
-        batch_size: batch_size.unwrap_or(40),
-        max_concurrent: concurrency.unwrap_or(TranslationOptions::default().max_concurrent),
+        batch_size: batch_size.unwrap_or(if grok { 10 } else { 40 }),
+        max_concurrent: concurrency.unwrap_or(if grok {
+            10
+        } else {
+            TranslationOptions::default().max_concurrent
+        }),
+        max_batch_tokens: max_batch_tokens.or(TranslationOptions::default().max_batch_tokens),
+        use_memory: !no_memory,
+        allow_lossy_binary_fit,
         cost_limit_usd: cost_limit,
         game_context: context,
         ..Default::default()
@@ -1090,6 +1286,7 @@ async fn cmd_translate(
     });
 
     let mut total_cost = 0.0;
+    let mut cost_is_complete = false;
     let mut total_translated = 0;
     let mut errors = 0u64;
     let start = std::time::Instant::now();
@@ -1102,10 +1299,12 @@ async fn cmd_translate(
             ProgressEvent::BatchCompleted {
                 completed,
                 cost_so_far,
+                cost_is_complete: complete,
                 ..
             } => {
                 bar.set_position(completed as u64);
-                bar.set_message(format!("${:.4}", cost_so_far));
+                bar.set_message(format_observed_cost(cost_so_far, complete));
+                cost_is_complete = complete;
                 total_cost = cost_so_far;
                 total_translated = completed;
             }
@@ -1121,12 +1320,14 @@ async fn cmd_translate(
             ProgressEvent::Completed {
                 total_translated: tt,
                 total_cost: tc,
+                cost_is_complete: complete,
                 ..
             } => {
                 total_translated = tt;
                 total_cost = tc;
+                cost_is_complete = complete;
             }
-            ProgressEvent::Failed { error, .. } => {
+            ProgressEvent::BatchFailed { error, .. } | ProgressEvent::Failed { error, .. } => {
                 errors += 1;
                 if errors <= 3 {
                     bar.println(format!("Error: {error}"));
@@ -1144,7 +1345,10 @@ async fn cmd_translate(
     table.set_header(vec!["Metric", "Value"]);
     table.add_row(vec!["Total translated", &total_translated.to_string()]);
     table.add_row(vec!["Time elapsed", &format_duration(elapsed)]);
-    table.add_row(vec!["Total cost", &format!("${:.4}", total_cost)]);
+    table.add_row(vec![
+        "Total cost",
+        &format_observed_cost(total_cost, cost_is_complete),
+    ]);
     table.add_row(vec!["Batch errors", &errors.to_string()]);
     println!("{table}");
 
@@ -1198,6 +1402,13 @@ async fn cmd_inject(
             },
         );
     }
+    if languages.len() > 1 {
+        anyhow::bail!(
+            "one project database can inject only one target language per run. \
+             Create/use a separate pivot database for each target language, then \
+             run inject once per DB."
+        );
+    }
 
     let db = Arc::new(Database::open(&project)?);
     let registry = Arc::new(locust_formats::default_registry());
@@ -1214,12 +1425,8 @@ async fn cmd_inject(
     std::fs::create_dir_all(&backup_root).ok();
     let backup_mgr = Arc::new(BackupManager::new(backup_root));
 
-    // Auto-rotate: keep only the 3 most recent backups to prevent disk bloat
-    if let Ok(deleted) = backup_mgr.delete_old_backups(3) {
-        if deleted > 0 {
-            println!("Cleaned {} old backup(s)", deleted);
-        }
-    }
+    // Recordings in other project databases can still reference older backups.
+    // A global age/count limit cannot prove those originals are unreferenced.
 
     let preflight_entries = db.get_entries(&EntryFilter::default())?;
     warn_binary_slot_oversize(&preflight_entries);
@@ -1266,6 +1473,9 @@ async fn cmd_inject(
     ]);
     table.add_row(vec!["Backup ID", &report.backup_id]);
     for (lang, rep) in &report.reports {
+        for (reason, count) in &rep.skip_reasons {
+            table.add_row(vec![format!("{lang} skipped: {reason}"), count.to_string()]);
+        }
         table.add_row(vec![
             &format!("{} files modified", lang),
             &rep.files_modified.to_string(),
@@ -1311,6 +1521,13 @@ async fn cmd_inject_direct(
     project: PathBuf,
     languages: Vec<String>,
 ) -> anyhow::Result<()> {
+    if languages.len() > 1 {
+        anyhow::bail!(
+            "one project database can inject only one target language per run. \
+             Create/use a separate pivot database for each target language, then \
+             run inject once per DB."
+        );
+    }
     let db = Database::open(&project)?;
     let registry = locust_formats::default_registry();
 
@@ -1361,6 +1578,11 @@ async fn cmd_inject_direct(
     table.add_row(vec!["Files modified", &report.files_modified.to_string()]);
     table.add_row(vec!["Strings written", &report.strings_written.to_string()]);
     table.add_row(vec!["Strings skipped", &report.strings_skipped.to_string()]);
+    if let Some(rep) = report.reports.values().next() {
+        for (reason, count) in &rep.skip_reasons {
+            table.add_row(vec![format!("Skipped: {reason}"), count.to_string()]);
+        }
+    }
     if let Some(ref path) = report.backup_path {
         table.add_row(vec!["Backup", path]);
     }
@@ -1714,14 +1936,18 @@ async fn cmd_import(
         _ => anyhow::bail!("unsupported import format: {}. Use 'po' or 'xliff'", format),
     };
     let attempted = updates.len();
-    let applied = db.save_translations_batch(updates, "import").await?;
-    let (imported, _skipped) = export::import_counts_after_batch(pre_skipped, attempted, applied);
+    let report = db.save_imported_translations_batch(updates).await?;
+    let (imported, skipped) =
+        export::import_counts_after_batch(pre_skipped, attempted, report.imported);
 
     println!(
         "Imported {} translations from {}",
         imported,
         input.display()
     );
+    if skipped > 0 {
+        println!("Skipped {skipped}: {} outdated source(s), {} unknown id(s), {pre_skipped} empty/missing entries", report.stale_sources, report.unknown_ids);
+    }
     Ok(())
 }
 
@@ -1900,7 +2126,7 @@ mod tests {
     // recording injection persisted (root + rel + hash per language key);
     // every mismatch is a loud error naming a remedy that works ─────────────
 
-    use locust_core::database::{paths_identical, sha256_hex};
+    use locust_core::database::sha256_hex;
     use locust_core::models::StringEntry;
 
     fn patch_test_tempdir() -> PathBuf {
@@ -1934,6 +2160,96 @@ mod tests {
         save_translated(&db, "script.rpy#2", "Hello", &script, "Hola");
         drop(db);
         (game_dir, script, db_path, contents)
+    }
+
+    #[test]
+    fn test_patch_astro_refuses_protected_or_existing_outputs_before_packing() {
+        for case in [
+            "game",
+            "new_game_file",
+            "zip",
+            "database",
+            "wal",
+            "note",
+            "pristine",
+        ] {
+            let base = patch_test_tempdir();
+            let (game, script, db_path, contents) = make_renpy_game(&base);
+            let db = Database::open(&db_path).unwrap();
+            db.record_injection(Some("es"), &game, std::slice::from_ref(&script))
+                .unwrap();
+            drop(db);
+            let zip = base.join("patch.zip");
+            let pristine = base.join("pristine");
+            fs::create_dir(&pristine).unwrap();
+            let note = base.join("release.md");
+            fs::write(&note, "user notes").unwrap();
+            let output = match case {
+                "game" => script.clone(),
+                "new_game_file" => game.join("new-release.md"),
+                "zip" => base.join(".").join("patch.zip"),
+                "database" => db_path.clone(),
+                "wal" => PathBuf::from(format!("{}-wal", db_path.display())),
+                "pristine" => pristine.join("release.md"),
+                _ => note.clone(),
+            };
+            let previous = fs::read(&output).ok();
+            let database = fs::read(&db_path).unwrap();
+            let result = cmd_patch(
+                game,
+                db_path.clone(),
+                Some("es".into()),
+                Some(zip.clone()),
+                Some(output.clone()),
+                Some(pristine),
+            );
+            assert!(result.is_err(), "{case} unexpectedly accepted");
+            assert!(
+                !zip.exists(),
+                "{case} packed a ZIP before refusing the stub"
+            );
+            assert_eq!(
+                fs::read(&output).ok(),
+                previous,
+                "{case} changed destination"
+            );
+            assert_eq!(fs::read(&db_path).unwrap(), database);
+            assert_eq!(fs::read_to_string(script).unwrap(), contents);
+            let _ = fs::remove_dir_all(base);
+        }
+    }
+
+    #[test]
+    fn astro_stub_uses_the_auto_selected_recording_language() {
+        let base = patch_test_tempdir();
+        let (game, script, db_path, _) = make_renpy_game(&base);
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("fr"), &game, &[script]).unwrap();
+        drop(db);
+        let stub = base.join("release.md");
+        cmd_patch(
+            game,
+            db_path,
+            None,
+            Some(base.join("patch.zip")),
+            Some(stub.clone()),
+            None,
+        )
+        .unwrap();
+        assert!(fs::read_to_string(stub)
+            .unwrap()
+            .contains("Translation into fr"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn astro_stub_refuses_existing_file_even_without_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("release.md");
+        fs::write(&stub, "user notes").unwrap();
+        assert!(write_astro_stub(&stub, dir.path(), Some("es")).is_err());
+        assert_eq!(fs::read_to_string(&stub).unwrap(), "user notes");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -2539,8 +2855,8 @@ mod tests {
             "error must name the changed rel: {msg}"
         );
         assert!(
-            msg.contains("--direct -l es"),
-            "error must advise re-injecting to refresh the recording: {msg}"
+            msg.contains("Restore the last recorded injected files"),
+            "error must explain how to recover the recorded bytes: {msg}"
         );
         assert!(!out_zip.exists(), "no archive may be written on this path");
     }
@@ -2582,11 +2898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_inject_direct_records_rel_root_and_hash_per_language() {
-        // The bridge that makes the recorded-injection patch path reachable:
-        // `locust inject --direct` must persist root + rel + hash for EVERY
-        // requested language (recording only the first orphaned `patch -l
-        // <other>` — today's F1 bug).
+    async fn test_inject_direct_rejects_multiple_languages_for_one_database() {
         let base = patch_test_tempdir();
         let bak = base.join("bak");
         let game_dir = base.join("renpygame");
@@ -2597,47 +2909,40 @@ mod tests {
 
         let db_path = base.join("project.locust.db");
         let db = Database::open(&db_path).unwrap();
-        save_translated(
-            &db,
-            "script.rpy#2",
-            "Hello, world!",
-            &script,
-            "Hola, mundo!",
+        let mut pivoted =
+            StringEntry::new("script.rpy#2", "English semantic source", script.clone());
+        pivoted.translation = Some("Hola, mundo!".into());
+        pivoted.status = StringStatus::Translated;
+        pivoted.metadata.insert(
+            "locust_injection_source".into(),
+            serde_json::json!("Hello, world!"),
         );
+        db.save_entries(&[pivoted]).unwrap();
         drop(db);
 
         {
             let _guard = BACKUP_ROOT_LOCK.lock().await;
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
-            cmd_inject_direct(
+            let error = cmd_inject_direct(
                 game_dir.clone(),
                 db_path.clone(),
                 vec!["es".to_string(), "fr".to_string()],
             )
             .await
-            .unwrap();
+            .unwrap_err();
+            assert!(error.to_string().contains("separate pivot database"));
             std::env::remove_var("LOCUST_BACKUP_ROOT");
         }
 
         let db = Database::open(&db_path).unwrap();
         for lang in ["es", "fr"] {
-            let rec = db
-                .get_injection(Some(lang))
-                .unwrap()
-                .unwrap_or_else(|| panic!("a recording must exist for {lang}"));
-            assert!(
-                paths_identical(&rec.root, &game_dir),
-                "{lang}: the recorded root must be the injected game dir"
-            );
-            assert_eq!(rec.files.len(), 1, "{lang}: exactly the written file");
-            assert_eq!(rec.files[0].rel, "game/script.rpy");
-            let on_disk = fs::read(&script).unwrap();
-            assert_eq!(
-                rec.files[0].hash,
-                sha256_hex(&on_disk),
-                "{lang}: the recorded hash must be the hash of the written bytes"
-            );
+            assert!(db.get_injection(Some(lang)).unwrap().is_none());
         }
+        assert_eq!(
+            fs::read_to_string(&script).unwrap(),
+            "label start:\n    \"Hello, world!\"\n"
+        );
+        assert!(!bak.exists());
     }
 
     #[tokio::test]
@@ -2650,18 +2955,20 @@ mod tests {
         let game_sub = game_dir.join("game");
         fs::create_dir_all(&game_sub).unwrap();
         let script = game_sub.join("script.rpy");
-        fs::write(&script, "label start:\n    \"Hello, world!\"\n").unwrap();
+        fs::write(&script, "label start:\n    \"こんにちは、世界！\"\n").unwrap();
         let original = fs::read(&script).unwrap();
 
         let db_path = base.join("project.locust.db");
         let db = Database::open(&db_path).unwrap();
-        save_translated(
-            &db,
-            "script.rpy#2",
-            "Hello, world!",
-            &script,
-            "Hola, mundo!",
+        let mut pivoted =
+            StringEntry::new("script.rpy#2", "English semantic source", script.clone());
+        pivoted.translation = Some("Hola, mundo!".into());
+        pivoted.status = StringStatus::Translated;
+        pivoted.metadata.insert(
+            "locust_injection_source".into(),
+            serde_json::json!("こんにちは、世界！"),
         );
+        db.save_entries(&[pivoted]).unwrap();
         drop(db);
 
         {
@@ -2674,7 +2981,8 @@ mod tests {
         }
 
         // Injection mutated the loose script.
-        assert_ne!(fs::read(&script).unwrap(), original);
+        let injected = fs::read_to_string(&script).unwrap();
+        assert!(injected.contains("Hola, mundo!"), "{injected}");
 
         // Isolated backup root holds the pre-inject bytes.
         let bak_dirs: Vec<_> = fs::read_dir(&bak)
@@ -2689,7 +2997,7 @@ mod tests {
             "direct inject on a mutating engine must create exactly one backup under {}",
             bak.display()
         );
-        let backed = bak_dirs[0].join("game").join("script.rpy");
+        let backed = bak_dirs[0].join("payload").join("game").join("script.rpy");
         assert!(
             backed.is_file(),
             "backup must contain the original game/script.rpy"
@@ -2698,6 +3006,49 @@ mod tests {
             fs::read(&backed).unwrap(),
             original,
             "backup must hold pre-inject bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn pivoted_html_inject_uses_original_slot_and_leaves_duplicate_untouched() {
+        let base = patch_test_tempdir();
+        let bak = base.join("bak");
+        let game = base.join("htmlgame");
+        fs::create_dir_all(&game).unwrap();
+        let html = game.join("index.html");
+        fs::write(&html, "<p>日本語</p><p>日本語</p>").unwrap();
+
+        let registry = locust_formats::default_registry();
+        let plugin = registry.detect(&game).expect("HTML format");
+        let mut extracted = plugin.extract(&game).unwrap();
+        assert_eq!(extracted.len(), 2);
+        let mut pivoted = extracted.remove(0);
+        let physical = pivoted.source.clone();
+        pivoted.source = "English semantic source".into();
+        pivoted.translation = Some("Español".into());
+        pivoted.status = StringStatus::Translated;
+        pivoted.metadata.insert(
+            "locust_injection_source".into(),
+            serde_json::json!(physical),
+        );
+        let db_path = base.join("html.locust.db");
+        Database::open(&db_path)
+            .unwrap()
+            .save_entries(&[pivoted])
+            .unwrap();
+
+        {
+            let _guard = BACKUP_ROOT_LOCK.lock().await;
+            std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
+            cmd_inject_direct(game.clone(), db_path, vec!["es".into()])
+                .await
+                .unwrap();
+            std::env::remove_var("LOCUST_BACKUP_ROOT");
+        }
+
+        assert_eq!(
+            fs::read_to_string(html).unwrap(),
+            "<p>Español</p><p>日本語</p>"
         );
     }
 
