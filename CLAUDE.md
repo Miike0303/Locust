@@ -1,7 +1,36 @@
 # Project Locust
 
+## Estado vigente (2026-09-26): /goal reanudado por el usuario
+
+El usuario reanudó el trabajo con `/goal` y autorizó escritores **Codex y Cursor** (Grok Build sigue apagado). Config y gates: `.claude/improvement.md`; ledger: `docs/IMPROVEMENT-GOAL.md`; mapa: `docs/ARCHITECTURE.md`. El trabajo previo sin commit (sesiones 2026-09-11..21) quedó en commits snapshot `e0e5268..` sobre `feat/desktop-ux-kimi-k3-p2`. Esto reemplaza la pausa del 2026-09-21 y la restricción "sin Cursor" de las secciones históricas siguientes.
+
 Universal open-source game translation tool built in Rust.
 
+## Active goal: restarted 2026-09-21
+
+Latest provider steering: **work directly in Codex using the ChatGPT subscription; do not use Cursor or Grok Build**. This explicitly supersedes all historical external-worker instructions below. Preserve existing changes. Current verified checkpoint: `tmp/goal-20260921/BATCH13.json`; next work: `tmp/goal-20260921/NEXT.md`. The goal remains active without a token budget or new deadline; do useful work, never artificial quota consumption. Prefer hidden processes and headless screenshots with isolated profiles/fixtures. No purchases, resets, publishing, or real-game modification.
+
+BATCH13: 1439 Rust tests passed, 17 ignored; fmt, strict Clippy, release CLI/desktop, 25 Direct + 25 Replace saved-translation cases, Rule95 artifacts and actual frontend/backend QA passed. Repeated unchanged Direct injections retain the original backup and discard only the newly created redundant generation after locked verification. Raw backup-reader integrity and real game/font coverage remain pending. Native windows have not been upgraded to this release. Later batch checkpoints supersede these counts when present.
+
+## Latest continuation (2026-09-17)
+
+User explicitly resumed work. Session drafts now survive DetailPanel unmount, row changes and route navigation, scoped by project database/game/format/entry. Shared pending writes/errors survive remount; server acknowledgment cannot clear newer text. Editor query keys include project scope; queue preserves database_path and extraction warnings. See `docs/CONTINUATION-2026-09-17.md` and `tmp/continuation-20260917/` for current evidence: 29 frontend test files, production build and real-backend headless UI flows pass. Drafts are in memory only, not persisted across app reload/exit. Prior Rust/matrix totals below were not rerun for this frontend change. Do not revive the old timed goal.
+
+## Latest engine verification (2026-09-12, Astra continuation)
+
+Current work and limitations: `docs/ENGINE-ASTRA-2026-09-12.md`. The user superseded the original 07:00 UTC deadline and requested early closure with 5% quota remaining. Closure complete: 1239 Rust tests, 28 frontend test files, strict Clippy/format, all four release binaries, 25-case Locust and Rule95 replay pass. Summary: tmp/pending-astra-20260911/FINAL.md. Do not resume autonomous work from the old deadline. Development model override is Astra; Cursor CLI did not expose Astra, so native `gpt-6-astra` high workers are used in isolated snapshots. No usage resets or purchases authorized. A physical Escape stopped Computer Use; do not resume desktop control during this goal. Shell-driven headless browser QA is permitted and has passed the font-patch flow.
+
+Integrated: validated Unity TextAsset growth/UnityFS node relocation and unchanged compressed-block reuse; shared immutable physical TextAsset originals in memory/SQLite; modern PAK + native indexed ExternalFile IoStore LocRes; tuple-safe LocRes identities; ZIP-plan integrity, operation-owned scratch files, cross-process patch locks; font coverage and combined font patches via CLI/HTTP/UI. Partial extraction diagnostics preserve absent translated rows until a later complete extraction. Root checkpoints and source SHA manifests are under `tmp/pending-astra-20260911/`. The API matrix passed five engines and five target languages (31 runs, 316 translations). Final integrated release verification and exact hashes are recorded in tmp/pending-astra-20260911/FINAL.md; consult it before attributing older test results.
+
+## Historical checkpoint (2026-09-11, superseded where noted above)
+
+See `docs/ENGINE-MATRIX-2026-09-11.md` for current results and limitations; older counts below are historical. JA→EN→ES/FR/DE/PT-BR/ZH completed on five synthetic formats (Unity German required a concise provider retry). Real UnityFS, Unreal patch PAK, RenPy RPA, RPG Maker MZ and SugarCube samples passed artifact install/reextract/rollback checks. 890 Rust tests passed, 9 ignored; 26 UI test files, TypeScript, production frontend, CLI and desktop release builds passed. Native game runtime/font/save-load QA is still pending.
+
+Pivot provenance is immutable (`locust_injection_source`, `locust_injection_capacity`); semantic English remains in DB and provider input. One injection DB corresponds to one language; CLI/API/UI reject multiple labels for one translation. Keep separate pivot DBs per target. Stale/missing pivot rows fail merge atomically. RenPy loose overrides win during DB extraction; structured Unity fields retain CJK and fixed padding. SugarCube injects only selected visible rows and skips joined inline-markup rows to preserve links/conditions. Pending: automatic whole-TextAsset budget retry, markup-aware SugarCube fragments, full-game Unreal PAK ordering, fonts/runtime/linguistic QA. Current binaries are `target/release/locust.exe` and `target/release/locust-desktop.exe`; original game files were not modified.
+
+## User preference: Grok parallelism (2026-09-11)
+
+Use Grok concurrency for independent translation batches. The user recalls roughly 6–10 simultaneous tasks; treat this as a preferred working range, not a verified service limit. The Locust OAuth benchmark successfully used 10 concurrent requests with batches of 10; CLI Grok defaults already use that profile. Respect explicit settings, budget enforcement, rate limits and cancellation. For development workers, verify available capacity and keep one writer per checkout or use isolated snapshots. The earlier Cursor Grok preference was superseded by the user's request for Astra. See the current checkpoint above.
 ## Architecture
 
 Cargo workspace with 6 crates:
@@ -9,7 +38,7 @@ Cargo workspace with 6 crates:
 - `crates/formats` — 14 plugins, all with real inject. Stable (inherit `FormatPlugin::stability` default, not an explicit declaration): `rpgmaker-mv`, `rpgmaker-vxa`, `renpy`. Experimental (explicit): Wolf RPG, SugarCube, HTML, Unity, Unreal, QSP, TyranoBuilder, KiriKiri, YU-RIS, NScripter, VNTextPatch. No registered plugin is `ComingSoon`.
 - `crates/providers` — always registered: Google (free, no key), Mock, Argos, LM Studio, Ollama. Key-gated (registered when `api_key` is set): DeepL, OpenAI, Claude, DeepSeek, Grok, Gemini. `grok-sub` when an OAuth token exists (`locust auth grok`). Retry + per-provider rate limiting are wired at the single call site in `locust-core::translation` (not dead code): retries transient failures only (429/5xx/timeout/network), never auth errors; exponential backoff with jitter; overall deadline; cancellation wins during backoff; per-provider-id RPM defaults.
 - `crates/server` — Axum, 37 routes, loopback (`127.0.0.1`) by default. JSON REST + one WebSocket (`/api/translate/ws/:job_id`). Does **not** serve a static UI.
-- `crates/cli` — clap CLI, 19 subcommands (see below). `locust server` default port is **3000**; the desktop app uses **7842**.
+- `crates/cli` — clap CLI (see `locust --help` for current subcommands). `locust server` default port is **3000**; the desktop app reserves an available loopback socket and reports the actual port to its frontend. Standalone production HTTP UI defaults to **7842**.
 - `apps/desktop/src-tauri` — Tauri desktop app (React + Vite + TypeScript in `apps/desktop/`). UI chrome is English/Spanish via Settings → Appearance → Interface language (`localStorage` `locust.ui.language`); that is not the translation target language.
 
 ## Project database
@@ -31,7 +60,7 @@ cd apps/desktop
 npm run build
 ```
 
-~730 tests across the workspace; 13 frontend unit test files (`npm run test:unit` in `apps/desktop`).
+See the current final verification report for Rust totals; 28 frontend unit test files (`npm run test:unit` in `apps/desktop`).
 
 ## Key Commands
 

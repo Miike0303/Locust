@@ -45,8 +45,8 @@ Stability matches `locust formats` / the desktop Welcome screen
 | ------------------------- | ---------------- | ----- |
 | **SugarCube / Twine**     | `.html`, `.htm`  | Interactive fiction |
 | **HTML (generic)**        | `.html`, `.htm`  | Non-SugarCube HTML adventures |
-| **Unity**                 | `.assets`, `level*` | TextAsset structural + heuristic UTF-8 slots (≤ source) |
-| **Unreal Engine**         | `.pak`, `.locres` | UTF-16LE heuristic + structural `.locres`; inject → `*_LOCUST_P.pak` |
+| **Unity**                 | `.assets`, `level*`, `data.unity3d` | Validated TextAsset resizing in SerializedFile v17–22 / UnityFS v6–8; other heuristic slots remain fixed-size |
+| **Unreal Engine**         | `.pak`, `.locres`, `.utoc` / `.ucas` | Structural LocRes from supported classic/modern PAK and indexed IoStore ExternalFile chunks; writes `*_LOCUST_P.pak` overlays |
 | **Wolf RPG Editor**       | `.wolf`          | Shift-JIS binary; length ≤ source |
 | **VNTextPatch JSON**      | `.json`          | VN intermediate (KiriKiri/YU-RIS/… via VNTextPatch); Phase-2 patch apply proven on fixture |
 | **QSP**                   | `.qsp`, `.gam`   | QuestSoft Player; synthetic fixture only |
@@ -100,7 +100,9 @@ locust apply "<game-copy>" --url "https://example.com/game-es-patch.zip"
 
 ### Build from source
 
-Requires Rust 1.75+ and Node.js 20+.
+Use current stable Rust (validated with Rust 1.94) and Node.js 20+.
+Patch coordination uses the standard library's file-lock API, so older toolchains
+without that API cannot build this version.
 
 ```bash
 git clone https://github.com/Miike0303/Locust.git
@@ -142,7 +144,11 @@ locust patch-status "<clean_copy>"
 locust patch-rollback "<clean_copy>"   # restores .locust/backup
 ```
 
+After a new Direct injection, `patch` can omit `--pristine`: it retrieves the exact recorded backup and verifies its original hashes, including after restart or switching between CLI and desktop profiles. Repeating an injection that writes nothing keeps the previous association. A missing or modified recorded backup stops packaging; supply an intact `--pristine` copy to recover. Older records without backup provenance retain the legacy fallback behavior. The backup belongs to that injection generation, which may start from an already translated working copy.
+
 Got suspicious strings? Open the Editor, filter by tag (`dialogue`, `ui_label`, `menu`, etc.), and edit or approve translations manually before injecting.
+
+If a Direct/Add insertion is interrupted, run `locust inject-status "<work_copy>"` and `locust inject-recover "<work_copy>"` before modifying that game again. Recovery uses verified originals and preserves conflicting edits when explicitly forced. See [insertion recovery](docs/INJECTION-RECOVERY.md) for commands, backup behavior, disk costs, and limits.
 
 ---
 

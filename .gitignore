@@ -1,6 +1,7 @@
 # Build output
 /target
 /target-alt
+/target-*
 /dist
 **/dist/
 node_modules/
@@ -72,3 +73,6 @@ TODO.local.md
 # Built KiriKiri proxy DLLs and the renamed original system DLL they forward to.
 # Build from docs/vn-tools/proxy/src instead of committing binaries.
 docs/vn-tools/proxy/*.dll
+
+# Python bytecode
+__pycache__/
