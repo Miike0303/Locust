@@ -54,6 +54,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 47 (optimization, full-Codex mode; research duel skipped: single researcher).** Patch apply's `classify_files` hashed every existing file and then discarded the hash for replaced paths (`let _ = hash;`); only added paths use it to tell already-patched from conflicting. It now hashes only existing added paths (counter test `classify_files_hashes_only_existing_added_paths`: 2 → 1; Codex negative-tested it). Claude's note: an unreadable replaced file no longer errors at this step, but verification already hashed it and the write would fail. Next rotation: `defect`.
+
 - `pending` — **cycle 46 (capability, full-Codex mode; research duel skipped: single researcher).** `patch-status` read the receipt only, so it said "patched" even after an installed file changed or disappeared. `--verify` checks the receipt-listed files and hashes under the game lock, lists changed or missing paths, and exits nonzero on drift; the default stays quick. Read-only. Test `patch_status_verify_detects_changed_and_missing_files`; Codex negative-tested it. Next rotation: `optimization`.
 
 - `pending` — **cycle 45 (defect, full-Codex mode; research duel skipped: single researcher).** Server patch-apply cancellation escaped the blocking engine by `panic!` inside the progress callback. `patch::apply_cancellable` takes a `FnMut(PatchProgress) -> Result<()>` and stops with `PatchInterrupted` at the same point, before the next file write, leaving the same interrupted journal. `apply` keeps its API as a thin wrapper, and the server no longer panics. `cancelled_apply_after_one_write_can_be_rolled_back` shows the interrupted status and a byte-identical rollback; Codex negative-tested it. Next rotation: `capability`.

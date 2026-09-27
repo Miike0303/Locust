@@ -749,32 +749,33 @@ pub fn classify_files(
     for f in files {
         let target = game_root.join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if target.is_file() {
-            let hash = sha256_path(&target)?;
             if let Some(orig) = &f.original_sha256 {
                 replaced.push(ReceiptReplaced {
                     path: f.path.clone(),
                     original_sha256: Some(orig.clone()),
                     patched_sha256: f.patched_sha256.clone(),
                 });
-                let _ = hash;
-            } else if hash == f.patched_sha256 {
-                // already patched added file
-                added.push(ReceiptAdded {
-                    path: f.path.clone(),
-                    patched_sha256: f.patched_sha256.clone(),
-                });
-            } else if force {
-                // Conflict → reclassify to replaced, backup current bytes.
-                replaced.push(ReceiptReplaced {
-                    path: f.path.clone(),
-                    original_sha256: Some(hash),
-                    patched_sha256: f.patched_sha256.clone(),
-                });
             } else {
-                return Err(LocustError::PatchVerificationFailed(format!(
-                    "added-path conflict at {} (file exists with different content)",
-                    f.path
-                )));
+                let hash = sha256_path(&target)?;
+                if hash == f.patched_sha256 {
+                    // already patched added file
+                    added.push(ReceiptAdded {
+                        path: f.path.clone(),
+                        patched_sha256: f.patched_sha256.clone(),
+                    });
+                } else if force {
+                    // Conflict → reclassify to replaced, backup current bytes.
+                    replaced.push(ReceiptReplaced {
+                        path: f.path.clone(),
+                        original_sha256: Some(hash),
+                        patched_sha256: f.patched_sha256.clone(),
+                    });
+                } else {
+                    return Err(LocustError::PatchVerificationFailed(format!(
+                        "added-path conflict at {} (file exists with different content)",
+                        f.path
+                    )));
+                }
             }
         } else if f.original_sha256.is_some() {
             // Expected to exist for replace — still plan as replaced (apply may fail later).
@@ -797,6 +798,40 @@ pub fn classify_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_files_hashes_only_existing_added_paths() {
+        let game = tempfile::tempdir().unwrap();
+        std::fs::write(game.path().join("replaced.rpy"), b"original").unwrap();
+        std::fs::write(game.path().join("added.rpy"), b"patched").unwrap();
+        let files = vec![
+            PatchFileEntry {
+                path: "replaced.rpy".into(),
+                patched_sha256: crate::database::sha256_hex(b"translated"),
+                size: 10,
+                original_sha256: Some(crate::database::sha256_hex(b"original")),
+            },
+            PatchFileEntry {
+                path: "added.rpy".into(),
+                patched_sha256: crate::database::sha256_hex(b"patched"),
+                size: 7,
+                original_sha256: None,
+            },
+        ];
+
+        crate::database::SHA256_PATH_CALLS.with(|calls| calls.set(Some(0)));
+        let (replaced, added, warnings) = classify_files(game.path(), &files, false).unwrap();
+        let hashes = crate::database::SHA256_PATH_CALLS.with(|calls| calls.replace(None));
+
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(added.len(), 1);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            hashes,
+            Some(1),
+            "only the existing added path needs hashing"
+        );
+    }
 
     #[test]
     fn strict_verify_hashes_each_existing_file_once() {
