@@ -1011,7 +1011,7 @@ fn cmd_patch_rollback(game_path: PathBuf, force: bool) -> anyhow::Result<()> {
         println!("{m}");
     }
     if !report.torn_deleted.is_empty() {
-        println!("changed files deleted with explicit force (interrupted apply):");
+        println!("changed added files deleted with explicit force:");
         for p in &report.torn_deleted {
             println!("  {p}");
         }

@@ -25,8 +25,8 @@ pub struct RollbackReport {
     /// Added files that looked user-edited (receipt path) and were kept because
     /// confirmation was required and not given.
     pub aborted_edited: Vec<String>,
-    /// Changed added files explicitly authorized for deletion after an
-    /// interrupted operation. The field name is retained for API compatibility;
+    /// Changed added files explicitly authorized for deletion. The field name
+    /// is retained for API compatibility;
     /// a hash mismatch alone cannot distinguish torn bytes from a user edit.
     pub torn_deleted: Vec<String>,
 }
@@ -256,12 +256,8 @@ pub(super) fn rollback_under_lock(
                 deleted: delete_set.len(),
                 baseline: Some(baseline),
                 messages: vec![msg],
-                aborted_edited: if opts.delete_modified_added {
-                    edited
-                } else {
-                    vec![]
-                },
-                torn_deleted: vec![],
+                aborted_edited: vec![],
+                torn_deleted: edited,
             })
         }
     }

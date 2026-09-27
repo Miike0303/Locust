@@ -52,3 +52,51 @@ fn interrupted_rollback_reports_failure_until_modified_added_deletion_is_forced(
     assert!(!game.path().join("added.txt").exists());
     assert!(!store.exists());
 }
+
+#[test]
+fn forced_completed_rollback_reports_success_after_deleting_edited_added_file() {
+    let game = tempfile::tempdir().unwrap();
+    let store = game.path().join(".locust");
+    std::fs::create_dir_all(store.join("backup/files")).unwrap();
+    std::fs::write(game.path().join("replaced.txt"), b"patched").unwrap();
+    std::fs::write(game.path().join("added.txt"), b"user edit").unwrap();
+    std::fs::write(store.join("backup/files/replaced.txt"), b"original").unwrap();
+    std::fs::write(
+        store.join("backup/manifest.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1, "created_at": "fixture", "baseline": "pristine",
+            "files": [{"path": "replaced.txt", "sha256": sha256_hex(b"original"), "size": 8}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        store.join("receipt.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1, "patch_id": "fixture", "patch_version": "1.0.0",
+            "generator_version": "test", "language": "es", "engine": "html",
+            "applied_at": "fixture", "verification": "strict", "forced": false,
+            "baseline": "pristine", "created_dirs": [],
+            "replaced": [{"path": "replaced.txt", "patched_sha256": sha256_hex(b"patched")}],
+            "added": [{"path": "added.txt", "patched_sha256": sha256_hex(b"patch output")}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    common::locust()
+        .arg("patch-rollback")
+        .arg(game.path())
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "rollback complete — restored 1, deleted 1",
+        ));
+    assert_eq!(
+        std::fs::read(game.path().join("replaced.txt")).unwrap(),
+        b"original"
+    );
+    assert!(!game.path().join("added.txt").exists());
+    assert!(!store.exists());
+}
