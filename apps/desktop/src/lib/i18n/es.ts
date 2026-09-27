@@ -941,4 +941,9 @@ export const es: Record<keyof typeof en, string> = {
   "ws.patchJobStreamLost": "se perdió la conexión con el trabajo de parche",
   "provider.free": "gratuito",
   "provider.needsApiKeySuffix": "falta la clave API",
+  "route.crash.title": "Esta pantalla dejó de funcionar",
+  "route.crash.body": "Su proyecto y lo que escribió siguen guardados. Elija otra página o recargue.",
+  "route.crash.reload": "Recargar",
+  "route.crash.sidebarHint": "O elija otra página en la barra lateral.",
+  "route.crash.details": "Detalles técnicos",
 };

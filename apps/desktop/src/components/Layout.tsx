@@ -1,5 +1,5 @@
 import { Suspense, useState } from "react";
-import { Outlet, NavLink } from "react-router-dom";
+import { Outlet, NavLink, useLocation } from "react-router-dom";
 import {
 	Home,
 	FileText,
@@ -14,6 +14,7 @@ import {
 import clsx from "clsx";
 import { useGlobalHotkeys } from "../lib/hotkeys";
 import HotkeyHelp from "./HotkeyHelp";
+import RouteErrorBoundary from "./RouteErrorBoundary";
 import ToastContainer from "./ToastContainer";
 import ActivityLog from "./ActivityLog";
 import BottomBar from "./BottomBar";
@@ -35,6 +36,7 @@ const navItems = [
 
 export default function Layout() {
 	const t = useT();
+	const location = useLocation();
 	const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
 	const [showHelp, setShowHelp] = useState(false);
 	useGlobalHotkeys(() => setShowHelp(true));
@@ -146,9 +148,11 @@ export default function Layout() {
 					<p className="mt-1 break-all font-mono text-xs">{config.load_warning}</p>
 				</div>}
 				<div className="flex-1 overflow-auto">
-				<Suspense fallback={<div role="status" className="p-6 text-sm text-gray-500">{t("common.loading")}</div>}>
-					<Outlet />
-				</Suspense>
+				<RouteErrorBoundary key={location.pathname}>
+					<Suspense fallback={<div role="status" className="p-6 text-sm text-gray-500">{t("common.loading")}</div>}>
+						<Outlet />
+					</Suspense>
+				</RouteErrorBoundary>
 				</div>
 				<BottomBar />
 			</main>

@@ -84,6 +84,22 @@ export async function pickGameFolder(t: TranslateFn): Promise<string | null> {
   return prompt(t("welcome.prompt.folderPath"));
 }
 
+/**
+ * Run a Welcome open action whose native file/folder dialog may reject.
+ * A rejection is reported through `onFailed` instead of escaping as an
+ * unhandled promise rejection; the returned promise never rejects.
+ */
+export async function runOpenAction(
+  action: () => Promise<void>,
+  onFailed: (message: string) => void,
+): Promise<void> {
+  try {
+    await action();
+  } catch (err: unknown) {
+    onFailed(err instanceof Error ? err.message : String(err));
+  }
+}
+
 /** Pick an existing `.locust.db` (CLI extract / pivot) without opening a bare game folder. */
 export type PickLocustDbResult =
   | { status: "picked"; path: string }

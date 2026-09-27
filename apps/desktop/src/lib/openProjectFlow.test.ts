@@ -9,6 +9,7 @@ import {
   projectFromOpenResponse,
   projectOpenHttpBody,
   projectOpenTauriArgs,
+  runOpenAction,
   shouldOpenProjectDb,
 } from "./openProjectFlow.ts";
 
@@ -90,5 +91,27 @@ const folderTauri = projectOpenTauriArgs("C:\\Games\\Title", "html-game");
 assert.equal("preferSaved" in folderTauri, false, "Ctrl+O / Open Folder omit preferSaved");
 const recentTauri = projectOpenTauriArgs("C:\\Games\\Title", "html-game", true);
 assert.equal(recentTauri.preferSaved, true);
+
+// A rejected native dialog resolves quietly and reports the failed-open message.
+{
+  const failures: string[] = [];
+  const outcome = await runOpenAction(
+    () => Promise.reject(new Error("dialog plugin unavailable")),
+    (message) => failures.push(message),
+  );
+  assert.equal(outcome, undefined, "rejected dialog must resolve, not throw");
+  assert.equal(failures.length, 1, "failed-open callback fires once");
+  assert.equal(failures[0], "dialog plugin unavailable");
+
+  const nonError: string[] = [];
+  await runOpenAction(() => Promise.reject("denied"), (m) => nonError.push(m));
+  assert.equal(nonError[0], "denied");
+
+  let ran = false;
+  const ok: string[] = [];
+  await runOpenAction(async () => { ran = true; }, (m) => ok.push(m));
+  assert.ok(ran, "action runs");
+  assert.equal(ok.length, 0, "no failure callback on success");
+}
 
 console.log("openProjectFlow.test.ts: ok");

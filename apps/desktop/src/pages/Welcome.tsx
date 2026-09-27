@@ -43,6 +43,7 @@ import {
 	openDbCanConfirm,
 	pickGameFolder,
 	pickLocustDbFile,
+	runOpenAction,
 	shouldOpenProjectDb,
 } from "../lib/openProjectFlow";
 import {
@@ -279,6 +280,12 @@ export default function Welcome() {
 
 	const pickFolderPath = () => pickGameFolder(t);
 
+	/** A rejected native dialog must toast, not vanish as an unhandled rejection. */
+	const reportDialogFailure = (message: string) => {
+		addLog("error", "Failed to open project", message, "project");
+		addToast("error", t("welcome.toast.failedOpen", { error: message }));
+	};
+
 	const handleConfirmFormat = async () => {
 		if (openDbDraft) {
 			if (!openDbCanConfirm(openDbDraft.databasePath, openDbDraft.gamePath, selectedFormat)) {
@@ -298,11 +305,13 @@ export default function Welcome() {
 			return;
 		}
 		// Manual mode: format chosen first, now pick the game folder.
-		const path = await pickFolderPath();
-		if (path) await openWithPath(path, formatId);
+		await runOpenAction(async () => {
+			const path = await pickFolderPath();
+			if (path) await openWithPath(path, formatId);
+		}, reportDialogFailure);
 	};
 
-	const handleOpenProjectDb = async () => {
+	const handleOpenProjectDb = () => runOpenAction(async () => {
 		const picked = await pickLocustDbFile(t);
 		if (picked.status === "cancelled") return;
 		if (picked.status === "invalid") {
@@ -317,7 +326,7 @@ export default function Welcome() {
 		setPicker(null);
 		setSelectedFormat("");
 		setOpenDbDraft({ databasePath: picked.path, gamePath });
-	};
+	}, reportDialogFailure);
 
 	const handleAddToQueue = (path: string) => {
 		addToQueue(path);
@@ -325,7 +334,7 @@ export default function Welcome() {
 		addToast("info", t("welcome.toast.addedToQueue"));
 	};
 
-	const handleOpenFile = async () => {
+	const handleOpenFile = () => runOpenAction(async () => {
 		let path: string | null = null;
 		if (IS_TAURI) {
 			const { open } = await import("@tauri-apps/plugin-dialog");
@@ -352,12 +361,12 @@ export default function Welcome() {
 			path = prompt(t("welcome.prompt.filePath"));
 		}
 		if (path) await openWithPath(path);
-	};
+	}, reportDialogFailure);
 
-	const handleOpenFolder = async () => {
+	const handleOpenFolder = () => runOpenAction(async () => {
 		const path = await pickFolderPath();
 		if (path) await openWithPath(path);
-	};
+	}, reportDialogFailure);
 
 	const handleChooseFormatManually = () => {
 		setSelectedFormat("auto");

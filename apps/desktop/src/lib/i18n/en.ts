@@ -970,4 +970,9 @@ export const en = {
   "ws.patchJobStreamLost": "connection to the patch job was lost",
   "provider.free": "free",
   "provider.needsApiKeySuffix": "needs API key",
+  "route.crash.title": "This screen stopped working",
+  "route.crash.body": "Your project and typed edits are still saved. Choose another page or reload.",
+  "route.crash.reload": "Reload",
+  "route.crash.sidebarHint": "Or pick another page from the sidebar.",
+  "route.crash.details": "Technical details",
 } as const;
