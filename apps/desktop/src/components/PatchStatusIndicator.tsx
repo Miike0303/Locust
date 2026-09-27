@@ -74,10 +74,10 @@ export default function PatchStatusIndicator({
 			<button
 				type="button"
 				onClick={onOpenPatch}
-				className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-medium bg-gray-50 text-gray-600 dark:bg-gray-800 dark:text-gray-300 border-gray-200 dark:border-gray-700"
+				className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] font-medium transition-colors hover:brightness-95 dark:hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 bg-gray-50 text-gray-600 dark:bg-gray-800 dark:text-gray-300 border-gray-200 dark:border-gray-700"
 				title={t("patch.status.checking")}
 			>
-				<Loader2 size={14} className="animate-spin" />
+				<Loader2 size={12} className="animate-spin" />
 				{t("patch.status.label")}
 			</button>
 		);
@@ -88,10 +88,10 @@ export default function PatchStatusIndicator({
 			<button
 				type="button"
 				onClick={onOpenPatch}
-				className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-medium bg-amber-50 text-amber-900 dark:bg-amber-950/40 dark:text-amber-100 border-amber-200 dark:border-amber-900"
+				className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] font-medium transition-colors hover:brightness-95 dark:hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 bg-amber-50 text-amber-900 dark:bg-amber-950/40 dark:text-amber-100 border-amber-200 dark:border-amber-900"
 				title={t("patch.status.unknownTitle")}
 			>
-				<HelpCircle size={14} />
+				<HelpCircle size={12} />
 				{t("patch.status.unknown")}
 			</button>
 		);
@@ -107,10 +107,10 @@ export default function PatchStatusIndicator({
 		<button
 			type="button"
 			onClick={onOpenPatch}
-			className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-medium ${className}`}
+			className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] font-medium transition-colors hover:brightness-95 dark:hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${className}`}
 			title={t("patch.status.openTitle", { label })}
 		>
-			<Icon size={14} />
+			<Icon size={12} />
 			{detail}
 		</button>
 	);

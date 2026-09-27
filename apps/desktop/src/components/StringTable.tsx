@@ -26,15 +26,21 @@ const statusLabel: Record<string, MessageKey> = {
 	error: "detail.status.error",
 };
 
-const statusBadge: Record<string, string> = {
-	pending: "bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200",
-	translated:
-		"bg-blue-100 text-blue-700 dark:bg-blue-900/60 dark:text-blue-200",
-	reviewed:
-		"bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200",
-	approved:
-		"bg-green-100 text-green-800 dark:bg-green-900/60 dark:text-green-200",
-	error: "bg-red-100 text-red-700 dark:bg-red-900/60 dark:text-red-200",
+/** Calm status marker: a colored dot plus a sentence-case label (never color alone). */
+const statusDot: Record<string, string> = {
+	pending: "bg-transparent ring-1 ring-inset ring-gray-400 dark:ring-gray-500",
+	translated: "bg-blue-500 dark:bg-blue-400",
+	reviewed: "bg-amber-500 dark:bg-amber-400",
+	approved: "bg-emerald-600 dark:bg-emerald-400",
+	error: "bg-red-600 dark:bg-red-400",
+};
+
+const statusText: Record<string, string> = {
+	pending: "text-gray-500 dark:text-gray-400",
+	translated: "text-blue-700 dark:text-blue-300",
+	reviewed: "text-amber-800 dark:text-amber-300",
+	approved: "text-emerald-800 dark:text-emerald-300",
+	error: "text-red-700 dark:text-red-300",
 };
 
 function InlineEdit({
@@ -47,6 +53,7 @@ function InlineEdit({
 	const [editing, setEditing] = useState(false);
 	const t = useT();
 	const project = useProjectStore(state => state.project);
+	const selected = useEditorStore(state => state.selectedEntryId === entry.id);
 	const projectKey = project ? draftProjectKey(project) : "";
 	const draftKey = draftEntryKey(projectKey, entry.id);
 	const draft = useDraftStore(state => state.drafts[draftKey]);
@@ -108,12 +115,29 @@ function InlineEdit({
 				initialValue.current = value;
 				setEditing(true);
 			}}
-			className="block w-full text-left cursor-text text-xs truncate disabled:cursor-wait"
+			className="block w-full truncate rounded-sm text-left text-[13px] text-gray-900 dark:text-gray-100 cursor-text disabled:cursor-wait focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
 		>
 			{value || (
-				<span className="text-gray-500 dark:text-gray-400 italic">
-					{t("table.clickToEdit")}
-				</span>
+				<>
+					{/* Quiet empty state; the edit hint appears on row hover/focus or selection. */}
+					<span
+						aria-hidden="true"
+						className={clsx(
+							"text-gray-300 dark:text-gray-600 group-hover:hidden group-focus-within:hidden",
+							selected && "hidden",
+						)}
+					>
+						—
+					</span>
+					<span
+						className={clsx(
+							"italic text-gray-500 dark:text-gray-400 group-hover:inline group-focus-within:inline",
+							selected ? "inline" : "hidden",
+						)}
+					>
+						{t("table.clickToEdit")}
+					</span>
+				</>
 			)}
 		</button>
 		{draft && <span role="status" className="block text-[11px] text-amber-800 dark:text-amber-200">{saving ? t("table.saving") : t("table.unsaved")}</span>}
@@ -156,11 +180,17 @@ export default function StringTable({
 					return (
 						<span
 							className={clsx(
-								"px-1.5 py-0.5 rounded-full text-[11px] font-semibold uppercase tracking-wide",
-								statusBadge[status] ||
-									"bg-gray-100 dark:bg-gray-700 dark:text-gray-300",
+								"inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-medium",
+								statusText[status] || "text-gray-500 dark:text-gray-400",
 							)}
 						>
+							<span
+								aria-hidden="true"
+								className={clsx(
+									"size-2 shrink-0 rounded-full",
+									statusDot[status] || "bg-gray-400",
+								)}
+							/>
 							{statusLabel[status] ? t(statusLabel[status]) : status}
 						</span>
 					);
@@ -172,7 +202,7 @@ export default function StringTable({
 				size: 300,
 				cell: ({ getValue }) => (
 					<div
-						className="text-xs line-clamp-2 text-gray-800 dark:text-gray-200"
+						className="text-[13px] line-clamp-2 text-gray-800 dark:text-gray-200"
 						title={getValue() as string}
 					>
 						{getValue() as string}
@@ -213,7 +243,7 @@ export default function StringTable({
 						{(getValue() as string[]).map((t) => (
 							<span
 								key={t}
-								className="px-1 py-0.5 bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded text-[10px]"
+								className="px-1.5 py-px rounded border border-gray-200 text-gray-500 dark:border-gray-700 dark:text-gray-400 text-[10px]"
 							>
 								{t}
 							</span>
@@ -237,14 +267,14 @@ export default function StringTable({
 	return (
 		<div className="overflow-auto flex-1">
 			<table className="w-full text-left">
-				<thead className="sticky top-0 z-10 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 shadow-sm">
+				<thead className="sticky top-0 z-10 bg-white/95 dark:bg-gray-900/95 backdrop-blur border-b border-gray-200 dark:border-gray-800">
 					{table.getHeaderGroups().map((hg) => (
 						<tr key={hg.id}>
 							{hg.headers.map((header) => (
 								<th
 									key={header.id}
 									onClick={header.column.getToggleSortingHandler()}
-									className="px-2 py-1.5 text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700 select-none"
+									className="px-3 py-2 text-xs font-medium text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-800 dark:hover:text-gray-200 select-none"
 									style={{ width: header.getSize() }}
 								>
 									{flexRender(
@@ -266,16 +296,16 @@ export default function StringTable({
 							onClick={() => setSelected(row.original.id)}
 							style={{ height: rowHeight }}
 							className={clsx(
-								"border-b border-gray-100 dark:border-gray-800/80 cursor-pointer transition-colors",
+								"group border-b border-gray-100 dark:border-gray-800/80 cursor-pointer transition-colors",
 								selectedEntryId === row.original.id
-									? "bg-emerald-50 dark:bg-emerald-950/50 border-l-2 border-l-emerald-500"
-									: "hover:bg-gray-50 dark:hover:bg-gray-800/60 border-l-2 border-l-transparent",
+									? "bg-emerald-50/70 dark:bg-emerald-950/40 shadow-[inset_2px_0_0_0_var(--color-emerald-500)]"
+									: "hover:bg-gray-50 dark:hover:bg-gray-800/50",
 							)}
 						>
 							{row.getVisibleCells().map((cell) => (
 								<td
 									key={cell.id}
-									className="px-2 py-1"
+									className="px-3 py-1"
 									style={{ maxWidth: cell.column.getSize() }}
 								>
 									{flexRender(cell.column.columnDef.cell, cell.getContext())}

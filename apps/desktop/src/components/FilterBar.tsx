@@ -98,12 +98,12 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 						key={labelKey}
 						onClick={() => setFilter({ status: value, offset: 0 })}
 						className={clsx(
-							"px-2.5 py-0.5 rounded-full text-[11px] font-medium transition-colors",
+							"px-2.5 py-0.5 rounded-full text-[11px] font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500",
 							filter.status === value
 								? value
 									? statusColors[value]
 									: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
-								: "bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700",
+								: "text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100",
 						)}
 					>
 						{t(labelKey)}
@@ -111,7 +111,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 				))}
 			</div>
 
-			<div className="flex-1 relative min-w-40 max-w-md">
+			<div className="flex-1 relative min-w-40 max-w-sm">
 				<Search
 					size={16}
 					className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"

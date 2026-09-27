@@ -133,7 +133,7 @@ export default function DetailPanel({
                 </div>}
 				{/* Source */}
 				<div>
-					<label className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase">
+					<label className="text-xs font-medium text-gray-500 dark:text-gray-400">
 						{t("detail.source")}
 					</label>
 					<div className="mt-1 p-2 bg-gray-50 dark:bg-gray-800 rounded font-mono text-xs text-gray-800 dark:text-gray-200 select-all whitespace-pre-wrap">
@@ -143,7 +143,7 @@ export default function DetailPanel({
 
 				{/* Translation */}
 				<div>
-					<label className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase">
+					<label className="text-xs font-medium text-gray-500 dark:text-gray-400">
 						{t("detail.translation")}
 					</label>
 					<textarea
@@ -184,7 +184,7 @@ export default function DetailPanel({
 
 				{/* Status */}
 				<div>
-					<label className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase">
+					<label className="text-xs font-medium text-gray-500 dark:text-gray-400">
 						{t("detail.status")}
 					</label>
 					<div className="flex gap-1.5 mt-1">
@@ -228,7 +228,7 @@ export default function DetailPanel({
 				<div>
 					<button
 						onClick={() => setShowMeta(!showMeta)}
-						className="flex items-center gap-1 text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase hover:text-gray-700 dark:hover:text-gray-200"
+						className="flex items-center gap-1 text-xs font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
 					>
 						{showMeta ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
 						{t("detail.metadata")}

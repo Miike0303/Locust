@@ -191,6 +191,12 @@ export const en = {
   "editor.export": "Export",
   "editor.replace": "Replace",
   "editor.pivot": "Pivot",
+  "editor.formatTitle": "Game format",
+  "editor.progressAria": "{done} of {total} strings translated ({percent}%)",
+  "editor.progressPercent": "{percent}%",
+  "editor.toolbarAria": "Project actions",
+  "editor.workflowActions": "Workflow actions",
+  "editor.moreTools": "More tools",
   "editor.loadingStrings": "Loading strings…",
   "editor.loadError": "Could not load strings",
   "editor.empty.title": "No project open",
@@ -896,6 +902,7 @@ export const en = {
   "workflow.injectAction": "Open Inject",
   "workflow.skipReview": "Skip review",
   "workflow.dismiss": "Dismiss workflow guide",
+  "workflow.stepDone": "(completed)",
 
   // ── update ──────────────────────────────────────────────────────────────
   "update.checking": "Checking for updates...",

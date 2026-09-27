@@ -17,6 +17,7 @@ import {
 	getStats,
 	getString,
 	validate,
+	type ProjectStats,
 	type ValidationResponse,
 } from "../lib/api";
 import { useEditorStore } from "../stores/editorStore";
@@ -53,6 +54,41 @@ import {
 } from "../lib/translationCost";
 import { buildSettingsPath } from "../lib/settingsNav";
 import { useT } from "../lib/i18n";
+
+const BTN_BASE =
+	"inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-1 dark:focus-visible:ring-offset-gray-900 disabled:cursor-not-allowed disabled:opacity-50";
+const BTN_PRIMARY = `${BTN_BASE} bg-emerald-600 text-white shadow-sm hover:bg-emerald-700`;
+const BTN_SECONDARY = `${BTN_BASE} border border-gray-300 bg-white text-gray-800 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-100 dark:hover:bg-gray-800`;
+const BTN_GHOST = `${BTN_BASE} px-2.5 text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100`;
+
+/** Slim stacked progress bar: approved / reviewed / translated over total. */
+function EditorProgress({ stats }: { stats: ProjectStats }) {
+	const t = useT();
+	const total = stats.total || 0;
+	const done = stats.translated + stats.reviewed + stats.approved;
+	const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+	const width = (n: number) => `${total > 0 ? (n / total) * 100 : 0}%`;
+	const label = t("editor.progressAria", { done, total, percent });
+	return (
+		<div className="flex items-center gap-2" title={label}>
+			<div
+				role="progressbar"
+				aria-label={label}
+				aria-valuemin={0}
+				aria-valuemax={total}
+				aria-valuenow={done}
+				className="flex h-2 w-36 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700"
+			>
+				<span className="h-full bg-emerald-600 dark:bg-emerald-500" style={{ width: width(stats.approved) }} />
+				<span className="h-full bg-amber-500 dark:bg-amber-400" style={{ width: width(stats.reviewed) }} />
+				<span className="h-full bg-blue-500 dark:bg-blue-400" style={{ width: width(stats.translated) }} />
+			</div>
+			<span className="text-xs font-semibold tabular-nums text-gray-700 dark:text-gray-200">
+				{t("editor.progressPercent", { percent })}
+			</span>
+		</div>
+	);
+}
 
 export default function Editor() {
 	const t = useT();
@@ -294,131 +330,147 @@ export default function Editor() {
 					</ul>
 				</details>
 			)}
-			{/* Top bar */}
-			<div className="flex flex-wrap items-center gap-3 px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
-				<div className="w-full min-w-0 break-words">
-					<span className="font-semibold">{project?.name || t("editor.noProject")}</span>
-					{project && (
-						<span className="ml-2 px-2 py-0.5 bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300 rounded text-xs font-medium">
-							{project.format_id}
-						</span>
-					)}
-					{statsData && (
-						<span className="ml-3 text-xs text-gray-500 dark:text-gray-400">
-							{t(editorStatsKey(statsData.total_cost_usd), {
-								pending: statsData.pending,
-								translated: statsData.translated,
-								approved: statsData.approved,
-								cost: formatUsdCost(statsData.total_cost_usd),
-							})}
-						</span>
-					)}
-					{hasProject && (
-						<button
-							type="button"
-							onClick={() => navigate(buildSettingsPath("history"))}
-							title={t("editor.viewHistoryTitle")}
-							className="ml-2 text-xs font-medium text-emerald-700 underline-offset-2 hover:underline dark:text-emerald-300"
-						>
-							{t("editor.viewHistory")}
-						</button>
-					)}
-					{hasProject && guideDismissed && workflowStep && (
-						<button
-							type="button"
-							onClick={handleGuidePrimaryAction}
-							title={t("editor.nextStepTitle")}
-							className="ml-3 inline-flex items-center gap-0.5 rounded-full border border-emerald-300 px-2 py-0.5 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
-						>
-							{t("editor.next", { step: t(`workflow.${workflowStep}`) })}
-							<ChevronRight size={12} aria-hidden="true" />
-						</button>
-					)}
-				</div>
-
-				{/* Primary workflow actions */}
-				<div className="flex flex-wrap items-center gap-2">
-					<button
-						onClick={() => setShowTranslateModal(true)}
-						disabled={!hasProject}
-						className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+T" : t("editor.hotkeyOrProject")}
-					>
-						<Languages size={16} /> {t("editor.translate")}
-					</button>
-
-					<button
-						onClick={() => setShowInjectModal(true)}
-						disabled={!hasProject}
-						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+I" : t("editor.hotkeyOrProject")}
-					>
-						<FileCheck size={16} /> {t("editor.inject")}
-					</button>
-
-					<button
-						onClick={() => setShowPatchModal(true)}
-						disabled={!hasProject}
-						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+Shift+P" : t("editor.hotkeyOrProject")}
-					>
-						<Package size={16} /> {t("editor.patch")}
-					</button>
-
-					<PatchStatusIndicator
-						gamePath={project?.path}
-						onOpenPatch={() => setShowPatchModal(true)}
-						refreshKey={patchStatusRefreshKey}
-					/>
-				</div>
-
-				{/* Secondary project tools */}
-				<div className="flex flex-wrap items-center gap-2">
-					<button
-						onClick={() => {
-							void handleValidate();
-						}}
-						disabled={validating || !hasProject}
-						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+Shift+V" : t("editor.hotkeyOrProject")}
-					>
-						{validating ? (
-							<Loader2 size={16} className="animate-spin" />
-						) : (
-							<Shield size={16} />
+			{/* Top bar: project identity + progress, then grouped actions */}
+			<header className="flex flex-col gap-2 border-b border-gray-200 bg-white px-4 pb-2 pt-2.5 dark:border-gray-800 dark:bg-gray-900">
+				<div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5">
+					<div className="flex min-w-0 flex-wrap items-center gap-2">
+						<h1 className="min-w-0 break-words text-base font-semibold text-gray-900 dark:text-gray-100">
+							{project?.name || t("editor.noProject")}
+						</h1>
+						{project && (
+							<span
+								className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[11px] text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+								title={t("editor.formatTitle")}
+							>
+								{project.format_id}
+							</span>
 						)}
-						{t("editor.validate")}
-					</button>
+						<PatchStatusIndicator
+							gamePath={project?.path}
+							onOpenPatch={() => setShowPatchModal(true)}
+							refreshKey={patchStatusRefreshKey}
+						/>
+						{hasProject && guideDismissed && workflowStep && (
+							<button
+								type="button"
+								onClick={handleGuidePrimaryAction}
+								title={t("editor.nextStepTitle")}
+								className="inline-flex items-center gap-0.5 rounded-full border border-emerald-300 px-2 py-0.5 text-[11px] font-medium text-emerald-700 transition-colors hover:bg-emerald-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:border-emerald-800 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
+							>
+								{t("editor.next", { step: t(`workflow.${workflowStep}`) })}
+								<ChevronRight size={12} aria-hidden="true" />
+							</button>
+						)}
+					</div>
 
-					<button
-						onClick={() => setShowExportModal(true)}
-						disabled={!hasProject}
-						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+E" : t("editor.hotkeyOrProject")}
-					>
-						<Download size={16} /> {t("editor.export")}
-					</button>
-
-					<button
-						onClick={() => setShowReplaceModal(true)}
-						disabled={!hasProject}
-						className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium transition-colors"
-						title={hasProject ? "Ctrl+Shift+F" : t("editor.hotkeyOrProject")}
-					>
-						<Replace size={16} /> {t("editor.replace")}
-					</button>
-
-					<button
-						type="button"
-						onClick={() => setShowPivotModal(true)}
-						disabled={!hasProject}
-						className="flex items-center gap-1 px-2 py-1.5 text-xs text-gray-500 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
-						title={t("pivot.title")}
-					>
-						<GitBranch size={14} /> {t("editor.pivot")}
-					</button>
+					{statsData && (
+						<div className="ml-auto flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+							<EditorProgress stats={statsData} />
+							<span className="text-xs text-gray-500 dark:text-gray-400">
+								{t(editorStatsKey(statsData.total_cost_usd), {
+									pending: statsData.pending,
+									translated: statsData.translated,
+									approved: statsData.approved,
+									cost: formatUsdCost(statsData.total_cost_usd),
+								})}
+							</span>
+							{hasProject && (
+								<button
+									type="button"
+									onClick={() => navigate(buildSettingsPath("history"))}
+									title={t("editor.viewHistoryTitle")}
+									className="rounded-sm text-xs font-medium text-emerald-700 underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:text-emerald-300"
+								>
+									{t("editor.viewHistory")}
+								</button>
+							)}
+						</div>
+					)}
 				</div>
-			</div>
+
+				<div
+					role="toolbar"
+					aria-label={t("editor.toolbarAria")}
+					className="flex flex-wrap items-center gap-x-4 gap-y-2"
+				>
+					{/* Primary workflow actions */}
+					<div role="group" aria-label={t("editor.workflowActions")} className="flex flex-wrap items-center gap-1.5">
+						<button
+							onClick={() => setShowTranslateModal(true)}
+							disabled={!hasProject}
+							className={BTN_PRIMARY}
+							title={hasProject ? "Ctrl+T" : t("editor.hotkeyOrProject")}
+						>
+							<Languages size={15} aria-hidden="true" /> {t("editor.translate")}
+						</button>
+
+						<button
+							onClick={() => {
+								void handleValidate();
+							}}
+							disabled={validating || !hasProject}
+							className={BTN_SECONDARY}
+							title={hasProject ? "Ctrl+Shift+V" : t("editor.hotkeyOrProject")}
+						>
+							{validating ? (
+								<Loader2 size={15} className="animate-spin" aria-hidden="true" />
+							) : (
+								<Shield size={15} aria-hidden="true" />
+							)}
+							{t("editor.validate")}
+						</button>
+
+						<button
+							onClick={() => setShowInjectModal(true)}
+							disabled={!hasProject}
+							className={BTN_SECONDARY}
+							title={hasProject ? "Ctrl+I" : t("editor.hotkeyOrProject")}
+						>
+							<FileCheck size={15} aria-hidden="true" /> {t("editor.inject")}
+						</button>
+
+						<button
+							onClick={() => setShowPatchModal(true)}
+							disabled={!hasProject}
+							className={BTN_SECONDARY}
+							title={hasProject ? "Ctrl+Shift+P" : t("editor.hotkeyOrProject")}
+						>
+							<Package size={15} aria-hidden="true" /> {t("editor.patch")}
+						</button>
+					</div>
+
+					{/* Secondary project tools */}
+					<div role="group" aria-label={t("editor.moreTools")} className="flex flex-wrap items-center gap-0.5 sm:ml-auto">
+						<button
+							onClick={() => setShowExportModal(true)}
+							disabled={!hasProject}
+							className={BTN_GHOST}
+							title={hasProject ? "Ctrl+E" : t("editor.hotkeyOrProject")}
+						>
+							<Download size={15} aria-hidden="true" /> {t("editor.export")}
+						</button>
+
+						<button
+							onClick={() => setShowReplaceModal(true)}
+							disabled={!hasProject}
+							className={BTN_GHOST}
+							title={hasProject ? "Ctrl+Shift+F" : t("editor.hotkeyOrProject")}
+						>
+							<Replace size={15} aria-hidden="true" /> {t("editor.replace")}
+						</button>
+
+						<button
+							type="button"
+							onClick={() => setShowPivotModal(true)}
+							disabled={!hasProject}
+							className={BTN_GHOST}
+							title={t("pivot.title")}
+						>
+							<GitBranch size={15} aria-hidden="true" /> {t("editor.pivot")}
+						</button>
+					</div>
+				</div>
+			</header>
 
 			{validationWorklist && validationWorklist.length > 0 && (
 				<div className="flex items-center gap-3 px-4 py-1.5 border-b border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
