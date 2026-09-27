@@ -219,7 +219,12 @@ enum Commands {
         force: bool,
     },
     /// Show whether a game has a Locust patch applied
-    PatchStatus { game_path: PathBuf },
+    PatchStatus {
+        game_path: PathBuf,
+        /// Check installed files against the patch receipt
+        #[arg(long)]
+        verify: bool,
+    },
     /// Inspect an interrupted translation insertion and its recovery conflicts
     InjectStatus { game_path: PathBuf },
     /// Restore the original files after an interrupted translation insertion
@@ -454,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
         } => cmd_apply(game_path, zip, url, force, confirm_legacy, dry_run)?,
         Commands::PatchRollback { game_path, force } => cmd_patch_rollback(game_path, force)?,
-        Commands::PatchStatus { game_path } => cmd_patch_status(game_path)?,
+        Commands::PatchStatus { game_path, verify } => cmd_patch_status(game_path, verify)?,
         Commands::InjectStatus { game_path } => injection_recovery::status(&game_path)?,
         Commands::InjectRecover { game_path, force } => {
             injection_recovery::recover(&game_path, force)?
@@ -1025,16 +1030,26 @@ fn cmd_patch_rollback(game_path: PathBuf, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_patch_status(game_path: PathBuf) -> anyhow::Result<()> {
-    use locust_core::patch::{PatchStatus, PatchStore};
+fn cmd_patch_status(game_path: PathBuf, verify: bool) -> anyhow::Result<()> {
+    use locust_core::patch::{GameLock, PatchStatus, PatchStore};
 
     if !game_path.is_dir() {
         anyhow::bail!("game path is not a directory: {}", game_path.display());
     }
+    // Keep an apply or rollback from changing files during the hash check.
+    let _lock = if verify {
+        Some(GameLock::acquire(&game_path)?)
+    } else {
+        None
+    };
     let store = PatchStore::new(&game_path);
     match store.status()? {
+        PatchStatus::NotPatched if verify => anyhow::bail!("no completed patch to verify"),
         PatchStatus::NotPatched => println!("not patched"),
         PatchStatus::Patched(r) => {
+            if verify {
+                verify_patch_receipt_files(&game_path, &r)?;
+            }
             println!(
                 "patched: {}@{} (engine {}, lang {}, baseline {:?}, forced={})",
                 r.patch_id, r.patch_version, r.engine, r.language, r.baseline, r.forced
@@ -1046,6 +1061,9 @@ fn cmd_patch_status(game_path: PathBuf) -> anyhow::Result<()> {
                 r.applied_at
             );
         }
+        PatchStatus::Interrupted(_) if verify => {
+            anyhow::bail!("patch apply was interrupted; roll back before verifying")
+        }
         PatchStatus::Interrupted(j) => {
             println!(
                 "INTERRUPTED apply of {} — run `locust patch-rollback \"{}\"`",
@@ -1053,6 +1071,7 @@ fn cmd_patch_status(game_path: PathBuf) -> anyhow::Result<()> {
                 game_path.display()
             );
         }
+        PatchStatus::Unknown if verify => anyhow::bail!("no usable patch receipt to verify"),
         PatchStatus::Unknown => {
             println!(
                 "unknown — .locust/ present but no usable receipt (run patch-status after apply, \
@@ -1060,6 +1079,50 @@ fn cmd_patch_status(game_path: PathBuf) -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn verify_patch_receipt_files(
+    game_path: &Path,
+    receipt: &locust_core::patch::Receipt,
+) -> anyhow::Result<()> {
+    use locust_core::database::sha256_path;
+    use locust_core::patch::zipsec::safe_stored_rel;
+
+    let root = game_path.canonicalize()?;
+    let files = receipt
+        .replaced
+        .iter()
+        .map(|file| (file.path.as_str(), file.patched_sha256.as_str()))
+        .chain(
+            receipt
+                .added
+                .iter()
+                .map(|file| (file.path.as_str(), file.patched_sha256.as_str())),
+        );
+    let mut checked = 0;
+    let mut differing = 0;
+    for (path, expected) in files {
+        let relative = safe_stored_rel(path)?;
+        let target = root.join(relative);
+        checked += 1;
+        if !target.is_file() {
+            println!("missing: {path}");
+            differing += 1;
+            continue;
+        }
+        if !target.canonicalize()?.starts_with(&root) {
+            anyhow::bail!("patch file resolves outside game folder: {path}");
+        }
+        if sha256_path(&target)? != expected {
+            println!("changed: {path}");
+            differing += 1;
+        }
+    }
+    if differing > 0 {
+        anyhow::bail!("{differing} patch file(s) differ from the receipt");
+    }
+    println!("verified {checked} patch file(s) against the receipt");
     Ok(())
 }
 

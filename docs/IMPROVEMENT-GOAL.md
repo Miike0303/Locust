@@ -54,6 +54,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 46 (capability, full-Codex mode; research duel skipped: single researcher).** `patch-status` read the receipt only, so it said "patched" even after an installed file changed or disappeared. `--verify` checks the receipt-listed files and hashes under the game lock, lists changed or missing paths, and exits nonzero on drift; the default stays quick. Read-only. Test `patch_status_verify_detects_changed_and_missing_files`; Codex negative-tested it. Next rotation: `optimization`.
+
 - `pending` — **cycle 45 (defect, full-Codex mode; research duel skipped: single researcher).** Server patch-apply cancellation escaped the blocking engine by `panic!` inside the progress callback. `patch::apply_cancellable` takes a `FnMut(PatchProgress) -> Result<()>` and stops with `PatchInterrupted` at the same point, before the next file write, leaving the same interrupted journal. `apply` keeps its API as a thin wrapper, and the server no longer panics. `cancelled_apply_after_one_write_can_be_rolled_back` shows the interrupted status and a byte-identical rollback; Codex negative-tested it. Next rotation: `capability`.
 
 - `pending` — **cycle 44 (optimization, full-Codex mode; research duel skipped: single researcher).** Translation read the full glossary from SQLite once per string for exact matches and again for provider hints (8 reads for 4 strings). It now takes one glossary snapshot per run and applies the same matching and hint rules to it (1 read). Accepted behavior change: a glossary edit made during an active run applies from the next run. Counter test `test_glossary_hint_injected_with_one_query`; Codex negative-tested it. Next rotation: `defect`.
