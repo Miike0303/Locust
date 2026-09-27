@@ -10,14 +10,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::AbortHandle;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use locust_core::backup::{BackupEntry, BackupManager};
 use locust_core::config::AppConfig;
@@ -360,6 +361,129 @@ fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
     })
 }
 
+// ─── Loopback guard ────────────────────────────────────────────────────────
+//
+// Binding to 127.0.0.1 is not enough: a browser page on any site can still
+// call that address, and DNS rebinding can present a foreign Host. CORS only
+// hides responses, so "simple" requests (for example text/plain import) would
+// still run. Refuse the request itself.
+
+fn origin_allowed(origin: &str) -> bool {
+    matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    ) || loopback_http_origin(origin)
+}
+
+fn loopback_http_origin(origin: &str) -> bool {
+    let Some(authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    if authority
+        .bytes()
+        .any(|b| matches!(b, b'/' | b'?' | b'#' | b'@' | b' ' | b'\\'))
+    {
+        return false;
+    }
+    let port = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((addr, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if !addr.eq_ignore_ascii_case("::1") {
+            return false;
+        }
+        let Some(port) = after.strip_prefix(':') else {
+            return false;
+        };
+        port
+    } else {
+        let Some((host, port)) = authority.split_once(':') else {
+            return false;
+        };
+        if !(host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1") {
+            return false;
+        }
+        port
+    };
+    is_tcp_port(port)
+}
+
+fn host_allowed(host: &str) -> bool {
+    match host_header_hostname(host) {
+        Some(name) => {
+            name.eq_ignore_ascii_case("localhost")
+                || name == "127.0.0.1"
+                || name.eq_ignore_ascii_case("::1")
+        }
+        None => false,
+    }
+}
+
+/// Hostname from a `Host` header. Strips a numeric port and IPv6 brackets.
+fn host_header_hostname(host: &str) -> Option<&str> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    if host.eq_ignore_ascii_case("::1") {
+        return Some(host);
+    }
+    if let Some(rest) = host.strip_prefix('[') {
+        let (addr, after) = rest.split_once(']')?;
+        if addr.is_empty() {
+            return None;
+        }
+        if after.is_empty() {
+            return Some(addr);
+        }
+        let port = after.strip_prefix(':')?;
+        if !is_tcp_port(port) {
+            return None;
+        }
+        return Some(addr);
+    }
+    match host.split_once(':') {
+        Some((name, port)) if !name.is_empty() && !name.contains(':') && is_tcp_port(port) => {
+            Some(name)
+        }
+        Some(_) => None,
+        None => Some(host),
+    }
+}
+
+fn is_tcp_port(port: &str) -> bool {
+    (1..=5).contains(&port.len())
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+fn local_cors() -> CorsLayer {
+    // Same origin predicate as the guard. Methods are unrestricted; headers
+    // include content-type (PO/XLIFF import is text/plain, JSON is application/json).
+    // The desktop client reads response bodies only (`res.text()`), never
+    // response headers, so nothing is exposed beyond the CORS-safelisted set.
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin, _| {
+            origin.to_str().is_ok_and(origin_allowed)
+        }))
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+async fn guard_local_client(request: axum::extract::Request, next: Next) -> Response {
+    if let Some(host) = request.headers().get(axum::http::header::HOST) {
+        if !host.to_str().is_ok_and(host_allowed) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+    if let Some(origin) = request.headers().get(axum::http::header::ORIGIN) {
+        if !origin.to_str().is_ok_and(origin_allowed) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+    next.run(request).await
+}
+
 // ─── Router ────────────────────────────────────────────────────────────────
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -413,14 +537,20 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/backups", get(list_backups))
         .route("/api/backups/:id/restore", post(restore_backup))
         .route("/api/backups/:id", delete(delete_backup))
-        .layer(CorsLayer::permissive())
+        // CORS is inner so allowed preflights are answered here. The guard is
+        // the last layer, so axum runs it first and refuses foreign Origin/Host
+        // before a handler (or this CORS layer) can run.
+        .layer(local_cors())
+        .layer(middleware::from_fn(guard_local_client))
         .with_state(state)
 }
 
 pub async fn start_server(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
     // Loopback only by default: patch apply/rollback take absolute filesystem
     // paths and must not be reachable from the LAN without an explicit opt-in
-    // (see start_server_on). Desktop and CLI talk over localhost.
+    // (see start_server_on). `create_router` also refuses a non-loopback Host
+    // (DNS rebinding) and a foreign Origin, so another website cannot drive
+    // the API even on 127.0.0.1. Desktop and CLI talk over localhost.
     start_server_on(state, format!("127.0.0.1:{port}")).await
 }
 
@@ -4158,17 +4288,247 @@ mod tests {
         assert_eq!(deepl_key, "***");
     }
 
+    #[test]
+    fn origin_and_host_allow_lists() {
+        for origin in [
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "http://localhost:1420",
+            "http://localhost:80",
+            "http://127.0.0.1:7842",
+            "http://127.0.0.1:1",
+            "http://[::1]:1420",
+            "http://[::1]:80",
+        ] {
+            assert!(origin_allowed(origin), "{origin}");
+        }
+        for origin in [
+            "https://evil.example",
+            "http://evil.example",
+            "http://localhost.evil.example",
+            "http://localhost.evil.example:80",
+            "http://127.0.0.1.evil.example",
+            "http://127.0.0.1.evil.example:80",
+            "null",
+            "http://[::1]",
+            "http://::1:1420",
+            "https://localhost:1420",
+            "https://127.0.0.1:1420",
+            "http://localhost",
+            "tauri://evil.example",
+        ] {
+            assert!(!origin_allowed(origin), "{origin}");
+        }
+
+        for host in [
+            "localhost",
+            "localhost:1420",
+            "127.0.0.1",
+            "127.0.0.1:7842",
+            "[::1]",
+            "[::1]:1420",
+            "::1",
+        ] {
+            assert!(host_allowed(host), "{host}");
+        }
+        for host in [
+            "evil.example",
+            "evil.example:80",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example",
+            "[::1",
+            "127.0.0.1.1",
+            "",
+        ] {
+            assert!(!host_allowed(host), "{host}");
+        }
+    }
+
+    fn assert_no_acao(headers: &reqwest::header::HeaderMap) {
+        assert!(
+            headers.get("access-control-allow-origin").is_none(),
+            "refused request must not grant CORS: {headers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_origin_preflight_is_forbidden() {
+        let (url, _h) = setup().await;
+        let resp = client()
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("{url}/api/patch/rollback"),
+            )
+            .header("Origin", "https://evil.example")
+            .header("Access-Control-Request-Method", "POST")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403);
+        assert_no_acao(resp.headers());
+    }
+
+    #[tokio::test]
+    async fn foreign_origin_post_does_not_mutate() {
+        let (url, _h) = setup().await;
+        let resp = client()
+            .post(format!("{url}/api/glossary"))
+            .header("Origin", "https://evil.example")
+            .header("Content-Type", "text/plain")
+            .body(
+                r#"{"term":"HP","translation":"PV","lang_pair":"en-es","context":null,"case_sensitive":false}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403);
+        assert_no_acao(resp.headers());
+
+        let resp = client()
+            .get(format!("{url}/api/glossary?lang_pair=en-es"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+        assert!(
+            body.is_empty(),
+            "foreign origin must not insert a glossary row"
+        );
+    }
+
+    #[tokio::test]
+    async fn tauri_origin_preflight_is_allowed() {
+        let (url, _h) = setup().await;
+        let resp = client()
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("{url}/api/patch/rollback"),
+            )
+            .header("Origin", "http://tauri.localhost")
+            .header("Access-Control-Request-Method", "POST")
+            .header("Access-Control-Request-Headers", "content-type")
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://tauri.localhost")
+        );
+        let allow_headers = resp
+            .headers()
+            .get("access-control-allow-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            allow_headers == "*" || allow_headers.to_ascii_lowercase().contains("content-type"),
+            "{allow_headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_without_origin_is_allowed() {
+        let (url, _h) = setup().await;
+        let health = client().get(format!("{url}/health")).send().await.unwrap();
+        assert_eq!(health.status().as_u16(), 200);
+        let formats = client()
+            .get(format!("{url}/api/formats"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(formats.status().as_u16(), 200);
+    }
+
+    async fn raw_http(addr: &str, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("timed out waiting for the response")
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    #[tokio::test]
+    async fn foreign_host_is_forbidden() {
+        let (url, _h) = setup().await;
+        let addr = url.trim_start_matches("http://");
+        let text = raw_http(
+            addr,
+            "GET /health HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            text.starts_with("HTTP/1.1 403"),
+            "foreign host must be refused, got {text}"
+        );
+        assert!(
+            !text
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_origin_websocket_is_forbidden() {
+        let (url, _h) = setup().await;
+        let addr = url.trim_start_matches("http://");
+        let request = format!(
+            "GET /api/translate/ws/x HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Origin: https://evil.example\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             \r\n"
+        );
+        let text = raw_http(addr, &request).await;
+        assert!(
+            text.starts_with("HTTP/1.1 403"),
+            "foreign websocket origin must be refused, got {text}"
+        );
+        assert!(
+            !text
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn test_cors_header_present() {
         let (url, _h) = setup().await;
         let resp = client()
-            .get(format!("{}/health", url))
+            .get(format!("{url}/health"))
+            .header("Origin", "http://127.0.0.1:1420")
             .send()
             .await
             .unwrap();
-        // CorsLayer::permissive() adds the header on actual CORS requests
-        // but for same-origin it may not. Check the server responds OK.
-        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://127.0.0.1:1420"),
+            "allowed loopback origins are echoed, not *"
+        );
+
+        let resp = client()
+            .get(format!("{url}/health"))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403);
+        assert_no_acao(resp.headers());
     }
 }
 
