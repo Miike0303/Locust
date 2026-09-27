@@ -597,6 +597,16 @@ impl BackupManager {
     /// Per-file replacement is atomic; this is not a multi-file transaction and
     /// does not delete files added after backup or merge later user edits.
     pub fn restore(&self, backup_id: &str) -> Result<()> {
+        self.restore_inner(backup_id, false)
+    }
+
+    /// Check the same backup, game, and destination preconditions as restore
+    /// without replacing any game files.
+    pub fn verify_restore(&self, backup_id: &str) -> Result<()> {
+        self.restore_inner(backup_id, true)
+    }
+
+    fn restore_inner(&self, backup_id: &str, dry_run: bool) -> Result<()> {
         let backup_dir = self.resolve_backup_dir(backup_id)?;
         let (summary, v2) = Self::load_manifest(backup_id, &backup_dir)?;
         if !summary.source_path.is_absolute() {
@@ -687,6 +697,9 @@ impl BackupManager {
                     )));
                 }
             }
+        }
+        if dry_run {
+            return Ok(());
         }
         for (rel, entry) in &inventory {
             let dest = destination(rel);

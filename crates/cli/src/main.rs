@@ -237,7 +237,12 @@ enum Commands {
     /// List saved original-game backups from injection
     Backups,
     /// Restore original game files from a saved injection backup
-    RestoreBackup { id: String },
+    RestoreBackup {
+        id: String,
+        /// Check the backup and restore destination without writing game files
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Authenticate with a provider via OAuth (currently: grok)
     Auth {
         /// Provider to authenticate: grok
@@ -465,7 +470,7 @@ async fn main() -> anyhow::Result<()> {
             injection_recovery::recover(&game_path, force)?
         }
         Commands::Backups => cmd_backups()?,
-        Commands::RestoreBackup { id } => cmd_restore_backup(&id)?,
+        Commands::RestoreBackup { id, dry_run } => cmd_restore_backup(&id, dry_run)?,
         Commands::Auth { provider } => cmd_auth(provider).await?,
         Commands::Providers => cmd_providers(&config)?,
         Commands::Formats => cmd_formats()?,
@@ -542,9 +547,15 @@ fn cmd_backups() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_restore_backup(id: &str) -> anyhow::Result<()> {
-    BackupManager::new(locust_backup_root()).restore(id)?;
-    println!("Restored backup {id} to its original game location.");
+fn cmd_restore_backup(id: &str, dry_run: bool) -> anyhow::Result<()> {
+    let manager = BackupManager::new(locust_backup_root());
+    if dry_run {
+        manager.verify_restore(id)?;
+        println!("Backup {id} can be restored to its original game location.");
+    } else {
+        manager.restore(id)?;
+        println!("Restored backup {id} to its original game location.");
+    }
     Ok(())
 }
 
