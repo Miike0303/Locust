@@ -556,17 +556,6 @@ const RESTORE_ORIGINAL_FIRST: &str =
     "Your original game was modified — restore it from the backup listed above \
      (or from a clean copy) first.";
 
-/// Appended to `patch`-side advice that names a `--direct` re-run. Every
-/// registered format writes in place, so a legacy database on an
-/// already-injected game loops on the identical error without this note.
-fn maybe_mutated_note() -> &'static str {
-    "\nThis engine writes translations into the ORIGINAL game files: if this \
-     game was already injected (for example through an older Locust that kept \
-     no recording), that command will report 0 files written and record \
-     nothing — restore the original game files from a backup or a clean copy \
-     first, then re-run it."
-}
-
 /// Remedy for a Replace-mode containment failure, per engine — advice that
 /// cannot work for the engine that produced the error is a closed loop, so
 /// each branch names only commands proven to unblock that engine class.
@@ -727,15 +716,7 @@ fn cmd_patch(
         &backup_store,
         None,
         true,
-    )
-    .map_err(|e| {
-        // Preserve CLI remedies that mention inject paths when useful.
-        let mut msg = e.to_string();
-        if msg.contains("no injection has been recorded") {
-            msg = format!("{msg}{}", maybe_mutated_note());
-        }
-        anyhow::anyhow!(msg)
-    })?;
+    )?;
 
     for m in &report.messages {
         println!("note: {m}");
@@ -2602,6 +2583,12 @@ mod tests {
         assert!(
             msg.contains(&advised),
             "error must name the exact inject command\nwant: {advised}\ngot: {msg}"
+        );
+        assert_eq!(
+            msg.matches("This engine writes translations into the ORIGINAL game files")
+                .count(),
+            1,
+            "restore advice must appear once: {msg}"
         );
         assert!(!out_zip.exists(), "no archive may be written on this path");
     }
