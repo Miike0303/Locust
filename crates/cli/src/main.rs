@@ -229,6 +229,10 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// List saved original-game backups from injection
+    Backups,
+    /// Restore original game files from a saved injection backup
+    RestoreBackup { id: String },
     /// Authenticate with a provider via OAuth (currently: grok)
     Auth {
         /// Provider to authenticate: grok
@@ -455,6 +459,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::InjectRecover { game_path, force } => {
             injection_recovery::recover(&game_path, force)?
         }
+        Commands::Backups => cmd_backups()?,
+        Commands::RestoreBackup { id } => cmd_restore_backup(&id)?,
         Commands::Auth { provider } => cmd_auth(provider).await?,
         Commands::Providers => cmd_providers(&config)?,
         Commands::Formats => cmd_formats()?,
@@ -510,6 +516,31 @@ fn locust_backup_root() -> PathBuf {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| locust_core::config::AppConfig::config_dir().join("backups"))
+}
+
+fn cmd_backups() -> anyhow::Result<()> {
+    let backups = BackupManager::new(locust_backup_root()).list_backups()?;
+    if backups.is_empty() {
+        println!("No injection backups found.");
+    } else {
+        for backup in backups {
+            println!(
+                "{}\t{}\t{} file(s), {} bytes\t{}",
+                backup.id,
+                backup.source_path.display(),
+                backup.file_count,
+                backup.size_bytes,
+                backup.created_at
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_restore_backup(id: &str) -> anyhow::Result<()> {
+    BackupManager::new(locust_backup_root()).restore(id)?;
+    println!("Restored backup {id} to its original game location.");
+    Ok(())
 }
 
 /// The restore step shared by every remedy issued from a state where the

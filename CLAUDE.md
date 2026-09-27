@@ -64,7 +64,7 @@ See the current final verification report for Rust totals; 28 frontend unit test
 
 ## Key Commands
 
-19 subcommands:
+25 subcommands (also font-check, font-patch, inject-status, inject-recover):
 
 ```bash
 locust extract <game_path>              # Auto-detect format and extract strings
@@ -78,6 +78,8 @@ locust patch <injected> -P <db> -l es -o patch.zip   # Package patch zip
 locust apply <game> <patch.zip>         # Apply local zip (or --url https://…)
 locust patch-rollback <game>            # Restore .locust/backup
 locust patch-status <game>              # Whether a Locust patch is applied
+locust backups                          # List original-game backups from injection
+locust restore-backup <id>              # Restore a backup to its game (checked, locked)
 locust auth grok                        # xAI OAuth → grok-sub provider
 locust providers                        # List translation providers
 locust formats                          # List supported formats (+ stability)
