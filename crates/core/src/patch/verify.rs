@@ -542,55 +542,6 @@ fn verify_strict(
         VerificationOutcome::Clean
     };
 
-    // Re-evaluate: if every existing file matches patched and none match
-    // original, and we got here without a receipt, force Unknown.
-    let all_look_patched = manifest.files.iter().all(|f| {
-        let target = game_root.join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if !target.is_file() {
-            // absent added path is "clean" not patched-looking
-            f.original_sha256.is_none()
-        } else {
-            sha256_path(&target)
-                .map(|h| h == f.patched_sha256)
-                .unwrap_or(false)
-        }
-    });
-    let any_original = manifest.files.iter().any(|f| {
-        let target = game_root.join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let Some(orig) = f.original_sha256.as_ref() else {
-            return false;
-        };
-        target.is_file() && sha256_path(&target).map(|h| h == *orig).unwrap_or(false)
-    });
-    let outcome = if all_look_patched && !any_original && !manifest.files.is_empty() {
-        // If every path is an added path that is absent, that's Clean not Unknown.
-        let all_absent_added = manifest.files.iter().all(|f| {
-            f.original_sha256.is_none()
-                && !game_root
-                    .join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR))
-                    .is_file()
-        });
-        if all_absent_added {
-            VerificationOutcome::Clean
-        } else if any_original {
-            outcome
-        } else {
-            // Files match patched hashes with no receipt.
-            let any_present = manifest.files.iter().any(|f| {
-                game_root
-                    .join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR))
-                    .is_file()
-            });
-            if any_present {
-                VerificationOutcome::Unknown
-            } else {
-                outcome
-            }
-        }
-    } else {
-        outcome
-    };
-
     Ok(VerificationReport {
         outcome,
         tier: Some(VerificationTier::Strict),
@@ -846,6 +797,37 @@ pub fn classify_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_verify_hashes_each_existing_file_once() {
+        let game = tempfile::tempdir().unwrap();
+        let original = b"original";
+        let patched = b"patched";
+        std::fs::write(game.path().join("script.rpy"), patched).unwrap();
+        let manifest = PatchManifest {
+            schema_version: PatchManifest::SCHEMA_VERSION,
+            patch_id: "test".into(),
+            game_name: "test".into(),
+            engine: "renpy".into(),
+            language: "es".into(),
+            patch_version: "1.0.0".into(),
+            generator_version: "test".into(),
+            created_at: "test".into(),
+            files: vec![PatchFileEntry {
+                path: "script.rpy".into(),
+                patched_sha256: crate::database::sha256_hex(patched),
+                size: patched.len() as u64,
+                original_sha256: Some(crate::database::sha256_hex(original)),
+            }],
+        };
+
+        crate::database::SHA256_PATH_CALLS.with(|calls| calls.set(Some(0)));
+        let report = verify_strict(game.path(), &manifest, false).unwrap();
+        let hashes = crate::database::SHA256_PATH_CALLS.with(|calls| calls.replace(None));
+
+        assert_eq!(report.outcome, VerificationOutcome::Unknown);
+        assert_eq!(hashes, Some(1), "one game-file hash per strict verify");
+    }
 
     #[test]
     fn version_order() {

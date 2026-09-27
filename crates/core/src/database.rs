@@ -214,8 +214,19 @@ pub fn sha256_file(path: &Path) -> Result<(String, u64)> {
     Ok((hex::encode(hasher.finalize()), total))
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SHA256_PATH_CALLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// Digest of a file on disk — same hex as [`sha256_hex`] of its bytes.
 pub fn sha256_path(path: &Path) -> Result<String> {
+    #[cfg(test)]
+    SHA256_PATH_CALLS.with(|calls| {
+        if let Some(n) = calls.get() {
+            calls.set(Some(n + 1));
+        }
+    });
     Ok(sha256_file(path)?.0)
 }
 
