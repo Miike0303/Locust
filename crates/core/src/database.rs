@@ -7,6 +7,11 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ENTRY_ROWS_MATERIALIZED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 use crate::error::{LocustError, Result};
 use crate::models::{
     StringEntry, StringStatus, TranslationResult, ValidationIssue, ValidationKind,
@@ -673,6 +678,12 @@ impl Database {
         let mut originals = OriginalCache::new();
         for row in rows {
             let raw = row?;
+            #[cfg(test)]
+            ENTRY_ROWS_MATERIALIZED.with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n + 1));
+                }
+            });
             entries.push(raw_to_entry(raw, &conn, &mut originals)?);
         }
         Ok(entries)

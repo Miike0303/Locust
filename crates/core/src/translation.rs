@@ -1978,11 +1978,10 @@ impl TranslationManager {
 /// Pending (and otherwise translatable) entries, fresh from the DB.
 /// Restricting to pending keeps fallbacks from overwriting earlier providers.
 pub fn load_pending_entries(db: &Database) -> Result<Vec<StringEntry>> {
-    Ok(db
-        .get_entries(&crate::database::EntryFilter::default())?
-        .into_iter()
-        .filter(|e| e.status == StringStatus::Pending)
-        .collect())
+    db.get_entries(&crate::database::EntryFilter {
+        status: Some(StringStatus::Pending),
+        ..Default::default()
+    })
 }
 
 /// Primary first, then unique fallbacks (duplicates of the primary skipped).
@@ -3772,6 +3771,35 @@ mod tests {
 
         let left = load_pending_entries(&db).unwrap().len();
         assert_eq!(left, 0, "all strings should be translated");
+    }
+
+    #[test]
+    fn load_pending_entries_materializes_only_pending_rows() {
+        let (db, _) = setup();
+        let mut entries: Vec<_> = (0..200)
+            .map(|i| {
+                let mut entry =
+                    StringEntry::new(format!("done-{i}"), "Source", PathBuf::from("f.json"));
+                entry.status = StringStatus::Translated;
+                entry.translation = Some("Translated".into());
+                entry
+            })
+            .collect();
+        entries.push(StringEntry::new(
+            "pending",
+            "Pending",
+            PathBuf::from("f.json"),
+        ));
+        db.save_entries(&entries).unwrap();
+
+        crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.set(Some(0)));
+        let pending = load_pending_entries(&db).unwrap();
+        let materialized =
+            crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.replace(None));
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "pending");
+        assert_eq!(materialized, Some(1));
     }
 
     #[tokio::test]
