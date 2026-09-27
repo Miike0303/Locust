@@ -9,7 +9,8 @@ use locust_core::database::sha256_hex;
 use locust_core::error::LocustError;
 use locust_core::patch::manifest::{BackupManifest, PatchFileEntry, PatchManifest};
 use locust_core::patch::{
-    apply, rollback, verify, ApplyOptions, RollbackOptions, VerificationOutcome,
+    apply, apply_cancellable, rollback, verify, ApplyOptions, PatchStatus, PatchStore,
+    RollbackOptions, VerificationOutcome,
 };
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
@@ -105,6 +106,44 @@ fn apply_then_rollback_is_byte_identical_including_added_file() {
     assert!(!game.join("data").join("NewFile.json").exists());
     assert!(!game.join(".locust").exists());
 
+    let _ = fs::remove_dir_all(&game);
+}
+
+#[test]
+fn cancelled_apply_after_one_write_can_be_rolled_back() {
+    let game = tmp_game("cancel_after_write");
+    write_file(&game, "data/a.json", b"ORIGINAL_A");
+    write_file(&game, "data/b.json", b"ORIGINAL_B");
+    let zip = game.join("patch.zip");
+    build_patch_zip(
+        &zip,
+        &[
+            ("data/a.json", b"PATCHED_A", Some(b"ORIGINAL_A")),
+            ("data/b.json", b"PATCHED_B", Some(b"ORIGINAL_B")),
+        ],
+        "1.0.0",
+        "cancel-test",
+    );
+
+    let result = apply_cancellable(&game, &zip, ApplyOptions::default(), |progress| {
+        if progress.current == 2 {
+            return Err(LocustError::PatchInterrupted("cancelled".into()));
+        }
+        Ok(())
+    });
+    assert!(matches!(result, Err(LocustError::PatchInterrupted(_))));
+    assert_eq!(fs::read(game.join("data/a.json")).unwrap(), b"PATCHED_A");
+    assert_eq!(fs::read(game.join("data/b.json")).unwrap(), b"ORIGINAL_B");
+    assert!(matches!(
+        PatchStore::new(&game).status().unwrap(),
+        PatchStatus::Interrupted(_)
+    ));
+
+    let report = rollback(&game, RollbackOptions::default()).unwrap();
+    assert_eq!(report.restored, 2);
+    assert_eq!(fs::read(game.join("data/a.json")).unwrap(), b"ORIGINAL_A");
+    assert_eq!(fs::read(game.join("data/b.json")).unwrap(), b"ORIGINAL_B");
+    assert!(!game.join(".locust").exists());
     let _ = fs::remove_dir_all(&game);
 }
 

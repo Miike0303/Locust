@@ -1991,12 +1991,13 @@ async fn run_patch_apply_job(
     let apply_cancel = cancel.clone();
 
     let apply_task = tokio::task::spawn_blocking(move || {
-        locust_core::patch::apply(&game, &zip, opts, |p| {
-            // apply has no cancel hook — fail the send / unwind so the blocking
-            // call stops instead of finishing the write loop after cancel.
+        locust_core::patch::apply_cancellable(&game, &zip, opts, |p| {
             if apply_cancel.is_cancelled() || progress_tx.blocking_send(p).is_err() {
-                panic!("patch apply cancelled");
+                return Err(locust_core::error::LocustError::PatchInterrupted(
+                    "cancelled".into(),
+                ));
             }
+            Ok(())
         })
     });
     tokio::pin!(apply_task);

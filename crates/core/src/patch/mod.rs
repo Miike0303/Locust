@@ -24,7 +24,7 @@ pub mod stream;
 pub mod verify;
 pub mod zipsec;
 
-pub use apply::{apply, ApplyOptions, ApplyReport, PatchProgress};
+pub use apply::{apply, apply_cancellable, ApplyOptions, ApplyReport, PatchProgress};
 pub use lock::GameLock;
 pub use manifest::{BackupBaseline, BackupManifest, PatchFileEntry, PatchManifest, Receipt};
 pub use pack::{

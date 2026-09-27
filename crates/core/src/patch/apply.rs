@@ -74,6 +74,22 @@ pub fn apply<F>(
 where
     F: FnMut(PatchProgress),
 {
+    apply_cancellable(game_root, zip_path, opts, |progress| {
+        on_progress(progress);
+        Ok(())
+    })
+}
+
+/// Apply a patch while allowing the progress callback to stop before a file write.
+pub fn apply_cancellable<F>(
+    game_root: &Path,
+    zip_path: &Path,
+    opts: ApplyOptions,
+    mut on_progress: F,
+) -> Result<ApplyReport>
+where
+    F: FnMut(PatchProgress) -> Result<()>,
+{
     let game_lock = super::lock::GameLock::acquire(game_root)?;
     crate::injection_transaction::ensure_no_pending_under_lock(&game_lock)?;
     let game_root = game_lock.root();
@@ -247,7 +263,7 @@ fn apply_after_rollback<F>(
     on_progress: &mut F,
 ) -> Result<ApplyReport>
 where
-    F: FnMut(PatchProgress),
+    F: FnMut(PatchProgress) -> Result<()>,
 {
     // Re-check the baseline restored by rollback, using the SAME staged data.
     let report = verify_scanned(game_root, &prepared.entries)?;
@@ -363,7 +379,7 @@ fn apply_fresh<F>(
     r2_allow_discard: bool,
 ) -> Result<ApplyReport>
 where
-    F: FnMut(PatchProgress),
+    F: FnMut(PatchProgress) -> Result<()>,
 {
     let store = PatchStore::new(game_root);
     let _empty_locust_guard = EmptyLocustGuard(game_root.to_path_buf());
@@ -610,7 +626,7 @@ where
             total,
             path: path.clone(),
             phase: "write",
-        });
+        })?;
         let staged = zip_files
             .get(&path)
             .ok_or_else(|| LocustError::PatchError(format!("zip missing path {path}")))?;
