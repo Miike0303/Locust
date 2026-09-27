@@ -106,7 +106,12 @@ enum Commands {
         direct: bool,
     },
     /// Validate translations
-    Validate { project: PathBuf },
+    Validate {
+        project: PathBuf,
+        /// Emit machine-readable issues on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Audit TTF/OTF/TTC glyph coverage (WOFF and parse failures are reported)
     FontCheck {
         path: PathBuf,
@@ -365,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
                 cmd_inject(game_path, project, mode, languages, output_dir).await?
             }
         }
-        Commands::Validate { project } => cmd_validate(project)?,
+        Commands::Validate { project, json } => cmd_validate(project, json)?,
         Commands::FontCheck { path, text_file } => {
             let text = std::fs::read_to_string(text_file)?;
             let audit = if path.is_dir() {
@@ -1600,10 +1605,21 @@ async fn cmd_inject_direct(
     Ok(())
 }
 
-fn cmd_validate(project: PathBuf) -> anyhow::Result<()> {
+fn cmd_validate(project: PathBuf, json: bool) -> anyhow::Result<()> {
     let db = Database::open(&project)?;
     let entries = db.get_entries(&EntryFilter::default())?;
     let issues = Validator::validate_all(&entries);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "count": issues.len(), "issues": issues })
+        );
+        if issues.is_empty() {
+            return Ok(());
+        }
+        std::process::exit(1);
+    }
 
     if issues.is_empty() {
         println!("No validation issues found.");
