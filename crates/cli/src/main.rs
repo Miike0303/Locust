@@ -277,7 +277,7 @@ enum Commands {
     },
     /// Start the web server
     Server {
-        #[arg(short, long, default_value = "3000")]
+        #[arg(short, long, default_value = "7842")]
         port: Option<u16>,
     },
 }
@@ -476,7 +476,7 @@ async fn main() -> anyhow::Result<()> {
             lang,
             input,
         } => cmd_import(project, format, lang, input).await?,
-        Commands::Server { port } => cmd_server(port.unwrap_or(3000)).await?,
+        Commands::Server { port } => cmd_server(port.unwrap_or(7842)).await?,
     }
 
     Ok(())
@@ -2098,6 +2098,23 @@ mod tests {
         // Verify the CLI struct parses without panicking
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn server_uses_browser_port_by_default() {
+        let Commands::Server { port } = Cli::try_parse_from(["locust", "server"]).unwrap().command
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(port, Some(7842));
+
+        let Commands::Server { port } = Cli::try_parse_from(["locust", "server", "--port", "9000"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(port, Some(9000));
     }
 
     #[test]

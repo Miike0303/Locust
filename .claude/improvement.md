@@ -75,7 +75,7 @@ Owned by no lane; Claude applies these after the writers finish.
 - Isolate every QA run with `LOCUST_DATA_DIR=<scratch>`. Without it the run uses
   the user's real profile, keys and global memory (`crates/core/src/config.rs:183`).
 - Browser-mode UI needs `locust server --port 7842`, because production
-  `api.ts:41` hard-codes 7842 while the CLI defaults to 3000 (`crates/cli/src/main.rs:275`).
+  `api.ts:41` hard-codes 7842; since cycle 42 the CLI default is 7842 too (it was 3000).
   Vite dev runs on 1420 and proxies `/api` to 7842. Folder pickers fall back to
   `window.prompt`, so headless QA must answer `dialog` events.
 - **Codex CAN run the full suite with a widened sandbox (since cycle 37).** Call
