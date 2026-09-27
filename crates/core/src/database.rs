@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
@@ -16,6 +16,10 @@ use crate::models::{
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
     path: Mutex<PathBuf>,
+}
+
+fn lock_connection(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    conn.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -524,13 +528,13 @@ impl Database {
         }
         let new_conn = Connection::open(path)?;
         init_schema(&new_conn)?;
-        *self.conn.lock().unwrap() = new_conn;
+        *lock_connection(&self.conn) = new_conn;
         *self.path.lock().unwrap() = path.to_path_buf();
         Ok(())
     }
 
     pub fn get_project_metadata(&self, key: &str) -> Result<Option<serde_json::Value>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut stmt = conn.prepare("SELECT value FROM project_metadata WHERE key = ?1")?;
         let mut rows = stmt.query(params![key])?;
         match rows.next()? {
@@ -540,7 +544,7 @@ impl Database {
     }
 
     pub fn set_project_metadata(&self, key: &str, value: &serde_json::Value) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        lock_connection(&self.conn).execute(
             "INSERT OR REPLACE INTO project_metadata(key, value) VALUES (?1, ?2)",
             params![key, serde_json::to_string(value)?],
         )?;
@@ -548,7 +552,7 @@ impl Database {
     }
 
     pub fn save_entries(&self, entries: &[StringEntry]) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         // Single transaction: per-row implicit transactions fsync each insert,
         // which takes minutes for a full game extraction.
         // prepare_cached: parse/plan the INSERT once per connection, not per row
@@ -596,7 +600,7 @@ impl Database {
     }
 
     pub fn get_entries(&self, filter: &EntryFilter) -> Result<Vec<StringEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut sql = String::from("SELECT id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at FROM strings WHERE 1=1");
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -664,7 +668,7 @@ impl Database {
     }
 
     pub fn get_entry(&self, id: &str) -> Result<Option<StringEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at FROM strings WHERE id = ?1",
         )?;
@@ -696,7 +700,7 @@ impl Database {
     /// Tags are a JSON array column; flattened via `json_each`, not by
     /// loading every `StringEntry`.
     pub fn get_string_facets(&self) -> Result<StringFacets> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
 
         let mut file_stmt =
             conn.prepare("SELECT DISTINCT file_path FROM strings ORDER BY file_path")?;
@@ -724,7 +728,7 @@ impl Database {
     /// Rows with a non-empty trimmed `translation` — the only inputs pivot needs.
     /// Avoids loading every pending row on large projects (tens of thousands).
     fn entries_with_nonempty_translation(&self) -> Result<Vec<StringEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at
              FROM strings
@@ -814,7 +818,7 @@ impl Database {
         let out_db = Database::open(output)?;
         let count = out_db.save_entries(&pivoted)?;
         {
-            let conn = self.conn.lock().unwrap();
+            let conn = lock_connection(&self.conn);
             let mut stmt = conn.prepare("SELECT key, value FROM project_metadata")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -831,7 +835,7 @@ impl Database {
     }
 
     pub fn count_entries(&self, filter: &EntryFilter) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut sql = String::from("SELECT COUNT(*) FROM strings WHERE 1=1");
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -874,7 +878,7 @@ impl Database {
         let translation = translation.to_string();
         let provider = provider.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = lock_connection(&conn);
             let now = Utc::now().to_rfc3339();
             let n = conn.execute(
                 "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4",
@@ -900,7 +904,7 @@ impl Database {
         let conn = self.conn.clone();
         let provider = provider.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = lock_connection(&conn);
             let now = Utc::now().to_rfc3339();
             let tx = conn.unchecked_transaction()?;
             let mut applied = 0usize;
@@ -943,7 +947,7 @@ impl Database {
         }
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = lock_connection(&conn);
             let tx = conn.unchecked_transaction()?;
             let now = Utc::now().to_rfc3339();
             let mut report = ImportApplyReport::default();
@@ -976,7 +980,7 @@ impl Database {
         let conn = self.conn.clone();
         let results = results.to_vec();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = lock_connection(&conn);
             let tx = conn.unchecked_transaction()?;
             let now = Utc::now().to_rfc3339();
             {
@@ -1045,7 +1049,7 @@ impl Database {
         }
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = lock_connection(&conn);
             let tx = conn.unchecked_transaction()?;
             let now = Utc::now().to_rfc3339();
             {
@@ -1067,7 +1071,7 @@ impl Database {
         let entry_id = entry_id.to_string();
         let status_str = status.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = lock_connection(&conn);
             conn.execute(
                 "UPDATE strings SET status = ?1, metadata = CASE WHEN ?1 IN ('reviewed', 'approved') THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END, reviewed_at = CASE WHEN ?1 IN ('reviewed', 'approved') THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE reviewed_at END WHERE id = ?2",
                 params![status_str, entry_id],
@@ -1079,7 +1083,7 @@ impl Database {
     }
 
     pub fn lookup_memory(&self, source_hash: &str, lang_pair: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let result = conn.query_row(
             "SELECT translation FROM translation_memory WHERE source_hash = ?1 AND lang_pair = ?2",
             params![source_hash, lang_pair],
@@ -1105,7 +1109,7 @@ impl Database {
         let translation = translation.to_string();
         let lang_pair = lang_pair.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = lock_connection(&conn);
             let now = Utc::now().to_rfc3339();
             conn.execute(
                 "INSERT INTO translation_memory (source_hash, lang_pair, source, translation, uses, last_used)
@@ -1126,7 +1130,7 @@ impl Database {
         let conn = self.conn.clone();
         let run = run.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = lock_connection(&conn);
             conn.execute(
                 "INSERT INTO translation_runs
                  (started_at, duration_secs, provider, source_lang, target_lang,
@@ -1241,7 +1245,7 @@ impl Database {
 
         let root_str = root_abs.to_string_lossy().to_string();
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM injected_files WHERE lang IS ?1", params![lang])?;
         // Same class as save_entries/merge_entries: one plan for N file rows
@@ -1271,7 +1275,7 @@ impl Database {
     /// key — `None` matches only the language-unspecified recording, never a
     /// named one, and vice versa. `Ok(None)` when nothing is recorded for it.
     pub fn get_injection(&self, lang: Option<&str>) -> Result<Option<InjectionRecording>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT root, rel, hash, size, recorded_at, pristine_backup FROM injected_files
              WHERE lang IS ?1 ORDER BY id ASC",
@@ -1331,7 +1335,7 @@ impl Database {
     /// ever been recorded — `locust patch` must then hard-error with the
     /// exact inject command, never fall back to guessing from entries.
     pub fn list_recorded_langs(&self) -> Result<Vec<Option<String>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut stmt =
             conn.prepare("SELECT DISTINCT lang FROM injected_files ORDER BY (lang IS NULL), lang")?;
         let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
@@ -1345,7 +1349,7 @@ impl Database {
     /// All ledger rows, oldest first (CLI `stats` chronological table).
     /// Callers that want newest-first (HTTP UI) reverse the slice.
     pub fn get_translation_runs(&self) -> Result<Vec<TranslationRun>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT id, started_at, duration_secs, provider, source_lang, target_lang,
                     strings_translated, tokens_used, input_tokens, output_tokens, cost_usd, cost_is_complete
@@ -1393,7 +1397,7 @@ impl Database {
     }
 
     pub fn get_stats(&self) -> Result<ProjectStats> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         // One table scan: the editor polls this after every page of work.
         let mut stmt =
             conn.prepare_cached("SELECT status, COUNT(*) FROM strings GROUP BY status")?;
@@ -1417,7 +1421,7 @@ impl Database {
     }
 
     pub fn save_glossary_entry(&self, entry: &GlossaryEntry) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         conn.execute(
             "INSERT INTO glossary (term, translation, lang_pair, context, case_sensitive)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1437,7 +1441,7 @@ impl Database {
     }
 
     pub fn get_glossary(&self, lang_pair: &str) -> Result<Vec<GlossaryEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT term, translation, lang_pair, context, case_sensitive FROM glossary WHERE lang_pair = ?1",
         )?;
@@ -1458,7 +1462,7 @@ impl Database {
     }
 
     pub fn delete_glossary_entry(&self, term: &str, lang_pair: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         conn.execute(
             "DELETE FROM glossary WHERE term = ?1 AND lang_pair = ?2",
             params![term, lang_pair],
@@ -1470,7 +1474,7 @@ impl Database {
         let conn = self.conn.clone();
         let issues: Vec<ValidationIssue> = issues.to_vec();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = lock_connection(&conn);
             if issues.is_empty() {
                 return Ok(());
             }
@@ -1493,7 +1497,7 @@ impl Database {
     }
 
     pub fn get_validation_issues(&self, entry_id: Option<&str>) -> Result<Vec<ValidationIssue>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match entry_id {
             Some(id) => (
                 "SELECT entry_id, kind, message FROM validation_issues WHERE entry_id = ?1"
@@ -1527,7 +1531,7 @@ impl Database {
     }
 
     pub fn clear_entries(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         conn.execute("DELETE FROM strings", [])?;
         Ok(())
     }
@@ -1553,7 +1557,7 @@ impl Database {
         entries: &[StringEntry],
         preserve_missing: bool,
     ) -> Result<MergeStats> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let tx = conn.unchecked_transaction()?;
 
         struct Stored {
@@ -1835,7 +1839,7 @@ impl Database {
     }
 
     pub fn memory_count(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let count: usize =
             conn.query_row("SELECT COUNT(*) FROM translation_memory", [], |row| {
                 row.get(0)
@@ -1850,7 +1854,7 @@ impl Database {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<MemoryEntry>, usize)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
 
         let mut where_clauses = Vec::new();
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1909,7 +1913,7 @@ impl Database {
     }
 
     pub fn delete_memory(&self, source_hash: &str, lang_pair: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         conn.execute(
             "DELETE FROM translation_memory WHERE source_hash = ?1 AND lang_pair = ?2",
             params![source_hash, lang_pair],
@@ -1918,13 +1922,13 @@ impl Database {
     }
 
     pub fn clear_memory(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         conn.execute("DELETE FROM translation_memory", [])?;
         Ok(())
     }
 
     pub fn memory_lang_pairs(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_connection(&self.conn);
         let mut stmt =
             conn.prepare("SELECT DISTINCT lang_pair FROM translation_memory ORDER BY lang_pair")?;
         let pairs = stmt
@@ -2186,6 +2190,26 @@ mod tests {
     fn test_open_in_memory() {
         let db = Database::open_in_memory().unwrap();
         assert!(db.get_entries(&EntryFilter::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn poisoned_connection_allows_later_queries() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = conn.lock().unwrap();
+            panic!("simulate a worker panic while holding the connection");
+        })
+        .join()
+        .is_err());
+
+        assert_eq!(db.get_project_metadata("after_panic").unwrap(), None);
+        db.set_project_metadata("after_panic", &serde_json::json!(true))
+            .unwrap();
+        assert_eq!(
+            db.get_project_metadata("after_panic").unwrap(),
+            Some(serde_json::json!(true))
+        );
     }
 
     #[test]
