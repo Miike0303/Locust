@@ -1131,6 +1131,9 @@ pub async fn spawn_translation_job(
     options: TranslationOptions,
 ) -> std::result::Result<String, String> {
     let exclusive = try_project_operation(state)?;
+    if state.current_project.read().await.is_none() {
+        return Err("no project open".into());
+    }
     let reg = state.provider_registry.read().await;
     if reg.get(&provider_id).is_none() {
         return Err("provider not found".into());
@@ -1246,6 +1249,8 @@ async fn translate_start(
     .map_err(|m| {
         let status = if m == PROJECT_BUSY_MESSAGE || m == TRANSLATION_IN_FLIGHT_MESSAGE {
             StatusCode::CONFLICT
+        } else if m == "no project open" {
+            StatusCode::BAD_REQUEST
         } else {
             StatusCode::NOT_FOUND
         };
@@ -4147,8 +4152,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn translation_start_without_project_keeps_stale_rows_untouched() {
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .save_entries(&[StringEntry::new(
+                "stale",
+                "Old project text",
+                PathBuf::from("story.html"),
+            )])
+            .unwrap();
+
+        let response = client()
+            .post(format!("{url}/api/translate/start"))
+            .json(&serde_json::json!({
+                "provider_id": "mock",
+                "options": TranslationOptions::default()
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.text().await.unwrap(), "no project open");
+        assert!(state.active_jobs.is_empty());
+        assert!(state
+            .db
+            .get_entry("stale")
+            .unwrap()
+            .unwrap()
+            .translation
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn test_translate_start_returns_job_id() {
         let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         let entry = StringEntry::new("t1", "Hello", PathBuf::from("f.json"));
         state.db.save_entries(&[entry]).unwrap();
 
@@ -4169,6 +4209,7 @@ mod tests {
     #[tokio::test]
     async fn test_translate_start_accepts_fallback_provider_ids() {
         let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         let entry = StringEntry::new("t1", "Hello", PathBuf::from("f.json"));
         state.db.save_entries(&[entry]).unwrap();
 
@@ -4191,6 +4232,7 @@ mod tests {
     #[tokio::test]
     async fn test_translate_start_without_fallback_field_unchanged() {
         let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         let entry = StringEntry::new("t2", "World", PathBuf::from("f.json"));
         state.db.save_entries(&[entry]).unwrap();
 
@@ -4225,6 +4267,7 @@ mod tests {
     #[tokio::test]
     async fn test_translate_cancel() {
         let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         let entry = StringEntry::new("t1", "Hello", PathBuf::from("f.json"));
         state.db.save_entries(&[entry]).unwrap();
 

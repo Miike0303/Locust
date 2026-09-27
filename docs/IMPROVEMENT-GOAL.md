@@ -19,6 +19,7 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 ## Backlog
 
+- **[defect · backend · S] Finish the no-project class.** Cycles 21, 51 and 57 closed the strings list, string detail/edits and translation start one by one. Audit every remaining HTTP/Tauri handler that reads or writes `state.db` (validate, export, search/replace, stats, glossary-in-project, inject) and apply the same `current_project` guard in one change. Check: one test per newly guarded handler.
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
 - Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Remaining: dynamic IO/parse messages (and other free-form backend text). Unknown export/import format and xAI `handle not found` were catalogued in cycle 29.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
@@ -51,6 +52,8 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 57 (defect, full-Codex mode; research duel skipped: single researcher).** Same class as cycle 51: with no project open, `spawn_translation_job` (shared by HTTP and Tauri) still started a job over leftover rows in the default database, possibly spending paid provider calls on a project nobody had open. It now refuses with the existing localized `no project open` (HTTP 400) before creating a job. The desktop queue opens its project before starting (`queueStore.ts:150`), so it is unaffected. `translation_start_without_project_keeps_stale_rows_untouched`; Codex negative-tested it (200 vs 400). Gates 1488 pass / 0 fail. Next rotation: `capability`.
 
 - `pending` — **cycle 56 (optimization, full-Codex mode; research duel skipped: single researcher).** Reopening a project re-extracts and merges, and `merge_entries` issued an UPDATE for every existing row even when nothing had changed. It now skips a row when every column the UPDATE would write (source, file path, context, tags, metadata, char limit, status) already matches; the other columns are rewritten from the stored row, so a skipped row is byte-identical to a written one (Claude checked the column list against the SQL). A format-only mismatch just writes, the safe direction. Merge counts are unchanged. Codex measured an on-disk 20,000-row unchanged merge at 475 → 122 ms. `merge_entries_writes_only_changed_rows` counts SQLite `total_changes()` (1 changed row, then 0); Codex negative-tested it. Gates 1487 pass / 0 fail. Next rotation: `defect`.
 

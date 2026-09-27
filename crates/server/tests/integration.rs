@@ -1821,6 +1821,12 @@ async fn test_spawn_translation_job_falls_back_to_second_provider() {
             PathBuf::from("a.json"),
         )])
         .unwrap();
+    *state.current_project.write().await = Some(locust_server::ProjectInfo {
+        path: PathBuf::from("test-game"),
+        format_id: "rpgmaker-mv".into(),
+        name: "Test game".into(),
+        ..Default::default()
+    });
 
     locust_server::spawn_translation_job(
         &state,
