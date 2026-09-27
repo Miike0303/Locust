@@ -29,6 +29,8 @@
 //! Out of scope: CxDec / Hxv4 encrypted XP3, `.tjs`/compiled `.scn`,
 //! rewriting base `.xp3` archives (patch.xp3 only).
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -37,7 +39,39 @@ use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 use tracing::warn;
 
-use crate::kirikiri_xp3::{self, Xp3Archive};
+use crate::kirikiri_xp3::{self, Xp3Archive, Xp3Entry};
+
+// One increment per archive-entry name inspected by a lookup. `None` means this
+// thread is not measuring (production tests stay quiet under --test-threads>1).
+#[cfg(test)]
+thread_local! {
+    static XP3_NAME_INSPECTIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    static FIND_KS_FILES_CALLS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn note_xp3_name_inspection() {
+    #[cfg(test)]
+    XP3_NAME_INSPECTIONS.with(|c| {
+        if let Some(n) = c.get() {
+            c.set(Some(n + 1));
+        }
+    });
+}
+
+/// First index of each normalized entry name. Later duplicates do not replace it.
+fn index_xp3_names(entries: &[Xp3Entry]) -> HashMap<String, usize> {
+    let mut by_name = HashMap::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        note_xp3_name_inspection();
+        by_name.entry(entry.name.clone()).or_insert(i);
+    }
+    by_name
+}
+
+struct CachedXp3 {
+    archive: Xp3Archive,
+    by_name: HashMap<String, usize>,
+}
 
 /// How the on-disk bytes encode the decoded Unicode text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +122,13 @@ impl KirikiriPlugin {
     }
 
     fn find_ks_files(root: &Path) -> Vec<PathBuf> {
+        #[cfg(test)]
+        FIND_KS_FILES_CALLS.with(|c| {
+            if let Some(n) = c.get() {
+                c.set(Some(n + 1));
+            }
+        });
+
         let mut out = Vec::new();
         if root.is_file() {
             if Self::is_ks(root) {
@@ -802,7 +843,7 @@ impl FormatPlugin for KirikiriPlugin {
     }
 
     fn detect(&self, path: &Path) -> bool {
-        !Self::find_ks_files(path).is_empty() || Self::has_xp3(path)
+        Self::has_xp3(path) || !Self::find_ks_files(path).is_empty()
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
@@ -833,8 +874,8 @@ impl FormatPlugin for KirikiriPlugin {
         let mut last_xp3_err = String::new();
         let mut xp3_ks_seen = 0usize;
         let mut xp3_skipped = 0usize;
-        // (rel virtual path, archive path, entry name for read)
-        let mut xp3_cands: Vec<(String, PathBuf, String)> = Vec::new();
+        // (rel virtual path, archive path, first entry with that name)
+        let mut xp3_cands: Vec<(String, PathBuf, Xp3Entry)> = Vec::new();
         let mut open_archives: HashMap<PathBuf, Xp3Archive> = HashMap::new();
 
         for arch_path in &xp3_files {
@@ -852,11 +893,19 @@ impl FormatPlugin for KirikiriPlugin {
                     continue;
                 }
             };
+            // ks_entries() is in index order, so the first yield of a name is the
+            // same entry the old linear find returned. Later duplicates reuse it.
+            let mut first_ks: HashMap<String, Xp3Entry> = HashMap::new();
             for entry in archive.ks_entries() {
+                note_xp3_name_inspection();
                 xp3_ks_seen += 1;
                 let inner = entry.name.replace('\\', "/");
                 let rel = format!("{arch_name}/{inner}");
-                xp3_cands.push((rel, arch_path.clone(), entry.name.clone()));
+                let canonical = first_ks
+                    .entry(entry.name.clone())
+                    .or_insert_with(|| entry.clone())
+                    .clone();
+                xp3_cands.push((rel, arch_path.clone(), canonical));
             }
             open_archives.insert(arch_path.clone(), archive);
         }
@@ -876,13 +925,8 @@ impl FormatPlugin for KirikiriPlugin {
             readable.push((rel.clone(), fpath.clone(), decoded.text));
         }
 
-        for (rel, arch_path, entry_name) in &xp3_cands {
+        for (rel, arch_path, entry) in &xp3_cands {
             let Some(archive) = open_archives.get(arch_path) else {
-                continue;
-            };
-            let Some(entry) = archive.entries.iter().find(|e| {
-                e.name == *entry_name || e.name.replace('\\', "/") == entry_name.replace('\\', "/")
-            }) else {
                 continue;
             };
             let arch_name = arch_path
@@ -894,7 +938,7 @@ impl FormatPlugin for KirikiriPlugin {
                 Err(e) => {
                     warn!(
                         archive = %arch_name,
-                        entry = %entry_name,
+                        entry = %entry.name,
                         error = %e,
                         "failed to read XP3 .ks entry; skipped"
                     );
@@ -910,7 +954,7 @@ impl FormatPlugin for KirikiriPlugin {
                 Ok(_) => {
                     warn!(
                         archive = %arch_name,
-                        entry = %entry_name,
+                        entry = %entry.name,
                         "XP3 .ks decoded to non-script bytes (cxdec/encrypted?); skipped"
                     );
                     xp3_skipped += 1;
@@ -918,7 +962,7 @@ impl FormatPlugin for KirikiriPlugin {
                 Err(e) => {
                     warn!(
                         archive = %arch_name,
-                        entry = %entry_name,
+                        entry = %entry.name,
                         error = %e,
                         "XP3 .ks payload did not decode as text (cxdec/encrypted?); skipped"
                     );
@@ -977,8 +1021,8 @@ impl FormatPlugin for KirikiriPlugin {
 
         // Collect modified XP3 payloads for a single patch.xp3
         let mut patch_files: Vec<(String, Vec<u8>)> = Vec::new();
-        // Cache opened base archives: archive file name → archive
-        let mut archive_cache: HashMap<String, Xp3Archive> = HashMap::new();
+        // Cache opened base archives: archive file name → archive + name index
+        let mut archive_cache: HashMap<String, CachedXp3> = HashMap::new();
 
         for (file_path, file_entries) in &by_file {
             if let Some((archive_name, inner)) = split_xp3_virtual_path(file_path) {
@@ -986,7 +1030,14 @@ impl FormatPlugin for KirikiriPlugin {
                     let arch_path = search_root.join(&archive_name);
                     match Xp3Archive::open(&arch_path) {
                         Ok(a) => {
-                            archive_cache.insert(archive_name.clone(), a);
+                            let by_name = index_xp3_names(&a.entries);
+                            archive_cache.insert(
+                                archive_name.clone(),
+                                CachedXp3 {
+                                    archive: a,
+                                    by_name,
+                                },
+                            );
                         }
                         Err(e) => {
                             warnings.push(format!(
@@ -997,12 +1048,13 @@ impl FormatPlugin for KirikiriPlugin {
                         }
                     }
                 }
-                let arch = archive_cache.get(&archive_name).unwrap();
+                let cached = archive_cache.get(&archive_name).unwrap();
+                let inner_norm = inner.replace('\\', "/");
 
-                let entry = match arch
-                    .entries
-                    .iter()
-                    .find(|e| e.name.replace('\\', "/") == inner.replace('\\', "/"))
+                let entry = match cached
+                    .by_name
+                    .get(&inner_norm)
+                    .and_then(|&i| cached.archive.entries.get(i))
                 {
                     Some(e) => e.clone(),
                     None => {
@@ -1012,7 +1064,7 @@ impl FormatPlugin for KirikiriPlugin {
                     }
                 };
 
-                let bytes = match arch.read_entry(&entry) {
+                let bytes = match cached.archive.read_entry(&entry) {
                     Ok(b) => b,
                     Err(e) => {
                         warnings.push(format!("read {archive_name}/{inner}: {e}"));
@@ -1618,6 +1670,121 @@ This is narration.\r\n\
                 assert!(!s.contains("panic"), "{s}");
             }
         }
+    }
+
+    #[test]
+    fn xp3_lookup_is_linear() {
+        const FILLER: usize = 400;
+        const SCRIPTS: usize = 100;
+        let dir = tempdir();
+        let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(FILLER + SCRIPTS);
+        for i in 0..FILLER {
+            files.push((format!("img/{i:04}.png"), vec![0, 1, 2, 3]));
+        }
+        let ks_utf16 = |text: &str| {
+            let mut bytes = vec![0xFF, 0xFE];
+            bytes.extend_from_slice(&utf16le_bytes_from_str(text));
+            bytes
+        };
+        // Scripts sit at the end. The last entry repeats the first script name
+        // with different text; lookup must keep the earlier payload.
+        for i in 0..SCRIPTS - 1 {
+            let text = format!("; c\nHello SCRIPT{i:03}\n");
+            files.push((format!("scenario/s{i:03}.ks"), ks_utf16(&text)));
+        }
+        files.push((
+            "scenario/s000.ks".into(),
+            ks_utf16("; c\nHello DUP_SECOND\n"),
+        ));
+        let n_entries = files.len();
+        let n_scripts = files
+            .iter()
+            .filter(|(name, _)| name.ends_with(".ks"))
+            .count();
+        assert_eq!(n_entries, FILLER + SCRIPTS);
+        assert_eq!(n_scripts, SCRIPTS);
+
+        let arch = crate::kirikiri_xp3::write_xp3(&files).unwrap();
+        let archive_path = dir.join("game.xp3");
+        fs::write(&archive_path, arch).unwrap();
+        assert_eq!(
+            Xp3Archive::open(&archive_path).unwrap().entries.len(),
+            n_entries
+        );
+
+        let plugin = KirikiriPlugin::new();
+        XP3_NAME_INSPECTIONS.with(|c| c.set(Some(0)));
+        let mut entries = plugin.extract(&dir).unwrap();
+
+        let mut expected: Vec<String> = (0..SCRIPTS - 1)
+            .map(|i| format!("Hello SCRIPT{i:03}"))
+            .collect();
+        // Both candidates for the duplicated name resolve to the first entry.
+        expected.push("Hello SCRIPT000".into());
+        expected.sort();
+        let mut got: Vec<String> = entries.iter().map(|e| e.source.clone()).collect();
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "duplicate name must resolve to the first entry"
+        );
+        assert!(entries.iter().all(|e| !e.source.contains("DUP_SECOND")));
+        assert!(entries
+            .iter()
+            .any(|e| { e.id == "game.xp3/scenario/s000.ks#2" && e.source == "Hello SCRIPT000" }));
+        assert!(entries
+            .iter()
+            .any(|e| { e.id == "game.xp3/scenario/s098.ks#2" && e.source == "Hello SCRIPT098" }));
+
+        let target = entries
+            .iter_mut()
+            .find(|e| e.source == "Hello SCRIPT098")
+            .unwrap();
+        target.translation = Some("Hola SCRIPT098".into());
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert!(
+            report.warnings.iter().all(|w| !w.contains("not found")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(report.strings_written >= 1, "{report:?}");
+
+        let inspections = XP3_NAME_INSPECTIONS.with(|c| c.replace(None)).unwrap();
+        assert!(
+            inspections >= n_entries,
+            "name inspections {inspections} never indexed {n_entries} archive entries"
+        );
+        assert!(
+            inspections <= n_entries + n_scripts,
+            "name inspections {inspections} exceeded {n_entries} entries + {n_scripts} scripts"
+        );
+    }
+
+    #[test]
+    fn detect_xp3_skips_ks_walk() {
+        let xp3_dir = tempdir();
+        fs::write(xp3_dir.join("game.xp3"), b"XP3\r\n").unwrap();
+        fs::create_dir_all(xp3_dir.join("nested").join("deeper")).unwrap();
+        fs::write(xp3_dir.join("nested").join("deeper").join("note.txt"), b"x").unwrap();
+
+        FIND_KS_FILES_CALLS.with(|c| c.set(Some(0)));
+        assert!(KirikiriPlugin::new().detect(&xp3_dir));
+        let walks = FIND_KS_FILES_CALLS.with(|c| c.replace(None));
+        assert_eq!(
+            walks,
+            Some(0),
+            "a top-level xp3 must not walk the tree for .ks files"
+        );
+
+        let ks_dir = tempdir();
+        write_utf16le_ks(&ks_dir.join("scenario.ks"), sample_script());
+        FIND_KS_FILES_CALLS.with(|c| c.set(Some(0)));
+        assert!(KirikiriPlugin::new().detect(&ks_dir));
+        let walks = FIND_KS_FILES_CALLS.with(|c| c.replace(None));
+        assert!(
+            walks.is_some_and(|n| n >= 1),
+            "a .ks-only directory still needs find_ks_files, got {walks:?}"
+        );
     }
 
     #[test]
