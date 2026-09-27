@@ -53,6 +53,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 49 (capability, full-Codex mode; research duel skipped: single researcher).** The `--astro` stub generated for rule95 told players to run `locust apply`, leaving out the player-facing Rule95 Patcher. It now tells them to pick the patch ZIP and game folder in Rule95 Patcher, apply there, and use Undo to restore the backup. `astro_stub_guides_players_to_rule95_patcher` also rejects CLI or manual-unzip instructions; Codex negative-tested it. Still open: the rule95 site's own "unzip over Data" copy (a separate repo). Next rotation: `optimization`.
+
 - `pending` — **cycle 48 (defect, full-Codex mode; research duel skipped: single researcher).** `locust patch` with no recorded injection printed its "restore the original game files" paragraph twice: core's error already contained it and the CLI appended it again (seen live in the fleet-explore audit). The CLI now passes the core error through with the exact inject command, and the advice appears once. `test_patch_without_recording_names_the_exact_inject_command` requires exactly one occurrence; Codex negative-tested it. Next rotation: `capability`.
 
 - `pending` — **cycle 47 (optimization, full-Codex mode; research duel skipped: single researcher).** Patch apply's `classify_files` hashed every existing file and then discarded the hash for replaced paths (`let _ = hash;`); only added paths use it to tell already-patched from conflicting. It now hashes only existing added paths (counter test `classify_files_hashes_only_existing_added_paths`: 2 → 1; Codex negative-tested it). Claude's note: an unreadable replaced file no longer errors at this step, but verification already hashed it and the write would fail. Next rotation: `defect`.

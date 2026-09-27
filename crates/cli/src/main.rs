@@ -822,9 +822,10 @@ fn write_astro_stub(
          dateAdded: TODO-YYYY-MM-DD\n\
          ---\n\n\
          Translation into {target} of *{title}*, made with Locust.\n\n\
-         **How to apply:** `locust apply <game> <patch.zip>` (or `--url https://…/patch.zip`), \
-         or the desktop Patch modal. This creates a restorable backup; \
-         `locust patch-rollback <game>` undoes it.\n"
+         **How to apply:** Download the patch ZIP, then select it in Rule95 Patcher. \
+         Select the original game folder and choose Apply patch. The patcher \
+         verifies the game files and creates a restorable backup. Choose \
+         Undo last patch in Rule95 Patcher to restore the game.\n"
     );
 
     // Never truncate a destination (including one created after preflight).
@@ -2229,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn astro_stub_tells_users_to_use_locust_apply() {
+    fn astro_stub_guides_players_to_rule95_patcher() {
         let dir = std::env::temp_dir().join(format!("locust_astro_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let stub = dir.join("release.md");
@@ -2239,17 +2240,22 @@ mod tests {
         let md = fs::read_to_string(&stub).unwrap();
         let _ = fs::remove_dir_all(&dir);
         assert!(
-            !md.contains("extract the patch over the game folder"),
-            "unzip-over-game skips verify/backup/receipt:\n{md}"
+            md.contains("Rule95 Patcher"),
+            "must name the player app:\n{md}"
+        );
+        assert!(md.contains("patch ZIP"), "must name the patch file:\n{md}");
+        assert!(
+            md.contains("game folder"),
+            "must name the game folder:\n{md}"
+        );
+        assert!(md.contains("Undo last patch"), "must explain undo:\n{md}");
+        assert!(
+            !md.contains("locust apply"),
+            "must not require the CLI:\n{md}"
         );
         assert!(
-            md.contains("locust apply <game> <patch.zip>"),
-            "must name locust apply:\n{md}"
-        );
-        assert!(md.contains("--url"), "must mention --url:\n{md}");
-        assert!(
-            md.contains("locust patch-rollback <game>"),
-            "must name rollback:\n{md}"
+            !md.contains("extract over"),
+            "must not suggest manual unzip:\n{md}"
         );
         assert!(
             md.to_lowercase().contains("backup"),
