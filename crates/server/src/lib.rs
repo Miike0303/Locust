@@ -964,6 +964,9 @@ async fn get_string(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<StringEntry>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "entry not found"));
+    }
     state
         .db
         .get_entry(&id)
@@ -997,6 +1000,9 @@ async fn patch_string_owned(
     id: String,
     req: PatchStringRequest,
 ) -> Result<Json<StringEntry>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     if let Some(ref translation) = req.translation {
         state
             .db
@@ -1053,6 +1059,9 @@ async fn batch_patch_strings_owned(
     state: Arc<AppState>,
     req: BatchPatchRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     if req.updates.len() > 50_000 {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -3684,6 +3693,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn string_detail_and_edits_require_an_open_project() {
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .save_entries(&[translated("leftover", "Hello", "f.json", "Hola")])
+            .unwrap();
+
+        let detail = client()
+            .get(format!("{url}/api/strings/leftover"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), 404);
+
+        let patch = client()
+            .patch(format!("{url}/api/strings/leftover"))
+            .json(&serde_json::json!({"translation": "Wrong project"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), 400);
+        assert_eq!(patch.text().await.unwrap(), "no project open");
+
+        let batch = client()
+            .post(format!("{url}/api/strings/batch"))
+            .json(&serde_json::json!({"updates": [{"id": "leftover", "translation": "Wrong project"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(batch.status(), 400);
+        assert_eq!(batch.text().await.unwrap(), "no project open");
+        assert_eq!(
+            state
+                .db
+                .get_entry("leftover")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Hola")
+        );
+    }
+
+    #[tokio::test]
     async fn open_returns_409_while_translation_in_flight_and_keeps_current_project() {
         let (url, _h, state) = setup_with_state().await;
         mark_project_open(&state).await;
@@ -3955,6 +4008,7 @@ mod tests {
     #[tokio::test]
     async fn test_patch_string_updates_translation() {
         let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         let entry = StringEntry::new("test1", "Hello", PathBuf::from("f.json"));
         state.db.save_entries(&[entry]).unwrap();
 
@@ -3981,6 +4035,7 @@ mod tests {
     #[tokio::test]
     async fn test_patch_string_updates_status() {
         let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         let entry = StringEntry::new("test2", "Hello", PathBuf::from("f.json"));
         state.db.save_entries(&[entry]).unwrap();
 

@@ -326,6 +326,9 @@ pub async fn patch_string(
     let s = state.0.clone();
     let exclusive = try_project_operation(&s)?;
     run_owned_project_operation(exclusive, async move {
+        if s.current_project.read().await.is_none() {
+            return Err("no project open".into());
+        }
         if let Some(ref translation) = data.translation {
             s.db.save_translation(&id, translation, "manual")
                 .await
@@ -379,6 +382,9 @@ pub async fn batch_patch_strings(
     let s = state.0.clone();
     let exclusive = try_project_operation(&s)?;
     run_owned_project_operation(exclusive, async move {
+        if s.current_project.read().await.is_none() {
+            return Err("no project open".into());
+        }
         let applied =
             s.db.save_translations_batch(pairs, &data.provider)
                 .await

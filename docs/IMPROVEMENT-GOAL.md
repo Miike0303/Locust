@@ -21,7 +21,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
 - Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Remaining: dynamic IO/parse messages (and other free-form backend text). Unknown export/import format and xAI `handle not found` were catalogued in cycle 29.
-- Other long-running writers that touch `state.db` without taking `project_exclusive` beyond inject/pivot/validate (e.g. export/import bulk paths) remain a thinner race class; a full mutex around every DB op is still larger than needed.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 
 Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size] what. Evidence. Check that proves it fixed.
@@ -52,6 +51,8 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 51 (defect, full-Codex mode; research duel skipped: single researcher).** With no project open, the strings list already hid leftover rows in the default database (cycle 21's leak guard), but `GET /api/strings/:id` still returned them and the HTTP and Tauri single/batch edit paths still wrote to them. A stale editor draft could land in a database nobody had open. Detail now returns 404 and edits refuse with the existing, already-localized `no project open`, matching the guards at `commands.rs:222-307`. `string_detail_and_edits_require_an_open_project` also checks the saved translation is untouched; Codex negative-tested it (200 vs 404). Claude reran all gates (1482 pass / 0 fail). Codex found the export/import race backlog item already fixed (import takes the project guard, `lib.rs:2325`, `commands.rs:539`). Next rotation: `capability`.
 
 - `39dbfe2` — **cycle 50 (optimization, full-Codex mode; research duel skipped: single researcher).** `load_pending_entries` loaded every string of the project (with its original-text lookup) and then dropped the non-pending ones in Rust, so every translation start and fallback pass paid for the whole project. On a mostly translated KiriKiri or YU-RIS extract that is tens of thousands of rows to translate a few. It now passes `status: Pending` to the existing `EntryFilter`, so SQLite returns only those rows. Counter test `load_pending_entries_materializes_only_pending_rows`: 201 rows → 1. The Codex session was cut off before its own verification; Claude ran the negative test (old code fails with 201) and all gates (1481 pass / 0 fail). Next rotation: `defect`.
 
