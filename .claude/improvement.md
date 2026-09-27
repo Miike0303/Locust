@@ -2,7 +2,7 @@
 ledger: docs/IMPROVEMENT-GOAL.md
 categories: [capability, optimization, defect]
 delivery: commit-only
-branch: feature
+branch: main
 push_refs: []
 ---
 
@@ -63,9 +63,9 @@ Owned by no lane; Claude applies these after the writers finish.
   stray `*.locust.db` files sit in `apps/desktop/`. The backlog of uncommitted
   work since 2026-09-03 was snapshotted in `e0e5268..` on 2026-09-26. A dirty
   tree at cycle start means someone else is working here: stop.
-- **Writers:** as of 2026-09-26 the user authorized Codex (`codex-write.ps1`) and
-  Cursor (`cursor-write.ps1`). Grok Build stays off. Frontend is Claude's per
-  the fleet rules.
+- **Writers: Codex ONLY (user, 2026-09-27).** No Cursor, no Grok Build. Use
+  Codex until its quota and resets are exhausted or the user says otherwise.
+  Supersedes the 2026-09-26 Codex+Cursor authorization.
 - **Model allow-list (user, 2026-09-26). Never substitute:**
   - Codex: `gpt-6-sol` with `-Effort high` for standard or hard work, and
     `gpt-6-luna` for light work.
@@ -117,7 +117,7 @@ as a loop with nothing to say.
 
 ## Notes
 
-`delivery: commit-only` and `branch: feature` are deliberate for this repo:
-commits land on the current feature branch, never on `main`, and nothing is
-pushed. This is stricter than ThreeMaker, which pushes because CI gates every
+`delivery: commit-only` and `branch: main` (user, 2026-09-27: "cambia a rama
+main, y sigue"; main was fast-forwarded from `feat/desktop-ux-kimi-k3-p2`).
+Commits land on local `main`; nothing is pushed. This is stricter than ThreeMaker, which pushes because CI gates every
 push there. Do not harmonise them.
