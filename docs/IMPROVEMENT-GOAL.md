@@ -55,6 +55,8 @@ Nothing.
 
 ## Done
 
+- `pending` — **cycle 44 (optimization, full-Codex mode; research duel skipped: single researcher).** Translation read the full glossary from SQLite once per string for exact matches and again for provider hints (8 reads for 4 strings). It now takes one glossary snapshot per run and applies the same matching and hint rules to it (1 read). Accepted behavior change: a glossary edit made during an active run applies from the next run. Counter test `test_glossary_hint_injected_with_one_query`; Codex negative-tested it. Next rotation: `defect`.
+
 - `pending` — **cycle 43 (capability, full-Codex mode; research duel skipped: single researcher).** CLI injection kept original-game backups, but CLI users could neither list nor restore them. `locust backups` lists id, source path, size and date; `locust restore-backup <id>` uses `BackupManager::restore`, which already takes `GameLock` and refuses a pending injection (`backup.rs:629-630`). Integration test `cli_can_list_and_restore_an_injection_backup` restores the original bytes; Codex negative-tested it. CLAUDE.md now says 25 subcommands. Next rotation: `optimization`.
 
 - `pending` — **cycle 42 (defect, full-Codex mode; research duel skipped: single researcher).** `locust server` defaulted to port 3000 while the browser API, WebSocket and Vite proxy expect 7842, so a no-flags server plus the browser UI never connected. The clap default and dispatch fallback are now 7842, and `--port` still overrides. Test `server_uses_browser_port_by_default`; Codex negative-tested it and live-checked `/health` on 7842. CLAUDE.md is updated (port; also the stale "37 routes / one WebSocket" line). Next rotation: `capability`.

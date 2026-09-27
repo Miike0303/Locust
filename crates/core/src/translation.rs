@@ -1184,14 +1184,19 @@ impl TranslationManager {
             remaining = translatable;
         }
 
+        let glossary_entries = if opts.use_glossary && !remaining.is_empty() {
+            self.glossary.get_all(&lang_pair).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // 3b. Exact glossary hits (full-string): short-circuit provider — key for
         // short UI binary slots where the user already fixed a fitting form.
         if opts.use_glossary && !remaining.is_empty() {
             let mut still = Vec::with_capacity(remaining.len());
             for entry in remaining.drain(..) {
                 let Some(term) =
-                    self.glossary
-                        .lookup_exact(&entry.source, &opts.source_lang, &opts.target_lang)
+                    Glossary::lookup_exact_in_entries(&glossary_entries, &entry.source)
                 else {
                     still.push(entry);
                     continue;
@@ -1364,9 +1369,8 @@ impl TranslationManager {
                         // Per-entry glossary: terms present in source; for binary
                         // slots also drop translations that cannot fit the budget.
                         let glossary_hint = if opts.use_glossary {
-                            self.glossary.build_hint_for_text_budgeted(
-                                &opts.source_lang,
-                                &opts.target_lang,
+                            Glossary::hint_from_entries(
+                                &glossary_entries,
                                 &entry.source,
                                 slot_budget
                                     .as_ref()
@@ -2788,7 +2792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_glossary_hint_injected() {
+    async fn test_glossary_hint_injected_with_one_query() {
         let (db, glossary) = setup();
 
         db.save_glossary_entry(&crate::database::GlossaryEntry {
@@ -2800,7 +2804,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut entries = make_entries(1);
+        let mut entries = make_entries(4);
         // Source must contain the glossary term so filtered hints attach.
         entries[0].source = "Current HP is low".to_string();
         entries[0].context = Some("battle screen".to_string());
@@ -2864,6 +2868,7 @@ mod tests {
         });
         let provider_ref = provider.clone();
 
+        let glossary_ref = glossary.clone();
         let manager = TranslationManager::new(provider, db, glossary);
         let (tx, mut rx) = mpsc::channel(100);
         let cancel = CancellationToken::new();
@@ -2888,6 +2893,7 @@ mod tests {
 
         let hints = provider_ref.glossary_hints.lock().unwrap();
         assert!(hints[0].as_ref().unwrap().contains("HP → Health Points"));
+        assert_eq!(glossary_ref.get_all_call_count(), 1);
     }
 
     #[tokio::test]

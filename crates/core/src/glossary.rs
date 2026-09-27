@@ -1,14 +1,22 @@
 use crate::database::{Database, GlossaryEntry};
 use crate::error::Result;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub struct Glossary {
     db: Arc<Database>,
+    #[cfg(test)]
+    get_all_calls: AtomicUsize,
 }
 
 impl Glossary {
     pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+        Self {
+            db,
+            #[cfg(test)]
+            get_all_calls: AtomicUsize::new(0),
+        }
     }
 
     pub fn add(
@@ -28,7 +36,14 @@ impl Glossary {
     }
 
     pub fn get_all(&self, lang_pair: &str) -> Result<Vec<GlossaryEntry>> {
+        #[cfg(test)]
+        self.get_all_calls.fetch_add(1, Ordering::Relaxed);
         self.db.get_glossary(lang_pair)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_all_call_count(&self) -> usize {
+        self.get_all_calls.load(Ordering::Relaxed)
     }
 
     pub fn delete(&self, term: &str, lang_pair: &str) -> Result<()> {
@@ -72,6 +87,14 @@ impl Glossary {
     ) -> Option<String> {
         let lang_pair = format!("{}-{}", source_lang, target_lang);
         let entries = self.get_all(&lang_pair).ok()?;
+        Self::hint_from_entries(&entries, text, max_bytes)
+    }
+
+    pub(crate) fn hint_from_entries(
+        entries: &[GlossaryEntry],
+        text: &str,
+        max_bytes: Option<(&str, usize)>,
+    ) -> Option<String> {
         if entries.is_empty() || text.is_empty() {
             return None;
         }
@@ -121,11 +144,18 @@ impl Glossary {
     ) -> Option<String> {
         let lang_pair = format!("{}-{}", source_lang, target_lang);
         let entries = self.get_all(&lang_pair).ok()?;
+        Self::lookup_exact_in_entries(&entries, source)
+    }
+
+    pub(crate) fn lookup_exact_in_entries(
+        entries: &[GlossaryEntry],
+        source: &str,
+    ) -> Option<String> {
         let trimmed = source.trim();
         if trimmed.is_empty() {
             return None;
         }
-        for e in &entries {
+        for e in entries {
             let hit = if e.case_sensitive {
                 e.term == trimmed || e.term == source
             } else {
