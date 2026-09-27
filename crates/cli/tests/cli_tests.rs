@@ -1,9 +1,7 @@
-use assert_cmd::Command;
 use predicates::prelude::*;
 
-fn locust() -> Command {
-    Command::cargo_bin("locust").unwrap()
-}
+mod common;
+use common::locust;
 
 #[test]
 fn test_cli_help_exits_0() {

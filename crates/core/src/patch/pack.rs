@@ -99,6 +99,7 @@ fn maybe_mutated_note(engine: Option<&str>) -> &'static str {
 fn resolved_destination(path: &Path) -> Result<PathBuf> {
     let absolute = std::path::absolute(path)?;
     let mut resolved = PathBuf::new();
+    let mut inaccessible_ancestor = None;
     for component in absolute.components() {
         match component {
             std::path::Component::ParentDir => {
@@ -108,13 +109,25 @@ fn resolved_destination(path: &Path) -> Result<PathBuf> {
             std::path::Component::Normal(name) => {
                 resolved.push(name);
                 match std::fs::canonicalize(&resolved) {
-                    Ok(canonical) => resolved = canonical,
+                    Ok(canonical) => {
+                        resolved = canonical;
+                        inaccessible_ancestor = None;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    // A sandbox may deny an ancestor while allowing a more
+                    // specific temp directory. Keep resolving until the
+                    // accessible descendant confirms the full real path.
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        inaccessible_ancestor = Some(error);
+                    }
                     Err(error) => return Err(error.into()),
                 }
             }
             other => resolved.push(other.as_os_str()),
         }
+    }
+    if let Some(error) = inaccessible_ancestor {
+        return Err(error.into());
     }
     Ok(resolved)
 }

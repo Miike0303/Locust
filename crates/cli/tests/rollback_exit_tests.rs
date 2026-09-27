@@ -1,6 +1,7 @@
-use assert_cmd::Command;
 use locust_core::database::sha256_hex;
 use serde_json::json;
+
+mod common;
 
 #[test]
 fn interrupted_rollback_reports_failure_until_modified_added_deletion_is_forced() {
@@ -29,8 +30,7 @@ fn interrupted_rollback_reports_failure_until_modified_added_deletion_is_forced(
     )
     .unwrap();
     let journal = std::fs::read(store.join("journal.json")).unwrap();
-    Command::cargo_bin("locust")
-        .unwrap()
+    common::locust()
         .arg("patch-rollback")
         .arg(game.path())
         .assert()
@@ -43,8 +43,7 @@ fn interrupted_rollback_reports_failure_until_modified_added_deletion_is_forced(
         b"user edit"
     );
     assert_eq!(std::fs::read(store.join("journal.json")).unwrap(), journal);
-    Command::cargo_bin("locust")
-        .unwrap()
+    common::locust()
         .arg("patch-rollback")
         .arg(game.path())
         .arg("--force")

@@ -11,15 +11,13 @@
 //! must not grow) translations written through the same public Database API
 //! `locust import` uses.
 
-use assert_cmd::Command;
 use locust_core::database::Database;
 use predicates::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn locust() -> Command {
-    Command::cargo_bin("locust").unwrap()
-}
+mod common;
+use common::locust;
 
 fn base_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("locust_patchrec_{}", uuid::Uuid::new_v4()));

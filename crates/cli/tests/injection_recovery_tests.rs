@@ -1,14 +1,10 @@
-use assert_cmd::Command;
 use serde_json::{json, Value};
 use std::{fs, path::Path};
 
+mod common;
+
 fn invoke(command: &str, game: &Path) -> Value {
-    let result = Command::cargo_bin("locust")
-        .unwrap()
-        .arg(command)
-        .arg(game)
-        .assert()
-        .success();
+    let result = common::locust().arg(command).arg(game).assert().success();
     serde_json::from_slice(&result.get_output().stdout).unwrap()
 }
 
@@ -54,8 +50,7 @@ fn unknown_recovery_directory_returns_failure_and_preserves_user_files() {
     fs::create_dir(&store).unwrap();
     fs::write(store.join("mine.txt"), b"user-owned").unwrap();
     for command in ["inject-status", "inject-recover"] {
-        Command::cargo_bin("locust")
-            .unwrap()
+        common::locust()
             .arg(command)
             .arg(temp.path())
             .assert()

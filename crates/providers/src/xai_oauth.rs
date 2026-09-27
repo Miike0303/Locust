@@ -453,11 +453,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_translate_without_login_errors() {
-        // Only meaningful when no token file exists on the machine; skip otherwise.
-        if load_tokens().is_some() {
-            return;
+        let _lock = token_store_test_lock();
+        let token_file = std::env::temp_dir().join(format!(
+            "locust_xai_no_login_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        struct TokenPathRestore;
+        impl Drop for TokenPathRestore {
+            fn drop(&mut self) {
+                set_token_path_override(None);
+            }
         }
+        set_token_path_override(Some(token_file));
+        let _restore = TokenPathRestore;
         let p = GrokSubscriptionProvider::new(None);
         let result = p.health_check().await;
         assert!(result.is_err());

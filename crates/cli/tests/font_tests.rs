@@ -1,9 +1,11 @@
-use assert_cmd::Command;
 use serde_json::{json, Value};
 use std::io::Write;
 
-fn locust() -> Command {
-    let mut command = Command::cargo_bin("locust").unwrap();
+mod common;
+use common::locust as isolated_locust;
+
+fn locust() -> assert_cmd::Command {
+    let mut command = isolated_locust();
     command.env("LOCUST_CONFIG", "__font_test_missing_config__.toml");
     command
 }

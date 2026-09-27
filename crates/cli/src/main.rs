@@ -495,6 +495,12 @@ fn writes_to_entry_tree(format_id: &str) -> bool {
 /// `LOCUST_BACKUP_ROOT` isolates tests or selects another volume; otherwise the
 /// root follows `AppConfig::config_dir()`, including `LOCUST_DATA_DIR`.
 fn locust_backup_root() -> PathBuf {
+    #[cfg(test)]
+    assert!(
+        std::env::var_os("LOCUST_BACKUP_ROOT").is_some_and(|path| !path.is_empty())
+            || std::env::var_os("LOCUST_DATA_DIR").is_some_and(|path| !path.is_empty()),
+        "tests must set LOCUST_BACKUP_ROOT or LOCUST_DATA_DIR before selecting a backup root"
+    );
     std::env::var_os("LOCUST_BACKUP_ROOT")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
@@ -1994,6 +2000,37 @@ mod tests {
         }
     }
 
+    struct TestProfile {
+        _backup_root_restore: EnvVarRestore,
+        _data_dir_restore: EnvVarRestore,
+        _root: tempfile::TempDir,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestProfile {
+        fn new_with_lock(lock: tokio::sync::MutexGuard<'static, ()>) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let backup_root_restore = EnvVarRestore::capture("LOCUST_BACKUP_ROOT");
+            let data_dir_restore = EnvVarRestore::capture("LOCUST_DATA_DIR");
+            std::env::set_var("LOCUST_DATA_DIR", root.path().join("profile"));
+            std::env::set_var("LOCUST_BACKUP_ROOT", root.path().join("backups"));
+            Self {
+                _backup_root_restore: backup_root_restore,
+                _data_dir_restore: data_dir_restore,
+                _root: root,
+                _lock: lock,
+            }
+        }
+
+        fn new() -> Self {
+            Self::new_with_lock(BACKUP_ROOT_LOCK.blocking_lock())
+        }
+
+        async fn new_async() -> Self {
+            Self::new_with_lock(BACKUP_ROOT_LOCK.lock().await)
+        }
+    }
+
     #[tokio::test]
     async fn backup_root_follows_data_dir_not_temp() {
         let _lock = BACKUP_ROOT_LOCK.lock().await;
@@ -2214,6 +2251,7 @@ mod tests {
 
     #[test]
     fn test_patch_astro_refuses_protected_or_existing_outputs_before_packing() {
+        let _profile = TestProfile::new();
         for case in [
             "game",
             "new_game_file",
@@ -2271,6 +2309,7 @@ mod tests {
 
     #[test]
     fn astro_stub_uses_the_auto_selected_recording_language() {
+        let _profile = TestProfile::new();
         let base = patch_test_tempdir();
         let (game, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
@@ -2304,6 +2343,7 @@ mod tests {
 
     #[test]
     fn test_patch_packs_the_recorded_files_and_bytes() {
+        let _profile = TestProfile::new();
         // A recording exists for one key ("es", from a direct inject on the
         // game root); `patch` without -l resolves the single key and packs
         // exactly the recorded rels, byte-for-byte.
@@ -2331,6 +2371,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_patch_resolves_when_game_path_case_differs_from_record_time() {
+        let _profile = TestProfile::new();
         // The recorded root and the patch-time game path are the same on-disk
         // directory spelled with different case. The identity check must fold
         // case where the filesystem does, not refuse a spelling difference.
@@ -2353,6 +2394,7 @@ mod tests {
 
     #[test]
     fn test_patch_all_rpa_database_packs_recorded_injection_output() {
+        let _profile = TestProfile::new();
         // Archive-shipped Ren'Py game: EVERY database entry names the .rpa it
         // was READ from, while injection wrote loose .rpy files that
         // extraction deliberately never re-ingests (it skips `zzz_locust*`).
@@ -2401,6 +2443,7 @@ mod tests {
 
     #[test]
     fn test_patch_without_recording_names_the_exact_inject_command() {
+        let _profile = TestProfile::new();
         // A legacy database (or one whose old-format recording was dropped by
         // the migration): entries are translated, but nothing was ever
         // recorded. There is deliberately NO entry-derived fallback — the
@@ -2438,6 +2481,7 @@ mod tests {
 
     #[test]
     fn test_patch_key_miss_is_a_loud_error_listing_recorded_keys() {
+        let _profile = TestProfile::new();
         // A recording exists — for a DIFFERENT language. The old code fell
         // back to the entry-derived list silently; now the mismatch is loud,
         // lists what IS recorded, and offers only remedies that work from
@@ -2480,6 +2524,7 @@ mod tests {
 
     #[test]
     fn test_patch_null_key_is_packed_without_lang_and_never_by_a_named_lang() {
+        let _profile = TestProfile::new();
         // `--direct` without -l records under the reserved language-unspecified
         // key: `patch` without -l packs it, `patch -l es` must NOT silently
         // match it.
@@ -2523,6 +2568,7 @@ mod tests {
 
     #[test]
     fn test_patch_without_lang_and_multiple_keys_requires_an_explicit_choice() {
+        let _profile = TestProfile::new();
         // Key set {es, (unspecified)} with `patch` invoked without -l is
         // claimed by two rules: "NULL key is matched by patch without -l" and
         // "multiple keys without -l is an error". The error wins — packing a
@@ -2630,6 +2676,7 @@ mod tests {
 
     #[test]
     fn test_patch_no_recording_advice_warns_when_the_originals_may_be_mutated() {
+        let _profile = TestProfile::new();
         // A legacy database on an already-injected entry-tree game: `patch`
         // advises a bare `--direct` re-run, but for engines that mutate the
         // originals that re-run writes 0 files and records nothing — the
@@ -2692,6 +2739,7 @@ mod tests {
 
     #[test]
     fn test_patch_key_miss_advice_warns_when_the_originals_may_be_mutated() {
+        let _profile = TestProfile::new();
         // A recording exists for another language on an entry-tree game: its
         // originals were provably byte-patched by that inject, so the advised
         // `--direct -l <missing>` re-run needs the same restore-first note.
@@ -2718,6 +2766,7 @@ mod tests {
 
     #[test]
     fn test_patch_refuses_recorded_rels_that_are_not_plain_relative_paths() {
+        let _profile = TestProfile::new();
         // Record time cannot emit an absolute rel, but `patch` trusts DB TEXT
         // it did not derive (a shared .locust.db is a plausible input). An
         // absolute rel survives a ParentDir-only guard, and
@@ -2772,6 +2821,7 @@ mod tests {
 
     #[test]
     fn test_patch_counts_reviewed_and_approved_strings_as_translated() {
+        let _profile = TestProfile::new();
         // The desktop Review page sets `approved` (Review.tsx); `patch`'s
         // pre-check must not send a fully reviewed/approved project back to
         // `locust translate` — that advice would re-translate finished work.
@@ -2823,6 +2873,7 @@ mod tests {
 
     #[test]
     fn test_patch_refuses_the_wrong_tree_and_names_the_recorded_root() {
+        let _profile = TestProfile::new();
         // R6: Replace-mode injection recorded under the per-language COPY;
         // the user points patch at the ORIGINAL. The old content-root anchor
         // silently re-read the rels out of the original — an untranslated zip
@@ -2872,6 +2923,7 @@ mod tests {
 
     #[test]
     fn test_patch_refuses_a_recorded_file_that_changed_since_injection() {
+        let _profile = TestProfile::new();
         // The recording carries the hash of what injection wrote; a file that
         // no longer matches must fail loudly instead of shipping bytes nobody
         // verified (F8: nothing ever checked a packed file was the file
@@ -2913,6 +2965,7 @@ mod tests {
 
     #[test]
     fn test_patch_errors_when_a_recorded_file_is_missing() {
+        let _profile = TestProfile::new();
         // A recording names every file the patch promised to carry. A missing
         // one must be a hard error naming the path — the old flow listed it
         // under "Files not found on disk" and shipped the zip anyway.
@@ -2949,6 +3002,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_direct_rejects_multiple_languages_for_one_database() {
+        let _profile = TestProfile::new_async().await;
         let base = patch_test_tempdir();
         let bak = base.join("bak");
         let game_dir = base.join("renpygame");
@@ -2971,7 +3025,6 @@ mod tests {
         drop(db);
 
         {
-            let _guard = BACKUP_ROOT_LOCK.lock().await;
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
             let error = cmd_inject_direct(
                 game_dir.clone(),
@@ -2981,7 +3034,6 @@ mod tests {
             .await
             .unwrap_err();
             assert!(error.to_string().contains("separate pivot database"));
-            std::env::remove_var("LOCUST_BACKUP_ROOT");
         }
 
         let db = Database::open(&db_path).unwrap();
@@ -2997,6 +3049,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_direct_backs_up_before_mutating_renpy_tree() {
+        let _profile = TestProfile::new_async().await;
         // Task #14: --direct is the universally recommended recovery path, but
         // for engines that write the original tree it used to take no backup.
         let base = patch_test_tempdir();
@@ -3022,12 +3075,10 @@ mod tests {
         drop(db);
 
         {
-            let _guard = BACKUP_ROOT_LOCK.lock().await;
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
             cmd_inject_direct(game_dir.clone(), db_path, vec!["es".to_string()])
                 .await
                 .unwrap();
-            std::env::remove_var("LOCUST_BACKUP_ROOT");
         }
 
         // Injection mutated the loose script.
@@ -3061,6 +3112,7 @@ mod tests {
 
     #[tokio::test]
     async fn pivoted_html_inject_uses_original_slot_and_leaves_duplicate_untouched() {
+        let _profile = TestProfile::new_async().await;
         let base = patch_test_tempdir();
         let bak = base.join("bak");
         let game = base.join("htmlgame");
@@ -3088,12 +3140,10 @@ mod tests {
             .unwrap();
 
         {
-            let _guard = BACKUP_ROOT_LOCK.lock().await;
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
             cmd_inject_direct(game.clone(), db_path, vec!["es".into()])
                 .await
                 .unwrap();
-            std::env::remove_var("LOCUST_BACKUP_ROOT");
         }
 
         assert_eq!(
@@ -3104,6 +3154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_direct_without_lang_records_the_unspecified_key() {
+        let _profile = TestProfile::new_async().await;
         let base = patch_test_tempdir();
         let bak = base.join("bak");
         let game_dir = base.join("renpygame");
@@ -3124,12 +3175,10 @@ mod tests {
         drop(db);
 
         {
-            let _guard = BACKUP_ROOT_LOCK.lock().await;
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
             cmd_inject_direct(game_dir, db_path.clone(), Vec::new())
                 .await
                 .unwrap();
-            std::env::remove_var("LOCUST_BACKUP_ROOT");
         }
 
         let db = Database::open(&db_path).unwrap();
@@ -3145,6 +3194,7 @@ mod tests {
 
     #[test]
     fn test_patch_failed_run_leaves_existing_output_untouched() {
+        let _profile = TestProfile::new();
         // A previously published patch sits at `-o`. A re-run that fails the
         // recording verification (file missing since) must not truncate or
         // delete it: the archive is built in a temp file and renamed over the
