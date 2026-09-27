@@ -78,10 +78,20 @@ Owned by no lane; Claude applies these after the writers finish.
   `api.ts:41` hard-codes 7842 while the CLI defaults to 3000 (`crates/cli/src/main.rs:275`).
   Vite dev runs on 1420 and proxies `/api` to 7842. Folder pickers fall back to
   `window.prompt`, so headless QA must answer `dialog` events.
-- **Codex's sandbox cannot run the full suite.** `workspace-write` cannot write
-  the per-user game-lock dir (`%LOCALAPPDATA%\locust-patch-locks-v1`), so about
-  111 core tests fail, and it cannot open loopback sockets (server integration
-  tests). Ask Codex for targeted tests only, and run the full gates yourself.
+- **Codex CAN run the full suite with a widened sandbox (since cycle 37).** Call
+  `codex exec` directly, because the `codex-write.ps1` wrapper cannot pass these
+  flags:
+  `-s workspace-write -c "sandbox_workspace_write.writable_roots=['C:/Users/Mike/AppData/Local/locust-patch-locks-v1','C:/Users/Mike/AppData/Local/Temp']" -c "sandbox_workspace_write.network_access=true"`.
+  Use TOML single-quoted strings; PowerShell 5.1 strips embedded double quotes.
+  Never add `%LOCALAPPDATA%\project-locust` to the writable roots: its being
+  unwritable is what proves the tests do not touch the real profile. With plain
+  `workspace-write` about 111 tests fail (the lock dir, and no loopback for the
+  server tests).
+- **Full-Codex cycle mode (user, 2026-09-27: "use Codex much more").** One Codex
+  gpt-6-sol session researches, picks, implements and runs all five gates in the
+  widened sandbox. Claude reads the report, reviews any production hunk outside
+  the brief, reruns the gates once and commits. Report this as "research duel
+  skipped (single researcher)".
 - **Use `cursor-ask -Mode ask`, not `plan`, for research.** `plan` returned empty
   stdout (exit 0) on the long brief twice, with both cursor-grok-4.6-xhigh and
   grok-4.7-high. `ask` with the same brief reads the repo and answers. Always

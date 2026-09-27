@@ -27,6 +27,7 @@ use crate::unreal_pak::{
 #[cfg(test)]
 thread_local! {
     static FIND_PAK_FILES_CALLS: Cell<Option<usize>> = const { Cell::new(None) };
+    static PAK_MAGIC_PROBES: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// Plugin for Unreal Engine games.
@@ -127,7 +128,7 @@ impl UnrealPlugin {
         Self
     }
 
-    fn find_pak_files(path: &Path) -> Vec<PathBuf> {
+    fn find_pak_files(path: &Path, stop_after_first: bool) -> Vec<PathBuf> {
         #[cfg(test)]
         FIND_PAK_FILES_CALLS.with(|c| {
             if let Some(n) = c.get() {
@@ -153,6 +154,9 @@ impl UnrealPlugin {
                 let p = entry.path();
                 if p.extension().is_some_and(|e| e == "pak") && Self::looks_like_unreal_pak(p) {
                     paks.push(p.to_path_buf());
+                    if stop_after_first {
+                        break;
+                    }
                 }
             }
         }
@@ -163,6 +167,12 @@ impl UnrealPlugin {
     /// Filters Chromium/NW.js packs (`resources.pak`, `nw_*.pak`, `locales/*.pak`)
     /// that otherwise made NW.js RPG Maker deploys misdetect as Unreal.
     fn looks_like_unreal_pak(path: &Path) -> bool {
+        #[cfg(test)]
+        PAK_MAGIC_PROBES.with(|c| {
+            if let Some(n) = c.get() {
+                c.set(Some(n + 1));
+            }
+        });
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             let lower = name.to_ascii_lowercase();
             if lower == "resources.pak"
@@ -217,7 +227,7 @@ impl UnrealPlugin {
             return true;
         }
         // Pak-only trees (no Engine / Content) still need a filtered .pak walk.
-        !Self::find_pak_files(path).is_empty()
+        !Self::find_pak_files(path, true).is_empty()
     }
 
     /// Loose `*.locres` under the game tree (Localization or anywhere, depth-capped).
@@ -1516,7 +1526,7 @@ impl FormatPlugin for UnrealPlugin {
         } else {
             path
         };
-        let paks = Self::find_pak_files(path);
+        let paks = Self::find_pak_files(path, false);
         let tocs = unreal_iostore_native::find_tocs(path);
         let mut locres_files = Self::find_loose_locres(path);
         // Single-file .locres open
@@ -2182,6 +2192,22 @@ mod tests {
             calls.is_some_and(|n| n >= 1),
             "pak-only trees still need find_pak_files during detect, got {calls:?}"
         );
+    }
+
+    #[test]
+    fn test_detect_pak_only_tree_stops_after_first_valid_pak() {
+        let dir = tempdir();
+        let mut data = vec![0u8; 64];
+        data[60..64].copy_from_slice(&pak_magic());
+        for n in 0..20 {
+            fs::write(dir.join(format!("archive_{n}.pak")), &data).unwrap();
+        }
+
+        PAK_MAGIC_PROBES.with(|c| c.set(Some(0)));
+        assert!(UnrealPlugin::new().detect(&dir));
+        let probes = PAK_MAGIC_PROBES.with(|c| c.replace(None));
+        assert_eq!(probes, Some(1), "detect only needs the first valid pak");
+        assert_eq!(UnrealPlugin::find_pak_files(&dir, false).len(), 20);
     }
 
     #[test]
