@@ -32,6 +32,11 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
+#[cfg(test)]
+thread_local! {
+    static LOCRES_MAGIC_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Bounds apply to both loose files and decompressed PAK resources.
 pub const MAX_LOCRES_FILE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_LOCRES_DECODED_BYTES: usize = 128 * 1024 * 1024;
@@ -799,6 +804,12 @@ pub fn find_locres_offsets(data: &[u8]) -> Vec<usize> {
     }
     let mut i = 0;
     while i + 16 <= data.len() {
+        if data[i] != LOCRES_MAGIC[0] {
+            i += 1;
+            continue;
+        }
+        #[cfg(test)]
+        LOCRES_MAGIC_COMPARISONS.with(|count| count.set(count.get() + 1));
         if data[i..i + 16] == LOCRES_MAGIC {
             out.push(i);
             i += 16;
@@ -1014,5 +1025,16 @@ mod tests {
         buf.extend_from_slice(&[1, 2, 3]);
         let offs = find_locres_offsets(&buf);
         assert_eq!(offs, vec![32]);
+    }
+
+    #[test]
+    fn find_locres_offsets_compares_magic_only_at_candidate_bytes() {
+        let mut buf = vec![0u8; 1024 * 1024];
+        buf[123] = LOCRES_MAGIC[0];
+        buf[456_789..456_805].copy_from_slice(&LOCRES_MAGIC);
+
+        LOCRES_MAGIC_COMPARISONS.with(|count| count.set(0));
+        assert_eq!(find_locres_offsets(&buf), vec![456_789]);
+        assert_eq!(LOCRES_MAGIC_COMPARISONS.with(|count| count.get()), 2);
     }
 }
