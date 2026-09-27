@@ -217,6 +217,9 @@ enum Commands {
         /// Delete user-edited patch-added files without confirmation
         #[arg(long)]
         force: bool,
+        /// Check the rollback and show its effects without changing game files
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show whether a game has a Locust patch applied
     PatchStatus {
@@ -463,7 +466,11 @@ async fn main() -> anyhow::Result<()> {
             confirm_legacy,
             dry_run,
         } => cmd_apply(game_path, zip, url, force, confirm_legacy, dry_run)?,
-        Commands::PatchRollback { game_path, force } => cmd_patch_rollback(game_path, force)?,
+        Commands::PatchRollback {
+            game_path,
+            force,
+            dry_run,
+        } => cmd_patch_rollback(game_path, force, dry_run)?,
         Commands::PatchStatus { game_path, verify } => cmd_patch_status(game_path, verify)?,
         Commands::InjectStatus { game_path } => injection_recovery::status(&game_path)?,
         Commands::InjectRecover { game_path, force } => {
@@ -988,18 +995,20 @@ fn download_patch_zip(url: &str, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_patch_rollback(game_path: PathBuf, force: bool) -> anyhow::Result<()> {
-    use locust_core::patch::{rollback, RollbackOptions};
+fn cmd_patch_rollback(game_path: PathBuf, force: bool, dry_run: bool) -> anyhow::Result<()> {
+    use locust_core::patch::{preview_rollback, rollback, RollbackOptions};
 
     if !game_path.is_dir() {
         anyhow::bail!("game path is not a directory: {}", game_path.display());
     }
-    let report = rollback(
-        &game_path,
-        RollbackOptions {
-            delete_modified_added: force,
-        },
-    )?;
+    let opts = RollbackOptions {
+        delete_modified_added: force,
+    };
+    let report = if dry_run {
+        preview_rollback(&game_path, opts)?
+    } else {
+        rollback(&game_path, opts)?
+    };
     if !report.aborted_edited.is_empty() {
         println!("rollback aborted — edited added files need --force:");
         for p in &report.aborted_edited {
@@ -1011,15 +1020,29 @@ fn cmd_patch_rollback(game_path: PathBuf, force: bool) -> anyhow::Result<()> {
         println!("{m}");
     }
     if !report.torn_deleted.is_empty() {
-        println!("changed added files deleted with explicit force:");
+        println!(
+            "changed added files {} with explicit force:",
+            if dry_run {
+                "would be deleted"
+            } else {
+                "deleted"
+            }
+        );
         for p in &report.torn_deleted {
             println!("  {p}");
         }
     }
-    println!(
-        "rollback complete — restored {}, deleted {}",
-        report.restored, report.deleted
-    );
+    if dry_run {
+        println!(
+            "rollback planned — restore {}, delete {}",
+            report.restored, report.deleted
+        );
+    } else {
+        println!(
+            "rollback complete — restored {}, deleted {}",
+            report.restored, report.deleted
+        );
+    }
     Ok(())
 }
 

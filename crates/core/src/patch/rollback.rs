@@ -37,11 +37,25 @@ pub fn rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackRepor
     rollback_under_lock(&game_lock, opts)
 }
 
+/// Run rollback's preflight and classify deletions without changing game files.
+pub fn preview_rollback(game_root: &Path, opts: RollbackOptions) -> Result<RollbackReport> {
+    let game_lock = super::lock::GameLock::acquire(game_root)?;
+    rollback_under_lock_impl(&game_lock, opts, true)
+}
+
 /// Caller must hold GameLock for this canonical root across the complete
 /// rollback-and-reapply transition. Never reenter the public locking wrapper.
 pub(super) fn rollback_under_lock(
     game_lock: &super::lock::GameLock,
     opts: RollbackOptions,
+) -> Result<RollbackReport> {
+    rollback_under_lock_impl(game_lock, opts, false)
+}
+
+fn rollback_under_lock_impl(
+    game_lock: &super::lock::GameLock,
+    opts: RollbackOptions,
+    dry_run: bool,
 ) -> Result<RollbackReport> {
     crate::injection_transaction::ensure_no_pending_under_lock(game_lock)?;
     let game_root = game_lock.root();
@@ -84,7 +98,7 @@ pub(super) fn rollback_under_lock(
                             .into(),
                     ));
                 }
-                return restore_manifest_only(&store, bm, vec![], true);
+                return restore_manifest_only(&store, bm, vec![], true, dry_run);
             }
             Err(LocustError::PatchBackupIncomplete(
                 "no backup found — factory pristine is unrecoverable".into(),
@@ -132,6 +146,17 @@ pub(super) fn rollback_under_lock(
                     )],
                     aborted_edited: edited,
                     torn_deleted: vec![],
+                });
+            }
+
+            if dry_run {
+                return Ok(RollbackReport {
+                    restored: bm.files.len(),
+                    deleted: delete_set.len(),
+                    baseline: Some(bm.baseline),
+                    messages: vec!["dry-run: interrupted apply can be rolled back".into()],
+                    aborted_edited: vec![],
+                    torn_deleted: edited,
                 });
             }
 
@@ -213,6 +238,17 @@ pub(super) fn rollback_under_lock(
                 });
             }
 
+            if dry_run {
+                return Ok(RollbackReport {
+                    restored: bm.files.len(),
+                    deleted: delete_set.len(),
+                    baseline: Some(bm.baseline),
+                    messages: vec!["dry-run: patch can be rolled back".into()],
+                    aborted_edited: vec![],
+                    torn_deleted: edited,
+                });
+            }
+
             // Journal rolling-back.
             // (receipt path has no journal usually; optional)
 
@@ -268,7 +304,21 @@ fn restore_manifest_only(
     bm: &super::manifest::BackupManifest,
     delete_set: Vec<String>,
     note_added_may_remain: bool,
+    dry_run: bool,
 ) -> Result<RollbackReport> {
+    if dry_run {
+        return Ok(RollbackReport {
+            restored: bm.files.len(),
+            deleted: delete_set.len(),
+            baseline: Some(bm.baseline),
+            messages: vec![
+                "dry-run: restore is possible, but patch-added files may remain without a receipt"
+                    .into(),
+            ],
+            aborted_edited: vec![],
+            torn_deleted: vec![],
+        });
+    }
     for p in &delete_set {
         let target = store
             .game_root()
