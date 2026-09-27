@@ -1584,6 +1584,10 @@ impl Database {
 
         struct Stored {
             source: String,
+            file_path: String,
+            context: Option<String>,
+            tags: String,
+            char_limit: Option<i64>,
             metadata: HashMap<String, serde_json::Value>,
             translation: Option<String>,
             status: String,
@@ -1596,8 +1600,8 @@ impl Database {
         let mut existing: HashMap<String, Stored> = HashMap::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT id, source, metadata, translation, status, provider_used,
-                        created_at, translated_at, reviewed_at
+                "SELECT id, source, file_path, context, tags, char_limit, metadata,
+                        translation, status, provider_used, created_at, translated_at, reviewed_at
                  FROM strings",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -1607,16 +1611,24 @@ impl Database {
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             })?;
             for row in rows {
                 let (
                     id,
                     source,
+                    file_path,
+                    context,
+                    tags,
+                    char_limit,
                     metadata_json,
                     translation,
                     status,
@@ -1634,6 +1646,10 @@ impl Database {
                     id,
                     Stored {
                         source,
+                        file_path,
+                        context,
+                        tags,
+                        char_limit,
                         metadata,
                         translation,
                         status,
@@ -1814,11 +1830,21 @@ impl Database {
                             }
                         }
                     }
-                    let metadata_json = serde_json::to_string(&metadata)?;
                     if old.translation.as_ref().is_some_and(|t| !t.is_empty()) {
                         stats.preserved_translations += 1;
                     }
                     stats.updated += 1;
+                    if old.source == source
+                        && old.file_path == file_path_str
+                        && old.context == entry.context
+                        && old.tags == tags_json
+                        && old.char_limit == char_limit
+                        && old.metadata == metadata
+                        && old.status == status
+                    {
+                        continue;
+                    }
+                    let metadata_json = serde_json::to_string(&metadata)?;
                     update.execute(params![
                         source,
                         file_path_str,
@@ -2983,6 +3009,39 @@ mod tests {
         let mage = db.get_entry("mage").unwrap().unwrap();
         assert_eq!(mage.status, StringStatus::Pending);
         assert!(mage.translation.is_none());
+    }
+
+    #[test]
+    fn merge_entries_writes_only_changed_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let unchanged = make_entry("unchanged", "Hello");
+        let mut changed = make_entry("changed", "Goodbye");
+        db.save_entries(&[unchanged.clone(), changed.clone()])
+            .unwrap();
+
+        changed.context = Some("new context".into());
+        let before: i64 = lock_connection(&db.conn)
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        let stats = db
+            .merge_entries(&[unchanged.clone(), changed.clone()])
+            .unwrap();
+        let after: i64 = lock_connection(&db.conn)
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stats.updated, 2);
+        assert_eq!(after - before, 1, "only the changed row should be written");
+
+        let stats = db.merge_entries(&[unchanged, changed]).unwrap();
+        let final_changes: i64 = lock_connection(&db.conn)
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stats.updated, 2);
+        assert_eq!(
+            final_changes - after,
+            0,
+            "an unchanged reopen should write no rows"
+        );
     }
 
     #[tokio::test]
