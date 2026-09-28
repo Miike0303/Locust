@@ -185,7 +185,7 @@ fn saved_project_db_candidates(game_root: &Path, config_dir: &Path) -> Vec<PathB
     out
 }
 
-fn saved_db_handles_match(left: &std::fs::File, right: &std::fs::File) -> bool {
+pub(crate) fn saved_db_handles_match(left: &std::fs::File, right: &std::fs::File) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

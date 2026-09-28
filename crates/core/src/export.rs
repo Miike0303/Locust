@@ -2,6 +2,58 @@ use crate::error::{LocustError, Result};
 use crate::models::StringEntry;
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+/// Refuse destinations that would replace the project or its SQLite sidecars.
+pub fn check_export_destination(output: &Path, project_db: &Path) -> Result<()> {
+    let project = project_db.canonicalize()?;
+    let destination = match output.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name = output.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid export destination",
+                )
+            })?;
+            let parent = output
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            parent.canonicalize()?.join(name)
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let output_handle = if output.try_exists()? {
+        Some(std::fs::File::open(output)?)
+    } else {
+        None
+    };
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = project.as_os_str().to_os_string();
+        name.push(suffix);
+        let protected = std::path::PathBuf::from(name);
+        let same_path = crate::database::paths_identical(&destination, &protected);
+        let same_file = match &output_handle {
+            Some(output) if protected.try_exists()? => {
+                crate::project::saved_db_handles_match(output, &std::fs::File::open(&protected)?)
+            }
+            _ => false,
+        };
+        if same_path || same_file {
+            let target = if suffix.is_empty() {
+                "the project database itself".to_string()
+            } else {
+                format!("the project database's SQLite {suffix} sidecar")
+            };
+            return Err(LocustError::Other(anyhow::anyhow!(
+                "the export destination is {target}; choose a different file"
+            )));
+        }
+    }
+    Ok(())
+}
 
 // ─── PO format ─────────────────────────────────────────────────────────────
 
@@ -483,6 +535,106 @@ fn escape_xml(s: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn export_destination_refuses_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("project.locust.db");
+        std::fs::write(&db, b"project").unwrap();
+        for output in [&db, &dir.path().join("./project.locust.db")] {
+            let err = check_export_destination(output, &db).unwrap_err();
+            assert!(err.to_string().contains("project database itself"), "{err}");
+        }
+        assert_eq!(std::fs::read(&db).unwrap(), b"project");
+    }
+
+    #[test]
+    fn export_destination_refuses_existing_and_missing_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("project.locust.db");
+        std::fs::write(&db, b"project").unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = dir.path().join(format!("project.locust.db{suffix}"));
+            for exists in [false, true] {
+                if exists {
+                    std::fs::write(&sidecar, b"sqlite sidecar").unwrap();
+                }
+                let err = check_export_destination(&sidecar, &db).unwrap_err();
+                assert!(err.to_string().contains("SQLite"), "{err}");
+                assert!(err.to_string().contains(suffix), "{err}");
+                assert_eq!(sidecar.exists(), exists);
+                if exists {
+                    assert_eq!(std::fs::read(&sidecar).unwrap(), b"sqlite sidecar");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn export_destination_allows_unrelated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("project.locust.db");
+        let catalog = dir.path().join("catalog.po");
+        std::fs::write(&db, b"project").unwrap();
+        std::fs::write(&catalog, b"translator edits").unwrap();
+        check_export_destination(&catalog, &db).unwrap();
+        assert_eq!(std::fs::read(&catalog).unwrap(), b"translator edits");
+    }
+
+    #[test]
+    fn export_destination_allows_missing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("project.locust.db");
+        let catalog = dir.path().join("catalog.po");
+        std::fs::write(&db, b"project").unwrap();
+        check_export_destination(&catalog, &db).unwrap();
+        assert!(!catalog.exists());
+    }
+
+    #[test]
+    fn export_destination_refuses_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("project.locust.db");
+        std::fs::write(&db, b"project").unwrap();
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let protected = dir.path().join(format!("project.locust.db{suffix}"));
+            if !suffix.is_empty() {
+                std::fs::write(&protected, b"sqlite sidecar").unwrap();
+            }
+            let alias = dir.path().join(format!("catalog{suffix}.po"));
+            std::fs::hard_link(&protected, &alias).unwrap();
+            let err = check_export_destination(&alias, &db).unwrap_err();
+            assert!(err.to_string().contains("choose a different file"), "{err}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn export_destination_refuses_windows_case_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("Project.locust.db");
+        std::fs::write(&db, b"project").unwrap();
+        for suffix in ["", "-WAL", "-SHM", "-JOURNAL"] {
+            let output = dir.path().join(format!("PROJECT.LOCUST.DB{suffix}"));
+            assert!(check_export_destination(&output, &db).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_destination_refuses_symlink_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("project.locust.db");
+        let alias = dir.path().join("catalog.po");
+        std::fs::write(&db, b"project").unwrap();
+        std::os::unix::fs::symlink(&db, &alias).unwrap();
+        assert!(check_export_destination(&alias, &db).is_err());
+        let parent_alias = dir.path().join("linked");
+        std::os::unix::fs::symlink(dir.path(), &parent_alias).unwrap();
+        assert!(
+            check_export_destination(&parent_alias.join("project.locust.db-wal"), &db).is_err()
+        );
+    }
 
     fn make_entries() -> Vec<StringEntry> {
         let mut e1 = StringEntry::new("e1", "Hello", PathBuf::from("test.json"));

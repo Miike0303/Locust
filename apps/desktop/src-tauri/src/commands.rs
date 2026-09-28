@@ -501,6 +501,7 @@ async fn apply_export_translations(
         other => return Err(format!("unknown export format: {other}")),
     };
     let out = PathBuf::from(&path);
+    locust_core::export::check_export_destination(&out, &s.db.path()).map_err(|e| e.to_string())?;
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -997,6 +998,85 @@ mod tests {
             serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap(),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn export_preserves_database_and_sidecars() {
+        let dir = std::env::temp_dir().join(format!("locust_export_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let project = dir.join("project.locust.db");
+        let state = locust_server::create_test_state_with_db(&project);
+        *state.current_project.write().await = Some(ProjectInfo::default());
+        state
+            .db
+            .save_entries(&[translated_entry("hello", "Hello", "Hola")])
+            .unwrap();
+        let before_rows =
+            serde_json::to_value(state.db.get_entries(&EntryFilter::default()).unwrap()).unwrap();
+        let before_bytes = std::fs::read(&project).unwrap();
+
+        for format in ["po", "xliff"] {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let output = dir.join(format!("project.locust.db{suffix}"));
+                let before_output = output.exists().then(|| std::fs::read(&output).unwrap());
+                let err = apply_export_translations(
+                    &state,
+                    format.into(),
+                    "es".into(),
+                    output.to_string_lossy().into_owned(),
+                )
+                .await
+                .unwrap_err();
+                assert!(err.contains("choose a different file"), "{err}");
+                assert_eq!(std::fs::read(&project).unwrap(), before_bytes);
+                assert_eq!(
+                    output.exists().then(|| std::fs::read(&output).unwrap()),
+                    before_output
+                );
+            }
+        }
+        drop(state);
+        let reopened = locust_core::database::Database::open(&project).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.get_entries(&EntryFilter::default()).unwrap()).unwrap(),
+            before_rows
+        );
+        drop(reopened);
+        std::fs::remove_file(&project).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_allows_confirmed_catalog_replacement() {
+        let dir = std::env::temp_dir().join(format!("locust_export_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let project = dir.join("project.locust.db");
+        let state = locust_server::create_test_state_with_db(&project);
+        *state.current_project.write().await = Some(ProjectInfo::default());
+        state
+            .db
+            .save_entries(&[translated_entry("hello", "Hello", "Hola")])
+            .unwrap();
+        let output = dir.join("catalog.po");
+        std::fs::write(&output, b"previous catalog").unwrap();
+
+        let result = apply_export_translations(
+            &state,
+            "po".into(),
+            "es".into(),
+            output.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["entries"], 1);
+        let content = std::fs::read_to_string(&output).unwrap();
+        let entries = locust_core::export::import_po(&content).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].translation, "Hola");
+        drop(state);
+        std::fs::remove_file(&output).unwrap();
+        std::fs::remove_file(&project).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[tokio::test]

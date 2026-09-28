@@ -281,6 +281,9 @@ enum Commands {
         lang: String,
         #[arg(short, long)]
         output: PathBuf,
+        /// Replace an existing catalog (never the project database or its sidecars)
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Import translations from PO or XLIFF
     Import {
@@ -495,7 +498,8 @@ async fn main() -> anyhow::Result<()> {
             format,
             lang,
             output,
-        } => cmd_export(&config, project, format, lang, output)?,
+            overwrite,
+        } => cmd_export(&config, project, format, lang, output, overwrite)?,
         Commands::Import {
             project,
             format,
@@ -2032,7 +2036,15 @@ fn cmd_export(
     format: String,
     lang: String,
     output: PathBuf,
+    overwrite: bool,
 ) -> anyhow::Result<()> {
+    export::check_export_destination(&output, &project)?;
+    if output.try_exists()? && !overwrite {
+        anyhow::bail!(
+            "{} already exists; pass --overwrite to replace it",
+            output.display()
+        );
+    }
     let db = Database::open(&project)?;
     let entries = db.get_entries(&EntryFilter::default())?;
 
