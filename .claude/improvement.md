@@ -68,7 +68,8 @@ Owned by no lane; Claude applies these after the writers finish.
   Supersedes the 2026-09-26 Codex+Cursor authorization.
 - **Model allow-list (user, 2026-09-27, supersedes 2026-09-26). Never substitute. No Fast tier:**
   - Codex writers: `gpt-6-astra` with `-c model_reasoning_effort=xhigh`.
-  - Codex researchers: `gpt-6-sol` with `-c model_reasoning_effort=high`.
+  - Codex researchers and any subagent: `gpt-6-astra` with `-c model_reasoning_effort=high`.
+    **Never `gpt-6-sol`** (user, 2026-09-28: "solo usa astra de codex … también en los agentes y subagentes").
   - The user tried and then declined `service_tier="fast"`; leave the default tier.
   - Loop cadence: 15-20 minute ticks (user, 2026-09-27).
 - **Codex Windows sandbox fails under heavy concurrency (2026-09-27).** With ~20 Codex sessions from other
@@ -104,7 +105,7 @@ Owned by no lane; Claude applies these after the writers finish.
   `workspace-write` about 111 tests fail (the lock dir, and no loopback for the
   server tests).
 - **Full-Codex cycle mode (user, 2026-09-27: "use Codex much more").** One Codex
-  gpt-6-sol session researches, picks, implements and runs all five gates in the
+  gpt-6-astra session researches, picks, implements and runs all five gates in the
   widened sandbox. Claude reads the report, reviews any production hunk outside
   the brief, reruns the gates once and commits. Report this as "research duel
   skipped (single researcher)".
