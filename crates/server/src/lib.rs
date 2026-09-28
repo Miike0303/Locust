@@ -2106,12 +2106,14 @@ async fn patch_rollback(
     let game = PathBuf::from(&req.game_path);
     let force = req.force;
     let report = tokio::task::spawn_blocking(move || {
-        locust_core::patch::rollback(
-            &game,
-            locust_core::patch::RollbackOptions {
-                delete_modified_added: force,
-            },
-        )
+        let opts = locust_core::patch::RollbackOptions {
+            delete_modified_added: force,
+        };
+        if req.dry_run {
+            locust_core::patch::preview_rollback(&game, opts)
+        } else {
+            locust_core::patch::rollback(&game, opts)
+        }
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
@@ -2123,6 +2125,7 @@ async fn patch_rollback(
         "messages": report.messages,
         "aborted_edited": report.aborted_edited,
         "torn_deleted": report.torn_deleted,
+        "dry_run": req.dry_run,
     })))
 }
 

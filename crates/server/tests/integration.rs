@@ -1107,6 +1107,13 @@ fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 
 /// Strict-tier zip + a pristine target game (`file_count` replaced files).
 fn make_strict_patch(file_count: usize) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    make_patch_fixture(file_count, 0)
+}
+
+fn make_patch_fixture(
+    replaced_count: usize,
+    added_count: usize,
+) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let tmp = TempDir::new().unwrap();
     let recorded = tmp.path().join("recorded");
     let pristine = tmp.path().join("pristine");
@@ -1114,9 +1121,12 @@ fn make_strict_patch(file_count: usize) -> (TempDir, std::path::PathBuf, std::pa
     std::fs::create_dir_all(recorded.join("data")).unwrap();
     std::fs::create_dir_all(pristine.join("data")).unwrap();
     let mut written = Vec::new();
+    let file_count = replaced_count + added_count;
     for i in 0..file_count {
         let name = format!("f{i}.txt");
-        std::fs::write(pristine.join("data").join(&name), format!("orig{i}")).unwrap();
+        if i < replaced_count {
+            std::fs::write(pristine.join("data").join(&name), format!("orig{i}")).unwrap();
+        }
         let rec = recorded.join("data").join(&name);
         std::fs::write(&rec, format!("xlat{i}")).unwrap();
         written.push(rec);
@@ -1124,7 +1134,7 @@ fn make_strict_patch(file_count: usize) -> (TempDir, std::path::PathBuf, std::pa
     let db = locust_core::database::Database::open_in_memory().unwrap();
     // An injection recording alone is not packable: `pack_injection_recording`
     // refuses a project with nothing translated, reviewed or approved. Seed one
-    // translated entry per replaced file so the pack has something to claim.
+    // translated entry per file so the pack has something to claim.
     let entries: Vec<_> = (0..file_count)
         .map(|i| {
             let mut e = locust_core::models::StringEntry::new(
@@ -1204,6 +1214,107 @@ async fn collect_patch_ws_frames(base_url: &str, job_id: &str) -> Vec<serde_json
         .await
         .expect("timed out waiting for patch job frames");
     frames
+}
+
+#[tokio::test]
+async fn patch_rollback_dry_run_changes_nothing() {
+    let (_fixture, zip, game) = make_patch_fixture(1, 1);
+    std::fs::write(game.join("untouched.bin"), b"unrelated game bytes").unwrap();
+    let pristine = snapshot_tree(&game);
+    let (base_url, server) =
+        locust_server::start_test_server(locust_server::create_test_state()).await;
+    let job = start_patch_apply_job(
+        &base_url,
+        &serde_json::json!({"game_path": game, "zip_path": zip}),
+    )
+    .await;
+    let frames = collect_patch_ws_frames(&base_url, &job).await;
+    let applied = frames
+        .iter()
+        .find(|frame| frame["type"] == "done")
+        .unwrap_or_else(|| panic!("apply must succeed: {frames:?}"));
+    assert_eq!(applied["report"]["replaced"], 1);
+    assert_eq!(applied["report"]["added"], 1);
+
+    let added = game.join("data/f1.txt");
+    let modified = added.metadata().unwrap().modified().unwrap();
+    std::fs::write(&added, b"user edit").unwrap();
+    // Preserve the timestamp so quick HTTP status still reports patched.
+    // Rollback hashes the bytes and must classify this added file as edited.
+    std::fs::File::options()
+        .write(true)
+        .open(&added)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let store = locust_core::patch::PatchStore::new(&game);
+    let before_game = snapshot_tree(&game);
+    let before_store = snapshot_tree(&store.locust_dir());
+    assert!(store.receipt_path().is_file());
+    assert!(store.backup_manifest_path().is_file());
+    assert!(!before_store.is_empty());
+
+    let response = client()
+        .post(format!("{base_url}/api/patch/rollback"))
+        .json(&serde_json::json!({"game_path": game, "dry_run": true, "force": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let preview: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        snapshot_tree(&game),
+        before_game,
+        "dry-run must preserve every game file, including the edited added file"
+    );
+    assert_eq!(
+        snapshot_tree(&store.locust_dir()),
+        before_store,
+        "dry-run must preserve the receipt and all patch store bytes"
+    );
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["restored"], 1);
+    assert_eq!(preview["deleted"], 1);
+    assert_eq!(preview["baseline"], "Pristine");
+    assert_eq!(preview["aborted_edited"], serde_json::json!([]));
+    assert_eq!(preview["torn_deleted"], serde_json::json!(["data/f1.txt"]));
+    assert!(preview["messages"]
+        .as_array()
+        .is_some_and(|m| !m.is_empty()));
+
+    let response = client()
+        .post(format!("{base_url}/api/patch/status"))
+        .json(&serde_json::json!({"game_path": game}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let status: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status["status"], "patched", "{status}");
+    assert_eq!(status["patch_id"], applied["report"]["patch_id"]);
+
+    // The same request without dry_run must perform exactly the planned work.
+    let response = client()
+        .post(format!("{base_url}/api/patch/rollback"))
+        .json(&serde_json::json!({"game_path": game, "force": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let rolled_back: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(rolled_back["dry_run"], false);
+    for key in [
+        "restored",
+        "deleted",
+        "baseline",
+        "aborted_edited",
+        "torn_deleted",
+    ] {
+        assert_eq!(rolled_back[key], preview[key], "{key}");
+    }
+    assert_eq!(snapshot_tree(&game), pristine);
+    assert!(!store.locust_dir().exists());
+    server.abort();
 }
 
 #[tokio::test]
@@ -1465,6 +1576,8 @@ async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
     let rs = rr.status();
     let rbody = rr.text().await.unwrap();
     assert_eq!(rs, 200, "rollback: {rbody}");
+    let rjson: serde_json::Value = serde_json::from_str(&rbody).unwrap();
+    assert_eq!(rjson["dry_run"], false);
 
     assert_eq!(
         snapshot_tree(&game),
