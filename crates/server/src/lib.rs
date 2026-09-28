@@ -2940,6 +2940,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_backups_returns_readable_backup_despite_damaged_manifest() {
+        let state = create_test_state();
+        let game = tempfile::tempdir().unwrap();
+        std::fs::write(game.path().join("story.txt"), b"original").unwrap();
+        let valid = state.backup_manager.create_backup(game.path()).unwrap();
+        let damaged = valid.path.parent().unwrap().join("damaged");
+        std::fs::create_dir(&damaged).unwrap();
+        std::fs::write(damaged.join("manifest.json"), b"{").unwrap();
+
+        let (url, _h) = start_test_server(state).await;
+        let resp = client()
+            .get(format!("{url}/api/backups"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        let entries: Vec<BackupEntry> = resp.json().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, valid.id);
+    }
+
+    #[tokio::test]
     async fn test_health_returns_ok() {
         let (url, _h) = setup().await;
         let resp = client()

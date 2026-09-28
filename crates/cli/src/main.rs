@@ -544,20 +544,25 @@ fn locust_backup_root() -> PathBuf {
 }
 
 fn cmd_backups() -> anyhow::Result<()> {
-    let backups = BackupManager::new(locust_backup_root()).list_backups()?;
-    if backups.is_empty() {
-        println!("No injection backups found.");
-    } else {
-        for backup in backups {
-            println!(
-                "{}\t{}\t{} file(s), {} bytes\t{}",
-                backup.id,
-                backup.source_path.display(),
-                backup.file_count,
-                backup.size_bytes,
-                backup.created_at
-            );
+    let report = BackupManager::new(locust_backup_root()).list_backups_report()?;
+    for backup in &report.entries {
+        println!(
+            "{}\t{}\t{} file(s), {} bytes\t{}",
+            backup.id,
+            backup.source_path.display(),
+            backup.file_count,
+            backup.size_bytes,
+            backup.created_at
+        );
+    }
+    for (id, error) in &report.unreadable {
+        eprintln!("warning: backup {id} has an unreadable manifest.json: {error}");
+    }
+    if report.entries.is_empty() {
+        if !report.unreadable.is_empty() {
+            anyhow::bail!("No readable injection backups found.");
         }
+        println!("No injection backups found.");
     }
     Ok(())
 }

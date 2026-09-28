@@ -86,6 +86,13 @@ pub struct BackupEntry {
     pub size_bytes: u64,
 }
 
+/// Readable backups and the IDs and errors of backups whose manifests cannot be read.
+#[derive(Debug, Default)]
+pub struct BackupListing {
+    pub entries: Vec<BackupEntry>,
+    pub unreadable: Vec<(String, String)>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct BackupManifest {
     pub source_path: PathBuf,
@@ -797,11 +804,26 @@ impl BackupManager {
     }
 
     pub fn list_backups(&self) -> Result<Vec<BackupEntry>> {
-        checked_absolute(&self.backup_root)?;
-        if !self.backup_root.exists() {
-            return Ok(Vec::new());
+        let report = self.list_backups_report()?;
+        if report.entries.is_empty() && !report.unreadable.is_empty() {
+            let errors = report
+                .unreadable
+                .iter()
+                .map(|(id, error)| format!("{id}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(failure(format!("no readable backups: {errors}")));
         }
-        let mut entries = Vec::new();
+        Ok(report.entries)
+    }
+
+    /// Report manifest failures individually while keeping filesystem and link-safety errors fatal.
+    pub fn list_backups_report(&self) -> Result<BackupListing> {
+        checked_absolute(&self.backup_root)?;
+        let mut report = BackupListing::default();
+        if !self.backup_root.exists() {
+            return Ok(report);
+        }
         for dir in fs::read_dir(&self.backup_root)? {
             let dir = dir?;
             reject_link(&dir.path(), &fs::symlink_metadata(dir.path())?)?;
@@ -809,8 +831,16 @@ impl BackupManager {
                 continue;
             }
             let id = dir.file_name().to_string_lossy().to_string();
-            let (m, _) = Self::load_manifest(&id, &dir.path())?;
-            entries.push(BackupEntry {
+            // Preserve load_manifest's path-safety failures as fatal listing errors.
+            checked_absolute(&dir.path().join("manifest.json"))?;
+            let (m, _) = match Self::load_manifest(&id, &dir.path()) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    report.unreadable.push((id, error.to_string()));
+                    continue;
+                }
+            };
+            report.entries.push(BackupEntry {
                 id,
                 path: dir.path(),
                 source_path: m.source_path,
@@ -819,8 +849,10 @@ impl BackupManager {
                 size_bytes: m.size_bytes,
             });
         }
-        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        Ok(entries)
+        report
+            .entries
+            .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(report)
     }
 
     /// Prove that this invocation's exact complete backup is redundant with
@@ -1170,6 +1202,114 @@ mod tests {
         let list = mgr.list_backups().unwrap();
         assert_eq!(list.len(), 2);
         assert!(list[0].created_at >= list[1].created_at);
+    }
+
+    fn damaged_backup(root: &Path, id: &str) -> PathBuf {
+        let dir = root.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("manifest.json"), b"{").unwrap();
+        dir
+    }
+
+    #[test]
+    fn listing_keeps_readable_backups_and_reports_damaged_manifests() {
+        let game = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        fs::write(game.path().join("story.txt"), b"original").unwrap();
+        let mgr = BackupManager::new(backups.path().to_owned());
+        let valid = mgr.create_backup(game.path()).unwrap();
+        damaged_backup(backups.path(), "damaged");
+
+        let entries = mgr.list_backups().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, valid.id);
+        let report = mgr.list_backups_report().unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].id, valid.id);
+        assert_eq!(report.unreadable.len(), 1);
+        assert_eq!(report.unreadable[0].0, "damaged");
+        assert!(report.unreadable[0].1.contains("manifest.json"));
+        assert!(report.unreadable[0].1.contains("EOF"));
+    }
+
+    #[test]
+    fn listing_only_damaged_backups_is_an_error_naming_each_id() {
+        let backups = tempfile::tempdir().unwrap();
+        let mgr = BackupManager::new(backups.path().to_owned());
+        for (index, id) in ["damaged-first", "damaged-second"].iter().enumerate() {
+            damaged_backup(backups.path(), id);
+            let report = mgr.list_backups_report().unwrap();
+            assert!(report.entries.is_empty());
+            assert_eq!(report.unreadable.len(), index + 1);
+            let error = mgr.list_backups().unwrap_err().to_string();
+            for (unreadable_id, _) in &report.unreadable {
+                assert!(error.contains(unreadable_id), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn pruning_keeps_damaged_backups() {
+        let game = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        fs::write(game.path().join("story.txt"), b"original").unwrap();
+        let mgr = BackupManager::new(backups.path().to_owned());
+        let valid = mgr.create_backup(game.path()).unwrap();
+        let damaged = damaged_backup(backups.path(), "damaged");
+        fs::write(damaged.join("original.txt"), b"recoverable original").unwrap();
+
+        assert_eq!(mgr.delete_old_backups(0).unwrap(), 1);
+        assert!(!valid.path.exists());
+        assert!(damaged.is_dir());
+        assert_eq!(fs::read(damaged.join("manifest.json")).unwrap(), b"{");
+        assert_eq!(
+            fs::read(damaged.join("original.txt")).unwrap(),
+            b"recoverable original"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn listing_rejects_linked_backup_directories_and_manifests() {
+        for manifest_link in [false, true] {
+            let game = tempfile::tempdir().unwrap();
+            let backups = tempfile::tempdir().unwrap();
+            fs::write(game.path().join("story.txt"), b"original").unwrap();
+            let mgr = BackupManager::new(backups.path().to_owned());
+            let valid = mgr.create_backup(game.path()).unwrap();
+            let linked = backups.path().join("linked");
+            let (target, link) = if manifest_link {
+                fs::create_dir(&linked).unwrap();
+                (
+                    valid.path.join("manifest.json"),
+                    linked.join("manifest.json"),
+                )
+            } else {
+                (valid.path.clone(), linked)
+            };
+            #[cfg(windows)]
+            let result = if manifest_link {
+                std::os::windows::fs::symlink_file(&target, &link)
+            } else {
+                std::os::windows::fs::symlink_dir(&target, &link)
+            };
+            #[cfg(unix)]
+            let result = std::os::unix::fs::symlink(&target, &link);
+            if let Err(error) = result {
+                eprintln!("skipping link-safety test: cannot create link: {error}");
+                return;
+            }
+            let error = mgr.list_backups().unwrap_err().to_string();
+            assert!(
+                error.contains("unsupported link/reparse/special path"),
+                "{error}"
+            );
+            let error = mgr.list_backups_report().unwrap_err().to_string();
+            assert!(
+                error.contains("unsupported link/reparse/special path"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
