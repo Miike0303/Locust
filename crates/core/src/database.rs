@@ -33,6 +33,11 @@ fn lock_connection(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ImportApplyReport {
     pub imported: usize,
+    /// Identical translations, also included in `imported`.
+    #[serde(default)]
+    pub unchanged: usize,
+    #[serde(default)]
+    pub kept_existing: usize,
     pub stale_sources: usize,
     pub unknown_ids: usize,
 }
@@ -988,6 +993,20 @@ impl Database {
         &self,
         updates: Vec<crate::export::ImportedTranslation>,
     ) -> Result<ImportApplyReport> {
+        self.save_imported_translations_batch_with(updates, false)
+            .await
+    }
+
+    /// Identical translations on non-pending rows count as imported without changes.
+    /// Pending rows are written to confirm their translation, even if identical.
+    /// With `keep_existing`, differing nonblank translations are also preserved.
+    pub async fn save_imported_translations_batch_with(
+        &self,
+        updates: Vec<crate::export::ImportedTranslation>,
+        keep_existing: bool,
+    ) -> Result<ImportApplyReport> {
+        use rusqlite::OptionalExtension;
+
         let mut seen = std::collections::HashSet::new();
         for entry in &updates {
             if !seen.insert(&entry.id) {
@@ -1010,14 +1029,30 @@ impl Database {
                 let mut write = tx.prepare_cached(
                     "UPDATE strings SET translation = ?1, status = 'translated', provider_used = 'import', translated_at = ?2, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?3 AND source = ?4",
                 )?;
-                let mut exists = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM strings WHERE id = ?1)")?;
+                let mut current = tx.prepare_cached("SELECT source, translation, status FROM strings WHERE id = ?1")?;
                 for entry in updates {
+                    let Some((source, translation, status)) = current.query_row(params![entry.id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?))
+                    }).optional()? else {
+                        report.unknown_ids += 1;
+                        continue;
+                    };
+                    if source != entry.source {
+                        report.stale_sources += 1;
+                        continue;
+                    }
+                    let identical = translation.as_deref() == Some(entry.translation.as_str());
+                    if identical && status != "pending" {
+                        report.imported += 1;
+                        report.unchanged += 1;
+                        continue;
+                    }
+                    if keep_existing && !identical && translation.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+                        report.kept_existing += 1;
+                        continue;
+                    }
                     if write.execute(params![entry.translation, now, entry.id, entry.source, !entry.translation.trim().is_empty()])? > 0 {
                         report.imported += 1;
-                    } else if exists.query_row(params![entry.id], |row| row.get::<_, bool>(0))? {
-                        report.stale_sources += 1;
-                    } else {
-                        report.unknown_ids += 1;
                     }
                 }
             }
@@ -3537,6 +3572,225 @@ mod tests {
         let again = db.get_entry(id).unwrap().unwrap();
         assert_eq!(again.translation.as_deref(), Some("Hola alli"));
         assert_eq!(again.status, StringStatus::Translated);
+    }
+
+    #[tokio::test]
+    async fn import_identical_translation_keeps_approval() {
+        use crate::export::ImportedTranslation;
+
+        for keep_existing in [false, true] {
+            for status in [
+                StringStatus::Approved,
+                StringStatus::Reviewed,
+                StringStatus::Translated,
+            ] {
+                let db = Database::open_in_memory().unwrap();
+                let mut entry = reviewed_import_entry("same", "Hello");
+                entry.status = status;
+                db.save_entries(&[entry]).unwrap();
+                let before = db.get_entry("same").unwrap().unwrap();
+                let updates = vec![ImportedTranslation {
+                    id: before.id.clone(),
+                    source: before.source.clone(),
+                    translation: before.translation.clone().unwrap(),
+                }];
+                let report = if keep_existing {
+                    db.save_imported_translations_batch_with(updates, true)
+                        .await
+                } else {
+                    db.save_imported_translations_batch(updates).await
+                }
+                .unwrap();
+
+                let after = db.get_entry("same").unwrap().unwrap();
+                assert_eq!(after.status, before.status);
+                assert_eq!(after.provider_used, before.provider_used);
+                assert_eq!(after.translated_at, before.translated_at);
+                assert_eq!(after.reviewed_at, before.reviewed_at);
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                assert_eq!(report.imported, 1);
+                assert_eq!(report.unchanged, 1);
+                assert_eq!(report.kept_existing, 0);
+                assert_eq!(report.stale_sources, 0);
+                assert_eq!(report.unknown_ids, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn import_identical_translation_confirms_pending_stale_row() {
+        use crate::export::ImportedTranslation;
+
+        for keep_existing in [false, true] {
+            let db = Database::open_in_memory().unwrap();
+            let mut entry = make_entry("stale", "Hello");
+            entry.translation = Some("Hola".into());
+            entry.status = StringStatus::Translated;
+            entry.provider_used = Some("original-provider".into());
+            entry.translated_at = Some("2025-01-01T00:00:00Z".parse().unwrap());
+            db.save_entries(&[entry]).unwrap();
+            let stats = db
+                .merge_entries(&[make_entry("stale", "Hello again")])
+                .unwrap();
+            assert_eq!(stats.stale_source_reset, 1);
+            let before = db.get_entry("stale").unwrap().unwrap();
+            assert_eq!(before.status, StringStatus::Pending);
+            assert_eq!(before.translation.as_deref(), Some("Hola"));
+            assert!(before.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY));
+
+            let report = db
+                .save_imported_translations_batch_with(
+                    vec![ImportedTranslation {
+                        id: before.id.clone(),
+                        source: before.source.clone(),
+                        translation: "Hola".into(),
+                    }],
+                    keep_existing,
+                )
+                .await
+                .unwrap();
+
+            let after = db.get_entry("stale").unwrap().unwrap();
+            assert_eq!(after.translation.as_deref(), Some("Hola"));
+            assert_eq!(after.status, StringStatus::Translated);
+            assert_eq!(after.provider_used.as_deref(), Some("import"));
+            assert!(after.translated_at.unwrap() > before.translated_at.unwrap());
+            assert!(!after.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY));
+            assert_eq!(report.imported, 1);
+            assert_eq!(report.unchanged, 0);
+            assert_eq!(report.kept_existing, 0);
+            assert_eq!(report.stale_sources, 0);
+            assert_eq!(report.unknown_ids, 0);
+        }
+    }
+
+    fn reviewed_import_entry(id: &str, source: &str) -> StringEntry {
+        let mut entry = make_entry(id, source);
+        entry.translation = Some("Hola".into());
+        entry.status = StringStatus::Approved;
+        entry.provider_used = Some("reviewed-provider".into());
+        entry.translated_at = Some("2025-01-01T00:00:00Z".parse().unwrap());
+        entry.reviewed_at = Some("2025-01-02T00:00:00Z".parse().unwrap());
+        entry.metadata.insert(
+            STALE_TRANSLATION_METADATA_KEY.into(),
+            serde_json::json!("preserve on no-op"),
+        );
+        entry.metadata.insert(
+            INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("日本語"),
+        );
+        entry
+    }
+
+    #[tokio::test]
+    async fn import_keep_existing_preserves_translated_and_fills_empty() {
+        use crate::export::ImportedTranslation;
+
+        for empty_translation in [None, Some(""), Some(" \t\r\n\u{2003}")] {
+            let db = Database::open_in_memory().unwrap();
+            let approved = reviewed_import_entry("approved", "Hello");
+            let stale = reviewed_import_entry("stale", "Current source");
+            let mut empty = make_entry("empty", "Goodbye");
+            empty.translation = empty_translation.map(str::to_owned);
+            db.save_entries(&[approved.clone(), empty, stale.clone()])
+                .unwrap();
+            let report = db
+                .save_imported_translations_batch_with(
+                    vec![
+                        ImportedTranslation {
+                            id: "approved".into(),
+                            source: "Hello".into(),
+                            translation: "Collaborator correction".into(),
+                        },
+                        ImportedTranslation {
+                            id: "empty".into(),
+                            source: "Goodbye".into(),
+                            translation: "Adiós".into(),
+                        },
+                        ImportedTranslation {
+                            id: "stale".into(),
+                            source: "Old source".into(),
+                            // Source identity takes precedence even for identical text.
+                            translation: "Hola".into(),
+                        },
+                        ImportedTranslation {
+                            id: "unknown".into(),
+                            source: "Unknown".into(),
+                            translation: "Missing".into(),
+                        },
+                    ],
+                    true,
+                )
+                .await
+                .unwrap();
+
+            for before in [approved, stale] {
+                assert_eq!(
+                    serde_json::to_value(db.get_entry(&before.id).unwrap().unwrap()).unwrap(),
+                    serde_json::to_value(before).unwrap()
+                );
+            }
+            let filled = db.get_entry("empty").unwrap().unwrap();
+            assert_eq!(filled.translation.as_deref(), Some("Adiós"));
+            assert_eq!(filled.status, StringStatus::Translated);
+            assert_eq!(filled.provider_used.as_deref(), Some("import"));
+            assert!(filled.translated_at.is_some());
+            assert!(filled.reviewed_at.is_none());
+            assert!(db.get_entry("unknown").unwrap().is_none());
+            assert_eq!(report.imported, 1);
+            assert_eq!(report.unchanged, 0);
+            assert_eq!(report.kept_existing, 1);
+            assert_eq!(report.stale_sources, 1);
+            assert_eq!(report.unknown_ids, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn import_without_keep_existing_overwrites_differing_translation() {
+        use crate::export::ImportedTranslation;
+
+        let db = Database::open_in_memory().unwrap();
+        let before = reviewed_import_entry("approved", "Hello");
+        db.save_entries(std::slice::from_ref(&before)).unwrap();
+        let report = db
+            .save_imported_translations_batch(vec![ImportedTranslation {
+                id: before.id.clone(),
+                source: before.source.clone(),
+                // Whitespace differences are not byte-identical.
+                translation: "Hola ".into(),
+            }])
+            .await
+            .unwrap();
+
+        let after = db.get_entry(&before.id).unwrap().unwrap();
+        assert_eq!(after.translation.as_deref(), Some("Hola "));
+        assert_eq!(after.status, StringStatus::Translated);
+        assert_eq!(after.provider_used.as_deref(), Some("import"));
+        assert!(after.translated_at.unwrap() > before.translated_at.unwrap());
+        assert_eq!(after.reviewed_at, before.reviewed_at);
+        assert!(!after.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY));
+        assert_eq!(
+            after.metadata.get(INJECTION_SOURCE_METADATA_KEY),
+            before.metadata.get(INJECTION_SOURCE_METADATA_KEY)
+        );
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.unchanged, 0);
+        assert_eq!(report.kept_existing, 0);
+        assert_eq!(report.stale_sources, 0);
+        assert_eq!(report.unknown_ids, 0);
+    }
+
+    #[test]
+    fn import_report_defaults_new_counters_for_older_json() {
+        let report: ImportApplyReport = serde_json::from_value(serde_json::json!({
+            "imported": 1, "stale_sources": 2, "unknown_ids": 3
+        }))
+        .unwrap();
+        assert_eq!(report.unchanged, 0);
+        assert_eq!(report.kept_existing, 0);
     }
 
     #[tokio::test]

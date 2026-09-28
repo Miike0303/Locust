@@ -291,6 +291,9 @@ enum Commands {
         lang: String,
         #[arg(short, long)]
         input: PathBuf,
+        /// Preserve existing nonblank translations
+        #[arg(long)]
+        keep_existing: bool,
     },
     /// Start the web server
     Server {
@@ -498,7 +501,8 @@ async fn main() -> anyhow::Result<()> {
             format,
             lang,
             input,
-        } => cmd_import(project, format, lang, input).await?,
+            keep_existing,
+        } => cmd_import(project, format, lang, input, keep_existing).await?,
         Commands::Server { port } => cmd_server(port.unwrap_or(7842)).await?,
     }
 
@@ -2059,6 +2063,7 @@ async fn cmd_import(
     format: String,
     _lang: String,
     input: PathBuf,
+    keep_existing: bool,
 ) -> anyhow::Result<()> {
     let db = Database::open(&project)?;
     let content = std::fs::read_to_string(&input)?;
@@ -2075,15 +2080,29 @@ async fn cmd_import(
         _ => anyhow::bail!("unsupported import format: {}. Use 'po' or 'xliff'", format),
     };
     let attempted = updates.len();
-    let report = db.save_imported_translations_batch(updates).await?;
-    let (imported, skipped) =
-        export::import_counts_after_batch(pre_skipped, attempted, report.imported);
+    let report = db
+        .save_imported_translations_batch_with(updates, keep_existing)
+        .await?;
+    let (imported, skipped) = export::import_counts_after_batch(
+        pre_skipped,
+        attempted - report.kept_existing,
+        report.imported,
+    );
 
     println!(
         "Imported {} translations from {}",
         imported,
         input.display()
     );
+    if report.unchanged > 0 {
+        println!("Unchanged {} (already identical)", report.unchanged);
+    }
+    if report.kept_existing > 0 {
+        println!(
+            "Kept {} existing translation(s) (--keep-existing)",
+            report.kept_existing
+        );
+    }
     if skipped > 0 {
         println!("Skipped {skipped}: {} outdated source(s), {} unknown id(s), {pre_skipped} empty/missing entries", report.stale_sources, report.unknown_ids);
     }
