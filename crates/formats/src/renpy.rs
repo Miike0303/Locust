@@ -1,5 +1,5 @@
 use locust_core::backup::RevisionOriginal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read as IoRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -535,6 +535,7 @@ impl RenPyPlugin {
             });
         }
 
+        let names: HashSet<&str> = index.iter().map(|(name, _, _)| name.as_str()).collect();
         let mut extracted_files = Vec::new();
         for (name, offset, length) in &index {
             // Only extract script files
@@ -544,11 +545,8 @@ impl RenPyPlugin {
             // Prefer .rpy source over .rpyc — if both exist, use the source.
             // Lone .rpyc files (how shipped games are packed) are extracted too
             // and mined for strings via the pickle harvester.
-            if name.ends_with(".rpyc") {
-                let rpy_name = name.strip_suffix("c").unwrap();
-                if index.iter().any(|(n, _, _)| n == rpy_name) {
-                    continue;
-                }
+            if Self::has_rpy_twin(&names, name) {
+                continue;
             }
 
             file.seek(SeekFrom::Start(*offset))?;
@@ -565,6 +563,10 @@ impl RenPyPlugin {
         }
 
         Ok(extracted_files)
+    }
+
+    fn has_rpy_twin(names: &HashSet<&str>, rpyc: &str) -> bool {
+        rpyc.ends_with(".rpyc") && names.contains(&rpyc[..rpyc.len() - 1])
     }
 
     fn extract_file(file_path: &Path) -> Result<Vec<StringEntry>> {
@@ -3042,6 +3044,122 @@ mod tests {
 
     fn tiny_rpyc(strings: &[&str]) -> Vec<u8> {
         wrap_pickle_as_rpyc(&tiny_pickle(strings))
+    }
+
+    /// Multi-member version of the protocol-2 RPA fixture in
+    /// tests/renpy_ui_injection.rs, preserving the supplied index order.
+    fn build_rpa(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        const KEY: i64 = 0x42424242;
+        let placeholder = format!("RPA-3.0 {:016x} {:08x}\n", 0u64, KEY);
+        let mut archive = placeholder.into_bytes();
+        let mut pickle = vec![0x80, 0x02, b'}', b'q', 0, b'('];
+        for (name, content) in files {
+            pickle.push(b'X'); // BINUNICODE
+            pickle.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            pickle.extend_from_slice(name.as_bytes());
+            // Memo slots can be reused: no member refers to an earlier one.
+            pickle.extend_from_slice(&[b'q', 1, b']', b'q', 2]);
+            let offset = archive.len() as i64 ^ KEY;
+            let size = ((64 - (offset as u64).leading_zeros()) / 8 + 1) as usize;
+            pickle.extend_from_slice(&[0x8a, size as u8]); // LONG1
+            pickle.extend_from_slice(&offset.to_le_bytes()[..size]);
+            pickle.push(b'J'); // BININT
+            pickle.extend_from_slice(&((content.len() as i64 ^ KEY) as i32).to_le_bytes());
+            // Empty prefix, BINPUT, TUPLE3, APPEND.
+            pickle.extend_from_slice(&[b'U', 0, b'q', 3, 0x87, b'a']);
+            archive.extend_from_slice(content);
+        }
+        pickle.extend_from_slice(b"u."); // SETITEMS, STOP
+        let header = format!("RPA-3.0 {:016x} {:08x}\n", archive.len(), KEY);
+        archive[..header.len()].copy_from_slice(header.as_bytes());
+        archive.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(&pickle, 6));
+        archive
+    }
+
+    #[test]
+    fn rpa_rpyc_twin_lookup_uses_the_name_set() {
+        let mut names = HashSet::from([
+            "scripts/exact.rpy",
+            "scripts/case.rpy",
+            "other/path.rpy",
+            "scripts/extension.RPY",
+            "scripts/café.rpy",
+        ]);
+        for (name, expected) in [
+            ("scripts/exact.rpyc", true),
+            ("scripts/Case.rpyc", false),
+            ("scripts/path.rpyc", false),
+            ("scripts/extension.rpyc", false),
+            ("scripts/lone.rpyc", false),
+            ("scripts/café.rpyc", true),
+            ("scripts/exact.rpy", false),
+            ("", false),
+        ] {
+            assert_eq!(RenPyPlugin::has_rpy_twin(&names, name), expected, "{name}");
+        }
+        names.remove("scripts/exact.rpy");
+        assert!(!RenPyPlugin::has_rpy_twin(&names, "scripts/exact.rpyc"));
+        names.insert("scripts/lone.rpy");
+        assert!(RenPyPlugin::has_rpy_twin(&names, "scripts/lone.rpyc"));
+    }
+
+    #[test]
+    fn rpa_rpyc_twins_require_exact_names_in_either_index_order() {
+        let mut files = vec![
+            (
+                "scripts/exact.rpyc",
+                tiny_rpyc(&["Skip this compiled twin!"]),
+            ),
+            ("images/title.png", b"image bytes".to_vec()),
+            ("scripts/Case.rpyc", tiny_rpyc(&["Keep the case mismatch!"])),
+            ("scripts/path.rpyc", tiny_rpyc(&["Keep the path mismatch!"])),
+            ("scripts/lone.rpyc", tiny_rpyc(&["Keep the lone script!"])),
+            ("scripts/case.rpy", b"\"Case source!\"\n".to_vec()),
+            ("other/path.rpy", b"\"Other path source!\"\n".to_vec()),
+            ("scripts/exact.rpy", b"\"Exact source!\"\n".to_vec()),
+            ("audio/theme.ogg", b"audio bytes".to_vec()),
+        ];
+        let mut expected = vec![
+            ("scripts/Case.rpyc", "Keep the case mismatch!"),
+            ("scripts/path.rpyc", "Keep the path mismatch!"),
+            ("scripts/lone.rpyc", "Keep the lone script!"),
+            ("scripts/case.rpy", "Case source!"),
+            ("other/path.rpy", "Other path source!"),
+            ("scripts/exact.rpy", "Exact source!"),
+        ];
+        for reverse in [false, true] {
+            if reverse {
+                files.reverse();
+                expected.reverse();
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("scripts.rpa");
+            let output = dir.path().join("extracted");
+            fs::write(&archive, build_rpa(&files)).unwrap();
+
+            let extracted = RenPyPlugin::extract_rpa(&archive, &output).unwrap();
+            assert_eq!(
+                extracted,
+                expected
+                    .iter()
+                    .map(|(name, _)| output.join(name))
+                    .collect::<Vec<_>>()
+            );
+            assert!(!output.join("scripts/exact.rpyc").exists());
+            assert!(!output.join("images/title.png").exists());
+            assert!(!output.join("audio/theme.ogg").exists());
+            for (name, _) in &expected {
+                let (_, bytes) = files.iter().find(|(member, _)| member == name).unwrap();
+                assert_eq!(fs::read(output.join(name)).unwrap(), *bytes);
+            }
+
+            let entries = RenPyPlugin::new().extract(&archive).unwrap();
+            assert_eq!(entries.len(), expected.len());
+            for (entry, (_, source)) in entries.iter().zip(&expected) {
+                assert_eq!(entry.source, *source);
+                assert_eq!(entry.file_path, archive);
+            }
+        }
     }
 
     #[test]
