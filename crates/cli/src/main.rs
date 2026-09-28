@@ -1282,7 +1282,11 @@ fn cmd_extract(
     });
 
     let db = Database::open(&db_path)?;
-    db.save_entries(&entries)?;
+    let merge = if extraction_warnings.is_empty() {
+        db.merge_entries(&entries)?
+    } else {
+        db.merge_entries_preserving_missing(&entries)?
+    };
     db.set_project_metadata(
         "extraction_warnings",
         &serde_json::json!(extraction_warnings),
@@ -1293,6 +1297,17 @@ fn cmd_extract(
     table.add_row(vec!["Format", plugin.name()]);
     table.add_row(vec!["Strings extracted", &total.to_string()]);
     table.add_row(vec!["Output file", &db_path.display().to_string()]);
+    table.add_row(vec!["Added", &merge.added.to_string()]);
+    table.add_row(vec!["Updated", &merge.updated.to_string()]);
+    table.add_row(vec![
+        "Source changed (reset to pending)",
+        &merge.stale_source_reset.to_string(),
+    ]);
+    table.add_row(vec!["Removed", &merge.removed.to_string()]);
+    table.add_row(vec![
+        "Translations preserved",
+        &merge.preserved_translations.to_string(),
+    ]);
     println!("{table}");
 
     Ok(())
