@@ -284,6 +284,10 @@ enum Commands {
         /// Replace an existing catalog (never the project database or its sidecars)
         #[arg(long)]
         overwrite: bool,
+        /// Export only these states (repeat to combine): pending, translated,
+        /// reviewed, approved, error
+        #[arg(long, value_name = "STATE")]
+        status: Vec<String>,
     },
     /// Import translations from PO or XLIFF
     Import {
@@ -502,7 +506,8 @@ async fn main() -> anyhow::Result<()> {
             lang,
             output,
             overwrite,
-        } => cmd_export(&config, project, format, lang, output, overwrite)?,
+            status,
+        } => cmd_export(&config, project, format, lang, output, overwrite, status)?,
         Commands::Import {
             project,
             format,
@@ -2059,7 +2064,10 @@ fn cmd_export(
     lang: String,
     output: PathBuf,
     overwrite: bool,
+    status: Vec<String>,
 ) -> anyhow::Result<()> {
+    use locust_core::models::StringStatus;
+
     export::check_export_destination(&output, &project)?;
     if output.try_exists()? && !overwrite {
         anyhow::bail!(
@@ -2067,8 +2075,25 @@ fn cmd_export(
             output.display()
         );
     }
+    let statuses = status
+        .iter()
+        .map(|state| {
+            state.parse::<StringStatus>().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid export status '{state}'; valid values: pending, translated, reviewed, approved, error"
+                )
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let db = Database::open(&project)?;
-    let entries = db.get_entries(&EntryFilter::default())?;
+    let mut entries = db.get_entries(&EntryFilter::default())?;
+    // Retain the database's ID order for any union of states, including repeats.
+    if !statuses.is_empty() {
+        entries.retain(|entry| statuses.contains(&entry.status));
+    }
+    if entries.is_empty() {
+        anyhow::bail!("no entries to export");
+    }
 
     // Prefer the source language of the latest translation run for this
     // target — config.default_source_lang is a user preference default, not
