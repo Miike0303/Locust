@@ -16,8 +16,8 @@ use super::rollback::{rollback_under_lock, RollbackOptions};
 use super::store::{PatchStatus, PatchStore};
 use super::stream::StagingDir;
 use super::verify::{
-    classify_files, open_archive, scan_zip_entries, verify_scanned, VerificationOutcome,
-    VerificationReport, ZipEntryMeta,
+    classify_files_with_hashes, open_archive, scan_zip_entries, verify_scanned,
+    VerificationOutcome, VerificationReport, ZipEntryMeta,
 };
 
 /// Staged ZIP content in an operation-owned `.locust-stage-*/` directory.
@@ -387,31 +387,37 @@ where
     let zip_files = &prepared.files;
 
     // Build plan.
-    let (mut replaced, mut added, mut user_edits) = if let Some(ref m) = manifest {
-        classify_files(game_root, &m.files, opts.force)?
-    } else {
-        // Legacy: every existing path replaced, absent = added.
-        let mut replaced = Vec::new();
-        let mut added = Vec::new();
-        for (path, staged) in zip_files {
-            let target = game_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            let patched = staged.sha256.clone();
-            if target.is_file() {
-                let orig = sha256_path(&target)?;
-                replaced.push(ReceiptReplaced {
-                    path: path.clone(),
-                    original_sha256: Some(orig),
-                    patched_sha256: patched,
-                });
-            } else {
-                added.push(ReceiptAdded {
-                    path: path.clone(),
-                    patched_sha256: patched,
-                });
+    let (mut replaced, mut added, mut user_edits, mut current_hashes) =
+        if let Some(ref m) = manifest {
+            classify_files_with_hashes(game_root, &m.files, opts.force)?
+        } else {
+            // Legacy: every existing path replaced, absent = added.
+            let mut replaced = Vec::new();
+            let mut added = Vec::new();
+            for (path, staged) in zip_files {
+                let target = game_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let patched = staged.sha256.clone();
+                if target.is_file() {
+                    let orig = sha256_path(&target)?;
+                    replaced.push(ReceiptReplaced {
+                        path: path.clone(),
+                        original_sha256: Some(orig),
+                        patched_sha256: patched,
+                    });
+                } else {
+                    added.push(ReceiptAdded {
+                        path: path.clone(),
+                        patched_sha256: patched,
+                    });
+                }
             }
-        }
-        (replaced, added, Vec::new())
-    };
+            (
+                replaced,
+                added,
+                Vec::new(),
+                std::collections::HashMap::new(),
+            )
+        };
 
     // R1 carry-forward: prior receipt classifications win per path on reapply.
     if let Some(ref prior) = prior_receipt {
@@ -435,7 +441,10 @@ where
                 // Check user edit.
                 let target = game_root.join(r.path.replace('/', std::path::MAIN_SEPARATOR_STR));
                 if target.is_file() {
-                    let h = sha256_path(&target)?;
+                    let h = match current_hashes.remove(&r.path) {
+                        Some(hash) => hash,
+                        None => sha256_path(&target)?,
+                    };
                     if h != pa.patched_sha256 {
                         user_edits.push(r.path.clone());
                     }
@@ -465,7 +474,10 @@ where
                 if let Some(pa) = prior_added.get(&a.path) {
                     let target = game_root.join(a.path.replace('/', std::path::MAIN_SEPARATOR_STR));
                     if target.is_file() {
-                        let h = sha256_path(&target)?;
+                        let h = match current_hashes.remove(&a.path) {
+                            Some(hash) => hash,
+                            None => sha256_path(&target)?,
+                        };
                         if h != pa.patched_sha256 {
                             user_edits.push(a.path.clone());
                         }
@@ -753,4 +765,132 @@ fn prepare_backup_slot(
          refusing to discard (R2). Manual recovery required."
             .into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::{sha256_hex, SHA256_PATH_CALLS};
+    use crate::patch::manifest::PatchFileEntry;
+    use std::io::Write;
+
+    fn write_added_patch(zip_path: &Path, manifest: &PatchManifest, content: &[u8]) {
+        let mut zip = zip::ZipWriter::new(fs::File::create(zip_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(PatchManifest::FILENAME, options).unwrap();
+        zip.write_all(&serde_json::to_vec(manifest).unwrap())
+            .unwrap();
+        zip.start_file(&manifest.files[0].path, options).unwrap();
+        zip.write_all(content).unwrap();
+        zip.finish().unwrap();
+    }
+
+    /// Exercise the public apply path, including its single GameLock and receipt writes.
+    fn forced_reapply_hashes(edited: bool, incoming_original: bool) -> Option<usize> {
+        let game = tempfile::tempdir().unwrap();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let zip_path = archive_dir.path().join("patch.zip");
+        let path = "Content/Paks/translation.pak";
+        let content = b"patched pak";
+        let mut manifest = PatchManifest {
+            schema_version: PatchManifest::SCHEMA_VERSION,
+            patch_id: "reapply-hash-fixture".into(),
+            game_name: "fixture".into(),
+            engine: "unreal".into(),
+            language: "es".into(),
+            patch_version: "1.0.0".into(),
+            generator_version: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            files: vec![PatchFileEntry {
+                path: path.into(),
+                patched_sha256: sha256_hex(content),
+                size: content.len() as u64,
+                original_sha256: None,
+            }],
+        };
+        write_added_patch(&zip_path, &manifest, content);
+        apply(
+            game.path(),
+            &zip_path,
+            ApplyOptions {
+                confirm_legacy: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        if edited {
+            fs::write(game.path().join(path), b"user edit").unwrap();
+        }
+        if incoming_original {
+            // Same version and file set, but classification now skips this hash.
+            manifest.files[0].original_sha256 = Some(sha256_hex(b"original pak"));
+            write_added_patch(&zip_path, &manifest, content);
+        }
+
+        SHA256_PATH_CALLS.with(|calls| calls.set(Some(0)));
+        let result = apply(
+            game.path(),
+            &zip_path,
+            ApplyOptions {
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        );
+        let hashes = SHA256_PATH_CALLS.with(|calls| calls.replace(None));
+        let report = result.unwrap();
+        assert_eq!(report.replaced, 0);
+        assert_eq!(report.added, 1);
+        assert_eq!(
+            report.user_edits_overwritten,
+            if edited { vec![path] } else { vec![] }
+        );
+        assert_eq!(fs::read(game.path().join(path)).unwrap(), content);
+
+        // Compare the entire written JSON with the pre-optimization receipt.
+        // The wall-clock timestamp is the only nondeterministic field.
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(PatchStore::new(game.path()).receipt_path()).unwrap())
+                .unwrap();
+        chrono::DateTime::parse_from_rfc3339(receipt["applied_at"].as_str().unwrap()).unwrap();
+        receipt["applied_at"] = serde_json::json!("<timestamp>");
+        assert_eq!(
+            receipt,
+            serde_json::json!({
+                "schema_version": 1,
+                "patch_id": "reapply-hash-fixture",
+                "patch_version": "1.0.0",
+                "generator_version": "test",
+                "language": "es",
+                "engine": "unreal",
+                "applied_at": "<timestamp>",
+                "verification": if incoming_original { "strict" } else { "structural" },
+                "forced": true,
+                "baseline": "unverified",
+                "created_dirs": [],
+                "replaced": [],
+                "added": [{ "path": path, "patched_sha256": sha256_hex(content) }]
+            })
+        );
+        hashes
+    }
+
+    #[test]
+    fn forced_reapply_hashes_existing_added_file_once() {
+        assert_eq!(forced_reapply_hashes(false, false), Some(1));
+    }
+
+    #[test]
+    fn forced_reapply_hashes_edited_added_file_once() {
+        assert_eq!(forced_reapply_hashes(true, false), Some(1));
+    }
+
+    #[test]
+    fn forced_reapply_hashes_prior_added_path_with_incoming_original() {
+        for edited in [false, true] {
+            assert_eq!(forced_reapply_hashes(edited, true), Some(1));
+        }
+    }
 }

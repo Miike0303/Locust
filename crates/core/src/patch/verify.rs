@@ -806,10 +806,28 @@ pub fn classify_files(
     Vec<super::manifest::ReceiptAdded>,
     Vec<String>,
 )> {
+    let (replaced, added, warnings, _) = classify_files_with_hashes(game_root, files, force)?;
+    Ok((replaced, added, warnings))
+}
+
+type ClassifiedFilesWithHashes = (
+    Vec<super::manifest::ReceiptReplaced>,
+    Vec<super::manifest::ReceiptAdded>,
+    Vec<String>,
+    HashMap<String, String>,
+);
+
+/// Also retain hashes read during classification for reconciliation under the apply lock.
+pub(super) fn classify_files_with_hashes(
+    game_root: &Path,
+    files: &[PatchFileEntry],
+    force: bool,
+) -> Result<ClassifiedFilesWithHashes> {
     use super::manifest::{ReceiptAdded, ReceiptReplaced};
     let mut replaced = Vec::new();
     let mut added = Vec::new();
     let user_edit_warnings = Vec::new();
+    let mut current_hashes = HashMap::new();
 
     for f in files {
         let target = game_root.join(f.path.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -822,6 +840,7 @@ pub fn classify_files(
                 });
             } else {
                 let hash = sha256_path(&target)?;
+                current_hashes.insert(f.path.clone(), hash.clone());
                 if hash == f.patched_sha256 {
                     // already patched added file
                     added.push(ReceiptAdded {
@@ -856,8 +875,7 @@ pub fn classify_files(
             });
         }
     }
-    let _ = user_edit_warnings;
-    Ok((replaced, added, user_edit_warnings))
+    Ok((replaced, added, user_edit_warnings, current_hashes))
 }
 
 #[cfg(test)]
@@ -965,20 +983,81 @@ mod tests {
                 size: 7,
                 original_sha256: None,
             },
+            PatchFileEntry {
+                path: "missing-replaced.rpy".into(),
+                patched_sha256: crate::database::sha256_hex(b"translated"),
+                size: 10,
+                original_sha256: Some(crate::database::sha256_hex(b"original")),
+            },
+            PatchFileEntry {
+                path: "missing-added.rpy".into(),
+                patched_sha256: crate::database::sha256_hex(b"patched"),
+                size: 7,
+                original_sha256: None,
+            },
         ];
 
         crate::database::SHA256_PATH_CALLS.with(|calls| calls.set(Some(0)));
-        let (replaced, added, warnings) = classify_files(game.path(), &files, false).unwrap();
+        let (replaced, added, warnings, current_hashes) =
+            classify_files_with_hashes(game.path(), &files, false).unwrap();
         let hashes = crate::database::SHA256_PATH_CALLS.with(|calls| calls.replace(None));
 
-        assert_eq!(replaced.len(), 1);
-        assert_eq!(added.len(), 1);
+        assert_eq!(replaced.len(), 2);
+        assert_eq!(added.len(), 2);
         assert!(warnings.is_empty());
+        assert_eq!(
+            current_hashes,
+            HashMap::from([("added.rpy".into(), crate::database::sha256_hex(b"patched"))])
+        );
         assert_eq!(
             hashes,
             Some(1),
             "only the existing added path needs hashing"
         );
+        assert_eq!(
+            classify_files(game.path(), &files, false).unwrap(),
+            (replaced, added, warnings)
+        );
+    }
+
+    #[test]
+    fn classify_files_with_hashes_retains_forced_conflict_hash() {
+        let game = tempfile::tempdir().unwrap();
+        std::fs::create_dir(game.path().join("nested")).unwrap();
+        std::fs::write(game.path().join("nested/added.pak"), b"user edit").unwrap();
+        let files = [PatchFileEntry {
+            path: "nested/added.pak".into(),
+            patched_sha256: crate::database::sha256_hex(b"patched"),
+            size: 7,
+            original_sha256: None,
+        }];
+
+        let (replaced, added, warnings, current_hashes) =
+            classify_files_with_hashes(game.path(), &files, true).unwrap();
+        let edited_hash = crate::database::sha256_hex(b"user edit");
+        assert_eq!(
+            current_hashes,
+            HashMap::from([("nested/added.pak".into(), edited_hash.clone())])
+        );
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(
+            replaced[0].original_sha256.as_deref(),
+            Some(edited_hash.as_str())
+        );
+        assert!(added.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(
+            classify_files(game.path(), &files, true).unwrap(),
+            (replaced, added, warnings)
+        );
+        assert!(matches!(
+            classify_files(game.path(), &files, false),
+            Err(LocustError::PatchVerificationFailed(_))
+        ));
+        assert!(matches!(
+            classify_files_with_hashes(game.path(), &files, false),
+            Err(LocustError::PatchVerificationFailed(_))
+        ));
     }
 
     #[test]
