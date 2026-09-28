@@ -198,12 +198,14 @@ fn failure(message: impl Into<String>) -> LocustError {
 }
 
 fn reject_link(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-    let mut linked = metadata.file_type().is_symlink();
     #[cfg(windows)]
-    {
+    let reparse = {
         use std::os::windows::fs::MetadataExt;
-        linked |= metadata.file_attributes() & 0x400 != 0;
-    }
+        metadata.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let reparse = false;
+    let linked = metadata.file_type().is_symlink() || reparse;
     if linked || (!metadata.is_file() && !metadata.is_dir()) {
         return Err(failure(format!(
             "unsupported link/reparse/special path: {}",
