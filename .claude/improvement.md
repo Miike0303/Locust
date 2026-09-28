@@ -71,6 +71,12 @@ Owned by no lane; Claude applies these after the writers finish.
   - Codex researchers: `gpt-6-sol` with `-c model_reasoning_effort=high`.
   - The user tried and then declined `service_tier="fast"`; leave the default tier.
   - Loop cadence: 15-20 minute ticks (user, 2026-09-27).
+- **Codex Windows sandbox fails under heavy concurrency (2026-09-27).** With ~20 Codex sessions from other
+  projects (ThreeMaker, Runnked-backend, Fantasy Cut, MikeLibrary fleets) running at once, a cycle writer failed
+  with `windows sandbox failed: helper_unknown_error: apply deny-read ACLs`, and shells hung; it exits 0 with a
+  report saying nothing was done. Run at most ONE Codex session from this loop at a time when other fleets are busy,
+  grep every report/log for `sandbox failed`, and never kill Codex processes you did not start (check
+  `Win32_Process` parent and `-C <repo>` first). A trivial `codex exec ... "echo hello"` probe tells you if it recovered.
 - `bat`/`fd`/`eza` are not installed on this Windows host. Use `rg` and the Read tool.
 - Isolate every QA run with `LOCUST_DATA_DIR=<scratch>`. Without it the run uses
   the user's real profile, keys and global memory (`crates/core/src/config.rs:183`).
