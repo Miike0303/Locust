@@ -1161,29 +1161,37 @@ impl TranslationManager {
         let started_at = chrono::Utc::now().to_rfc3339();
         let lang_pair = format!("{}-{}", opts.source_lang, opts.target_lang);
 
-        // 3. Check translation memory for each entry
+        // 3. Look up memory in bulk, preserving entry order for saves and events.
         let mut remaining = Vec::new();
         if opts.use_memory {
-            for entry in translatable.drain(..) {
-                let hash = entry.source_hash();
-                if let Ok(Some(cached)) = self.db.lookup_memory(&hash, &lang_pair) {
-                    if !translation_fits_entry(&entry, &cached) {
+            let hashes: Vec<_> = translatable.iter().map(StringEntry::source_hash).collect();
+            // Lookup failures have always been cache misses, not run failures.
+            let memory = self
+                .db
+                .lookup_memory_batch(&hashes, &lang_pair)
+                .unwrap_or_default();
+            let mut updates = Vec::new();
+            let mut memory_events = Vec::new();
+            for (entry, hash) in translatable.drain(..).zip(hashes) {
+                if let Some(cached) = memory.get(&hash) {
+                    if !translation_fits_entry(&entry, cached) {
                         remaining.push(entry);
                         continue;
                     }
-                    self.db
-                        .save_translation_guarded(&entry, &cached, "memory")
-                        .await?;
-                    let _ = tx
-                        .send(ProgressEvent::StringTranslated {
-                            entry_id: entry.id.clone(),
-                            translation: cached,
-                        })
-                        .await;
-                    completed += 1;
+                    let guard = TranslationSaveGuard::from(&entry);
+                    updates.push((entry.id.clone(), cached.clone(), "memory".into(), guard));
+                    memory_events.push(ProgressEvent::StringTranslated {
+                        entry_id: entry.id,
+                        translation: cached.clone(),
+                    });
                 } else {
                     remaining.push(entry);
                 }
+            }
+            self.db.save_guarded_updates(updates).await?;
+            for event in memory_events {
+                let _ = tx.send(event).await;
+                completed += 1;
             }
         } else {
             remaining = translatable;
@@ -2350,12 +2358,14 @@ mod tests {
 
     struct MockProvider {
         call_count: AtomicUsize,
+        entry_ids: Mutex<Vec<String>>,
     }
 
     impl MockProvider {
         fn new() -> Self {
             Self {
                 call_count: AtomicUsize::new(0),
+                entry_ids: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2379,6 +2389,10 @@ mod tests {
             requests: &[TranslationRequest],
         ) -> Result<Vec<TranslationResult>> {
             self.call_count.fetch_add(requests.len(), Ordering::SeqCst);
+            self.entry_ids
+                .lock()
+                .unwrap()
+                .extend(requests.iter().map(|request| request.entry_id.clone()));
             Ok(requests
                 .iter()
                 .map(|r| TranslationResult {
@@ -2628,6 +2642,370 @@ mod tests {
         assert_eq!(provider_ref.call_count.load(Ordering::SeqCst), 4);
         let e0 = db.get_entry("e0").unwrap().unwrap();
         assert_eq!(e0.translation, Some("Cached translation".to_string()));
+    }
+
+    async fn memory_run_events(
+        mut rx: mpsc::Receiver<ProgressEvent>,
+    ) -> (Vec<(String, String)>, usize) {
+        let mut translated = Vec::new();
+        let mut completed = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ProgressEvent::StringTranslated {
+                    entry_id,
+                    translation,
+                } => {
+                    translated.push((entry_id, translation));
+                }
+                ProgressEvent::Completed {
+                    total_translated, ..
+                } => {
+                    completed = Some(total_translated);
+                }
+                ProgressEvent::Failed { error, .. } | ProgressEvent::BatchFailed { error, .. } => {
+                    panic!("unexpected translation failure: {error}");
+                }
+                _ => {}
+            }
+        }
+        (translated, completed.expect("run must complete"))
+    }
+
+    async fn check_memory_prepass_counts(hits: bool) {
+        let (db, glossary) = setup();
+        let entries = make_entries(2_000);
+        db.save_entries(&entries).unwrap();
+        if hits {
+            let items: Vec<_> = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.source_hash(),
+                        entry.source.clone(),
+                        format!("Cached {}", entry.id),
+                    )
+                })
+                .collect();
+            db.save_memory_batch(&items, "ja-en").await.unwrap();
+        }
+        let provider = Arc::new(MockProvider::new());
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+        let (tx, rx) = mpsc::channel(4_100);
+        crate::database::MEMORY_LOOKUP_QUERIES.with(|count| count.set(Some(0)));
+        crate::database::GUARDED_TRANSLATION_TRANSACTIONS.with(|count| count.set(Some(0)));
+        manager
+            .translate_entries(
+                entries.clone(),
+                TranslationOptions {
+                    batch_size: 2_000,
+                    max_batch_tokens: None,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "memory-prepass-counts".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let queries = crate::database::MEMORY_LOOKUP_QUERIES
+            .with(|count| count.replace(None))
+            .unwrap();
+        let transactions = crate::database::GUARDED_TRANSLATION_TRANSACTIONS
+            .with(|count| count.replace(None))
+            .unwrap();
+        assert!(
+            (1..=4).contains(&queries),
+            "2,000 memory lookups must use at most 4 queries, got {queries}"
+        );
+        assert_eq!(
+            transactions, 1,
+            "2,000 hits must share one guarded transaction"
+        );
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            if hits { 0 } else { 2_000 }
+        );
+        let (events, completed) = memory_run_events(rx).await;
+        assert_eq!(completed, 2_000);
+        assert_eq!(
+            db.get_translation_runs().unwrap()[0].strings_translated,
+            2_000
+        );
+        let expected: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                let translation = if hits {
+                    format!("Cached {}", entry.id)
+                } else {
+                    format!("en: {}", entry.source)
+                };
+                let saved = db.get_entry(&entry.id).unwrap().unwrap();
+                assert_eq!(saved.translation.as_deref(), Some(translation.as_str()));
+                assert_eq!(
+                    saved.provider_used.as_deref(),
+                    Some(if hits { "memory" } else { "mock" })
+                );
+                assert_eq!(saved.status, StringStatus::Translated);
+                (entry.id.clone(), translation)
+            })
+            .collect();
+        assert_eq!(events, expected);
+    }
+
+    #[tokio::test]
+    async fn memory_prepass_2000_misses_use_at_most_four_queries() {
+        check_memory_prepass_counts(false).await;
+    }
+
+    #[tokio::test]
+    async fn memory_prepass_2000_hits_use_one_transaction() {
+        check_memory_prepass_counts(true).await;
+    }
+
+    #[tokio::test]
+    async fn memory_prepass_preserves_mixed_entry_and_event_order() {
+        let (db, glossary) = setup();
+        let mut entries = make_entries(7);
+        for (entry, id) in entries.iter_mut().zip(["z", "b", "y", "a", "x", "c", "w"]) {
+            entry.id = id.into();
+        }
+        entries[2].source = entries[0].source.clone();
+        entries[3].source = "Hello [name]".into();
+        db.save_entries(&entries).unwrap();
+        for (index, translation) in [
+            (0, "Cached zero"),
+            (3, "Missing placeholder"),
+            (4, "Cached four"),
+            (6, "   "),
+        ] {
+            db.save_memory(
+                &entries[index].source_hash(),
+                &entries[index].source,
+                translation,
+                "ja-en",
+            )
+            .await
+            .unwrap();
+        }
+        let provider = Arc::new(MockProvider::new());
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+        let (tx, rx) = mpsc::channel(100);
+        manager
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "memory-mixed".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // Written-out per-entry outcome: duplicate y hits too; invalid a/w stay
+        // with misses b/c, in input order, when passed to the provider.
+        assert_eq!(*provider.entry_ids.lock().unwrap(), ["b", "a", "c", "w"]);
+        let expected = [
+            ("z", "Cached zero", "memory"),
+            ("y", "Cached zero", "memory"),
+            ("x", "Cached four", "memory"),
+            ("b", "en: Source 1", "mock"),
+            ("a", "en: Hello [name]", "mock"),
+            ("c", "en: Source 5", "mock"),
+            ("w", "en: Source 6", "mock"),
+        ];
+        for (id, translation, provider) in expected {
+            let saved = db.get_entry(id).unwrap().unwrap();
+            assert_eq!(saved.translation.as_deref(), Some(translation));
+            assert_eq!(saved.provider_used.as_deref(), Some(provider));
+            assert_eq!(saved.status, StringStatus::Translated);
+        }
+        let (events, completed) = memory_run_events(rx).await;
+        assert_eq!(completed, 7);
+        assert_eq!(
+            events,
+            expected
+                .into_iter()
+                .map(|(id, text, _)| (id.into(), text.into()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_prepass_lookup_error_discards_earlier_chunks_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory-error.db");
+        let db = Arc::new(Database::open(&path).unwrap());
+        let entries = make_entries(501);
+        db.save_entries(&entries).unwrap();
+        let items: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.source_hash(), entry.source.clone(), "Cached".into()))
+            .collect();
+        db.save_memory_batch(&items, "ja-en").await.unwrap();
+        // SQLite accepts a blob in this TEXT column; decoding the last chunk
+        // as String must fail after the first 500 hits have been read.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE translation_memory SET translation = X'80' WHERE source_hash = ?1",
+                rusqlite::params![entries[500].source_hash()],
+            )
+            .unwrap();
+        let hashes: Vec<_> = entries.iter().map(StringEntry::source_hash).collect();
+        assert!(db.lookup_memory_batch(&hashes, "ja-en").is_err());
+        let glossary = Arc::new(Glossary::new(db.clone()));
+        let provider = Arc::new(MockProvider::new());
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+        let (tx, rx) = mpsc::channel(1_100);
+        manager
+            .translate_entries(
+                entries.clone(),
+                TranslationOptions {
+                    use_glossary: false,
+                    max_batch_tokens: None,
+                    batch_size: 501,
+                    ..Default::default()
+                },
+                tx,
+                "memory-lookup-error".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.entry_ids.lock().unwrap(),
+            entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>()
+        );
+        let (events, completed) = memory_run_events(rx).await;
+        assert_eq!(completed, 501);
+        assert_eq!(
+            events,
+            entries
+                .iter()
+                .map(|entry| (entry.id.clone(), format!("en: {}", entry.source)))
+                .collect::<Vec<_>>()
+        );
+        for entry in entries {
+            let saved = db.get_entry(&entry.id).unwrap().unwrap();
+            assert_eq!(saved.provider_used.as_deref(), Some("mock"));
+            assert_eq!(saved.translation, Some(format!("en: {}", entry.source)));
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_prepass_guard_conflict_errors_without_saves_or_events() {
+        for missing in [false, true] {
+            let (db, glossary) = setup();
+            let entries = make_entries(2);
+            db.save_entries(&entries).unwrap();
+            for entry in &entries {
+                db.save_memory(&entry.source_hash(), &entry.source, "Cached", "ja-en")
+                    .await
+                    .unwrap();
+            }
+            if missing {
+                db.clear_entries().unwrap();
+                db.save_entries(&entries[..1]).unwrap();
+            } else {
+                db.save_translation("e1", "User edit", "user")
+                    .await
+                    .unwrap();
+            }
+            let old_error = db
+                .save_translation_guarded(&entries[1], "Cached", "memory")
+                .await
+                .unwrap_err();
+            let provider = Arc::new(MockProvider::new());
+            let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+            let (tx, mut rx) = mpsc::channel(100);
+            let error = manager
+                .translate_entries(
+                    entries,
+                    TranslationOptions {
+                        use_glossary: false,
+                        ..Default::default()
+                    },
+                    tx,
+                    "memory-conflict".into(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), old_error.to_string());
+            assert!(error.to_string().contains("translation_conflict"));
+            assert!(db.get_entry("e0").unwrap().unwrap().translation.is_none());
+            let edited = db.get_entry("e1").unwrap();
+            if missing {
+                assert!(edited.is_none());
+            } else {
+                let edited = edited.unwrap();
+                assert_eq!(edited.translation.as_deref(), Some("User edit"));
+                assert_eq!(edited.provider_used.as_deref(), Some("user"));
+            }
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
+            while let Some(event) = rx.recv().await {
+                assert!(!matches!(
+                    event,
+                    ProgressEvent::StringTranslated { .. } | ProgressEvent::Completed { .. }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_prepass_disabled_does_not_query_or_reuse_memory() {
+        let (db, glossary) = setup();
+        let entries = make_entries(1);
+        db.save_entries(&entries).unwrap();
+        db.save_memory(
+            &entries[0].source_hash(),
+            &entries[0].source,
+            "Cached",
+            "ja-en",
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(MockProvider::new());
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+        let (tx, rx) = mpsc::channel(100);
+        crate::database::MEMORY_LOOKUP_QUERIES.with(|count| count.set(Some(0)));
+        manager
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "memory-disabled".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::database::MEMORY_LOOKUP_QUERIES.with(|count| count.replace(None)),
+            Some(0)
+        );
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        let (events, completed) = memory_run_events(rx).await;
+        assert_eq!(completed, 1);
+        assert_eq!(events, [("e0".into(), "en: Source 0".into())]);
+        assert_eq!(
+            db.get_entry("e0")
+                .unwrap()
+                .unwrap()
+                .provider_used
+                .as_deref(),
+            Some("mock")
+        );
     }
 
     #[tokio::test]

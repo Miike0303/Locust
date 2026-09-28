@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 thread_local! {
     pub(crate) static ENTRY_ROWS_MATERIALIZED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(crate) static MEMORY_TRANSACTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    pub(crate) static MEMORY_LOOKUP_QUERIES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    pub(crate) static GUARDED_TRANSLATION_TRANSACTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 use crate::error::{LocustError, Result};
@@ -1093,7 +1095,7 @@ impl Database {
         .await
     }
 
-    async fn save_guarded_updates(
+    pub(crate) async fn save_guarded_updates(
         &self,
         updates: Vec<(String, String, String, TranslationSaveGuard)>,
     ) -> Result<()> {
@@ -1101,7 +1103,7 @@ impl Database {
             return Ok(());
         }
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let conn = lock_connection(&conn);
             let tx = conn.unchecked_transaction()?;
             let now = Utc::now().to_rfc3339();
@@ -1116,7 +1118,16 @@ impl Database {
             }
             tx.commit()?;
             Ok(())
-        }).await.map_err(|e| LocustError::ProviderError(format!("translation save task failed: {e}")))?
+        }).await.map_err(|e| LocustError::ProviderError(format!("translation save task failed: {e}")))?;
+        #[cfg(test)]
+        if result.is_ok() {
+            GUARDED_TRANSLATION_TRANSACTIONS.with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n + 1));
+                }
+            });
+        }
+        result
     }
 
     pub async fn update_entry_status(&self, entry_id: &str, status: StringStatus) -> Result<()> {
@@ -1137,6 +1148,12 @@ impl Database {
 
     pub fn lookup_memory(&self, source_hash: &str, lang_pair: &str) -> Result<Option<String>> {
         let conn = lock_connection(&self.conn);
+        #[cfg(test)]
+        MEMORY_LOOKUP_QUERIES.with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
         let result = conn.query_row(
             "SELECT translation FROM translation_memory WHERE source_hash = ?1 AND lang_pair = ?2",
             params![source_hash, lang_pair],
@@ -1147,6 +1164,44 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Look up a run's hashes with at most 500 hashes plus one language parameter
+    /// per query. Reuse the cached statement for each repeated chunk size.
+    pub fn lookup_memory_batch(
+        &self,
+        source_hashes: &[String],
+        lang_pair: &str,
+    ) -> Result<HashMap<String, String>> {
+        let mut translations = HashMap::new();
+        if source_hashes.is_empty() {
+            return Ok(translations);
+        }
+        let conn = lock_connection(&self.conn);
+        for chunk in source_hashes.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut statement = conn.prepare_cached(&format!(
+                "SELECT source_hash, translation FROM translation_memory \
+                 WHERE lang_pair = ? AND source_hash IN ({placeholders})"
+            ))?;
+            #[cfg(test)]
+            MEMORY_LOOKUP_QUERIES.with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n + 1));
+                }
+            });
+            let rows = statement.query_map(
+                rusqlite::params_from_iter(
+                    std::iter::once(lang_pair).chain(chunk.iter().map(String::as_str)),
+                ),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            for row in rows {
+                let (hash, translation) = row?;
+                translations.insert(hash, translation);
+            }
+        }
+        Ok(translations)
     }
 
     pub async fn save_memory(
@@ -3634,6 +3689,50 @@ mod tests {
         assert_eq!(duplicate.source, "Existing source");
         assert_eq!(duplicate.translation, "Last translation");
         assert_eq!(duplicate.uses, 4);
+    }
+
+    #[tokio::test]
+    async fn lookup_memory_batch_matches_single_lookups_across_chunk_sizes() {
+        let db = Database::open_in_memory().unwrap();
+        let mut hashes: Vec<_> = (0..501).map(|i| format!("hash'{i}")).collect();
+        let items: Vec<_> = hashes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(i, hash)| {
+                (
+                    hash.clone(),
+                    format!("Source {i}"),
+                    format!("Translation {i}"),
+                )
+            })
+            .collect();
+        db.save_memory_batch(&items, "en-es").await.unwrap();
+        db.save_memory(&hashes[0], "Source 0", "Other language", "en-fr")
+            .await
+            .unwrap();
+        hashes.push(hashes[0].clone());
+        hashes.push("missing".into());
+        let expected: HashMap<_, _> = hashes
+            .iter()
+            .filter_map(|hash| {
+                db.lookup_memory(hash, "en-es")
+                    .unwrap()
+                    .map(|text| (hash.clone(), text))
+            })
+            .collect();
+        MEMORY_LOOKUP_QUERIES.with(|count| count.set(Some(0)));
+        assert_eq!(db.lookup_memory_batch(&hashes, "en-es").unwrap(), expected);
+        assert!(db.lookup_memory_batch(&[], "en-es").unwrap().is_empty());
+        assert_eq!(
+            MEMORY_LOOKUP_QUERIES.with(|count| count.replace(None)),
+            Some(2)
+        );
+        assert_eq!(
+            db.lookup_memory_batch(&hashes, "en-fr").unwrap(),
+            HashMap::from([(hashes[0].clone(), "Other language".into())])
+        );
+        assert!(db.lookup_memory_batch(&hashes, "en-de").unwrap().is_empty());
     }
 
     #[test]
