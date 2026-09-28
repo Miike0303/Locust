@@ -2428,6 +2428,7 @@ mod tests {
         while rx.recv().await.is_some() {}
 
         let png = output_dir.join("mygame-es").join("image.png");
+        use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(&png).unwrap();
         assert!(meta.nlink() > 1);
     }
