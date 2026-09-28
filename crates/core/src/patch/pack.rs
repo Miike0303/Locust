@@ -10,7 +10,6 @@ use serde::Serialize;
 
 use crate::database::{paths_identical, sha256_file, Database, InjectionRecording};
 use crate::error::{LocustError, Result};
-use crate::models::StringStatus;
 use crate::patch::manifest::{PatchFileEntry, PatchManifest};
 use crate::patch::store::PatchStore;
 use crate::patch::stream::{stream_bounded, StreamError};
@@ -280,19 +279,7 @@ fn select_pack_recording(db: &Database, opts: &PackOptions) -> Result<(Injection
     let lang = &opts.lang;
 
     // Friendly pre-check: no translations → nothing to pack.
-    let entries = db.get_entries(&crate::database::EntryFilter::default())?;
-    let translated = entries
-        .iter()
-        .filter(|e| {
-            e.translation
-                .as_deref()
-                .is_some_and(|t| !t.trim().is_empty())
-                && matches!(
-                    e.status,
-                    StringStatus::Translated | StringStatus::Reviewed | StringStatus::Approved
-                )
-        })
-        .count();
+    let translated = db.count_translated_entries()?;
     if translated == 0 {
         return Err(pack_err(
             "no translated, reviewed, or approved strings — nothing to pack yet. Run translate first.",
@@ -729,7 +716,7 @@ impl Drop for TempFileGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::StringEntry;
+    use crate::models::{StringEntry, StringStatus};
     use std::fs;
     use std::io::Read;
 
@@ -737,6 +724,74 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("locust_pack_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn pack_counts_translations_without_materializing_entries() {
+        let fixture = tempfile::tempdir().unwrap();
+        let game = fixture.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let script = game.join("story.txt");
+        fs::write(&script, "Hola").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut entries = Vec::new();
+        for status in [
+            StringStatus::Pending,
+            StringStatus::Translated,
+            StringStatus::Reviewed,
+            StringStatus::Approved,
+            StringStatus::Error,
+        ] {
+            for translation in [
+                None,
+                Some(""),
+                Some(" \t\r\n"),
+                Some("\u{3000}"),
+                Some(" \t\u{3000}\n"),
+                Some("Hola"),
+                Some(" \u{3000}Hola\t"),
+            ] {
+                let mut entry =
+                    StringEntry::new(format!("line-{}", entries.len()), "Hello", script.clone());
+                entry.status = status.clone();
+                entry.translation = translation.map(str::to_owned);
+                entries.push(entry);
+            }
+        }
+        db.save_entries(&entries).unwrap();
+        db.record_injection(Some("es"), &game, &[script]).unwrap();
+        let options = PackOptions {
+            game_path: game,
+            lang: Some("es".into()),
+            output: fixture.path().join("patch.zip"),
+            pristine: None,
+            engine: None,
+            project: fixture.path().join("project.db"),
+            require_pristine: false,
+        };
+        let expected = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry
+                    .translation
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty())
+                    && matches!(
+                        entry.status,
+                        StringStatus::Translated | StringStatus::Reviewed | StringStatus::Approved
+                    )
+            })
+            .count();
+        assert_eq!(expected, 6);
+
+        crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.set(Some(0)));
+        let result = select_pack_recording(&db, &options);
+        let materialized =
+            crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.replace(None));
+        assert_eq!(result.unwrap().1, expected);
+        assert_eq!(materialized, Some(0));
     }
 
     fn live_payload_changed_before_stream(change: &str) {

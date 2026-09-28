@@ -856,6 +856,23 @@ impl Database {
         })
     }
 
+    /// Count packable translations without materializing entries or originals.
+    pub fn count_translated_entries(&self) -> Result<usize> {
+        let conn = lock_connection(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT translation FROM strings WHERE status IN ('translated', 'reviewed', 'approved')",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+        let mut count = 0;
+        for row in rows {
+            // SQLite trim() only strips spaces; retain Rust's Unicode rule.
+            if row?.is_some_and(|translation| !translation.trim().is_empty()) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn count_entries(&self, filter: &EntryFilter) -> Result<usize> {
         let conn = lock_connection(&self.conn);
         let mut sql = String::from("SELECT COUNT(*) FROM strings WHERE 1=1");

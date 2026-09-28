@@ -799,15 +799,24 @@ impl MultiLangInjector {
                     .into(),
             ));
         }
-        restore_physical_sources(entries_for_target(
-            self.db.get_entries(&EntryFilter::default())?,
-            project_path,
-        )?)?;
+        let mut entries = self.db.get_entries(&EntryFilter::default())?;
+        if mode == OutputMode::Add {
+            entries = restore_physical_sources(entries_for_target(entries, project_path)?)?;
+        } else {
+            // Validate before backup/copy, retaining raw paths for warnings and
+            // semantic sources for the physical-source checks after remapping.
+            check_entries_for_target(&mut entries, project_path, false)?;
+            for entry in &entries {
+                validated_injection_source(entry)?;
+            }
+        }
         let plugin = self.registry.get(format_id).ok_or_else(|| {
             LocustError::UnsupportedFormat(format!("format not found: {}", format_id))
         })?;
         if mode == OutputMode::Add {
-            return self.inject_add(project_path, plugin, languages, tx).await;
+            return self
+                .inject_add(project_path, plugin, languages, entries, tx)
+                .await;
         }
         match mode {
             OutputMode::Replace => {
@@ -815,6 +824,7 @@ impl MultiLangInjector {
                     project_path,
                     plugin,
                     languages,
+                    entries,
                     output_dir.ok_or_else(|| {
                         LocustError::InjectionError(
                             "output_dir is required for Replace mode".to_string(),
@@ -835,6 +845,7 @@ impl MultiLangInjector {
         project_path: &Path,
         plugin: &dyn FormatPlugin,
         languages: Vec<String>,
+        entries: Vec<StringEntry>,
         output_dir: PathBuf,
         tx: mpsc::Sender<ProgressEvent>,
     ) -> Result<MultiLangReport> {
@@ -873,7 +884,8 @@ impl MultiLangInjector {
             .to_string_lossy()
             .to_string();
 
-        for (idx, lang) in languages.iter().enumerate() {
+        // inject accepts exactly one language, which consumes the loaded rows.
+        for (idx, (lang, entries)) in languages.iter().zip([entries]).enumerate() {
             let dest = output_dir.join(format!("{}-{}", game_name, lang));
 
             let dest_lock = match copy_dir_for_inject_under_lock(&selected, &dest, &source_lock) {
@@ -883,11 +895,6 @@ impl MultiLangInjector {
                     continue;
                 }
             };
-
-            // Load entries from db with tag filter for this language
-            let entries = self
-                .db
-                .get_entries(&crate::database::EntryFilter::default())?;
 
             emit_binary_slot_preflight(&entries, &tx).await;
 
@@ -962,6 +969,7 @@ impl MultiLangInjector {
         project_path: &Path,
         plugin: &dyn FormatPlugin,
         languages: Vec<String>,
+        entries: Vec<StringEntry>,
         tx: mpsc::Sender<ProgressEvent>,
     ) -> Result<MultiLangReport> {
         let total = languages.len();
@@ -972,12 +980,8 @@ impl MultiLangInjector {
         let mut backup_id = String::new();
         let mut recording_outcomes = HashMap::new();
 
-        for (idx, lang) in languages.iter().enumerate() {
-            let entries = self
-                .db
-                .get_entries(&crate::database::EntryFilter::default())?;
-
-            let entries = restore_physical_sources(entries_for_target(entries, project_path)?)?;
+        // inject accepts exactly one language, which consumes the preflight rows.
+        for (idx, (lang, entries)) in languages.iter().zip([entries]).enumerate() {
             let selected = project_path.canonicalize()?;
             emit_binary_slot_preflight(&entries, &tx).await;
 
@@ -1066,25 +1070,27 @@ impl MultiLangInjector {
 /// metadata remain byte-for-byte/logically unchanged.
 fn restore_physical_sources(mut entries: Vec<StringEntry>) -> Result<Vec<StringEntry>> {
     for entry in &mut entries {
-        entry
-            .require_current_translation()
-            .map_err(LocustError::InjectionError)?;
-        entry
-            .require_preserved_translation_controls()
-            .map_err(LocustError::InjectionError)?;
-        crate::validation::binary_slot_budget(entry).map_err(|error| {
-            LocustError::InjectionError(format!(
-                "invalid injection provenance for '{}': {error}",
-                entry.id
-            ))
-        })?;
-        let source = entry
-            .injection_source()
-            .map_err(LocustError::InjectionError)?
-            .to_string();
-        entry.source = source;
+        entry.source = validated_injection_source(entry)?.to_string();
     }
     Ok(entries)
+}
+
+fn validated_injection_source(entry: &StringEntry) -> Result<&str> {
+    entry
+        .require_current_translation()
+        .map_err(LocustError::InjectionError)?;
+    entry
+        .require_preserved_translation_controls()
+        .map_err(LocustError::InjectionError)?;
+    crate::validation::binary_slot_budget(entry).map_err(|error| {
+        LocustError::InjectionError(format!(
+            "invalid injection provenance for '{}': {error}",
+            entry.id
+        ))
+    })?;
+    entry
+        .injection_source()
+        .map_err(LocustError::InjectionError)
 }
 
 /// Compare lexical paths without following interior links. The database's
@@ -1196,6 +1202,15 @@ fn ensure_injection_path(root: &Path, relative: &Path) -> Result<()> {
 /// format plugin; external paths, traversal and existing interior links fail
 /// the entire preflight. An explicitly selected root junction is resolved once.
 fn entries_for_target(mut entries: Vec<StringEntry>, selection: &Path) -> Result<Vec<StringEntry>> {
+    check_entries_for_target(&mut entries, selection, true)?;
+    Ok(entries)
+}
+
+fn check_entries_for_target(
+    entries: &mut [StringEntry],
+    selection: &Path,
+    normalize_paths: bool,
+) -> Result<()> {
     let absolute = std::path::absolute(selection)?;
     let selected = selection.canonicalize()?;
     let is_file = selected.is_file();
@@ -1209,7 +1224,7 @@ fn entries_for_target(mut entries: Vec<StringEntry>, selection: &Path) -> Result
     } else {
         &selected
     };
-    for entry in &mut entries {
+    for entry in entries {
         validate_injection_spelling(&entry.file_path)?;
         let from_cwd = std::path::absolute(&entry.file_path)?;
         let relative = injection_relative(&from_cwd, alias_root)
@@ -1239,9 +1254,11 @@ fn entries_for_target(mut entries: Vec<StringEntry>, selection: &Path) -> Result
             )));
         }
         ensure_injection_path(root, &relative)?;
-        entry.file_path = root.join(relative);
+        if normalize_paths {
+            entry.file_path = root.join(relative);
+        }
     }
-    Ok(entries)
+    Ok(())
 }
 
 fn entries_for_copy(
@@ -2247,6 +2264,67 @@ mod tests {
 
         let injector = MultiLangInjector::new(Arc::new(registry), db, backup);
         (injector, game_dir, output_dir)
+    }
+
+    async fn assert_inject_materializes_entries_once(mode: OutputMode) {
+        let fixture = tempfile::tempdir().unwrap();
+        let game = fixture.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("game.mock"), "original").unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let entries: Vec<_> = (0..32)
+            .map(|i| {
+                let mut entry = StringEntry::new(format!("line-{i}"), "Hello", "game.mock".into());
+                entry.translation = Some("Hola".into());
+                entry
+            })
+            .collect();
+        db.save_entries(&entries).unwrap();
+        let mut registry = make_registry();
+        registry.register(Box::new(ContainedMock));
+        let injector = MultiLangInjector::new(
+            Arc::new(registry),
+            db,
+            Arc::new(BackupManager::new(fixture.path().join("backups"))),
+        );
+        let format = if mode == OutputMode::Add {
+            "mock"
+        } else {
+            "contained"
+        };
+        let (tx, _rx) = mpsc::channel(100);
+        crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.set(Some(0)));
+        let result = injector
+            .inject(
+                &game,
+                format,
+                mode,
+                vec!["es".into()],
+                Some(fixture.path().join("output")),
+                tx,
+            )
+            .await;
+        let materialized =
+            crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.replace(None));
+        let report = result.unwrap();
+        assert!(
+            report.languages_failed.is_empty(),
+            "{:?}",
+            report.languages_failed
+        );
+        assert_eq!(report.languages_processed, vec!["es"]);
+        assert_eq!(report.reports["es"].strings_written, entries.len());
+        assert_eq!(materialized, Some(entries.len()));
+    }
+
+    #[tokio::test]
+    async fn add_materializes_entries_once() {
+        assert_inject_materializes_entries_once(OutputMode::Add).await;
+    }
+
+    #[tokio::test]
+    async fn replace_materializes_entries_once() {
+        assert_inject_materializes_entries_once(OutputMode::Replace).await;
     }
 
     #[tokio::test]
