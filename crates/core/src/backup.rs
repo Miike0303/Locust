@@ -14,6 +14,17 @@ pub struct BackupManager {
     backup_root: PathBuf,
 }
 
+/// File changes a restore would make after passing its locked preflight.
+/// Paths are relative to `destination` for directory backups; single-file
+/// backups report the destination file's own path.
+#[derive(Debug)]
+pub struct RestorePreview {
+    pub destination: PathBuf,
+    pub replaced: Vec<PathBuf>,
+    pub recreated: Vec<PathBuf>,
+    pub identical: Vec<PathBuf>,
+}
+
 /// An original file with an immutable expected digest and size. Readers get
 /// only bytes checked against that snapshot, never an unchecked backup path.
 #[derive(Clone, Debug)]
@@ -599,16 +610,23 @@ impl BackupManager {
     /// Per-file replacement is atomic; this is not a multi-file transaction and
     /// does not delete files added after backup or merge later user edits.
     pub fn restore(&self, backup_id: &str) -> Result<()> {
-        self.restore_inner(backup_id, false)
+        self.restore_inner(backup_id, false).map(|_| ())
     }
 
     /// Check the same backup, game, and destination preconditions as restore
     /// without replacing any game files.
     pub fn verify_restore(&self, backup_id: &str) -> Result<()> {
-        self.restore_inner(backup_id, true)
+        self.preview_restore(backup_id).map(|_| ())
     }
 
-    fn restore_inner(&self, backup_id: &str, dry_run: bool) -> Result<()> {
+    /// Check restore preconditions and compare inventoried files with their
+    /// destinations while holding the game lock, without changing game files.
+    pub fn preview_restore(&self, id: &str) -> Result<RestorePreview> {
+        self.restore_inner(id, true)?
+            .ok_or_else(|| failure("restore preview was not produced"))
+    }
+
+    fn restore_inner(&self, backup_id: &str, dry_run: bool) -> Result<Option<RestorePreview>> {
         let backup_dir = self.resolve_backup_dir(backup_id)?;
         let (summary, v2) = Self::load_manifest(backup_id, &backup_dir)?;
         if !summary.source_path.is_absolute() {
@@ -701,7 +719,42 @@ impl BackupManager {
             }
         }
         if dry_run {
-            return Ok(());
+            let mut preview = RestorePreview {
+                destination: target.clone(),
+                replaced: Vec::new(),
+                recreated: Vec::new(),
+                identical: Vec::new(),
+            };
+            for (rel, entry) in &inventory {
+                let InventoryEntry::File { size, sha256 } = entry else {
+                    continue;
+                };
+                let dest = destination(rel);
+                let path = if kind == SourceKind::File {
+                    dest.clone()
+                } else {
+                    rel.clone()
+                };
+                match fs::symlink_metadata(&dest) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        preview.recreated.push(path);
+                    }
+                    Err(error) => return Err(error.into()),
+                    Ok(meta) if meta.len() != *size => preview.replaced.push(path),
+                    Ok(_) => {
+                        let (digest, actual_size) = sha256_file(&dest)?;
+                        if actual_size == *size && digest == *sha256 {
+                            preview.identical.push(path);
+                        } else {
+                            preview.replaced.push(path);
+                        }
+                    }
+                }
+            }
+            preview.replaced.sort();
+            preview.recreated.sort();
+            preview.identical.sort();
+            return Ok(Some(preview));
         }
         for (rel, entry) in &inventory {
             let dest = destination(rel);
@@ -740,7 +793,7 @@ impl BackupManager {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     pub fn list_backups(&self) -> Result<Vec<BackupEntry>> {
@@ -1195,6 +1248,102 @@ mod tests {
             "b"
         );
         assert!(!game_b.join("data.json").exists());
+    }
+
+    #[test]
+    fn preview_restore_classifies_changed_missing_and_identical() {
+        let game = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        fs::create_dir(game.path().join("nested")).unwrap();
+        fs::create_dir(game.path().join("empty")).unwrap();
+        fs::write(game.path().join("same-length.rpy"), b"original").unwrap();
+        fs::write(game.path().join("different-length.rpy"), b"short").unwrap();
+        fs::write(game.path().join("nested/missing.rpy"), b"recreate me").unwrap();
+        fs::write(game.path().join("identical.rpy"), b"unchanged").unwrap();
+        let mgr = BackupManager::new(backups.path().to_owned());
+        let backup = mgr.create_backup(game.path()).unwrap();
+
+        fs::write(game.path().join("same-length.rpy"), b"modified").unwrap();
+        fs::write(game.path().join("different-length.rpy"), b"longer change").unwrap();
+        fs::remove_file(game.path().join("nested/missing.rpy")).unwrap();
+        fs::write(game.path().join("added.rpy"), b"keep this new file").unwrap();
+
+        let snapshot = |root: &Path| -> BTreeMap<PathBuf, Vec<u8>> {
+            WalkDir::new(root)
+                .into_iter()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| {
+                    (
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let game_before = snapshot(game.path());
+        let backup_before = snapshot(&backup.path);
+        let preview = mgr.preview_restore(&backup.id).unwrap();
+        assert_eq!(preview.destination, game.path().canonicalize().unwrap());
+        assert_eq!(
+            preview.replaced,
+            vec![
+                PathBuf::from("different-length.rpy"),
+                PathBuf::from("same-length.rpy"),
+            ]
+        );
+        assert_eq!(preview.recreated, vec![PathBuf::from("nested/missing.rpy")]);
+        assert_eq!(preview.identical, vec![PathBuf::from("identical.rpy")]);
+        assert_eq!(snapshot(game.path()), game_before);
+        assert_eq!(snapshot(&backup.path), backup_before);
+
+        mgr.verify_restore(&backup.id).unwrap();
+        assert_eq!(snapshot(game.path()), game_before);
+        assert_eq!(snapshot(&backup.path), backup_before);
+
+        let mut expected = game_before;
+        for path in preview.replaced.iter().chain(&preview.recreated) {
+            expected.insert(
+                path.clone(),
+                fs::read(backup.path.join("payload").join(path)).unwrap(),
+            );
+        }
+        mgr.restore(&backup.id).unwrap();
+        assert_eq!(snapshot(game.path()), expected);
+        assert_eq!(snapshot(&backup.path), backup_before);
+        assert_eq!(
+            fs::read(game.path().join("added.rpy")).unwrap(),
+            b"keep this new file"
+        );
+    }
+
+    #[test]
+    fn preview_restore_single_file_reports_original_path() {
+        let game = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let file = game.path().join("script.rpy");
+        fs::write(&file, b"original").unwrap();
+        let mgr = BackupManager::new(backups.path().to_owned());
+        let backup = mgr.create_backup(&file).unwrap();
+        let destination = file.canonicalize().unwrap();
+
+        let preview = mgr.preview_restore(&backup.id).unwrap();
+        assert_eq!(preview.destination, destination);
+        assert!(preview.replaced.is_empty());
+        assert!(preview.recreated.is_empty());
+        assert_eq!(preview.identical, vec![destination.clone()]);
+
+        fs::write(&file, b"modified").unwrap();
+        let preview = mgr.preview_restore(&backup.id).unwrap();
+        assert_eq!(preview.destination, destination);
+        assert_eq!(preview.replaced, vec![destination]);
+        assert!(preview.recreated.is_empty());
+        assert!(preview.identical.is_empty());
+        assert_eq!(fs::read(&file).unwrap(), b"modified");
+        assert_eq!(
+            fs::read(backup.path.join("payload/file")).unwrap(),
+            b"original"
+        );
     }
 
     #[test]

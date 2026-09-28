@@ -59,7 +59,17 @@ fn restore_backup_dry_run_checks_payload_without_writing_game() {
             .args(["restore-backup", &backup.id, "--dry-run"]);
         command
     };
-    run().assert().success();
+    let output = run().assert().success().get_output().stdout.clone();
+    let output = String::from_utf8(output).unwrap();
+    let expected = format!(
+        "Destination: {}\n\
+         Would replace 1 file(s):\n  script.rpy\n\
+         Would recreate 0 missing file(s):\n\
+         Already identical: 0\n\
+         Files added to the game after this backup are not removed.\n",
+        game.canonicalize().unwrap().display()
+    );
+    assert_eq!(output, expected);
     assert_eq!(std::fs::read(&script).unwrap(), b"translated");
 
     std::fs::write(backup.path.join("payload/script.rpy"), b"corrupted").unwrap();

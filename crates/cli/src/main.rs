@@ -565,8 +565,21 @@ fn cmd_backups() -> anyhow::Result<()> {
 fn cmd_restore_backup(id: &str, dry_run: bool) -> anyhow::Result<()> {
     let manager = BackupManager::new(locust_backup_root());
     if dry_run {
-        manager.verify_restore(id)?;
-        println!("Backup {id} can be restored to its original game location.");
+        let preview = manager.preview_restore(id)?;
+        println!("Destination: {}", preview.destination.display());
+        println!("Would replace {} file(s):", preview.replaced.len());
+        for path in &preview.replaced {
+            println!("  {}", path.display());
+        }
+        println!(
+            "Would recreate {} missing file(s):",
+            preview.recreated.len()
+        );
+        for path in &preview.recreated {
+            println!("  {}", path.display());
+        }
+        println!("Already identical: {}", preview.identical.len());
+        println!("Files added to the game after this backup are not removed.");
     } else {
         manager.restore(id)?;
         println!("Restored backup {id} to its original game location.");
