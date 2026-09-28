@@ -66,12 +66,10 @@ Owned by no lane; Claude applies these after the writers finish.
 - **Writers: Codex ONLY (user, 2026-09-27).** No Cursor, no Grok Build. Use
   Codex until its quota and resets are exhausted or the user says otherwise.
   Supersedes the 2026-09-26 Codex+Cursor authorization.
-- **Model allow-list (user, 2026-09-27, supersedes 2026-09-26). Never substitute:**
-  - Codex writers: `gpt-6-astra` with `-c model_reasoning_effort=xhigh -c service_tier="fast"`.
-  - Codex researchers: `gpt-6-sol` with `-c model_reasoning_effort=high -c service_tier="fast"`.
-  - Why: the user wants the Codex subscription and its resets used well, so Fast tier and high effort are
-    deliberate. The CLI accepts `service_tier="fast"` (`models_cache.json` lists `additional_speed_tiers: ['fast']`,
-    API id `priority`); the session log does not record the tier, so it is unconfirmed beyond "accepted".
+- **Model allow-list (user, 2026-09-27, supersedes 2026-09-26). Never substitute. No Fast tier:**
+  - Codex writers: `gpt-6-astra` with `-c model_reasoning_effort=xhigh`.
+  - Codex researchers: `gpt-6-sol` with `-c model_reasoning_effort=high`.
+  - The user tried and then declined `service_tier="fast"`; leave the default tier.
   - Loop cadence: 15-20 minute ticks (user, 2026-09-27).
 - `bat`/`fd`/`eza` are not installed on this Windows host. Use `rg` and the Read tool.
 - Isolate every QA run with `LOCUST_DATA_DIR=<scratch>`. Without it the run uses
