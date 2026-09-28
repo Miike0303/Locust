@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -12,6 +12,7 @@ thread_local! {
     pub(crate) static ENTRY_ROWS_MATERIALIZED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(crate) static MEMORY_TRANSACTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(crate) static MEMORY_LOOKUP_QUERIES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static STRINGS_QUERIES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(crate) static GUARDED_TRANSLATION_TRANSACTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
@@ -625,45 +626,42 @@ impl Database {
 
     pub fn get_entries(&self, filter: &EntryFilter) -> Result<Vec<StringEntry>> {
         let conn = lock_connection(&self.conn);
-        let mut sql = String::from("SELECT id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at FROM strings WHERE 1=1");
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(ref status) = filter.status {
-            sql.push_str(" AND status = ?");
-            param_values.push(Box::new(status.to_string()));
-        }
-        if let Some(ref fp) = filter.file_path {
-            sql.push_str(" AND file_path = ?");
-            param_values.push(Box::new(fp.clone()));
-        }
-        if let Some(ref tag) = filter.tag {
-            sql.push_str(" AND tags LIKE ?");
-            param_values.push(Box::new(format!("%\"{}\"%", tag)));
-        }
-        if let Some(ref search) = filter.search {
-            sql.push_str(" AND (source LIKE ? OR translation LIKE ?)");
-            let pattern = format!("%{}%", search);
-            param_values.push(Box::new(pattern.clone()));
-            param_values.push(Box::new(pattern));
-        }
-
-        sql.push_str(" ORDER BY id");
-
-        if let Some(limit) = filter.limit {
-            sql.push_str(" LIMIT ?");
-            param_values.push(Box::new(limit as i64));
-        }
-        if let Some(offset) = filter.offset {
-            if filter.limit.is_none() {
-                sql.push_str(" LIMIT -1");
-            }
-            sql.push_str(" OFFSET ?");
-            param_values.push(Box::new(offset as i64));
-        }
-
+        let (where_clause, mut param_values) = entry_where_clause(filter);
+        let mut sql = format!("SELECT {ENTRY_COLUMNS} FROM strings {where_clause}");
+        append_entry_pagination(&mut sql, &mut param_values, filter);
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
+            param_values.iter().map(|p| p as _).collect();
         query_entries(&conn, &sql, &params_refs, &mut OriginalCache::new())
+    }
+
+    /// Return a page and its unpaginated total from one strings query. An empty
+    /// page has no window total, so count it under the same connection lock.
+    pub fn get_entries_page(&self, filter: &EntryFilter) -> Result<(Vec<StringEntry>, usize)> {
+        let conn = lock_connection(&self.conn);
+        let (where_clause, param_values) = entry_where_clause(filter);
+        let mut sql = format!(
+            "SELECT {ENTRY_COLUMNS}, COUNT(*) OVER () AS total FROM strings {where_clause}"
+        );
+        let mut page_params = param_values.clone();
+        append_entry_pagination(&mut sql, &mut page_params, filter);
+        let mut entries = Vec::new();
+        let mut total = None;
+        let mut originals = OriginalCache::new();
+        {
+            let mut stmt = conn.prepare(&sql)?;
+            #[cfg(test)]
+            record_strings_query();
+            let mut rows = stmt.query(rusqlite::params_from_iter(&page_params))?;
+            while let Some(row) = rows.next()? {
+                total = Some(row.get::<_, usize>("total")?);
+                entries.push(entry_from_row(row, &conn, &mut originals)?);
+            }
+        }
+        let total = match total {
+            Some(total) => total,
+            None => count_filtered_entries(&conn, &where_clause, &param_values)?,
+        };
+        Ok((entries, total))
     }
 
     /// All siblings of the selected TextAsset groups, in the same id order as
@@ -896,32 +894,8 @@ impl Database {
 
     pub fn count_entries(&self, filter: &EntryFilter) -> Result<usize> {
         let conn = lock_connection(&self.conn);
-        let mut sql = String::from("SELECT COUNT(*) FROM strings WHERE 1=1");
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(ref status) = filter.status {
-            sql.push_str(" AND status = ?");
-            param_values.push(Box::new(status.to_string()));
-        }
-        if let Some(ref fp) = filter.file_path {
-            sql.push_str(" AND file_path = ?");
-            param_values.push(Box::new(fp.clone()));
-        }
-        if let Some(ref tag) = filter.tag {
-            sql.push_str(" AND tags LIKE ?");
-            param_values.push(Box::new(format!("%\"{}\"%", tag)));
-        }
-        if let Some(ref search) = filter.search {
-            sql.push_str(" AND (source LIKE ? OR translation LIKE ?)");
-            let pattern = format!("%{}%", search);
-            param_values.push(Box::new(pattern.clone()));
-            param_values.push(Box::new(pattern));
-        }
-
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-        let count: usize = conn.query_row(&sql, params_refs.as_slice(), |row| row.get(0))?;
-        Ok(count)
+        let (where_clause, param_values) = entry_where_clause(filter);
+        count_filtered_entries(&conn, &where_clause, &param_values)
     }
 
     /// Update an existing string's translation. Returns `true` if a row was
@@ -2217,6 +2191,67 @@ struct RawEntry {
 
 type OriginalCache = HashMap<String, Arc<crate::models::TextAssetOriginal>>;
 
+const ENTRY_COLUMNS: &str = "id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at";
+
+fn entry_where_clause(filter: &EntryFilter) -> (String, Vec<Value>) {
+    let mut sql = String::from("WHERE 1=1");
+    let mut params = Vec::new();
+    if let Some(ref status) = filter.status {
+        sql.push_str(" AND status = ?");
+        params.push(Value::Text(status.to_string()));
+    }
+    if let Some(ref file_path) = filter.file_path {
+        sql.push_str(" AND file_path = ?");
+        params.push(Value::Text(file_path.clone()));
+    }
+    if let Some(ref tag) = filter.tag {
+        sql.push_str(" AND tags LIKE ?");
+        params.push(Value::Text(format!("%\"{}\"%", tag)));
+    }
+    if let Some(ref search) = filter.search {
+        sql.push_str(" AND (source LIKE ? OR translation LIKE ?)");
+        let pattern = format!("%{}%", search);
+        params.push(Value::Text(pattern.clone()));
+        params.push(Value::Text(pattern));
+    }
+    (sql, params)
+}
+
+fn append_entry_pagination(sql: &mut String, params: &mut Vec<Value>, filter: &EntryFilter) {
+    sql.push_str(" ORDER BY id");
+    if let Some(limit) = filter.limit {
+        sql.push_str(" LIMIT ?");
+        params.push(Value::Integer(limit as i64));
+    }
+    if let Some(offset) = filter.offset {
+        if filter.limit.is_none() {
+            sql.push_str(" LIMIT -1");
+        }
+        sql.push_str(" OFFSET ?");
+        params.push(Value::Integer(offset as i64));
+    }
+}
+
+fn count_filtered_entries(
+    conn: &Connection,
+    where_clause: &str,
+    params: &[Value],
+) -> Result<usize> {
+    let sql = format!("SELECT COUNT(*) FROM strings {where_clause}");
+    #[cfg(test)]
+    record_strings_query();
+    Ok(conn.query_row(&sql, rusqlite::params_from_iter(params), |row| row.get(0))?)
+}
+
+#[cfg(test)]
+fn record_strings_query() {
+    STRINGS_QUERIES.with(|count| {
+        if let Some(n) = count.get() {
+            count.set(Some(n + 1));
+        }
+    });
+}
+
 fn query_entries(
     conn: &Connection,
     sql: &str,
@@ -2224,35 +2259,43 @@ fn query_entries(
     originals: &mut OriginalCache,
 ) -> Result<Vec<StringEntry>> {
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params, |row| {
-        Ok(RawEntry {
-            id: row.get(0)?,
-            source: row.get(1)?,
-            translation: row.get(2)?,
-            status: row.get(3)?,
-            file_path: row.get(4)?,
-            context: row.get(5)?,
-            tags: row.get(6)?,
-            metadata: row.get(7)?,
-            char_limit: row.get(8)?,
-            provider_used: row.get(9)?,
-            created_at: row.get(10)?,
-            translated_at: row.get(11)?,
-            reviewed_at: row.get(12)?,
-        })
-    })?;
+    #[cfg(test)]
+    record_strings_query();
+    let mut rows = stmt.query(params)?;
     let mut entries = Vec::new();
-    for row in rows {
-        let raw = row?;
-        #[cfg(test)]
-        ENTRY_ROWS_MATERIALIZED.with(|count| {
-            if let Some(n) = count.get() {
-                count.set(Some(n + 1));
-            }
-        });
-        entries.push(raw_to_entry(raw, conn, originals)?);
+    while let Some(row) = rows.next()? {
+        entries.push(entry_from_row(row, conn, originals)?);
     }
     Ok(entries)
+}
+
+fn entry_from_row(
+    row: &rusqlite::Row<'_>,
+    conn: &Connection,
+    originals: &mut OriginalCache,
+) -> Result<StringEntry> {
+    let raw = RawEntry {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        translation: row.get(2)?,
+        status: row.get(3)?,
+        file_path: row.get(4)?,
+        context: row.get(5)?,
+        tags: row.get(6)?,
+        metadata: row.get(7)?,
+        char_limit: row.get(8)?,
+        provider_used: row.get(9)?,
+        created_at: row.get(10)?,
+        translated_at: row.get(11)?,
+        reviewed_at: row.get(12)?,
+    };
+    #[cfg(test)]
+    ENTRY_ROWS_MATERIALIZED.with(|count| {
+        if let Some(n) = count.get() {
+            count.set(Some(n + 1));
+        }
+    });
+    raw_to_entry(raw, conn, originals)
 }
 
 fn parse_entry_metadata(id: &str, json: &str) -> Result<HashMap<String, serde_json::Value>> {
@@ -3489,6 +3532,285 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "e2");
         assert_eq!(results[1].id, "e3");
+    }
+
+    #[test]
+    fn test_get_entries_page_strings_query_count() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[
+            make_entry("c", "hello three"),
+            make_entry("a", "hello one"),
+            make_entry("b", "hello two"),
+            make_entry("d", "unrelated"),
+        ])
+        .unwrap();
+        for (search, limit, offset, expected_len, expected_total, expected_queries) in [
+            ("hello", 1, 1, 1, 3, 1),
+            ("hello", 1, 3, 0, 3, 2),
+            ("hello", 1, 30, 0, 3, 2),
+            ("missing", 1, 0, 0, 0, 2),
+            ("hello", 0, 0, 0, 3, 2),
+        ] {
+            let filter = EntryFilter {
+                search: Some(search.into()),
+                limit: Some(limit),
+                offset: Some(offset),
+                ..Default::default()
+            };
+            STRINGS_QUERIES.with(|count| count.set(Some(0)));
+            let result = db.get_entries_page(&filter);
+            let queries = STRINGS_QUERIES.with(|count| count.replace(None));
+            let (entries, total) = result.unwrap();
+            assert_eq!(
+                queries,
+                Some(expected_queries),
+                "strings query count for {filter:?}"
+            );
+            assert_eq!(entries.len(), expected_len, "{filter:?}");
+            assert_eq!(total, expected_total, "{filter:?}");
+        }
+    }
+
+    #[test]
+    fn test_get_entries_page_matches_entries_and_count() {
+        let db = Database::open_in_memory().unwrap();
+        let mut a = make_entry("a", "source-only needle");
+        a.file_path = PathBuf::from("data/menu's.json");
+        a.tags = vec!["ui".into(), "dialogue".into()];
+        let mut b = make_entry("b", "Other source");
+        b.translation = Some("translation-only needle".into());
+        b.status = StringStatus::Translated;
+        b.file_path = PathBuf::from("data/other.json");
+        b.tags = vec!["ui_label".into()];
+        let mut c = a.clone();
+        c.id = "c".into();
+        c.source = "Another needle".into();
+        c.translation = Some("Listo".into());
+        c.status = StringStatus::Translated;
+        c.context = Some("Menu title".into());
+        c.char_limit = Some(42);
+        c.provider_used = Some("test-provider".into());
+        c.translated_at = Some(Utc::now());
+        c.reviewed_at = Some(Utc::now());
+        c.metadata
+            .insert("custom".into(), serde_json::json!([1, "two"]));
+        let mut d = make_entry("d", "Unrelated");
+        d.status = StringStatus::Approved;
+        db.save_entries(&[d, c, b, a]).unwrap();
+
+        let cases: Vec<(EntryFilter, &[&str], usize)> = vec![
+            (EntryFilter::default(), &["a", "b", "c", "d"], 4),
+            (
+                EntryFilter {
+                    status: Some(StringStatus::Translated),
+                    ..Default::default()
+                },
+                &["b", "c"],
+                2,
+            ),
+            (
+                EntryFilter {
+                    file_path: Some("data/menu's.json".into()),
+                    ..Default::default()
+                },
+                &["a", "c"],
+                2,
+            ),
+            (
+                EntryFilter {
+                    tag: Some("ui".into()),
+                    ..Default::default()
+                },
+                &["a", "c"],
+                2,
+            ),
+            (
+                EntryFilter {
+                    search: Some("source-only".into()),
+                    ..Default::default()
+                },
+                &["a"],
+                1,
+            ),
+            (
+                EntryFilter {
+                    search: Some("translation-only".into()),
+                    ..Default::default()
+                },
+                &["b"],
+                1,
+            ),
+            (
+                EntryFilter {
+                    search: Some("missing".into()),
+                    ..Default::default()
+                },
+                &[],
+                0,
+            ),
+            (
+                EntryFilter {
+                    limit: Some(2),
+                    offset: Some(1),
+                    ..Default::default()
+                },
+                &["b", "c"],
+                4,
+            ),
+            (
+                EntryFilter {
+                    limit: Some(2),
+                    offset: Some(4),
+                    ..Default::default()
+                },
+                &[],
+                4,
+            ),
+            (
+                EntryFilter {
+                    limit: Some(2),
+                    offset: Some(9),
+                    ..Default::default()
+                },
+                &[],
+                4,
+            ),
+            (
+                EntryFilter {
+                    offset: Some(2),
+                    ..Default::default()
+                },
+                &["c", "d"],
+                4,
+            ),
+            (
+                EntryFilter {
+                    limit: Some(0),
+                    ..Default::default()
+                },
+                &[],
+                4,
+            ),
+            (
+                EntryFilter {
+                    search: Some("needle".into()),
+                    limit: Some(1),
+                    offset: Some(1),
+                    ..Default::default()
+                },
+                &["b"],
+                3,
+            ),
+            (
+                EntryFilter {
+                    search: Some("needle".into()),
+                    limit: Some(1),
+                    offset: Some(3),
+                    ..Default::default()
+                },
+                &[],
+                3,
+            ),
+            (
+                EntryFilter {
+                    search: Some("needle".into()),
+                    offset: Some(9),
+                    ..Default::default()
+                },
+                &[],
+                3,
+            ),
+            (
+                EntryFilter {
+                    search: Some("source%only".into()),
+                    ..Default::default()
+                },
+                &["a"],
+                1,
+            ),
+            (
+                EntryFilter {
+                    search: Some(String::new()),
+                    ..Default::default()
+                },
+                &["a", "b", "c", "d"],
+                4,
+            ),
+            (
+                EntryFilter {
+                    status: Some(StringStatus::Translated),
+                    file_path: Some("data/menu's.json".into()),
+                    tag: Some("ui".into()),
+                    search: Some("needle".into()),
+                    limit: Some(1),
+                    offset: Some(0),
+                },
+                &["c"],
+                1,
+            ),
+        ];
+        for (filter, ids, expected_total) in cases {
+            let expected_entries = db.get_entries(&filter).unwrap();
+            let count = db.count_entries(&filter).unwrap();
+            let (entries, total) = db.get_entries_page(&filter).unwrap();
+            assert_eq!(total, count, "{filter:?}");
+            assert_eq!(total, expected_total, "{filter:?}");
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.id.as_str())
+                    .collect::<Vec<_>>(),
+                ids,
+                "{filter:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(&entries).unwrap(),
+                serde_json::to_value(&expected_entries).unwrap(),
+                "{filter:?}"
+            );
+        }
+        let empty = Database::open_in_memory().unwrap();
+        let (entries, total) = empty.get_entries_page(&EntryFilter::default()).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_get_entries_page_preserves_shared_originals_and_errors() {
+        let db = Database::open_in_memory().unwrap();
+        let (original, entries) = shared_textasset_rows(4);
+        db.save_entries(&entries).unwrap();
+        let filter = EntryFilter {
+            limit: Some(2),
+            offset: Some(1),
+            ..Default::default()
+        };
+        let expected = db.get_entries(&filter).unwrap();
+        let (page, total) = db.get_entries_page(&filter).unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(page.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&page).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let head = page[0].textasset_original.as_ref().unwrap();
+        for entry in &page {
+            let restored = entry.textasset_original.as_ref().unwrap();
+            assert!(Arc::ptr_eq(head, restored));
+            assert_eq!(restored.text(), original);
+        }
+        for metadata in ["{", r#"{"textasset_group_original_ref":"missing"}"#] {
+            lock_connection(&db.conn)
+                .execute(
+                    "UPDATE strings SET metadata = ?1 WHERE id = ?2",
+                    params![metadata, page[0].id],
+                )
+                .unwrap();
+            assert_eq!(
+                db.get_entries_page(&filter).unwrap_err().to_string(),
+                db.get_entries(&filter).unwrap_err().to_string()
+            );
+        }
     }
 
     #[tokio::test]

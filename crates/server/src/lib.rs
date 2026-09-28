@@ -912,19 +912,6 @@ async fn get_strings(
     let limit = q.limit.unwrap_or(100);
     let offset = q.offset.unwrap_or(0);
 
-    let count_filter = EntryFilter {
-        status: status.clone(),
-        file_path: q.file_path.clone(),
-        tag: q.tag.clone(),
-        search: q.search.clone(),
-        limit: None,
-        offset: None,
-    };
-    let total = state
-        .db
-        .count_entries(&count_filter)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
     let filter = EntryFilter {
         status,
         file_path: q.file_path,
@@ -933,9 +920,9 @@ async fn get_strings(
         limit: Some(limit),
         offset: Some(offset),
     };
-    let entries = state
+    let (entries, total) = state
         .db
-        .get_entries(&filter)
+        .get_entries_page(&filter)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(StringsResponse {
@@ -3284,6 +3271,42 @@ mod tests {
         assert_eq!(stats.status(), 200);
         let stats_body: ProjectStats = stats.json().await.unwrap();
         assert_eq!(stats_body.total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_strings_search_out_of_range_keeps_total() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let source_match = StringEntry::new("a", "needle in source", PathBuf::from("menu.json"));
+        let mut translation_match =
+            StringEntry::new("b", "Other source", PathBuf::from("menu.json"));
+        translation_match.translation = Some("needle in translation".into());
+        let unrelated = StringEntry::new("c", "Unrelated", PathBuf::from("menu.json"));
+        state
+            .db
+            .save_entries(&[source_match, translation_match, unrelated])
+            .unwrap();
+
+        for offset in [0, 2, 9] {
+            let resp = client()
+                .get(format!(
+                    "{url}/api/strings?search=needle&limit=1&offset={offset}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: StringsResponse = resp.json().await.unwrap();
+            assert_eq!(body.total, 2);
+            assert_eq!(body.offset, offset);
+            assert_eq!(body.limit, 1);
+            if offset == 0 {
+                assert_eq!(body.entries.len(), 1);
+                assert_eq!(body.entries[0].id, "a");
+            } else {
+                assert!(body.entries.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

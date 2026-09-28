@@ -243,20 +243,6 @@ pub async fn get_strings(
 
     let status = filter.status.and_then(|s| s.parse::<StringStatus>().ok());
 
-    let count_filter = EntryFilter {
-        status: status.clone(),
-        file_path: filter.file_path.clone(),
-        tag: filter.tag.clone(),
-        search: filter.search.clone(),
-        limit: None,
-        offset: None,
-    };
-    let total = state
-        .0
-        .db
-        .count_entries(&count_filter)
-        .map_err(|e| e.to_string())?;
-
     let entry_filter = EntryFilter {
         status,
         file_path: filter.file_path,
@@ -265,10 +251,10 @@ pub async fn get_strings(
         limit: Some(limit),
         offset: Some(offset),
     };
-    let entries = state
+    let (entries, total) = state
         .0
         .db
-        .get_entries(&entry_filter)
+        .get_entries_page(&entry_filter)
         .map_err(|e| e.to_string())?;
 
     Ok(StringsResponse {
