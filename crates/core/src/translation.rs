@@ -825,17 +825,22 @@ impl TranslationManager {
                         if attempts > 0 {
                             *retried_ok += to_save.len();
                         }
+                        let mut memory_items = Vec::new();
                         for result in &to_save {
                             if opts.use_memory && result.provider != "mock" {
                                 if let Some(source) = sources_by_id.get(&result.entry_id) {
                                     use sha2::{Digest, Sha256};
                                     let hash = hex::encode(Sha256::digest(source.as_bytes()));
-                                    let _ = self
-                                        .db
-                                        .save_memory(&hash, source, &result.translation, lang_pair)
-                                        .await;
+                                    memory_items.push((
+                                        hash,
+                                        source.clone(),
+                                        result.translation.clone(),
+                                    ));
                                 }
                             }
+                        }
+                        let _ = self.db.save_memory_batch(&memory_items, lang_pair).await;
+                        for result in &to_save {
                             let _ = tx
                                 .send(ProgressEvent::StringTranslated {
                                     entry_id: result.entry_id.clone(),
@@ -1230,7 +1235,7 @@ impl TranslationManager {
         if !group_acc.selected.is_empty() {
             for entry in self
                 .db
-                .get_entries(&crate::database::EntryFilter::default())?
+                .get_entries_for_textasset_groups(&group_acc.selected.keys().cloned().collect())?
             {
                 if let Some(group_id) = entry
                     .metadata
@@ -1777,6 +1782,7 @@ impl TranslationManager {
                         in_flight.abort_all();
                         break;
                     }
+                    let mut memory_items = Vec::new();
                     for result in &results {
                         // Don't cache mock translations in memory
                         if opts.use_memory
@@ -1791,13 +1797,16 @@ impl TranslationManager {
                             if let Some(source) = sources_by_id.get(&result.entry_id) {
                                 use sha2::{Digest, Sha256};
                                 let hash = hex::encode(Sha256::digest(source.as_bytes()));
-                                let _ = self
-                                    .db
-                                    .save_memory(&hash, source, &result.translation, &lang_pair)
-                                    .await;
+                                memory_items.push((
+                                    hash,
+                                    source.clone(),
+                                    result.translation.clone(),
+                                ));
                             }
                         }
-
+                    }
+                    let _ = self.db.save_memory_batch(&memory_items, &lang_pair).await;
+                    for result in &results {
                         let _ = tx
                             .send(ProgressEvent::StringTranslated {
                                 entry_id: result.entry_id.clone(),
@@ -4334,6 +4343,159 @@ mod tests {
             .unwrap();
         rx.close();
         while rx.recv().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn grouped_textasset_run_materializes_only_selected_siblings() {
+        let (db, _) = setup();
+        let original = "Menu.A: Hi\nMenu.B: Hello\nMenu.C: Bye\n        ";
+        let mut members = grouped_loc_entries(
+            original,
+            &[
+                ("z", "Menu.A", "Hi"),
+                ("a", "Menu.B", "Hello"),
+                ("m", "Menu.C", "Bye"),
+            ],
+        );
+        for entry in &mut members[1..] {
+            entry.status = StringStatus::Translated;
+            entry.translation = Some("Ya".into());
+        }
+        db.save_entries(&make_entries(20_000)).unwrap();
+        db.save_entries(&members).unwrap();
+        let selected = HashSet::from(["g-test".into()]);
+        let expected: Vec<_> = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .metadata
+                    .get(crate::textasset_group::GROUP_ID_KEY)
+                    .and_then(|v| v.as_str())
+                    == Some("g-test")
+            })
+            .collect();
+        let actual = db.get_entries_for_textasset_groups(&selected).unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "m", "z"]
+        );
+        for entry in &actual {
+            assert_eq!(
+                crate::textasset_group::original_textasset(entry),
+                Some(original)
+            );
+        }
+        crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.set(Some(0)));
+        run_group_job(
+            db.clone(),
+            Arc::new(GroupMapProvider::new(vec![group_script(&[("z", "Hola")])])),
+            vec![members[0].clone()],
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            crate::database::ENTRY_ROWS_MATERIALIZED.with(|count| count.replace(None)),
+            Some(3)
+        );
+        assert_eq!(
+            db.get_entry("z").unwrap().unwrap().translation.as_deref(),
+            Some("Hola")
+        );
+        for id in ["a", "m"] {
+            assert_eq!(
+                db.get_entry(id).unwrap().unwrap().translation.as_deref(),
+                Some("Ya")
+            );
+        }
+    }
+
+    async fn check_translation_memory_batch(grouped: bool) {
+        let (db, _) = setup();
+        let mut entries = grouped_loc_entries(
+            "Menu.A: Hello\nMenu.B: Hello\nMenu.C: World\nMenu.D: Hello\n                ",
+            &[
+                ("a", "Menu.A", "Hello"),
+                ("b", "Menu.B", "Hello"),
+                ("c", "Menu.C", "World"),
+                ("d", "Menu.D", "Hello"),
+            ],
+        );
+        if !grouped {
+            for entry in &mut entries {
+                entry.metadata.clear();
+                entry.textasset_original = None;
+            }
+        }
+        db.save_entries(&entries).unwrap();
+        let answers = group_script(&[
+            ("a", "First"),
+            ("b", "Second"),
+            ("c", "Third"),
+            ("d", "Last"),
+        ]);
+        let sequential = Database::open_in_memory().unwrap();
+        for entry in &entries {
+            sequential
+                .save_memory(
+                    &entry.source_hash(),
+                    &entry.source,
+                    &answers[&entry.id],
+                    "en-es",
+                )
+                .await
+                .unwrap();
+        }
+        crate::database::MEMORY_TRANSACTIONS.with(|count| count.set(Some(0)));
+        run_group_job(
+            db.clone(),
+            Arc::new(GroupMapProvider::new(vec![answers])),
+            entries,
+            TranslationOptions {
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                use_memory: true,
+                use_glossary: false,
+                batch_size: 10,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            crate::database::MEMORY_TRANSACTIONS.with(|count| count.replace(None)),
+            Some(1)
+        );
+        let snapshot = |db: &Database| {
+            let (mut rows, _) = db.list_memory(None, Some("en-es"), 100, 0).unwrap();
+            rows.sort_by(|a, b| a.source_hash.cmp(&b.source_hash));
+            for row in &mut rows {
+                row.last_used.clear();
+            }
+            serde_json::to_value(rows).unwrap()
+        };
+        assert_eq!(snapshot(&db), snapshot(&sequential));
+    }
+
+    #[tokio::test]
+    async fn translation_memory_batch_ungrouped_uses_one_transaction() {
+        check_translation_memory_batch(false).await;
+    }
+
+    #[tokio::test]
+    async fn translation_memory_batch_grouped_uses_one_transaction() {
+        check_translation_memory_batch(true).await;
     }
 
     #[tokio::test]

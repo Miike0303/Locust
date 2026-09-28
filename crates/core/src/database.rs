@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 thread_local! {
     pub(crate) static ENTRY_ROWS_MATERIALIZED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    pub(crate) static MEMORY_TRANSACTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 use crate::error::{LocustError, Result};
@@ -655,36 +656,49 @@ impl Database {
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            Ok(RawEntry {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                translation: row.get(2)?,
-                status: row.get(3)?,
-                file_path: row.get(4)?,
-                context: row.get(5)?,
-                tags: row.get(6)?,
-                metadata: row.get(7)?,
-                char_limit: row.get(8)?,
-                provider_used: row.get(9)?,
-                created_at: row.get(10)?,
-                translated_at: row.get(11)?,
-                reviewed_at: row.get(12)?,
-            })
-        })?;
+        query_entries(&conn, &sql, &params_refs, &mut OriginalCache::new())
+    }
 
+    /// All siblings of the selected TextAsset groups, in the same id order as
+    /// get_entries, without materializing unrelated strings.
+    pub fn get_entries_for_textasset_groups(
+        &self,
+        group_ids: &HashSet<String>,
+    ) -> Result<Vec<StringEntry>> {
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = lock_connection(&self.conn);
+        let mut ids = Vec::new();
+        // Filtering with json_extract alone would hide malformed metadata on
+        // non-members (and differs from serde for duplicate JSON keys). Scan
+        // only id/metadata, retaining neither unrelated rows nor their blobs.
+        let mut stmt = conn.prepare("SELECT id, metadata FROM strings ORDER BY id")?;
+        let mut rows = stmt.query([])?;
+        let mut validated_originals = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let metadata = parse_entry_metadata(&id, &row.get::<_, String>(1)?)?;
+            if metadata
+                .get(crate::textasset_group::GROUP_ID_KEY)
+                .and_then(|value| value.as_str())
+                .is_some_and(|group_id| group_ids.contains(group_id))
+            {
+                ids.push(id);
+            } else {
+                validate_unselected_original(&conn, &metadata, &mut validated_originals)?;
+            }
+        }
         let mut entries = Vec::new();
         let mut originals = OriginalCache::new();
-        for row in rows {
-            let raw = row?;
-            #[cfg(test)]
-            ENTRY_ROWS_MATERIALIZED.with(|count| {
-                if let Some(n) = count.get() {
-                    count.set(Some(n + 1));
-                }
-            });
-            entries.push(raw_to_entry(raw, &conn, &mut originals)?);
+        for chunk in ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at FROM strings WHERE id IN ({placeholders}) ORDER BY id");
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql)
+                .collect();
+            entries.extend(query_entries(&conn, &sql, &params_refs, &mut originals)?);
         }
         Ok(entries)
     }
@@ -1142,27 +1156,54 @@ impl Database {
         translation: &str,
         lang_pair: &str,
     ) -> Result<()> {
+        self.save_memory_batch(
+            &[(hash.to_owned(), source.to_owned(), translation.to_owned())],
+            lang_pair,
+        )
+        .await
+    }
+
+    pub async fn save_memory_batch(
+        &self,
+        items: &[(String, String, String)],
+        lang_pair: &str,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
         let conn = self.conn.clone();
-        let hash = hash.to_string();
-        let source = source.to_string();
-        let translation = translation.to_string();
+        let items = items.to_vec();
         let lang_pair = lang_pair.to_string();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let conn = lock_connection(&conn);
-            let now = Utc::now().to_rfc3339();
-            conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            let mut upsert = tx.prepare_cached(
                 "INSERT INTO translation_memory (source_hash, lang_pair, source, translation, uses, last_used)
                  VALUES (?1, ?2, ?3, ?4, 1, ?5)
                  ON CONFLICT(source_hash, lang_pair) DO UPDATE SET
                      translation = excluded.translation,
                      uses = uses + 1,
                      last_used = excluded.last_used",
-                params![hash, lang_pair, source, translation, now],
             )?;
+            for (hash, source, translation) in items {
+                let now = Utc::now().to_rfc3339();
+                upsert.execute(params![hash, lang_pair, source, translation, now])?;
+            }
+            drop(upsert);
+            tx.commit()?;
             Ok(())
         })
         .await
-        .unwrap()
+        .unwrap();
+        #[cfg(test)]
+        if result.is_ok() {
+            MEMORY_TRANSACTIONS.with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n + 1));
+                }
+            });
+        }
+        result
     }
 
     pub async fn record_translation_run(&self, run: &TranslationRun) -> Result<()> {
@@ -2086,6 +2127,109 @@ struct RawEntry {
 
 type OriginalCache = HashMap<String, Arc<crate::models::TextAssetOriginal>>;
 
+fn query_entries(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::types::ToSql],
+    originals: &mut OriginalCache,
+) -> Result<Vec<StringEntry>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, |row| {
+        Ok(RawEntry {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            translation: row.get(2)?,
+            status: row.get(3)?,
+            file_path: row.get(4)?,
+            context: row.get(5)?,
+            tags: row.get(6)?,
+            metadata: row.get(7)?,
+            char_limit: row.get(8)?,
+            provider_used: row.get(9)?,
+            created_at: row.get(10)?,
+            translated_at: row.get(11)?,
+            reviewed_at: row.get(12)?,
+        })
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let raw = row?;
+        #[cfg(test)]
+        ENTRY_ROWS_MATERIALIZED.with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
+        entries.push(raw_to_entry(raw, conn, originals)?);
+    }
+    Ok(entries)
+}
+
+fn parse_entry_metadata(id: &str, json: &str) -> Result<HashMap<String, serde_json::Value>> {
+    serde_json::from_str(json).map_err(|error| {
+        LocustError::Other(anyhow::anyhow!(
+            "entry '{id}' has malformed metadata: {error}"
+        ))
+    })
+}
+
+// Preserve get_entries' original-metadata errors even for unselected groups.
+// Check shared payloads once per digest, retaining only their lengths; unrelated
+// StringEntries are never hydrated; payloads are discarded after validation.
+fn validate_unselected_original(
+    conn: &Connection,
+    metadata: &HashMap<String, serde_json::Value>,
+    validated: &mut HashMap<String, usize>,
+) -> Result<()> {
+    use crate::textasset_group as group;
+    let inline = metadata
+        .get(group::GROUP_ORIGINAL_KEY)
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| original_error("malformed TextAsset original".into()))?;
+            crate::models::TextAssetOriginal::new(text).map_err(original_error)
+        })
+        .transpose()?;
+    if let Some(value) = metadata.get(group::GROUP_ORIGINAL_REF_KEY) {
+        let reference = value
+            .as_str()
+            .ok_or_else(|| original_error("malformed TextAsset reference".into()))?;
+        let byte_len = if let Some(original) = inline {
+            if reference != original.sha256() {
+                return Err(original_error(
+                    "shared TextAsset original digest or length does not match metadata".into(),
+                ));
+            }
+            original.text().len()
+        } else if let Some(byte_len) = validated.get(reference) {
+            *byte_len
+        } else {
+            let original =
+                load_original(conn, reference, &mut OriginalCache::new())?.ok_or_else(|| {
+                    original_error(format!("missing shared TextAsset original {reference}"))
+                })?;
+            let byte_len = original.text().len();
+            validated.insert(reference.to_owned(), byte_len);
+            byte_len
+        };
+        if metadata
+            .get(group::GROUP_ORIGINAL_BYTES_KEY)
+            .and_then(|value| value.as_u64())
+            != Some(byte_len as u64)
+        {
+            return Err(original_error(
+                "shared TextAsset original digest or length does not match metadata".into(),
+            ));
+        }
+    } else if metadata.contains_key(group::GROUP_ORIGINAL_BYTES_KEY) {
+        return Err(original_error(
+            "TextAsset original length has no digest reference".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn original_error(message: String) -> LocustError {
     LocustError::Other(anyhow::anyhow!(message))
 }
@@ -2204,13 +2348,7 @@ fn raw_to_entry(
 ) -> Result<StringEntry> {
     let status: StringStatus = raw.status.parse().unwrap_or(StringStatus::Pending);
     let tags: Vec<String> = serde_json::from_str(&raw.tags).unwrap_or_default();
-    let metadata: HashMap<String, serde_json::Value> = serde_json::from_str(&raw.metadata)
-        .map_err(|error| {
-            LocustError::Other(anyhow::anyhow!(
-                "entry '{}' has malformed metadata: {error}",
-                raw.id
-            ))
-        })?;
+    let metadata = parse_entry_metadata(&raw.id, &raw.metadata)?;
     let created_at: DateTime<Utc> = DateTime::parse_from_rfc3339(&raw.created_at)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
@@ -2407,6 +2545,100 @@ mod tests {
     }
 
     #[test]
+    fn textasset_group_query_preserves_order_across_chunks_and_shared_originals() {
+        let db = Database::open_in_memory().unwrap();
+        let (original, mut entries) = shared_textasset_rows(601);
+        for (i, entry) in entries.iter_mut().enumerate() {
+            entry.metadata.insert(
+                crate::textasset_group::GROUP_ID_KEY.into(),
+                serde_json::json!(if i % 2 == 0 { "group-a'" } else { "group-b" }),
+            );
+        }
+        db.save_entries(&entries).unwrap();
+        let expected = db.get_entries(&EntryFilter::default()).unwrap();
+        let actual = db
+            .get_entries_for_textasset_groups(&HashSet::from(["group-b".into(), "group-a'".into()]))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let head = actual[0].textasset_original.as_ref().unwrap();
+        for entry in &actual {
+            assert!(Arc::ptr_eq(
+                head,
+                entry.textasset_original.as_ref().unwrap()
+            ));
+            assert_eq!(head.text(), original);
+        }
+        assert!(db
+            .get_entries_for_textasset_groups(&HashSet::new())
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .get_entries_for_textasset_groups(&HashSet::from(["absent".into()]))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn textasset_group_query_rejects_corrupt_unselected_metadata() {
+        let db = Database::open_in_memory().unwrap();
+        let (_, entries) = shared_textasset_rows(3);
+        db.save_entries(&entries).unwrap();
+        db.save_entries(&[make_entry("unrelated", "Unrelated")])
+            .unwrap();
+        let selected = HashSet::from(["shared-group".into()]);
+        let deep = format!("{{\"nested\":{}{}}}", "[".repeat(130), "]".repeat(130));
+        for metadata in [
+            "{",
+            "[]",
+            "null",
+            "\"scalar\"",
+            "{\"number\":1e9999}",
+            &deep,
+            "{\"textasset_group_original\":7}",
+            "{\"textasset_group_original_ref\":7}",
+            "{\"textasset_group_original_ref\":\"bad\"}",
+            "{\"textasset_group_original_bytes\":1}",
+        ] {
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE strings SET metadata=?1 WHERE id='unrelated'",
+                    params![metadata],
+                )
+                .unwrap();
+            assert!(
+                db.get_entries(&EntryFilter::default()).is_err(),
+                "{metadata}"
+            );
+            assert!(
+                db.get_entries_for_textasset_groups(&selected).is_err(),
+                "{metadata}"
+            );
+        }
+        // serde uses the last duplicate key; SQLite json_extract uses the first.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE strings SET metadata=?1 WHERE id='unrelated'",
+                params![
+                    "{\"textasset_group_id\":\"other\",\"textasset_group_id\":\"shared-group\"}"
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_entries_for_textasset_groups(&selected)
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
     fn shared_textasset_partial_pivot_and_merge_preserve_physical_blob_without_leader() {
         let dir = recording_tempdir();
         let (original, mut entries) = shared_textasset_rows(256);
@@ -2544,6 +2776,11 @@ mod tests {
             }
             assert!(db.get_entry(&entries[0].id).is_err(), "{attack}");
             assert!(db.get_entries(&EntryFilter::default()).is_err(), "{attack}");
+            assert!(
+                db.get_entries_for_textasset_groups(&HashSet::from(["unselected".into()]))
+                    .is_err(),
+                "unselected original must still fail: {attack}"
+            );
             if attack != "missing" && attack != "reference" {
                 assert!(
                     db.save_entries(&entries).is_err(),
@@ -3331,6 +3568,72 @@ mod tests {
         });
         let result = db.lookup_memory("hash1", "en-es").unwrap();
         assert_eq!(result, Some("Hola".to_string()));
+    }
+
+    #[tokio::test]
+    async fn save_memory_batch_preserves_sequential_upserts() {
+        let sequential = Database::open_in_memory().unwrap();
+        let batched = Database::open_in_memory().unwrap();
+        let items: Vec<(String, String, String)> = [
+            ("duplicate", "First source", "First translation"),
+            ("other", "Other source", "Other translation"),
+            ("duplicate", "Changed source", "Second translation"),
+            ("duplicate", "Last source", "Last translation"),
+        ]
+        .into_iter()
+        .map(|(h, s, t)| (h.into(), s.into(), t.into()))
+        .collect();
+        for db in [&sequential, &batched] {
+            db.save_memory("duplicate", "Existing source", "Old translation", "en-es")
+                .await
+                .unwrap();
+            db.save_memory("duplicate", "Other language", "Autre", "en-fr")
+                .await
+                .unwrap();
+        }
+        let before = Utc::now();
+        MEMORY_TRANSACTIONS.with(|count| count.set(Some(0)));
+        for (hash, source, translation) in &items {
+            sequential
+                .save_memory(hash, source, translation, "en-es")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            MEMORY_TRANSACTIONS.with(|count| count.replace(Some(0))),
+            Some(4)
+        );
+        batched.save_memory_batch(&items, "en-es").await.unwrap();
+        batched.save_memory_batch(&[], "en-es").await.unwrap();
+        assert_eq!(
+            MEMORY_TRANSACTIONS.with(|count| count.replace(None)),
+            Some(1)
+        );
+        let after = Utc::now();
+        let snapshot = |db: &Database| {
+            let (mut rows, _) = db.list_memory(None, None, 100, 0).unwrap();
+            rows.sort_by(|a, b| {
+                (&a.lang_pair, &a.source_hash).cmp(&(&b.lang_pair, &b.source_hash))
+            });
+            for row in &mut rows {
+                if row.lang_pair == "en-es" {
+                    let used = DateTime::parse_from_rfc3339(&row.last_used).unwrap();
+                    assert!(used >= before && used <= after);
+                }
+                // Separate executions have different wall-clock timestamps.
+                row.last_used.clear();
+            }
+            serde_json::to_value(rows).unwrap()
+        };
+        assert_eq!(snapshot(&batched), snapshot(&sequential));
+        let (rows, _) = batched.list_memory(None, Some("en-es"), 100, 0).unwrap();
+        let duplicate = rows
+            .iter()
+            .find(|row| row.source_hash == "duplicate")
+            .unwrap();
+        assert_eq!(duplicate.source, "Existing source");
+        assert_eq!(duplicate.translation, "Last translation");
+        assert_eq!(duplicate.uses, 4);
     }
 
     #[test]
