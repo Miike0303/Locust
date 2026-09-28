@@ -96,36 +96,42 @@ pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) 
 pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
     let mut entries = Vec::new();
     let mut current_id: Option<String> = None;
+    let mut current_reference_id: Option<String> = None;
     let mut current_msgid: Option<String> = None;
     let mut current_msgstr: Option<String> = None;
     let mut reading = ReadingState::None;
 
-    for line in content.lines() {
+    for (index, line) in content.lines().enumerate() {
         let trimmed = line.trim();
+        let line_number = index + 1;
 
         if trimmed.is_empty() {
             // Flush current entry
             if let (Some(msgid), Some(msgstr)) = (current_msgid.take(), current_msgstr.take()) {
                 if !msgid.is_empty() {
                     entries.push(PoEntry {
-                        id: current_id.take(),
+                        id: current_id
+                            .take()
+                            .filter(|id| !id.is_empty())
+                            .or(current_reference_id.take()),
                         source: msgid,
                         translation: msgstr,
                     });
                 }
             }
             current_id = None;
+            current_reference_id = None;
             reading = ReadingState::None;
             continue;
         }
 
         if let Some(reference) = trimmed.strip_prefix("#: ") {
-            // Legacy Locust exports used `#: path#id`. Prefer msgctxt when present;
-            // only fill id from the reference if we do not already have one.
-            if current_id.is_none() {
+            // Keep the legacy `#: path#id` fallback separate until msgctxt and
+            // all its continuations have been read; an empty context uses it.
+            if current_reference_id.is_none() {
                 // First `#` separates path from id so multi-# ids stay intact.
                 if let Some(hash_pos) = reference.find('#') {
-                    current_id = Some(reference[hash_pos + 1..].to_string());
+                    current_reference_id = Some(reference[hash_pos + 1..].to_string());
                 }
             }
             continue;
@@ -135,44 +141,65 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
             continue;
         }
 
-        if let Some(rest) = trimmed.strip_prefix("msgctxt ") {
-            let val = extract_po_string(rest);
+        let (keyword, rest) = trimmed
+            .split_once(char::is_whitespace)
+            .unwrap_or((trimmed, ""));
+
+        if keyword == "msgctxt" {
+            let val = parse_po_string(rest, line_number)?;
             current_id = Some(unescape_po(&val));
-            reading = ReadingState::None;
+            reading = ReadingState::Msgctxt;
             continue;
         }
 
-        if let Some(rest) = trimmed.strip_prefix("msgid ") {
-            let val = extract_po_string(rest);
+        if keyword == "msgid" {
+            let val = parse_po_string(rest, line_number)?;
             current_msgid = Some(unescape_po(&val));
             reading = ReadingState::Msgid;
             continue;
         }
 
-        if let Some(rest) = trimmed.strip_prefix("msgstr ") {
-            let val = extract_po_string(rest);
+        if keyword == "msgstr" {
+            let val = parse_po_string(rest, line_number)?;
             current_msgstr = Some(unescape_po(&val));
             reading = ReadingState::Msgstr;
             continue;
         }
 
-        // Continuation line (quoted string)
-        if trimmed.starts_with('"') {
-            let val = extract_po_string(trimmed);
-            let unescaped = unescape_po(&val);
-            match reading {
-                ReadingState::Msgid => {
-                    if let Some(ref mut s) = current_msgid {
-                        s.push_str(&unescaped);
-                    }
+        if keyword == "msgid_plural"
+            || keyword
+                .strip_prefix("msgstr[")
+                .and_then(|index| index.strip_suffix(']'))
+                .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
+        {
+            parse_po_string(rest, line_number)?;
+            // Plural entries are not imported; validate and discard their continuations.
+            current_msgid = None;
+            current_msgstr = None;
+            reading = ReadingState::None;
+            continue;
+        }
+
+        // Every non-comment, non-directive line must be a quoted continuation.
+        let val = parse_po_string(trimmed, line_number)?;
+        let unescaped = unescape_po(&val);
+        match reading {
+            ReadingState::Msgctxt => {
+                if let Some(ref mut s) = current_id {
+                    s.push_str(&unescaped);
                 }
-                ReadingState::Msgstr => {
-                    if let Some(ref mut s) = current_msgstr {
-                        s.push_str(&unescaped);
-                    }
-                }
-                _ => {}
             }
+            ReadingState::Msgid => {
+                if let Some(ref mut s) = current_msgid {
+                    s.push_str(&unescaped);
+                }
+            }
+            ReadingState::Msgstr => {
+                if let Some(ref mut s) = current_msgstr {
+                    s.push_str(&unescaped);
+                }
+            }
+            ReadingState::None => {}
         }
     }
 
@@ -180,7 +207,9 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
     if let (Some(msgid), Some(msgstr)) = (current_msgid, current_msgstr) {
         if !msgid.is_empty() {
             entries.push(PoEntry {
-                id: current_id,
+                id: current_id
+                    .filter(|id| !id.is_empty())
+                    .or(current_reference_id),
                 source: msgid,
                 translation: msgstr,
             });
@@ -199,6 +228,7 @@ pub struct PoEntry {
 
 enum ReadingState {
     None,
+    Msgctxt,
     Msgid,
     Msgstr,
 }
@@ -231,13 +261,27 @@ fn unescape_po(s: &str) -> String {
     result
 }
 
-fn extract_po_string(s: &str) -> String {
+fn parse_po_string(s: &str, line: usize) -> Result<String> {
     let trimmed = s.trim();
-    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-        trimmed[1..trimmed.len() - 1].to_string()
-    } else {
-        trimmed.to_string()
+    if trimmed.starts_with('"') {
+        let mut backslashes = 0;
+        for (index, byte) in trimmed.bytes().enumerate().skip(1) {
+            // The first unescaped quote closes the string. Nothing but
+            // whitespace may follow it, even another quoted string.
+            if byte == b'"' && backslashes % 2 == 0 {
+                if index == trimmed.len() - 1 {
+                    return Ok(trimmed[1..index].to_string());
+                }
+                break;
+            }
+            backslashes = if byte == b'\\' { backslashes + 1 } else { 0 };
+        }
     }
+    let excerpt: String = trimmed.chars().take(80).collect();
+    Err(LocustError::ParseError {
+        file: "po".into(),
+        message: format!("line {line}: malformed PO string: {excerpt}"),
+    })
 }
 
 // ─── XLIFF format ──────────────────────────────────────────────────────────
@@ -741,6 +785,206 @@ msgstr "Hola"
             "legacy import must keep full id after first #, got {:?}",
             imported[0].id
         );
+    }
+
+    #[test]
+    fn test_import_po_continued_empty_context() {
+        let po = "msgctxt \"\"\n\"game.rpy\"\n\"#42\"\nmsgid \"Hello\"\nmsgstr \"Hola\"\n\n";
+        let imported = import_po(po).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].id.as_deref(), Some("game.rpy#42"));
+    }
+
+    #[test]
+    fn test_import_po_continued_context_does_not_use_prefix_id() {
+        let po = "msgctxt \"line1\"\n\"0\"\nmsgid \"Hello\"\nmsgstr \"Hola\"";
+        let imported = import_po(po).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].id.as_deref(), Some("line10"));
+    }
+
+    #[test]
+    fn test_import_po_empty_context_falls_back_to_reference() {
+        for context in ["msgctxt \"\"\n", "msgctxt \"\"\n\"\"\n"] {
+            for prefix in [
+                format!("#: game.rpy#legacy#42\n{context}"),
+                format!("{context}#: game.rpy#legacy#42\n"),
+            ] {
+                for ending in ["", "\n\n"] {
+                    let po = format!("{prefix}msgid \"Hello\"\nmsgstr \"Hola\"{ending}");
+                    let imported = import_po(&po).unwrap();
+                    assert_eq!(imported.len(), 1);
+                    assert_eq!(imported[0].id.as_deref(), Some("legacy#42"), "{po}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_po_continued_context_overrides_reference_and_resets() {
+        let po = concat!(
+            "#: game.rpy#legacy\nmsgctxt \"\"\n",
+            "# A comment does not interrupt the context.\n\"line1\"\n\"0\"\n",
+            "#: game.rpy#other\nmsgid \"Hello\"\nmsgstr \"Hola\"\n\n",
+            "msgid \"Next\"\nmsgstr \"Siguiente\"\n\n",
+            "msgctxt \"\"\nmsgid \"Last\"\nmsgstr \"Último\"",
+        );
+        let imported = import_po(po).unwrap();
+        assert_eq!(imported.len(), 3);
+        assert_eq!(imported[0].id.as_deref(), Some("line10"));
+        assert_eq!(imported[1].id, None);
+        assert_eq!(imported[2].id, None);
+    }
+
+    #[test]
+    fn test_import_po_skips_plural_entries_between_singular_entries() {
+        let po = concat!(
+            "msgctxt \"first\"\nmsgid \"Hello\"\nmsgstr \"Hola\"\n\n",
+            "msgctxt \"plural\"\nmsgid \"One \"\n\"item\"\n",
+            "msgid_plural \"Many \"\n\"items\"\n",
+            "msgstr[0] \"Un \"\n\"elemento\"\n",
+            "msgstr[1] \"Varios \"\n\"elementos\"\n",
+            "msgstr[10] \"Otros \"\n\"elementos\"\n\n",
+            "msgctxt \"last\"\nmsgid \"Good\"\n\"bye\"\nmsgstr \"Adi\"\n\"ós\"",
+        );
+        for ending in ["", "\n\n"] {
+            let imported = import_po(&format!("{po}{ending}")).unwrap();
+            assert_eq!(imported.len(), 2);
+            assert_eq!(imported[0].id.as_deref(), Some("first"));
+            assert_eq!(imported[0].source, "Hello");
+            assert_eq!(imported[0].translation, "Hola");
+            assert_eq!(imported[1].id.as_deref(), Some("last"));
+            assert_eq!(imported[1].source, "Goodbye");
+            assert_eq!(imported[1].translation, "Adiós");
+        }
+    }
+
+    #[test]
+    fn test_import_po_rejects_unknown_keywords() {
+        for keyword in [
+            "msgfoo",
+            "msgid_plurals",
+            "msgstr[]",
+            "msgstr[-1]",
+            "msgstr[1x]",
+            "msgstr[١]",
+            "msgstr[1]suffix",
+        ] {
+            let po = format!("msgid \"Hello\"\n{keyword} \"x\"\n");
+            let LocustError::ParseError { file, message } = import_po(&po).expect_err(&po) else {
+                panic!("expected ParseError for {po}");
+            };
+            assert_eq!(file, "po");
+            assert!(
+                message.starts_with("line 2: malformed PO string:"),
+                "{message}"
+            );
+            assert!(message.contains(keyword), "{message}");
+        }
+    }
+
+    #[test]
+    fn test_import_po_rejects_malformed_strings_with_line_numbers() {
+        for malformed in [
+            "garbage",
+            "\"Hola",
+            "\"Hola\" trailing junk",
+            "\"abc\\\"",
+            "\"abc\\\\\\\"",
+            "\"Hola\" \"extra\"",
+            "\"Hola\" junk\"",
+            "\"",
+            "",
+        ] {
+            // A complete preceding entry must not hide a later parse failure.
+            let prefix = "# Comment\nmsgctxt \"valid\"\nmsgid \"First\"\nmsgstr \"Uno\"\n\n";
+            for (directive, preceding) in [
+                ("msgctxt", ""),
+                ("msgid", "msgctxt \"second\"\n"),
+                ("msgstr", "msgctxt \"second\"\nmsgid \"Second\"\n"),
+                ("msgid_plural", "msgid \"One item\"\n"),
+                (
+                    "msgstr[0]",
+                    "msgid \"One item\"\nmsgid_plural \"Many items\"\n",
+                ),
+                (
+                    "msgstr[1]",
+                    "msgid \"One item\"\nmsgid_plural \"Many items\"\nmsgstr[0] \"Un elemento\"\n",
+                ),
+            ] {
+                for continuation in [false, true] {
+                    // A blank continuation is a separator, not a malformed string.
+                    if continuation && malformed.is_empty() {
+                        continue;
+                    }
+                    let input = if continuation {
+                        format!("{prefix}{preceding}{directive} \"\"\n{malformed}\n")
+                    } else {
+                        format!("{prefix}{preceding}{directive} {malformed}\n")
+                    };
+                    let line = prefix.lines().count()
+                        + preceding.lines().count()
+                        + 1
+                        + usize::from(continuation);
+                    let err = import_po(&input).expect_err(&input);
+                    let LocustError::ParseError { file, message } = err else {
+                        panic!("expected ParseError for {input}");
+                    };
+                    assert_eq!(file, "po");
+                    assert!(
+                        message.starts_with(&format!("line {line}: malformed PO string:")),
+                        "{message}: {input}"
+                    );
+                    assert!(message.contains(malformed), "{message}: {input}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_po_continuations_unescape_and_preserve_whitespace() {
+        let po = concat!(
+            "msgctxt \"\"\n\"game\\\\path\\\"\"\n\"#42\\n日本語\"  \t\n",
+            "msgid \"Hello \"\n\"\\\"world\\\"\\n\"\n\"\\\\\"\n",
+            "msgstr \"Hola \"\n\"\\\"mundo\\\"\\n\"\n\"\\\\\\\\\"\n",
+        );
+        let imported = import_po(po).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].id.as_deref(), Some("game\\path\"#42\n日本語"));
+        assert_eq!(imported[0].source, "Hello \"world\"\n\\");
+        assert_eq!(imported[0].translation, "Hola \"mundo\"\n\\\\");
+    }
+
+    #[test]
+    fn test_import_po_roundtrip_tricky_strings() {
+        let values = [
+            "game.rpy#42#日本語 \"quote\" \\path\nnext\ttab",
+            "ends in a quote\"",
+            "ends in a backslash\\",
+            "ends in two backslashes\\\\",
+            "backslash and quote\\\"",
+            r"literal escapes: \n \t \q",
+            "  espacios, español, 日本語\t ",
+        ];
+        let entries: Vec<_> = values
+            .iter()
+            .map(|value| {
+                let mut entry = StringEntry::new(*value, *value, PathBuf::from("game.rpy"));
+                entry.translation = Some((*value).into());
+                entry
+            })
+            .collect();
+        let po = export_po(&entries, "en", "es");
+        let imported = import_po(&po).unwrap();
+        assert_eq!(imported.len(), entries.len());
+        for (actual, expected) in imported.iter().zip(&entries) {
+            assert_eq!(actual.id.as_deref(), Some(expected.id.as_str()));
+            assert_eq!(actual.source, expected.source);
+            assert_eq!(
+                Some(actual.translation.as_str()),
+                expected.translation.as_deref()
+            );
+        }
     }
 
     #[test]
