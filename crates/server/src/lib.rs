@@ -1101,6 +1101,9 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<ProjectSta
 async fn list_translation_runs(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<TranslationRun>>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     let mut runs = state
         .db
         .get_translation_runs()
@@ -1485,6 +1488,9 @@ async fn inject_owned(
     state: Arc<AppState>,
     req: InjectRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     if req.direct {
         let game_path = PathBuf::from(&req.project_path);
         let format_id = req.format_id.clone();
@@ -1778,6 +1784,9 @@ async fn patch_pack(
     Json(req): Json<PatchPackRequest>,
 ) -> Result<Json<locust_core::patch::PackReport>, ApiError> {
     let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     if req.game_path.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "game_path required"));
     }
@@ -2159,6 +2168,9 @@ async fn validate(State(state): State<Arc<AppState>>) -> Result<Json<serde_json:
 }
 
 async fn validate_owned(state: Arc<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     let entries = state
         .db
         .get_entries(&EntryFilter::default())
@@ -2250,6 +2262,9 @@ async fn get_glossary(
     State(state): State<Arc<AppState>>,
     Query(q): Query<GlossaryQuery>,
 ) -> Result<Json<Vec<GlossaryEntry>>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     state
         .glossary
         .get_all(&q.lang_pair)
@@ -2261,6 +2276,9 @@ async fn add_glossary(
     State(state): State<Arc<AppState>>,
     Json(entry): Json<GlossaryEntry>,
 ) -> Result<StatusCode, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     state
         .glossary
         .add(
@@ -2278,6 +2296,9 @@ async fn delete_glossary(
     AxumPath(term): AxumPath<String>,
     Query(q): Query<GlossaryQuery>,
 ) -> Result<StatusCode, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     state
         .glossary
         .delete(&term, &q.lang_pair)
@@ -2297,6 +2318,9 @@ async fn export_po(
     // Export combines rows with translation-run language metadata. Both must
     // belong to the same project, even across the config-lock await below.
     let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     let entries = state
         .db
         .get_entries(&EntryFilter::default())
@@ -2337,6 +2361,9 @@ async fn import_po_owned(
     state: Arc<AppState>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     let po_entries = export::import_po(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let (updates, pre_skipped) = export::po_entries_for_batch(&po_entries);
     let attempted = updates.len();
@@ -2357,6 +2384,9 @@ async fn export_xliff(
     Query(q): Query<LangQuery>,
 ) -> Result<(StatusCode, [(String, String); 2], String), ApiError> {
     let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     let entries = state
         .db
         .get_entries(&EntryFilter::default())
@@ -2397,6 +2427,9 @@ async fn import_xliff_owned(
     state: Arc<AppState>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     let units = export::import_xliff(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let (updates, pre_skipped) = export::xliff_units_for_batch(&units);
     let attempted = updates.len();
@@ -3742,6 +3775,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_requires_an_open_project() {
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .save_entries(&[translated("leftover", "Hello", "story.html", "Hola")])
+            .unwrap();
+        let before = state.db.get_entry("leftover").unwrap().unwrap();
+        let issues_before = state.db.get_validation_issues(None).unwrap();
+
+        let response = client()
+            .post(format!("{url}/api/validate"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.text().await.unwrap(), "no project open");
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("leftover").unwrap().unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.get_validation_issues(None).unwrap()).unwrap(),
+            serde_json::to_value(issues_before).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn injection_requires_an_open_project() {
+        let (url, _h, state) = setup_with_state().await;
+        let game = tempfile::tempdir().unwrap();
+        let file = game.path().join("story.html");
+        let original = b"<p>Hello</p>";
+        std::fs::write(&file, original).unwrap();
+        state
+            .db
+            .save_entries(&[translated("leftover", "Hello", "story.html", "Hola")])
+            .unwrap();
+        let before = state.db.get_entry("leftover").unwrap().unwrap();
+        let recordings_before = state.db.list_recorded_langs().unwrap();
+
+        for direct in [false, true] {
+            let response = client()
+                .post(format!("{url}/api/inject"))
+                .json(&serde_json::json!({
+                    "project_path": game.path(),
+                    "format_id": "html-game",
+                    "languages": ["es"],
+                    "direct": direct
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+            assert_eq!(response.text().await.unwrap(), "no project open");
+            assert_eq!(
+                serde_json::to_value(state.db.get_entry("leftover").unwrap().unwrap()).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(state.db.list_recorded_langs().unwrap(), recordings_before);
+            assert_eq!(std::fs::read(&file).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_pack_requires_an_open_project() {
+        let (url, _h, state) = setup_with_state().await;
+        let game = tempfile::tempdir().unwrap();
+        let file = game.path().join("story.html");
+        let original = b"<p>Hola</p>";
+        std::fs::write(&file, original).unwrap();
+        state
+            .db
+            .save_entries(&[translated("leftover", "Hello", "story.html", "Hola")])
+            .unwrap();
+        state
+            .db
+            .record_injection(Some("es"), game.path(), std::slice::from_ref(&file))
+            .unwrap();
+        let before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
+        let recordings_before = state.db.list_recorded_langs().unwrap();
+        let output = game
+            .path()
+            .parent()
+            .unwrap()
+            .join(format!("locust_pack_{}.zip", uuid::Uuid::new_v4()));
+
+        let response = client()
+            .post(format!("{url}/api/patch/pack"))
+            .json(&serde_json::json!({
+                "game_path": game.path(),
+                "output_path": output,
+                "languages": ["es"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.text().await.unwrap(), "no project open");
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(state.db.list_recorded_langs().unwrap(), recordings_before);
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    async fn glossary_requires_an_open_project() {
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .save_entries(&[translated("leftover", "Hello", "story.html", "Hola")])
+            .unwrap();
+        state.glossary.add("HP", "PV", "en-es", None).unwrap();
+        let before = serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap();
+        let row_before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
+
+        let get = client()
+            .get(format!("{url}/api/glossary?lang_pair=en-es"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status(), 400);
+        assert_eq!(get.text().await.unwrap(), "no project open");
+
+        let add = client()
+            .post(format!("{url}/api/glossary"))
+            .json(&serde_json::json!({
+                "term": "MP", "translation": "PM", "lang_pair": "en-es",
+                "context": null, "case_sensitive": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(add.status(), 400);
+        assert_eq!(add.text().await.unwrap(), "no project open");
+
+        let delete = client()
+            .delete(format!("{url}/api/glossary/HP?lang_pair=en-es"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), 400);
+        assert_eq!(delete.text().await.unwrap(), "no project open");
+        assert_eq!(
+            serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap(),
+            row_before
+        );
+    }
+
+    #[tokio::test]
+    async fn exports_require_an_open_project() {
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .save_entries(&[translated("leftover", "Hello", "story.html", "Hola")])
+            .unwrap();
+        let before = state.db.get_entry("leftover").unwrap().unwrap();
+
+        for format in ["po", "xliff"] {
+            let response = client()
+                .get(format!("{url}/api/export/{format}?lang=es"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400, "{format}");
+            assert_eq!(response.text().await.unwrap(), "no project open");
+        }
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("leftover").unwrap().unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn imports_require_an_open_project() {
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .save_entries(&[translated("leftover", "Hello", "story.html", "Hola")])
+            .unwrap();
+        let before = state.db.get_entry("leftover").unwrap().unwrap();
+        let po = "msgctxt \"leftover\"\nmsgid \"Hello\"\nmsgstr \"Wrong\"\n";
+        let xliff = r#"<xliff version="1.2"><file><body><trans-unit id="leftover"><source>Hello</source><target>Wrong</target></trans-unit></body></file></xliff>"#;
+
+        for (format, body) in [("po", po), ("xliff", xliff)] {
+            let response = client()
+                .post(format!("{url}/api/import/{format}"))
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400, "{format}");
+            assert_eq!(response.text().await.unwrap(), "no project open");
+            assert_eq!(
+                serde_json::to_value(state.db.get_entry("leftover").unwrap().unwrap()).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn open_returns_409_while_translation_in_flight_and_keeps_current_project() {
         let (url, _h, state) = setup_with_state().await;
         mark_project_open(&state).await;
@@ -4113,6 +4353,16 @@ mod tests {
             .await
             .unwrap();
 
+        let refused = client()
+            .get(format!("{}/api/runs", url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400);
+        assert_eq!(refused.text().await.unwrap(), "no project open");
+        assert_eq!(state.db.get_translation_runs().unwrap().len(), 2);
+        mark_project_open(&state).await;
+
         let resp = client()
             .get(format!("{}/api/runs", url))
             .send()
@@ -4293,7 +4543,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_glossary_add_and_get() {
-        let (url, _h) = setup().await;
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         let resp = client()
             .post(format!("{}/api/glossary", url))
             .json(&serde_json::json!({
@@ -4320,7 +4571,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_glossary_delete() {
-        let (url, _h) = setup().await;
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         client()
             .post(format!("{}/api/glossary", url))
             .json(&serde_json::json!({
@@ -4345,6 +4597,7 @@ mod tests {
     #[tokio::test]
     async fn test_export_po_returns_text() {
         let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         let mut entry = StringEntry::new("e1", "Hello", PathBuf::from("f.json"));
         entry.translation = Some("Hola".to_string());
         state.db.save_entries(&[entry]).unwrap();
@@ -4470,7 +4723,8 @@ mod tests {
 
     #[tokio::test]
     async fn foreign_origin_post_does_not_mutate() {
-        let (url, _h) = setup().await;
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
         let resp = client()
             .post(format!("{url}/api/glossary"))
             .header("Origin", "https://evil.example")

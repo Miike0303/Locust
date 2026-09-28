@@ -437,10 +437,17 @@ pub async fn cancel_translation(
 pub async fn run_validation(
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    let s = state.0.clone();
+    apply_run_validation(&state.0).await
+}
+
+async fn apply_run_validation(s: &Arc<AppState>) -> Result<serde_json::Value, String> {
+    let s = s.clone();
     // Same exclusive as HTTP validate: issue writes must not race Database::reopen.
     let exclusive = try_project_operation(&s)?;
     run_owned_project_operation(exclusive, async move {
+        if s.current_project.read().await.is_none() {
+            return Err("no project open".into());
+        }
         let entries =
             s.db.get_entries(&EntryFilter::default())
                 .map_err(|e| e.to_string())?;
@@ -479,9 +486,20 @@ pub async fn export_translations(
     path: String,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    let s = &state.0;
+    apply_export_translations(&state.0, format, lang, path).await
+}
+
+async fn apply_export_translations(
+    s: &Arc<AppState>,
+    format: String,
+    lang: String,
+    path: String,
+) -> Result<serde_json::Value, String> {
     let default_source = s.config.read().await.default_source_lang.clone();
     let _exclusive = try_project_operation(s)?;
+    if s.current_project.read().await.is_none() {
+        return Err("no project open".into());
+    }
     let entries =
         s.db.get_entries(&EntryFilter::default())
             .map_err(|e| e.to_string())?;
@@ -519,7 +537,15 @@ pub async fn import_translations(
     path: String,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
-    let s = state.0.clone();
+    apply_import_translations(&state.0, format, path).await
+}
+
+async fn apply_import_translations(
+    s: &Arc<AppState>,
+    format: String,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    let s = s.clone();
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     if content.trim().is_empty() {
         return Err("import file is empty".into());
@@ -538,6 +564,9 @@ pub async fn import_translations(
     let attempted = updates.len();
     let exclusive = try_project_operation(&s)?;
     run_owned_project_operation(exclusive, async move {
+        if s.current_project.read().await.is_none() {
+            return Err("no project open".into());
+        }
         let report =
             s.db.save_imported_translations_batch(updates)
                 .await
@@ -588,15 +617,25 @@ pub async fn run_inject(
     params: InjectParams,
     state: State<'_, AppStateWrapper>,
 ) -> Result<serde_json::Value, String> {
+    apply_run_inject(params, &state.0).await
+}
+
+async fn apply_run_inject(
+    params: InjectParams,
+    s: &Arc<AppState>,
+) -> Result<serde_json::Value, String> {
     // Same guard as CLI/server: empty languages used to return success with
     // zero work and zero recording — a silent no-op that breaks `locust patch`.
     if params.languages.is_empty() {
         return Err(INJECT_EMPTY_LANGUAGES_MESSAGE.to_string());
     }
-    let s = state.0.clone();
+    let s = s.clone();
     let exclusive = try_project_operation(&s)?;
 
     if params.direct {
+        if s.current_project.read().await.is_none() {
+            return Err("no project open".into());
+        }
         let game_path = PathBuf::from(&params.project_path);
         let format_id = params.format_id.clone();
         let languages = params.languages.clone();
@@ -616,6 +655,9 @@ pub async fn run_inject(
     }
 
     run_owned_project_operation(exclusive, async move {
+        if s.current_project.read().await.is_none() {
+            return Err("no project open".into());
+        }
         let mode = params.mode.unwrap_or(OutputMode::Replace);
         let injector = locust_core::extraction::MultiLangInjector::new(
             s.format_registry.clone(),
@@ -740,25 +782,33 @@ pub fn get_backups(
 }
 
 #[tauri::command]
-pub fn get_glossary(
+pub async fn get_glossary(
     lang_pair: String,
-    state: State<AppStateWrapper>,
+    state: State<'_, AppStateWrapper>,
 ) -> Result<Vec<GlossaryEntry>, String> {
-    state
-        .0
-        .glossary
-        .get_all(&lang_pair)
-        .map_err(|e| e.to_string())
+    apply_get_glossary(&state.0, &lang_pair).await
+}
+
+async fn apply_get_glossary(s: &AppState, lang_pair: &str) -> Result<Vec<GlossaryEntry>, String> {
+    if s.current_project.read().await.is_none() {
+        return Err("no project open".into());
+    }
+    s.glossary.get_all(lang_pair).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn add_glossary_entry(
+pub async fn add_glossary_entry(
     entry: GlossaryEntry,
-    state: State<AppStateWrapper>,
+    state: State<'_, AppStateWrapper>,
 ) -> Result<(), String> {
-    state
-        .0
-        .glossary
+    apply_add_glossary_entry(&state.0, &entry).await
+}
+
+async fn apply_add_glossary_entry(s: &AppState, entry: &GlossaryEntry) -> Result<(), String> {
+    if s.current_project.read().await.is_none() {
+        return Err("no project open".into());
+    }
+    s.glossary
         .add(
             &entry.term,
             &entry.translation,
@@ -905,6 +955,170 @@ mod tests {
         e.translation = Some(translation.into());
         e.status = StringStatus::Translated;
         e
+    }
+
+    #[tokio::test]
+    async fn validation_requires_an_open_project() {
+        let state = locust_server::create_test_state();
+        state
+            .db
+            .save_entries(&[translated_entry("leftover", "Hello", "Hola")])
+            .unwrap();
+        let before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
+        let issues_before =
+            serde_json::to_value(state.db.get_validation_issues(None).unwrap()).unwrap();
+
+        assert_eq!(
+            apply_run_validation(&state).await.unwrap_err(),
+            "no project open"
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.get_validation_issues(None).unwrap()).unwrap(),
+            issues_before
+        );
+    }
+
+    #[tokio::test]
+    async fn export_requires_an_open_project() {
+        let state = locust_server::create_test_state();
+        state
+            .db
+            .save_entries(&[translated_entry("leftover", "Hello", "Hola")])
+            .unwrap();
+        let before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
+        let output = std::env::temp_dir().join(format!("locust_export_{}", uuid::Uuid::new_v4()));
+
+        for format in ["po", "xliff"] {
+            let file = output.with_extension(format);
+            assert_eq!(
+                apply_export_translations(
+                    &state,
+                    format.into(),
+                    "es".into(),
+                    file.to_string_lossy().into_owned(),
+                )
+                .await
+                .unwrap_err(),
+                "no project open"
+            );
+            assert!(!file.exists());
+        }
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn import_requires_an_open_project() {
+        let state = locust_server::create_test_state();
+        state
+            .db
+            .save_entries(&[translated_entry("leftover", "Hello", "Hola")])
+            .unwrap();
+        let before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
+        let input = std::env::temp_dir().join(format!("locust_import_{}", uuid::Uuid::new_v4()));
+        let po = "msgctxt \"leftover\"\nmsgid \"Hello\"\nmsgstr \"Wrong\"\n";
+        let xliff = r#"<xliff version="1.2"><file><body><trans-unit id="leftover"><source>Hello</source><target>Wrong</target></trans-unit></body></file></xliff>"#;
+
+        for (format, body) in [("po", po), ("xliff", xliff)] {
+            std::fs::write(&input, body).unwrap();
+            assert_eq!(
+                apply_import_translations(
+                    &state,
+                    format.into(),
+                    input.to_string_lossy().into_owned(),
+                )
+                .await
+                .unwrap_err(),
+                "no project open"
+            );
+            assert_eq!(
+                serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap(),
+                before
+            );
+        }
+        std::fs::remove_file(&input).unwrap();
+    }
+
+    #[tokio::test]
+    async fn injection_requires_an_open_project() {
+        let state = locust_server::create_test_state();
+        state
+            .db
+            .save_entries(&[translated_entry("leftover", "Hello", "Hola")])
+            .unwrap();
+        let before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
+        let recordings_before = state.db.list_recorded_langs().unwrap();
+        let game = std::env::temp_dir().join(format!("locust_inject_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&game).unwrap();
+        let file = game.join("story.html");
+        let original = b"<p>Hello</p>";
+        std::fs::write(&file, original).unwrap();
+
+        for direct in [false, true] {
+            let params = InjectParams {
+                project_path: game.to_string_lossy().into_owned(),
+                format_id: "html-game".into(),
+                mode: None,
+                languages: vec!["es".into()],
+                output_dir: None,
+                direct,
+            };
+            assert_eq!(
+                apply_run_inject(params, &state).await.unwrap_err(),
+                "no project open"
+            );
+            assert_eq!(
+                serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(state.db.list_recorded_langs().unwrap(), recordings_before);
+            assert_eq!(std::fs::read(&file).unwrap(), original);
+        }
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[tokio::test]
+    async fn glossary_requires_an_open_project() {
+        let state = locust_server::create_test_state();
+        state
+            .db
+            .save_entries(&[translated_entry("leftover", "Hello", "Hola")])
+            .unwrap();
+        state.glossary.add("HP", "PV", "en-es", None).unwrap();
+        let before = serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap();
+        let row_before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
+        let new_entry = GlossaryEntry {
+            term: "MP".into(),
+            translation: "PM".into(),
+            lang_pair: "en-es".into(),
+            context: None,
+            case_sensitive: false,
+        };
+
+        assert_eq!(
+            apply_get_glossary(&state, "en-es").await.unwrap_err(),
+            "no project open"
+        );
+        assert_eq!(
+            apply_add_glossary_entry(&state, &new_entry)
+                .await
+                .unwrap_err(),
+            "no project open"
+        );
+        assert_eq!(
+            serde_json::to_value(state.glossary.get_all("en-es").unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap(),
+            row_before
+        );
     }
 
     #[tokio::test]

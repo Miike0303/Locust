@@ -9,6 +9,12 @@ async fn http_import_reports_stale_sources_and_keeps_current_reviewed_translatio
     old.status = StringStatus::Reviewed;
     let fresh = StringEntry::new("fresh", "Fresh source", "story.html".into());
     state.db.save_entries(&[old, fresh]).unwrap();
+    *state.current_project.write().await = Some(locust_server::ProjectInfo {
+        path: "story.html".into(),
+        format_id: "html-game".into(),
+        name: "story".into(),
+        ..Default::default()
+    });
     let (url, handle) = locust_server::start_test_server(state.clone()).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let po = "msgctxt \"stale\"\nmsgid \"Old source\"\nmsgstr \"Outdated translation\"\n\nmsgctxt \"fresh\"\nmsgid \"Fresh source\"\nmsgstr \"Traducción\"\n";
