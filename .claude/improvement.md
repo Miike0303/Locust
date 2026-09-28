@@ -63,9 +63,18 @@ Owned by no lane; Claude applies these after the writers finish.
   stray `*.locust.db` files sit in `apps/desktop/`. The backlog of uncommitted
   work since 2026-09-03 was snapshotted in `e0e5268..` on 2026-09-26. A dirty
   tree at cycle start means someone else is working here: stop.
-- **Writers: Codex ONLY (user, 2026-09-27).** No Cursor, no Grok Build. Use
+- **Writers: Codex first (user, 2026-09-27); Cursor Grok 4.7 only as the fallback below (user, 2026-09-28).** No Grok Build. Use
   Codex until its quota and resets are exhausted or the user says otherwise.
   Supersedes the 2026-09-26 Codex+Cursor authorization.
+- **Fallback: Cursor Grok 4.7 when Codex is unavailable (user, 2026-09-28: "usa cursor, grok 4.7 si codex no esta
+  disponible").** Codex stays primary. "Unavailable" means: the trivial `codex exec` probe gets no answer within
+  180 s, a Codex session stalls or fails the sandbox twice in a row for the same step, or Codex quota is exhausted.
+  Then use Cursor: writers `~/.claude/bin/cursor-write.ps1 -WorkDir <repo> -Model grok-4.7-xhigh -PromptFile <brief>`;
+  researchers `~/.claude/bin/cursor-ask.ps1 -WorkDir <repo> -Mode ask -Model grok-4.7-high -PromptFile <brief>`
+  (`ask`, not `plan`: plan returned empty output before). Never the `-fast` variants. Probe Codex again at the next
+  step and switch back as soon as it answers. Cursor Ultra is credit-metered: only as a fallback, never in parallel with
+  a Codex writer on this tree. Grok historically stops at the TDD red phase (see above): check the suite is not red
+  before accepting its report, and expect one `-Continue` dispatch.
 - **Model allow-list (user, 2026-09-27, supersedes 2026-09-26). Never substitute. No Fast tier:**
   - Codex writers: `gpt-6-astra` with `-c model_reasoning_effort=xhigh`.
   - Codex researchers and any subagent: `gpt-6-astra` with `-c model_reasoning_effort=high`.
