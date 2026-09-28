@@ -936,6 +936,44 @@ fn split_ypf_virtual_path(path: &Path) -> Option<(String, String)> {
     Some((archive, inner))
 }
 
+#[cfg(test)]
+thread_local! {
+    static YPF_LOOKUP_NORMALIZATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn normalize_ypf_lookup_name(name: &str) -> String {
+    #[cfg(test)]
+    YPF_LOOKUP_NORMALIZATIONS.with(|count| {
+        if let Some(n) = count.get() {
+            count.set(Some(n + 1));
+        }
+    });
+    name.replace('\\', "/")
+}
+
+/// Index each archive once, preserving the first match for duplicate names.
+struct YpfMemberIndex<'a> {
+    entries: &'a [yuris_ypf::YpfEntry],
+    by_name: HashMap<String, usize>,
+}
+
+impl<'a> YpfMemberIndex<'a> {
+    fn new(entries: &'a [yuris_ypf::YpfEntry]) -> Self {
+        let mut by_name = HashMap::with_capacity(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            by_name
+                .entry(normalize_ypf_lookup_name(&entry.name))
+                .or_insert(i);
+        }
+        Self { entries, by_name }
+    }
+
+    fn find(&self, inner: &str) -> Option<&'a yuris_ypf::YpfEntry> {
+        let normalized = normalize_ypf_lookup_name(inner);
+        self.by_name.get(&normalized).map(|&i| &self.entries[i])
+    }
+}
+
 // ─── FormatPlugin ──────────────────────────────────────────────────────────
 
 impl FormatPlugin for YurisPlugin {
@@ -1210,13 +1248,10 @@ impl FormatPlugin for YurisPlugin {
 
             let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
             let mut arch_written = 0usize;
+            let member_index = YpfMemberIndex::new(&archive.entries);
 
             for (inner, file_entries) in inners {
-                let entry = match archive
-                    .entries
-                    .iter()
-                    .find(|e| e.name.replace('\\', "/") == inner.replace('\\', "/"))
-                {
+                let entry = match member_index.find(&inner) {
                     Some(e) => e,
                     None => {
                         warnings.push(format!("entry {inner} not in {archive_rel}"));
@@ -1302,6 +1337,126 @@ impl FormatPlugin for YurisPlugin {
 
 #[cfg(test)]
 mod tests {
+    fn lookup_members(names: impl IntoIterator<Item = String>) -> Vec<yuris_ypf::YpfEntry> {
+        names
+            .into_iter()
+            .map(|name| yuris_ypf::YpfEntry {
+                name,
+                index_name: Vec::new(),
+                name_hash: 0,
+                file_type: 0,
+                is_packed: false,
+                unpacked_size: 0,
+                packed_size: 0,
+                offset: 0,
+                checksum: 0,
+                extra: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ypf_member_index_preserves_first_match_and_name_rules() {
+        let members = lookup_members(
+            [
+                "scripts\\first.ybn",
+                "scripts/first.ybn",
+                "scripts/second.ybn",
+                "Scripts/first.ybn",
+            ]
+            .map(String::from),
+        );
+        let index = YpfMemberIndex::new(&members);
+        for (name, expected) in [
+            ("scripts/first.ybn", 0),
+            ("scripts\\first.ybn", 0),
+            ("scripts\\second.ybn", 2),
+            ("Scripts/first.ybn", 3),
+        ] {
+            assert!(std::ptr::eq(index.find(name).unwrap(), &members[expected]));
+        }
+        assert!(index.find("scripts/FIRST.ybn").is_none());
+        assert!(index.find("scripts/missing.ybn").is_none());
+        assert!(YpfMemberIndex::new(&[]).find("missing.ybn").is_none());
+    }
+
+    #[test]
+    fn ypf_member_index_normalizations_scale_with_members_plus_scripts() {
+        // Place scripts after unrelated assets so a per-script scan is costly.
+        let members = lookup_members(
+            (0..16_000)
+                .map(|i| format!("images\\asset{i:05}.png"))
+                .chain((0..2_000).map(|i| format!("scripts\\yst{i:05}.ybn"))),
+        );
+        let scripts: Vec<_> = (0..2_000)
+            .map(|i| format!("scripts/yst{i:05}.ybn"))
+            .collect();
+
+        YPF_LOOKUP_NORMALIZATIONS.with(|count| count.set(Some(0)));
+        let index = YpfMemberIndex::new(&members);
+        let member_normalizations =
+            YPF_LOOKUP_NORMALIZATIONS.with(|count| count.replace(Some(0)).unwrap());
+        for (i, script) in scripts.iter().enumerate() {
+            assert!(std::ptr::eq(
+                index.find(script).unwrap(),
+                &members[16_000 + i]
+            ));
+        }
+        let lookup_normalizations =
+            YPF_LOOKUP_NORMALIZATIONS.with(|count| count.replace(None).unwrap());
+        eprintln!(
+            "YPF normalizations: members={member_normalizations}, lookups={lookup_normalizations}"
+        );
+        assert!(
+            member_normalizations <= 20_000,
+            "member normalizations: {member_normalizations} > 20000"
+        );
+        assert!(
+            lookup_normalizations <= 2_000,
+            "lookup normalizations: {lookup_normalizations} > 2000"
+        );
+    }
+
+    #[test]
+    fn ypf_missing_members_keep_warning_and_skipped_count() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("game.ypf");
+        let ystb = build_minimal_ystb(TRUE_KEY_B4626AD8, "Hello original!", "Untouched line");
+        let original =
+            yuris_ypf::write_ypf(0x1E4, 0xFF, &[("scripts/present.ybn".into(), ystb, true)])
+                .unwrap();
+        fs::write(&path, &original).unwrap();
+        let mut entries = Vec::new();
+        for inner in ["scripts/missing.ybn", "scripts/PRESENT.ybn"] {
+            for arg in 0..2 {
+                let virtual_path = format!("game.ypf/{inner}");
+                let mut entry = StringEntry::new(
+                    format!("{virtual_path}#arg{arg}"),
+                    "Original text",
+                    PathBuf::from(virtual_path),
+                );
+                entry.translation = Some("Translated text".into());
+                entries.push(entry);
+            }
+        }
+
+        let report = YurisPlugin::new().inject(root.path(), &entries).unwrap();
+        assert_eq!(report.strings_skipped, 4, "{report:?}");
+        assert_eq!(report.strings_written, 0, "{report:?}");
+        assert_eq!(report.files_modified, 0, "{report:?}");
+        assert!(report.files_written.is_empty(), "{report:?}");
+        let mut warnings = report.warnings;
+        warnings.sort();
+        assert_eq!(
+            warnings,
+            [
+                "entry scripts/PRESENT.ybn not in game.ypf",
+                "entry scripts/missing.ybn not in game.ypf",
+            ]
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
     #[test]
     fn held_lock_injects_loose_and_archive_without_releasing_exclusion() {
         for packed in [false, true] {
