@@ -49,6 +49,71 @@ pub struct VerificationReport {
     pub messages: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptVerificationMode {
+    /// Trust files whose modification time is no newer than the receipt.
+    Quick,
+    /// Hash every present file regardless of modification time.
+    Full,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReceiptVerificationReport {
+    /// Number of receipt entries inspected, including missing and trusted files.
+    pub checked: usize,
+    pub changed: Vec<String>,
+    pub missing: Vec<String>,
+}
+
+/// Check installed files without acquiring GameLock or writing to the game.
+/// Quick mode relies on apply publishing the receipt after writing the files;
+/// full mode also detects edits that preserve or backdate modification times.
+pub fn verify_receipt_files(
+    store: &PatchStore,
+    receipt: &Receipt,
+    mode: ReceiptVerificationMode,
+) -> Result<ReceiptVerificationReport> {
+    let root = store.game_root().canonicalize()?;
+    let receipt_modified = match mode {
+        ReceiptVerificationMode::Quick => Some(store.receipt_path().metadata()?.modified()?),
+        ReceiptVerificationMode::Full => None,
+    };
+    let files = receipt
+        .replaced
+        .iter()
+        .map(|file| (&file.path, &file.patched_sha256))
+        .chain(
+            receipt
+                .added
+                .iter()
+                .map(|file| (&file.path, &file.patched_sha256)),
+        );
+    let mut report = ReceiptVerificationReport::default();
+    for (path, expected) in files {
+        let relative = super::zipsec::safe_stored_rel(path)?;
+        let target = root.join(relative);
+        report.checked += 1;
+        if !target.is_file() {
+            report.missing.push(path.clone());
+            continue;
+        }
+        if !target.canonicalize()?.starts_with(&root) {
+            return Err(LocustError::PatchError(format!(
+                "patch file resolves outside game folder: {path}"
+            )));
+        }
+        if let Some(receipt_modified) = receipt_modified {
+            if target.metadata()?.modified()? <= receipt_modified {
+                continue;
+            }
+        }
+        if sha256_path(&target)? != *expected {
+            report.changed.push(path.clone());
+        }
+    }
+    Ok(report)
+}
+
 /// Open the zip, scan security, parse optional manifest, compare to game.
 pub fn verify(game_root: &Path, zip_path: &Path) -> Result<VerificationReport> {
     let game_lock = super::lock::GameLock::acquire(game_root)?;
@@ -798,6 +863,89 @@ pub fn classify_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receipt_fixture() -> (tempfile::TempDir, PatchStore, Receipt) {
+        let game = tempfile::tempdir().unwrap();
+        let store = PatchStore::new(game.path());
+        std::fs::write(game.path().join("replaced.txt"), b"patched").unwrap();
+        std::fs::write(game.path().join("added.txt"), b"added").unwrap();
+        let receipt = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "patch_id": "fixture", "patch_version": "1",
+            "generator_version": "test", "language": "es", "engine": "html",
+            "applied_at": "fixture", "verification": "strict", "forced": false,
+            "baseline": "pristine", "created_dirs": [],
+            "replaced": [{"path": "replaced.txt", "patched_sha256": crate::database::sha256_hex(b"patched")}],
+            "added": [{"path": "added.txt", "patched_sha256": crate::database::sha256_hex(b"added")}]
+        }))
+        .unwrap();
+        store.write_receipt(&receipt).unwrap();
+        (game, store, receipt)
+    }
+
+    #[test]
+    fn receipt_quick_trusts_old_and_equal_mtime_but_full_detects_changes() {
+        let (game, store, receipt) = receipt_fixture();
+        let receipt_modified = store.receipt_path().metadata().unwrap().modified().unwrap();
+        let target = game.path().join("replaced.txt");
+        std::fs::write(&target, b"user edit").unwrap();
+        let file = File::options().write(true).open(&target).unwrap();
+        for modified in [
+            receipt_modified - std::time::Duration::from_secs(2),
+            receipt_modified,
+        ] {
+            file.set_modified(modified).unwrap();
+            let quick =
+                verify_receipt_files(&store, &receipt, ReceiptVerificationMode::Quick).unwrap();
+            assert_eq!(quick.checked, 2);
+            assert!(quick.changed.is_empty(), "old edits must remain trusted");
+            assert!(quick.missing.is_empty());
+            let full =
+                verify_receipt_files(&store, &receipt, ReceiptVerificationMode::Full).unwrap();
+            assert_eq!(full.checked, 2);
+            assert_eq!(full.changed, ["replaced.txt"]);
+            assert!(full.missing.is_empty());
+        }
+        // Full verification does not depend on a receipt file on disk.
+        std::fs::remove_file(store.receipt_path()).unwrap();
+        assert_eq!(
+            verify_receipt_files(&store, &receipt, ReceiptVerificationMode::Full)
+                .unwrap()
+                .changed,
+            ["replaced.txt"]
+        );
+    }
+
+    #[test]
+    fn receipt_quick_detects_newer_changes_and_missing_files() {
+        let (game, store, receipt) = receipt_fixture();
+        let receipt_modified = store.receipt_path().metadata().unwrap().modified().unwrap();
+        let target = game.path().join("replaced.txt");
+        std::fs::write(&target, b"user edit").unwrap();
+        File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(receipt_modified + std::time::Duration::from_secs(2))
+            .unwrap();
+        std::fs::remove_file(game.path().join("added.txt")).unwrap();
+        let report =
+            verify_receipt_files(&store, &receipt, ReceiptVerificationMode::Quick).unwrap();
+        assert_eq!(report.checked, 2);
+        assert_eq!(report.changed, ["replaced.txt"]);
+        assert_eq!(report.missing, ["added.txt"]);
+    }
+
+    #[test]
+    fn receipt_verification_rejects_unsafe_paths_in_both_modes() {
+        let (_game, store, mut receipt) = receipt_fixture();
+        receipt.replaced[0].path = "../outside.txt".into();
+        for mode in [
+            ReceiptVerificationMode::Quick,
+            ReceiptVerificationMode::Full,
+        ] {
+            assert!(verify_receipt_files(&store, &receipt, mode).is_err());
+        }
+    }
 
     #[test]
     fn classify_files_hashes_only_existing_added_paths() {

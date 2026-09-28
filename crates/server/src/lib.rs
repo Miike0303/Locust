@@ -2135,18 +2135,41 @@ async fn patch_status(
         locust_core::patch::PatchStatus::NotPatched => {
             serde_json::json!({ "status": "not_patched" })
         }
-        locust_core::patch::PatchStatus::Patched(r) => serde_json::json!({
-            "status": "patched",
-            "patch_id": r.patch_id,
-            "patch_version": r.patch_version,
-            "engine": r.engine,
-            "language": r.language,
-            "baseline": format!("{:?}", r.baseline),
-            "forced": r.forced,
-            "applied_at": r.applied_at,
-            "replaced": r.replaced.len(),
-            "added": r.added.len(),
-        }),
+        locust_core::patch::PatchStatus::Patched(r) => {
+            // Status is read-only: no GameLock. The journal check above gives
+            // an in-flight apply precedence as Interrupted.
+            let (r, report) = tokio::task::spawn_blocking(move || {
+                locust_core::patch::verify_receipt_files(
+                    &store,
+                    &r,
+                    locust_core::patch::ReceiptVerificationMode::Quick,
+                )
+                .map(|report| (r, report))
+            })
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .map_err(map_patch_err)?;
+            let mut body = serde_json::json!({
+                "status": "patched",
+                "patch_id": r.patch_id,
+                "patch_version": r.patch_version,
+                "engine": r.engine,
+                "language": r.language,
+                "baseline": format!("{:?}", r.baseline),
+                "forced": r.forced,
+                "applied_at": r.applied_at,
+                "replaced": r.replaced.len(),
+                "added": r.added.len(),
+            });
+            if !report.changed.is_empty() || !report.missing.is_empty() {
+                body["status"] = serde_json::json!("unknown");
+                body["drift"] = serde_json::json!({
+                    "changed": report.changed,
+                    "missing": report.missing,
+                });
+            }
+            body
+        }
         locust_core::patch::PatchStatus::Interrupted(j) => serde_json::json!({
             "status": "interrupted",
             "patch_id": j.patch_id,
@@ -2670,6 +2693,13 @@ async fn delete_memory_entry(
 async fn clear_memory(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move { clear_memory_owned(state).await })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
+async fn clear_memory_owned(state: Arc<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     // Clear both global memory and project-level memory
     state
         .global_memory

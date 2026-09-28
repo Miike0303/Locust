@@ -42,6 +42,62 @@ fn options() -> TranslationOptions {
     }
 }
 
+#[tokio::test]
+async fn clear_memory_refuses_project_conflict_without_clearing_either_store() {
+    let state = state().await;
+    state
+        .db
+        .save_memory("project-hash", "Project", "Proyecto", "en-es")
+        .await
+        .unwrap();
+    state
+        .global_memory
+        .save_memory("global-hash", "Global", "Global", "en-es")
+        .await
+        .unwrap();
+    let (base, server) = start_test_server(state.clone()).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let held = locust_server::try_project_operation(&state).unwrap();
+    let response = client
+        .delete(format!("{base}/api/memory"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert_eq!(state.db.memory_count().unwrap(), 1);
+    assert_eq!(state.global_memory.memory_count().unwrap(), 1);
+    assert_eq!(
+        state
+            .db
+            .lookup_memory("project-hash", "en-es")
+            .unwrap()
+            .as_deref(),
+        Some("Proyecto")
+    );
+    assert_eq!(
+        state
+            .global_memory
+            .lookup_memory("global-hash", "en-es")
+            .unwrap()
+            .as_deref(),
+        Some("Global")
+    );
+    drop(held);
+    let response = client
+        .delete(format!("{base}/api/memory"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"ok":true})
+    );
+    assert_eq!(state.db.memory_count().unwrap(), 0);
+    assert_eq!(state.global_memory.memory_count().unwrap(), 0);
+    server.abort();
+}
+
 async fn start(base: &str, provider: &str) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("{base}/api/translate/start"))

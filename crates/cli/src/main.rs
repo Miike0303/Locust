@@ -1102,43 +1102,35 @@ fn verify_patch_receipt_files(
     game_path: &Path,
     receipt: &locust_core::patch::Receipt,
 ) -> anyhow::Result<()> {
-    use locust_core::database::sha256_path;
-    use locust_core::patch::zipsec::safe_stored_rel;
+    use locust_core::patch::{verify_receipt_files, PatchStore, ReceiptVerificationMode};
 
-    let root = game_path.canonicalize()?;
+    let report = verify_receipt_files(
+        &PatchStore::new(game_path),
+        receipt,
+        ReceiptVerificationMode::Full,
+    )?;
+    let changed: std::collections::HashSet<_> = report.changed.iter().collect();
+    let missing: std::collections::HashSet<_> = report.missing.iter().collect();
     let files = receipt
         .replaced
         .iter()
-        .map(|file| (file.path.as_str(), file.patched_sha256.as_str()))
-        .chain(
-            receipt
-                .added
-                .iter()
-                .map(|file| (file.path.as_str(), file.patched_sha256.as_str())),
-        );
-    let mut checked = 0;
-    let mut differing = 0;
-    for (path, expected) in files {
-        let relative = safe_stored_rel(path)?;
-        let target = root.join(relative);
-        checked += 1;
-        if !target.is_file() {
+        .map(|file| &file.path)
+        .chain(receipt.added.iter().map(|file| &file.path));
+    for path in files {
+        if missing.contains(path) {
             println!("missing: {path}");
-            differing += 1;
-            continue;
-        }
-        if !target.canonicalize()?.starts_with(&root) {
-            anyhow::bail!("patch file resolves outside game folder: {path}");
-        }
-        if sha256_path(&target)? != expected {
+        } else if changed.contains(path) {
             println!("changed: {path}");
-            differing += 1;
         }
     }
+    let differing = report.changed.len() + report.missing.len();
     if differing > 0 {
         anyhow::bail!("{differing} patch file(s) differ from the receipt");
     }
-    println!("verified {checked} patch file(s) against the receipt");
+    println!(
+        "verified {} patch file(s) against the receipt",
+        report.checked
+    );
     Ok(())
 }
 

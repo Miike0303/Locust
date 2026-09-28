@@ -1206,6 +1206,78 @@ async fn collect_patch_ws_frames(base_url: &str, job_id: &str) -> Vec<serde_json
     frames
 }
 
+#[tokio::test]
+async fn patch_status_detects_receipt_drift() {
+    let (_fixture, zip, game) = make_strict_patch(2);
+    let (base_url, server) =
+        locust_server::start_test_server(locust_server::create_test_state()).await;
+    let job = start_patch_apply_job(
+        &base_url,
+        &serde_json::json!({"game_path": game, "zip_path": zip}),
+    )
+    .await;
+    let frames = collect_patch_ws_frames(&base_url, &job).await;
+    assert!(
+        frames.iter().any(|frame| frame["type"] == "done"),
+        "{frames:?}"
+    );
+    let store = locust_core::patch::PatchStore::new(&game);
+    let receipt = store.read_receipt().unwrap().unwrap();
+    let receipt_modified = store.receipt_path().metadata().unwrap().modified().unwrap();
+    let original_body = serde_json::json!({
+        "status": "patched",
+        "patch_id": receipt.patch_id,
+        "patch_version": receipt.patch_version,
+        "engine": receipt.engine,
+        "language": receipt.language,
+        "baseline": format!("{:?}", receipt.baseline),
+        "forced": receipt.forced,
+        "applied_at": receipt.applied_at,
+        "replaced": receipt.replaced.len(),
+        "added": receipt.added.len(),
+    });
+    // Status must remain available while a game lock is held elsewhere.
+    let _lock = locust_core::patch::GameLock::acquire(&game).unwrap();
+    for scenario in ["untouched", "missing", "changed"] {
+        let mut expected = original_body.clone();
+        match scenario {
+            "missing" => {
+                std::fs::remove_file(game.join("data/f0.txt")).unwrap();
+                expected["status"] = serde_json::json!("unknown");
+                expected["drift"] = serde_json::json!({
+                    "changed": [], "missing": ["data/f0.txt"]
+                });
+            }
+            "changed" => {
+                std::fs::write(game.join("data/f0.txt"), b"xlat0").unwrap();
+                let target = game.join("data/f1.txt");
+                std::fs::write(&target, b"user edit").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(target)
+                    .unwrap()
+                    .set_modified(receipt_modified + std::time::Duration::from_secs(2))
+                    .unwrap();
+                expected["status"] = serde_json::json!("unknown");
+                expected["drift"] = serde_json::json!({
+                    "changed": ["data/f1.txt"], "missing": []
+                });
+            }
+            _ => {}
+        }
+        let response = client()
+            .post(format!("{base_url}/api/patch/status"))
+            .json(&serde_json::json!({"game_path": game}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{scenario}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body, expected, "{scenario}");
+    }
+    server.abort();
+}
+
 /// The four patch endpoints that had no coverage, driven in their real order
 /// against a real packed zip: verify → apply → status → rollback. The game must
 /// come back byte-identical, which is the whole promise of the transaction.

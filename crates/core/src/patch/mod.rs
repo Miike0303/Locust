@@ -1,8 +1,9 @@
 //! Automatic patch application engine.
 //!
 //! Shared by CLI, Axum server, and external patchers. Verification never writes
-//! the game and runs before any asset write. Each public operation holds one
-//! cross-process game lock in per-user OS data storage. Apply is journaled —
+//! the game and runs before any asset write. Mutations and archive verification
+//! hold a cross-process game lock in per-user OS data storage; receipt status
+//! checks are read-only and do not acquire it. Apply is journaled —
 //! recovery is always rollback-to-pristine via `.locust/backup/`.
 //!
 //! Authoritative rules (design rev 4):
@@ -33,4 +34,7 @@ pub use pack::{
 };
 pub use rollback::{preview_rollback, rollback, RollbackOptions, RollbackReport};
 pub use store::{PatchStatus, PatchStore};
-pub use verify::{verify, FileMismatch, VerificationOutcome, VerificationReport};
+pub use verify::{
+    verify, verify_receipt_files, FileMismatch, ReceiptVerificationMode, ReceiptVerificationReport,
+    VerificationOutcome, VerificationReport,
+};
