@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use locust_core::encoding::EncodingDetector;
 use locust_core::error::{LocustError, Result};
+use locust_core::injection_transaction::ensure_no_pending_under_lock;
+use locust_core::patch::GameLock;
 use serde::Serialize;
 
 use crate::rpgmaker_mv::RpgMakerMvPlugin;
@@ -52,13 +54,17 @@ pub fn register_language(
         });
     }
 
+    let lock = GameLock::acquire(game_root)?;
+    ensure_no_pending_under_lock(&lock)?;
+
     let mut report = RegisterLanguageReport::default();
+    let mut planned = Vec::new();
 
     let plugins = game_root.join("js").join("plugins.js");
     if plugins.is_file() {
-        let backup = backup_file(&plugins)?;
-        report.backups.push(backup);
-        let (iavra, visu) = patch_plugins_js(&plugins, lang, label)?;
+        let (file, iavra, visu) = patch_plugins_js(&plugins, lang, label)?;
+        // Keep the existing plugins.js backup/report behavior even on a no-op.
+        planned.push(file);
         report.plugins_js = iavra || visu;
         report.iavra_languages = iavra;
         report.visumz_options = visu;
@@ -77,9 +83,9 @@ pub fn register_language(
         RpgMakerMvPlugin::find_data_dir(game_root).unwrap_or_else(|| game_root.join("data"));
     if data_dir.is_dir() {
         let maps = patch_language_choice_maps(&data_dir, lang, label)?;
-        for (path, bak) in maps {
-            report.maps_patched.push(path);
-            report.backups.push(bak);
+        for file in maps {
+            report.maps_patched.push(file.path.clone());
+            planned.push(file);
         }
     }
 
@@ -91,22 +97,74 @@ pub fn register_language(
         );
     }
 
+    // Every read, decode and parse has succeeded before the first backup/write.
+    report.backups = write_planned_files(&planned)?;
     Ok(report)
 }
 
-fn backup_file(path: &Path) -> Result<PathBuf> {
+struct PlannedFile {
+    path: PathBuf,
+    original: Vec<u8>,
+    content: Option<String>,
+}
+
+fn write_planned_files(planned: &[PlannedFile]) -> Result<Vec<PathBuf>> {
+    let mut created_backups = Vec::new();
+    let mut written: Vec<&PlannedFile> = Vec::new();
+    let result = (|| {
+        let mut backups = Vec::new();
+        for file in planned {
+            backups.push(backup_file(&file.path, &mut created_backups)?);
+            if let Some(content) = &file.content {
+                // Include the failing file: write may truncate before returning Err.
+                written.push(file);
+                std::fs::write(&file.path, content)?;
+            }
+        }
+        Ok(backups)
+    })();
+    if result.is_err() {
+        let mut restored = true;
+        for file in written.into_iter().rev() {
+            if std::fs::read(&file.path).is_ok_and(|bytes| bytes == file.original) {
+                continue;
+            }
+            // A .bak-locust may predate this call, so restore the in-memory bytes.
+            if let Err(error) = std::fs::write(&file.path, &file.original) {
+                restored = false;
+                tracing::error!(path = %file.path.display(), %error, "language registration rollback failed");
+            }
+        }
+        // Keep recovery copies if restoration itself failed; return the first error.
+        if restored {
+            for backup in created_backups.into_iter().rev() {
+                if let Err(error) = std::fs::remove_file(&backup) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::error!(path = %backup.display(), %error, "language registration backup cleanup failed");
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn backup_file(path: &Path, created_backups: &mut Vec<PathBuf>) -> Result<PathBuf> {
     let bak = path.parent().unwrap_or(path).join(format!(
         "{}.bak-locust",
         path.file_name().unwrap().to_string_lossy()
     ));
     if !bak.exists() {
+        // Track even a failed copy so a partially created backup is removed.
+        created_backups.push(bak.clone());
         std::fs::copy(path, &bak)?;
     }
     Ok(bak)
 }
 
-fn patch_plugins_js(path: &Path, lang: &str, label: &str) -> Result<(bool, bool)> {
+fn patch_plugins_js(path: &Path, lang: &str, label: &str) -> Result<(PlannedFile, bool, bool)> {
     let mut raw = std::fs::read_to_string(path)?;
+    let original = raw.as_bytes().to_vec();
     let mut iavra = false;
     let mut visu = false;
 
@@ -162,10 +220,15 @@ fn patch_plugins_js(path: &Path, lang: &str, label: &str) -> Result<(bool, bool)
         }
     }
 
-    if iavra || visu {
-        std::fs::write(path, raw)?;
-    }
-    Ok((iavra, visu))
+    Ok((
+        PlannedFile {
+            path: path.to_owned(),
+            original,
+            content: (iavra || visu).then_some(raw),
+        },
+        iavra,
+        visu,
+    ))
 }
 
 fn patch_iavra_languages_param(raw: &str, lang: &str) -> Option<String> {
@@ -287,6 +350,13 @@ fn extend_js_string_array_literal(raw: &str, marker: &str, lang: &str) -> String
     out
 }
 
+fn floor_char_boundary(raw: &str, mut index: usize) -> usize {
+    while !raw.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 fn rewrite_lang_length_clamps(raw: &str) -> String {
     // When a langs = [...] array is nearby, optionsCoreFonts.length - 1 is wrong.
     // Replace with (langs.length - 1) which VisuMZ evaluates as JS.
@@ -295,7 +365,7 @@ fn rewrite_lang_length_clamps(raw: &str) -> String {
     let mut search_from = 0;
     while let Some(rel) = out[search_from..].find(needle) {
         let pos = search_from + rel;
-        let window_start = pos.saturating_sub(600);
+        let window_start = floor_char_boundary(&out, pos.saturating_sub(600));
         let window = &out[window_start..pos + needle.len()];
         if window.contains("langs")
             || window.contains("IAVRA")
@@ -313,7 +383,7 @@ fn rewrite_lang_length_clamps(raw: &str) -> String {
 fn extend_fontfaces_array(raw: &str, lang: &str) -> Option<String> {
     let key = "FontFaces:arraystr";
     let fi = raw.find(key)?;
-    let region_end = (fi + 200).min(raw.len());
+    let region_end = floor_char_boundary(raw, (fi + 200).min(raw.len()));
     let region = &raw[fi..region_end];
     if region.contains(&format!("\"{lang}\""))
         || region.contains(&format!("\\\"{lang}\\\""))
@@ -377,7 +447,7 @@ fn append_language_draw_label(raw: &str, _lang: &str, label: &str) -> Option<Str
     }
     let end = end?;
     // Newline sequence before this drawText
-    let before = &raw[zi.saturating_sub(40)..zi];
+    let before = &raw[floor_char_boundary(raw, zi.saturating_sub(40))..zi];
     let nl = if before.contains("\\\\\\\\\\\\\\\\n") {
         // keep short relative escape — copy last backslash-n run
         let mut run = "\\n";
@@ -446,7 +516,7 @@ fn patch_language_choice_maps(
     data_dir: &Path,
     lang: &str,
     label: &str,
-) -> Result<Vec<(PathBuf, PathBuf)>> {
+) -> Result<Vec<PlannedFile>> {
     let mut changed = Vec::new();
     let rd = match std::fs::read_dir(data_dir) {
         Ok(r) => r,
@@ -465,15 +535,16 @@ fn patch_language_choice_maps(
         if !(lower.starts_with("map") && lower[3..].chars().all(|c| c.is_ascii_digit())) {
             continue;
         }
-        if let Some(bak) = patch_one_map(&path, lang, label)? {
-            changed.push((path, bak));
+        if let Some(file) = patch_one_map(&path, lang, label)? {
+            changed.push(file);
         }
     }
     Ok(changed)
 }
 
-fn patch_one_map(path: &Path, lang: &str, label: &str) -> Result<Option<PathBuf>> {
-    let (raw, _) = EncodingDetector::read_file_auto(path)?;
+fn patch_one_map(path: &Path, lang: &str, label: &str) -> Result<Option<PlannedFile>> {
+    let original = std::fs::read(path)?;
+    let (raw, _) = EncodingDetector::detect_and_decode(&original)?;
     let text = if path.extension().and_then(|e| e.to_str()) == Some("jsono") {
         let units =
             lz_str::decompress_from_base64(raw.trim()).ok_or_else(|| LocustError::ParseError {
@@ -519,10 +590,11 @@ fn patch_one_map(path: &Path, lang: &str, label: &str) -> Result<Option<PathBuf>
     } else {
         serde_json::to_string_pretty(&map)?
     };
-    // Backup original bytes before the first write. Existing .bak-locust is kept.
-    let bak = backup_file(path)?;
-    std::fs::write(path, encoded)?;
-    Ok(Some(bak))
+    Ok(Some(PlannedFile {
+        path: path.to_owned(),
+        original,
+        content: Some(encoded),
+    }))
 }
 
 fn looks_like_language_choices(choices: &[String]) -> bool {
