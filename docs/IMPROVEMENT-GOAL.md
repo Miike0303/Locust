@@ -19,6 +19,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 ## Backlog
 
+- **[capability · CLI · S] `locust export --status <state>`** (cycle 73 research, A). Export always loads `EntryFilter::default()` (`crates/cli/src/main.rs:~2066`) although the filter supports status (`crates/core/src/database.rs:75`); a translator cannot hand off only pending or only unreviewed work. Omitted flag keeps the full export. Check: `--status pending` exports exactly the pending ids, PO and XLIFF.
+
 - **[optimization · formats · S] RPA extraction scans the whole index for every `.rpyc`** (cycle 71 research, A's pick). `index.iter().any(..)` per compiled script (`crates/formats/src/renpy.rs:547-550`) is `rpyc_count × all_members` (images included). Build a `HashSet<&str>` of names once; keep exact case-sensitive matching and member order. Tens of ms on large VNs. Check: 2,000 compiled-only members take ≤4,000 name probes.
 - **[optimization · core · S] Export resolves the source language by loading the whole run ledger** (cycle 71 research, B). `resolve_export_source_lang` materializes every `TranslationRun` (`crates/core/src/database.rs:~1495`, `:~1528`). One scalar query with the same target/empty-source/order/fallback rules. Check: 2,000 runs → ≤1 materialized row, same result.
 
@@ -59,6 +61,8 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 73 (capability; research duel incomplete: researcher B's sandbox reads stalled and it declined to guess; researcher A Codex gpt-6-astra high; writer Codex gpt-6-astra xhigh).** `locust import` saved as soon as it parsed the catalog, so a differing translation replaced an approved or reviewed row with no way to see it first. The per-row decision now lives in one `classify_import` (unknown, stale source, unchanged, kept, fill, replace, confirm) shared by the unchanged save path and a new read-only `preview_imported_translations`; `locust import --dry-run` prints each replacement as `id: "old" (status) -> "new"` (truncated), the fill/unchanged/kept counts and the usual skip line, then "Dry run: nothing was saved." Tests: preview counts equal a following real import across every decision, with and without `--keep-existing`, and every row is byte-identical after the preview; CLI covers PO and XLIFF. Codex negative-tested it (empty preview fails). Claude checked the refactored save path branch by branch against the cycle 67 logic and ran all five gates (1578 pass / 0 fail, 32 frontend). A's second proposal (`export --status`) went to the backlog. Next rotation: `optimization`.
 
 - `pending` — **cycle 72 (defect, from backlog; three independent research runs found it — cycle 61 A, cycle 66 A and B — so no new duel; writer Codex gpt-6-astra xhigh).** `BackupManager::list_backups` propagated the first unreadable `manifest.json` with `?`, so one truncated or hand-edited manifest made `/api/backups` answer 500, the desktop Settings list show "No backups", CLI `locust backups` print only the error and `delete_old_backups` fail: the user could not find the intact backups of their original game files. `list_backups_report` now collects a manifest failure per backup in `unreadable` and keeps going; path-safety (`checked_absolute`, now also checked before loading), `read_dir` and link-rejection errors stay fatal. `list_backups` returns the readable ones and errors only when every backup is unreadable, so a lone damaged backup is never shown as "no backups"; pruning never deletes a damaged one. The CLI warns per damaged backup on stderr. HTTP and Tauri keep their response shape. Codex negative-tested the HTTP case (500 without the fix). Claude ran all five gates (1573 pass / 0 fail, 32 frontend). The desktop still has no way to show which backups are damaged: frontend follow-up. Next rotation: `capability`.
 
@@ -219,6 +223,7 @@ Nothing.
 
 ## Failures
 
+- **2026-09-28, cycle 73 researcher B (environment).** Same as cycle 67: shell reads stalled, B returned no proposals instead of guessing. A trivial probe answered right after (11 Codex processes), so the writer ran normally.
 - **2026-09-28, cycle 67 researcher B (environment, not code).** Codex astra returned "research is blocked: repository reads returned no output, an independent check timed out" with ~17 Codex processes from other fleets running; a trivial `codex exec` probe also produced nothing within 180 s. It refused to guess rather than fabricate citations — the right behavior. Cycle 67 proceeds on researcher A's cited proposal alone once the sandbox answers a probe again.
 
 - **2026-09-27, cycle 61 first attempt (environment, not code).** Codex exited 0 having changed nothing: `windows sandbox failed: helper_unknown_error: apply deny-read ACLs` while ~20 Codex sessions from other projects ran. Relaunched alone and it succeeded. Trap recorded in `.claude/improvement.md`.

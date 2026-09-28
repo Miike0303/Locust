@@ -43,6 +43,112 @@ pub struct ImportApplyReport {
     pub unknown_ids: usize,
 }
 
+/// A read-only import plan. Counts include confirmations and unchanged rows as imported.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ImportPreview {
+    pub report: ImportApplyReport,
+    pub replacements: Vec<ImportChange>,
+    pub confirmations: Vec<ImportChange>,
+    pub fill_ids: Vec<String>,
+    pub kept_ids: Vec<String>,
+    pub unchanged_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportChange {
+    pub id: String,
+    pub previous: String,
+    pub previous_status: String,
+    pub new_text: String,
+}
+
+enum ImportDecision {
+    Unknown,
+    StaleSource,
+    Unchanged,
+    Kept,
+    Fill,
+    Replace {
+        previous: String,
+        previous_status: String,
+    },
+    /// An identical translation on a pending row still needs its status confirmed.
+    Confirm {
+        previous: String,
+        previous_status: String,
+    },
+}
+
+impl ImportDecision {
+    fn record(&self, report: &mut ImportApplyReport) {
+        match self {
+            Self::Unknown => report.unknown_ids += 1,
+            Self::StaleSource => report.stale_sources += 1,
+            Self::Unchanged => {
+                report.imported += 1;
+                report.unchanged += 1;
+            }
+            Self::Kept => report.kept_existing += 1,
+            Self::Fill | Self::Replace { .. } | Self::Confirm { .. } => report.imported += 1,
+        }
+    }
+}
+
+fn validate_import_ids(updates: &[crate::export::ImportedTranslation]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for entry in updates {
+        if !seen.insert(&entry.id) {
+            return Err(LocustError::ValidationError {
+                entry_id: entry.id.clone(),
+                message: "duplicate import id; no translations were saved".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn classify_import(
+    current: &mut rusqlite::Statement<'_>,
+    entry: &crate::export::ImportedTranslation,
+    keep_existing: bool,
+) -> Result<ImportDecision> {
+    use rusqlite::OptionalExtension;
+
+    let Some((source, translation, status)) = current
+        .query_row(params![entry.id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?
+    else {
+        return Ok(ImportDecision::Unknown);
+    };
+    if source != entry.source {
+        return Ok(ImportDecision::StaleSource);
+    }
+    if translation.as_deref() == Some(entry.translation.as_str()) {
+        return Ok(if status != "pending" {
+            ImportDecision::Unchanged
+        } else {
+            ImportDecision::Confirm {
+                previous: entry.translation.clone(),
+                previous_status: status,
+            }
+        });
+    }
+    match translation.filter(|text| !text.trim().is_empty()) {
+        Some(_) if keep_existing => Ok(ImportDecision::Kept),
+        Some(previous) => Ok(ImportDecision::Replace {
+            previous,
+            previous_status: status,
+        }),
+        None => Ok(ImportDecision::Fill),
+    }
+}
+
 /// Semantic row state used to compute an automatic translation. Physical pivot
 /// source metadata is deliberately excluded: `source` is the request language.
 #[derive(Clone, Debug)]
@@ -979,17 +1085,7 @@ impl Database {
         updates: Vec<crate::export::ImportedTranslation>,
         keep_existing: bool,
     ) -> Result<ImportApplyReport> {
-        use rusqlite::OptionalExtension;
-
-        let mut seen = std::collections::HashSet::new();
-        for entry in &updates {
-            if !seen.insert(&entry.id) {
-                return Err(LocustError::ValidationError {
-                    entry_id: entry.id.clone(),
-                    message: "duplicate import id; no translations were saved".into(),
-                });
-            }
-        }
+        validate_import_ids(&updates)?;
         if updates.is_empty() {
             return Ok(ImportApplyReport::default());
         }
@@ -1005,34 +1101,69 @@ impl Database {
                 )?;
                 let mut current = tx.prepare_cached("SELECT source, translation, status FROM strings WHERE id = ?1")?;
                 for entry in updates {
-                    let Some((source, translation, status)) = current.query_row(params![entry.id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?))
-                    }).optional()? else {
-                        report.unknown_ids += 1;
-                        continue;
-                    };
-                    if source != entry.source {
-                        report.stale_sources += 1;
+                    let decision = classify_import(&mut current, &entry, keep_existing)?;
+                    if matches!(decision, ImportDecision::Fill | ImportDecision::Replace { .. } | ImportDecision::Confirm { .. })
+                        && write.execute(params![entry.translation, now, entry.id, entry.source, !entry.translation.trim().is_empty()])? == 0 {
                         continue;
                     }
-                    let identical = translation.as_deref() == Some(entry.translation.as_str());
-                    if identical && status != "pending" {
-                        report.imported += 1;
-                        report.unchanged += 1;
-                        continue;
-                    }
-                    if keep_existing && !identical && translation.as_deref().is_some_and(|text| !text.trim().is_empty()) {
-                        report.kept_existing += 1;
-                        continue;
-                    }
-                    if write.execute(params![entry.translation, now, entry.id, entry.source, !entry.translation.trim().is_empty()])? > 0 {
-                        report.imported += 1;
-                    }
+                    decision.record(&mut report);
                 }
             }
             tx.commit()?;
             Ok(report)
         }).await.map_err(|e| LocustError::Other(anyhow::anyhow!("import save task failed: {e}")))?
+    }
+
+    /// Preview an import using only reads. A later save rechecks the current rows.
+    pub fn preview_imported_translations(
+        &self,
+        updates: &[crate::export::ImportedTranslation],
+        keep_existing: bool,
+    ) -> Result<ImportPreview> {
+        validate_import_ids(updates)?;
+        let mut preview = ImportPreview::default();
+        if updates.is_empty() {
+            return Ok(preview);
+        }
+        let conn = lock_connection(&self.conn);
+        let mut current =
+            conn.prepare_cached("SELECT source, translation, status FROM strings WHERE id = ?1")?;
+        for entry in updates {
+            let decision = classify_import(&mut current, entry, keep_existing)?;
+            decision.record(&mut preview.report);
+            let changes = match decision {
+                ImportDecision::Replace {
+                    previous,
+                    previous_status,
+                } => Some((&mut preview.replacements, previous, previous_status)),
+                ImportDecision::Confirm {
+                    previous,
+                    previous_status,
+                } => Some((&mut preview.confirmations, previous, previous_status)),
+                ImportDecision::Fill => {
+                    preview.fill_ids.push(entry.id.clone());
+                    None
+                }
+                ImportDecision::Kept => {
+                    preview.kept_ids.push(entry.id.clone());
+                    None
+                }
+                ImportDecision::Unchanged => {
+                    preview.unchanged_ids.push(entry.id.clone());
+                    None
+                }
+                ImportDecision::Unknown | ImportDecision::StaleSource => None,
+            };
+            if let Some((changes, previous, previous_status)) = changes {
+                changes.push(ImportChange {
+                    id: entry.id.clone(),
+                    previous,
+                    previous_status,
+                    new_text: entry.translation.clone(),
+                });
+            }
+        }
+        Ok(preview)
     }
 
     /// Commit a provider batch atomically. Unlike an import, a missing entry is
@@ -3894,6 +4025,139 @@ mod tests {
         let again = db.get_entry(id).unwrap().unwrap();
         assert_eq!(again.translation.as_deref(), Some("Hola alli"));
         assert_eq!(again.status, StringStatus::Translated);
+    }
+
+    fn import_rows_bytes(db: &Database) -> Vec<u8> {
+        // JSON values sort metadata keys, so fresh HashMaps serialize identically.
+        let rows = serde_json::to_value(db.get_entries(&EntryFilter::default()).unwrap()).unwrap();
+        serde_json::to_vec(&rows).unwrap()
+    }
+
+    #[tokio::test]
+    async fn import_preview_matches_apply_without_changing_any_rows() {
+        use crate::export::ImportedTranslation;
+
+        for keep_existing in [false, true] {
+            let db = Database::open_in_memory().unwrap();
+            let mut confirm = reviewed_import_entry("confirm", "Hello again");
+            confirm.status = StringStatus::Pending;
+            let mut blank = make_entry("blank", "Thanks");
+            blank.translation = Some(" \t\r\n\u{2003}".into());
+            db.save_entries(&[
+                reviewed_import_entry("same", "Hello"),
+                confirm,
+                make_entry("empty", "Goodbye"),
+                blank,
+                reviewed_import_entry("different", "Welcome"),
+                reviewed_import_entry("stale", "Current source"),
+                reviewed_import_entry("untouched", "Outside the catalog"),
+            ])
+            .unwrap();
+            let updates: Vec<_> = [
+                ("unknown", "Unknown", "Missing"),
+                ("stale", "Old source", "Hola"),
+                ("same", "Hello", "Hola"),
+                ("confirm", "Hello again", "Hola"),
+                ("empty", "Goodbye", "Adiós"),
+                ("blank", "Thanks", "Gracias"),
+                ("different", "Welcome", "Bienvenido"),
+            ]
+            .into_iter()
+            .map(|(id, source, translation)| ImportedTranslation {
+                id: id.into(),
+                source: source.into(),
+                translation: translation.into(),
+            })
+            .collect();
+            let before = import_rows_bytes(&db);
+            lock_connection(&db.conn)
+                .execute_batch("PRAGMA query_only = ON")
+                .unwrap();
+
+            let preview = db
+                .preview_imported_translations(&updates, keep_existing)
+                .unwrap();
+
+            assert_eq!(import_rows_bytes(&db), before);
+            lock_connection(&db.conn)
+                .execute_batch("PRAGMA query_only = OFF")
+                .unwrap();
+            let applied = db
+                .save_imported_translations_batch_with(updates, keep_existing)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&preview.report).unwrap(),
+                serde_json::to_value(&applied).unwrap(),
+                "preview counts must match the following real import (keep_existing={keep_existing})"
+            );
+            assert_eq!(
+                serde_json::to_value(&preview.report).unwrap(),
+                serde_json::json!({
+                    "imported": if keep_existing { 4 } else { 5 },
+                    "unchanged": 1,
+                    "kept_existing": usize::from(keep_existing),
+                    "stale_sources": 1,
+                    "unknown_ids": 1,
+                })
+            );
+            assert_eq!(preview.fill_ids, ["empty", "blank"]);
+            assert_eq!(preview.unchanged_ids, ["same"]);
+            assert_eq!(preview.confirmations.len(), 1);
+            let confirmation = &preview.confirmations[0];
+            assert_eq!(confirmation.id, "confirm");
+            assert_eq!(confirmation.previous, "Hola");
+            assert_eq!(confirmation.previous_status, "pending");
+            assert_eq!(confirmation.new_text, "Hola");
+            if keep_existing {
+                assert!(preview.replacements.is_empty());
+                assert_eq!(preview.kept_ids, ["different"]);
+            } else {
+                assert!(preview.kept_ids.is_empty());
+                assert_eq!(preview.replacements.len(), 1);
+                let replacement = &preview.replacements[0];
+                assert_eq!(replacement.id, "different");
+                assert_eq!(replacement.previous, "Hola");
+                assert_eq!(replacement.previous_status, "approved");
+                assert_eq!(replacement.new_text, "Bienvenido");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn import_preview_refuses_duplicate_ids_and_accepts_empty_batch() {
+        use crate::export::ImportedTranslation;
+
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[reviewed_import_entry("same", "Hello")])
+            .unwrap();
+        let before = import_rows_bytes(&db);
+        for keep_existing in [false, true] {
+            let update = ImportedTranslation {
+                id: "same".into(),
+                source: "Hello".into(),
+                translation: "New translation".into(),
+            };
+            let updates = vec![update.clone(), update];
+            let preview_error = db
+                .preview_imported_translations(&updates, keep_existing)
+                .unwrap_err();
+            let save_error = db
+                .save_imported_translations_batch_with(updates, keep_existing)
+                .await
+                .unwrap_err();
+            assert!(preview_error.to_string().contains("duplicate import id"));
+            assert_eq!(preview_error.to_string(), save_error.to_string());
+            assert_eq!(
+                serde_json::to_value(
+                    db.preview_imported_translations(&[], keep_existing)
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(ImportPreview::default()).unwrap()
+            );
+            assert_eq!(import_rows_bytes(&db), before);
+        }
     }
 
     #[tokio::test]

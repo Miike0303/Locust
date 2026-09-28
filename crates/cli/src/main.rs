@@ -297,6 +297,9 @@ enum Commands {
         /// Preserve existing nonblank translations
         #[arg(long)]
         keep_existing: bool,
+        /// Preview changes without saving translations
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Start the web server
     Server {
@@ -506,7 +509,8 @@ async fn main() -> anyhow::Result<()> {
             lang,
             input,
             keep_existing,
-        } => cmd_import(project, format, lang, input, keep_existing).await?,
+            dry_run,
+        } => cmd_import(project, format, lang, input, keep_existing, dry_run).await?,
         Commands::Server { port } => cmd_server(port.unwrap_or(7842)).await?,
     }
 
@@ -2094,6 +2098,7 @@ async fn cmd_import(
     _lang: String,
     input: PathBuf,
     keep_existing: bool,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     let db = Database::open(&project)?;
     let content = std::fs::read_to_string(&input)?;
@@ -2110,31 +2115,66 @@ async fn cmd_import(
         _ => anyhow::bail!("unsupported import format: {}. Use 'po' or 'xliff'", format),
     };
     let attempted = updates.len();
-    let report = db
-        .save_imported_translations_batch_with(updates, keep_existing)
-        .await?;
+    let report = if dry_run {
+        let preview = db.preview_imported_translations(&updates, keep_existing)?;
+        println!(
+            "Would replace {} translation(s):",
+            preview.replacements.len() + preview.confirmations.len()
+        );
+        for change in preview.replacements.iter().chain(&preview.confirmations) {
+            let truncate = |text: &str| {
+                let mut chars = text.chars();
+                let mut short: String = chars.by_ref().take(79).collect();
+                if chars.next().is_some() {
+                    short.push('…');
+                }
+                short
+            };
+            println!(
+                "  {}: {:?} ({}) -> {:?}",
+                change.id,
+                truncate(&change.previous),
+                change.previous_status,
+                truncate(&change.new_text)
+            );
+        }
+        println!("Would fill {} empty row(s)", preview.fill_ids.len());
+        preview.report
+    } else {
+        db.save_imported_translations_batch_with(updates, keep_existing)
+            .await?
+    };
     let (imported, skipped) = export::import_counts_after_batch(
         pre_skipped,
         attempted - report.kept_existing,
         report.imported,
     );
 
-    println!(
-        "Imported {} translations from {}",
-        imported,
-        input.display()
-    );
+    if !dry_run {
+        println!(
+            "Imported {} translations from {}",
+            imported,
+            input.display()
+        );
+    }
     if report.unchanged > 0 {
         println!("Unchanged {} (already identical)", report.unchanged);
     }
     if report.kept_existing > 0 {
-        println!(
-            "Kept {} existing translation(s) (--keep-existing)",
-            report.kept_existing
-        );
+        if dry_run {
+            println!("Kept {} (--keep-existing)", report.kept_existing);
+        } else {
+            println!(
+                "Kept {} existing translation(s) (--keep-existing)",
+                report.kept_existing
+            );
+        }
     }
     if skipped > 0 {
         println!("Skipped {skipped}: {} outdated source(s), {} unknown id(s), {pre_skipped} empty/missing entries", report.stale_sources, report.unknown_ids);
+    }
+    if dry_run {
+        println!("Dry run: nothing was saved.");
     }
     Ok(())
 }
