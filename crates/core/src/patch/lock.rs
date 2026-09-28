@@ -20,7 +20,7 @@ pub struct GameLock {
 }
 
 impl GameLock {
-    /// Acquire exclusive access without waiting; a competing operation is an error.
+    /// Acquire exclusive access; Unix briefly retries before reporting a busy game.
     pub fn acquire(game_root: &Path) -> Result<Self> {
         let root = game_root.canonicalize()?;
         if !root.is_dir() {
@@ -93,7 +93,11 @@ impl GameLock {
         let file = options.open(&path)?;
         ensure_metadata(&file.metadata()?, false)?;
         ensure_plain(&path, false)?;
-        match file.try_lock() {
+        #[cfg(unix)]
+        let lock_result = try_lock_with_retry(|| file.try_lock());
+        #[cfg(not(unix))]
+        let lock_result = file.try_lock();
+        match lock_result {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(LocustError::PatchError(format!(
@@ -146,6 +150,24 @@ impl GameLock {
         }
         Ok(())
     }
+}
+
+#[cfg(any(unix, test))]
+fn try_lock_with_retry(
+    mut try_lock: impl FnMut() -> std::result::Result<(), std::fs::TryLockError>,
+) -> std::result::Result<(), std::fs::TryLockError> {
+    const ATTEMPTS: usize = 11;
+    // Bridge the fork-inheritance window before a child execs/closes the fd.
+    // A genuinely held lock still fails after the bounded 50 ms retry period.
+    for _ in 1..ATTEMPTS {
+        match try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+    try_lock()
 }
 
 // Resolve all existing ancestors before deciding whether storage is outside
@@ -210,6 +232,77 @@ fn root_key(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_retry_succeeds_after_transient_contention() {
+        let mut attempts = 0;
+        let result = try_lock_with_retry(|| {
+            attempts += 1;
+            if attempts <= 3 {
+                Err(std::fs::TryLockError::WouldBlock)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn lock_retry_returns_would_block_after_bound() {
+        let mut attempts = 0;
+        let result = try_lock_with_retry(|| {
+            attempts += 1;
+            Err(std::fs::TryLockError::WouldBlock)
+        });
+        assert!(matches!(result, Err(std::fs::TryLockError::WouldBlock)));
+        assert_eq!(attempts, 11);
+    }
+
+    #[test]
+    fn lock_retry_returns_other_errors_without_retrying() {
+        let mut attempts = 0;
+        let result = try_lock_with_retry(|| {
+            attempts += 1;
+            Err(std::fs::TryLockError::Error(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )))
+        });
+        assert!(matches!(
+            result,
+            Err(std::fs::TryLockError::Error(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_succeeds_when_lock_is_released_during_retry() {
+        let game = tempfile::tempdir().unwrap();
+        let lock = GameLock::acquire(game.path()).unwrap();
+        let (started, release) = std::sync::mpsc::channel();
+        let releaser = std::thread::spawn(move || {
+            release.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            drop(lock);
+        });
+
+        started.send(()).unwrap();
+        let result = GameLock::acquire(game.path());
+        releaser.join().unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_returns_game_busy_when_lock_remains_held() {
+        let game = tempfile::tempdir().unwrap();
+        let lock = GameLock::acquire(game.path()).unwrap();
+        let error = GameLock::acquire(game.path()).err().unwrap();
+        assert!(error.to_string().contains("game busy"));
+        drop(lock);
+    }
 
     #[test]
     fn delegated_selection_requires_the_same_directory_or_file_parent() {

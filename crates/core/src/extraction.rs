@@ -2408,7 +2408,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_replace_uses_hardlinks_on_unix() {
+    async fn test_replace_output_does_not_share_inodes_with_original_on_unix() {
         let (injector, game_dir, output_dir) = setup_contained_injector();
         let (tx, mut rx) = mpsc::channel(100);
 
@@ -2430,7 +2430,9 @@ mod tests {
         let png = output_dir.join("mygame-es").join("image.png");
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(&png).unwrap();
-        assert!(meta.nlink() > 1);
+        let original = fs::metadata(game_dir.join("image.png")).unwrap();
+        assert_ne!((meta.dev(), meta.ino()), (original.dev(), original.ino()));
+        assert_eq!(meta.nlink(), 1);
     }
 
     #[tokio::test]

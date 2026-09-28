@@ -77,6 +77,16 @@ Owned by no lane; Claude applies these after the writers finish.
   report saying nothing was done. Run at most ONE Codex session from this loop at a time when other fleets are busy,
   grep every report/log for `sandbox failed`, and never kill Codex processes you did not start (check
   `Win32_Process` parent and `-C <repo>` first). A trivial `codex exec ... "echo hello"` probe tells you if it recovered.
+- **Linux check (cycle 63).** CI is ubuntu, and `cargo test` stops at the first failing binary, so CI hides later
+  failures. Reproduce locally with Docker (WSL Ubuntu has no C toolchain and `sudo` needs a password; do not use
+  `wsl -u root`): clone to scratch, then `MSYS_NO_PATHCONV=1 docker run --rm -v <clone>:/src -v locust-linux-target:/target
+  -v locust-cargo-reg:/usr/local/cargo/registry -e CARGO_TARGET_DIR=/target -w /src rust:1.94.0 bash -c 'cargo test
+  --workspace --exclude locust-desktop --no-fail-fast'`. Without `MSYS_NO_PATHCONV` Git Bash rewrites `/src`. The desktop
+  crate needs `apt-get install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libssl-dev` in the container
+  and a copied `apps/desktop/dist`. Tests that spawn a child (`Command::new(current_exe())`) share a process with
+  lock tests: flock fds leak across fork until exec, so run suspect binaries ~20x in parallel before trusting green.
+- Codex stops on "ACL errors" if the brief says so: git always warns it cannot read `~/.config/git/ignore` in the
+  sandbox. Stop rules must name `windows sandbox failed` exactly.
 - `bat`/`fd`/`eza` are not installed on this Windows host. Use `rg` and the Read tool.
 - Isolate every QA run with `LOCUST_DATA_DIR=<scratch>`. Without it the run uses
   the user's real profile, keys and global memory (`crates/core/src/config.rs:183`).

@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn resolve_project_db_path_falls_back_when_parent_not_writable() {
-        let game = PathBuf::from(r"Z:\locked-parent\My Game");
+        let game = Path::new("locked-parent").join("My Game");
         let db_path = resolve_project_db_path_with(&game, |_| false);
         let name = db_path.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("My Game-") || name.starts_with("My_Game-"));

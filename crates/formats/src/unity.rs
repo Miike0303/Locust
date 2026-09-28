@@ -3055,7 +3055,6 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_serialized_candidate_extensionless_managers_and_levels() {
-        use std::path::PathBuf;
         assert!(is_unity_serialized_candidate(Path::new(
             "Game_Data/globalgamemanagers"
         )));
@@ -3082,9 +3081,14 @@ script Chapter_1_script chapter 1 {
         assert!(!is_unity_serialized_candidate(Path::new(
             "Game_Data/sharedassets0.assets.resS"
         )));
-        // PathBuf for Windows-style
-        let p = PathBuf::from(r"C:\Games\Boxman_Data\globalgamemanagers");
+        let p = Path::new("Games")
+            .join("Boxman_Data")
+            .join("globalgamemanagers");
         assert!(is_unity_serialized_candidate(&p));
+        #[cfg(windows)]
+        assert!(is_unity_serialized_candidate(Path::new(
+            r"C:\Games\Boxman_Data\globalgamemanagers"
+        )));
     }
 
     #[test]
