@@ -1,8 +1,8 @@
 # Project Locust
 
-## Estado vigente (2026-09-26): /goal reanudado por el usuario
+## Estado vigente (2026-09-27): /goal en `main`, solo Codex
 
-El usuario reanudó el trabajo con `/goal` y autorizó escritores **Codex y Cursor** (Grok Build sigue apagado). Config y gates: `.claude/improvement.md`; ledger: `docs/IMPROVEMENT-GOAL.md`; mapa: `docs/ARCHITECTURE.md`. El trabajo previo sin commit (sesiones 2026-09-11..21) quedó en commits snapshot `e0e5268..` sobre `feat/desktop-ux-kimi-k3-p2`. Esto reemplaza la pausa del 2026-09-21 y la restricción "sin Cursor" de las secciones históricas siguientes.
+Leer primero `docs/HANDOFF-2026-09-27.md`. Rama de trabajo: **`main`**. Escritores: **solo Codex** (`gpt-6-astra` xhigh; investigadores `gpt-6-sol` high; sin Fast tier). Nada de Cursor ni Grok Build. El usuario quiere agotar la suscripción de Codex y sus reinicios con trabajo útil. Ticks del loop cada 15-20 min. Config y gates: `.claude/improvement.md`; ledger: `docs/IMPROVEMENT-GOAL.md`; mapa: `docs/ARCHITECTURE.md`. El loop se reanuda solo al abrir sesión (hook SessionStart en `.claude/settings.local.json`; lanzador `.claude/start-goal.cmd`). Esto reemplaza las restricciones de las secciones históricas siguientes (Cursor, `feat/desktop-ux-kimi-k3-p2`, "work directly in Codex").
 
 Universal open-source game translation tool built in Rust.
 
