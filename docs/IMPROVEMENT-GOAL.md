@@ -20,7 +20,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 ## Backlog
 
 
-- **[capability · CLI/core · S] `locust glossary copy <src.db> <dst.db> --lang-pair`** (cycle 79, both researchers independently). Only add/list/delete exist (`crates/cli/src/main.rs:~316`); re-adding terms loses context and case sensitivity (`Glossary::add` forces `case_sensitive: false`, `crates/core/src/glossary.rs:~21-29`), and the single-entry save overwrites conflicts (`database.rs:~1718`). Copy full entries in one transaction; keep destination conflicts unless `--overwrite`. Check: context/case kept, conflict unchanged, other pairs and source untouched.
 - **[capability · CLI/core · M] `locust extract --dry-run`** (cycle 79 research, A's pick). Show which saved translations a re-extract would delete (ids gone) or reset to pending (source changed) before `merge_entries` writes (`crates/cli/src/main.rs:~1320`, `database.rs:~2006`); preserve partial-extraction and pivot rules (`:~1839`, `:~1939`). Check: preview matches a following real extract, rows unchanged.
 
 
@@ -61,6 +60,8 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 Nothing.
 
 ## Done
+
+- `pending` — **cycle 82 (capability, from backlog: both cycle 79 researchers independently; research duel skipped; writer Codex gpt-6-astra xhigh).** A glossary lives in one project DB, and the CLI had only add/list/delete; re-adding terms by hand in another project lost their context and case sensitivity (`Glossary::add` forces `case_sensitive: false`) and the upsert overwrote terms the translator had tuned. `locust glossary copy <source.db> <dest.db> --lang-pair <pair> [--overwrite]` reads the pair from the source and `Database::merge_glossary_entries` applies it in one transaction: absent → added with every field, identical → unchanged (no write), different → kept unless `--overwrite`; other pairs untouched, same-DB and missing paths refused. Codex negative-tested it (an unconditional upsert replaced the tuned "Puntos de vida" with "PV"). Claude ran all five gates (1642 pass / 0 fail, 32 frontend). Next rotation: `optimization`.
 
 - `pending` — **cycle 81 (defect, from Claude's cycle 79 review; research duel skipped; writer Codex gpt-6-astra xhigh).** `Database::open` creates the file, and 14 CLI commands opened the project the user named that way, so a mistyped path made `stats` report zeros, `translate` "translate" nothing, `export` fail with "no entries" and `backup-project` checkpoint an empty DB — each leaving an empty `.db` (plus `-wal`/`-shm`) behind. `open_existing_project` checks the path exists and is not a directory before opening, and names the path with an `extract -o` hint; it now guards patch, pivot source, stats, translate, inject (both), validate, replace, glossary add/list/delete, backup-project input, export and import. `extract` output, pivot's new DB and reopening a just-written checkpoint keep `Database::open`. 18 tests: every guarded command on a missing path exits non-zero, names it and creates no file; directories refused; existing projects still work. Codex negative-tested stats (the file was created). Claude ran all five gates (1634 pass / 0 fail, 32 frontend). Next rotation: `capability`.
 

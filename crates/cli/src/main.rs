@@ -356,6 +356,16 @@ enum GlossaryCommands {
         #[arg(short, long)]
         lang_pair: String,
     },
+    /// Copy a language pair's glossary to an existing project.
+    Copy {
+        source: PathBuf,
+        dest: PathBuf,
+        #[arg(short, long)]
+        lang_pair: String,
+        /// Replace conflicting destination terms with the source entries.
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 #[tokio::main]
@@ -2074,6 +2084,24 @@ fn cmd_glossary(action: GlossaryCommands) -> anyhow::Result<()> {
             let glossary = Glossary::new(db);
             glossary.delete(&term, &lang_pair)?;
             println!("Deleted: {} ({})", term, lang_pair);
+        }
+        GlossaryCommands::Copy {
+            source,
+            dest,
+            lang_pair,
+            overwrite,
+        } => {
+            if locust_core::database::paths_identical(&source, &dest) {
+                anyhow::bail!("source and destination refer to the same database");
+            }
+            let source_db = open_existing_project(&source)?;
+            let dest_db = open_existing_project(&dest)?;
+            let entries = source_db.get_glossary(&lang_pair)?;
+            let report = dest_db.merge_glossary_entries(&entries, overwrite)?;
+            println!(
+                "Glossary copy: added={} overwritten={} kept_existing={} unchanged={}",
+                report.added, report.overwritten, report.kept_existing, report.unchanged
+            );
         }
     }
     Ok(())
