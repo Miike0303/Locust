@@ -424,6 +424,11 @@ pub fn apply_patches(original: &str, kind: GroupKind, patches: &[CellPatch<'_>])
     tests::APPLY_PATCHES_CALLS.with(|calls| calls.set(calls.get() + 1));
 
     let mut lines: Vec<String> = original.split_inclusive('\n').map(str::to_string).collect();
+    let loc_lines = if kind == GroupKind::LocLine {
+        index_loc_lines(original)
+    } else {
+        HashMap::new()
+    };
     let rows: Vec<usize> = lines
         .iter()
         .enumerate()
@@ -487,7 +492,7 @@ pub fn apply_patches(original: &str, kind: GroupKind, patches: &[CellPatch<'_>])
                 }
                 GroupKind::LocLine => {
                     let i = find_loc_line(
-                        &lines,
+                        &loc_lines,
                         &used_lines,
                         patch.line_index,
                         patch.loc_key,
@@ -744,34 +749,47 @@ fn split_loc_kv(line: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
+type LocLineIndex<'a> = HashMap<(Option<&'a str>, &'a str), Vec<usize>>;
+
+fn index_loc_lines(original: &str) -> LocLineIndex<'_> {
+    let mut index = HashMap::new();
+    for (i, line) in original.split_inclusive('\n').enumerate() {
+        #[cfg(test)]
+        tests::LOC_LINE_INSPECTIONS.with(|count| count.set(count.get() + 1));
+
+        let body = line_body(line);
+        let key = match split_loc_kv(body) {
+            Some((key, _, value)) => (Some(key), value),
+            None => (None, body),
+        };
+        index.entry(key).or_insert_with(Vec::new).push(i);
+    }
+    // Only consumed lines can change, so original keys stay valid for unused lines.
+    index
+}
+
 fn find_loc_line(
-    lines: &[String],
+    index: &LocLineIndex<'_>,
     used: &std::collections::HashSet<usize>,
     line_index: Option<usize>,
     loc_key: Option<&str>,
     physical: &str,
 ) -> Option<usize> {
-    let mut matches = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if used.contains(&i) {
-            continue;
-        }
-        let body = line_body(line);
-        let ok = match (loc_key, split_loc_kv(body)) {
-            (Some(key), Some((actual, _sep, value))) => actual == key && value == physical,
-            (None, None) => body == physical,
-            _ => false,
-        };
-        if ok {
-            matches.push(i);
-        }
+    let mut matches = index
+        .get(&(loc_key, physical))?
+        .iter()
+        .copied()
+        .filter(|i| {
+            #[cfg(test)]
+            tests::LOC_LINE_INSPECTIONS.with(|count| count.set(count.get() + 1));
+
+            !used.contains(i)
+        });
+    let first = matches.next()?;
+    match line_index {
+        Some(index) if index > 0 => matches.nth(index - 1).or(Some(first)),
+        _ => Some(first),
     }
-    if let Some(index) = line_index {
-        if index < matches.len() {
-            return Some(matches[index]);
-        }
-    }
-    matches.first().copied()
 }
 
 #[cfg(test)]
@@ -782,6 +800,10 @@ mod tests {
     thread_local! {
         // Keep reconstruction counts independent of concurrently running tests.
         pub(super) static APPLY_PATCHES_CALLS: std::cell::Cell<usize> = const {
+            std::cell::Cell::new(0)
+        };
+        // Count original-line indexing and candidate visits, without timing assertions.
+        pub(super) static LOC_LINE_INSPECTIONS: std::cell::Cell<usize> = const {
             std::cell::Cell::new(0)
         };
     }
@@ -802,6 +824,384 @@ mod tests {
             .metadata
             .insert("binary_slot".into(), serde_json::json!("utf8"));
         entry
+    }
+
+    fn loc_patch<'a>(
+        id: &'a str,
+        key: Option<&'a str>,
+        source: &'a str,
+        translation: &'a str,
+        line_index: Option<usize>,
+    ) -> CellPatch<'a> {
+        CellPatch {
+            entry_id: id,
+            physical_source: source,
+            translation,
+            line_index,
+            loc_key: key,
+            csv_row: None,
+            csv_col: None,
+            csv_header: None,
+        }
+    }
+
+    // Deliberately retain the old whole-table scan as an independent oracle.
+    fn reference_apply_loc_patches(original: &str, patches: &[CellPatch<'_>]) -> AppliedBlob {
+        let mut lines: Vec<String> = original.split_inclusive('\n').map(str::to_string).collect();
+        let mut used = std::collections::HashSet::new();
+        let mut outcomes = Vec::new();
+        for patch in patches {
+            let result = (|| {
+                if patch.translation.contains(['\r', '\n']) {
+                    return Err("error");
+                }
+                let mut matches = Vec::new();
+                for (i, line) in lines.iter().enumerate() {
+                    if used.contains(&i) {
+                        continue;
+                    }
+                    let body = line_body(line);
+                    let matched = match (patch.loc_key, split_loc_kv(body)) {
+                        (Some(key), Some((actual, _, value))) => {
+                            actual == key && value == patch.physical_source
+                        }
+                        (None, None) => body == patch.physical_source,
+                        _ => false,
+                    };
+                    if matched {
+                        matches.push(i);
+                    }
+                }
+                let i = patch
+                    .line_index
+                    .and_then(|index| matches.get(index))
+                    .or_else(|| matches.first())
+                    .copied()
+                    .ok_or("target_missing")?;
+                let body = line_body(&lines[i]);
+                match (patch.loc_key, split_loc_kv(body)) {
+                    (Some(key), Some((actual, _, value))) if actual == key => {
+                        if value != patch.physical_source || !body.ends_with(value) {
+                            return Err("source_changed");
+                        }
+                        let ending = &lines[i][body.len()..];
+                        lines[i] = format!(
+                            "{}{}{ending}",
+                            &body[..body.len() - value.len()],
+                            patch.translation
+                        );
+                    }
+                    (None, None) => {
+                        if body != patch.physical_source {
+                            return Err("source_changed");
+                        }
+                        let ending = &lines[i][body.len()..];
+                        lines[i] = format!("{}{ending}", patch.translation);
+                    }
+                    _ => return Err("source_changed"),
+                }
+                used.insert(i);
+                Ok(())
+            })();
+            outcomes.push((patch.entry_id.to_string(), result));
+        }
+        AppliedBlob {
+            text: lines.concat(),
+            outcomes,
+        }
+    }
+
+    fn assert_loc_patches(
+        original: &str,
+        patches: &[CellPatch<'_>],
+        expected_text: &str,
+        expected_results: &[std::result::Result<(), &'static str>],
+    ) {
+        assert_eq!(patches.len(), expected_results.len());
+        let expected = AppliedBlob {
+            text: expected_text.to_string(),
+            outcomes: patches
+                .iter()
+                .zip(expected_results)
+                .map(|(patch, result)| (patch.entry_id.to_string(), *result))
+                .collect(),
+        };
+        assert_eq!(reference_apply_loc_patches(original, patches), expected);
+        assert_eq!(
+            apply_patches(original, GroupKind::LocLine, patches),
+            expected
+        );
+    }
+
+    #[test]
+    fn loc_line_index_distinguishes_keys_values_and_missing_targets() {
+        let original = " Menu.A : Start\r\nMenu.A=Exit\nMenu.B: Start\nMenu.A:Start\r\n";
+        let patches = [
+            loc_patch("exit", Some("Menu.A"), "Exit", "Salir", None),
+            loc_patch("second", Some("Menu.A"), "Start", "Segundo", Some(1)),
+            loc_patch("consumed", Some("Menu.A"), "Exit", "Otra vez", None),
+            loc_patch("missing", Some("Menu.Z"), "Start", "Ausente", None),
+            // Source mismatches are rejected by lookup as target_missing, as before.
+            loc_patch("changed", Some("Menu.B"), "Old", "Nuevo", Some(2)),
+            loc_patch("first", Some("Menu.A"), "Start", "Inicio", Some(99)),
+        ];
+        assert_loc_patches(
+            original,
+            &patches,
+            " Menu.A : Inicio\r\nMenu.A=Salir\nMenu.B: Start\nMenu.A:Segundo\r\n",
+            &[
+                Ok(()),
+                Ok(()),
+                Err("target_missing"),
+                Err("target_missing"),
+                Err("target_missing"),
+                Ok(()),
+            ],
+        );
+    }
+
+    #[test]
+    fn loc_line_index_selects_nth_unused_then_falls_back_to_first() {
+        let original = "Menu.A: Go\r\nMenu.A=Go\n Menu.A : Go\r\r\nMenu.A:Go";
+        let patches = [
+            loc_patch("one", Some("Menu.A"), "Go", "uno", Some(1)),
+            loc_patch("two", Some("Menu.A"), "Go", "dos", Some(1)),
+            loc_patch("three", Some("Menu.A"), "Go", "tres", Some(usize::MAX)),
+            loc_patch("four", Some("Menu.A"), "Go", "cuatro", Some(0)),
+            loc_patch("five", Some("Menu.A"), "Go", "cinco", None),
+        ];
+        assert_loc_patches(
+            original,
+            &patches,
+            "Menu.A: tres\r\nMenu.A=uno\n Menu.A : dos\r\r\nMenu.A:cuatro",
+            &[Ok(()), Ok(()), Ok(()), Ok(()), Err("target_missing")],
+        );
+    }
+
+    #[test]
+    fn loc_line_index_keeps_keyless_matches_separate_and_failures_unused() {
+        let original = "untagged\r\nMenu.A: untagged\ninvalid key=value\n";
+        let patches = [
+            loc_patch("invalid", None, "untagged", "bad\nline", None),
+            loc_patch("plain", None, "untagged", "Menu.New: value", None),
+            loc_patch("new-key", Some("Menu.New"), "value", "used", None),
+            loc_patch("keyed", None, "Menu.A: untagged", "mixed", None),
+            loc_patch("unkeyed", Some("invalid key"), "value", "mixed", None),
+            loc_patch("raw", None, "invalid key=value", "texto", None),
+            loc_patch("consumed", None, "untagged", "again", None),
+        ];
+        assert_loc_patches(
+            original,
+            &patches,
+            "Menu.New: value\r\nMenu.A: untagged\ntexto\n",
+            &[
+                Err("error"),
+                Ok(()),
+                Err("target_missing"),
+                Err("target_missing"),
+                Err("target_missing"),
+                Ok(()),
+                Err("target_missing"),
+            ],
+        );
+    }
+
+    #[test]
+    fn loc_line_index_matches_old_scan_on_deterministic_tables() {
+        fn draw(state: &mut u64, upper: usize) -> usize {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*state >> 32) as usize) % upper
+        }
+        let bodies = [
+            "Menu.A: Start game",
+            "Menu.A=Start game",
+            " Menu.A : Start game",
+            "Menu.A: Exit",
+            "Menu.B: Start game",
+            "Menu.C:\tPlay",
+            "Menu.D=",
+            "Menu.A: Start game ",
+            "日本語=値",
+            "words here: value=tail",
+            "Raw line",
+            "",
+            "\t",
+            " : invalid",
+            "Bad\tKey: Value",
+            "invalid key=value",
+            "foo::bar",
+        ];
+        let translations = [
+            "Go",
+            "Salir",
+            "日本語",
+            "",
+            "Menu.A: Exit",
+            "a,b",
+            "bad\nline",
+            "bad\rline",
+        ];
+        let mut state = 0x00c0_8910_ca11_ab1e_u64;
+        for case in 0..400 {
+            let mut original = String::new();
+            let line_count = draw(&mut state, 33);
+            for i in 0..line_count {
+                original.push_str(bodies[draw(&mut state, bodies.len())]);
+                let ending = ["\n", "\r\n", "\r\r\n"][draw(&mut state, 3)];
+                if i + 1 < line_count || draw(&mut state, 2) == 0 {
+                    original.push_str(ending);
+                }
+            }
+            let sources: Vec<_> = original
+                .split_inclusive('\n')
+                .map(|line| {
+                    let body = line_body(line);
+                    match split_loc_kv(body) {
+                        Some((key, _, value)) => (Some(key), value),
+                        None => (None, body),
+                    }
+                })
+                .collect();
+            let ids: Vec<_> = (0..draw(&mut state, 65)).map(|i| format!("p{i}")).collect();
+            let patches: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let (mut key, mut source) = if sources.is_empty() {
+                        (None, "missing")
+                    } else {
+                        sources[draw(&mut state, sources.len())]
+                    };
+                    match draw(&mut state, 6) {
+                        0 => key = None,
+                        1 => key = Some("Menu.Missing"),
+                        2 => source = "changed source",
+                        _ => {}
+                    }
+                    let line_index = match draw(&mut state, 5) {
+                        0 => None,
+                        1 => Some(0),
+                        2 => Some(1),
+                        3 => Some(usize::MAX),
+                        _ => Some(draw(&mut state, 40)),
+                    };
+                    loc_patch(
+                        id,
+                        key,
+                        source,
+                        translations[draw(&mut state, translations.len())],
+                        line_index,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                apply_patches(&original, GroupKind::LocLine, &patches),
+                reference_apply_loc_patches(&original, &patches),
+                "case {case}, original {original:?}, patches {patches:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loc_line_lookup_inspections_are_linear_for_ten_thousand_keys() {
+        let mut original = String::new();
+        let mut expected = String::new();
+        let mut entries = Vec::new();
+        for i in 0..10_000 {
+            let key = format!("Menu.K{i:05}");
+            original.push_str(&format!("{key}: Start game\n"));
+            expected.push_str(&format!("{key}: Iniciar\n"));
+            let mut entry = loc_entry(&format!("row{i}"), &key, "Start game", i);
+            entry.translation = Some("Iniciar".into());
+            entries.push(entry);
+        }
+        attach_to_entries(
+            &mut entries,
+            GroupKind::LocLine,
+            &original,
+            original.len(),
+            "large-localization",
+        );
+        LOC_LINE_INSPECTIONS.with(|count| count.set(0));
+        let issues = group_validation_issues(&entries);
+        assert!(issues.is_empty(), "{issues:?}");
+        let inspections = LOC_LINE_INSPECTIONS.with(|count| count.get());
+        assert!(
+            (10_000..=30_000).contains(&inspections),
+            "validation lookup inspected {inspections} lines; expected at most 30000"
+        );
+
+        let patches: Vec<_> = entries
+            .iter()
+            .map(|entry| patch_from_entry(entry, entry.translation.as_deref().unwrap()).unwrap())
+            .collect();
+        LOC_LINE_INSPECTIONS.with(|count| count.set(0));
+        let applied = apply_patches(&original, GroupKind::LocLine, &patches);
+        assert_eq!(applied.text, expected);
+        assert_eq!(
+            applied.outcomes,
+            entries
+                .iter()
+                .map(|entry| (entry.id.clone(), Ok(())))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fit_reconstructed(applied.text, original.len()),
+            Ok(expected)
+        );
+        let inspections = LOC_LINE_INSPECTIONS.with(|count| count.get());
+        assert!(
+            (10_000..=30_000).contains(&inspections),
+            "reconstruction lookup inspected {inspections} lines; expected at most 30000"
+        );
+    }
+
+    #[test]
+    fn csv_source_changed_outcomes_are_preserved_without_loc_indexing() {
+        let original = "ID,NAME\n1,cat\n2,dog,extra\n";
+        let patch = CellPatch {
+            csv_row: Some(1),
+            csv_col: Some(1),
+            csv_header: Some("NAME"),
+            ..loc_patch("valid", None, "cat", "gato", None)
+        };
+        let patches = [
+            CellPatch {
+                entry_id: "header",
+                csv_header: Some("TEXT"),
+                ..patch.clone()
+            },
+            CellPatch {
+                entry_id: "value",
+                physical_source: "old",
+                ..patch.clone()
+            },
+            CellPatch {
+                entry_id: "shape",
+                csv_row: Some(2),
+                physical_source: "dog",
+                ..patch.clone()
+            },
+            patch.clone(),
+            CellPatch {
+                entry_id: "used",
+                ..patch
+            },
+        ];
+        LOC_LINE_INSPECTIONS.with(|count| count.set(0));
+        assert_eq!(
+            apply_patches(original, GroupKind::Csv, &patches),
+            AppliedBlob {
+                text: "ID,NAME\n1,gato\n2,dog,extra\n".into(),
+                outcomes: vec![
+                    ("header".into(), Err("source_changed")),
+                    ("value".into(), Err("source_changed")),
+                    ("shape".into(), Err("source_changed")),
+                    ("valid".into(), Ok(())),
+                    ("used".into(), Err("error")),
+                ],
+            }
+        );
+        assert_eq!(LOC_LINE_INSPECTIONS.with(|count| count.get()), 0);
     }
 
     fn validation_group(kind: GroupKind, translations: [&str; 2]) -> Vec<StringEntry> {
