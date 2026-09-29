@@ -76,9 +76,11 @@ Owned by no lane; Claude applies these after the writers finish.
   a Codex writer on this tree. Grok historically stops at the TDD red phase (see above): check the suite is not red
   before accepting its report, and expect one `-Continue` dispatch.
 - **Model allow-list (user, 2026-09-27, supersedes 2026-09-26). Never substitute. No Fast tier:**
-  - Codex writers: `gpt-6-astra` with `-c model_reasoning_effort=xhigh`.
-  - Codex researchers and any subagent: `gpt-6-astra` with `-c model_reasoning_effort=high`.
-    **Never `gpt-6-sol`** (user, 2026-09-28: "solo usa astra de codex … también en los agentes y subagentes").
+  - **Updated 2026-09-29 (user: "ya esta el modelo 6.1 sol, cambialo"; needs Codex CLI >= 0.159.1): Sol 6.1 replaces Astra.**
+  - Codex writers: `gpt-6.1-sol` with `-c model_reasoning_effort=xhigh`.
+  - Codex researchers and any subagent: `gpt-6.1-sol` with `-c model_reasoning_effort=high`.
+    Do NOT use `gpt-6-sol` (6.0) or `gpt-6-astra` any more (superseded; the earlier "never gpt-6-sol" rule meant the 6.0 model).
+    Probe: `codex exec -m gpt-6.1-sol -c model_reasoning_effort=high "Reply with the single word: ok" </dev/null` answered ok on 2026-09-29.
   - The user tried and then declined `service_tier="fast"`; leave the default tier.
   - Loop cadence: 15-20 minute ticks (user, 2026-09-27). **Updated 2026-09-29: 20-minute ticks; Claude double-verifies every writer result and, if it is wrong, fixes it directly instead of a correction round (user).**
 - **Codex Windows sandbox fails under heavy concurrency (2026-09-27).** With ~20 Codex sessions from other
