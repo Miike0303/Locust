@@ -1605,6 +1605,21 @@ impl Database {
         }
     }
 
+    /// The pristine backup for each recorded language that has one.
+    /// Decode through `get_injection` so provenance and JSON errors are preserved.
+    pub fn recorded_backup_refs(&self) -> Result<Vec<(Option<String>, RecordedBackup)>> {
+        let mut refs = Vec::new();
+        for lang in self.list_recorded_langs()? {
+            if let Some(backup) = self
+                .get_injection(lang.as_deref())?
+                .and_then(|recording| recording.pristine_backup)
+            {
+                refs.push((lang, backup));
+            }
+        }
+        Ok(refs)
+    }
+
     /// Every language key with a recording, named keys first, the reserved
     /// language-unspecified key (`None`) last. Empty when no injection has
     /// ever been recorded — `locust patch` must then hard-error with the
@@ -3105,6 +3120,64 @@ mod tests {
         let bytes = b"label start:\n    \"Hola\"\n".to_vec();
         std::fs::write(&file, &bytes).unwrap();
         (root, file, bytes)
+    }
+
+    #[test]
+    fn test_recorded_backup_refs_returns_one_per_language_with_a_backup() {
+        let base = tempfile::tempdir().unwrap();
+        let (root, file, _) = make_recorded_tree(base.path());
+        let second = root.join("second.rpy");
+        std::fs::write(&second, b"translated").unwrap();
+        let files = [file, second];
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.recorded_backup_refs().unwrap().is_empty());
+
+        db.record_injection(Some("ja"), &root, &files).unwrap();
+        assert!(db.recorded_backup_refs().unwrap().is_empty());
+
+        let backup = RecordedBackup {
+            id: "shared-backup".into(),
+            source_path: root.clone(),
+            storage_root: Some(base.path().join("backups")),
+        };
+        let legacy_backup = RecordedBackup {
+            storage_root: None,
+            ..backup.clone()
+        };
+        for lang in [Some("es"), Some("fr")] {
+            db.record_injection_with_backup(lang, &root, &files, Some(&backup))
+                .unwrap();
+        }
+        db.record_injection_with_backup(None, &root, &files, Some(&legacy_backup))
+            .unwrap();
+
+        assert_eq!(
+            db.recorded_backup_refs().unwrap(),
+            vec![
+                (Some("es".into()), backup.clone()),
+                (Some("fr".into()), backup),
+                (None, legacy_backup),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_recorded_backup_refs_propagates_recording_decode_errors() {
+        let base = tempfile::tempdir().unwrap();
+        let (root, file, _) = make_recorded_tree(base.path());
+        let second = root.join("second.rpy");
+        std::fs::write(&second, b"translated").unwrap();
+        let files = [file, second];
+        for corruption in [
+            "UPDATE injected_files SET pristine_backup = 'not json'",
+            "UPDATE injected_files SET root = 'different' WHERE rel = 'second.rpy'",
+        ] {
+            let db = Database::open_in_memory().unwrap();
+            db.record_injection(Some("es"), &root, &files).unwrap();
+            lock_connection(&db.conn).execute(corruption, []).unwrap();
+            let expected = db.get_injection(Some("es")).unwrap_err().to_string();
+            assert_eq!(db.recorded_backup_refs().unwrap_err().to_string(), expected);
+        }
     }
 
     #[test]

@@ -40,6 +40,35 @@ async fn injection_backup_packs_strictly_for_directory_and_single_file_projects(
         assert_eq!(response.status(), 200);
         let injected: Value = response.json().await.unwrap();
         let id = injected["backup_id"].as_str().unwrap();
+        let backup = std::path::Path::new(injected["backup_path"].as_str().unwrap());
+        let refused = client
+            .delete(format!("{url}/api/backups/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 409);
+        assert!(refused.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"));
+        let message = refused.text().await.unwrap();
+        assert!(message.contains(&format!("backup {id} is needed to pack")));
+        assert!(message.contains("recorded for es"));
+        assert!(backup.is_dir());
+
+        let unrecorded = state.backup_manager.create_backup(selected).unwrap();
+        let unrecorded_path = state.backup_manager.root().join(&unrecorded.id);
+        assert!(unrecorded_path.is_dir());
+        let deleted = client
+            .delete(format!("{url}/api/backups/{}", unrecorded.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), 204);
+        assert!(!unrecorded_path.exists());
+        assert!(backup.is_dir());
+
+        // The refused deletion must leave the recorded original usable by pack.
         let output = directory.path().join("translation.zip");
         let request = json!({"game_path":selected,"output_path":output,"languages":["es"],"pristine":true,"pristine_backup_id":id});
         let response = client
@@ -71,7 +100,6 @@ async fn injection_backup_packs_strictly_for_directory_and_single_file_projects(
             original
         );
         // Output may not destroy an original, its manifest, or create files in backup storage.
-        let backup = std::path::Path::new(injected["backup_path"].as_str().unwrap());
         let manifest = std::fs::read(backup.join("manifest.json")).unwrap();
         for forbidden in [
             backup.join("manifest.json"),
@@ -113,6 +141,65 @@ async fn injection_backup_packs_strictly_for_directory_and_single_file_projects(
         handle.abort();
     }
 }
+
+#[tokio::test]
+async fn backup_deletion_respects_recorded_store_and_default_language() {
+    for store in ["same", "legacy", "different"] {
+        let directory = tempfile::tempdir().unwrap();
+        let game = directory.path().join("game");
+        std::fs::create_dir(&game).unwrap();
+        let source = game.join("story.html");
+        std::fs::write(&source, "<p>Hello player</p>").unwrap();
+        let state = locust_server::create_test_state();
+        let backup = state.backup_manager.create_backup(&game).unwrap();
+        let backup_path = state.backup_manager.root().join(&backup.id);
+        let storage_root = match store {
+            // Exercise equivalent path spellings (including Windows verbatim paths).
+            "same" => Some(std::fs::canonicalize(state.backup_manager.root()).unwrap()),
+            "legacy" => None,
+            "different" => {
+                let other = directory.path().join("other-backups");
+                std::fs::create_dir(&other).unwrap();
+                Some(other)
+            }
+            _ => unreachable!(),
+        };
+        state
+            .db
+            .record_injection_with_backup(
+                None,
+                &game,
+                &[source],
+                Some(&locust_core::database::RecordedBackup {
+                    id: backup.id.clone(),
+                    source_path: game.clone(),
+                    storage_root,
+                }),
+            )
+            .unwrap();
+        let (url, handle) = locust_server::start_test_server(state).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .delete(format!("{url}/api/backups/{}", backup.id))
+            .send()
+            .await
+            .unwrap();
+        if store == "different" {
+            assert_eq!(response.status(), 204);
+            assert!(!backup_path.exists());
+        } else {
+            assert_eq!(response.status(), 409, "store: {store}");
+            assert!(response
+                .text()
+                .await
+                .unwrap()
+                .contains("recorded for default"));
+            assert!(backup_path.is_dir());
+        }
+        handle.abort();
+    }
+}
+
 #[tokio::test]
 async fn repeated_injection_keeps_the_original_pack_baseline() {
     for single_file in [false, true] {

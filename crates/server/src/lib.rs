@@ -2763,11 +2763,33 @@ async fn delete_backup(
     let manager = state.backup_manager.clone();
     tokio::task::spawn_blocking(move || {
         let _exclusive = exclusive;
-        manager.delete_backup(&id)
+        // Only the open project's recordings are known here; recordings in
+        // other project databases cannot be checked from this handler.
+        for (lang, backup) in state
+            .db
+            .recorded_backup_refs()
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        {
+            if backup.id == id
+                && backup.storage_root.as_deref().is_none_or(|root| {
+                    locust_core::database::paths_identical(root, manager.root())
+                })
+            {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "backup {id} is needed to pack the injection recorded for {}; inject again or open another project before deleting it",
+                        lang.as_deref().unwrap_or("default")
+                    ),
+                ));
+            }
+        }
+        manager
+            .delete_backup(&id)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))??;
     Ok(StatusCode::NO_CONTENT)
 }
 
