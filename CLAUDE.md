@@ -67,7 +67,7 @@ See the current final verification report for Rust totals; 28 frontend unit test
 25 subcommands (also font-check, font-patch, inject-status, inject-recover):
 
 ```bash
-locust extract <game_path>              # Auto-detect format and extract strings
+locust extract <game_path>              # Auto-detect format and extract strings (--dry-run)
 locust translate <db> -p mock           # Translate with provider
 locust inject <game> -P <db> -l es      # Inject translations
 locust validate <db>                    # Placeholders + binary slot length (Unity/Unreal/Wolf)

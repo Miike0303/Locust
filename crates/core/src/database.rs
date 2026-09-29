@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, types::Value, Connection};
+use rusqlite::{params, types::Value, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -30,6 +30,12 @@ pub struct Database {
 
 fn lock_connection(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
     conn.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -219,6 +225,13 @@ pub struct MergeStats {
     pub stale_source_reset: usize,
     pub removed: usize,
     pub preserved_translations: usize,
+    /// Rows removed or reset to pending that currently have a non-empty translation.
+    #[serde(default)]
+    pub lost_translations: usize,
+}
+
+fn has_saved_translation(translation: &Option<String>) -> bool {
+    translation.as_ref().is_some_and(|text| !text.is_empty())
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -642,6 +655,36 @@ impl Database {
             conn: Arc::new(Mutex::new(conn)),
             path: Mutex::new(path.to_path_buf()),
         })
+    }
+
+    /// Open an existing database without creating directories or migrating it.
+    fn open_for_snapshot(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: Mutex::new(path.to_path_buf()),
+        })
+    }
+
+    /// Copy `src` with [`Database::snapshot_to`] without modifying that file.
+    /// A read-only snapshot can leave an empty `-wal`/`-shm` behind; those are
+    /// removed when this call created them. Sidecars that were already there stay.
+    pub fn snapshot_existing(src: &Path, dest: &Path) -> Result<()> {
+        let mut prior = Vec::new();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let path = sqlite_sidecar(src, suffix);
+            let existed = path.try_exists()?;
+            prior.push((path, existed));
+        }
+        let db = Self::open_for_snapshot(src)?;
+        let result = db.snapshot_to(dest);
+        drop(db);
+        for (path, existed) in prior {
+            if !existed {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        result
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -2117,10 +2160,13 @@ impl Database {
 
         {
             let mut delete = tx.prepare_cached("DELETE FROM strings WHERE id = ?1")?;
-            for id in existing.keys() {
+            for (id, stored) in &existing {
                 if !preserve_missing && !incoming.contains_key(id.as_str()) {
                     delete.execute(params![id])?;
                     stats.removed += 1;
+                    if has_saved_translation(&stored.translation) {
+                        stats.lost_translations += 1;
+                    }
                 }
             }
         }
@@ -2159,6 +2205,9 @@ impl Database {
                     let source_changed = !pivoted && old.source != entry.source;
                     let status = if source_changed {
                         stats.stale_source_reset += 1;
+                        if has_saved_translation(&old.translation) {
+                            stats.lost_translations += 1;
+                        }
                         StringStatus::Pending.to_string()
                     } else {
                         old.status.clone()
@@ -2211,7 +2260,7 @@ impl Database {
                             }
                         }
                     }
-                    if old.translation.as_ref().is_some_and(|t| !t.is_empty()) {
+                    if has_saved_translation(&old.translation) {
                         stats.preserved_translations += 1;
                     }
                     stats.updated += 1;
@@ -2932,6 +2981,32 @@ mod tests {
             })
             .unwrap();
         assert_eq!(original_count, 1);
+    }
+
+    #[test]
+    fn readonly_snapshot_leaves_source_bytes_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.locust.db");
+        let db = Database::open(&path).unwrap();
+        db.save_entries(&[make_entry("a", "Hello")]).unwrap();
+        drop(db);
+        let before = std::fs::read(&path).unwrap();
+        let wal = dir.path().join("project.locust.db-wal");
+        let shm = dir.path().join("project.locust.db-shm");
+        let wal_before = wal.is_file().then(|| std::fs::read(&wal).unwrap());
+        let shm_before = shm.is_file().then(|| std::fs::read(&shm).unwrap());
+        let dest = dir.path().join("copy.locust.db");
+        Database::snapshot_existing(&path, &dest).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let wal_after = wal.is_file().then(|| std::fs::read(&wal).unwrap());
+        let shm_after = shm.is_file().then(|| std::fs::read(&shm).unwrap());
+        assert_eq!(wal_after, wal_before);
+        assert_eq!(shm_after, shm_before);
+        let copied = Database::open(&dest).unwrap();
+        assert_eq!(
+            copied.get_entries(&EntryFilter::default()).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -3736,6 +3811,7 @@ mod tests {
         assert_eq!(stats.removed, 1);
         assert_eq!(stats.stale_source_reset, 0);
         assert_eq!(stats.preserved_translations, 1);
+        assert_eq!(stats.lost_translations, 0);
 
         let hero = db.get_entry("hero").unwrap().unwrap();
         assert_eq!(hero.translation.as_deref(), Some("Hola"));
@@ -3803,6 +3879,7 @@ mod tests {
         assert_eq!(stats.stale_source_reset, 1);
         assert_eq!(stats.updated, 1);
         assert_eq!(stats.preserved_translations, 1);
+        assert_eq!(stats.lost_translations, 1);
         assert_eq!(stats.added, 0);
         assert_eq!(stats.removed, 0);
 
@@ -3811,6 +3888,39 @@ mod tests {
         assert_eq!(npc.translation.as_deref(), Some("Bienvenido"));
         assert_eq!(npc.status, StringStatus::Pending);
         assert_eq!(npc.provider_used.as_deref(), Some("mock"));
+    }
+
+    #[tokio::test]
+    async fn merge_entries_counts_translations_lost_to_removal_or_pending_reset() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[
+            make_entry("reset", "Hello"),
+            make_entry("drop", "Goodbye"),
+            make_entry("plain", "Stay"),
+        ])
+        .unwrap();
+        assert!(db.save_translation("reset", "Hola", "mock").await.unwrap());
+        assert!(db.save_translation("drop", "Adiós", "mock").await.unwrap());
+
+        let stats = db
+            .merge_entries(&[make_entry("reset", "Hello!"), make_entry("plain", "Stay")])
+            .unwrap();
+        assert_eq!(stats.stale_source_reset, 1);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.lost_translations, 2);
+        assert_eq!(stats.preserved_translations, 1);
+
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[make_entry("reset", "Hello"), make_entry("keep", "Goodbye")])
+            .unwrap();
+        assert!(db.save_translation("reset", "Hola", "mock").await.unwrap());
+        assert!(db.save_translation("keep", "Adiós", "mock").await.unwrap());
+        let stats = db
+            .merge_entries_preserving_missing(&[make_entry("reset", "Hello!")])
+            .unwrap();
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.stale_source_reset, 1);
+        assert_eq!(stats.lost_translations, 1);
     }
 
     #[test]

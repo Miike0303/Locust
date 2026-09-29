@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use locust_core::backup::BackupManager;
 use locust_core::config::AppConfig;
-use locust_core::database::{Database, EntryFilter};
+use locust_core::database::{Database, EntryFilter, MergeStats};
 use locust_core::export;
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry};
@@ -68,6 +68,9 @@ enum Commands {
         format: Option<String>,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Preview only — do not write the database
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Translate extracted strings using a provider
     Translate {
@@ -385,7 +388,8 @@ async fn main() -> anyhow::Result<()> {
             path,
             format,
             output,
-        } => cmd_extract(path, format, output)?,
+            dry_run,
+        } => cmd_extract(path, format, output, dry_run)?,
         Commands::Translate {
             project,
             provider,
@@ -1311,10 +1315,63 @@ fn load_config(path: &Option<PathBuf>) -> AppConfig {
     })
 }
 
+fn merge_extracted(
+    db: &Database,
+    entries: &[StringEntry],
+    preserve_missing: bool,
+) -> anyhow::Result<MergeStats> {
+    Ok(if preserve_missing {
+        db.merge_entries_preserving_missing(entries)?
+    } else {
+        db.merge_entries(entries)?
+    })
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn remove_sqlite_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(sqlite_sidecar(path, suffix));
+    }
+}
+
+fn preview_extract_merge_in(
+    scratch_path: &Path,
+    db_path: &Path,
+    entries: &[StringEntry],
+    preserve_missing: bool,
+) -> anyhow::Result<MergeStats> {
+    if db_path.try_exists()? {
+        Database::snapshot_existing(db_path, scratch_path)?;
+    }
+    let scratch = Database::open(scratch_path)?;
+    merge_extracted(&scratch, entries, preserve_missing)
+}
+
+/// Run the same merge a real extract would, against a scratch database.
+/// The output path, its parent, and any existing database sidecars are not created or modified.
+fn preview_extract_merge(
+    db_path: &Path,
+    entries: &[StringEntry],
+    preserve_missing: bool,
+) -> anyhow::Result<MergeStats> {
+    let scratch_dir = tempfile::tempdir()?;
+    let scratch_path = scratch_dir.path().join("extract-preview.locust.db");
+    let result = preview_extract_merge_in(&scratch_path, db_path, entries, preserve_missing);
+    remove_sqlite_files(&scratch_path);
+    result
+}
+
 fn cmd_extract(
     path: PathBuf,
     format: Option<String>,
     output: Option<PathBuf>,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     let _source_lock = locust_core::project::lock_game_source(&path)?;
     let registry = locust_formats::default_registry();
@@ -1348,16 +1405,18 @@ fn cmd_extract(
         PathBuf::from(format!("{}.locust.db", name))
     });
 
-    let db = Database::open(&db_path)?;
-    let merge = if extraction_warnings.is_empty() {
-        db.merge_entries(&entries)?
+    let preserve_missing = !extraction_warnings.is_empty();
+    let merge = if dry_run {
+        preview_extract_merge(&db_path, &entries, preserve_missing)?
     } else {
-        db.merge_entries_preserving_missing(&entries)?
+        let db = Database::open(&db_path)?;
+        let merge = merge_extracted(&db, &entries, preserve_missing)?;
+        db.set_project_metadata(
+            "extraction_warnings",
+            &serde_json::json!(extraction_warnings),
+        )?;
+        merge
     };
-    db.set_project_metadata(
-        "extraction_warnings",
-        &serde_json::json!(extraction_warnings),
-    )?;
 
     let mut table = Table::new();
     table.set_header(vec!["Property", "Value"]);
@@ -1375,7 +1434,14 @@ fn cmd_extract(
         "Translations preserved",
         &merge.preserved_translations.to_string(),
     ]);
+    table.add_row(vec![
+        "Translations lost",
+        &merge.lost_translations.to_string(),
+    ]);
     println!("{table}");
+    if dry_run {
+        println!("Dry run: nothing was written");
+    }
 
     Ok(())
 }

@@ -1,6 +1,7 @@
+use std::fs;
 use std::path::Path;
 
-use locust_core::database::{Database, EntryFilter};
+use locust_core::database::{sha256_hex, Database, EntryFilter};
 use locust_core::models::{StringEntry, StringStatus};
 
 mod common;
@@ -18,14 +19,75 @@ fn renpy_fixture() -> tempfile::TempDir {
 }
 
 fn extract(game: &Path, project: &Path) -> String {
-    let assertion = locust()
-        .arg("extract")
-        .arg(game)
-        .arg("-o")
-        .arg(project)
-        .assert()
-        .success();
-    String::from_utf8(assertion.get_output().stdout.clone()).unwrap()
+    extract_output(game, project, false).0
+}
+
+fn extract_output(game: &Path, project: &Path, dry_run: bool) -> (String, String) {
+    let mut cmd = locust();
+    cmd.arg("extract").arg(game).arg("-o").arg(project);
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    let assertion = cmd.assert().success();
+    let output = assertion.get_output();
+    (
+        String::from_utf8(output.stdout.clone()).unwrap(),
+        String::from_utf8(output.stderr.clone()).unwrap(),
+    )
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Content hashes of the database and its SQLite sidecars. Missing files stay
+/// missing; file timestamps are not part of the hash.
+fn db_fingerprints(path: &Path) -> Vec<(String, Option<String>)> {
+    let mut files = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        files.push(sqlite_sidecar(path, suffix));
+    }
+    files
+        .into_iter()
+        .map(|file| {
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            let hash = file
+                .is_file()
+                .then(|| sha256_hex(&fs::read(&file).unwrap()));
+            (name, hash)
+        })
+        .collect()
+}
+
+fn dir_listing(path: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+const EXTRACT_COUNT_ROWS: &[&str] = &[
+    "Strings extracted",
+    "Added",
+    "Updated",
+    "Source changed (reset to pending)",
+    "Removed",
+    "Translations preserved",
+    "Translations lost",
+];
+
+fn assert_same_extract_counts(dry: &str, real: &str) {
+    for label in EXTRACT_COUNT_ROWS {
+        assert_eq!(
+            summary_count(dry, label),
+            summary_count(real, label),
+            "{label}"
+        );
+    }
 }
 
 fn summary_count(output: &str, label: &str) -> usize {
@@ -293,4 +355,160 @@ async fn cli_partial_reextract_preserves_missing_rows_until_complete() {
         .unwrap()
         .is_empty());
     assert_eq!(summary_count(&output, "Removed"), 1);
+}
+
+#[tokio::test]
+async fn cli_extract_dry_run_previews_lost_translations_without_writing() {
+    let dir = renpy_fixture();
+    let project = dir.path().join("project.db");
+    extract(dir.path(), &project);
+    let db = Database::open(&project).unwrap();
+    let changed = approve(&db, "script.rpy#2", "¡Hola, mundo!").await;
+    drop(db);
+
+    std::fs::write(
+        dir.path().join("game/script.rpy"),
+        "label start:\n    e \"Hello, everyone!\"\n",
+    )
+    .unwrap();
+    let before = db_fingerprints(&project);
+    let (dry, _) = extract_output(dir.path(), &project, true);
+    assert_eq!(
+        db_fingerprints(&project),
+        before,
+        "dry-run changed the project database or a SQLite sidecar"
+    );
+    assert!(dry.contains("Dry run: nothing was written"), "{dry}");
+    assert_eq!(summary_count(&dry, "Source changed (reset to pending)"), 1);
+    assert_eq!(summary_count(&dry, "Removed"), 1);
+    assert_eq!(summary_count(&dry, "Translations lost"), 1);
+
+    let db = Database::open(&project).unwrap();
+    let still = db.get_entry(&changed.id).unwrap().unwrap();
+    assert_eq!(still.source, changed.source);
+    assert_eq!(still.translation, changed.translation);
+    assert_eq!(still.status, changed.status);
+    assert!(db.get_entry("script.rpy#3").unwrap().is_some());
+    drop(db);
+
+    let real = extract(dir.path(), &project);
+    assert_same_extract_counts(&dry, &real);
+    assert!(!real.contains("Dry run: nothing was written"), "{real}");
+    let db = Database::open(&project).unwrap();
+    let after = db.get_entry(&changed.id).unwrap().unwrap();
+    assert_eq!(after.source, "Hello, everyone!");
+    assert_eq!(after.status, StringStatus::Pending);
+    assert!(db.get_entry("script.rpy#3").unwrap().is_none());
+}
+
+#[test]
+fn cli_extract_dry_run_missing_output_creates_no_file() {
+    let dir = renpy_fixture();
+    let missing_parent = dir.path().join("missing-parent");
+    let nested = missing_parent.join("project.locust.db");
+    let (nested_out, _) = extract_output(dir.path(), &nested, true);
+    assert!(
+        !missing_parent.exists(),
+        "dry-run created {missing_parent:?}"
+    );
+    assert!(!nested.exists());
+    assert!(
+        nested_out.contains("Dry run: nothing was written"),
+        "{nested_out}"
+    );
+    assert_eq!(summary_count(&nested_out, "Added"), 2);
+    assert_eq!(summary_count(&nested_out, "Translations lost"), 0);
+
+    let project = dir.path().join("new.locust.db");
+    let before = dir_listing(dir.path());
+    let (output, _) = extract_output(dir.path(), &project, true);
+    assert_eq!(
+        dir_listing(dir.path()),
+        before,
+        "dry-run left a database or scratch file next to the output path"
+    );
+    assert!(!project.exists());
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!sqlite_sidecar(&project, suffix).exists());
+    }
+    assert!(output.contains("Dry run: nothing was written"), "{output}");
+    assert_eq!(summary_count(&output, "Added"), 2);
+    assert_eq!(summary_count(&output, "Removed"), 0);
+}
+
+#[tokio::test]
+async fn cli_extract_dry_run_partial_preserves_missing_rows() {
+    use locust_formats::unreal_locres::{LocresFile, LocresNamespace, LocresString, LocresVersion};
+
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project.db");
+    let resource = dir.path().join("Game.locres");
+    let mut file = LocresFile {
+        version: LocresVersion::Compact,
+        namespaces: vec![LocresNamespace {
+            name: "Dialogue".into(),
+            name_hash: 0,
+            strings: ["Hello, world!", "Goodbye!"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, value)| LocresString {
+                    key: format!("line{i}"),
+                    key_hash: 0,
+                    source_string_hash: 0,
+                    value: value.into(),
+                })
+                .collect(),
+        }],
+    };
+    std::fs::write(&resource, file.serialize().unwrap()).unwrap();
+    extract(dir.path(), &project);
+    let db = Database::open(&project).unwrap();
+    let entries = db.get_entries(&EntryFilter::default()).unwrap();
+    let id = &entries.iter().find(|e| e.source == "Goodbye!").unwrap().id;
+    let missing = approve(&db, id, "¡Adiós!").await;
+    drop(db);
+
+    file.namespaces[0].strings.pop();
+    std::fs::write(&resource, file.serialize().unwrap()).unwrap();
+    let toc = dir.path().join("extra.utoc");
+    let mut header = [0u8; 144];
+    header[..16].copy_from_slice(b"-==--==--==--==-");
+    header[16] = 5;
+    header[20..24].copy_from_slice(&144u32.to_le_bytes());
+    header[80] = 2;
+    std::fs::write(&toc, header).unwrap();
+
+    let before = db_fingerprints(&project);
+    let (dry, stderr) = extract_output(dir.path(), &project, true);
+    assert!(
+        stderr.contains("partial extraction"),
+        "dry-run did not take the partial-extraction path:\n{stderr}"
+    );
+    assert_eq!(db_fingerprints(&project), before);
+    assert_eq!(summary_count(&dry, "Removed"), 0);
+    assert_eq!(summary_count(&dry, "Translations lost"), 0);
+    assert_eq!(summary_count(&dry, "Strings extracted"), 1);
+    assert!(dry.contains("Dry run: nothing was written"), "{dry}");
+
+    let db = Database::open(&project).unwrap();
+    assert_eq!(
+        serde_json::to_value(db.get_entry(&missing.id).unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&missing).unwrap()
+    );
+    assert!(locust_core::project::saved_extraction_warnings(&db)
+        .unwrap()
+        .is_empty());
+    drop(db);
+
+    let (real, _) = extract_output(dir.path(), &project, false);
+    assert_same_extract_counts(&dry, &real);
+    let db = Database::open(&project).unwrap();
+    assert!(db.get_entry(&missing.id).unwrap().is_some());
+    assert_eq!(
+        locust_core::project::saved_extraction_warnings(&db)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(summary_count(&real, "Removed"), 0);
 }
