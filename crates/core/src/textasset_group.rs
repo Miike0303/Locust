@@ -420,6 +420,9 @@ pub fn patch_from_entry<'a>(
 /// Rebuild the original blob with the given cell replacements. Failed patches
 /// leave that line untouched. This is the same layout inject writes.
 pub fn apply_patches(original: &str, kind: GroupKind, patches: &[CellPatch<'_>]) -> AppliedBlob {
+    #[cfg(test)]
+    tests::APPLY_PATCHES_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let mut lines: Vec<String> = original.split_inclusive('\n').map(str::to_string).collect();
     let rows: Vec<usize> = lines
         .iter()
@@ -702,51 +705,6 @@ pub fn group_validation_issues(entries: &[StringEntry]) -> Vec<ValidationIssue> 
                 });
             }
         }
-        if patches.is_empty() {
-            continue;
-        }
-        let applied = apply_patches(&meta.original, meta.kind, &patches);
-        for (id, result) in &applied.outcomes {
-            if let Err(reason) = result {
-                if *reason == "error" {
-                    issues.push(ValidationIssue {
-                        entry_id: id.clone(),
-                        kind: ValidationKind::InvalidInjectionProvenance,
-                        message: format!(
-                            "entry '{id}' cannot be reconstructed into the supported TextAsset layout"
-                        ),
-                        source: None,
-                    });
-                }
-            }
-        }
-        if applied.outcomes.iter().any(|(_, result)| result.is_err()) {
-            continue;
-        }
-        if let Err(actual) = fit_reconstructed(applied.text, meta.capacity) {
-            for entry in members {
-                if entry
-                    .translation
-                    .as_deref()
-                    .is_none_or(|t| t.is_empty() || t == entry.source)
-                {
-                    continue;
-                }
-                issues.push(ValidationIssue {
-                    entry_id: entry.id.clone(),
-                    kind: ValidationKind::ExceedsBinarySlot {
-                        encoding: "utf8".into(),
-                        limit: meta.capacity,
-                        actual,
-                    },
-                    message: format!(
-                        "reconstructed TextAsset blob exceeds shared capacity (utf8): {actual} > {} bytes",
-                        meta.capacity
-                    ),
-                    source: None,
-                });
-            }
-        }
     }
     issues
 }
@@ -821,6 +779,13 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    thread_local! {
+        // Keep reconstruction counts independent of concurrently running tests.
+        pub(super) static APPLY_PATCHES_CALLS: std::cell::Cell<usize> = const {
+            std::cell::Cell::new(0)
+        };
+    }
+
     fn loc_entry(id: &str, key: &str, value: &str, index: usize) -> StringEntry {
         let mut entry = StringEntry::new(id, value, PathBuf::from("sharedassets0.assets"));
         entry.metadata.insert(
@@ -837,6 +802,124 @@ mod tests {
             .metadata
             .insert("binary_slot".into(), serde_json::json!("utf8"));
         entry
+    }
+
+    fn validation_group(kind: GroupKind, translations: [&str; 2]) -> Vec<StringEntry> {
+        let (original, method) = match kind {
+            GroupKind::LocLine => ("Menu.A: Hi\nMenu.B: Go\n", "textasset_loc_line"),
+            GroupKind::Csv => ("ID,NAME\n1,Hi\n2,Go\n", "textasset_csv_cell"),
+        };
+        let mut members: Vec<_> = [("a", "Hi"), ("b", "Go")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, source))| {
+                let mut entry = StringEntry::new(id, source, PathBuf::from("sharedassets0.assets"));
+                entry
+                    .metadata
+                    .insert("extraction_method".into(), serde_json::json!(method));
+                match kind {
+                    GroupKind::LocLine => {
+                        entry.metadata.insert(
+                            "loc_key".into(),
+                            serde_json::json!(["Menu.A", "Menu.B"][index]),
+                        );
+                        entry
+                            .metadata
+                            .insert("line_index".into(), serde_json::json!(index));
+                    }
+                    GroupKind::Csv => {
+                        entry
+                            .metadata
+                            .insert("csv_row".into(), serde_json::json!(index + 1));
+                        entry
+                            .metadata
+                            .insert("csv_col".into(), serde_json::json!(1));
+                        entry
+                            .metadata
+                            .insert("csv_header".into(), serde_json::json!("NAME"));
+                    }
+                }
+                entry.translation = Some(translations[index].into());
+                entry
+            })
+            .collect();
+        attach_to_entries(&mut members, kind, original, original.len(), "validation");
+        members
+    }
+
+    #[test]
+    fn group_validation_reports_each_capacity_issue_once() {
+        for kind in [GroupKind::LocLine, GroupKind::Csv] {
+            let members = validation_group(kind, ["Hola!!", "Vamos"]);
+            let issues = group_validation_issues(&members);
+            assert_eq!(issues.len(), 2, "{kind:?}: {issues:?}");
+            assert_eq!(
+                issues
+                    .iter()
+                    .map(|issue| issue.entry_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["a", "b"]
+            );
+            let capacity = meta_usize(&members[0], GROUP_CAPACITY_KEY).unwrap();
+            let actual = capacity + "Hola!!".len() + "Vamos".len() - "Hi".len() - "Go".len();
+            for issue in issues {
+                assert!(matches!(
+                    issue.kind,
+                    ValidationKind::ExceedsBinarySlot {
+                        ref encoding,
+                        limit,
+                        actual: issue_actual,
+                    } if encoding == "utf8" && limit == capacity && issue_actual == actual
+                ));
+                assert_eq!(
+                    issue.message,
+                    format!(
+                        "reconstructed TextAsset blob exceeds shared capacity (utf8): {actual} > {capacity} bytes"
+                    )
+                );
+                assert!(issue.source.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn group_validation_reconstructs_each_group_once() {
+        for kind in [GroupKind::LocLine, GroupKind::Csv] {
+            for translations in [["Yo", "Va"], ["Hola!!", "Vamos"]] {
+                let members = validation_group(kind, translations);
+                APPLY_PATCHES_CALLS.with(|calls| calls.set(0));
+                group_validation_issues(&members);
+                assert_eq!(APPLY_PATCHES_CALLS.with(|calls| calls.get()), 1, "{kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn group_validation_reports_reconstruction_error_once() {
+        for kind in [GroupKind::LocLine, GroupKind::Csv] {
+            let members = validation_group(kind, ["No\nvale", "Vamos"]);
+            let issues = group_validation_issues(&members);
+            assert_eq!(issues.len(), 1, "{kind:?}: {issues:?}");
+            assert_eq!(issues[0].entry_id, "a");
+            assert!(matches!(
+                issues[0].kind,
+                ValidationKind::InvalidInjectionProvenance
+            ));
+            assert_eq!(
+                issues[0].message,
+                "entry 'a' cannot be reconstructed into the supported TextAsset layout"
+            );
+            assert!(issues[0].source.is_none());
+        }
+    }
+
+    #[test]
+    fn group_validation_reports_no_issues_for_fitting_group() {
+        for kind in [GroupKind::LocLine, GroupKind::Csv] {
+            let members = validation_group(kind, ["Yo", "Va"]);
+            let issues = group_validation_issues(&members);
+            assert!(issues.is_empty(), "{kind:?}: {issues:?}");
+        }
     }
 
     #[test]
