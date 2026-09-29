@@ -649,6 +649,22 @@ impl Database {
         self.path.lock().unwrap().clone()
     }
 
+    /// Write a consistent standalone checkpoint, including committed WAL data.
+    pub fn snapshot_to(&self, dest: &Path) -> Result<()> {
+        crate::export::check_export_destination(dest, &self.path())?;
+        if dest.try_exists()? {
+            return Err(LocustError::Other(anyhow::anyhow!(
+                "checkpoint destination already exists: {}",
+                dest.display()
+            )));
+        }
+        let dest = dest.to_str().ok_or_else(|| {
+            LocustError::Other(anyhow::anyhow!("checkpoint destination is not valid UTF-8"))
+        })?;
+        lock_connection(&self.conn).execute("VACUUM INTO ?1", params![dest])?;
+        Ok(())
+    }
+
     /// Swap the live connection to `path` in place and run the same schema
     /// init as [`Database::open`]. Shared `Arc<Database>` handlers keep working.
     pub fn reopen(&self, path: &Path) -> Result<()> {
@@ -2782,6 +2798,43 @@ mod tests {
             "shared-group",
         );
         (original, entries)
+    }
+
+    #[test]
+    fn snapshot_to_preserves_shared_textasset_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("project.db")).unwrap();
+        let (original, entries) = shared_textasset_rows(3);
+        db.save_entries(&entries).unwrap();
+        let expected = db.get_entries(&EntryFilter::default()).unwrap();
+        let dest = dir.path().join("checkpoint's shared original.locust.db");
+
+        db.snapshot_to(&dest).unwrap();
+
+        let checkpoint = Database::open(&dest).unwrap();
+        let loaded = checkpoint.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let head = loaded[0].textasset_original.as_ref().unwrap();
+        for entry in &loaded {
+            assert_eq!(
+                crate::textasset_group::original_textasset(entry),
+                Some(original.as_str())
+            );
+            assert!(Arc::ptr_eq(
+                head,
+                entry.textasset_original.as_ref().unwrap()
+            ));
+            assert!(crate::textasset_group::parse_group_meta(entry).is_ok());
+        }
+        let original_count: usize = lock_connection(&checkpoint.conn)
+            .query_row("SELECT COUNT(*) FROM textasset_originals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(original_count, 1);
     }
 
     #[test]

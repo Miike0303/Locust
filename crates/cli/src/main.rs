@@ -158,6 +158,13 @@ enum Commands {
     },
     /// Show translation stats: tokens, time, and cost per run
     Stats { project: PathBuf },
+    /// Create a standalone checkpoint that opens like any project database
+    BackupProject {
+        project: PathBuf,
+        /// New checkpoint path; existing files are never overwritten
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Pivot: seed a new project whose SOURCE is another project's translations,
     /// so you can translate e.g. JA→EN once, then EN→ES / EN→FR / EN→PT from it.
     Pivot {
@@ -462,6 +469,7 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
         } => cmd_replace(project, find, replace, case_sensitive, dry_run).await?,
         Commands::Stats { project } => cmd_stats(project)?,
+        Commands::BackupProject { project, output } => cmd_backup_project(project, output)?,
         Commands::Pivot { source, output } => cmd_pivot(source, output)?,
         Commands::Patch {
             game_path,
@@ -2054,6 +2062,20 @@ fn cmd_glossary(action: GlossaryCommands) -> anyhow::Result<()> {
             println!("Deleted: {} ({})", term, lang_pair);
         }
     }
+    Ok(())
+}
+
+fn cmd_backup_project(project: PathBuf, output: PathBuf) -> anyhow::Result<()> {
+    let db = Database::open(&project)?;
+    db.snapshot_to(&output)?;
+    let checkpoint = Database::open(&output)?;
+    let count = checkpoint.count_entries(&EntryFilter::default())?;
+    drop(checkpoint);
+    let size = std::fs::metadata(&output)?.len();
+    println!(
+        "Checkpoint: {} ({size} bytes, {count} strings)",
+        output.display()
+    );
     Ok(())
 }
 
