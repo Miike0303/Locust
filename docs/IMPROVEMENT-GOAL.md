@@ -19,7 +19,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 ## Backlog
 
-- **[defect · CLI · S] `replace` case-insensitive prefilter misses Unicode matches** (cycle 84 research runner-up). `cmd_replace` uses SQLite ASCII-only `LIKE` when the search term is ASCII, but the Rust matcher lowercases Unicode (`crates/cli/src/main.rs:~1837`, `:~1902`, `database.rs:~2471`): source `温度` translation `300 K` (U+212A), replace `k`→`K` reports no matches. Check: `cmd_replace` test on that row.
 - **[capability · core · L] `apply --dry-run` refuses upgrades and patch switches** (cycle 64 research, B). `reject_dry_run_rollback` (`crates/core/src/patch/apply.rs:157`, `:188`, `:276`) — needs a virtual post-rollback baseline. Large; only if a user asks.
 - **[defect · frontend · S] Settings Glossary and History are silently empty with no project open** (after cycle 58). The queries now fail with `no project open` and there is no global query error handler, so the lists render empty with no hint. Show "Open a project to see its glossary / translation history" instead. Check: a component test with the query rejected renders the hint.
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2. **Likely stale (cycle 83 researcher B): indexed extraction now reads only selected payloads (`crates/formats/src/unreal.rs:~354`) and the heuristic fallback rejects files above 8 MiB (`:~48`, `:~528`). Re-verify before picking.**
@@ -232,6 +231,7 @@ Nothing.
 - `a2f7952` — first workspace-wide `cargo fmt`, isolated so it could not bury the change beside it.
 
 ## Rejected
+- `replace` case-insensitive SQL prefilter misses U+212A (Kelvin) / U+0130 matches for an ASCII `k`/`i` (cycle 84 runner-up, rejected cycle 87): real but practically unreachable; the only fix skips the SQL prefilter for every case-insensitive replace (up to 100k rows fetched) to serve two exotic code points.
 
 - **`.zip` file association / `locust://` protocol handler** — 2026-08-14. The handler exists so a user can click a link on a patch distribution site. No such site exists; the Astro stub points at third-party rule95. Building the receiver now means OS-level registration, per-platform, untestable against anything real. Revisit when the web decision is made.
 - **Aligning the translation default languages** — 2026-08-14. The chain is `lastUsed ?? config ?? "auto"/"es"` and config always exists, so the hardcoded fallback is unreachable. Changing it changes nothing for anyone.
