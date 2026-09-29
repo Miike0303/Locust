@@ -317,6 +317,10 @@ enum Commands {
         /// reviewed, approved, error
         #[arg(long, value_name = "STATE")]
         status: Vec<String>,
+        /// Export only strings from this source file (exact stored path); combine with --status
+        /// Paths are stored verbatim; separators must match
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
     },
     /// Import translations from PO or XLIFF
     Import {
@@ -548,7 +552,10 @@ async fn main() -> anyhow::Result<()> {
             output,
             overwrite,
             status,
-        } => cmd_export(&config, project, format, lang, output, overwrite, status)?,
+            file,
+        } => cmd_export(
+            &config, project, format, lang, output, overwrite, status, file,
+        )?,
         Commands::Import {
             project,
             format,
@@ -2231,6 +2238,7 @@ fn cmd_backup_project(project: PathBuf, output: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_export(
     config: &AppConfig,
     project: PathBuf,
@@ -2239,6 +2247,7 @@ fn cmd_export(
     output: PathBuf,
     overwrite: bool,
     status: Vec<String>,
+    file: Option<String>,
 ) -> anyhow::Result<()> {
     use locust_core::models::StringStatus;
 
@@ -2260,7 +2269,24 @@ fn cmd_export(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut entries = db.get_entries(&EntryFilter::default())?;
+    // Extraction stores paths verbatim; EntryFilter uses SQL equality, keeping
+    // separators, case and dot components exactly as stored in strings.file_path.
+    let mut entries = db.get_entries(&EntryFilter {
+        file_path: file.clone(),
+        ..EntryFilter::default()
+    })?;
+    if entries.is_empty() {
+        if let Some(file) = file {
+            let known_files = db
+                .get_string_facets()?
+                .file_paths
+                .into_iter()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("no entries to export for file '{file}'; known files: {known_files}");
+        }
+    }
     // Retain the database's ID order for any union of states, including repeats.
     if !statuses.is_empty() {
         entries.retain(|entry| statuses.contains(&entry.status));

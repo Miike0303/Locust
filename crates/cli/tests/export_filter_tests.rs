@@ -11,6 +11,9 @@ use common::locust;
 const PENDING: (&str, &str, &str) = ("01-pending", "Untranslated", "");
 const APPROVED: (&str, &str, &str) = ("02-approved", "Approved source", "Aprobado");
 const STALE: (&str, &str, &str) = ("03-stale", "Changed <source>", "Texto anterior & válido");
+const B_PENDING: (&str, &str, &str) = ("02-b-pending", "Other pending source", "");
+const B_TRANSLATED: (&str, &str, &str) =
+    ("04-b-translated", "Other translated source", "Traducido");
 
 fn project_fixture() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -33,6 +36,28 @@ fn project_fixture() -> (tempfile::TempDir, PathBuf) {
     assert_eq!(stale.status, StringStatus::Pending);
     assert_eq!(stale.translation.as_deref(), Some(STALE.2));
     assert!(stale.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY));
+    (dir, project)
+}
+
+fn two_file_fixture() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project.locust.db");
+    let db = Database::open(&project).unwrap();
+    // Interleave files in ID order and insert out of order. Only b.rpy has
+    // translated entries, so a.rpy + translated is an empty intersection.
+    for (row, file, status) in [
+        (B_TRANSLATED, "b.rpy", StringStatus::Translated),
+        (APPROVED, "a.rpy", StringStatus::Approved),
+        (B_PENDING, "b.rpy", StringStatus::Pending),
+        (PENDING, "a.rpy", StringStatus::Pending),
+    ] {
+        let mut entry = StringEntry::new(row.0, row.1, file.into());
+        entry.status = status;
+        if !row.2.is_empty() {
+            entry.translation = Some(row.2.into());
+        }
+        db.save_entries(&[entry]).unwrap();
+    }
     (dir, project)
 }
 
@@ -244,4 +269,192 @@ fn destination_checks_precede_status_validation() {
         assert_eq!(std::fs::read(&output).unwrap(), b"existing catalog");
     }
     assert_eq!(std::fs::read(&project).unwrap(), before);
+}
+
+fn file_filter(format: &str, pending_only: bool) {
+    let (dir, project) = two_file_fixture();
+    let output = dir.path().join(format!("selected.{format}"));
+    let mut command = export_command(&project, format, &output);
+    command.args(["--file", "a.rpy"]);
+    let expected = if pending_only {
+        command.args(["--status", "pending"]);
+        vec![PENDING]
+    } else {
+        vec![PENDING, APPROVED]
+    };
+    command
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(format!(
+            "Exported {} entries to",
+            expected.len()
+        )));
+    assert_catalog(&output, format, &expected);
+}
+
+#[test]
+fn po_file_filter_intersects_status() {
+    file_filter("po", true);
+}
+
+#[test]
+fn xliff_file_filter_intersects_status() {
+    file_filter("xliff", true);
+}
+
+#[test]
+fn po_file_filter_alone_includes_all_file_statuses() {
+    file_filter("po", false);
+}
+
+#[test]
+fn xliff_file_filter_alone_includes_all_file_statuses() {
+    file_filter("xliff", false);
+}
+
+#[test]
+fn unmatched_file_lists_known_files_without_writing() {
+    let (dir, project) = two_file_fixture();
+    for format in ["po", "xliff"] {
+        let output = dir.path().join(format!("missing.{format}"));
+        export_command(&project, format, &output)
+            .args(["--file", "missing.rpy", "--status", "reviewed"])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(
+                "no entries to export for file 'missing.rpy'; known files: a.rpy, b.rpy",
+            ));
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn file_status_empty_intersection_refuses_to_write_or_replace() {
+    let (dir, project) = two_file_fixture();
+    for format in ["po", "xliff"] {
+        let output = dir.path().join(format!("empty.{format}"));
+        export_command(&project, format, &output)
+            .args(["--file", "a.rpy", "--status", "translated"])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("no entries to export"));
+        assert!(!output.exists());
+
+        std::fs::write(&output, b"existing catalog").unwrap();
+        for file in ["a.rpy", "missing.rpy"] {
+            export_command(&project, format, &output)
+                .args(["--overwrite", "--file", file, "--status", "translated"])
+                .assert()
+                .failure()
+                .stderr(predicates::str::contains("no entries to export"));
+            assert_eq!(std::fs::read(&output).unwrap(), b"existing catalog");
+        }
+    }
+}
+
+#[test]
+fn unmatched_file_lists_at_most_five_distinct_paths() {
+    let (dir, project) = two_file_fixture();
+    let db = Database::open(&project).unwrap();
+    for file in ["g.rpy", "f.rpy", "e.rpy", "d.rpy", "c.rpy"] {
+        db.save_entries(&[StringEntry::new(file, "Source", file.into())])
+            .unwrap();
+    }
+    drop(db);
+    for format in ["po", "xliff"] {
+        let output = dir.path().join(format!("missing.{format}"));
+        let assertion = export_command(&project, format, &output)
+            .args(["--file", "missing.rpy"])
+            .assert()
+            .failure();
+        let stderr = String::from_utf8_lossy(&assertion.get_output().stderr);
+        let known_files = stderr.split_once("known files: ").unwrap().1.trim();
+        assert_eq!(known_files, "a.rpy, b.rpy, c.rpy, d.rpy, e.rpy");
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn file_filter_matches_verbatim_paths_without_normalization() {
+    let (dir, project) = two_file_fixture();
+    let db = Database::open(&project).unwrap();
+    // Extraction stores these spellings verbatim, even on Windows. Similar
+    // basenames, case, separators, dot components and SQL wildcards differ.
+    let paths = [
+        "nested/a.rpy",
+        r"nested\a.rpy",
+        "./a.rpy",
+        "A.rpy",
+        "a.rpy.bak",
+        "a%.rpy",
+        "a_.rpy",
+    ];
+    for file in paths {
+        db.save_entries(&[StringEntry::new(file, "Distinct source", file.into())])
+            .unwrap();
+    }
+    drop(db);
+    for format in ["po", "xliff"] {
+        let output = dir.path().join(format!("exact.{format}"));
+        for file in paths.into_iter().chain(["a.rpy"]) {
+            export_command(&project, format, &output)
+                .args(["--file", file, "--overwrite"])
+                .assert()
+                .success();
+            if file == "a.rpy" {
+                assert_catalog(&output, format, &[PENDING, APPROVED]);
+            } else {
+                assert_catalog(&output, format, &[(file, "Distinct source", "")]);
+            }
+        }
+    }
+}
+
+#[test]
+fn omitted_file_matches_pre_change_bytes_with_and_without_status() {
+    let (dir, project) = two_file_fixture();
+    let db = Database::open(&project).unwrap();
+    let source_lang = db
+        .resolve_export_source_lang("es", &AppConfig::default().default_source_lang)
+        .unwrap();
+    for format in ["po", "xliff"] {
+        for pending_only in [false, true] {
+            // The pre-file-filter cmd_export path on the same database.
+            let mut entries = db.get_entries(&EntryFilter::default()).unwrap();
+            if pending_only {
+                entries.retain(|entry| entry.status == StringStatus::Pending);
+            }
+            let baseline = match format {
+                "po" => export_po(&entries, &source_lang, "es"),
+                "xliff" => export_xliff(&entries, &source_lang, "es"),
+                _ => unreachable!(),
+            };
+            let output = dir.path().join(format!("no-file-{pending_only}.{format}"));
+            let mut command = export_command(&project, format, &output);
+            let expected = if pending_only {
+                command.args(["--status", "pending"]);
+                vec![PENDING, B_PENDING]
+            } else {
+                vec![PENDING, APPROVED, B_PENDING, B_TRANSLATED]
+            };
+            command.assert().success();
+            assert_catalog(&output, format, &expected);
+            assert_eq!(std::fs::read(&output).unwrap(), baseline.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn export_help_describes_exact_verbatim_file_paths() {
+    locust()
+        .args(["export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--file <PATH>"))
+        .stdout(predicates::str::contains(
+            "Export only strings from this source file (exact stored path); combine with --status",
+        ))
+        .stdout(predicates::str::contains(
+            "Paths are stored verbatim; separators must match",
+        ));
 }
