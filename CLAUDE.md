@@ -1,8 +1,8 @@
 # Project Locust
 
-## Estado vigente (2026-09-27): /goal en `main`, solo Codex
+## Estado vigente (2026-09-28): /goal en `main`, solo Codex
 
-Leer primero `docs/HANDOFF-2026-09-27.md`. Rama de trabajo: **`main`**. Escritores: **solo Codex** (`gpt-6-astra` xhigh; investigadores y subagentes también `gpt-6-astra` high; nunca `gpt-6-sol`; sin Fast tier). Si Codex no está disponible (probe sin respuesta, sandbox trabado dos veces o cuota agotada): Cursor `grok-4.7-xhigh` para escribir y `grok-4.7-high` para investigar, nunca `-fast` (usuario, 2026-09-28). Nada de Grok Build. El usuario quiere agotar la suscripción de Codex y sus reinicios con trabajo útil. Ticks del loop cada 15-20 min. Config y gates: `.claude/improvement.md`; ledger: `docs/IMPROVEMENT-GOAL.md`; mapa: `docs/ARCHITECTURE.md`. El loop se reanuda solo al abrir sesión (hook SessionStart en `.claude/settings.local.json`; lanzador `.claude/start-goal.cmd`). Esto reemplaza las restricciones de las secciones históricas siguientes (Cursor, `feat/desktop-ux-kimi-k3-p2`, "work directly in Codex").
+Leer primero `docs/HANDOFF-2026-09-28.md`. Rama de trabajo: **`main`**. Escritores: **solo Codex** (`gpt-6-astra` xhigh; investigadores y subagentes también `gpt-6-astra` high; nunca `gpt-6-sol`; sin Fast tier). Si Codex no está disponible (probe sin respuesta, sandbox trabado dos veces o cuota agotada): Cursor `grok-4.7-xhigh` para escribir y `grok-4.7-high` para investigar, nunca `-fast` (usuario, 2026-09-28). Nada de Grok Build. El usuario quiere agotar la suscripción de Codex y sus reinicios con trabajo útil. Ticks del loop cada 15-20 min. Config y gates: `.claude/improvement.md`; ledger: `docs/IMPROVEMENT-GOAL.md`; mapa: `docs/ARCHITECTURE.md`. El loop se reanuda solo al abrir sesión (hook SessionStart en `.claude/settings.local.json`; lanzador `.claude/start-goal.cmd`). Esto reemplaza las restricciones de las secciones históricas siguientes (Cursor, `feat/desktop-ux-kimi-k3-p2`, "work directly in Codex").
 
 Universal open-source game translation tool built in Rust.
 
