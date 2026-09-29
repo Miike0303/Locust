@@ -100,12 +100,22 @@ impl PlaceholderProcessor {
 
         // Replace tokens with originals
         for ph in placeholders {
-            if !result.contains(&ph.token) {
+            let count = translated.matches(ph.token.as_str()).count();
+            if count == 0 {
                 return Err(LocustError::PlaceholderError {
                     entry_id: String::new(),
                     message: format!(
                         "missing placeholder token {} (original: {})",
                         ph.token, ph.original
+                    ),
+                });
+            }
+            if count > 1 {
+                return Err(LocustError::PlaceholderError {
+                    entry_id: String::new(),
+                    message: format!(
+                        "duplicate placeholder token {} appears {} times in translation",
+                        ph.token, count
                     ),
                 });
             }
@@ -808,6 +818,38 @@ mod tests {
         let (sanitized, placeholders) = PlaceholderProcessor::extract(source);
         let restored = PlaceholderProcessor::restore(&sanitized, &placeholders).unwrap();
         assert_eq!(restored, source);
+    }
+
+    #[test]
+    fn test_restore_duplicate_token() {
+        let (_, placeholders) = PlaceholderProcessor::extract("Hello %1");
+        for (translated, count) in [("Hola {PL_0} {PL_0}", 2), ("Hola{PL_0}{PL_0}{PL_0}", 3)] {
+            let err = PlaceholderProcessor::restore(translated, &placeholders).unwrap_err();
+            let LocustError::PlaceholderError { message, .. } = err else {
+                panic!("expected placeholder error, got {err}");
+            };
+            assert!(message.contains("{PL_0}"), "{message}");
+            assert!(message.contains(&count.to_string()), "{message}");
+        }
+    }
+
+    #[test]
+    fn test_restore_tokens_once_including_adjacent_text() {
+        let (_, one) = PlaceholderProcessor::extract("Hello %1");
+        assert_eq!(
+            PlaceholderProcessor::restore("Hola {PL_0}", &one).unwrap(),
+            "Hola %1"
+        );
+        assert_eq!(
+            PlaceholderProcessor::restore("Hola{PL_0}!", &one).unwrap(),
+            "Hola%1!"
+        );
+
+        let (_, two) = PlaceholderProcessor::extract("%1 has %2");
+        assert_eq!(
+            PlaceholderProcessor::restore("{PL_1} para {PL_0}", &two).unwrap(),
+            "%2 para %1"
+        );
     }
 
     #[test]

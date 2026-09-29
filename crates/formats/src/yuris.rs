@@ -402,9 +402,12 @@ fn decode_sjis(bytes: &[u8]) -> String {
     cow.into_owned()
 }
 
-fn encode_sjis(s: &str) -> Vec<u8> {
-    let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(s);
-    bytes.into_owned()
+fn encode_sjis(s: &str) -> Result<Vec<u8>> {
+    let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(s);
+    if had_errors {
+        return Err(parse_err("ystb", "text cannot be encoded in Shift-JIS"));
+    }
+    Ok(bytes.into_owned())
 }
 
 fn unquote_string(s: &str) -> String {
@@ -721,7 +724,7 @@ fn serialize_attr_value(attr_type: i16, text: &str) -> Result<Vec<u8>> {
     match attr_type {
         ATTR_RAW => {
             // Map \r\n → YU-RIS control EF F0 is optional for Experimental; keep SJIS as-is.
-            Ok(encode_sjis(text))
+            encode_sjis(text)
         }
         ATTR_EXPRESSION => {
             // Quote with backticks so content may contain both " and ' (VNTextPatch).
@@ -732,7 +735,7 @@ fn serialize_attr_value(attr_type: i16, text: &str) -> Result<Vec<u8>> {
                 ));
             }
             let body = format!("`{}`", escape_c_light(text));
-            let body_bytes = encode_sjis(&body);
+            let body_bytes = encode_sjis(&body)?;
             let mut out = Vec::with_capacity(3 + body_bytes.len());
             out.push(PUSH_STRING);
             let n = body_bytes.len() as u16;
@@ -898,7 +901,11 @@ fn entries_from_ystb_bytes(
     Ok(all)
 }
 
-fn translations_from_entries(file_entries: &[&StringEntry]) -> (HashMap<usize, String>, usize) {
+fn translations_from_entries(
+    file_entries: &[&StringEntry],
+    ystb: &DecryptedYstb,
+    warnings: &mut Vec<String>,
+) -> (HashMap<usize, String>, usize) {
     let mut translations = HashMap::new();
     let mut skipped = 0usize;
     for e in file_entries {
@@ -911,10 +918,17 @@ fn translations_from_entries(file_entries: &[&StringEntry]) -> (HashMap<usize, S
                 // Messages carry the author's own hard wraps; a provider hands
                 // back one flat line. `escape_c_light` drops bare CR, so
                 // rejoining on LF reproduces the file's original `\n` escapes.
-                translations.insert(
-                    idx,
-                    crate::rpgmaker_mv::rewrap_to_source_width(&e.source, t),
-                );
+                let text = crate::rpgmaker_mv::rewrap_to_source_width(&e.source, t);
+                // Reject only this string; other translations in the same script
+                // can still be written, preserving the original attribute bytes.
+                if let Some(s) = ystb.strings.get(idx) {
+                    if let Err(err) = serialize_attr_value(s.attr_type, &text) {
+                        warnings.push(format!("skip {}: {err}", e.id));
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                translations.insert(idx, text);
                 continue;
             }
         }
@@ -1195,7 +1209,8 @@ impl FormatPlugin for YurisPlugin {
                 }
             };
 
-            let (translations, skipped) = translations_from_entries(&file_entries);
+            let (translations, skipped) =
+                translations_from_entries(&file_entries, &ystb, &mut warnings);
             strings_skipped += skipped;
             if translations.is_empty() {
                 continue;
@@ -1281,7 +1296,8 @@ impl FormatPlugin for YurisPlugin {
                         continue;
                     }
                 };
-                let (translations, skipped) = translations_from_entries(&file_entries);
+                let (translations, skipped) =
+                    translations_from_entries(&file_entries, &ystb, &mut warnings);
                 strings_skipped += skipped;
                 if translations.is_empty() {
                     continue;
@@ -1605,7 +1621,7 @@ mod tests {
     /// Expression pushstring with double-quoted body (feeds CP932 scorer + extract).
     fn pushstring_double_quoted(s: &str) -> Vec<u8> {
         let body = format!("\"{}\"", escape_c_light(s));
-        let body_bytes = encode_sjis(&body);
+        let body_bytes = encode_sjis(&body).unwrap();
         let mut out = Vec::with_capacity(3 + body_bytes.len());
         out.push(PUSH_STRING);
         out.extend_from_slice(&(body_bytes.len() as u16).to_le_bytes());
@@ -1921,6 +1937,110 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_attr_value_rejects_unmappable_shift_jis() {
+        for attr_type in [ATTR_RAW, ATTR_EXPRESSION] {
+            let err = serialize_attr_value(attr_type, "Hola, señor.").unwrap_err();
+            assert!(err.to_string().contains("Shift-JIS"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_serialize_attr_value_shift_jis_byte_exact_roundtrip() {
+        for (text, expected) in [
+            ("Hola, viajero.", b"Hola, viajero.".as_slice()),
+            ("日本語", &[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA][..]),
+        ] {
+            let raw = serialize_attr_value(ATTR_RAW, text).unwrap();
+            assert_eq!(raw, expected);
+            assert_eq!(decode_sjis(&raw), text);
+            assert_eq!(
+                serialize_attr_value(ATTR_RAW, &decode_sjis(&raw)).unwrap(),
+                raw
+            );
+
+            let expression = serialize_attr_value(ATTR_EXPRESSION, text).unwrap();
+            let mut expected_expression = vec![PUSH_STRING];
+            expected_expression.extend_from_slice(&((expected.len() + 2) as u16).to_le_bytes());
+            expected_expression.push(b'`');
+            expected_expression.extend_from_slice(expected);
+            expected_expression.push(b'`');
+            assert_eq!(expression, expected_expression);
+            let decoded = evaluate_push_string(&expression).unwrap();
+            assert_eq!(decoded, text);
+            assert_eq!(
+                serialize_attr_value(ATTR_EXPRESSION, &decoded).unwrap(),
+                expression
+            );
+        }
+    }
+
+    #[test]
+    fn test_inject_skips_unmappable_shift_jis_in_loose_and_archive() {
+        for archived in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let original =
+                build_minimal_ystb(TRUE_KEY_B4626AD8, "Hello, traveler!", "Welcome home.");
+            let path = if archived {
+                let path = dir.path().join("game.ypf");
+                let archive =
+                    yuris_ypf::write_ypf(0x1E4, 0xFF, &[("yst00001.ybn".into(), original, true)])
+                        .unwrap();
+                fs::write(&path, archive).unwrap();
+                path
+            } else {
+                let path = dir.path().join("yst00001.ybn");
+                fs::write(&path, original).unwrap();
+                path
+            };
+            let plugin = YurisPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 2);
+            let skipped_id = entries
+                .iter()
+                .find(|e| e.source == "Hello, traveler!")
+                .unwrap()
+                .id
+                .clone();
+            for entry in &mut entries {
+                entry.translation = Some(
+                    if entry.id == skipped_id {
+                        "Hola, señor."
+                    } else {
+                        "Hola, viajero."
+                    }
+                    .into(),
+                );
+            }
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(report.strings_written, 1, "{report:?}");
+            assert_eq!(report.strings_skipped, 1, "{report:?}");
+            assert_eq!(report.files_modified, 1, "{report:?}");
+            assert_eq!(report.files_written, vec![path]);
+            assert_eq!(
+                report
+                    .warnings
+                    .iter()
+                    .filter(|w| w.contains(&skipped_id) && w.contains("Shift-JIS"))
+                    .count(),
+                1,
+                "{report:?}"
+            );
+            let again = plugin.extract(dir.path()).unwrap();
+            assert_eq!(again.len(), 2);
+            for entry in again {
+                assert_eq!(
+                    entry.source,
+                    if entry.id == skipped_id {
+                        "Hello, traveler!"
+                    } else {
+                        "Hola, viajero."
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_inject_roundtrip() {
         let dir = tempdir();
         create_fixture(&dir);
@@ -1935,18 +2055,15 @@ mod tests {
             }
         }
         let report = plugin.inject(&dir, &entries).unwrap();
-        assert!(report.files_modified >= 1, "{report:?}");
+        assert_eq!(report.files_modified, 1, "{report:?}");
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 1, "{report:?}");
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
+        assert!(report.warnings[0].contains("Shift-JIS"), "{report:?}");
 
         let again = plugin.extract(&dir).unwrap();
         let sources: Vec<&str> = again.iter().map(|e| e.source.as_str()).collect();
-        assert!(
-            sources.iter().any(|s| s.contains("Hola, viajero")),
-            "re-extract missing: {sources:?}"
-        );
-        assert!(
-            sources.iter().any(|s| s.contains("Bienvenido")),
-            "re-extract missing: {sources:?}"
-        );
+        assert_eq!(sources, vec!["Hello, traveler!", "Bienvenido a casa."]);
     }
 
     #[test]

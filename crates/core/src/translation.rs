@@ -3854,6 +3854,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_duplicate_placeholder_provider_answer_is_not_saved() {
+        let (db, glossary) = setup();
+        let entry = StringEntry::new("duplicate-token", "Hello %1", PathBuf::from("script.txt"));
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let provider = Arc::new(ScriptedLengthProvider::new(&["Hola {PL_0} {PL_0}"]));
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        manager
+            .translate_entries(
+                vec![entry],
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "job-duplicate-token".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        let mut rejected = false;
+        while let Some(event) = rx.recv().await {
+            if let ProgressEvent::BatchFailed { entry_id, error } = event {
+                if entry_id.as_deref() == Some("duplicate-token") {
+                    assert!(error.contains("protected placeholders"), "{error}");
+                    rejected = true;
+                }
+            }
+        }
+        assert!(
+            rejected,
+            "duplicate tokens must fail placeholder validation"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let saved = db.get_entry("duplicate-token").unwrap().unwrap();
+        assert_eq!(saved.status, StringStatus::Pending);
+        assert!(saved.translation.is_none());
+    }
+
+    #[tokio::test]
     async fn test_no_binary_slot_provider_called_once() {
         let (db, glossary) = setup();
         let entry = StringEntry::new("plain", "Hello", PathBuf::from("script.txt"));

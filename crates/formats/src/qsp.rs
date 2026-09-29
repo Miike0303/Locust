@@ -329,6 +329,29 @@ fn serialize_game(game: &QspGame) -> Vec<u8> {
 
 // ─── Extraction helpers ────────────────────────────────────────────────────
 
+/// Scan one literal, returning its unescaped text and the index after it.
+/// Unterminated literals consume the remaining code, as in the original scanner.
+fn scan_quoted_literal(chars: &[char], start: usize) -> (String, usize) {
+    let q = chars[start];
+    let mut i = start + 1;
+    let mut buf = String::new();
+    while i < chars.len() {
+        if chars[i] == q {
+            // QSP doubles a quote to escape: '' or ""
+            if chars.get(i + 1) == Some(&q) {
+                buf.push(q);
+                i += 2;
+                continue;
+            }
+            i += 1; // closing quote
+            break;
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    (buf, i)
+}
+
 /// Pull double-quoted and single-quoted string literals from a QSP code block.
 fn extract_quoted_literals(code: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -337,21 +360,8 @@ fn extract_quoted_literals(code: &str) -> Vec<String> {
     while i < chars.len() {
         let q = chars[i];
         if q == '"' || q == '\'' {
-            i += 1;
-            let mut buf = String::new();
-            while i < chars.len() && chars[i] != q {
-                // QSP doubles a quote to escape: '' or ""
-                if i + 1 < chars.len() && chars[i] == q && chars[i + 1] == q {
-                    buf.push(q);
-                    i += 2;
-                    continue;
-                }
-                buf.push(chars[i]);
-                i += 1;
-            }
-            if i < chars.len() {
-                i += 1; // closing quote
-            }
+            let (buf, end) = scan_quoted_literal(&chars, i);
+            i = end;
             if looks_player_visible(&buf) {
                 out.push(buf);
             }
@@ -475,20 +485,8 @@ fn replace_quoted_in_order(code: &str, replacements: &[String]) -> String {
         let q = chars[i];
         if q == '"' || q == '\'' {
             let start = i;
-            i += 1;
-            let mut buf = String::new();
-            while i < chars.len() && chars[i] != q {
-                if i + 1 < chars.len() && chars[i] == q && chars[i + 1] == q {
-                    buf.push(q);
-                    i += 2;
-                    continue;
-                }
-                buf.push(chars[i]);
-                i += 1;
-            }
-            if i < chars.len() {
-                i += 1;
-            }
+            let (buf, end) = scan_quoted_literal(&chars, start);
+            i = end;
             if looks_player_visible(&buf) && rep_i < replacements.len() {
                 out.push(q);
                 for c in replacements[rep_i].chars() {
@@ -671,6 +669,98 @@ mod tests {
         let path = dir.join("game.qsp");
         fs::write(&path, build_minimal_qsp_game()).unwrap();
         dir.to_path_buf()
+    }
+
+    #[test]
+    fn test_extract_doubled_quotes() {
+        assert_eq!(
+            extract_quoted_literals("*pl 'Don''t go.'"),
+            vec!["Don't go."]
+        );
+        assert_eq!(
+            extract_quoted_literals(r#"*pl "He said ""hi""""#),
+            vec![r#"He said "hi""#]
+        );
+    }
+
+    #[test]
+    fn test_quoted_literal_boundaries_and_replacement_order() {
+        assert!(extract_quoted_literals("''").is_empty());
+        assert_eq!(replace_quoted_in_order("''", &["unused".into()]), "''");
+        assert_eq!(
+            extract_quoted_literals("*pl 'Unterminated text"),
+            vec!["Unterminated text"]
+        );
+        assert_eq!(
+            replace_quoted_in_order("*pl 'Unterminated text", &[]),
+            "*pl 'Unterminated text"
+        );
+        assert_eq!(
+            replace_quoted_in_order("*pl 'Unterminated text", &["Texto traducido".into()]),
+            "*pl 'Texto traducido'"
+        );
+
+        let code = r#"'' & '123' & 'Don''t go.' & "He said ""hi""" & 'img/a.png' & 'Next line'"#;
+        assert_eq!(
+            extract_quoted_literals(code),
+            vec!["Don't go.", r#"He said "hi""#, "Next line"]
+        );
+        assert_eq!(
+            replace_quoted_in_order(code, &extract_quoted_literals(code)),
+            code
+        );
+        assert_eq!(
+            replace_quoted_in_order(code, &["L'ami".into(), "Dijo \"hola\"".into()]),
+            r#"'' & '123' & 'L''ami' & "Dijo ""hola""" & 'img/a.png' & 'Next line'"#
+        );
+    }
+
+    #[test]
+    fn test_doubled_quotes_inject_roundtrip() {
+        for (code, source, translation, expected_code) in [
+            (
+                "*pl 'Don''t go.'",
+                "Don't go.",
+                "L'ami reste.",
+                "*pl 'L''ami reste.'",
+            ),
+            (
+                r#"*pl "He said ""hi""""#,
+                "He said \"hi\"",
+                "Dijo \"hola\"",
+                r#"*pl "Dijo ""hola""""#,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("game.qsp");
+            let mut game = QspGame {
+                version: "locust-test 1.0".into(),
+                password: "No".into(),
+                locations: vec![QspLocation {
+                    name: "start".into(),
+                    description: String::new(),
+                    code: code.into(),
+                    actions: Vec::new(),
+                }],
+            };
+            fs::write(&path, serialize_game(&game)).unwrap();
+            let plugin = QspPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].source, source);
+            assert_eq!(entries[0].id, "game.qsp#loc0#code#str0");
+            entries[0].translation = Some(translation.into());
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(report.strings_written, 1, "{report:?}");
+            assert_eq!(report.strings_skipped, 0, "{report:?}");
+            assert_eq!(report.files_modified, 1, "{report:?}");
+            game.locations[0].code = expected_code.into();
+            assert_eq!(fs::read(&path).unwrap(), serialize_game(&game));
+            let again = plugin.extract(dir.path()).unwrap();
+            assert_eq!(again.len(), 1, "{again:?}");
+            assert_eq!(again[0].id, entries[0].id);
+            assert_eq!(again[0].source, translation);
+        }
     }
 
     #[test]
