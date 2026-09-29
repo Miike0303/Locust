@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 thread_local! {
     pub(crate) static ENTRY_ROWS_MATERIALIZED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static TRANSLATION_RUN_ROWS_MATERIALIZED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(crate) static MEMORY_TRANSACTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(crate) static MEMORY_LOOKUP_QUERIES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static STRINGS_QUERIES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -1662,6 +1663,12 @@ impl Database {
              FROM translation_runs ORDER BY started_at ASC, id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
+            #[cfg(test)]
+            TRANSLATION_RUN_ROWS_MATERIALIZED.with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n + 1));
+                }
+            });
             Ok(TranslationRun {
                 id: row.get(0)?,
                 started_at: row.get(1)?,
@@ -1688,18 +1695,31 @@ impl Database {
     /// `target_lang`, else the latest run of any target, else `fallback`.
     /// Config defaults are not project ground truth once a run exists.
     pub fn resolve_export_source_lang(&self, target_lang: &str, fallback: &str) -> Result<String> {
-        let runs = self.get_translation_runs()?;
-        if let Some(run) = runs
-            .iter()
-            .rev()
-            .find(|r| r.target_lang.eq_ignore_ascii_case(target_lang) && !r.source_lang.is_empty())
+        use rusqlite::OptionalExtension;
+
+        let conn = lock_connection(&self.conn);
+        // Both language columns are NOT NULL; lower() folds ASCII only.
+        if let Some(source_lang) = conn
+            .query_row(
+                "SELECT source_lang FROM translation_runs
+                 WHERE lower(target_lang) = lower(?1) AND source_lang <> ''
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+                [target_lang],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
         {
-            return Ok(run.source_lang.clone());
+            return Ok(source_lang);
         }
-        if let Some(run) = runs.iter().rev().find(|r| !r.source_lang.is_empty()) {
-            return Ok(run.source_lang.clone());
-        }
-        Ok(fallback.to_string())
+        Ok(conn
+            .query_row(
+                "SELECT source_lang FROM translation_runs WHERE source_lang <> ''
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| fallback.to_string()))
     }
 
     pub fn get_stats(&self) -> Result<ProjectStats> {
@@ -4870,6 +4890,148 @@ mod tests {
         // Simulate new project checking global memory
         let result = gm.lookup_memory("hash_g2", "en-es").unwrap();
         assert_eq!(result, Some("Mundo".to_string()));
+    }
+
+    // Keep the original materializing resolver as an equivalence oracle.
+    fn resolve_export_source_lang_from_runs(
+        db: &Database,
+        target_lang: &str,
+        fallback: &str,
+    ) -> Result<String> {
+        let runs = db.get_translation_runs()?;
+        if let Some(run) = runs
+            .iter()
+            .rev()
+            .find(|r| r.target_lang.eq_ignore_ascii_case(target_lang) && !r.source_lang.is_empty())
+        {
+            return Ok(run.source_lang.clone());
+        }
+        if let Some(run) = runs.iter().rev().find(|r| !r.source_lang.is_empty()) {
+            return Ok(run.source_lang.clone());
+        }
+        Ok(fallback.to_string())
+    }
+
+    #[test]
+    fn test_resolve_export_source_lang_matches_original_order_and_case_rules() {
+        let db = Database::open_in_memory().unwrap();
+        {
+            let conn = lock_connection(&db.conn);
+            // Insert tied timestamps out of ID order; the highest ID wins.
+            for (id, started_at, source_lang, target_lang) in [
+                (2, "2026-01-01T00:00:00Z", "ja", "ES"),
+                (9, "2026-01-02T00:00:00Z", "de", "eS"),
+                (5, "2026-01-02T00:00:00Z", "en", "es"),
+                (3, "2026-01-03T00:00:00Z", "it", "É"),
+                (4, "2026-01-04T00:00:00Z", "pt", "é"),
+                (11, "2026-01-05T00:00:00Z", "sv", "de"),
+                (6, "2026-01-05T00:00:00Z", "nl", "fr"),
+                (1, "2026-01-06T00:00:00Z", "", "ES"),
+                (7, "2026-01-06T00:00:00Z", "", "fr"),
+                (8, "2026-01-07T00:00:00Z", "", "empty-only"),
+                // A larger ID must not outrank a later timestamp.
+                (12, "2025-12-31T00:00:00Z", "ru", "es"),
+            ] {
+                conn.execute(
+                    "INSERT INTO translation_runs
+                     (id, started_at, duration_secs, provider, source_lang, target_lang,
+                      strings_translated)
+                     VALUES (?1, ?2, 0, 'mock', ?3, ?4, 1)",
+                    params![id, started_at, source_lang, target_lang],
+                )
+                .unwrap();
+            }
+        }
+
+        for (target, expected) in [
+            ("es", "de"),
+            ("ES", "de"),
+            ("Es", "de"),
+            ("É", "it"),
+            ("é", "pt"),
+            ("FR", "nl"),
+            ("unknown", "sv"),
+            ("empty-only", "sv"),
+        ] {
+            let original = resolve_export_source_lang_from_runs(&db, target, "fallback").unwrap();
+            assert_eq!(original, expected, "original resolver for {target:?}");
+            assert_eq!(
+                db.resolve_export_source_lang(target, "fallback").unwrap(),
+                original,
+                "target {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_export_source_lang_matches_original_without_nonempty_sources() {
+        for run_count in [0, 3] {
+            let db = Database::open_in_memory().unwrap();
+            {
+                let conn = lock_connection(&db.conn);
+                for _ in 0..run_count {
+                    conn.execute(
+                        "INSERT INTO translation_runs
+                         (started_at, duration_secs, provider, source_lang, target_lang,
+                          strings_translated)
+                         VALUES ('2026-01-01T00:00:00Z', 0, 'mock', '', 'ES', 1)",
+                        [],
+                    )
+                    .unwrap();
+                }
+            }
+            for target in ["es", "unknown"] {
+                for fallback in ["ja", ""] {
+                    let original =
+                        resolve_export_source_lang_from_runs(&db, target, fallback).unwrap();
+                    assert_eq!(original, fallback);
+                    assert_eq!(
+                        db.resolve_export_source_lang(target, fallback).unwrap(),
+                        original,
+                        "{run_count} empty-source runs, target {target:?}, fallback {fallback:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_export_source_lang_does_not_materialize_ledger() {
+        let db = Database::open_in_memory().unwrap();
+        {
+            let conn = lock_connection(&db.conn);
+            conn.execute_batch(
+                "WITH RECURSIVE runs(id) AS (
+                     SELECT 1 UNION ALL SELECT id + 1 FROM runs WHERE id < 2000
+                 )
+                 INSERT INTO translation_runs
+                 (id, started_at, duration_secs, provider, source_lang, target_lang,
+                  strings_translated)
+                 SELECT id, '2026-01-01T00:00:00Z', 0, 'mock',
+                        CASE WHEN id = 2000 THEN 'en' ELSE 'ja' END,
+                        CASE WHEN id = 2000 THEN 'fr' ELSE 'es' END, 1
+                 FROM runs",
+            )
+            .unwrap();
+        }
+
+        // Negative control: the full-ledger path must trip the same counter.
+        TRANSLATION_RUN_ROWS_MATERIALIZED.with(|count| count.set(Some(0)));
+        let runs = db.get_translation_runs().unwrap();
+        let rows = TRANSLATION_RUN_ROWS_MATERIALIZED.with(|count| count.replace(None).unwrap());
+        assert_eq!(runs.len(), 2000);
+        assert_eq!(rows, 2000, "the counter must observe every decoded run");
+
+        for (target, expected) in [("ES", "ja"), ("unknown", "en")] {
+            TRANSLATION_RUN_ROWS_MATERIALIZED.with(|count| count.set(Some(0)));
+            let source = db.resolve_export_source_lang(target, "fallback").unwrap();
+            let rows = TRANSLATION_RUN_ROWS_MATERIALIZED.with(|count| count.replace(None).unwrap());
+            assert_eq!(source, expected);
+            assert!(
+                rows <= 2,
+                "export for {target:?} materialized {rows} ledger rows; expected at most 2"
+            );
+        }
     }
 
     #[test]
