@@ -19,6 +19,7 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 ## Backlog
 
+- **[defect · CLI · S] `replace` case-insensitive prefilter misses Unicode matches** (cycle 84 research runner-up). `cmd_replace` uses SQLite ASCII-only `LIKE` when the search term is ASCII, but the Rust matcher lowercases Unicode (`crates/cli/src/main.rs:~1837`, `:~1902`, `database.rs:~2471`): source `温度` translation `300 K` (U+212A), replace `k`→`K` reports no matches. Check: `cmd_replace` test on that row.
 - **[capability · CLI/core · M] `locust extract --dry-run`** (cycle 79 research, A's pick). Show which saved translations a re-extract would delete (ids gone) or reset to pending (source changed) before `merge_entries` writes (`crates/cli/src/main.rs:~1320`, `database.rs:~2006`); preserve partial-extraction and pivot rules (`:~1839`, `:~1939`). Check: preview matches a following real extract, rows unchanged.
 - **[optimization · core · M] Import classification runs one SELECT per catalog row** (cycle 77 research, A's pick). `classify_import` queries each id separately for both save and preview (`crates/core/src/database.rs:~117`, `:~1102`, `:~1130`). Chunk the current-row reads (500 ids) inside the same transaction/lock. Check: 2,000 identical rows → ≤4 classification SELECTs per path, same counts. **Cycle 83: both researchers re-found it (B's pick, A's second); preview + save of an unchanged 2,000-row catalog = 4,000 SELECTs and 0 UPDATEs. Duplicate ids are already rejected before classification.**
 - **[capability · core · L] `apply --dry-run` refuses upgrades and patch switches** (cycle 64 research, B). `reject_dry_run_rollback` (`crates/core/src/patch/apply.rs:157`, `:188`, `:276`) — needs a virtual post-rollback baseline. Large; only if a user asks.
@@ -53,6 +54,8 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 Nothing.
 
 ## Done
+
+- `b82f76f` — **cycle 84 (defect; research: single Codex astra-high researcher, duel skipped; writer Codex astra xhigh).** NScripter inject wrote ASCII translations verbatim; the engine reads a line starting with an ASCII letter as a command and extract dropped it. `normalize_dialogue_translation` inserts a backtick after leading blanks (backtick and non-ASCII starts unchanged, blank text unchanged). 6 tests across 0.txt, nscr_sec.dat, nscript.dat; negative test (helper removed) fails 6. Claude reviewed the hunk and ran fmt, clippy, `cargo test --workspace` (1653 pass / 0 fail). Runner-up added to backlog. Next rotation: `capability`.
 
 - `6c9b210` — **cycle 83 (optimization + defect, research duel done in the previous session; writer Codex gpt-6-astra xhigh).** `group_validation_issues` repeated its whole reconstruction block, so every Unity CSV/localization group was rebuilt twice and every oversized group reported each member's `ExceedsBinarySlot` twice in CLI/HTTP/Tauri validation. Second copy deleted; first copy's issue kinds, messages and order kept. 4 tests (counter in `apply_patches`; LocLine + Csv). Negative test: restoring the duplicate fails 2 of them (4 vs 2 issues, 2 vs 1 reconstructions). Claude reviewed the production hunk (pure deletion + `#[cfg(test)]` counter) and ran fmt, clippy and `cargo test --workspace` (1646 pass / 0 fail); frontend gates skipped (no frontend change). Next rotation: `defect`.
 
