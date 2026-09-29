@@ -22,6 +22,7 @@
 //! `1.txt`…`99.txt` concat, `pscript.dat` UTF-8, `arc.nsa` / `.sar` archive unpack,
 //! real commercial game fixtures.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -312,6 +313,19 @@ fn is_player_text_line(line: &str) -> bool {
     }
 }
 
+/// Keep ASCII translations in dialogue mode without changing their indentation.
+fn normalize_dialogue_translation(text: &str) -> Cow<'_, str> {
+    let trimmed = text.trim_start_matches([' ', '\t']);
+    match trimmed.chars().next() {
+        Some(c) if c.is_ascii() && c != '`' && !text.trim().is_empty() => {
+            let mut normalized = text.to_owned();
+            normalized.insert(text.len() - trimmed.len(), '`');
+            Cow::Owned(normalized)
+        }
+        _ => Cow::Borrowed(text),
+    }
+}
+
 // ─── Plugin ────────────────────────────────────────────────────────────────
 
 impl FormatPlugin for NScripterPlugin {
@@ -473,8 +487,9 @@ impl FormatPlugin for NScripterPlugin {
                 let line = line.strip_suffix('\r').unwrap_or(line);
                 let line_no = idx + 1;
                 if let Some(t) = by_line.get(&line_no) {
-                    if is_player_text_line(line) && *t != line {
-                        match try_encode_sjis_line(t) {
+                    let t = normalize_dialogue_translation(t);
+                    if is_player_text_line(line) && t != line {
+                        match try_encode_sjis_line(&t) {
                             Some(encoded_line) => {
                                 out_lines.push(encoded_line);
                                 changed = true;
@@ -730,6 +745,144 @@ click"
         let dir = tempdir();
         write_0_txt(&dir, sample_script());
         roundtrip_translate(&dir, "`Hola, mundo!`");
+    }
+
+    fn assert_japanese_to_ascii_stays_dialogue(dir: &Path) {
+        let plugin = NScripterPlugin::new();
+        let mut entries = plugin.extract(dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        entries[0].translation = Some("Hello.@".into());
+
+        let report = plugin.inject(dir, &entries).unwrap();
+        assert_eq!(report.files_modified, 1, "{report:?}");
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 0, "{report:?}");
+        assert!(report.warnings.is_empty(), "{report:?}");
+
+        let again = plugin.extract(dir).unwrap();
+        assert_eq!(again.len(), 1, "ASCII translation must remain dialogue");
+        assert_eq!(again[0].source, "`Hello.@");
+        assert_eq!(again[0].id, entries[0].id);
+    }
+
+    #[test]
+    fn japanese_to_ascii_stays_dialogue() {
+        let dir = tempdir();
+        write_0_txt(&dir, "こんにちは。@\n");
+        assert_japanese_to_ascii_stays_dialogue(&dir);
+        assert_eq!(fs::read(dir.join("0.txt")).unwrap(), b"`Hello.@\n");
+    }
+
+    #[test]
+    fn japanese_to_ascii_stays_dialogue_nscr_sec() {
+        let dir = tempdir();
+        write_nscr_sec(&dir, "こんにちは。@\n");
+        assert_japanese_to_ascii_stays_dialogue(&dir);
+        assert_eq!(
+            fs::read(dir.join("nscr_sec.dat")).unwrap(),
+            xor_rot5_bytes(b"`Hello.@\n")
+        );
+    }
+
+    #[test]
+    fn japanese_to_ascii_stays_dialogue_nscript_dat() {
+        let dir = tempdir();
+        write_nscript_dat(&dir, "こんにちは。@\n");
+        assert_japanese_to_ascii_stays_dialogue(&dir);
+        assert_eq!(
+            fs::read(dir.join("nscript.dat")).unwrap(),
+            xor_bytes(b"`Hello.@\n", NSCRIPT_DAT_XOR)
+        );
+    }
+
+    #[test]
+    fn test_inject_preserves_dialogue_prefixes_and_indentation() {
+        for (translation, expected) in [
+            ("`Hi", "`Hi"),
+            ("さようなら。@", "さようなら。@"),
+            ("  Hi", "  `Hi"),
+            (" \t Hi", " \t `Hi"),
+            (" \t `Hi", " \t `Hi"),
+            (" \t さようなら。@", " \t さようなら。@"),
+            ("123", "`123"),
+            (";Hi", "`;Hi"),
+        ] {
+            let dir = tempdir();
+            write_0_txt(&dir, "こんにちは。@\n");
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(&dir).unwrap();
+            entries[0].translation = Some(translation.into());
+
+            let report = plugin.inject(&dir, &entries).unwrap();
+            assert_eq!(report.strings_written, 1, "{translation:?}: {report:?}");
+            assert_eq!(report.strings_skipped, 0, "{translation:?}: {report:?}");
+            assert!(report.warnings.is_empty(), "{report:?}");
+            assert_eq!(
+                fs::read(dir.join("0.txt")).unwrap(),
+                encode_sjis_fixture(&format!("{expected}\n")),
+                "{translation:?}"
+            );
+            let again = plugin.extract(&dir).unwrap();
+            assert_eq!(again.len(), 1, "{translation:?}");
+            assert_eq!(again[0].source, expected, "{translation:?}");
+        }
+    }
+
+    #[test]
+    fn test_inject_keeps_empty_and_whitespace_translations() {
+        for translation in ["", "   ", "\t", " \t ", " \t\n"] {
+            let dir = tempdir();
+            write_0_txt(&dir, "こんにちは。@\n");
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(&dir).unwrap();
+            entries[0].translation = Some(translation.into());
+
+            let report = plugin.inject(&dir, &entries).unwrap();
+            assert_eq!(report.strings_written, 1, "{translation:?}: {report:?}");
+            assert_eq!(report.strings_skipped, 0, "{translation:?}: {report:?}");
+            assert!(report.warnings.is_empty(), "{report:?}");
+            assert_eq!(
+                fs::read(dir.join("0.txt")).unwrap(),
+                format!("{translation}\n").as_bytes(),
+                "{translation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inject_normalized_translation_is_skipped() {
+        let dir = tempdir();
+        let original = " \t `Hello.@\n";
+        write_0_txt(&dir, original);
+        let plugin = NScripterPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        entries[0].translation = Some(" \t Hello.@".into());
+
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert_eq!(report.files_modified, 0, "{report:?}");
+        assert_eq!(report.strings_written, 0, "{report:?}");
+        assert_eq!(report.strings_skipped, 1, "{report:?}");
+        assert!(report.files_written.is_empty(), "{report:?}");
+        assert!(report.warnings.is_empty(), "{report:?}");
+        assert_eq!(fs::read(dir.join("0.txt")).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn test_inject_normalized_translation_is_skipped_in_changed_file() {
+        let dir = tempdir();
+        write_0_txt(&dir, "`Hello.@\nこんにちは。@\n");
+        let plugin = NScripterPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        entries[0].translation = Some("Hello.@".into());
+        entries[1].translation = Some("Hi.@".into());
+
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert_eq!(report.files_modified, 1, "{report:?}");
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 1, "{report:?}");
+        assert_eq!(report.files_written, vec![dir.join("0.txt")]);
+        assert!(report.warnings.is_empty(), "{report:?}");
+        assert_eq!(fs::read(dir.join("0.txt")).unwrap(), b"`Hello.@\n`Hi.@\n");
     }
 
     #[test]
