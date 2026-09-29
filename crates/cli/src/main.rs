@@ -16,6 +16,20 @@ use locust_core::models::{OutputMode, ProgressEvent, StringEntry};
 use locust_core::translation::{load_pending_entries, run_fallback_chain, TranslationOptions};
 use locust_core::validation::{count_binary_slot_oversize, Validator};
 
+fn open_existing_project(path: &Path) -> anyhow::Result<Database> {
+    if !path.try_exists()? {
+        anyhow::bail!(
+            "project database not found: {}. Create it with `locust extract <game> -o \"{}\"`",
+            path.display(),
+            path.display()
+        );
+    }
+    if path.metadata()?.is_dir() {
+        anyhow::bail!("project database path is a directory: {}", path.display());
+    }
+    Ok(Database::open(path)?)
+}
+
 /// Surface binary inject oversize (Unity/Unreal/Wolf) before the engine silently
 /// skips those strings. Full detail: `locust validate`. MultiLangInjector also
 /// emits a ValidationFailed progress event for server/desktop injects.
@@ -741,7 +755,7 @@ fn cmd_patch(
 ) -> anyhow::Result<()> {
     use locust_core::patch::{pack_with_pristine_backup, PackOptions};
 
-    let db = Database::open(&project)?;
+    let db = open_existing_project(&project)?;
     let out = output.unwrap_or_else(|| {
         let base = game_path.file_name().unwrap_or_default().to_string_lossy();
         let suffix = lang.as_deref().map(|l| format!("-{l}")).unwrap_or_default();
@@ -1179,7 +1193,7 @@ fn verify_patch_receipt_files(
 
 fn cmd_pivot(source: PathBuf, output: PathBuf) -> anyhow::Result<()> {
     // Shared with HTTP `POST /api/pivot` and the Tauri `run_pivot` command.
-    let src_db = Database::open(&source)?;
+    let src_db = open_existing_project(&source)?;
     let result = src_db.pivot_to(&output)?;
 
     let mut table = Table::new();
@@ -1196,7 +1210,7 @@ fn cmd_pivot(source: PathBuf, output: PathBuf) -> anyhow::Result<()> {
 }
 
 fn cmd_stats(project: PathBuf) -> anyhow::Result<()> {
-    let db = Database::open(&project)?;
+    let db = open_existing_project(&project)?;
     let runs = db.get_translation_runs()?;
 
     if runs.is_empty() {
@@ -1372,7 +1386,7 @@ async fn cmd_translate(
     cost_limit: Option<f64>,
     context: Option<String>,
 ) -> anyhow::Result<()> {
-    let db = Arc::new(Database::open(&project)?);
+    let db = Arc::new(open_existing_project(&project)?);
     let provider_reg = locust_providers::default_registry(&config);
     let glossary = Arc::new(Glossary::new(db.clone()));
 
@@ -1582,7 +1596,7 @@ async fn cmd_inject(
         );
     }
 
-    let db = Arc::new(Database::open(&project)?);
+    let db = Arc::new(open_existing_project(&project)?);
     let registry = Arc::new(locust_formats::default_registry());
 
     let plugin = registry
@@ -1699,7 +1713,7 @@ async fn cmd_inject_direct(
              run inject once per DB."
         );
     }
-    let db = Database::open(&project)?;
+    let db = open_existing_project(&project)?;
     let registry = locust_formats::default_registry();
 
     let plugin = registry
@@ -1766,7 +1780,7 @@ async fn cmd_inject_direct(
 }
 
 fn cmd_validate(project: PathBuf, json: bool) -> anyhow::Result<()> {
-    let db = Database::open(&project)?;
+    let db = open_existing_project(&project)?;
     let entries = db.get_entries(&EntryFilter::default())?;
     let issues = Validator::validate_all(&entries);
 
@@ -1874,7 +1888,7 @@ async fn cmd_replace(
     if find.is_empty() {
         anyhow::bail!("--find must not be empty");
     }
-    let db = Database::open(&project)?;
+    let db = open_existing_project(&project)?;
     // SQLite LIKE is case-insensitive only for ASCII. With non-ASCII find in
     // case-insensitive mode, skip the SQL prefilter and match in Rust.
     const ENTRY_LIMIT: usize = 100_000;
@@ -2035,13 +2049,13 @@ fn cmd_glossary(action: GlossaryCommands) -> anyhow::Result<()> {
             translation,
             lang_pair,
         } => {
-            let db = Arc::new(Database::open(&project)?);
+            let db = Arc::new(open_existing_project(&project)?);
             let glossary = Glossary::new(db);
             glossary.add(&term, &translation, &lang_pair, None)?;
             println!("Added: {} → {} ({})", term, translation, lang_pair);
         }
         GlossaryCommands::List { project, lang_pair } => {
-            let db = Arc::new(Database::open(&project)?);
+            let db = Arc::new(open_existing_project(&project)?);
             let glossary = Glossary::new(db);
             let entries = glossary.get_all(&lang_pair)?;
             let mut table = Table::new();
@@ -2056,7 +2070,7 @@ fn cmd_glossary(action: GlossaryCommands) -> anyhow::Result<()> {
             term,
             lang_pair,
         } => {
-            let db = Arc::new(Database::open(&project)?);
+            let db = Arc::new(open_existing_project(&project)?);
             let glossary = Glossary::new(db);
             glossary.delete(&term, &lang_pair)?;
             println!("Deleted: {} ({})", term, lang_pair);
@@ -2066,7 +2080,7 @@ fn cmd_glossary(action: GlossaryCommands) -> anyhow::Result<()> {
 }
 
 fn cmd_backup_project(project: PathBuf, output: PathBuf) -> anyhow::Result<()> {
-    let db = Database::open(&project)?;
+    let db = open_existing_project(&project)?;
     db.snapshot_to(&output)?;
     let checkpoint = Database::open(&output)?;
     let count = checkpoint.count_entries(&EntryFilter::default())?;
@@ -2090,6 +2104,7 @@ fn cmd_export(
 ) -> anyhow::Result<()> {
     use locust_core::models::StringStatus;
 
+    let db = open_existing_project(&project)?;
     export::check_export_destination(&output, &project)?;
     if output.try_exists()? && !overwrite {
         anyhow::bail!(
@@ -2107,7 +2122,6 @@ fn cmd_export(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let db = Database::open(&project)?;
     let mut entries = db.get_entries(&EntryFilter::default())?;
     // Retain the database's ID order for any union of states, including repeats.
     if !statuses.is_empty() {
@@ -2147,7 +2161,7 @@ async fn cmd_import(
     keep_existing: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let db = Database::open(&project)?;
+    let db = open_existing_project(&project)?;
     let content = std::fs::read_to_string(&input)?;
 
     let (updates, pre_skipped) = match format.as_str() {
