@@ -2285,21 +2285,32 @@ async fn get_glossary(
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
+#[derive(Deserialize)]
+struct AddGlossaryRequest {
+    term: String,
+    translation: String,
+    lang_pair: String,
+    context: Option<String>,
+    #[serde(default)]
+    case_sensitive: bool,
+}
+
 async fn add_glossary(
     State(state): State<Arc<AppState>>,
-    Json(entry): Json<GlossaryEntry>,
+    Json(entry): Json<AddGlossaryRequest>,
 ) -> Result<StatusCode, ApiError> {
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
     state
         .glossary
-        .add(
-            &entry.term,
-            &entry.translation,
-            &entry.lang_pair,
-            entry.context.as_deref(),
-        )
+        .add_entry(&GlossaryEntry {
+            term: entry.term,
+            translation: entry.translation,
+            lang_pair: entry.lang_pair,
+            context: entry.context,
+            case_sensitive: entry.case_sensitive,
+        })
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(StatusCode::CREATED)
 }
@@ -4667,6 +4678,78 @@ mod tests {
         let body: Vec<serde_json::Value> = resp.json().await.unwrap();
         assert_eq!(body.len(), 1);
         assert_eq!(body[0]["term"], "HP");
+        assert_eq!(body[0]["case_sensitive"], false);
+        assert_eq!(
+            state.glossary.lookup_exact("hp", "en", "es").as_deref(),
+            Some("PV")
+        );
+    }
+
+    #[tokio::test]
+    async fn glossary_post_preserves_case_sensitive() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let resp = client()
+            .post(format!("{url}/api/glossary"))
+            .json(&serde_json::json!({
+                "term": "US",
+                "translation": "EEUU",
+                "lang_pair": "en-es",
+                "context": null,
+                "case_sensitive": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        let resp = client()
+            .get(format!("{url}/api/glossary?lang_pair=en-es"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0]["term"], "US");
+        assert_eq!(body[0]["case_sensitive"], true);
+        assert!(state.glossary.lookup_exact("us", "en", "es").is_none());
+        assert_eq!(
+            state.glossary.lookup_exact("US", "en", "es").as_deref(),
+            Some("EEUU")
+        );
+    }
+
+    #[tokio::test]
+    async fn glossary_post_defaults_to_case_insensitive() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let resp = client()
+            .post(format!("{url}/api/glossary"))
+            .json(&serde_json::json!({
+                "term": "US",
+                "translation": "EEUU",
+                "lang_pair": "en-es",
+                "context": null
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        let resp = client()
+            .get(format!("{url}/api/glossary?lang_pair=en-es"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0]["case_sensitive"], false);
+        assert_eq!(
+            state.glossary.lookup_exact("us", "en", "es").as_deref(),
+            Some("EEUU")
+        );
     }
 
     #[tokio::test]

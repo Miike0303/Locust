@@ -26,13 +26,18 @@ impl Glossary {
         lang_pair: &str,
         context: Option<&str>,
     ) -> Result<()> {
-        self.db.save_glossary_entry(&GlossaryEntry {
+        self.add_entry(&GlossaryEntry {
             term: term.to_string(),
             translation: translation.to_string(),
             lang_pair: lang_pair.to_string(),
             context: context.map(|s| s.to_string()),
             case_sensitive: false,
         })
+    }
+
+    /// Save an entry with its context and case-sensitivity setting intact.
+    pub fn add_entry(&self, entry: &GlossaryEntry) -> Result<()> {
+        self.db.save_glossary_entry(entry)
     }
 
     pub fn get_all(&self, lang_pair: &str) -> Result<Vec<GlossaryEntry>> {
@@ -188,6 +193,7 @@ mod tests {
         glossary.add("MP", "Magic Points", "ja-en", None).unwrap();
         let entries = glossary.get_all("ja-en").unwrap();
         assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| !entry.case_sensitive));
     }
 
     #[test]

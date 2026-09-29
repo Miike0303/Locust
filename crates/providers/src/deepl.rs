@@ -41,7 +41,8 @@ impl DeepLProvider {
 #[derive(Serialize)]
 struct DeepLRequest {
     text: Vec<String>,
-    source_lang: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_lang: Option<String>,
     target_lang: String,
 }
 
@@ -104,7 +105,12 @@ impl TranslationProvider for DeepLProvider {
             return Ok(Vec::new());
         }
 
-        let source_lang = requests[0].source_lang.to_uppercase();
+        let source = requests[0].source_lang.trim();
+        let source_lang = if source.is_empty() || source.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            Some(requests[0].source_lang.to_uppercase())
+        };
         let target_lang = requests[0].target_lang.to_uppercase();
         let texts: Vec<String> = requests.iter().map(|r| r.source.clone()).collect();
 
@@ -245,6 +251,68 @@ mod tests {
 
         provider.translate(&requests).await.unwrap();
         mock.assert();
+    }
+
+    async fn assert_source_lang_request(source_lang: &str, expected_source_lang: Option<&str>) {
+        let server = MockServer::start();
+        let mut expected_body = serde_json::json!({
+            "text": ["Hello"],
+            "target_lang": "ES"
+        });
+        if let Some(source_lang) = expected_source_lang {
+            expected_body["source_lang"] = serde_json::json!(source_lang);
+        }
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v2/translate")
+                .json_body(expected_body);
+            then.status(200).json_body(serde_json::json!({
+                "translations": [{"text": "Hola"}]
+            }));
+        });
+        let provider = make_provider(&server);
+        let requests = [TranslationRequest {
+            entry_id: "e1".to_string(),
+            source: "Hello".to_string(),
+            source_lang: source_lang.to_string(),
+            target_lang: "es".to_string(),
+            context: None,
+            glossary_hint: None,
+        }];
+
+        let results = provider.translate(&requests).await;
+        mock.assert();
+        assert_eq!(results.unwrap()[0].translation, "Hola");
+    }
+
+    #[tokio::test]
+    async fn auto_source_omits_source_lang() {
+        assert_source_lang_request("auto", None).await;
+    }
+
+    #[tokio::test]
+    async fn uppercase_auto_source_omits_source_lang() {
+        assert_source_lang_request("AUTO", None).await;
+    }
+
+    #[tokio::test]
+    async fn empty_source_omits_source_lang() {
+        assert_source_lang_request("", None).await;
+    }
+
+    #[tokio::test]
+    async fn trimmed_auto_source_omits_source_lang() {
+        assert_source_lang_request(" \tAuTo\n", None).await;
+    }
+
+    #[tokio::test]
+    async fn whitespace_source_omits_source_lang() {
+        assert_source_lang_request(" \t\n", None).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_ja_source_sends_uppercase_lang() {
+        assert_source_lang_request("ja", Some("JA")).await;
     }
 
     #[tokio::test]
