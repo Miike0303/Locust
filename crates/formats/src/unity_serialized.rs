@@ -37,6 +37,12 @@
 
 use std::path::Path;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Object-table entries examined by the MonoBehaviour/TextMesh/GUIText wrappers.
+    pub(crate) static PATH_ID_LOOKUP_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Unity class ID for TextAsset.
 pub const CLASS_ID_TEXT_ASSET: i32 = 49;
 /// Unity class ID for Shader (HLSL source — not player-facing text).
@@ -690,8 +696,23 @@ impl SerializedFile {
         let obj = self
             .objects
             .iter()
-            .find(|o| o.path_id == path_id && is_monobehaviour_class(o.class_id))
+            .find(|o| {
+                #[cfg(test)]
+                PATH_ID_LOOKUP_STEPS.with(|steps| steps.set(steps.get() + 1));
+                o.path_id == path_id && is_monobehaviour_class(o.class_id)
+            })
             .ok_or_else(|| err(&label, format!("no MonoBehaviour with path_id={path_id}")))?;
+
+        self.read_mono_strings_object(obj)
+    }
+
+    /// Avoid a repeated whole-table search while walking MonoBehaviour objects.
+    pub(crate) fn read_mono_strings_object(
+        &self,
+        obj: &ObjectInfo,
+    ) -> Result<Vec<MonoStringData>, SerializedError> {
+        let label = self.path.display().to_string();
+        let path_id = obj.path_id;
 
         let start = obj.data_abs as usize;
         let end = (start + obj.byte_size as usize).min(self.data.len());
@@ -824,8 +845,23 @@ impl SerializedFile {
         let obj = self
             .objects
             .iter()
-            .find(|o| o.path_id == path_id && o.class_id == CLASS_ID_TEXT_MESH)
+            .find(|o| {
+                #[cfg(test)]
+                PATH_ID_LOOKUP_STEPS.with(|steps| steps.set(steps.get() + 1));
+                o.path_id == path_id && o.class_id == CLASS_ID_TEXT_MESH
+            })
             .ok_or_else(|| err(&label, format!("no TextMesh with path_id={path_id}")))?;
+
+        self.read_text_mesh_object(obj)
+    }
+
+    /// Avoid a repeated whole-table search while walking TextMesh objects.
+    pub(crate) fn read_text_mesh_object(
+        &self,
+        obj: &ObjectInfo,
+    ) -> Result<TextMeshData, SerializedError> {
+        let label = self.path.display().to_string();
+        let path_id = obj.path_id;
 
         let start = obj.data_abs as usize;
         let end = (start + obj.byte_size as usize).min(self.data.len());
@@ -857,8 +893,23 @@ impl SerializedFile {
         let obj = self
             .objects
             .iter()
-            .find(|o| o.path_id == path_id && o.class_id == CLASS_ID_GUI_TEXT)
+            .find(|o| {
+                #[cfg(test)]
+                PATH_ID_LOOKUP_STEPS.with(|steps| steps.set(steps.get() + 1));
+                o.path_id == path_id && o.class_id == CLASS_ID_GUI_TEXT
+            })
             .ok_or_else(|| err(&label, format!("no GUIText with path_id={path_id}")))?;
+
+        self.read_gui_text_object(obj)
+    }
+
+    /// Avoid a repeated whole-table search while walking GUIText objects.
+    pub(crate) fn read_gui_text_object(
+        &self,
+        obj: &ObjectInfo,
+    ) -> Result<GuiTextData, SerializedError> {
+        let label = self.path.display().to_string();
+        let path_id = obj.path_id;
 
         let start = obj.data_abs as usize;
         let end = (start + obj.byte_size as usize).min(self.data.len());
@@ -1651,6 +1702,110 @@ pub fn write_v17_fixture_ex(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_id_readers_preserve_data_and_lookup_errors() {
+        let sf = SerializedFile::parse(write_v17_mixed_objects_fixture(1), "mixed.assets").unwrap();
+        for obj in &sf.objects {
+            if is_monobehaviour_class(obj.class_id) {
+                let fields = sf.read_mono_strings(obj.path_id).unwrap();
+                let direct = sf.read_mono_strings_object(obj).unwrap();
+                let field_data = |field: MonoStringData| {
+                    (
+                        field.path_id,
+                        field.mono_name,
+                        field.field_index,
+                        field.text,
+                        field.len_offset,
+                        field.byte_len,
+                    )
+                };
+                let expected: &[&str] = if obj.class_id == CLASS_ID_MONO_BEHAVIOUR {
+                    &["DialogBox", "Welcome, traveler!", "See you later."]
+                } else {
+                    &["Menu", "Choose your destination."]
+                };
+                assert_eq!(
+                    fields
+                        .iter()
+                        .map(|field| field.text.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(fields.iter().all(|field| field.path_id == obj.path_id));
+                assert_eq!(
+                    fields.into_iter().map(field_data).collect::<Vec<_>>(),
+                    direct.into_iter().map(field_data).collect::<Vec<_>>()
+                );
+            }
+            let text_data = |field: TextMeshData| {
+                (
+                    field.path_id,
+                    field.text,
+                    field.text_len_offset,
+                    field.text_byte_len,
+                )
+            };
+            if obj.class_id == CLASS_ID_TEXT_MESH {
+                let field = sf.read_text_mesh(obj.path_id).unwrap();
+                assert_eq!(field.path_id, obj.path_id);
+                assert_eq!(field.text, "Hello, world!");
+                assert_eq!(field.text_byte_len, "Hello, world!".len());
+                assert_eq!(
+                    text_data(field),
+                    text_data(sf.read_text_mesh_object(obj).unwrap())
+                );
+            }
+            if obj.class_id == CLASS_ID_GUI_TEXT {
+                let field = sf.read_gui_text(obj.path_id).unwrap();
+                assert_eq!(field.path_id, obj.path_id);
+                assert_eq!(field.text, "Press Start");
+                assert_eq!(field.text_byte_len, "Press Start".len());
+                assert_eq!(
+                    text_data(field),
+                    text_data(sf.read_gui_text_object(obj).unwrap())
+                );
+            }
+        }
+
+        // Include existing ids of every class as well as one absent id.
+        for path_id in sf.objects.iter().map(|obj| obj.path_id).chain([999]) {
+            let class_id = sf
+                .objects
+                .iter()
+                .find(|obj| obj.path_id == path_id)
+                .map(|obj| obj.class_id);
+            for (kind, matches_class, result) in [
+                (
+                    "MonoBehaviour",
+                    class_id.is_some_and(is_monobehaviour_class),
+                    sf.read_mono_strings(path_id).map(|_| ()),
+                ),
+                (
+                    "TextMesh",
+                    class_id == Some(CLASS_ID_TEXT_MESH),
+                    sf.read_text_mesh(path_id).map(|_| ()),
+                ),
+                (
+                    "GUIText",
+                    class_id == Some(CLASS_ID_GUI_TEXT),
+                    sf.read_gui_text(path_id).map(|_| ()),
+                ),
+            ] {
+                if matches_class {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.file, "mixed.assets");
+                    assert_eq!(error.message, format!("no {kind} with path_id={path_id}"));
+                    assert_eq!(
+                        error.to_string(),
+                        format!("mixed.assets: no {kind} with path_id={path_id}")
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_v17_finds_text_asset() {
@@ -2594,6 +2749,67 @@ mod tests {
             "following string must still extract: {texts:?}"
         );
     }
+}
+
+/// Build interleaved object tables from the existing single-object fixtures.
+/// Each group has five MonoBehaviours (including negative script classes), one
+/// TextMesh, one GUIText and three non-text objects, with descending unique ids.
+#[cfg(test)]
+pub(crate) fn write_v17_mixed_objects_fixture(groups: usize) -> Vec<u8> {
+    let templates: Vec<_> = [
+        write_v17_mono_fixture("DialogBox", &["Welcome, traveler!", "See you later."]),
+        write_v17_mono_fixture_with_class(-123, "Menu", &["Choose your destination."]),
+        write_v17_textmesh_fixture("Hello, world!"),
+        write_v17_guitext_fixture("Press Start"),
+        write_v17_mono_fixture_with_class(1, "", &[]),
+    ]
+    .into_iter()
+    .map(|bytes| SerializedFile::parse(bytes, "template.assets").unwrap())
+    .collect();
+    let pattern = [4, 0, 1, 4, 0, 2, 1, 4, 0, 3];
+    let object_count = groups * pattern.len();
+    let mut meta = b"2019.4.0f1\0".to_vec();
+    meta.extend_from_slice(&1u32.to_le_bytes()); // target platform
+    meta.push(0); // no type tree
+    meta.extend_from_slice(&(templates.len() as i32).to_le_bytes());
+    for template in &templates {
+        let ty = &template.types[0];
+        meta.extend_from_slice(&ty.class_id.to_le_bytes());
+        meta.push(0);
+        meta.extend_from_slice(&ty.script_type_index.to_le_bytes());
+        if is_monobehaviour_class(ty.class_id) {
+            meta.extend_from_slice(&[0; 16]); // script_id
+        }
+        meta.extend_from_slice(&[0; 16]); // old_type_hash
+    }
+    meta.extend_from_slice(&(object_count as i32).to_le_bytes());
+    let mut data = Vec::new();
+    for (index, type_index) in pattern.into_iter().cycle().take(object_count).enumerate() {
+        let template = &templates[type_index];
+        let obj = &template.objects[0];
+        let start = obj.data_abs as usize;
+        meta.resize((meta.len() + 3) & !3, 0);
+        data.resize((data.len() + 3) & !3, 0);
+        meta.extend_from_slice(&((object_count - index) as i64).to_le_bytes());
+        meta.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        meta.extend_from_slice(&obj.byte_size.to_le_bytes());
+        meta.extend_from_slice(&(type_index as i32).to_le_bytes());
+        data.extend_from_slice(&template.data[start..start + obj.byte_size as usize]);
+    }
+    meta.extend_from_slice(&0i32.to_le_bytes()); // script types
+    meta.extend_from_slice(&0i32.to_le_bytes()); // externals
+    meta.push(0); // user information
+    let data_offset = (20 + meta.len() + 15) & !15;
+    let mut out = Vec::new();
+    out.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    out.extend_from_slice(&((data_offset + data.len()) as u32).to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.extend_from_slice(&[0; 4]); // little endian + reserved
+    out.extend_from_slice(&meta);
+    out.resize(data_offset, 0);
+    out.extend_from_slice(&data);
+    out
 }
 
 /// MonoBehaviour: m_Name + i32 count + N aligned strings (`string[]` / `List<string>`).

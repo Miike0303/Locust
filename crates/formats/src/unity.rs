@@ -1057,7 +1057,7 @@ impl UnityPlugin {
                 }
                 // Slice 2: MonoBehaviour m_Name + sequential aligned-string fields.
                 for obj in sf.mono_behaviour_objects() {
-                    match sf.read_mono_strings(obj.path_id) {
+                    match sf.read_mono_strings_object(obj) {
                         Ok(fields) => {
                             for field in fields {
                                 if !is_structural_unity_text(&field.text) {
@@ -1126,7 +1126,7 @@ impl UnityPlugin {
                 }
                 // Slice 2: TextMesh m_Text (legacy 3D text component, class 141).
                 for obj in sf.text_mesh_objects() {
-                    match sf.read_text_mesh(obj.path_id) {
+                    match sf.read_text_mesh_object(obj) {
                         Ok(tm) => {
                             if !is_structural_unity_text(&tm.text) {
                                 continue;
@@ -1170,7 +1170,7 @@ impl UnityPlugin {
                 }
                 // Slice 2: GUIText m_Text (legacy screen text, class 132).
                 for obj in sf.gui_text_objects() {
-                    match sf.read_gui_text(obj.path_id) {
+                    match sf.read_gui_text_object(obj) {
                         Ok(gt) => {
                             if !is_structural_unity_text(&gt.text) {
                                 continue;
@@ -4483,6 +4483,64 @@ Confirmation.Yes: YES\r\n\
         let path = data_dir.join("sharedassets0.assets");
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn structural_extract_avoids_path_id_table_searches() {
+        use crate::unity_serialized::{write_v17_mixed_objects_fixture, PATH_ID_LOOKUP_STEPS};
+
+        let bytes = write_v17_mixed_objects_fixture(200);
+        let path = Path::new("mixed.assets");
+        let sf = SerializedFile::parse(bytes.clone(), path).unwrap();
+        assert_eq!(sf.objects.len(), 2_000);
+        assert_eq!(sf.mono_behaviour_objects().count(), 1_000);
+        assert_eq!(sf.text_mesh_objects().count(), 200);
+        assert_eq!(sf.gui_text_objects().count(), 200);
+
+        // Reference the public path_id readers in the same class/table order.
+        // Do not sort or dedupe: repeated labels still need distinct entries.
+        PATH_ID_LOOKUP_STEPS.with(|steps| steps.set(0));
+        let mut expected = Vec::new();
+        for obj in sf.mono_behaviour_objects() {
+            for field in sf.read_mono_strings(obj.path_id).unwrap() {
+                assert!(is_structural_unity_text(&field.text));
+                expected.push((
+                    format!("monobehaviour/{}/{}", field.path_id, field.field_index),
+                    field.text,
+                ));
+            }
+        }
+        for obj in sf.text_mesh_objects() {
+            let field = sf.read_text_mesh(obj.path_id).unwrap();
+            assert!(is_structural_unity_text(&field.text));
+            expected.push((format!("textmesh/{}", field.path_id), field.text));
+        }
+        for obj in sf.gui_text_objects() {
+            let field = sf.read_gui_text(obj.path_id).unwrap();
+            assert!(is_structural_unity_text(&field.text));
+            expected.push((format!("guitext/{}", field.path_id), field.text));
+        }
+        assert_eq!(expected.len(), 3_000);
+        assert_eq!(
+            PATH_ID_LOOKUP_STEPS.with(|steps| steps.replace(0)),
+            1_401_400,
+            "the reference must count every object examined, including other classes"
+        );
+
+        let entries = UnityPlugin::extract_strings_from_assets(&bytes, "mixed.assets", path);
+        assert_eq!(
+            PATH_ID_LOOKUP_STEPS.with(|steps| steps.replace(0)),
+            0,
+            "structural extraction must use the objects it already iterates"
+        );
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(|entry| (entry.id, entry.source))
+                .collect::<Vec<_>>(),
+            expected,
+            "ids, sources and order must match the public path_id readers"
+        );
     }
 
     #[test]
