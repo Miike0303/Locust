@@ -23,8 +23,8 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use locust_core::backup::{BackupEntry, BackupManager};
 use locust_core::config::AppConfig;
 use locust_core::database::{
-    Database, EntryFilter, GlobalMemoryDb, GlossaryEntry, PivotResult, ProjectStats, StringFacets,
-    TranslationRun,
+    Database, EntryFilter, FileStats, GlobalMemoryDb, GlossaryEntry, PivotResult, ProjectStats,
+    StringFacets, TranslationRun,
 };
 use locust_core::export;
 use locust_core::extraction::{FormatRegistry, MultiLangInjector, PluginInfo};
@@ -503,6 +503,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/strings/facets", get(get_string_facets))
         .route("/api/strings/:id", get(get_string).patch(patch_string))
         .route("/api/stats", get(get_stats))
+        .route("/api/stats/files", get(get_file_stats))
         .route("/api/runs", get(list_translation_runs))
         .route("/api/translate/start", post(translate_start))
         .route("/api/translate/cancel/:job_id", post(translate_cancel))
@@ -1082,6 +1083,25 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<ProjectSta
         .get_stats()
         .map(Json)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+#[derive(Serialize)]
+struct FileStatsResponse {
+    files: Vec<FileStats>,
+}
+
+async fn get_file_stats(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<FileStatsResponse>, ApiError> {
+    let files = if state.current_project.read().await.is_none() {
+        Vec::new()
+    } else {
+        state
+            .db
+            .get_file_stats()
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    };
+    Ok(Json(FileStatsResponse { files }))
 }
 
 /// Translation run ledger (same rows as CLI `locust stats`), newest first.
@@ -4420,6 +4440,102 @@ mod tests {
         assert!(body.get("total").is_some());
         assert!(body.get("pending").is_some());
         assert!(body.get("translated").is_some());
+    }
+
+    #[tokio::test]
+    async fn file_stats_counts_statuses_in_file_order() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let entries: Vec<_> = [
+            (
+                "b-translated",
+                "b.rpy",
+                StringStatus::Translated,
+                Some("Hola"),
+            ),
+            ("b-error", "b.rpy", StringStatus::Error, None),
+            (
+                "a-pending",
+                "a.rpy",
+                StringStatus::Pending,
+                Some("Stale text"),
+            ),
+            (
+                "a-approved",
+                "a.rpy",
+                StringStatus::Approved,
+                Some("Aprobado"),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, file, status, translation)| {
+            let mut entry = StringEntry::new(id, id, file.into());
+            entry.status = status;
+            entry.translation = translation.map(str::to_owned);
+            entry
+        })
+        .collect();
+        state.db.save_entries(&entries).unwrap();
+        assert!(state.db.get_translation_runs().unwrap().is_empty());
+
+        let response = client()
+            .get(format!("{url}/api/stats/files"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"files": [
+                {"file_path": "a.rpy", "total": 2, "pending": 1, "translated": 0,
+                 "reviewed": 0, "approved": 1, "error": 0},
+                {"file_path": "b.rpy", "total": 2, "pending": 0, "translated": 1,
+                 "reviewed": 0, "approved": 0, "error": 1}
+            ]})
+        );
+    }
+
+    #[tokio::test]
+    async fn file_stats_without_project_matches_project_stats() {
+        let (url, _h, state) = setup_with_state().await;
+        // Persisted rows must stay hidden until a project is open.
+        state
+            .db
+            .save_entries(&[StringEntry::new("old", "Old session", "old.rpy".into())])
+            .unwrap();
+        let stats = client()
+            .get(format!("{url}/api/stats"))
+            .send()
+            .await
+            .unwrap();
+        let files = client()
+            .get(format!("{url}/api/stats/files"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stats.status(), 200);
+        assert_eq!(files.status(), stats.status());
+        assert_eq!(stats.json::<ProjectStats>().await.unwrap().total, 0);
+        assert_eq!(
+            files.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"files": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn file_stats_empty_project_returns_empty_files() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let response = client()
+            .get(format!("{url}/api/stats/files"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"files": []})
+        );
     }
 
     #[tokio::test]

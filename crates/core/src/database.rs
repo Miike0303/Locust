@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -260,6 +260,17 @@ pub struct ProjectStats {
     pub approved: usize,
     pub error: usize,
     pub total_cost_usd: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileStats {
+    pub file_path: String,
+    pub total: usize,
+    pub pending: usize,
+    pub translated: usize,
+    pub reviewed: usize,
+    pub approved: usize,
+    pub error: usize,
 }
 
 /// Distinct file paths and tags across the whole project (not one page).
@@ -1822,6 +1833,39 @@ impl Database {
             }
         }
         Ok(stats)
+    }
+
+    /// Progress by status, ordered by file path. Pending rows may retain stale text.
+    pub fn get_file_stats(&self) -> Result<Vec<FileStats>> {
+        let conn = lock_connection(&self.conn);
+        let mut stmt = conn.prepare_cached(
+            "SELECT file_path, status, COUNT(*) FROM strings GROUP BY file_path, status",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, usize>(2)?,
+            ))
+        })?;
+        let mut files = BTreeMap::new();
+        for row in rows {
+            let (file_path, status, n) = row?;
+            let stats = files.entry(file_path.clone()).or_insert_with(|| FileStats {
+                file_path,
+                ..FileStats::default()
+            });
+            stats.total += n;
+            match status.as_str() {
+                "pending" => stats.pending = n,
+                "translated" => stats.translated = n,
+                "reviewed" => stats.reviewed = n,
+                "approved" => stats.approved = n,
+                "error" => stats.error = n,
+                _ => {}
+            }
+        }
+        Ok(files.into_values().collect())
     }
 
     pub fn save_glossary_entry(&self, entry: &GlossaryEntry) -> Result<()> {
@@ -5159,6 +5203,105 @@ mod tests {
         assert_eq!(stats.total, 6);
         assert_eq!(stats.pending, 3);
         assert_eq!(stats.translated, 2);
+    }
+
+    #[test]
+    fn file_stats_counts_statuses_in_file_order_including_unknown() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.get_file_stats().unwrap().is_empty());
+        let entries: Vec<_> = [
+            (
+                "b-translated",
+                "b.rpy",
+                StringStatus::Translated,
+                Some("Hola"),
+            ),
+            ("b-error", "b.rpy", StringStatus::Error, None),
+            (
+                "a-pending",
+                "a.rpy",
+                StringStatus::Pending,
+                Some("Stale text"),
+            ),
+            (
+                "a-approved",
+                "a.rpy",
+                StringStatus::Approved,
+                Some("Aprobado"),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, file, status, translation)| {
+            let mut entry = StringEntry::new(id, id, file.into());
+            entry.status = status;
+            entry.translation = translation.map(str::to_owned);
+            entry
+        })
+        .collect();
+        db.save_entries(&entries).unwrap();
+        let mut expected = vec![
+            FileStats {
+                file_path: "a.rpy".into(),
+                total: 2,
+                pending: 1,
+                translated: 0,
+                reviewed: 0,
+                approved: 1,
+                error: 0,
+            },
+            FileStats {
+                file_path: "b.rpy".into(),
+                total: 2,
+                pending: 0,
+                translated: 1,
+                reviewed: 0,
+                approved: 0,
+                error: 1,
+            },
+        ];
+        assert_eq!(db.get_file_stats().unwrap(), expected);
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO strings (id, source, translation, file_path, status, created_at)
+                 VALUES ('unknown', 'Unknown', 'Retained text', 'a.rpy', 'weird', 't')",
+                [],
+            )
+            .unwrap();
+        expected[0].total += 1;
+        assert_eq!(db.get_file_stats().unwrap(), expected);
+        let project = db.get_stats().unwrap();
+        assert_eq!(project.total, 5);
+        assert_eq!(project.pending, 1);
+        assert_eq!(project.translated, 1);
+        assert_eq!(project.reviewed, 0);
+        assert_eq!(project.approved, 1);
+        assert_eq!(project.error, 1);
+    }
+
+    #[test]
+    fn file_stats_counts_multiple_reviewed_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let entries: Vec<_> = ["reviewed-1", "reviewed-2"]
+            .into_iter()
+            .map(|id| {
+                let mut entry = StringEntry::new(id, id, "review.rpy".into());
+                entry.status = StringStatus::Reviewed;
+                entry
+            })
+            .collect();
+        db.save_entries(&entries).unwrap();
+        assert_eq!(
+            db.get_file_stats().unwrap(),
+            vec![FileStats {
+                file_path: "review.rpy".into(),
+                total: 2,
+                reviewed: 2,
+                ..FileStats::default()
+            }]
+        );
     }
 
     #[test]

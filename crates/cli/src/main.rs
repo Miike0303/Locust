@@ -173,8 +173,13 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show translation stats: tokens, time, and cost per run
-    Stats { project: PathBuf },
+    /// Show translation stats: tokens, time, and cost per run, or progress by file
+    Stats {
+        project: PathBuf,
+        /// Show string counts by status for each file
+        #[arg(long)]
+        by_file: bool,
+    },
     /// Create a standalone checkpoint that opens like any project database
     BackupProject {
         project: PathBuf,
@@ -496,7 +501,7 @@ async fn main() -> anyhow::Result<()> {
             case_sensitive,
             dry_run,
         } => cmd_replace(project, find, replace, case_sensitive, dry_run).await?,
-        Commands::Stats { project } => cmd_stats(project)?,
+        Commands::Stats { project, by_file } => cmd_stats(project, by_file)?,
         Commands::BackupProject { project, output } => cmd_backup_project(project, output)?,
         Commands::Pivot { source, output } => cmd_pivot(source, output)?,
         Commands::Patch {
@@ -1223,8 +1228,47 @@ fn cmd_pivot(source: PathBuf, output: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_stats(project: PathBuf) -> anyhow::Result<()> {
+fn cmd_stats(project: PathBuf, by_file: bool) -> anyhow::Result<()> {
     let db = open_existing_project(&project)?;
+    if by_file {
+        let files = db.get_file_stats()?;
+        if files.is_empty() {
+            println!("No strings in this project yet.");
+            return Ok(());
+        }
+        let mut table = Table::new();
+        table.set_header(vec![
+            "File",
+            "Total",
+            "Pending",
+            "Translated",
+            "Reviewed",
+            "Approved",
+            "Error",
+        ]);
+        let mut totals = [0usize; 6];
+        for file in files {
+            let counts = [
+                file.total,
+                file.pending,
+                file.translated,
+                file.reviewed,
+                file.approved,
+                file.error,
+            ];
+            for (total, count) in totals.iter_mut().zip(counts) {
+                *total += count;
+            }
+            let mut row = vec![file.file_path];
+            row.extend(counts.map(|count| count.to_string()));
+            table.add_row(row);
+        }
+        let mut total_row = vec!["TOTAL".to_string()];
+        total_row.extend(totals.map(|count| count.to_string()));
+        table.add_row(total_row);
+        println!("{table}");
+        return Ok(());
+    }
     let runs = db.get_translation_runs()?;
 
     if runs.is_empty() {
