@@ -14,6 +14,7 @@ thread_local! {
     pub(crate) static MEMORY_TRANSACTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(crate) static MEMORY_LOOKUP_QUERIES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static STRINGS_QUERIES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static IMPORT_READ_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static GUARDED_TRANSLATION_TRANSACTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
@@ -114,45 +115,61 @@ fn validate_import_ids(updates: &[crate::export::ImportedTranslation]) -> Result
     Ok(())
 }
 
+type ImportRow = (String, Option<String>, String);
+
+/// Use the caller's connection so a save reads and writes in the same transaction.
+fn read_import_rows(
+    conn: &Connection,
+    updates: &[crate::export::ImportedTranslation],
+) -> Result<HashMap<String, ImportRow>> {
+    let mut current = HashMap::with_capacity(updates.len());
+    for chunk in updates.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut statement = conn.prepare_cached(&format!(
+            "SELECT id, source, translation, status FROM strings WHERE id IN ({placeholders})"
+        ))?;
+        #[cfg(test)]
+        IMPORT_READ_QUERIES.with(|count| count.set(count.get() + 1));
+        let rows = statement.query_map(
+            rusqlite::params_from_iter(chunk.iter().map(|entry| &entry.id)),
+            |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?))),
+        )?;
+        for row in rows {
+            let (id, state) = row?;
+            current.insert(id, state);
+        }
+    }
+    Ok(current)
+}
+
 fn classify_import(
-    current: &mut rusqlite::Statement<'_>,
+    current: Option<&ImportRow>,
     entry: &crate::export::ImportedTranslation,
     keep_existing: bool,
-) -> Result<ImportDecision> {
-    use rusqlite::OptionalExtension;
-
-    let Some((source, translation, status)) = current
-        .query_row(params![entry.id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .optional()?
-    else {
-        return Ok(ImportDecision::Unknown);
+) -> ImportDecision {
+    let Some((source, translation, status)) = current else {
+        return ImportDecision::Unknown;
     };
-    if source != entry.source {
-        return Ok(ImportDecision::StaleSource);
+    if source != &entry.source {
+        return ImportDecision::StaleSource;
     }
     if translation.as_deref() == Some(entry.translation.as_str()) {
-        return Ok(if status != "pending" {
+        return if status != "pending" {
             ImportDecision::Unchanged
         } else {
             ImportDecision::Confirm {
                 previous: entry.translation.clone(),
-                previous_status: status,
+                previous_status: status.clone(),
             }
-        });
+        };
     }
-    match translation.filter(|text| !text.trim().is_empty()) {
-        Some(_) if keep_existing => Ok(ImportDecision::Kept),
-        Some(previous) => Ok(ImportDecision::Replace {
-            previous,
-            previous_status: status,
-        }),
-        None => Ok(ImportDecision::Fill),
+    match translation.as_ref().filter(|text| !text.trim().is_empty()) {
+        Some(_) if keep_existing => ImportDecision::Kept,
+        Some(previous) => ImportDecision::Replace {
+            previous: previous.clone(),
+            previous_status: status.clone(),
+        },
+        None => ImportDecision::Fill,
     }
 }
 
@@ -1158,7 +1175,9 @@ impl Database {
             return Ok(ImportApplyReport::default());
         }
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
+        let report = tokio::task::spawn_blocking(move || -> Result<_> {
+            #[cfg(test)]
+            IMPORT_READ_QUERIES.with(|count| count.set(0));
             let conn = lock_connection(&conn);
             let tx = conn.unchecked_transaction()?;
             let now = Utc::now().to_rfc3339();
@@ -1167,9 +1186,9 @@ impl Database {
                 let mut write = tx.prepare_cached(
                     "UPDATE strings SET translation = ?1, status = 'translated', provider_used = 'import', translated_at = ?2, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?3 AND source = ?4",
                 )?;
-                let mut current = tx.prepare_cached("SELECT source, translation, status FROM strings WHERE id = ?1")?;
+                let current = read_import_rows(&tx, &updates)?;
                 for entry in updates {
-                    let decision = classify_import(&mut current, &entry, keep_existing)?;
+                    let decision = classify_import(current.get(&entry.id), &entry, keep_existing);
                     if matches!(decision, ImportDecision::Fill | ImportDecision::Replace { .. } | ImportDecision::Confirm { .. })
                         && write.execute(params![entry.translation, now, entry.id, entry.source, !entry.translation.trim().is_empty()])? == 0 {
                         continue;
@@ -1178,8 +1197,17 @@ impl Database {
                 }
             }
             tx.commit()?;
+            #[cfg(test)]
+            let report = (report, IMPORT_READ_QUERIES.with(|count| count.get()));
             Ok(report)
-        }).await.map_err(|e| LocustError::Other(anyhow::anyhow!("import save task failed: {e}")))?
+        }).await.map_err(|e| LocustError::Other(anyhow::anyhow!("import save task failed: {e}")))??;
+        // Return the blocking worker's measured reads to the calling test thread.
+        #[cfg(test)]
+        let report = {
+            IMPORT_READ_QUERIES.with(|count| count.set(count.get() + report.1));
+            report.0
+        };
+        Ok(report)
     }
 
     /// Preview an import using only reads. A later save rechecks the current rows.
@@ -1194,10 +1222,9 @@ impl Database {
             return Ok(preview);
         }
         let conn = lock_connection(&self.conn);
-        let mut current =
-            conn.prepare_cached("SELECT source, translation, status FROM strings WHERE id = ?1")?;
+        let current = read_import_rows(&conn, updates)?;
         for entry in updates {
-            let decision = classify_import(&mut current, entry, keep_existing)?;
+            let decision = classify_import(current.get(&entry.id), entry, keep_existing);
             decision.record(&mut preview.report);
             let changes = match decision {
                 ImportDecision::Replace {
@@ -4366,6 +4393,185 @@ mod tests {
         serde_json::to_vec(&rows).unwrap()
     }
 
+    fn identical_import_catalog() -> (Database, Vec<crate::export::ImportedTranslation>) {
+        let db = Database::open_in_memory().unwrap();
+        let entries: Vec<_> = (0..2_000)
+            .rev()
+            .map(|i| reviewed_import_entry(&format!("row{i:04}"), "Hello"))
+            .collect();
+        db.save_entries(&entries).unwrap();
+        let updates = entries
+            .into_iter()
+            .map(|entry| crate::export::ImportedTranslation {
+                id: entry.id,
+                source: entry.source,
+                translation: entry.translation.unwrap(),
+            })
+            .collect();
+        (db, updates)
+    }
+
+    #[test]
+    fn import_preview_reads_at_most_four_chunks_for_2000_identical_rows() {
+        let (db, updates) = identical_import_catalog();
+        let before = import_rows_bytes(&db);
+        IMPORT_READ_QUERIES.with(|count| count.set(0));
+        let preview = db.preview_imported_translations(&updates, false).unwrap();
+        let reads = IMPORT_READ_QUERIES.with(|count| count.replace(0));
+        assert!(
+            (1..=4).contains(&reads),
+            "preview issued {reads} SELECTs against strings for 2000 rows; expected at most 4"
+        );
+        assert_eq!(
+            serde_json::to_value(preview).unwrap(),
+            serde_json::json!({
+                "report": {
+                    "imported": 2000, "unchanged": 2000, "kept_existing": 0,
+                    "stale_sources": 0, "unknown_ids": 0,
+                },
+                "replacements": [], "confirmations": [], "fill_ids": [], "kept_ids": [],
+                "unchanged_ids": updates.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
+            })
+        );
+        assert_eq!(import_rows_bytes(&db), before);
+    }
+
+    #[tokio::test]
+    async fn import_save_reads_at_most_four_chunks_for_2000_identical_rows() {
+        let (db, updates) = identical_import_catalog();
+        let before = import_rows_bytes(&db);
+        IMPORT_READ_QUERIES.with(|count| count.set(0));
+        let report = db
+            .save_imported_translations_batch_with(updates, false)
+            .await
+            .unwrap();
+        let reads = IMPORT_READ_QUERIES.with(|count| count.replace(0));
+        assert!(
+            (1..=4).contains(&reads),
+            "save issued {reads} SELECTs against strings for 2000 rows; expected at most 4"
+        );
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "imported": 2000, "unchanged": 2000, "kept_existing": 0,
+                "stale_sources": 0, "unknown_ids": 0,
+            })
+        );
+        assert_eq!(import_rows_bytes(&db), before);
+    }
+
+    #[tokio::test]
+    async fn import_reads_all_1201_rows_across_chunk_boundaries_in_catalog_order() {
+        use crate::export::ImportedTranslation;
+
+        let db = Database::open_in_memory().unwrap();
+        let updates: Vec<_> = (0..1_201)
+            .rev()
+            .map(|i| ImportedTranslation {
+                // Quotes and punctuation must remain bound parameters.
+                id: format!("row'{i:04},?"),
+                source: format!("Source {i}"),
+                translation: format!("Translation {i}"),
+            })
+            .collect();
+        db.save_entries(
+            &updates
+                .iter()
+                .map(|entry| make_entry(&entry.id, &entry.source))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let expected_report = serde_json::json!({
+            "imported": 1201, "unchanged": 0, "kept_existing": 0,
+            "stale_sources": 0, "unknown_ids": 0,
+        });
+        IMPORT_READ_QUERIES.with(|count| count.set(0));
+        let preview = db.preview_imported_translations(&updates, true).unwrap();
+        assert_eq!(IMPORT_READ_QUERIES.with(|count| count.replace(0)), 3);
+        assert_eq!(
+            serde_json::to_value(preview).unwrap(),
+            serde_json::json!({
+                "report": expected_report,
+                "replacements": [], "confirmations": [], "kept_ids": [], "unchanged_ids": [],
+                "fill_ids": updates.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
+            })
+        );
+        let report = db
+            .save_imported_translations_batch_with(updates.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(IMPORT_READ_QUERIES.with(|count| count.replace(0)), 3);
+        assert_eq!(serde_json::to_value(report).unwrap(), expected_report);
+        for update in &updates {
+            let saved = db.get_entry(&update.id).unwrap().unwrap();
+            assert_eq!(saved.source, update.source);
+            assert_eq!(saved.translation.as_ref(), Some(&update.translation));
+            assert_eq!(saved.status, StringStatus::Translated);
+            assert_eq!(saved.provider_used.as_deref(), Some("import"));
+        }
+    }
+
+    #[tokio::test]
+    async fn import_save_does_not_count_ignored_writes() {
+        let db = Database::open_in_memory().unwrap();
+        let mut confirm = reviewed_import_entry("confirm", "Hello again");
+        confirm.status = StringStatus::Pending;
+        let skipped = [
+            make_entry("fill", "Goodbye"),
+            confirm,
+            reviewed_import_entry("replace", "Welcome"),
+        ];
+        db.save_entries(&skipped).unwrap();
+        db.save_entries(&[make_entry("saved", "Thanks")]).unwrap();
+        lock_connection(&db.conn)
+            .execute_batch(
+                "CREATE TRIGGER ignore_import BEFORE UPDATE ON strings
+                 WHEN OLD.id IN ('fill', 'confirm', 'replace')
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        let updates = [
+            ("fill", "Goodbye", "Adiós"),
+            ("confirm", "Hello again", "Hola"),
+            ("replace", "Welcome", "Bienvenido"),
+            ("saved", "Thanks", "Gracias"),
+        ]
+        .into_iter()
+        .map(
+            |(id, source, translation)| crate::export::ImportedTranslation {
+                id: id.into(),
+                source: source.into(),
+                translation: translation.into(),
+            },
+        )
+        .collect();
+        let report = db
+            .save_imported_translations_batch_with(updates, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "imported": 1, "unchanged": 0, "kept_existing": 0,
+                "stale_sources": 0, "unknown_ids": 0,
+            })
+        );
+        for before in skipped {
+            assert_eq!(
+                serde_json::to_value(db.get_entry(&before.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap(),
+            );
+        }
+        assert_eq!(
+            db.get_entry("saved")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Gracias")
+        );
+    }
+
     #[tokio::test]
     async fn import_preview_matches_apply_without_changing_any_rows() {
         use crate::export::ImportedTranslation;
@@ -4376,8 +4582,10 @@ mod tests {
             confirm.status = StringStatus::Pending;
             let mut blank = make_entry("blank", "Thanks");
             blank.translation = Some(" \t\r\n\u{2003}".into());
+            let mut same = reviewed_import_entry("same", "Hello");
+            same.status = StringStatus::Translated;
             db.save_entries(&[
-                reviewed_import_entry("same", "Hello"),
+                same,
                 confirm,
                 make_entry("empty", "Goodbye"),
                 blank,
