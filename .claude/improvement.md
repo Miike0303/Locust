@@ -80,7 +80,7 @@ Owned by no lane; Claude applies these after the writers finish.
   - Codex researchers and any subagent: `gpt-6-astra` with `-c model_reasoning_effort=high`.
     **Never `gpt-6-sol`** (user, 2026-09-28: "solo usa astra de codex … también en los agentes y subagentes").
   - The user tried and then declined `service_tier="fast"`; leave the default tier.
-  - Loop cadence: 15-20 minute ticks (user, 2026-09-27).
+  - Loop cadence: 15-20 minute ticks (user, 2026-09-27). **Updated 2026-09-29: 20-minute ticks; Claude double-verifies every writer result and, if it is wrong, fixes it directly instead of a correction round (user).**
 - **Codex Windows sandbox fails under heavy concurrency (2026-09-27).** With ~20 Codex sessions from other
   projects (ThreeMaker, Runnked-backend, Fantasy Cut, MikeLibrary fleets) running at once, a cycle writer failed
   with `windows sandbox failed: helper_unknown_error: apply deny-read ACLs`, and shells hung; it exits 0 with a
