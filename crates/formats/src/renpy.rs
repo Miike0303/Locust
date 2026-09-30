@@ -582,7 +582,9 @@ impl RenPyPlugin {
             .to_string();
 
         let mut entries = Vec::new();
-        let mut in_menu = false;
+        // (menu header indent, first child/choice indent). A stack preserves the
+        // enclosing menu when a nested menu finishes inside one of its branches.
+        let mut menus: Vec<(usize, Option<usize>)> = Vec::new();
         let mut in_python = false;
         let mut python_indent = 0usize;
         // Track multi-line define blocks (dicts, lists, parenthesized values).
@@ -595,6 +597,9 @@ impl RenPyPlugin {
         for (line_idx, line) in content.lines().enumerate() {
             let line_num = line_idx + 1;
             let trimmed = line.trim();
+            // Match the Python block tracker: count each leading space/tab as
+            // one byte, consistently for headers, choices and branch bodies.
+            let indent = line.len() - line.trim_start().len();
 
             // Track label definitions: `label start:`, `label foo(arg):`
             if trimmed.starts_with("label ") && trimmed.ends_with(':') {
@@ -634,50 +639,54 @@ impl RenPyPlugin {
                 || trimmed.starts_with("init -") && trimmed.contains("python:")
             {
                 in_python = true;
-                python_indent = line.len() - line.trim_start().len();
+                python_indent = indent;
                 // But still check for translatable calls inside python
             }
-            if in_python && !trimmed.is_empty() {
-                let cur_indent = line.len() - line.trim_start().len();
-                if cur_indent <= python_indent
-                    && !trimmed.starts_with("python:")
-                    && !trimmed.starts_with("init ")
-                    && !trimmed.starts_with('#')
-                {
-                    in_python = false;
+            if in_python
+                && !trimmed.is_empty()
+                && indent <= python_indent
+                && !trimmed.starts_with("python:")
+                && !trimmed.starts_with("init ")
+                && !trimmed.starts_with('#')
+            {
+                in_python = false;
+            }
+
+            // Comments and blank lines do not close or establish a menu scope.
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            // Python strings must not be mistaken for choices or nested menus.
+            if !in_python {
+                while menus.last().is_some_and(|(header, _)| indent <= *header) {
+                    menus.pop();
                 }
-            }
-
-            // Skip comments
-            if trimmed.starts_with('#') {
-                continue;
-            }
-
-            // Track menu blocks
-            if trimmed == "menu:" || trimmed.starts_with("menu ") && trimmed.ends_with(':') {
-                in_menu = true;
-                continue;
-            }
-
-            // Menu choice: "Choice text":
-            if in_menu {
-                if let Some(text) = extract_menu_choice(trimmed) {
-                    let id = format!("{}#{}", filename, line_num);
-                    let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
-                    entry.tags = vec!["menu".to_string()];
-                    entries.push(entry);
+                if trimmed == "menu:" || trimmed.starts_with("menu ") && trimmed.ends_with(':') {
+                    menus.push((indent, None));
                     continue;
                 }
-                // If line is not indented more or is a non-string line, check if still in menu
-                if !trimmed.is_empty()
-                    && !trimmed.starts_with('"')
-                    && !trimmed.starts_with("jump")
-                    && !trimmed.starts_with("pass")
-                    && !trimmed.starts_with('#')
-                {
-                    // Could be a say statement after menu — exit menu
-                    if !line.starts_with("        ") && !line.starts_with("\t\t") {
-                        in_menu = false;
+                if let Some((_, choice_indent)) = menus.last_mut() {
+                    let choice_indent = *choice_indent.get_or_insert(indent);
+                    if indent == choice_indent {
+                        // Bare captions are translated via strings blocks in
+                        // the corpus, so retain their existing menu tag.
+                        let text = extract_menu_choice(trimmed).or_else(|| {
+                            let (text, end) = extract_quoted_string(trimmed)?;
+                            let after = trimmed[end..].trim();
+                            (!text.is_empty() && (after.is_empty() || after.starts_with('#')))
+                                .then_some(text)
+                        });
+                        if let Some(text) = text {
+                            let id = format!("{}#{}", filename, line_num);
+                            let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
+                            entry.tags = vec!["menu".to_string()];
+                            entries.push(entry);
+                            continue;
+                        }
+                        if trimmed.starts_with("set ") {
+                            continue;
+                        }
                     }
                 }
             }
@@ -772,22 +781,21 @@ impl RenPyPlugin {
             }
 
             // say statement: character "text" or just "text"
-            if !in_menu {
-                if let Some((character, text)) = extract_say_statement(trimmed) {
-                    let id = format!("{}#{}", filename, line_num);
-                    let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
-                    entry.tags = vec!["dialogue".to_string()];
-                    if let Some(ch) = character {
-                        entry.context = Some(ch.to_string());
-                    }
-                    // Store label in metadata for proper Ren'Py translation block generation
-                    if let Some(ref lbl) = current_label {
-                        entry
-                            .metadata
-                            .insert("label".to_string(), serde_json::Value::String(lbl.clone()));
-                    }
-                    entries.push(entry);
+            // Branch bodies follow the same extraction path as outside menus.
+            if let Some((character, text)) = extract_say_statement(trimmed) {
+                let id = format!("{}#{}", filename, line_num);
+                let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
+                entry.tags = vec!["dialogue".to_string()];
+                if let Some(ch) = character {
+                    entry.context = Some(ch.to_string());
                 }
+                // Store label in metadata for proper Ren'Py translation block generation
+                if let Some(ref lbl) = current_label {
+                    entry
+                        .metadata
+                        .insert("label".to_string(), serde_json::Value::String(lbl.clone()));
+                }
+                entries.push(entry);
             }
         }
 
@@ -1263,14 +1271,70 @@ fn extract_menu_choice(line: &str) -> Option<&str> {
     if !trimmed.starts_with('"') {
         return None;
     }
-    // "Choice text": or "Choice text"
+    // Only choice headers: bare captions are handled at the menu's child level.
     let (text, end) = extract_quoted_string(trimmed)?;
     if text.is_empty() {
         return None;
     }
     let after = trimmed[end..].trim();
-    if after.is_empty() || after == ":" || after.starts_with(':') {
-        return Some(text);
+    // Conditions and arguments are opaque expressions, but their delimiters
+    // must balance and the header must end at a top-level colon (plus comment).
+    let clause = after
+        .strip_prefix("if")
+        .filter(|rest| rest.starts_with(char::is_whitespace) && !rest.trim().is_empty());
+    if !after.starts_with(':') && !after.starts_with('(') && clause.is_none() {
+        return None;
+    }
+    let mut brackets = Vec::new();
+    let mut in_arguments = after.starts_with('(');
+    let mut quote = None;
+    let mut escaped = false;
+    for (pos, ch) in after.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => brackets.push(')'),
+            '[' => brackets.push(']'),
+            '{' => brackets.push('}'),
+            ')' | ']' | '}' => {
+                if brackets.pop() != Some(ch) {
+                    return None;
+                }
+                // After an argument list only a condition or the final colon
+                // can follow; do not accept arbitrary statement suffixes.
+                if in_arguments && brackets.is_empty() {
+                    in_arguments = false;
+                    let tail = after[pos + 1..].trim_start();
+                    if !tail.starts_with(':')
+                        && !tail.strip_prefix("if").is_some_and(|rest| {
+                            rest.starts_with(char::is_whitespace)
+                                && !rest.trim_start().starts_with(':')
+                                && !rest.trim().is_empty()
+                        })
+                    {
+                        return None;
+                    }
+                }
+            }
+            ':' if brackets.is_empty() => {
+                if clause.is_some_and(|rest| rest.trim_start().starts_with(':')) {
+                    return None;
+                }
+                let tail = after[pos + 1..].trim();
+                return (tail.is_empty() || tail.starts_with('#')).then_some(text);
+            }
+            '#' => return None,
+            _ => {}
+        }
     }
     None
 }
@@ -3578,6 +3642,268 @@ mod tests {
         let right = entries.iter().find(|e| e.source == "Go right");
         assert!(right.is_some());
         assert!(right.unwrap().tags.contains(&"menu".to_string()));
+    }
+
+    fn assert_menu_dialogue(
+        entries: &[StringEntry],
+        text: &str,
+        speaker: Option<&str>,
+        label: &str,
+    ) {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.source == text)
+            .unwrap_or_else(|| panic!("Missing dialogue: {text}"));
+        assert_eq!(entry.context.as_deref(), speaker, "{text}");
+        assert_eq!(entry.tags, ["dialogue"], "{text}");
+        assert_eq!(entry.metadata["label"], label, "{text}");
+    }
+
+    #[test]
+    fn menu_regression_branch_say_and_add_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let script = game.join("script.rpy");
+        fs::write(
+            &script,
+            r#"define e = Character("Eileen")
+label start:
+    menu:
+        "Choose a route"
+        "First":
+            e "A visible branch line."
+            "A visible narration line."
+        "Second":
+            e "Another visible branch line."
+    e "An outside line."
+"#,
+        )
+        .unwrap();
+        let mut entries = RenPyPlugin::extract_file(&script).unwrap();
+        assert_eq!(entries.len(), 8);
+        for (text, speaker, line) in [
+            ("A visible branch line.", Some("e"), 6),
+            ("A visible narration line.", None, 7),
+            ("Another visible branch line.", Some("e"), 9),
+            ("An outside line.", Some("e"), 10),
+        ] {
+            assert_menu_dialogue(&entries, text, speaker, "start");
+            let entry = entries.iter().find(|entry| entry.source == text).unwrap();
+            assert_eq!(entry.id, format!("script.rpy#{line}"));
+        }
+        for text in ["Choose a route", "First", "Second"] {
+            let entry = entries.iter().find(|entry| entry.source == text).unwrap();
+            assert_eq!(entry.tags, ["menu"]);
+            assert!(entry.context.is_none());
+            assert!(!entry.metadata.contains_key("label"));
+        }
+
+        for entry in &mut entries {
+            entry.translation = Some(format!("Translated {}", entry.source));
+        }
+        RenPyPlugin::new()
+            .inject_add(dir.path(), "es", &entries)
+            .unwrap();
+        let blocks = fs::read_to_string(game.join("tl/es/script.rpy")).unwrap();
+        assert_eq!(blocks.matches("translate es start_").count(), 4);
+        for code in [
+            r#"e "A visible branch line.""#,
+            r#""A visible narration line.""#,
+            r#"e "Another visible branch line.""#,
+            r#"e "An outside line.""#,
+        ] {
+            assert!(blocks.contains(&format!("translate es start_{}:", expected_say_hash(code))));
+            assert!(blocks.contains(&format!("    # {code}\n")));
+        }
+        let strings = fs::read_to_string(game.join("tl/es/locust_strings.rpy")).unwrap();
+        for text in ["Choose a route", "First", "Second"] {
+            assert!(strings.contains(&format!("    old \"{text}\"\n")));
+        }
+    }
+
+    #[test]
+    fn menu_regression_nested_and_control_flow_scopes() {
+        let content = r#"label start:
+    if flag:
+        menu:
+            "Outer":
+                e "Before inner."
+                menu:
+                    "Inner":
+                        e "Inner branch."
+                        "Inner narration."
+                "After inner."
+            "Other":
+                e "Other branch."
+        "After outer."
+    while flag:
+        menu:
+            "Loop":
+                e "Loop branch."
+        e "After loop menu."
+    menu:
+        "Last":
+            e "Last branch."
+    return
+label next:
+    "Next label."
+"#;
+        let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), content);
+        for (text, speaker) in [
+            ("Before inner.", Some("e")),
+            ("Inner branch.", Some("e")),
+            ("Inner narration.", None),
+            ("After inner.", None),
+            ("Other branch.", Some("e")),
+            ("After outer.", None),
+            ("Loop branch.", Some("e")),
+            ("After loop menu.", Some("e")),
+            ("Last branch.", Some("e")),
+        ] {
+            assert_menu_dialogue(&entries, text, speaker, "start");
+        }
+        assert_menu_dialogue(&entries, "Next label.", None, "next");
+        assert_eq!(entries.len(), 15);
+    }
+
+    #[test]
+    fn menu_regression_tabs_custom_indents_and_adjacent_menus() {
+        // Exercise both tabs (counted as one, like Python blocks) and widths
+        // other than four spaces; choices establish their actual child level.
+        for unit in ["\t", "  ", "   "] {
+            let content = [
+                "label start:",
+                "@menu:",
+                "@@\"First\":",
+                "@@@e \"First branch.\"",
+                "@menu:",
+                "@@\"Second\":",
+                "@@@e \"Second branch.\"",
+                "@@@\"Branch narration.\"",
+                "@\"Outside narration.\"",
+                "@menu:",
+                "@@\"Third\":",
+                "@@@jump done",
+                "@jump done",
+                "label done:",
+                "@\"Done.\"",
+            ]
+            .join("\n")
+            .replace('@', unit);
+            let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &content);
+            for (text, speaker) in [
+                ("First branch.", Some("e")),
+                ("Second branch.", Some("e")),
+                ("Branch narration.", None),
+                ("Outside narration.", None),
+            ] {
+                assert_menu_dialogue(&entries, text, speaker, "start");
+            }
+            assert_menu_dialogue(&entries, "Done.", None, "done");
+            assert_eq!(entries.len(), 8);
+            assert_eq!(entries[2].source, "Second");
+            assert_eq!(entries[2].tags, ["menu"]);
+        }
+    }
+
+    #[test]
+    fn menu_regression_conditional_and_argument_choices() {
+        for (line, expected) in [
+            (r#""Go" if flag:"#, "Go"),
+            (r#""Stay" (x=1):"#, "Stay"),
+            (r#""Both" if a (x=1):"#, "Both"),
+            (r#""Reverse" (x=1) if flag:"#, "Reverse"),
+            (
+                r#""Nested condition" (x=1) if (flag) and check(x):"#,
+                "Nested condition",
+            ),
+            (
+                r#""Complex" if values["a:b"] and {'x': 1}: # comment"#,
+                "Complex",
+            ),
+            (r#""Args" (x=(1, 2), y="a:#b"):"#, "Args"),
+            (r#""Escaped \"choice\"" if flag:"#, r#"Escaped \"choice\""#),
+        ] {
+            assert_eq!(extract_menu_choice(line), Some(expected), "{line}");
+        }
+        for line in [
+            r#""Caption""#,
+            r#"e "Text" if x:"#,
+            r#""Missing colon" if flag"#,
+            r#""Empty condition" if :"#,
+            r#""Unknown suffix" nonsense:"#,
+            r#""Trailing code": pass"#,
+            r#""Unbalanced" (x=1:"#,
+            r#""Bad delimiter" (x=1]:"#,
+            r#""Bad args suffix" (x=1) nonsense:"#,
+            r#""Unclosed quote" if x == "oops:"#,
+            r#""Comment colon" if flag # :"#,
+            r#""" if flag:"#,
+        ] {
+            assert_eq!(extract_menu_choice(line), None, "{line}");
+        }
+        let content = r#"label start:
+    menu (screen="x"):
+        set seen
+        with dissolve
+        "Go" if flag:
+            e "Go branch."
+        "Stay" (x=1):
+            e "Stay branch."
+        "Both" if a (x=1):
+            e "Both branch."
+    e "Text" if x:
+"#;
+        let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), content);
+        assert_eq!(entries.len(), 7);
+        for text in ["Go", "Stay", "Both"] {
+            let entry = entries.iter().find(|entry| entry.source == text).unwrap();
+            assert_eq!(entry.tags, ["menu"]);
+            assert!(!entry.metadata.contains_key("label"));
+            assert_menu_dialogue(&entries, &format!("{text} branch."), Some("e"), "start");
+        }
+        assert_menu_dialogue(&entries, "Text", Some("e"), "start");
+    }
+
+    #[test]
+    fn menu_regression_python_comments_and_normal_extractors() {
+        let content = r#"label start:
+    menu:
+
+# Unindented comments do not end menus.
+        # A comment does not establish the choice indent.
+        "Choice":
+            python:
+                "Hidden Python literal."
+                value = "Hidden assigned literal."
+                translated = _("Python UI")
+
+# A comment inside Python does not end its block either.
+                "Still hidden."
+            e "Visible after Python."
+            "Visible branch narration."
+            $ label = _("Branch UI")
+        "Sibling":
+            pass
+    "Outside."
+"#;
+        let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), content);
+        assert_eq!(entries.len(), 7);
+        for text in [
+            "Hidden Python literal.",
+            "Hidden assigned literal.",
+            "Still hidden.",
+        ] {
+            assert!(!entries.iter().any(|entry| entry.source == text), "{text}");
+        }
+        for text in ["Python UI", "Branch UI"] {
+            let entry = entries.iter().find(|entry| entry.source == text).unwrap();
+            assert_eq!(entry.tags, ["ui_label"]);
+        }
+        assert_menu_dialogue(&entries, "Visible after Python.", Some("e"), "start");
+        assert_menu_dialogue(&entries, "Visible branch narration.", None, "start");
+        assert_menu_dialogue(&entries, "Outside.", None, "start");
     }
 
     #[test]
