@@ -1255,9 +1255,55 @@ fn is_file_reference(text: &str) -> bool {
     {
         return true;
     }
-    // Path-like patterns
-    if (t.contains('/') || t.contains('\\')) && !t.contains(' ') {
-        return true;
+    // Text tags (especially closing tags) and string escapes are not path
+    // separators. Check only what remains, without changing the extracted text.
+    if t.contains(['/', '\\']) {
+        let mut path = String::with_capacity(t.len());
+        let mut rest = t;
+        while !rest.is_empty() {
+            if rest.starts_with('{') && !rest.starts_with("{{") {
+                if let Some(end) = rest.find('}') {
+                    rest = &rest[end + 1..];
+                    continue;
+                }
+            }
+            if rest.starts_with('\\') {
+                let mut chars = rest.chars();
+                chars.next();
+                if chars
+                    .next()
+                    .is_some_and(|ch| matches!(ch, '"' | '\'' | '\\' | 'n' | 'r' | 't' | ' '))
+                {
+                    rest = chars.as_str();
+                    continue;
+                }
+            }
+            let ch = rest.chars().next().unwrap();
+            path.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+        // A slash in prose (yes/no, interpolation, percentages) is not enough.
+        // Extensionless resource paths still have a root or resource directory.
+        let slash_path = path.contains('/')
+            && (path.starts_with('/')
+                || path.starts_with("./")
+                || path.starts_with("../")
+                || ["gui/", "images/", "audio/", "video/", "fonts/", "scripts/"]
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+                || path.split('/').any(|segment| {
+                    segment.rsplit_once('.').is_some_and(|(stem, extension)| {
+                        !stem.is_empty()
+                            && !extension.is_empty()
+                            && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+                    })
+                }));
+        if !path.contains(char::is_whitespace)
+            && !path.contains(['{', '}', '[', ']', '%'])
+            && (path.contains('\\') || slash_path)
+        {
+            return true;
+        }
     }
     // Color hex codes
     if t.starts_with('#') && t.len() <= 9 && t[1..].chars().all(|c| c.is_ascii_hexdigit()) {
@@ -3607,6 +3653,117 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let plugin = RenPyPlugin::new();
         assert!(!plugin.detect(&dir));
+    }
+
+    #[test]
+    fn path_heuristic_regression_text_and_resources() {
+        for text in [
+            "{i}tap-tap-tap!{/i}",
+            "{b}Wow!{/b}",
+            "{color=#f00}Stop{/color}",
+            r#"She said \"no\""#,
+            r#"She said \\"no\\""#,
+            r"Line one\nLine two",
+            "{w}...{/w}",
+            r#"\"no\""#,
+            r"Line\nTwo",
+            r"Back\\slash",
+            r"It\'s",
+            r"One\ two",
+            "{i}either/or{/i}",
+            "yes/no",
+            "1/2",
+            "gui/[theme]/button",
+            "gui/100%/button",
+            "gui/foo\tbar",
+            "gui/foo\u{a0}bar",
+            "{i/gui",
+            "gui/foo}",
+            "{{gui/foo}}",
+        ] {
+            assert!(
+                !is_file_reference(text),
+                "Dialogue rejected as path: {text:?}"
+            );
+        }
+        for path in [
+            "gui/button.png",
+            "images/bg/room.jpg",
+            "audio/sfx/click.ogg",
+            r"C:\games\x\y.txt",
+            "scripts/label.rpy",
+            "#ff00ff",
+            "gui/button",
+            "images/bg/room",
+            "audio/sfx/click",
+            "video/intro",
+            "fonts/body",
+            "scripts/label",
+            "./cache/item",
+            "../cache/item",
+            "/cache/item",
+            "packs/chapter.data",
+            r"C:\games\x\y",
+            "{i}images/bg/room{/i}",
+        ] {
+            assert!(
+                is_file_reference(path),
+                "Resource accepted as text: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_heuristic_regression_extract_content() {
+        let script = r##"define button = "gui/button.png"
+define room = "images/bg/room.jpg"
+define click = "audio/sfx/click.ogg"
+define save = "C:\games\x\y.txt"
+define source = "scripts/label.rpy"
+define tint = "#ff00ff"
+define button_dir = "gui/button"
+image room = "images/bg/room.jpg"
+image button = "gui/button.png"
+label path_dialogue:
+    "{i}tap-tap-tap!{/i}"
+    e "{b}Wow!{/b}"
+    "{color=#f00}Stop{/color}"
+    e "She said \"no\""
+    "Line one\nLine two"
+    e "{w}...{/w}"
+    "\"no\""
+    e "Line\nTwo"
+    "Back\\slash"
+    e "It\'s"
+    "One\ two"
+    return
+"##;
+        let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), script);
+        let expected = [
+            ("{i}tap-tap-tap!{/i}", None),
+            ("{b}Wow!{/b}", Some("e")),
+            ("{color=#f00}Stop{/color}", None),
+            (r#"She said \"no\""#, Some("e")),
+            (r"Line one\nLine two", None),
+            ("{w}...{/w}", Some("e")),
+            (r#"\"no\""#, None),
+            (r"Line\nTwo", Some("e")),
+            (r"Back\\slash", None),
+            (r"It\'s", Some("e")),
+            (r"One\ two", None),
+        ];
+        assert_eq!(
+            entries.len(),
+            expected.len(),
+            "Extracted entries: {entries:?}"
+        );
+        for (index, (entry, (text, speaker))) in entries.iter().zip(expected).enumerate() {
+            assert_eq!(entry.source, text);
+            assert_eq!(entry.context.as_deref(), speaker, "{text}");
+            assert_eq!(entry.tags, ["dialogue"], "{text}");
+            assert_eq!(entry.metadata["label"], "path_dialogue", "{text}");
+            assert_eq!(entry.id, format!("script.rpy#{}", index + 11));
+        }
     }
 
     #[test]
