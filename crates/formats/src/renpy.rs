@@ -1171,6 +1171,50 @@ fn renpy_translation_id(label: &str, code: &str) -> String {
     format!("{label}_{hash}")
 }
 
+// Real corpus (D:/juegos/renpy): 5,382 TL files, 1,655,580 dialogue blocks,
+// 94 game/language scopes. All 132,577 repeated-base suffixes are unpadded
+// _N, starting at 1. Game/language + lexical TL path + block encounter order
+// gives the best full-ID agreement: 1,646,822/1,655,580 (99.4710%), versus
+// per TL file 99.4520%, per source file/line 99.3994%, reverse paths 99.3604%,
+// and starting at _0 91.5802%. Per-label scope within a game is equivalent:
+// the label is already part of the base. Lexical source paths + encounter
+// order agree at 99.4708%; sorting historical source-line comments drops to
+// 99.4195% (2,948 backwards line transitions in appended/updated TL files).
+// Base hashes agree at 99.7086%; the corpus gate requires full IDs >= 99.4%.
+// Fresh Add input is traversed by source path, then script line. Allocate
+// across all files, including untranslated occurrences, for each injection.
+fn renpy_numbered_translation_id(
+    base_id: String,
+    allocated: &mut HashMap<String, usize>,
+) -> String {
+    // Each allocated ID is reserved; values also cache the next suffix for a
+    // base. Checking candidates handles collisions with already suffixed IDs.
+    let mut suffix = allocated.get(&base_id).copied().unwrap_or(0);
+    loop {
+        let id = if suffix == 0 {
+            base_id.clone()
+        } else {
+            format!("{base_id}_{suffix}")
+        };
+        suffix += 1;
+        if let std::collections::hash_map::Entry::Vacant(slot) = allocated.entry(id.clone()) {
+            slot.insert(1);
+            allocated.insert(base_id, suffix);
+            return id;
+        }
+    }
+}
+
+fn renpy_add_line_number(entry: &StringEntry) -> usize {
+    entry
+        .id
+        .rsplit('#')
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0)
+}
+
 /// Check if a string looks like a file path/reference (not translatable text)
 fn is_file_reference(text: &str) -> bool {
     let t = text.trim();
@@ -2602,13 +2646,51 @@ impl FormatPlugin for RenPyPlugin {
         // Group dialogue entries by source .rpy filename.
         // Each source file gets a corresponding tl/<lang>/<filename>.rpy with
         // `translate <lang> <label>_<hash>:` blocks (Ren'Py's proper translation format).
-        let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
+        let mut by_file: HashMap<String, Vec<(&StringEntry, String)>> = HashMap::new();
         let mut string_entries: Vec<&StringEntry> = Vec::new();
         let mut strings_written = 0;
         let mut strings_skipped = 0;
         let mut files_written: Vec<PathBuf> = Vec::new();
 
-        for entry in entries {
+        // Reserve IDs in script order before filtering translations. Otherwise
+        // a missing/unchanged translation renumbers all later repeated lines.
+        let mut dialogue_entries: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry
+                    .tags
+                    .iter()
+                    .any(|tag| tag == "dialogue" || tag == "scroll_text" || tag == "menu")
+                    && entry
+                        .metadata
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .is_some()
+            })
+            .collect();
+        dialogue_entries.sort_by_cached_key(|(_, entry)| {
+            (
+                entry.file_path.to_string_lossy().replace('\\', "/"),
+                renpy_add_line_number(entry),
+            )
+        });
+        let mut allocated = HashMap::new();
+        let mut dialogue_ids = HashMap::new();
+        for (index, entry) in dialogue_entries {
+            let label = entry.metadata["label"].as_str().unwrap();
+            let safe_source = canonical_say_string(&entry.source);
+            let code = match &entry.context {
+                Some(ch) => format!("{} {}", ch, safe_source),
+                None => safe_source,
+            };
+            dialogue_ids.insert(
+                index,
+                renpy_numbered_translation_id(renpy_translation_id(label, &code), &mut allocated),
+            );
+        }
+
+        for (index, entry) in entries.iter().enumerate() {
             let translation = match &entry.translation {
                 Some(t) if t != &entry.source && !t.trim().is_empty() => t,
                 _ => {
@@ -2618,25 +2700,18 @@ impl FormatPlugin for RenPyPlugin {
             };
             let _ = translation;
 
-            // Dialogue entries (with known label) go into per-file translate blocks
-            let is_dialogue = entry
-                .tags
-                .iter()
-                .any(|t| t == "dialogue" || t == "scroll_text" || t == "menu");
-            let has_label = entry
-                .metadata
-                .get("label")
-                .and_then(|v| v.as_str())
-                .is_some();
-
-            if is_dialogue && has_label {
+            // Dialogue entries (with known label) go into per-file translate blocks.
+            if let Some(translation_id) = dialogue_ids.remove(&index) {
                 let filename = entry
                     .file_path
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                by_file.entry(filename).or_default().push(entry);
+                by_file
+                    .entry(filename)
+                    .or_default()
+                    .push((entry, translation_id));
             } else {
                 // UI labels, ui_label entries, and dialogue without known label
                 // go into a strings block
@@ -2645,21 +2720,22 @@ impl FormatPlugin for RenPyPlugin {
         }
 
         // Generate one .rpy file per source file with proper translate blocks
-        for (filename, file_entries) in &by_file {
+        let mut file_groups: Vec<_> = by_file.iter_mut().collect();
+        file_groups.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (filename, file_entries) in file_groups {
+            file_entries.sort_by_cached_key(|(entry, _)| {
+                (
+                    entry.file_path.to_string_lossy().replace('\\', "/"),
+                    renpy_add_line_number(entry),
+                )
+            });
             let mut lines = Vec::new();
             lines.push("# Auto-generated by Locust — Ren'Py translation file.".to_string());
             lines.push("# Format: `translate <lang> <label>_<md5(code + CRLF)[:8]>:`".to_string());
             lines.push(String::new());
 
-            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-            for entry in file_entries {
+            for (entry, translation_id) in file_entries {
                 let translation = entry.translation.as_ref().unwrap();
-                let label = entry
-                    .metadata
-                    .get("label")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
 
                 // Use the same canonical code for the ID and original comment.
                 // Extraction does not retain say attributes or with/id/nointeract
@@ -2670,21 +2746,8 @@ impl FormatPlugin for RenPyPlugin {
                     Some(ch) => format!("{} {}", ch, safe_source),
                     None => safe_source,
                 };
-                let translation_id = renpy_translation_id(label, &orig_line);
-                if !seen_ids.insert(translation_id.clone()) {
-                    // Ren'Py errors on duplicate translate block IDs — skip dupes
-                    strings_skipped += 1;
-                    continue;
-                }
-
                 // Extract line number from entry ID (format: filename.rpy#N)
-                let line_num = entry
-                    .id
-                    .split('#')
-                    .next_back()
-                    .unwrap_or("0")
-                    .parse::<usize>()
-                    .unwrap_or(0);
+                let line_num = renpy_add_line_number(entry);
 
                 // Reconstruct the translated "character text" or just "text" line.
                 let safe_trans = escape_inner_quotes(translation);
@@ -3686,6 +3749,166 @@ mod tests {
     }
 
     #[test]
+    fn add_dialogue_numbers_repeated_statements_in_script_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(
+            game.join("script.rpy"),
+            "label start:\n    \"Yes.\"\n    \"Yes.\"\n    \"Yes.\"\n",
+        )
+        .unwrap();
+        let plugin = RenPyPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        assert_eq!(entries.len(), 3);
+        for (index, entry) in entries.iter_mut().enumerate() {
+            entry.translation = Some(format!("Sí {}.", index + 1));
+        }
+        entries.reverse(); // Caller/database order must not assign the suffixes.
+
+        let report = plugin.inject_add(dir.path(), "es", &entries).unwrap();
+        assert_eq!(report.strings_written, 3);
+        assert_eq!(report.strings_skipped, 0);
+        let content = fs::read_to_string(game.join("tl/es/script.rpy")).unwrap();
+        let base = format!("start_{}", expected_say_hash(r#""Yes.""#));
+        let ids: Vec<_> = content
+            .lines()
+            .filter(|line| line.starts_with("translate "))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                format!("translate es {base}:"),
+                format!("translate es {base}_1:"),
+                format!("translate es {base}_2:")
+            ]
+        );
+        for (index, suffix) in ["", "_1", "_2"].iter().enumerate() {
+            assert!(content.contains(&format!("# game/script.rpy:{}\ntranslate es {base}{suffix}:\n\n    # \"Yes.\"\n    \"Sí {}.\"\n", index + 2, index + 1)), "{content}");
+        }
+    }
+
+    #[test]
+    fn add_dialogue_numbering_spans_files_and_keeps_labels_and_languages_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir_all(game.join("a")).unwrap();
+        fs::create_dir_all(game.join("z")).unwrap();
+        // Shared label metadata exercises the global ID namespace. The lexical
+        // source-path order is opposite the output basenames (layout stays flat).
+        fs::write(
+            game.join("a/z.rpy"),
+            "label start:\n    \"Yes.\"\n    \"Yes.\"\n",
+        )
+        .unwrap();
+        fs::write(
+            game.join("z/a.rpy"),
+            "label start:\n    \"Yes.\"\nlabel other:\n    \"Yes.\"\n    \"Yes.\"\n",
+        )
+        .unwrap();
+        let plugin = RenPyPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        assert_eq!(entries.len(), 5);
+        for entry in &mut entries {
+            entry.translation = Some(format!("Sí desde {}.", entry.id));
+        }
+        entries.reverse();
+        let hash = expected_say_hash(r#""Yes.""#);
+        for language in ["es", "fr"] {
+            let report = plugin.inject_add(dir.path(), language, &entries).unwrap();
+            assert_eq!(report.strings_written, 5);
+            assert_eq!(report.strings_skipped, 0);
+            let first = fs::read_to_string(game.join(format!("tl/{language}/z.rpy"))).unwrap();
+            let second = fs::read_to_string(game.join(format!("tl/{language}/a.rpy"))).unwrap();
+            let ids = |content: &str| {
+                content
+                    .lines()
+                    .filter(|line| line.starts_with("translate "))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                ids(&first),
+                [
+                    format!("translate {language} start_{hash}:"),
+                    format!("translate {language} start_{hash}_1:")
+                ]
+            );
+            assert_eq!(
+                ids(&second),
+                [
+                    format!("translate {language} start_{hash}_2:"),
+                    format!("translate {language} other_{hash}:"),
+                    format!("translate {language} other_{hash}_1:")
+                ]
+            );
+            entries.rotate_left(1);
+            plugin.inject_add(dir.path(), language, &entries).unwrap();
+            assert_eq!(
+                fs::read_to_string(game.join(format!("tl/{language}/z.rpy"))).unwrap(),
+                first
+            );
+            assert_eq!(
+                fs::read_to_string(game.join(format!("tl/{language}/a.rpy"))).unwrap(),
+                second
+            );
+        }
+    }
+
+    #[test]
+    fn add_dialogue_reserves_ids_for_untranslated_occurrences() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(
+            game.join("script.rpy"),
+            "label start:\n    \"Yes.\"\n    \"Yes.\"\n    \"Yes.\"\n    \"Yes.\"\n    \"Yes.\"\n",
+        )
+        .unwrap();
+        let plugin = RenPyPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        assert_eq!(entries.len(), 5);
+        entries[1].translation = Some("Yes.".to_string());
+        entries[2].translation = Some(" ".to_string());
+        entries[3].translation = Some("Sí cuatro.".to_string());
+        entries[4].translation = Some("Sí cinco.".to_string());
+        entries.reverse();
+        let report = plugin.inject_add(dir.path(), "es", &entries).unwrap();
+        assert_eq!(report.strings_written, 2);
+        assert_eq!(report.strings_skipped, 3);
+        let content = fs::read_to_string(game.join("tl/es/script.rpy")).unwrap();
+        let hash = expected_say_hash(r#""Yes.""#);
+        let ids: Vec<_> = content
+            .lines()
+            .filter(|line| line.starts_with("translate "))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                format!("translate es start_{hash}_3:"),
+                format!("translate es start_{hash}_4:")
+            ]
+        );
+        assert!(content.contains("    \"Sí cuatro.\"\n"));
+        assert!(content.contains("    \"Sí cinco.\"\n"));
+    }
+
+    #[test]
+    fn dialogue_numbering_advances_past_reserved_suffix_collisions() {
+        let mut allocated = HashMap::new();
+        let base = "start_09e39b23";
+        assert_eq!(
+            renpy_numbered_translation_id(base.to_string(), &mut allocated),
+            base
+        );
+        allocated.insert(format!("{base}_1"), 1);
+        assert_eq!(
+            renpy_numbered_translation_id(base.to_string(), &mut allocated),
+            format!("{base}_2")
+        );
+    }
+
+    #[test]
     fn add_dialogue_uses_canonical_escaped_statement() {
         for (statement, canonical) in [
             (r#""She said \"hi\" \ bye.""#, r#""She said \"hi\" \ bye.""#),
@@ -3727,7 +3950,7 @@ mod tests {
     }
 
     #[test]
-    fn add_preserves_order_duplicate_skipping_and_strings() {
+    fn add_preserves_order_duplicate_numbering_and_strings() {
         let dir = tempfile::tempdir().unwrap();
         let game = dir.path().join("game");
         fs::create_dir(&game).unwrap();
@@ -3744,8 +3967,8 @@ mod tests {
         }
 
         let report = plugin.inject_add(dir.path(), "es", &entries).unwrap();
-        assert_eq!(report.strings_written, 5);
-        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(report.strings_written, 6);
+        assert_eq!(report.strings_skipped, 0);
         let content = fs::read_to_string(game.join("tl/es/script.rpy")).unwrap();
         let ids: Vec<_> = content
             .lines()
@@ -3755,12 +3978,16 @@ mod tests {
             ids,
             [
                 format!("translate es start_{}:", expected_say_hash(r#"e "Hello.""#)),
+                format!(
+                    "translate es start_{}_1:",
+                    expected_say_hash(r#"e "Hello.""#)
+                ),
                 "translate es start_09e39b23:".to_string(),
                 format!("translate es start_{}:", expected_say_hash(r#""Bye.""#)),
             ]
         );
         assert!(content.contains("# game/script.rpy:3\n"));
-        assert!(!content.contains("# game/script.rpy:4\n"));
+        assert!(content.contains("# game/script.rpy:4\n"));
         assert!(content.contains("# game/script.rpy:5\n"));
         assert!(content.contains("# game/script.rpy:6\n"));
         assert_eq!(
@@ -3781,6 +4008,20 @@ mod tests {
         let mut matches = 0usize;
         let mut exact_matches = 0usize;
         let mut mismatches = Vec::new();
+        struct Block {
+            id: String,
+            base: String,
+            computed: String,
+            game_language: usize,
+            source_file: usize,
+            tl_file: usize,
+            line: usize,
+        }
+        let mut blocks = Vec::new();
+        let mut game_languages = HashMap::new();
+        let mut source_files = HashMap::new();
+        let mut source_paths = Vec::new();
+        let mut tl_paths = Vec::new();
         // Recovery copies are not independent Ren'Py corpus data and can contain
         // recursively nested legacy backups. Inspect the game trees themselves.
         for entry in walkdir::WalkDir::new(&root)
@@ -3807,12 +4048,34 @@ mod tests {
                 continue; // This corpus checks IDs generated by Ren'Py itself.
             }
             files += 1;
+            let tl_file = tl_paths.len();
+            tl_paths.push(entry.path().to_path_buf());
+            let game = entry
+                .path()
+                .ancestors()
+                .find(|path| path.file_name().is_some_and(|name| name == "tl"))
+                .unwrap()
+                .parent()
+                .unwrap();
             let mut pending_id = None;
+            let mut language = "";
+            let mut source_path = entry.path().to_string_lossy().replace('\\', "/");
+            let mut source_line = 0;
             for line in content.lines() {
                 let trimmed = line.trim();
+                if let Some((path, number)) = trimmed
+                    .strip_prefix("# ")
+                    .and_then(|comment| comment.rsplit_once(':'))
+                    .and_then(|(path, number)| number.parse::<usize>().ok().map(|n| (path, n)))
+                {
+                    if path.ends_with(".rpy") {
+                        source_path = path.replace('\\', "/");
+                        source_line = number;
+                    }
+                }
                 if let Some(header) = trimmed.strip_prefix("translate ") {
                     let mut parts = header.split_whitespace();
-                    let _lang = parts.next();
+                    language = parts.next().unwrap_or("");
                     pending_id = parts
                         .next()
                         .and_then(|id| id.strip_suffix(':'))
@@ -3842,9 +4105,7 @@ mod tests {
                 }
                 pending_id = None;
                 dialogue_blocks += 1;
-                // Validate the MD5-derived ID before Ren'Py's duplicate suffix.
-                // Add mode skips duplicates; it must not generate `_1` itself.
-                // Report full-ID agreement too so that distinction stays visible.
+                // Separate the hash check from the duplicate-numbering hypotheses.
                 let base_id = id.rsplit_once('_').map_or(id, |(prefix, tail)| {
                     let has_hash = prefix.rsplit_once('_').is_some_and(|(_, hash)| {
                         hash.len() == 8 && hash.bytes().all(|b| b.is_ascii_hexdigit())
@@ -3867,6 +4128,26 @@ mod tests {
                 } else if mismatches.len() < 5 {
                     mismatches.push(format!("{}: {id}", entry.path().display()));
                 }
+                let next_game_language = game_languages.len();
+                let game_language = *game_languages
+                    .entry((game.to_path_buf(), language.to_string()))
+                    .or_insert(next_game_language);
+                let next_source_file = source_paths.len();
+                let source_file = *source_files
+                    .entry((game_language, source_path.clone()))
+                    .or_insert_with(|| {
+                        source_paths.push(source_path.clone());
+                        next_source_file
+                    });
+                blocks.push(Block {
+                    id: id.to_string(),
+                    base: base_id.to_string(),
+                    computed: actual_id,
+                    game_language,
+                    source_file,
+                    tl_file,
+                    line: source_line,
+                });
             }
         }
         assert!(
@@ -3876,7 +4157,223 @@ mod tests {
         );
         let rate = matches as f64 * 100.0 / dialogue_blocks as f64;
         let exact_rate = exact_matches as f64 * 100.0 / dialogue_blocks as f64;
-        eprintln!("Ren'Py TL corpus: {matches}/{dialogue_blocks} MD5-derived dialogue IDs matched ({rate:.2}%) across {files} TL files; full IDs: {exact_matches}/{dialogue_blocks} ({exact_rate:.2}%).");
+        eprintln!("Ren'Py TL corpus: {matches}/{dialogue_blocks} MD5-derived dialogue IDs matched ({rate:.4}%) across {files} TL files; unsuffixed baseline full IDs: {exact_matches}/{dialogue_blocks} ({exact_rate:.4}%).");
+        let mut base_counts = HashMap::new();
+        for block in &blocks {
+            *base_counts
+                .entry((block.game_language, block.base.as_str()))
+                .or_insert(0usize) += 1;
+        }
+        let repeated_suffixes = blocks
+            .iter()
+            .filter(|block| {
+                block.id != block.base
+                    && base_counts[&(block.game_language, block.base.as_str())] > 1
+            })
+            .count();
+        let canonical_suffixes = blocks
+            .iter()
+            .filter(|block| {
+                block.id != block.base
+                    && base_counts[&(block.game_language, block.base.as_str())] > 1
+                    && block
+                        .id
+                        .strip_prefix(&format!("{}_", block.base))
+                        .is_some_and(|n| {
+                            n.parse::<usize>()
+                                .is_ok_and(|number| number > 0 && number.to_string() == n)
+                        })
+            })
+            .count();
+        eprintln!("Repeated-base suffix format: {canonical_suffixes}/{repeated_suffixes} are unpadded _N with N >= 1; {} game/language scopes.", game_languages.len());
+        let mut physical_order: Vec<_> = (0..blocks.len()).collect();
+        physical_order.sort_by(|&a, &b| {
+            let a = &blocks[a];
+            let b = &blocks[b];
+            (a.game_language, &tl_paths[a.tl_file]).cmp(&(b.game_language, &tl_paths[b.tl_file]))
+        });
+        let mut script_order = physical_order.clone();
+        script_order.sort_by(|&a, &b| {
+            let a = &blocks[a];
+            let b = &blocks[b];
+            (a.game_language, &source_paths[a.source_file], a.line).cmp(&(
+                b.game_language,
+                &source_paths[b.source_file],
+                b.line,
+            ))
+        });
+        let mut source_physical_order = physical_order.clone();
+        source_physical_order.sort_by(|&a, &b| {
+            let a = &blocks[a];
+            let b = &blocks[b];
+            (a.game_language, &source_paths[a.source_file])
+                .cmp(&(b.game_language, &source_paths[b.source_file]))
+        });
+        let backwards = physical_order
+            .windows(2)
+            .filter(|pair| {
+                let a = &blocks[pair[0]];
+                let b = &blocks[pair[1]];
+                a.tl_file == b.tl_file && a.source_file == b.source_file && a.line > b.line
+            })
+            .count();
+        eprintln!("TL blocks with decreasing source-line comments: {backwards}");
+        let mut reverse_files = physical_order.clone();
+        reverse_files.sort_by(|&a, &b| {
+            let a = &blocks[a];
+            let b = &blocks[b];
+            (
+                a.game_language,
+                std::cmp::Reverse(&source_paths[a.source_file]),
+                a.line,
+            )
+                .cmp(&(
+                    b.game_language,
+                    std::cmp::Reverse(&source_paths[b.source_file]),
+                    b.line,
+                ))
+        });
+        let mut basename_order = physical_order.clone();
+        basename_order.sort_by(|&a, &b| {
+            let a = &blocks[a];
+            let b = &blocks[b];
+            (
+                a.game_language,
+                source_paths[a.source_file].rsplit('/').next(),
+                a.line,
+            )
+                .cmp(&(
+                    b.game_language,
+                    source_paths[b.source_file].rsplit('/').next(),
+                    b.line,
+                ))
+        });
+        for (name, order, scope, start) in [
+            ("per TL file / TL order / _1", &physical_order, 0, 1),
+            ("per source file / script order / _1", &script_order, 1, 1),
+            (
+                "game+language / TL path then TL order / _1",
+                &physical_order,
+                2,
+                1,
+            ),
+            (
+                "game+language / source path then TL order / _1",
+                &source_physical_order,
+                2,
+                1,
+            ),
+            (
+                "game+language / source path then line / _1",
+                &script_order,
+                2,
+                1,
+            ),
+            (
+                "game+language / reverse source path then line / _1",
+                &reverse_files,
+                2,
+                1,
+            ),
+            (
+                "game+language / source basename then line / _1",
+                &basename_order,
+                2,
+                1,
+            ),
+            (
+                "game+language / source path then line / _0",
+                &script_order,
+                2,
+                0,
+            ),
+        ] {
+            let mut counts = HashMap::new();
+            let mut full_allocated = HashMap::new();
+            let mut current_scope = None;
+            let mut numbered_matches = 0;
+            let mut full_matches = 0;
+            let mut suffix_matches = 0;
+            for &index in order {
+                let block = &blocks[index];
+                let scope = match scope {
+                    0 => block.tl_file,
+                    1 => block.source_file,
+                    _ => block.game_language,
+                };
+                if current_scope != Some(scope) {
+                    full_allocated.clear();
+                    current_scope = Some(scope);
+                }
+                let count = counts.entry((scope, block.base.as_str())).or_insert(0usize);
+                let suffix = if *count == 0 {
+                    String::new()
+                } else {
+                    format!("_{}", *count - 1 + start)
+                };
+                *count += 1;
+                let expected = format!("{}{suffix}", block.base);
+                if expected == block.id {
+                    numbered_matches += 1;
+                    if block.id != block.base
+                        && base_counts[&(block.game_language, block.base.as_str())] > 1
+                    {
+                        suffix_matches += 1;
+                    }
+                }
+                let expected_full = if start == 1 {
+                    renpy_numbered_translation_id(block.computed.clone(), &mut full_allocated)
+                } else {
+                    let count = full_allocated
+                        .entry(block.computed.clone())
+                        .or_insert(0usize);
+                    let id = if *count == 0 {
+                        block.computed.clone()
+                    } else {
+                        format!("{}_{}", block.computed, *count - 1)
+                    };
+                    *count += 1;
+                    id
+                };
+                if expected_full == block.id {
+                    full_matches += 1;
+                }
+            }
+            eprintln!("Hypothesis {name}: numbering {numbered_matches}/{dialogue_blocks} ({:.4}%); full {full_matches}/{dialogue_blocks} ({:.4}%); repeated suffixes {suffix_matches}/{repeated_suffixes} ({:.4}%).", numbered_matches as f64 * 100.0 / dialogue_blocks as f64, full_matches as f64 * 100.0 / dialogue_blocks as f64, suffix_matches as f64 * 100.0 / repeated_suffixes as f64);
+        }
+        // A counter scoped per label within a game/language is equivalent to the
+        // game/language counter: each complete base ID already contains its label.
+        eprintln!("Per-label numbering within each game/language is identical to the game/language hypotheses because the label is included in every base ID.");
+        // TL encounter order best preserves the original script traversal in
+        // this historical corpus. Ren'Py appends updates, so old source-line
+        // comments cannot be used to reconstruct that traversal reliably.
+        let mut allocated = HashMap::new();
+        let mut current_game_language = None;
+        let mut full_matches = 0usize;
+        let mut full_mismatches = Vec::new();
+        for &index in &physical_order {
+            let block = &blocks[index];
+            if current_game_language != Some(block.game_language) {
+                allocated.clear();
+                current_game_language = Some(block.game_language);
+            }
+            let expected = renpy_numbered_translation_id(block.computed.clone(), &mut allocated);
+            if expected == block.id {
+                full_matches += 1;
+            } else if full_mismatches.len() < 5 {
+                full_mismatches.push(format!(
+                    "{}: expected {expected}, found {}",
+                    tl_paths[block.tl_file].display(),
+                    block.id
+                ));
+            }
+        }
+        let full_rate = full_matches as f64 * 100.0 / dialogue_blocks as f64;
+        eprintln!("Shared Add numbering function: full IDs {full_matches}/{dialogue_blocks} ({full_rate:.4}%).");
+        assert!(
+            full_matches * 1000 >= dialogue_blocks * 994,
+            "Expected at least 99.4% matching full IDs, got {full_rate:.4}%; examples: {full_mismatches:?}"
+        );
         assert!(
             matches * 100 >= dialogue_blocks * 95,
             "Expected at least 95% matching IDs, got {rate:.2}%; examples: {mismatches:?}"
