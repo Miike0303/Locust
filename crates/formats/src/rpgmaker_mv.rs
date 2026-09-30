@@ -64,26 +64,92 @@ fn parse_d_text_command(command: &str) -> Option<(&str, Option<&str>)> {
     Some((body, size))
 }
 
+/// Literal text in an allow-listed display slot, excluding asset/lookup values.
+fn has_plugin_display_text(text: &str) -> bool {
+    let literal = literal_display_text(text);
+    let text = literal.trim();
+    if !text.chars().any(char::is_alphabetic) {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    if matches!(lower.as_str(), "true" | "false" | "null") {
+        return false;
+    }
+    if lower.strip_prefix('#').is_some_and(|hex| {
+        matches!(hex.len(), 3 | 4 | 6 | 8) && hex.bytes().all(|c| c.is_ascii_hexdigit())
+    }) {
+        return false;
+    }
+    if lower.rsplit_once('.').is_some_and(|(_, ext)| {
+        matches!(
+            ext,
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "webp"
+                | "bmp"
+                | "gif"
+                | "svg"
+                | "rpgmvp"
+                | "png_"
+                | "ogg"
+                | "m4a"
+                | "mp3"
+                | "wav"
+                | "flac"
+                | "rpgmvo"
+                | "rpgmvm"
+                | "ogg_"
+                | "m4a_"
+                | "mp4"
+                | "webm"
+                | "avi"
+                | "mov"
+                | "ttf"
+                | "otf"
+                | "woff"
+                | "woff2"
+                | "json"
+                | "jsono"
+                | "js"
+        )
+    }) {
+        return false;
+    }
+    // Bare switch/variable references are parameters, not displayed prose.
+    for prefix in ["switch", "variable", "s[", "v["] {
+        if lower.strip_prefix(prefix).is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c.is_whitespace() || "[]:_#=".contains(c))
+        }) {
+            return false;
+        }
+    }
+    if lower.starts_with('$') {
+        return false;
+    }
+    // Explicit identifier spelling (e.g. quest_id) is not a literal UI label.
+    if text.contains('_') && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    true
+}
+
 /// Extract the body of D_TEXT, or the full command for other known display
-/// plugins containing CJK characters. Technical/audio/system commands are skipped.
+/// plugins with literal text. Technical/audio/system commands are skipped.
 fn extract_plugin_command_text(command: &str) -> Option<String> {
     if command.split_whitespace().next() == Some("D_TEXT") {
-        return parse_d_text_command(command).map(|(body, _)| body.to_string());
+        return parse_d_text_command(command)
+            .filter(|(body, _)| has_plugin_display_text(body))
+            .map(|(body, _)| body.to_string());
     }
     let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Check if the command starts with a known text-display plugin prefix
-    for prefix in TEXT_DISPLAY_PLUGINS {
-        if trimmed.starts_with(prefix) {
-            // Verify it has CJK text content
-            if trimmed.chars().any(|c| {
-                ('\u{3000}'..='\u{9FFF}').contains(&c) || ('\u{FF00}'..='\u{FFEF}').contains(&c)
-            }) {
-                return Some(trimmed.to_string());
-            }
-        }
+    let (dispatcher, body) = trimmed.split_once(char::is_whitespace)?;
+    // Check the body alone: a dispatcher is alphabetic even with no visible text.
+    if TEXT_DISPLAY_PLUGINS.contains(&dispatcher) && has_plugin_display_text(body) {
+        return Some(trimmed.to_string());
     }
     None
 }
@@ -118,12 +184,7 @@ fn extract_mz_plugin_command(params: &[serde_json::Value]) -> Vec<(String, Strin
                         };
                         if let Some(obj) = choice_obj {
                             if let Some(label) = obj.get("label").and_then(|v| v.as_str()) {
-                                if !label.trim().is_empty()
-                                    && label.chars().any(|c| {
-                                        ('\u{3000}'..='\u{9FFF}').contains(&c)
-                                            || ('\u{FF00}'..='\u{FFEF}').contains(&c)
-                                    })
-                                {
+                                if has_plugin_display_text(label) {
                                     results
                                         .push((format!("choices#{}#label", ci), label.to_string()));
                                 }
@@ -133,10 +194,7 @@ fn extract_mz_plugin_command(params: &[serde_json::Value]) -> Vec<(String, Strin
                 }
                 continue;
             }
-            // Regular text field — only if it contains CJK characters
-            if val.chars().any(|c| {
-                ('\u{3000}'..='\u{9FFF}').contains(&c) || ('\u{FF00}'..='\u{FFEF}').contains(&c)
-            }) {
+            if has_plugin_display_text(val) {
                 results.push((key.to_string(), val.to_string()));
             }
         }
@@ -1464,6 +1522,12 @@ impl RpgMakerMvPlugin {
 
 /// A displayed speaker needs literal content beyond control codes and whitespace.
 fn has_speaker_text(s: &str) -> bool {
+    literal_display_text(s).chars().any(char::is_alphabetic)
+}
+
+/// Strip engine/plugin escapes and lookup tags before testing literal content.
+fn literal_display_text(s: &str) -> String {
+    let mut literal = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -1504,11 +1568,11 @@ fn has_speaker_text(s: &str) -> bool {
             if chars.peek() == Some(&'}') {
                 chars.next();
             }
-        } else if c.is_alphabetic() {
-            return true;
+        } else {
+            literal.push(c);
         }
     }
-    false
+    literal
 }
 
 /// Visible length of a message line, skipping RPG Maker control codes such
@@ -2163,15 +2227,10 @@ mod tests {
             serde_json::json!(rebuilt);
         assert_eq!(written, expected, "only the command body may change");
         let again = plugin.extract(&file).unwrap();
-        if tags.contains(&"d_text") {
-            assert_eq!(
-                again.iter().find(|e| e.id == id).unwrap().source,
-                translation
-            );
-        } else {
-            // Other MV display commands retain their existing CJK extraction gate.
-            assert!(!again.iter().any(|e| e.id == id));
-        }
+        assert_eq!(
+            again.iter().find(|e| e.id == id).unwrap().source,
+            translation
+        );
     }
 
     #[test]
@@ -2245,7 +2304,7 @@ mod tests {
     #[test]
     fn test_mv_plugin_non_d_text_behavior_is_unchanged() {
         for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
-            for command in ["SHOW_TEXT テスト 32", "D_TEXT_OTHER テスト 32"] {
+            for command in ["SHOW_TEXT テスト 32", "T_TEXT テスト", "GN_TEXT テスト"] {
                 assert_mv_plugin_roundtrip(
                     filename,
                     command,
@@ -2256,8 +2315,243 @@ mod tests {
                 );
             }
         }
-        assert_eq!(extract_plugin_command_text("SHOW_TEXT Hello"), None);
+        assert_eq!(
+            extract_plugin_command_text("SHOW_TEXT Hello"),
+            Some("SHOW_TEXT Hello".into())
+        );
+        assert_eq!(extract_plugin_command_text("D_TEXT_OTHER テスト 32"), None);
         assert_eq!(extract_plugin_command_text("PLAY_SOUND テスト"), None);
+    }
+
+    #[test]
+    fn test_cycle104_mz_latin_display_roundtrip() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            let game = tempfile::tempdir().unwrap();
+            let file = game.path().join(filename);
+            let (mut original, id) = mv_plugin_fixture(filename, "unused");
+            let choices = serde_json::json!([
+                {"label": "Open the door.", "value": "door_id", "switch": "12"},
+                serde_json::json!({"label": "Wait here.", "value": "wait_id"}).to_string(),
+                {"label": "\\V[1]", "value": "dynamic"}
+            ]);
+            let command = mv_plugin_command_mut(filename, &mut original);
+            command["code"] = serde_json::json!(357);
+            command["parameters"] = serde_json::json!([
+                "QuestPlugin", "showQuest", "Editor description", {
+                    "description": "Meet Jade at the market at night.",
+                    "text": "\\C[2]Go to the market.",
+                    "choices": choices.to_string(),
+                    "filename": "title.png", "eval": "show_text", "id": "quest_1"
+                }
+            ]);
+            fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+            let plugin = RpgMakerMvPlugin::new();
+            let mut entries: Vec<_> = plugin
+                .extract(&file)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.tags.iter().any(|t| t == "plugin_cmd"))
+                .collect();
+            assert_eq!(entries.len(), 4, "{filename}");
+            let translations = [
+                ("text", "\\C[2]Ve al mercado."),
+                (
+                    "description",
+                    "Encuentra a Jade en el mercado por la noche.",
+                ),
+                ("choices#0#label", "Abre la puerta."),
+                ("choices#1#label", "Espera aquí."),
+            ];
+            for (key, translation) in translations {
+                let row = entries
+                    .iter_mut()
+                    .find(|e| e.id == format!("{id}#arg_{key}"))
+                    .expect("allow-listed English argument");
+                row.translation = Some(translation.into());
+            }
+            let report = plugin.inject(&file, &entries).unwrap();
+            assert_eq!(report.strings_written, 4);
+            assert_eq!(report.strings_skipped, 0);
+            assert!(report.skip_reasons.is_empty());
+            let mut expected = original;
+            let args = &mut mv_plugin_command_mut(filename, &mut expected)["parameters"][3];
+            args["text"] = serde_json::json!(translations[0].1);
+            args["description"] = serde_json::json!(translations[1].1);
+            let mut expected_choices = choices;
+            expected_choices[0]["label"] = serde_json::json!(translations[2].1);
+            let mut encoded: serde_json::Value =
+                serde_json::from_str(expected_choices[1].as_str().unwrap()).unwrap();
+            encoded["label"] = serde_json::json!(translations[3].1);
+            expected_choices[1] = serde_json::json!(encoded.to_string());
+            args["choices"] = serde_json::json!(expected_choices.to_string());
+            let written: serde_json::Value =
+                serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+            assert_eq!(written, expected, "all other fields must be unchanged");
+            let again = plugin.extract(&file).unwrap();
+            for row in entries {
+                assert_eq!(
+                    again.iter().find(|e| e.id == row.id).unwrap().source,
+                    row.translation.unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cycle104_mv_latin_display_roundtrip() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
+                let source = format!("{dispatcher} Meet Jade at the market.");
+                let translation = format!("{dispatcher} Encuentra a Jade en el mercado.");
+                assert_mv_plugin_roundtrip(
+                    filename,
+                    &source,
+                    &source,
+                    &translation,
+                    &translation,
+                    &["plugin_cmd"],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cycle104_plugin_display_rejects_technical_values() {
+        for text in [
+            "\\V[1]",
+            "\\N[2]",
+            "123",
+            "#ff00ff",
+            "true",
+            "false",
+            "null",
+            "title.png",
+            "Picture.PNG",
+            "audio/theme.ogg",
+            "Face.rpgmvp",
+            "Font.woff2",
+            "",
+            "  ",
+            "\\C[2]\\I[3]\\{\\}\\!",
+            "\\tl{A0026}",
+            "{{quest_title}}",
+            "<b></b>",
+            "switch[1]",
+            "variable:2",
+            "v[3]",
+            "s[4]",
+            "$gameVariables.value(1)",
+            "$gameSwitches.value(2)",
+            "quest_id",
+            "\\C[2]true",
+            "\\C[2]#ff00ff",
+            "\\C[2]title.png",
+        ] {
+            let mut args = serde_json::Map::new();
+            for &key in MZ_TRANSLATABLE_ARG_KEYS {
+                if key != "choices" {
+                    args.insert(key.into(), serde_json::json!(text));
+                }
+            }
+            args.insert(
+                "choices".into(),
+                serde_json::json!(serde_json::json!([
+                    {"label": text, "value": "1"},
+                    serde_json::json!({"label": text, "value": "2"}).to_string()
+                ])
+                .to_string()),
+            );
+            let params = serde_json::json!(["Plugin", "display", "Description", args]);
+            assert!(
+                extract_mz_plugin_command(params.as_array().unwrap()).is_empty(),
+                "{text:?}"
+            );
+            for dispatcher in TEXT_DISPLAY_PLUGINS {
+                let command = format!("{dispatcher} {text}");
+                assert_eq!(extract_plugin_command_text(&command), None, "{command:?}");
+            }
+        }
+        for command in [
+            "SHOW_TEXT_SETTINGS Hello",
+            "D_TEXT_OTHER Hello",
+            "PLAY_SOUND Hello",
+            "SHOW_PICTURE Hello",
+            "CHANGE_SWITCH Hello",
+            "SHOW_TEXT",
+            "GN_TEXT",
+        ] {
+            assert_eq!(extract_plugin_command_text(command), None, "{command:?}");
+        }
+        let params = serde_json::json!(["Plugin", "display", "Visible editor text", {
+            "asset": "Hello", "name": "Hello", "eval": "Hello", "value": "Hello"
+        }]);
+        assert!(extract_mz_plugin_command(params.as_array().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn test_cycle104_plugin_display_keeps_cjk_and_other_languages() {
+        for text in [
+            "テスト",
+            "選択肢",
+            "\\C[2]こんにちは",
+            "你好",
+            "안녕하세요",
+            "Привет",
+            "Hola",
+            "8m",
+        ] {
+            let params = serde_json::json!(["Plugin", "display", "Description", {
+                "text": text, "description": text,
+                "choices": serde_json::json!([
+                    {"label": text}, serde_json::json!({"label": text}).to_string()
+                ]).to_string()
+            }]);
+            assert_eq!(
+                extract_mz_plugin_command(params.as_array().unwrap()),
+                vec![
+                    ("text".into(), text.into()),
+                    ("description".into(), text.into()),
+                    ("choices#0#label".into(), text.into()),
+                    ("choices#1#label".into(), text.into()),
+                ]
+            );
+            for dispatcher in ["SHOW_TEXT", "T_TEXT", "GN_TEXT"] {
+                let command = format!("{dispatcher} {text}");
+                assert_eq!(extract_plugin_command_text(&command), Some(command.clone()));
+            }
+            assert_eq!(
+                extract_plugin_command_text(&format!("D_TEXT {text} 32")),
+                Some(text.into())
+            );
+        }
+    }
+
+    #[test]
+    fn test_cycle104_mz_changed_source_is_skipped() {
+        let game = tempfile::tempdir().unwrap();
+        let file = game.path().join("Map001.json");
+        let (mut original, _) = mv_plugin_fixture("Map001.json", "unused");
+        let command = mv_plugin_command_mut("Map001.json", &mut original);
+        command["code"] = serde_json::json!(357);
+        command["parameters"] = serde_json::json!(["Plugin", "display", "", {"text": "Hello"}]);
+        fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries: Vec<_> = plugin
+            .extract(&file)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.tags.iter().any(|t| t == "plugin_cmd"))
+            .collect();
+        assert_eq!(entries.len(), 1);
+        entries[0].translation = Some("Hola".into());
+        mv_plugin_command_mut("Map001.json", &mut original)["parameters"][3]["text"] =
+            serde_json::json!("Goodbye");
+        let bytes = serde_json::to_vec(&original).unwrap();
+        fs::write(&file, &bytes).unwrap();
+        let report = plugin.inject(&file, &entries).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+        assert_eq!(fs::read(&file).unwrap(), bytes);
     }
 
     #[test]
