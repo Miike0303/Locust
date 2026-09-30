@@ -1346,6 +1346,7 @@ impl RpgMakerMvPlugin {
 
         let mut run_len = 0usize;
         let mut max_width = 0usize;
+        let mut source_lines = Vec::new();
         while let Some(cmd) = list.get(cmd_idx + run_len) {
             if cmd.get("code").and_then(|v| v.as_i64()) != Some(code) {
                 break;
@@ -1357,6 +1358,9 @@ impl RpgMakerMvPlugin {
                 .and_then(|v| v.as_str())
             {
                 max_width = max_width.max(visible_len(text));
+                source_lines.push(text);
+            } else {
+                source_lines.push("");
             }
             run_len += 1;
         }
@@ -1367,14 +1371,21 @@ impl RpgMakerMvPlugin {
         // Wrap to the width the game's own text was wrapped at; the floor
         // keeps messages with only short lines from wrapping absurdly early.
         let width = max_width.max(40);
-        let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
-        // A leading name tag (\n<Name>) must stay intact at the start of the
-        // first line — it may contain spaces, so wrap only the body.
-        let (name_tag, body) = split_name_tag(&flat);
-        let mut lines = wrap_message(body, width);
-        if !name_tag.is_empty() {
-            lines[0] = format!("{}{}", name_tag, lines[0]);
-        }
+        let wrap = |text: &str| {
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            // A leading name tag (\n<Name>) may contain spaces; wrap only its body.
+            let (name_tag, body) = split_name_tag(&flat);
+            let mut lines = wrap_message(body, width);
+            if !name_tag.is_empty() {
+                lines[0] = format!("{}{}", name_tag, lines[0]);
+            }
+            lines
+        };
+        // Both engines consume the entire 401/405 run: Show Text paginates at
+        // the window height, and Scrolling Text renders all lines. Keep that
+        // behaviour rather than truncating a translation to four commands.
+        let lines = preserve_blank_line_layout(&source_lines.join("\n"), translation, wrap)
+            .unwrap_or_else(|| wrap(translation));
 
         let template = list[cmd_idx].clone();
         let new_cmds: Vec<serde_json::Value> = lines
@@ -1624,11 +1635,78 @@ pub(crate) fn rewrap_to_source_width(source: &str, translation: &str) -> String 
         return translation.to_string();
     }
     let width = source.lines().map(visible_len).max().unwrap_or(0);
-    if width == 0 || translation.lines().all(|l| visible_len(l) <= width) {
+    if width == 0 {
+        return translation.to_string();
+    }
+    if let Some(lines) = preserve_blank_line_layout(source, translation, |paragraph| {
+        if paragraph.lines().all(|l| visible_len(l) <= width) {
+            paragraph.split('\n').map(str::to_string).collect()
+        } else {
+            wrap_message(paragraph, width)
+        }
+    }) {
+        return lines.join("\n");
+    }
+    if translation.lines().all(|l| visible_len(l) <= width) {
         return translation.to_string();
     }
     let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
     wrap_message(&flat, width).join("\n")
+}
+
+/// Empty (including whitespace-only) lines separate nonempty paragraphs; a
+/// single newline inside a paragraph is just a hand-wrapped display line.
+/// Record leading/trailing blanks too, using split rather than lines so a
+/// final empty command is retained.
+fn message_paragraphs(text: &str) -> (Vec<String>, Vec<usize>) {
+    let mut paragraphs = Vec::new();
+    let mut blanks = vec![0];
+    let mut paragraph = String::new();
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            if !paragraph.is_empty() {
+                paragraphs.push(std::mem::take(&mut paragraph));
+                blanks.push(0);
+            }
+            *blanks.last_mut().unwrap() += 1;
+        } else {
+            if !paragraph.is_empty() {
+                paragraph.push('\n');
+            }
+            paragraph.push_str(line);
+        }
+    }
+    if !paragraph.is_empty() {
+        paragraphs.push(paragraph);
+        blanks.push(0);
+    }
+    (paragraphs, blanks)
+}
+
+/// Match translated paragraphs to source paragraphs in order, restoring the
+/// source's exact counts of blank lines around them. Provider blank-line
+/// counts are separators, not extra display rows. If paragraph counts differ,
+/// the mapping is ambiguous: callers keep the previous wrapping behaviour on
+/// the entire translation, never discarding unmatched text or adding blanks.
+fn preserve_blank_line_layout(
+    source: &str,
+    translation: &str,
+    mut wrap: impl FnMut(&str) -> Vec<String>,
+) -> Option<Vec<String>> {
+    let (source_paragraphs, blanks) = message_paragraphs(source);
+    if !blanks.iter().any(|&n| n > 0) {
+        return None;
+    }
+    let (paragraphs, _) = message_paragraphs(translation);
+    if paragraphs.is_empty() || paragraphs.len() != source_paragraphs.len() {
+        return None;
+    }
+    let mut lines = vec![String::new(); blanks[0]];
+    for (paragraph, &blank_count) in paragraphs.iter().zip(&blanks[1..]) {
+        lines.extend(wrap(paragraph));
+        lines.extend(std::iter::repeat_with(String::new).take(blank_count));
+    }
+    Some(lines)
 }
 
 pub(crate) fn wrap_message(text: &str, width: usize) -> Vec<String> {
@@ -1870,8 +1948,8 @@ impl FormatPlugin for RpgMakerMvPlugin {
                         continue;
                     }
                     // Replace mode reaches Iavra packs and multi-line database
-                    // `description` fields too, so restore line width here —
-                    // `apply_message_block` re-flattens what it handles.
+                    // `description` fields too, so restore line width here.
+                    // Message blocks then wrap each paragraph at their width floor.
                     let translation = rewrap_to_source_width(&entry.source, translation);
                     Self::apply_translation(&mut json, filename, &entry.id, &translation);
                     strings_written += 1;
@@ -2994,6 +3072,180 @@ mod tests {
         let lines = wrap_message("uno dos tres cuatro cinco seis", 12);
         assert!(lines.iter().all(|l| visible_len(l) <= 12), "{:?}", lines);
         assert_eq!(lines.join(" "), "uno dos tres cuatro cinco seis");
+    }
+
+    fn assert_message_layout_roundtrip(
+        filename: &str,
+        code: i64,
+        source: &[&str],
+        translation: &str,
+        expected_lines: &[&str],
+    ) {
+        let game = tempfile::tempdir().unwrap();
+        let file = game.path().join(filename);
+        let mut original = speaker_fixture(filename, serde_json::json!(["Face", 2, 1, 0]));
+        let mut list = vec![serde_json::json!({
+            "code": if code == 405 { 105 } else { 101 },
+            "indent": 1,
+            "parameters": if code == 405 { serde_json::json!([2, false]) }
+                          else { serde_json::json!(["Face", 2, 1, 0]) }
+        })];
+        for line in source {
+            list.push(serde_json::json!({"code": code, "indent": 1, "parameters": [line]}));
+        }
+        // Later commands and every header/line's metadata must survive splicing.
+        list.push(serde_json::json!({"code": 250, "indent": 1, "parameters": ["Sound"]}));
+        list.push(serde_json::json!({"code": 0, "indent": 0, "parameters": []}));
+        *speaker_list_mut(filename, &mut original) = serde_json::json!(list);
+        fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&file).unwrap();
+        let row = entries.iter_mut().find(|e| e.id.ends_with("#msg")).unwrap();
+        assert_eq!(row.source, source.join("\n"));
+        let id = row.id.clone();
+        row.translation = Some(translation.into());
+        assert_eq!(plugin.inject(&file, &entries).unwrap().strings_written, 1);
+
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        let template = list[1].clone();
+        let commands = expected_lines.iter().map(|line| {
+            let mut cmd = template.clone();
+            cmd["parameters"][0] = serde_json::json!(line);
+            cmd
+        });
+        list.splice(1..1 + source.len(), commands);
+        *speaker_list_mut(filename, &mut original) = serde_json::json!(list);
+        assert_eq!(
+            written, original,
+            "{filename}: exact raw layout and metadata"
+        );
+        let again = plugin.extract(&file).unwrap();
+        assert_eq!(
+            again
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap()
+                .source
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            translation.split_whitespace().collect::<Vec<_>>(),
+            "normalized re-extraction must equal the complete translation"
+        );
+    }
+
+    #[test]
+    fn test_cycle105_map_blank_line_roundtrip() {
+        assert_message_layout_roundtrip(
+            "Map001.json",
+            401,
+            &["Hello", "", "-Hizor"],
+            "Hola\n\n-Hizor",
+            &["Hola", "", "-Hizor"],
+        );
+    }
+
+    #[test]
+    fn test_cycle105_common_event_blank_line_roundtrip() {
+        assert_message_layout_roundtrip(
+            "CommonEvents.json",
+            401,
+            &["Hello", "", "-Hizor"],
+            "Hola\n\n-Hizor",
+            &["Hola", "", "-Hizor"],
+        );
+    }
+
+    #[test]
+    fn test_cycle105_troop_blank_line_roundtrip() {
+        assert_message_layout_roundtrip(
+            "Troops.json",
+            401,
+            &["Hello", "", "-Hizor"],
+            "Hola\n\n-Hizor",
+            &["Hola", "", "-Hizor"],
+        );
+    }
+
+    #[test]
+    fn test_cycle105_scroll_blank_line_roundtrip() {
+        assert_message_layout_roundtrip(
+            "Map001.json",
+            405,
+            &["Hello", "", "-Hizor"],
+            "Hola\n\n-Hizor",
+            &["Hola", "", "-Hizor"],
+        );
+    }
+
+    #[test]
+    fn test_cycle105_blank_line_counts_and_name_tag() {
+        assert_message_layout_roundtrip(
+            "CommonEvents.json",
+            401,
+            &["", "\\n<Demon Girl>Hello", "", " \t ", "-Hizor", ""],
+            "\\n<Chica Demonio>Hola\r\n \t\r\n-Hizor",
+            &["", "\\n<Chica Demonio>Hola", "", "", "-Hizor", ""],
+        );
+    }
+
+    #[test]
+    fn test_cycle105_paragraph_width_and_blank_lines() {
+        let source = "Hello there\n\n\n-Hizor\n";
+        let translation = "Hola a todos mis amigos\n\n-Hizor";
+        assert_eq!(
+            rewrap_to_source_width(source, translation),
+            "Hola a\ntodos mis\namigos\n\n\n-Hizor\n"
+        );
+        assert_message_layout_roundtrip(
+            "Troops.json",
+            401,
+            &["Hello", "", "-Hizor"],
+            "Hola a todos mis amigos y a cada visitante de este lugar\n\n-Hizor",
+            &[
+                "Hola a todos mis amigos y a cada",
+                "visitante de este lugar",
+                "",
+                "-Hizor",
+            ],
+        );
+        // Even when width already fits, source blank counts remain authoritative.
+        assert_eq!(
+            rewrap_to_source_width(source, "Hola\n\n-Hizor"),
+            "Hola\n\n\n-Hizor\n"
+        );
+    }
+
+    #[test]
+    fn test_cycle105_paragraph_mismatch_fallback_keeps_all_text() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for code in [401, 405] {
+                for translation in [
+                    "Hola -Hizor",
+                    "Hola a todos -Hizor",
+                    "Hola\n\nOtra\n\n-Hizor",
+                    "Hola a todos\n\nOtra visita\n\n-Hizor",
+                ] {
+                    let flat = translation.split_whitespace().collect::<Vec<_>>().join(" ");
+                    assert_message_layout_roundtrip(
+                        filename,
+                        code,
+                        &["Hello", "", "-Hizor"],
+                        translation,
+                        &[&flat],
+                    );
+                    // Width overflow still uses the previous whole-text fallback.
+                    let expected = if translation.lines().all(|l| visible_len(l) <= 6) {
+                        translation.to_string()
+                    } else {
+                        wrap_message(&flat, 6).join("\n")
+                    };
+                    assert_eq!(
+                        rewrap_to_source_width("Hello\n\n-Hizor", translation),
+                        expected
+                    );
+                }
+            }
+        }
     }
 
     #[test]
