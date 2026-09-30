@@ -36,6 +36,10 @@
 //! script-defined fields (slice 2 only walks further **aligned strings**).
 
 use std::path::Path;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 #[cfg(test)]
 std::thread_local! {
@@ -185,6 +189,62 @@ pub struct SerializedFile {
     pub objects: Vec<ObjectInfo>,
     /// Full file bytes (owned for inject / text-asset reads).
     pub data: Vec<u8>,
+    externals: Vec<String>,
+    local_scripts: OnceLock<HashMap<i64, MonoScriptIdentity>>,
+    external_scripts: Vec<OnceLock<Arc<HashMap<i64, MonoScriptIdentity>>>>,
+}
+
+#[derive(Debug)]
+struct BundleScriptCache {
+    path: std::path::PathBuf,
+    stamp: (u64, std::time::SystemTime),
+    nodes: HashMap<String, Arc<HashMap<i64, MonoScriptIdentity>>>,
+}
+
+// Cache only script identities, never object payloads or translated strings.
+// Multiple SerializedFiles in a player bundle share the same script metadata.
+static BUNDLE_SCRIPT_CACHE: OnceLock<Mutex<Vec<BundleScriptCache>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct MonoScriptIdentity {
+    class: String,
+    namespace: String,
+    assembly: String,
+}
+
+impl MonoScriptIdentity {
+    fn is_text_renderer(&self) -> bool {
+        (self.namespace == "TMPro"
+            && matches!(self.class.as_str(), "TextMeshPro" | "TextMeshProUGUI"))
+            || (self.namespace == "UnityEngine.UI" && self.class == "Text")
+    }
+
+    fn has_technical_object_name(&self) -> bool {
+        let assembly = self.assembly.trim_end_matches(".dll");
+        self.is_text_renderer()
+            || self.namespace == "UnityEngine.Rendering"
+            || self.namespace.starts_with("UnityEngine.Rendering.")
+            || (self.namespace == "UnityEngine.InputSystem" && self.class == "InputActionAsset")
+            || (self.namespace == "UnityEngine.Tilemaps" && self.class == "Tile")
+            || self.namespace.starts_with("Live2D.Cubism.")
+            || (self.namespace == "TMPro"
+                && matches!(
+                    self.class.as_str(),
+                    "TMP_FontAsset" | "TMP_SpriteAsset" | "TMP_StyleSheet" | "TMP_Settings"
+                ))
+            || ((self.namespace == "Naninovel" || self.namespace.starts_with("Naninovel."))
+                && (self.class.ends_with("Configuration")
+                    || matches!(
+                        self.class.as_str(),
+                        "Script" | "ScriptAsset" | "ProjectResources" | "EngineVersion"
+                    )))
+            || (self.namespace == "DG.Tweening.Core"
+                && self.class == "DOTweenSettings"
+                && assembly == "DOTween")
+            || (self.namespace == "BlendModes" && self.class == "ShaderResources")
+            || (self.namespace == "FunkyCode.LightingSettings"
+                && matches!(self.class.as_str(), "Profile" | "ProjectSettings"))
+    }
 }
 
 struct R<'a> {
@@ -297,7 +357,13 @@ impl SerializedFile {
         data: Vec<u8>,
         path: impl Into<std::path::PathBuf>,
     ) -> Result<Self, SerializedError> {
-        let path = path.into();
+        let mut parsed = Self::parse_metadata(&data, path.into())?;
+        parsed.data = data;
+        Ok(parsed)
+    }
+
+    // Also used by the fixed-slot writer without cloning the complete file.
+    fn parse_metadata(data: &[u8], path: std::path::PathBuf) -> Result<Self, SerializedError> {
         let label = path.display().to_string();
         if data.len() < 20 {
             return Err(err(&label, "file too small for SerializedFile header"));
@@ -305,7 +371,7 @@ impl SerializedFile {
 
         // Header is big-endian until endianness is known.
         let mut hr = R {
-            data: &data,
+            data,
             pos: 0,
             file: &label,
             endian: Endian::Big,
@@ -467,14 +533,159 @@ impl SerializedFile {
             });
         }
 
+        // Older synthetic/stripped files may omit the optional reference tables.
+        // An unreadable reference leaves the owning script unresolved; it must
+        // never turn an unknown custom asset name into a technical name.
+        let externals = read_external_paths(&mut r).unwrap_or_default();
+        let external_scripts = (0..externals.len()).map(|_| OnceLock::new()).collect();
         Ok(Self {
             path,
             header,
             unity_version,
             types,
             objects,
-            data,
+            data: Vec::new(),
+            externals,
+            local_scripts: OnceLock::new(),
+            external_scripts,
         })
+    }
+
+    fn script_identity(
+        &self,
+        data: &[u8],
+        file_id: i32,
+        path_id: i64,
+    ) -> Option<&MonoScriptIdentity> {
+        if file_id == 0 {
+            self.local_scripts
+                .get_or_init(|| self.read_script_identities(data))
+                .get(&path_id)
+        } else {
+            let index = usize::try_from(file_id).ok()?.checked_sub(1)?;
+            self.external_scripts
+                .get(index)?
+                .get_or_init(|| self.read_external_scripts(index).unwrap_or_default())
+                .get(&path_id)
+        }
+    }
+
+    fn read_script_identities(&self, data: &[u8]) -> HashMap<i64, MonoScriptIdentity> {
+        let label = self.path.display().to_string();
+        self.objects
+            .iter()
+            .filter(|obj| obj.class_id == CLASS_ID_MONO_SCRIPT)
+            .filter_map(|obj| {
+                let end = (obj.data_abs as usize).checked_add(obj.byte_size as usize)?;
+                let mut r = R {
+                    data: data.get(..end)?,
+                    pos: obj.data_abs as usize,
+                    file: &label,
+                    endian: self.header.endian,
+                };
+                r.aligned_string().ok()?; // m_Name
+                r.i32().ok()?; // m_ExecutionOrder
+                r.take(16).ok()?; // m_PropertiesHash (v17+)
+                let (class, _, _) = r.aligned_string().ok()?;
+                let (namespace, _, _) = r.aligned_string().ok()?;
+                let (assembly, _, _) = r.aligned_string().ok()?;
+                if class.is_empty()
+                    || assembly.is_empty()
+                    || [&class, &namespace, &assembly]
+                        .iter()
+                        .any(|s| s.contains('\u{FFFD}') || s.chars().any(char::is_control))
+                {
+                    return None;
+                }
+                Some((
+                    obj.path_id,
+                    MonoScriptIdentity {
+                        class,
+                        namespace,
+                        assembly,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn read_external_scripts(&self, index: usize) -> Option<Arc<HashMap<i64, MonoScriptIdentity>>> {
+        // Injection labels use "bundle / node"; extraction uses bundle.join(node).
+        let label = self.path.to_string_lossy();
+        let path = label.split_once(" / ").map_or_else(
+            || self.path.clone(),
+            |(bundle, node)| Path::new(bundle).join(node),
+        );
+        let bundle = path.ancestors().skip(1).find(|p| p.is_file());
+        let parent = bundle
+            .and_then(Path::parent)
+            .or_else(|| path.parent())
+            .unwrap_or_else(|| Path::new(""));
+        let normalized = self.externals.get(index)?.replace('\\', "/");
+        let name = normalized.rsplit('/').next()?;
+        if name.is_empty() || name == "." || name == ".." {
+            return None;
+        }
+        if let Some(bundle) = bundle {
+            if let Some(scripts) = Self::bundle_script_identities(bundle, &normalized, name) {
+                return Some(scripts);
+            }
+        }
+        // Unity's Library/Resources builtins ship under *_Data/Resources.
+        let external_path = [parent.join(name), parent.join("Resources").join(name)]
+            .into_iter()
+            .find(|p| p.is_file())?;
+        let bytes = std::fs::read(&external_path).ok()?;
+        let sf = Self::parse_metadata(&bytes, external_path).ok()?;
+        Some(Arc::new(sf.read_script_identities(&bytes)))
+    }
+
+    fn bundle_script_identities(
+        path: &Path,
+        node_path: &str,
+        name: &str,
+    ) -> Option<Arc<HashMap<i64, MonoScriptIdentity>>> {
+        let metadata = path.metadata().ok()?;
+        let stamp = (metadata.len(), metadata.modified().ok()?);
+        let mut cache = BUNDLE_SCRIPT_CACHE
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .ok()?;
+        if let Some(entry) = cache.iter().find(|e| e.path == path && e.stamp == stamp) {
+            return entry
+                .nodes
+                .get(node_path)
+                .or_else(|| entry.nodes.get(name))
+                .cloned();
+        }
+        let archive = crate::unity_fs::UnityFsArchive::parse_path(path).ok()?;
+        let nodes = archive
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let bytes = archive.node_bytes(node).ok()?;
+                let sf = Self::parse_metadata(bytes, path.join(&node.path)).ok()?;
+                Some((
+                    node.path.replace('\\', "/"),
+                    Arc::new(sf.read_script_identities(bytes)),
+                ))
+            })
+            .collect();
+        cache.retain(|e| e.path != path);
+        if cache.len() >= 4 {
+            cache.remove(0);
+        }
+        cache.push(BundleScriptCache {
+            path: path.into(),
+            stamp,
+            nodes,
+        });
+        let entry = cache.last()?;
+        entry
+            .nodes
+            .get(node_path)
+            .or_else(|| entry.nodes.get(name))
+            .cloned()
     }
 
     pub fn parse_path(path: &Path) -> Result<Self, SerializedError> {
@@ -730,14 +941,21 @@ impl SerializedFile {
         let _enabled = r.u8()?;
         r.align4();
         // m_Script PPtr
-        let _script_file = r.i32()?;
-        let _script_path = r.i64()?;
+        let script_file = r.i32()?;
+        let script_path = r.i64()?;
         // m_Name
         let (mono_name, name_off, name_len) = r.aligned_string()?;
+        let script = self.script_identity(&self.data, script_file, script_path);
+        let text_renderer = script.is_some_and(MonoScriptIdentity::is_text_renderer);
+        let font_name_range =
+            script.and_then(|script| technical_font_name_range(&r, script, &mono_name));
 
         let mut out = Vec::new();
-        // m_Name: keep short natural labels; still drop binary / FFFD.
-        if mono_name_worth_extracting(&mono_name) {
+        // Base Object.m_Name is an asset identifier for identified engine types.
+        // Unknown/custom ScriptableObjects can expose their name as a UI label.
+        if !script.is_some_and(MonoScriptIdentity::has_technical_object_name)
+            && mono_name_worth_extracting(&mono_name)
+        {
             out.push(MonoStringData {
                 path_id,
                 mono_name: mono_name.clone(),
@@ -786,7 +1004,9 @@ impl SerializedFile {
                 if let Some(items) = try_read_mono_string_array(&mut r, end, len_peek as usize) {
                     non_string_skips = 0;
                     for (text, len_offset, byte_len) in items {
-                        if mono_script_field_worth_extracting(&text) {
+                        if mono_field_worth_extracting(&text, text_renderer, &mono_name)
+                            && font_name_range.is_none_or(|(start, _)| start != len_offset)
+                        {
                             out.push(MonoStringData {
                                 path_id,
                                 mono_name: mono_name.clone(),
@@ -809,7 +1029,9 @@ impl SerializedFile {
                         break;
                     }
                     non_string_skips = 0;
-                    if mono_script_field_worth_extracting(&text) {
+                    if mono_field_worth_extracting(&text, text_renderer, &mono_name)
+                        && font_name_range.is_none_or(|(start, _)| start != len_offset)
+                    {
                         out.push(MonoStringData {
                             path_id,
                             mono_name: mono_name.clone(),
@@ -1083,6 +1305,66 @@ fn skip_type_tree_blob(r: &mut R<'_>, version: u32) -> Result<(), SerializedErro
     r.take(nodes_bytes)?;
     r.take(string_buffer_size as usize)?;
     Ok(())
+}
+
+fn read_external_paths(r: &mut R<'_>) -> Result<Vec<String>, SerializedError> {
+    let script_count = r.i32()?;
+    if !(0..=100_000).contains(&script_count) {
+        return Err(err(r.file, "invalid script reference count"));
+    }
+    for _ in 0..script_count {
+        r.i32()?;
+        r.align4();
+        r.i64()?;
+    }
+    let count = r.i32()?;
+    if !(0..=100_000).contains(&count) {
+        return Err(err(r.file, "invalid external reference count"));
+    }
+    let mut paths = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        r.cstring()?;
+        r.take(20)?; // GUID + external type
+        paths.push(r.cstring()?);
+    }
+    Ok(paths)
+}
+
+fn mono_field_worth_extracting(s: &str, text_renderer: bool, name: &str) -> bool {
+    mono_script_field_worth_extracting(s)
+        // Transfer an eligible renderer label from the base name to its actual
+        // script field (MENU / MENU), preserving its display occurrence without
+        // changing the general script-field content policy.
+        || (text_renderer
+            && s == name
+            && mono_name_worth_extracting(s)
+            && s.trim().chars().all(|c| c.is_ascii_uppercase()))
+}
+
+/// TMP 1.1.0 FaceInfo duplicates some asset IDs in m_FamilyName. These are
+/// technical font metadata, not renderer m_text. Recognize the actual layout
+/// and owning type; equal strings in renderers/custom scripts stay eligible.
+fn technical_font_name_range(
+    after_name: &R<'_>,
+    script: &MonoScriptIdentity,
+    name: &str,
+) -> Option<(usize, usize)> {
+    if script.namespace != "TMPro" || script.class != "TMP_FontAsset" || name.is_empty() {
+        return None;
+    }
+    let mut r = R {
+        data: after_name.data,
+        pos: after_name.pos,
+        file: after_name.file,
+        endian: after_name.endian,
+    };
+    let (version, _, _) = r.aligned_string().ok()?;
+    if version != "1.1.0" {
+        return None;
+    }
+    r.i32().ok()?; // FaceInfo.m_FaceIndex
+    let (family, offset, _) = r.aligned_string().ok()?;
+    (family == name && r.pos <= r.data.len()).then_some((offset, r.pos))
 }
 
 fn mono_name_worth_extracting(s: &str) -> bool {
@@ -1567,6 +1849,43 @@ pub fn rewrite_text_asset_script_inplace(
         .ok_or_else(|| err(file_label, "script field offset overflow"))?;
     if need > file_bytes.len() {
         return Err(err(file_label, "script field past EOF"));
+    }
+    // This writer also receives legacy MonoBehaviour field_index=0 entries.
+    // Revalidate against the current object and its owning MonoScript, rather
+    // than trusting extraction metadata or a blacklist of the name's text.
+    if let Ok(sf) = SerializedFile::parse_metadata(file_bytes, file_label.into()) {
+        for obj in sf.mono_behaviour_objects() {
+            let name_offset = obj.data_abs as usize + 28;
+            let object_end = obj.data_abs as usize + obj.byte_size as usize;
+            if script_len_offset >= object_end || need <= name_offset {
+                continue;
+            }
+            let mut r = R {
+                data: &file_bytes[..object_end],
+                pos: obj.data_abs as usize + 16,
+                file: file_label,
+                endian: sf.header.endian,
+            };
+            if let Ok((file_id, path_id, name, name_end)) = (|| {
+                let file_id = r.i32()?;
+                let path_id = r.i64()?;
+                let (name, _, _) = r.aligned_string()?;
+                Ok::<_, SerializedError>((file_id, path_id, name, r.pos))
+            })() {
+                if let Some(script) = sf.script_identity(file_bytes, file_id, path_id) {
+                    let font_name = technical_font_name_range(&r, script, &name);
+                    if (script_len_offset < name_end && script.has_technical_object_name())
+                        || font_name
+                            .is_some_and(|(start, end)| script_len_offset < end && need > start)
+                    {
+                        return Err(err(
+                            file_label,
+                            "technical Object.m_Name or font-name alias is not a translation slot",
+                        ));
+                    }
+                }
+            }
+        }
     }
     // Do not rewrite the length prefix — leave endianness and value as on disk.
     // Field size stays fixed; pad shorter text with 0x20 (Unity reads the full buffer).
@@ -2079,13 +2398,417 @@ mod tests {
         assert_eq!(monos[0].class_id, CLASS_ID_MONO_BEHAVIOUR);
 
         let fields = sf.read_mono_strings(10).unwrap();
-        // m_Name + 2 script strings
+        // Unresolved custom script: its name remains eligible as a label.
         assert_eq!(fields.len(), 3, "fields: {fields:?}");
         assert_eq!(fields[0].field_index, 0);
         assert_eq!(fields[0].text, "DialogBox");
         assert_eq!(fields[1].text, "Welcome, traveler!");
         assert_eq!(fields[2].text, "See you later.");
         assert_eq!(fields[1].mono_name, "DialogBox");
+    }
+
+    /// Real MonoScript metadata, including local/external PPtrs; names alone
+    /// deliberately provide no evidence about the owning script type.
+    fn identified_mono_fixture(
+        identity: (&str, &str, &str),
+        name: &str,
+        fields: &[&str],
+        script_file: i32,
+    ) -> Vec<u8> {
+        fn string(out: &mut Vec<u8>, value: &str) {
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+            out.resize((out.len() + 3) & !3, 0);
+        }
+        let mut mono = vec![0; 16];
+        mono[12] = 1;
+        mono.extend_from_slice(&script_file.to_le_bytes());
+        mono.extend_from_slice(&20i64.to_le_bytes());
+        string(&mut mono, name);
+        for field in fields {
+            string(&mut mono, field);
+        }
+        let mut script = Vec::new();
+        string(&mut script, identity.0);
+        script.extend_from_slice(&[0; 20]); // execution order + properties hash
+        for value in [identity.0, identity.1, identity.2] {
+            string(&mut script, value);
+        }
+        let payloads = [
+            mono.clone(),
+            mono,
+            script,
+            b"opaque other object bytes".to_vec(),
+        ];
+        let classes = [CLASS_ID_MONO_BEHAVIOUR, CLASS_ID_MONO_SCRIPT, 1];
+        let mut meta = b"2019.4.0f1\0".to_vec();
+        meta.extend_from_slice(&1u32.to_le_bytes());
+        meta.push(0);
+        meta.extend_from_slice(&3i32.to_le_bytes());
+        for class in classes {
+            meta.extend_from_slice(&class.to_le_bytes());
+            meta.push(0);
+            meta.extend_from_slice(&(-1i16).to_le_bytes());
+            if is_monobehaviour_class(class) {
+                meta.extend_from_slice(&[0; 16]);
+            }
+            meta.extend_from_slice(&[0; 16]);
+        }
+        meta.extend_from_slice(&4i32.to_le_bytes());
+        let mut offset = 0usize;
+        for ((id, ty), payload) in [(10i64, 0i32), (11, 0), (20, 1), (30, 2)]
+            .into_iter()
+            .zip(&payloads)
+        {
+            meta.resize((meta.len() + 3) & !3, 0);
+            meta.extend_from_slice(&id.to_le_bytes());
+            meta.extend_from_slice(&(offset as u32).to_le_bytes());
+            meta.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            meta.extend_from_slice(&ty.to_le_bytes());
+            offset += payload.len();
+        }
+        meta.extend_from_slice(&0i32.to_le_bytes()); // script reference table
+        meta.extend_from_slice(&1i32.to_le_bytes()); // external table
+        meta.extend_from_slice(&[0; 21]); // empty string + GUID + external type
+        meta.extend_from_slice(b"globalgamemanagers.assets\0");
+        meta.extend_from_slice(&0i32.to_le_bytes());
+        meta.push(0); // user information
+        let data_offset = (20 + meta.len() + 15) & !15;
+        let mut bytes = Vec::new();
+        for value in [
+            meta.len() as u32,
+            (data_offset + offset) as u32,
+            17,
+            data_offset as u32,
+        ] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&meta);
+        bytes.resize(data_offset, 0);
+        for payload in payloads {
+            bytes.extend_from_slice(&payload);
+        }
+        bytes
+    }
+
+    #[test]
+    fn do_not_extract_object_name() {
+        let bytes = identified_mono_fixture(
+            (
+                "LiftGammaGain",
+                "UnityEngine.Rendering.Universal",
+                "Unity.RenderPipelines.Universal.Runtime",
+            ),
+            "LiftGammaGain",
+            &["Hello traveler!"],
+            0,
+        );
+        let sf = SerializedFile::parse(bytes.clone(), "technical.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        assert_eq!(
+            fields.len(),
+            1,
+            "technical m_Name must be excluded: {fields:?}"
+        );
+        assert_eq!(fields[0].field_index, 1);
+        assert_eq!(fields[0].text, "Hello traveler!");
+        let mut after = bytes.clone();
+        rewrite_text_asset_script_inplace(
+            &mut after,
+            fields[0].len_offset,
+            fields[0].byte_len,
+            "Hola viajero!",
+            "technical.assets",
+        )
+        .unwrap();
+        let start = fields[0].len_offset + 4;
+        assert_eq!(
+            &after[..start],
+            &bytes[..start],
+            "header, base name, prefix"
+        );
+        assert_eq!(
+            &after[start + fields[0].byte_len..],
+            &bytes[start + fields[0].byte_len..],
+            "other objects and padding"
+        );
+        let parsed = SerializedFile::parse(after, "technical.assets").unwrap();
+        assert_eq!(
+            parsed.read_mono_strings(10).unwrap()[0].text.trim_end(),
+            "Hola viajero!"
+        );
+        assert_eq!(
+            parsed.read_mono_strings(11).unwrap()[0].text,
+            "Hello traveler!"
+        );
+    }
+
+    #[test]
+    fn technical_object_name_legacy_writes_are_rejected() {
+        use locust_core::extraction::FormatPlugin;
+        use locust_core::models::StringEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resources.assets");
+        let bytes = identified_mono_fixture(
+            (
+                "LiftGammaGain",
+                "UnityEngine.Rendering.Universal",
+                "Unity.RenderPipelines.Universal.Runtime",
+            ),
+            "LiftGammaGain",
+            &["Hello traveler!"],
+            0,
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        let sf = SerializedFile::parse(bytes.clone(), &path).unwrap();
+        let name_offset = sf.objects[0].data_abs as usize + 28;
+        let mut entry = StringEntry::new("monobehaviour/10/0", "LiftGammaGain", path.clone());
+        entry.translation = Some("Nombre".into());
+        entry.metadata.insert(
+            "extraction_method".into(),
+            serde_json::json!("monobehaviour"),
+        );
+        entry
+            .metadata
+            .insert("field_index".into(), serde_json::json!(0));
+        entry
+            .metadata
+            .insert("path_id".into(), serde_json::json!(10));
+        entry
+            .metadata
+            .insert("mono_string_offset".into(), serde_json::json!(name_offset));
+        entry
+            .metadata
+            .insert("mono_string_byte_len".into(), serde_json::json!(13));
+        let report = crate::unity::UnityPlugin::new()
+            .inject(dir.path(), &[entry])
+            .unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // Even a stale offset into the name, or a slot covering name + text,
+        // cannot bypass protection through the shared fixed-slot writer.
+        for (offset, len) in [(name_offset, 13), (name_offset + 4, 8), (name_offset, 32)] {
+            let mut after = bytes.clone();
+            assert!(rewrite_text_asset_script_inplace(
+                &mut after,
+                offset,
+                len,
+                "Changed",
+                path.to_str().unwrap()
+            )
+            .is_err());
+            assert_eq!(after, bytes);
+        }
+    }
+
+    #[test]
+    fn technical_object_name_tmp_menu_keeps_display_and_duplicate_instances() {
+        let bytes = identified_mono_fixture(
+            ("TextMeshProUGUI", "TMPro", "Unity.TextMeshPro"),
+            "MENU",
+            &["MENU", "存"],
+            0,
+        );
+        let sf = SerializedFile::parse(bytes, "menu.assets").unwrap();
+        for id in [10, 11] {
+            let fields = sf.read_mono_strings(id).unwrap();
+            assert_eq!(
+                fields
+                    .iter()
+                    .map(|f| (f.field_index, f.text.as_str()))
+                    .collect::<Vec<_>>(),
+                [(1, "MENU"), (2, "存")]
+            );
+        }
+    }
+
+    #[test]
+    fn technical_object_name_unknown_custom_labels_remain_eligible() {
+        for (class, namespace) in [
+            ("MemoryType", ""),
+            ("LiftGammaGain", "Game.Custom"),
+            ("Script", "Game.Custom"),
+        ] {
+            let bytes = identified_mono_fixture(
+                (class, namespace, "Assembly-CSharp"),
+                "LiftGammaGain",
+                &["Hello traveler!"],
+                0,
+            );
+            let sf = SerializedFile::parse(bytes, "custom.assets").unwrap();
+            let fields = sf.read_mono_strings(10).unwrap();
+            assert_eq!(
+                fields.iter().map(|f| f.field_index).collect::<Vec<_>>(),
+                [0, 1]
+            );
+        }
+        let bytes = write_v17_mono_fixture("LiftGammaGain", &["Hello traveler!"]);
+        let sf = SerializedFile::parse(bytes, "unresolved.assets").unwrap();
+        assert_eq!(sf.read_mono_strings(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn technical_object_name_type_categories_keep_actual_script_strings() {
+        for identity in [
+            (
+                "Tile",
+                "UnityEngine.Tilemaps",
+                "UnityEngine.TilemapModule.dll",
+            ),
+            ("CubismMoc", "Live2D.Cubism.Core", "Assembly-CSharp.dll"),
+            (
+                "AudioConfiguration",
+                "Naninovel",
+                "Elringus.Naninovel.Runtime.dll",
+            ),
+            ("Script", "Naninovel", "Elringus.Naninovel.Runtime.dll"),
+            ("TMP_FontAsset", "TMPro", "Unity.TextMeshPro"),
+            ("Text", "UnityEngine.UI", "UnityEngine.UI.dll"),
+            ("TextMeshPro", "TMPro", "Unity.TextMeshPro.dll"),
+            (
+                "LensDistortion",
+                "UnityEngine.Rendering.Universal",
+                "Unity.RenderPipelines.Universal.Runtime",
+            ),
+        ] {
+            // Natural-looking names must be excluded by owning type too.
+            let bytes = identified_mono_fixture(
+                identity,
+                "Player facing label",
+                &["Hello traveler!", "存"],
+                0,
+            );
+            let sf = SerializedFile::parse(bytes.clone(), "typed.assets").unwrap();
+            let fields = sf.read_mono_strings(10).unwrap();
+            assert_eq!(
+                fields.iter().map(|f| f.field_index).collect::<Vec<_>>(),
+                [1, 2],
+                "{identity:?}"
+            );
+            let mut after = bytes.clone();
+            assert!(rewrite_text_asset_script_inplace(
+                &mut after,
+                sf.objects[0].data_abs as usize + 28,
+                19,
+                "Cambio",
+                "typed.assets"
+            )
+            .is_err());
+            assert_eq!(after, bytes);
+        }
+    }
+
+    #[test]
+    fn technical_object_name_font_family_alias_preserved() {
+        let bytes = identified_mono_fixture(
+            ("TMP_FontAsset", "TMPro", "Unity.TextMeshPro"),
+            "OCR-A",
+            &["1.1.0", "", "OCR-A", "Hello traveler!"],
+            0,
+        );
+        let sf = SerializedFile::parse(bytes.clone(), "font.assets").unwrap();
+        let fields = sf.read_mono_strings(10).unwrap();
+        assert_eq!(
+            fields
+                .iter()
+                .map(|f| (f.field_index, f.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(4, "Hello traveler!")]
+        );
+        let mut after = bytes.clone();
+        let family_offset = sf.objects[0].data_abs as usize + 28 + 12 + 12 + 4;
+        assert_eq!(&bytes[family_offset + 4..family_offset + 9], b"OCR-A");
+        assert!(rewrite_text_asset_script_inplace(
+            &mut after,
+            family_offset,
+            5,
+            "X",
+            "font.assets"
+        )
+        .is_err());
+        assert_eq!(after, bytes);
+        rewrite_text_asset_script_inplace(
+            &mut after,
+            fields[0].len_offset,
+            fields[0].byte_len,
+            "Hola!",
+            "font.assets",
+        )
+        .unwrap();
+        assert_eq!(
+            &after[..fields[0].len_offset + 4],
+            &bytes[..fields[0].len_offset + 4]
+        );
+    }
+
+    #[test]
+    fn technical_object_name_external_and_bundle_script_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = ("Script", "Naninovel", "Elringus.Naninovel.Runtime.dll");
+        let bytes = identified_mono_fixture(identity, "Scenario", &["Hello traveler!"], 1);
+        let scripts = identified_mono_fixture(identity, "Scenario", &[], 0);
+        let path = dir.path().join("resources.assets");
+        std::fs::write(dir.path().join("globalgamemanagers.assets"), &scripts).unwrap();
+        let sf = SerializedFile::parse(bytes.clone(), &path).unwrap();
+        assert_eq!(sf.read_mono_strings(10).unwrap().len(), 1);
+        // Missing external metadata cannot be inferred from a same-ID local script.
+        let unresolved = SerializedFile::parse(bytes.clone(), "missing/resources.assets").unwrap();
+        assert_eq!(unresolved.read_mono_strings(10).unwrap().len(), 2);
+        let bundle_path = dir.path().join("data.unity3d");
+        let bundle = crate::unity_fs::build_test_bundle(
+            &[
+                ("resources.assets", &bytes),
+                ("globalgamemanagers.assets", &scripts),
+            ],
+            true,
+            8,
+            true,
+            false,
+        );
+        std::fs::write(&bundle_path, bundle).unwrap();
+        for label in [
+            bundle_path.join("resources.assets"),
+            format!("{} / resources.assets", bundle_path.display()).into(),
+        ] {
+            let sf = SerializedFile::parse(bytes.clone(), &label).unwrap();
+            assert_eq!(sf.read_mono_strings(10).unwrap().len(), 1);
+            let mut after = bytes.clone();
+            assert!(rewrite_text_asset_script_inplace(
+                &mut after,
+                sf.objects[0].data_abs as usize + 28,
+                8,
+                "Cambio",
+                label.to_str().unwrap()
+            )
+            .is_err());
+            assert_eq!(after, bytes);
+        }
+        let custom_scripts = identified_mono_fixture(
+            ("Script", "Game.Custom", "Assembly-CSharp.dll"),
+            "Scenario",
+            &[],
+            0,
+        );
+        let changed_bundle = crate::unity_fs::build_test_bundle(
+            &[
+                ("resources.assets", &bytes),
+                ("globalgamemanagers.assets", &custom_scripts),
+                ("extra.bin", b"new"),
+            ],
+            true,
+            8,
+            true,
+            false,
+        );
+        std::fs::write(&bundle_path, changed_bundle).unwrap();
+        let changed = SerializedFile::parse(bytes, bundle_path.join("resources.assets")).unwrap();
+        assert_eq!(
+            changed.read_mono_strings(10).unwrap().len(),
+            2,
+            "changed bundle must invalidate its cached owning type"
+        );
     }
 
     #[test]
