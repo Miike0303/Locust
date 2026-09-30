@@ -634,10 +634,8 @@ impl RenPyPlugin {
             }
 
             // Track python blocks (skip most content inside them)
-            if trimmed.starts_with("python:")
-                || trimmed.starts_with("init python:")
-                || trimmed.starts_with("init -") && trimmed.contains("python:")
-            {
+            let python_header = is_python_block_header(trimmed);
+            if python_header {
                 in_python = true;
                 python_indent = indent;
                 // But still check for translatable calls inside python
@@ -645,8 +643,7 @@ impl RenPyPlugin {
             if in_python
                 && !trimmed.is_empty()
                 && indent <= python_indent
-                && !trimmed.starts_with("python:")
-                && !trimmed.starts_with("init ")
+                && !python_header
                 && !trimmed.starts_with('#')
             {
                 in_python = false;
@@ -801,6 +798,54 @@ impl RenPyPlugin {
 
         entries
     }
+}
+
+/// Recognize complete Python headers, including init priorities and named stores.
+/// Plain `init:` blocks still contain Ren'Py statements and are not Python blocks.
+fn is_python_block_header(line: &str) -> bool {
+    let statement = line.split('#').next().unwrap_or(line).trim();
+    let Some(header) = statement.strip_suffix(':') else {
+        return false;
+    };
+    let mut words = header.split_whitespace().peekable();
+    match words.next() {
+        Some("python") => {}
+        Some("init") => {
+            if words.peek().is_some_and(|word| {
+                let digits = word.strip_prefix(['-', '+']).unwrap_or(word);
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            }) {
+                words.next();
+            }
+            if words.next() != Some("python") {
+                return false;
+            }
+        }
+        Some("translate") => {
+            return words.next().is_some_and(is_python_store_name)
+                && words.next() == Some("python")
+                && words.next().is_none();
+        }
+        _ => return false,
+    }
+    for modifier in ["early", "hide"] {
+        if words.peek() == Some(&modifier) {
+            words.next();
+        }
+    }
+    match words.next() {
+        None => true,
+        Some("in") => words.next().is_some_and(is_python_store_name) && words.next().is_none(),
+        _ => false,
+    }
+}
+
+fn is_python_store_name(name: &str) -> bool {
+    name.split('.').all(|part| {
+        let mut chars = part.chars();
+        chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
+            && chars.all(|c| c == '_' || c.is_alphanumeric())
+    })
 }
 
 fn extract_quoted_string(s: &str) -> Option<(&str, usize)> {
@@ -4471,6 +4516,161 @@ label next:
         let version = entries.iter().find(|e| e.source == "Version 1.0");
         assert!(version.is_some());
         assert!(version.unwrap().tags.contains(&"ui_label".to_string()));
+    }
+
+    fn python_block_headers() -> Vec<String> {
+        let mut headers = Vec::new();
+        for prefix in [
+            "python",
+            "init python",
+            "init -1 python",
+            "init 1000 python",
+        ] {
+            for modifiers in [
+                "",
+                " early",
+                " hide",
+                " in mystore",
+                " early hide",
+                " early in phone.config",
+                " hide in _viewers",
+                " early hide in phone.config",
+            ] {
+                headers.push(format!("{prefix}{modifiers}:"));
+            }
+        }
+        headers.extend(
+            [
+                "init +1 python:",
+                "translate japanese python:",
+                "  init\t1000\tpython\thide :  ",
+                "python early in phone.config: # Named store",
+            ]
+            .map(str::to_string),
+        );
+        headers
+    }
+
+    #[test]
+    fn python_block_header_variants_skip_literals_keep_i18n_and_end_at_dedent() {
+        for header in python_block_headers() {
+            let script = format!(
+                "{header}\n\
+                 \x20   x = \"Hello, this is a long sentence.\"\n\
+                 \x20   \"Hidden Python literal.\"\n\
+                 \n\
+                 # A dedented comment does not close Python.\n\
+                 \x20   \"Still inside Python.\"\n\
+                 \x20   translated = _(\"Translatable\")\n\
+                 e \"Actual dialogue after Python.\"\n"
+            );
+            let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &script);
+            let rows: Vec<_> = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.id.as_str(),
+                        entry.source.as_str(),
+                        entry.tags.as_slice(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    (
+                        "script.rpy#7",
+                        "Translatable",
+                        &["ui_label".to_string()][..]
+                    ),
+                    (
+                        "script.rpy#8",
+                        "Actual dialogue after Python.",
+                        &["dialogue".to_string()][..],
+                    ),
+                ],
+                "{header}"
+            );
+            assert_eq!(entries[1].context.as_deref(), Some("e"), "{header}");
+        }
+    }
+
+    #[test]
+    fn python_block_header_variants_allow_following_menu() {
+        for header in python_block_headers() {
+            let header = header.trim();
+            // Exercise spaces and tabs with the header inside a label.
+            for unit in ["    ", "\t"] {
+                let script = format!(
+                    "label start:\n\
+                     @{header}\n\
+                     @@\"Hidden Python literal.\"\n\
+                     @menu:\n\
+                     @@\"Choice\":\n\
+                     @@@e \"Visible branch.\"\n\
+                     @e \"Visible after menu.\"\n"
+                )
+                .replace('@', unit);
+                let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), &script);
+                assert_eq!(entries.len(), 3, "{header}, indent {unit:?}: {entries:?}");
+                assert_eq!(entries[0].source, "Choice", "{header}");
+                assert_eq!(entries[0].tags, ["menu"], "{header}");
+                assert_menu_dialogue(&entries, "Visible branch.", Some("e"), "start");
+                assert_menu_dialogue(&entries, "Visible after menu.", Some("e"), "start");
+            }
+        }
+    }
+
+    #[test]
+    fn python_block_header_requires_complete_grammar() {
+        for line in [
+            "init:",
+            "init 1000:",
+            "init -1:",
+            "python",
+            "python: trailing code",
+            "python_early:",
+            "python unknown:",
+            "python in:",
+            "python in 123:",
+            "python in store..nested:",
+            "python in store extra:",
+            "python hide early:",
+            "python early early:",
+            "init 1.5 python:",
+            "init --1 python:",
+            "init -1 not_python:",
+            "translate python:",
+            "translate japanese strings:",
+            "# python:",
+            "e \"python:\"",
+            "init -1 define text = \"python:\"",
+        ] {
+            assert!(!is_python_block_header(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn python_block_dedent_to_plain_init_preserves_normal_extractors() {
+        let script = r#"python hide:
+    "Hidden Python literal."
+init 10:
+    define gui.title = _("Init title")
+    default setting = "Hidden default literal."
+    $ text = "Hidden one-line literal."
+    $ translated = _("One-line UI")
+    python in mystore:
+        "Hidden nested Python literal."
+label start:
+    e "Visible dialogue."
+"#;
+        let entries = RenPyPlugin::extract_content(Path::new("script.rpy"), script);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(entries[0].source, "Init title");
+        assert_eq!(entries[0].tags, ["ui_label"]);
+        assert_eq!(entries[1].source, "One-line UI");
+        assert_eq!(entries[1].tags, ["ui_label"]);
+        assert_menu_dialogue(&entries, "Visible dialogue.", Some("e"), "start");
     }
 
     #[test]
