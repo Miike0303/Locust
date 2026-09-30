@@ -47,10 +47,29 @@ const MZ_TRANSLATABLE_ARG_KEYS: &[&str] = &[
     "choices",     // Choice arrays (nested JSON with labels)
 ];
 
-/// Extract translatable text from a plugin command (code 356).
-/// Returns Some(full_command) only if it's a known text-display plugin command
-/// containing CJK characters. Returns None for technical/audio/system commands.
+/// D_TEXT uses a literal space after the dispatcher and, optionally, before
+/// its final integer font size. Keep slices so the size spelling is preserved.
+fn parse_d_text_command(command: &str) -> Option<(&str, Option<&str>)> {
+    let text = command.strip_prefix("D_TEXT ")?;
+    let (body, size) = match text.rsplit_once(' ').filter(|(_, size)| {
+        let digits = size.strip_prefix(['+', '-']).unwrap_or(size);
+        !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit())
+    }) {
+        Some((body, size)) => (body, Some(size)),
+        _ => (text, None),
+    };
+    if body.trim().is_empty() {
+        return None;
+    }
+    Some((body, size))
+}
+
+/// Extract the body of D_TEXT, or the full command for other known display
+/// plugins containing CJK characters. Technical/audio/system commands are skipped.
 fn extract_plugin_command_text(command: &str) -> Option<String> {
+    if command.split_whitespace().next() == Some("D_TEXT") {
+        return parse_d_text_command(command).map(|(body, _)| body.to_string());
+    }
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return None;
@@ -511,6 +530,9 @@ impl RpgMakerMvPlugin {
                             let mut entry =
                                 StringEntry::new(id, &extracted, file_path.to_path_buf());
                             entry.tags = vec!["plugin_cmd".to_string()];
+                            if parse_d_text_command(text).is_some() {
+                                entry.tags.push("d_text".to_string());
+                            }
                             entries.push(entry);
                         }
                     }
@@ -977,6 +999,10 @@ impl RpgMakerMvPlugin {
             Self::apply_mz_plugin_arg(cmd, arg_suffix, translation);
         } else {
             let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            if code == 356 {
+                Self::apply_mv_plugin_command(cmd, translation);
+                return;
+            }
             if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
                 if code == 320 {
                     // Change Actor Name: text is in params[1]
@@ -988,6 +1014,31 @@ impl RpgMakerMvPlugin {
                 }
             }
         }
+    }
+
+    fn apply_mv_plugin_command(cmd: &mut serde_json::Value, translation: &str) {
+        let Some(first) = cmd
+            .get_mut("parameters")
+            .and_then(|v| v.as_array_mut())
+            .and_then(|p| p.first_mut())
+        else {
+            return;
+        };
+        let rebuilt = if first
+            .as_str()
+            .is_some_and(|s| s.split_whitespace().next() == Some("D_TEXT"))
+        {
+            let Some((_, size)) = first.as_str().and_then(parse_d_text_command) else {
+                return;
+            };
+            match size {
+                Some(size) => format!("D_TEXT {translation} {size}"),
+                None => format!("D_TEXT {translation}"),
+            }
+        } else {
+            translation.to_string()
+        };
+        *first = serde_json::Value::String(rebuilt);
     }
 
     fn apply_speaker_translation(cmd: &mut serde_json::Value, translation: &str) {
@@ -1123,6 +1174,10 @@ impl RpgMakerMvPlugin {
             Self::apply_mz_plugin_arg(cmd, arg_suffix, translation);
         } else {
             let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            if code == 356 {
+                Self::apply_mv_plugin_command(cmd, translation);
+                return;
+            }
             if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
                 if code == 320 {
                     if let Some(val) = params.get_mut(1) {
@@ -1201,6 +1256,10 @@ impl RpgMakerMvPlugin {
             Self::apply_mz_plugin_arg(cmd, arg_suffix, translation);
         } else {
             let code = cmd.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            if code == 356 {
+                Self::apply_mv_plugin_command(cmd, translation);
+                return;
+            }
             if let Some(params) = cmd.get_mut("parameters").and_then(|v| v.as_array_mut()) {
                 if code == 320 {
                     if let Some(val) = params.get_mut(1) {
@@ -1715,9 +1774,9 @@ impl FormatPlugin for RpgMakerMvPlugin {
             } else {
                 Self::extract_file(&file_path)?
             };
-            let current_by_id: HashMap<String, String> = current_entries
+            let current_by_id: HashMap<String, (String, Vec<String>)> = current_entries
                 .into_iter()
-                .map(|entry| (entry.id, entry.source))
+                .map(|entry| (entry.id, (entry.source, entry.tags)))
                 .collect();
             let mut file_changed = false;
 
@@ -1728,12 +1787,15 @@ impl FormatPlugin for RpgMakerMvPlugin {
 
             for entry in ordered {
                 if let Some(ref translation) = entry.translation {
-                    let Some(current) = current_by_id.get(&entry.id) else {
+                    let Some((current, current_tags)) = current_by_id.get(&entry.id) else {
                         strings_skipped += 1;
                         *skip_reasons.entry("missing_target".into()).or_default() += 1;
                         continue;
                     };
-                    if current != &entry.source {
+                    if current != &entry.source
+                        || (entry.tags.iter().any(|t| t == "d_text")
+                            && !current_tags.iter().any(|t| t == "d_text"))
+                    {
                         strings_skipped += 1;
                         *skip_reasons.entry("source_changed".into()).or_default() += 1;
                         continue;
@@ -2033,6 +2095,226 @@ mod tests {
             } else {
                 fs::copy(entry.path(), &dest).unwrap();
             }
+        }
+    }
+
+    fn mv_plugin_fixture(filename: &str, command: &str) -> (serde_json::Value, String) {
+        let list = serde_json::json!([
+            {"code": 356, "indent": 1, "parameters": [command]},
+            {"code": 250, "indent": 1, "parameters": [{"name": "Sound", "volume": 90}]},
+            {"code": 0, "indent": 0, "parameters": []}
+        ]);
+        let (json, prefix) = match filename {
+            "Map001.json" => (
+                serde_json::json!({"displayName": "Room", "events": [null,
+                    {"name": "Event", "pages": [{"list": list}]}]}),
+                "0#event_1#page_0",
+            ),
+            "CommonEvents.json" => (
+                serde_json::json!([null, {"name": "Common", "trigger": 0, "list": list}]),
+                "1",
+            ),
+            "Troops.json" => (
+                serde_json::json!([null, {"name": "Troop", "members": [],
+                    "pages": [{"list": list}]}]),
+                "1#page_0",
+            ),
+            _ => panic!("unexpected plugin fixture: {filename}"),
+        };
+        (json, format!("{filename}#{prefix}#cmd_0"))
+    }
+
+    fn mv_plugin_command_mut<'a>(
+        filename: &str,
+        json: &'a mut serde_json::Value,
+    ) -> &'a mut serde_json::Value {
+        match filename {
+            "Map001.json" => &mut json["events"][1]["pages"][0]["list"][0],
+            "CommonEvents.json" => &mut json[1]["list"][0],
+            "Troops.json" => &mut json[1]["pages"][0]["list"][0],
+            _ => panic!("unexpected plugin fixture: {filename}"),
+        }
+    }
+
+    fn assert_mv_plugin_roundtrip(
+        filename: &str,
+        command: &str,
+        source: &str,
+        translation: &str,
+        rebuilt: &str,
+        tags: &[&str],
+    ) {
+        let game = tempfile::tempdir().unwrap();
+        let file = game.path().join(filename);
+        let (original, id) = mv_plugin_fixture(filename, command);
+        let bytes = serde_json::to_vec(&original).unwrap();
+        fs::write(&file, &bytes).unwrap();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(&file).unwrap();
+        let row = entries.iter_mut().find(|e| e.id == id).expect("356 row");
+        assert_eq!(row.source, source);
+        assert_eq!(row.tags, tags);
+        row.translation = Some(translation.into());
+        let report = plugin.inject(&file, &entries).unwrap();
+        assert_eq!(report.strings_written, 1);
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        let mut expected = original;
+        mv_plugin_command_mut(filename, &mut expected)["parameters"][0] =
+            serde_json::json!(rebuilt);
+        assert_eq!(written, expected, "only the command body may change");
+        let again = plugin.extract(&file).unwrap();
+        if tags.contains(&"d_text") {
+            assert_eq!(
+                again.iter().find(|e| e.id == id).unwrap().source,
+                translation
+            );
+        } else {
+            // Other MV display commands retain their existing CJK extraction gate.
+            assert!(!again.iter().any(|e| e.id == id));
+        }
+    }
+
+    #[test]
+    fn test_mv_d_text_map_roundtrip() {
+        assert_mv_plugin_roundtrip(
+            "Map001.json",
+            "D_TEXT テスト 32",
+            "テスト",
+            "Prueba",
+            "D_TEXT Prueba 32",
+            &["plugin_cmd", "d_text"],
+        );
+    }
+
+    #[test]
+    fn test_mv_d_text_common_event_roundtrip() {
+        assert_mv_plugin_roundtrip(
+            "CommonEvents.json",
+            "D_TEXT テスト 32",
+            "テスト",
+            "Prueba",
+            "D_TEXT Prueba 32",
+            &["plugin_cmd", "d_text"],
+        );
+    }
+
+    #[test]
+    fn test_mv_d_text_troop_roundtrip() {
+        assert_mv_plugin_roundtrip(
+            "Troops.json",
+            "D_TEXT テスト 32",
+            "テスト",
+            "Prueba",
+            "D_TEXT Prueba 32",
+            &["plugin_cmd", "d_text"],
+        );
+    }
+
+    #[test]
+    fn test_mv_d_text_without_size_roundtrip() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            assert_mv_plugin_roundtrip(
+                filename,
+                "D_TEXT Hello",
+                "Hello",
+                "Hola",
+                "D_TEXT Hola",
+                &["plugin_cmd", "d_text"],
+            );
+        }
+    }
+
+    #[test]
+    fn test_mv_d_text_multiline_numeric_translation_keeps_size_last() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for size in ["32", "0032", "+32", "-32"] {
+                for translation in ["Prueba\nsegunda 99", "\nPrueba 99\n"] {
+                    assert_mv_plugin_roundtrip(
+                        filename,
+                        &format!("D_TEXT テスト {size}"),
+                        "テスト",
+                        translation,
+                        &format!("D_TEXT {translation} {size}"),
+                        &["plugin_cmd", "d_text"],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mv_plugin_non_d_text_behavior_is_unchanged() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for command in ["SHOW_TEXT テスト 32", "D_TEXT_OTHER テスト 32"] {
+                assert_mv_plugin_roundtrip(
+                    filename,
+                    command,
+                    command,
+                    "SHOW_TEXT Prueba 32",
+                    "SHOW_TEXT Prueba 32",
+                    &["plugin_cmd"],
+                );
+            }
+        }
+        assert_eq!(extract_plugin_command_text("SHOW_TEXT Hello"), None);
+        assert_eq!(extract_plugin_command_text("PLAY_SOUND テスト"), None);
+    }
+
+    #[test]
+    fn test_mv_d_text_malformed_or_stale_command_is_untouched() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for command in ["D_TEXT", "D_TEXT ", "D_TEXT\tテスト 32"] {
+                let game = tempfile::tempdir().unwrap();
+                let file = game.path().join(filename);
+                let (original, id) = mv_plugin_fixture(filename, command);
+                let bytes = serde_json::to_vec(&original).unwrap();
+                fs::write(&file, &bytes).unwrap();
+                let plugin = RpgMakerMvPlugin::new();
+                let mut entries = plugin.extract(&file).unwrap();
+                assert!(!entries.iter().any(|e| e.id == id), "{command:?}");
+                // A row extracted before the command changed must also be skipped.
+                let mut stale = StringEntry::new(&id, "テスト", file.clone());
+                stale.tags = vec!["plugin_cmd".into(), "d_text".into()];
+                stale.translation = Some("Prueba".into());
+                entries.push(stale);
+                assert_eq!(plugin.inject(&file, &entries).unwrap().files_modified, 0);
+                assert_eq!(fs::read(&file).unwrap(), bytes);
+                let mut direct = original.clone();
+                RpgMakerMvPlugin::apply_translation(&mut direct, filename, &id, "Prueba");
+                assert_eq!(direct, original);
+            }
+        }
+    }
+
+    #[test]
+    fn test_mv_d_text_writers_rebuild_only_the_body() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            let (mut json, id) = mv_plugin_fixture(filename, "D_TEXT テスト 32");
+            let mut expected = json.clone();
+            mv_plugin_command_mut(filename, &mut expected)["parameters"][0] =
+                serde_json::json!("D_TEXT Prueba\n99 32");
+            RpgMakerMvPlugin::apply_translation(&mut json, filename, &id, "Prueba\n99");
+            assert_eq!(json, expected);
+        }
+    }
+
+    #[test]
+    fn test_mv_d_text_changed_dispatcher_with_matching_source_is_untouched() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            let game = tempfile::tempdir().unwrap();
+            let file = game.path().join(filename);
+            let (original, id) = mv_plugin_fixture(filename, "D_TEXT SHOW_TEXT テスト 32 48");
+            fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+            let plugin = RpgMakerMvPlugin::new();
+            let mut entries = plugin.extract(&file).unwrap();
+            let row = entries.iter_mut().find(|e| e.id == id).unwrap();
+            assert_eq!(row.source, "SHOW_TEXT テスト 32");
+            row.translation = Some("Prueba".into());
+            let (changed, _) = mv_plugin_fixture(filename, "SHOW_TEXT テスト 32");
+            let bytes = serde_json::to_vec(&changed).unwrap();
+            fs::write(&file, &bytes).unwrap();
+            assert_eq!(plugin.inject(&file, &entries).unwrap().files_modified, 0);
+            assert_eq!(fs::read(&file).unwrap(), bytes);
         }
     }
 
