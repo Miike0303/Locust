@@ -19,7 +19,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 ## Backlog
 
-- **[defect · core · S] PO import treats `#, fuzzy` entries as finished translations** (cycle 93 research runner-up). `import_po` discards every `#` comment (`crates/core/src/export.rs:~140`, `:~223`); a fuzzy entry replaces even an approved translation and becomes `translated` (`database.rs:~168`, `:~1198`). Fix: keep the fuzzy flag on `PoEntry` and skip fuzzy entries with visible accounting. Check: `import_po` of a `#, fuzzy` entry yields no update in `po_entries_for_batch`.
 - **[optimization · formats · M] Unity extract/inject copy the whole asset buffer** (cycle 89 research; the object-table half shipped in cycle 92). `extract_strings_from_assets` does `bytes.to_vec()` into an owning parser (`crates/formats/src/unity.rs:~796`, `unity_serialized.rs:~181`); inject clones its buffer too (`unity.rs:~376`, `:~758`) — a 2 GiB asset needs 4 GiB for inputs alone. Check: no allocation ≥ the asset size during extract.
 - **[capability · core · L] `apply --dry-run` refuses upgrades and patch switches** (cycle 64 research, B). `reject_dry_run_rollback` (`crates/core/src/patch/apply.rs:157`, `:188`, `:276`) — needs a virtual post-rollback baseline. Large; only if a user asks.
 - **[defect · frontend · S] Settings Glossary and History are silently empty with no project open** (after cycle 58). The queries now fail with `no project open` and there is no global query error handler, so the lists render empty with no hint. Show "Open a project to see its glossary / translation history" instead. Check: a component test with the query rejected renders the hint.
@@ -53,6 +52,8 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 Nothing.
 
 ## Done
+
+- `be1f11b` — **cycle 95 (defect, from backlog: cycle 93 runner-up; research skipped; writer Codex gpt-6.1-sol xhigh).** `import_po` dropped `#, fuzzy`, so PO catalogs merged by msgmerge/Poedit/Weblate overwrote existing (even approved) translations with unreviewed guesses. `PoEntry.fuzzy` is parsed from any `#,` flag list, reset per entry (also without blank-line separators); `po_entries_for_batch` skips fuzzy entries and counts them as skipped; the CLI summary says "empty/missing/fuzzy". Negative test fails 4 core + 1 CLI. Claude double-verified: read the diff, fmt, clippy, `cargo test --workspace` 1718 pass / 0 fail. Next rotation: `capability`.
 
 - `5d97432` — **cycle 94 (defect, follow-up to cycle 93; writer Codex gpt-6.1-sol xhigh).** Ren'Py Add mode skipped repeated (label, statement) ids, leaving ~8% of lines untranslated; Ren'Py numbers them `base`, `base_1`, `base_2`. The writer derived the rule from the real corpus (132,577 suffixes, unpadded from 1; scope = whole game+language, source path then line order; untranslated repeats still reserve their number) by testing 8 scope/order hypotheses (99.36-99.47%; starting at _0 = 91.58%). Full-id agreement 91.78% → 99.47%; base 99.71%. Claude re-ran the corpus test (passes the >= 99.4% assertion) and read the diff; fmt, clippy, `cargo test --workspace` 1711 pass / 0 fail. Negative test (old skip restored) fails. Next rotation: `optimization`.
 
