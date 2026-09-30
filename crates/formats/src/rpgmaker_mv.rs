@@ -1805,9 +1805,9 @@ impl RpgMakerMvPlugin {
         };
         if is_jsono {
             let encoded = lz_str::compress_to_base64(&text);
-            std::fs::write(file_path, encoded)?;
+            EncodingDetector::write_file_encoded(file_path, &encoded, "UTF-8")?;
         } else {
-            std::fs::write(file_path, text)?;
+            EncodingDetector::write_file_encoded(file_path, &text, "UTF-8")?;
         }
         Ok(())
     }
@@ -2342,6 +2342,95 @@ mod tests {
         assert_eq!(json[1]["classId"].as_i64().unwrap(), 1);
     }
 
+    fn assert_utf8_map_roundtrip(annotation: bool, bom: bool) {
+        for source in [
+            "Ice Ⅰ",
+            "Wait…",
+            "I didn’t expect help from a human!",
+            "Hello\u{3000}world",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("data");
+            fs::create_dir(&data).unwrap();
+            fs::write(data.join("System.json"), r#"{"gameTitle":"Test"}"#).unwrap();
+            let path = data.join("Map001.json");
+            let dialogue = if annotation {
+                "Hello, traveler!"
+            } else {
+                source
+            };
+            let note = if annotation {
+                source
+            } else {
+                "Untouched annotation"
+            };
+            let mut expected = serde_json::json!({
+                "displayName": "Town",
+                "note": "Keep this map metadata",
+                "events": [null, {"id": 1, "pages": [{"list": [
+                    {"code": 101, "indent": 0, "parameters": ["", 0, 0, 2, ""]},
+                    {"code": 401, "indent": 0, "parameters": [dialogue]},
+                    {"code": 657, "indent": 0, "parameters": [note]},
+                    {"code": 0, "indent": 0, "parameters": []}
+                ]}]}]
+            });
+            let mut bytes = if bom { vec![0xEF, 0xBB, 0xBF] } else { vec![] };
+            bytes.extend(serde_json::to_vec(&expected).unwrap());
+            fs::write(&path, &bytes).unwrap();
+
+            let plugin = RpgMakerMvPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            let message = entries.iter().find(|e| e.id.ends_with("#msg")).unwrap();
+            assert_eq!(message.source, dialogue);
+            assert!(!entries.iter().any(|e| e.source == note));
+            let selected = entries
+                .iter_mut()
+                .find(|e| e.id == "Map001.json#displayName")
+                .unwrap();
+            selected.translation = Some("Village".into());
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(report.strings_written, 1);
+            assert_eq!(report.files_modified, 1);
+
+            let written = fs::read(&path).unwrap();
+            assert_eq!(written.starts_with(&[0xEF, 0xBB, 0xBF]), bom);
+            let content = if bom { &written[3..] } else { &written[..] };
+            let actual: serde_json::Value = serde_json::from_slice(content).unwrap();
+            let list = &actual["events"][1]["pages"][0]["list"];
+            assert_eq!(
+                list[1]["parameters"][0].as_str().unwrap().as_bytes(),
+                dialogue.as_bytes()
+            );
+            assert_eq!(
+                list[2]["parameters"][0].as_str().unwrap().as_bytes(),
+                note.as_bytes()
+            );
+            // The serialized untouched string values must also retain their exact bytes.
+            for text in [dialogue, note] {
+                let original = serde_json::to_vec(text).unwrap();
+                assert!(content.windows(original.len()).any(|w| w == original));
+            }
+            expected["displayName"] = serde_json::json!("Village");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn test_utf8_map_extract_and_inject_preserves_untouched_dialogue() {
+        assert_utf8_map_roundtrip(false, false);
+    }
+
+    #[test]
+    fn test_utf8_map_inject_preserves_untouched_annotations() {
+        assert_utf8_map_roundtrip(true, false);
+    }
+
+    #[test]
+    fn test_utf8_map_extract_and_inject_preserves_bom() {
+        assert_utf8_map_roundtrip(false, true);
+        assert_utf8_map_roundtrip(true, true);
+    }
+
     #[test]
     fn test_inject_add_mz_creates_file() {
         let game_dir = temp_game_dir();
@@ -2442,6 +2531,37 @@ mod tests {
             .expect("gameTitle from jsono");
         assert_eq!(title.source, "LZ Title");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_utf8_jsono_inject_preserves_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let path = data.join("System.jsono");
+        let expected = serde_json::json!({"gameTitle": "Ice Ⅰ", "note": "Wait…"});
+        let compressed = lz_str::compress_to_base64(&expected.to_string());
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(compressed.as_bytes());
+        fs::write(&path, bytes).unwrap();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        let title = entries
+            .iter_mut()
+            .find(|e| e.id == "System.jsono#gameTitle")
+            .unwrap();
+        assert_eq!(title.source, "Ice Ⅰ");
+        title.translation = Some("Glace Ⅰ".into());
+        assert_eq!(
+            plugin.inject(dir.path(), &entries).unwrap().strings_written,
+            1
+        );
+        assert!(fs::read(&path).unwrap().starts_with(&[0xEF, 0xBB, 0xBF]));
+        let actual = RpgMakerMvPlugin::read_data_json(&path).unwrap();
+        assert_eq!(
+            actual,
+            serde_json::json!({"gameTitle": "Glace Ⅰ", "note": "Wait…"})
+        );
     }
 
     #[test]
