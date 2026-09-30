@@ -100,6 +100,22 @@ Owned by no lane; Claude applies these after the writers finish.
 - Codex stops on "ACL errors" if the brief says so: git always warns it cannot read `~/.config/git/ignore` in the
   sandbox. Stop rules must name `windows sandbox failed` exactly.
 - `bat`/`fd`/`eza` are not installed on this Windows host. Use `rg` and the Read tool.
+- **Ground-truth audits (2026-09-29, the most productive technique so far).** Before writing a brief from code
+  reading, look for a real artifact on disk that lists what the engine itself treats as translatable (Ren'Py: the
+  `tl/<lang>/*.rpy` files it wrote; RPG Maker: original vs translated pairs plus an independent JSON parse), measure
+  recall and precision with a script, give the writer the script and demand BEFORE/AFTER numbers, then re-run it
+  yourself. Scripts, how to run and the latest reports: `tools/ground-truth/README.md`. Ren'Py went from recall
+  65.96% / precision 88.15% to 97.92% / 98.45%. Researchers doing this may write only under the scratch directory,
+  never the repo or `D:\juegos`; check `git status --short` afterwards.
+- **Briefs go through the file-writing tool, not shell heredocs.** A backtick or apostrophe in a briefing broke bash
+  twice (`unexpected EOF`, nothing started). Launch with `nohup codex exec ... - < brief.md > log 2>&1 &`.
+- **`docs/IMPROVEMENT-GOAL.md` has mixed line endings** (mostly LF, ~35 CRLF, stray CR characters inside old entries).
+  Edit it by whole `\n`-delimited physical lines (Python `split('\n')`), never `splitlines()`, `split('\r\n')` or
+  multi-line perl, and check `git diff --stat` (a wrong edit once showed +37/-67 for three lines).
+- **Codex sandbox/update on this host:** `[windows] sandbox = "elevated"` made some reads hang ~170 s while
+  `unelevated` answered in 20 s; try `-c windows.sandbox="unelevated"` per call only after rerunning the full suite.
+  `codex update` fails from pwsh 7 (`Get-FileHash` missing) unless
+  `$env:PSModulePath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\Modules"` is set first.
 - Isolate every QA run with `LOCUST_DATA_DIR=<scratch>`. Without it the run uses
   the user's real profile, keys and global memory (`crates/core/src/config.rs:183`).
 - Browser-mode UI needs `locust server --port 7842`, because production
