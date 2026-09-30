@@ -162,11 +162,13 @@ impl UnityPlugin {
                 // Dialogue: `CharID Text here` or `CharID Text with \bformatting\b`
                 if let Some((character, text)) = extract_vn_dialogue(trimmed) {
                     if !text.is_empty() && text.len() >= 2 {
-                        // Strip format codes for translation, store clean text
-                        let clean = strip_vn_format_codes(text);
+                        // Controls remain in the translation source, including
+                        // boundaries inside dialogue. Only ignore them when
+                        // deciding whether there is any visible text.
+                        let clean = vn_visible_text(text);
                         if !clean.is_empty() && clean.len() >= 2 {
                             let id = format!("{}#{}", filename, line_num);
-                            let mut entry = StringEntry::new(&id, &clean, fpath.to_path_buf());
+                            let mut entry = StringEntry::new(&id, text, fpath.to_path_buf());
                             entry.tags = vec!["dialogue".to_string()];
                             entry.context = Some(character.to_string());
                             // Store original text with format codes in metadata
@@ -237,28 +239,38 @@ impl UnityPlugin {
                         report.skip("error", 1);
                         continue;
                     }
+                    if vn_control_tokens(&entry.source) != vn_control_tokens(translation) {
+                        report.skip("unsafe_controls", 1);
+                        continue;
+                    }
                     body.replacen(
                         &format!("\"{}\"", entry.source),
                         &format!("\"{translation}\""),
                         1,
                     )
-                } else if let Some(space_pos) = trimmed.find(' ') {
-                    let after_character = &trimmed[space_pos + 1..];
-                    let (prefix, _inner, suffix) = split_format_codes(after_character);
-                    if strip_vn_format_codes(after_character) != entry.source
+                } else if let Some((character, text)) = extract_vn_dialogue(trimmed) {
+                    // Exact rich-source matching also rejects legacy stripped
+                    // entries instead of silently replacing formatted dialogue.
+                    if entry.injection_source().ok() != Some(text)
                         || entry
                             .context
                             .as_deref()
-                            .is_some_and(|character| character != &trimmed[..space_pos])
+                            .is_some_and(|expected| expected != character)
                     {
                         report.skip("source_changed", 1);
                         continue;
                     }
-                    let indent = &body[..body.len() - body.trim_start().len()];
-                    let trailing = &body[body.trim_end().len()..];
+                    if vn_control_tokens(text) != vn_control_tokens(translation) {
+                        report.skip("unsafe_controls", 1);
+                        continue;
+                    }
+                    // Replace only the dialogue span; retain indentation,
+                    // speaker spacing, trailing whitespace and the line ending.
+                    let start = body.len() - body.trim_start().len() + trimmed.len() - text.len();
                     format!(
-                        "{indent}{} {prefix}{translation}{suffix}{trailing}",
-                        &trimmed[..space_pos]
+                        "{}{translation}{}",
+                        &body[..start],
+                        &body[start + text.len()..]
                     )
                 } else {
                     report.skip("source_changed", 1);
@@ -2002,7 +2014,7 @@ fn extract_quoted_in_line(line: &str) -> Option<&str> {
 
 /// Extract VN dialogue: `CharID Dialogue text here`
 /// Character IDs are 1-5 char identifiers (letters, sometimes digits)
-/// Returns (char_id, clean_text) where clean_text has format codes stripped
+/// Returns (char_id, text), retaining all embedded engine controls.
 fn extract_vn_dialogue(line: &str) -> Option<(&str, &str)> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -2032,62 +2044,62 @@ fn extract_vn_dialogue(line: &str) -> Option<(&str, &str)> {
     Some((char_id, text))
 }
 
-/// Strip VN format codes from text for translation.
-/// Codes like \i, \b, \- are engine formatting and should not be translated.
-fn strip_vn_format_codes(text: &str) -> String {
-    text.replace("\\i", "")
-        .replace("\\b", "")
-        .replace("\\-", "")
-        .replace("\\p", "")
-        .replace("\\n", " ")
-        .trim()
-        .to_string()
-}
-
-/// Find format code prefix/suffixes in the original text so we can restore them.
-/// Returns (prefix_codes, inner_text, suffix_codes)
-fn split_format_codes(text: &str) -> (String, String, String) {
-    let mut prefix = String::new();
-    let mut suffix = String::new();
-    let inner = text.to_string();
-
-    // Extract leading format codes
-    let mut chars = inner.chars().peekable();
-    let mut prefix_end = 0;
-    while let Some(&ch) = chars.peek() {
+/// Byte spans of protected VN escapes and Unity rich-text tags. Unknown escapes
+/// are protected too: interpreting engine commands is not a translator's job.
+fn vn_control_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
         if ch == '\\' {
-            chars.next();
-            if let Some(&next) = chars.peek() {
-                prefix.push('\\');
-                prefix.push(next);
-                chars.next();
-                prefix_end += 2;
-                // Skip any following whitespace
-                while let Some(&ws) = chars.peek() {
-                    if ws == ' ' {
-                        chars.next();
-                        prefix_end += 1;
-                    } else {
-                        break;
+            let end = chars
+                .next()
+                .map_or(start + 1, |(pos, code)| pos + code.len_utf8());
+            spans.push(start..end);
+        } else if ch == '<'
+            && chars
+                .peek()
+                .is_some_and(|(_, next)| next.is_ascii_alphabetic() || matches!(next, '/' | '#'))
+        {
+            // Link attributes may contain '>' inside quotes; protect the whole
+            // tag, including its target, rather than just its tag name.
+            let mut quote = None;
+            let mut end = text.len();
+            for (pos, next) in chars.by_ref() {
+                if let Some(q) = quote {
+                    if next == q {
+                        quote = None;
                     }
+                } else if matches!(next, '\'' | '"') {
+                    quote = Some(next);
+                } else if next == '>' {
+                    end = pos + 1;
+                    break;
                 }
             }
-        } else {
-            break;
+            spans.push(start..end);
         }
     }
+    spans
+}
 
-    let remaining = &inner[prefix_end..];
+/// Preserve the source's exact control order/count (including style pairing).
+/// Some shipped lines have open style toggles; retain those as authored too.
+fn vn_control_tokens(text: &str) -> Vec<&str> {
+    vn_control_spans(text)
+        .into_iter()
+        .map(|span| &text[span])
+        .collect()
+}
 
-    // Check for trailing format codes
-    let trimmed_end = remaining.trim_end();
-    if trimmed_end.ends_with("\\i") || trimmed_end.ends_with("\\b") {
-        let code_start = trimmed_end.len() - 2;
-        suffix = remaining[code_start..].to_string();
-        return (prefix, remaining[..code_start].trim().to_string(), suffix);
+fn vn_visible_text(text: &str) -> String {
+    let mut visible = String::new();
+    let mut start = 0;
+    for span in vn_control_spans(text) {
+        visible.push_str(&text[start..span.start]);
+        start = span.end;
     }
-
-    (prefix, remaining.to_string(), suffix)
+    visible.push_str(&text[start..]);
+    visible.trim().to_string()
 }
 
 /// Safety floor for fields whose Unity class identifies them as text.
@@ -2658,6 +2670,138 @@ impl FormatPlugin for UnityPlugin {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn vn_controls_fixture(script: &str) -> (tempfile::TempDir, PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let scripts = fixture.path().join("Controls_Data/SCRIPTS~");
+        fs::create_dir_all(&scripts).unwrap();
+        let file = scripts.join("Dialogue.txt");
+        fs::write(&file, script).unwrap();
+        fs::write(
+            scripts.join("Definitions.txt"),
+            "# untouched\r\nversion 1.0  \r\n",
+        )
+        .unwrap();
+        (fixture, file)
+    }
+
+    #[test]
+    fn vn_controls_roundtrip_rich_dialogue_and_preserve_untouched_bytes() {
+        for (source, translation) in [
+            (r"Hello \bworld\b.", r"AUDIT Hello \bworld\b."),
+            (r"Hello \iworld\i.", r"Hola \imundo\i."),
+            (
+                r"\p<link=journal>Hello \bworld\b</link>\n\>続き。",
+                r"\p<link=journal>Hola \bmundo\b</link>\n\>Continuación.",
+            ),
+            (r"\-Él dijo \i你好\i.", r"\-Ella dijo \iこんにちは\i."),
+            (r"That...\ishouting?!", r"Eso...\i¿gritando?!"),
+            ("Plain dialogue.", "Diálogo sencillo."),
+        ] {
+            for ending in ["\r\n", "\n", ""] {
+                let before = format!("# untouched  \r\n  CJ   {source}  \t{ending}");
+                let (fixture, file) = vn_controls_fixture(&before);
+                let definitions = file.with_file_name("Definitions.txt");
+                let untouched = fs::read(&definitions).unwrap();
+                let plugin = UnityPlugin::new();
+                let mut entries = plugin.extract(fixture.path()).unwrap();
+                assert_eq!(entries.len(), 1, "{source}");
+                assert_eq!(
+                    entries[0].source, source,
+                    "engine controls belong in the source"
+                );
+                entries[0].translation = Some(translation.into());
+                let report = plugin.inject(fixture.path(), &entries).unwrap();
+                assert_diagnostic_totals(&report, 1);
+                assert_eq!(
+                    (report.strings_written, report.files_modified),
+                    (1, 1),
+                    "{report:?}"
+                );
+                assert_eq!(
+                    fs::read(&file).unwrap(),
+                    format!("# untouched  \r\n  CJ   {translation}  \t{ending}").as_bytes()
+                );
+                assert_eq!(fs::read(definitions).unwrap(), untouched);
+            }
+        }
+    }
+
+    #[test]
+    fn vn_controls_reject_missing_added_reordered_or_changed_controls_without_writes() {
+        let source = r#"\p<link="journal>entry">Hello \b世界\b and \ifriends\i.</link>\n\>End."#;
+        for translation in [
+            "Hola mundo.",
+            r#"\p<link="journal>entry">Hola \b世界 and \iamigos\i.</link>\n\>Fin."#,
+            r#"\p<link="journal>entry">Hola \i世界\i y \bamigos\b.</link>\n\>Fin."#,
+            r#"\p<link="other">Hola \b世界\b y \iamigos\i.</link>\n\>Fin."#,
+            r#"\p<link="journal>entry">Hola \b世界\b y \iamigos\i.\n\>Fin."#,
+            r#"\p<link="journal>entry">Hola \b世界\b y \iamigos\i.</link>\>Fin."#,
+            r#"\p<link="journal>entry">Hola \b世界\b y \iamigos\i.</link>\nFin."#,
+            r#"\p<link="journal>entry">Hola \b世界\b y \iamigos\i.</link>\n\>Fin.\b"#,
+        ] {
+            let before = format!("CJ {source}  \r\nCJ Untouched.\r\n");
+            let (fixture, file) = vn_controls_fixture(&before);
+            let mut entry = UnityPlugin::new()
+                .extract(fixture.path())
+                .unwrap()
+                .into_iter()
+                .find(|e| e.id == "Dialogue.txt#1")
+                .unwrap();
+            entry.translation = Some(translation.into());
+            let report = UnityPlugin::new().inject(fixture.path(), &[entry]).unwrap();
+            assert_diagnostic_totals(&report, 1);
+            assert_eq!(
+                (report.strings_written, report.files_modified),
+                (0, 0),
+                "{report:?}"
+            );
+            assert_eq!(report.skip_reasons.get("unsafe_controls"), Some(&1));
+            assert_eq!(fs::read(file).unwrap(), before.as_bytes());
+        }
+    }
+
+    #[test]
+    fn vn_controls_legacy_stripped_entries_cannot_overwrite_rich_sources() {
+        for source in [r"Hello \bworld\b.", r"\iHello world.\i", r"Hello\nworld."] {
+            let before = format!("CJ {source}\r\n");
+            let (fixture, file) = vn_controls_fixture(&before);
+            let mut entry = StringEntry::new("Dialogue.txt#1", "Hello world.", file.clone());
+            entry.translation = Some("Hola mundo.".into());
+            entry
+                .metadata
+                .insert("original_with_codes".into(), serde_json::json!(source));
+            let report = UnityPlugin::new().inject(fixture.path(), &[entry]).unwrap();
+            assert_diagnostic_totals(&report, 1);
+            assert_eq!((report.strings_written, report.files_modified), (0, 0));
+            assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+            assert_eq!(fs::read(file).unwrap(), before.as_bytes());
+        }
+    }
+
+    #[test]
+    fn vn_controls_menu_labels_preserve_tags_and_reject_removal() {
+        let before = "  button 0 \"<b>Enter</b>\" +link jump 5  \r\n";
+        let (fixture, file) = vn_controls_fixture(before);
+        let mut entry = UnityPlugin::new()
+            .extract(fixture.path())
+            .unwrap()
+            .remove(0);
+        entry.translation = Some("Entrar".into());
+        let report = UnityPlugin::new()
+            .inject(fixture.path(), &[entry.clone()])
+            .unwrap();
+        assert_eq!((report.strings_written, report.files_modified), (0, 0));
+        assert_eq!(report.skip_reasons.get("unsafe_controls"), Some(&1));
+        assert_eq!(fs::read(&file).unwrap(), before.as_bytes());
+        entry.translation = Some("<b>Entrar</b>".into());
+        let report = UnityPlugin::new().inject(fixture.path(), &[entry]).unwrap();
+        assert_eq!((report.strings_written, report.files_modified), (1, 1));
+        assert_eq!(
+            fs::read(file).unwrap(),
+            "  button 0 \"<b>Entrar</b>\" +link jump 5  \r\n".as_bytes()
+        );
+    }
 
     #[test]
     fn empty_translation_is_untranslated_and_never_erases_a_unity_slot() {
