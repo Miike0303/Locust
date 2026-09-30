@@ -2396,7 +2396,7 @@ async fn cmd_import(
         }
     }
     if skipped > 0 {
-        println!("Skipped {skipped}: {} outdated source(s), {} unknown id(s), {pre_skipped} empty/missing entries", report.stale_sources, report.unknown_ids);
+        println!("Skipped {skipped}: {} outdated source(s), {} unknown id(s), {pre_skipped} empty/missing/fuzzy entries", report.stale_sources, report.unknown_ids);
     }
     if dry_run {
         println!("Dry run: nothing was saved.");

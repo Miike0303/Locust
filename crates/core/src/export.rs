@@ -99,13 +99,21 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
     let mut current_reference_id: Option<String> = None;
     let mut current_msgid: Option<String> = None;
     let mut current_msgstr: Option<String> = None;
+    let mut current_fuzzy = false;
+    let mut entry_complete = false;
     let mut reading = ReadingState::None;
 
     for (index, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         let line_number = index + 1;
+        let (keyword, rest) = trimmed
+            .split_once(char::is_whitespace)
+            .unwrap_or((trimmed, ""));
+        let starts_entry = matches!(keyword, "msgctxt" | "msgid")
+            || trimmed.starts_with("#,")
+            || trimmed.starts_with("#: ");
 
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || (entry_complete && starts_entry) {
             // Flush current entry
             if let (Some(msgid), Some(msgstr)) = (current_msgid.take(), current_msgstr.take()) {
                 if !msgid.is_empty() {
@@ -116,12 +124,22 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
                             .or(current_reference_id.take()),
                         source: msgid,
                         translation: msgstr,
+                        fuzzy: current_fuzzy,
                     });
                 }
             }
             current_id = None;
             current_reference_id = None;
+            current_fuzzy = false;
+            entry_complete = false;
             reading = ReadingState::None;
+            if trimmed.is_empty() {
+                continue;
+            }
+        }
+
+        if let Some(flags) = trimmed.strip_prefix("#,") {
+            current_fuzzy |= flags.split(',').any(|flag| flag.trim() == "fuzzy");
             continue;
         }
 
@@ -141,10 +159,6 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
             continue;
         }
 
-        let (keyword, rest) = trimmed
-            .split_once(char::is_whitespace)
-            .unwrap_or((trimmed, ""));
-
         if keyword == "msgctxt" {
             let val = parse_po_string(rest, line_number)?;
             current_id = Some(unescape_po(&val));
@@ -162,6 +176,7 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
         if keyword == "msgstr" {
             let val = parse_po_string(rest, line_number)?;
             current_msgstr = Some(unescape_po(&val));
+            entry_complete = true;
             reading = ReadingState::Msgstr;
             continue;
         }
@@ -176,6 +191,7 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
             // Plural entries are not imported; validate and discard their continuations.
             current_msgid = None;
             current_msgstr = None;
+            entry_complete = true;
             reading = ReadingState::None;
             continue;
         }
@@ -212,6 +228,7 @@ pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
                     .or(current_reference_id),
                 source: msgid,
                 translation: msgstr,
+                fuzzy: current_fuzzy,
             });
         }
     }
@@ -224,6 +241,8 @@ pub struct PoEntry {
     pub id: Option<String>,
     pub source: String,
     pub translation: String,
+    #[serde(default)]
+    pub fuzzy: bool,
 }
 
 enum ReadingState {
@@ -518,12 +537,12 @@ pub struct ImportedTranslation {
     pub translation: String,
 }
 
-/// Empty msgstr / missing id count toward `skipped`; the database checks source identity.
+/// Empty msgstr / missing id / fuzzy count toward `skipped`; the database checks source identity.
 pub fn po_entries_for_batch(entries: &[PoEntry]) -> (Vec<ImportedTranslation>, usize) {
     let mut skipped = 0usize;
     let mut updates = Vec::with_capacity(entries.len());
     for pe in entries {
-        if pe.translation.is_empty() {
+        if pe.fuzzy || pe.translation.is_empty() {
             skipped += 1;
             continue;
         }
@@ -735,6 +754,133 @@ mod tests {
             po.contains("msgctxt \"e1\""),
             "export must write msgctxt ids"
         );
+    }
+
+    #[test]
+    fn test_import_po_fuzzy_entries_are_skipped() {
+        for context in ["msgctxt \"entry\"\n", "#: game.rpy#entry\n"] {
+            for translation in ["Hola", ""] {
+                for ending in ["", "\n\n"] {
+                    let po = format!(
+                        "#, fuzzy\n{context}msgid \"Hello\"\nmsgstr \"{translation}\"{ending}"
+                    );
+                    let imported = import_po(&po).unwrap();
+                    assert_eq!(imported.len(), 1);
+                    assert!(imported[0].fuzzy, "{po}");
+                    assert_eq!(imported[0].id.as_deref(), Some("entry"));
+                    let (updates, skipped) = po_entries_for_batch(&imported);
+                    assert!(updates.is_empty(), "{po}");
+                    assert_eq!(skipped, 1, "{po}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_po_fuzzy_flags_match_exactly() {
+        for (comments, fuzzy) in [
+            ("#, fuzzy, python-format", true),
+            ("#, c-format, fuzzy", true),
+            ("#,c-format,  fuzzy  , python-format", true),
+            ("#, fuzzy\n#, python-format", true),
+            ("#, python-format", false),
+            ("#, Fuzzy, fuzzy-format, not-fuzzy", false),
+            ("# fuzzy", false),
+            ("#| msgid \"old\"", false),
+            ("#| msgid \"#, fuzzy\"", false),
+            ("#~ msgid \"#, fuzzy\"\n#~ msgstr \"old\"", false),
+            ("#~ #, fuzzy", false),
+        ] {
+            let po = format!("{comments}\nmsgctxt \"entry\"\nmsgid \"Hello\"\nmsgstr \"Hola\"");
+            let imported = import_po(&po).unwrap();
+            assert_eq!(imported.len(), 1, "{po}");
+            assert_eq!(imported[0].fuzzy, fuzzy, "{po}");
+            let (updates, skipped) = po_entries_for_batch(&imported);
+            assert_eq!(updates.len(), usize::from(!fuzzy), "{po}");
+            assert_eq!(skipped, usize::from(fuzzy), "{po}");
+        }
+    }
+
+    #[test]
+    fn test_import_po_fuzzy_does_not_leak_between_entries() {
+        for separator in ["\n", "\n\n"] {
+            for fuzzy_first in [true, false] {
+                for use_context in [true, false] {
+                    let entry = |id, fuzzy| {
+                        let flags = if fuzzy { "#, fuzzy\n" } else { "" };
+                        let context = if use_context {
+                            format!("msgctxt \"{id}\"\n")
+                        } else {
+                            format!("#: game.rpy#{id}\n")
+                        };
+                        format!("{flags}{context}msgid \"Hello\"\nmsgstr \"Hola\"")
+                    };
+                    let po = format!(
+                        "{}{separator}{}",
+                        entry("first", fuzzy_first),
+                        entry("second", !fuzzy_first)
+                    );
+                    let imported = import_po(&po).unwrap();
+                    assert_eq!(imported.len(), 2, "{po}");
+                    assert_eq!(imported[0].fuzzy, fuzzy_first, "{po}");
+                    assert_eq!(imported[1].fuzzy, !fuzzy_first, "{po}");
+                    let (updates, skipped) = po_entries_for_batch(&imported);
+                    assert_eq!(skipped, 1, "{po}");
+                    assert_eq!(updates.len(), 1, "{po}");
+                    assert_eq!(updates[0].id, if fuzzy_first { "second" } else { "first" });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_po_fuzzy_resets_after_discarded_entries() {
+        for prefix in [
+            "#, fuzzy\n\n",
+            "#, fuzzy\nmsgid \"\"\nmsgstr \"\"\n\"Language: es\\n\"\n",
+            "#, fuzzy\nmsgid \"One\"\nmsgid_plural \"Many\"\nmsgstr[0] \"Uno\"\n",
+        ] {
+            let po = format!("{prefix}msgctxt \"entry\"\nmsgid \"Hello\"\nmsgstr \"Hola\"");
+            let imported = import_po(&po).unwrap();
+            assert_eq!(imported.len(), 1, "{po}");
+            assert!(!imported[0].fuzzy, "{po}");
+            let (updates, skipped) = po_entries_for_batch(&imported);
+            assert_eq!(updates.len(), 1, "{po}");
+            assert_eq!(skipped, 0, "{po}");
+        }
+    }
+
+    #[test]
+    fn test_import_po_fuzzy_preserves_wrapped_strings() {
+        let po = concat!(
+            "#, fuzzy\n#: game.rpy#legacy\nmsgctxt \"\"\n\"game.rpy\"\n\"#42\"\n",
+            "msgid \"Hello \"\n\"world\\n\"\n",
+            "msgstr \"Hola \"\n# Translator comment\n\"mundo\\n\"",
+        );
+        let imported = import_po(po).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert!(imported[0].fuzzy);
+        assert_eq!(imported[0].id.as_deref(), Some("game.rpy#42"));
+        assert_eq!(imported[0].source, "Hello world\n");
+        assert_eq!(imported[0].translation, "Hola mundo\n");
+        let (updates, skipped) = po_entries_for_batch(&imported);
+        assert!(updates.is_empty());
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn test_po_entry_fuzzy_defaults_false_and_export_is_not_fuzzy() {
+        let entry: PoEntry = serde_json::from_value(serde_json::json!({
+            "id": "entry", "source": "Hello", "translation": "Hola"
+        }))
+        .unwrap();
+        assert!(!entry.fuzzy);
+        let po = export_po(&make_entries(), "en", "es");
+        let imported = import_po(&po).unwrap();
+        assert!(imported.iter().all(|entry| !entry.fuzzy));
+        let (updates, skipped) = po_entries_for_batch(&imported);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(skipped, 1);
     }
 
     #[test]
@@ -1081,16 +1227,19 @@ msgstr "Hola"
                 id: Some("a".into()),
                 source: "A".into(),
                 translation: "Á".into(),
+                fuzzy: false,
             },
             PoEntry {
                 id: Some("b".into()),
                 source: "B".into(),
                 translation: String::new(),
+                fuzzy: false,
             },
             PoEntry {
                 id: None,
                 source: "C".into(),
                 translation: "Cé".into(),
+                fuzzy: false,
             },
         ];
         let (updates, pre_skipped) = po_entries_for_batch(&entries);

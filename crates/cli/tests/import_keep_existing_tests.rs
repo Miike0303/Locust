@@ -105,7 +105,7 @@ fn cli_import_keep_existing_preserves_approved_and_fills_empty() {
         );
         assert!(
             output.contains(
-                "Skipped 3: 1 outdated source(s), 1 unknown id(s), 1 empty/missing entries"
+                "Skipped 3: 1 outdated source(s), 1 unknown id(s), 1 empty/missing/fuzzy entries"
             ),
             "{output}"
         );
@@ -163,6 +163,62 @@ fn cli_import_default_preserves_identical_and_overwrites_differing() {
         assert_eq!(after.translation.as_deref(), Some("Adiós"));
         assert_eq!(after.status, StringStatus::Translated);
         assert_eq!(after.provider_used.as_deref(), Some("import"));
+    }
+}
+
+#[test]
+fn cli_import_po_fuzzy_preserves_approved_and_imports_normal() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project.db");
+    let input = dir.path().join("catalog.po");
+    let db = Database::open(&project).unwrap();
+    let reviewed = approved("fuzzy", "Hello", "Reviewed translation");
+    let normal = entry("normal", "Goodbye", None);
+    db.save_entries(&[reviewed.clone(), normal.clone()])
+        .unwrap();
+    drop(db);
+    std::fs::write(
+        &input,
+        concat!(
+            "#, fuzzy\nmsgctxt \"fuzzy\"\nmsgid \"Hello\"\nmsgstr \"Unreviewed guess\"\n\n",
+            "msgctxt \"normal\"\nmsgid \"Goodbye\"\nmsgstr \"Adiós\"",
+        ),
+    )
+    .unwrap();
+
+    for dry_run in [true, false] {
+        let output = import(&project, &input, "po", false, dry_run);
+        assert!(
+            output.contains(
+                "Skipped 1: 0 outdated source(s), 0 unknown id(s), 1 empty/missing/fuzzy entries"
+            ),
+            "{output}"
+        );
+        let db = Database::open(&project).unwrap();
+        let after = db.get_entry("fuzzy").unwrap().unwrap();
+        assert_eq!(after.translation, reviewed.translation);
+        assert_eq!(after.status, StringStatus::Approved);
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(&reviewed).unwrap()
+        );
+        let after = db.get_entry("normal").unwrap().unwrap();
+        if dry_run {
+            assert!(
+                output.contains("Would replace 0 translation(s):"),
+                "{output}"
+            );
+            assert!(output.contains("Would fill 1 empty row(s)"), "{output}");
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(&normal).unwrap()
+            );
+        } else {
+            assert!(output.contains("Imported 1 translations from "), "{output}");
+            assert_eq!(after.translation.as_deref(), Some("Adiós"));
+            assert_eq!(after.status, StringStatus::Translated);
+            assert_eq!(after.provider_used.as_deref(), Some("import"));
+        }
     }
 }
 
@@ -237,7 +293,8 @@ fn check_dry_run_then_import(format: &str) {
             keep_existing,
             "{output}"
         );
-        let skip_line = "Skipped 3: 1 outdated source(s), 1 unknown id(s), 1 empty/missing entries";
+        let skip_line =
+            "Skipped 3: 1 outdated source(s), 1 unknown id(s), 1 empty/missing/fuzzy entries";
         assert!(output.contains(skip_line), "{output}");
         assert!(
             output.trim_end().ends_with("Dry run: nothing was saved."),
