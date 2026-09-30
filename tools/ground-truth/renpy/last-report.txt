@@ -1,0 +1,40 @@
+Cycle 96: read-only RenPy extractor audit
+16 games; 686,682 raw tl statements, 580,543 unique (file, line, who, canonical text) after de-duplicating languages.
+Recall 97.92% (568,494/580,543); precision-ish 98.45% (545,171/553,735); live exact-reference subset 99.99% (475,780/475,844).
+Match: exact normalized (relative file, physical line) plus canonical text when current source agrees with the tl literal; when references drift or source is compiled, fallback to canonical text with speaker/context when available. This is text coverage for fallback matches, not proof every repeated occurrence survives.
+Precision-ish accepts either a tl dialogue literal or an old string from any language. Unmatched live dialogue is not automatically a false positive. Confirmed false positives are compiled non-text AST fields or dialogue-tagged literals inside Python blocks.
+
+game | unique tl | matched | extracted dialogue rows | not in tl | recall % | precision-ish %
+Area69-0.83-pc | 13317 | 13317 | 12079 | 769 | 100.00 | 93.63
+B.E.S.T-Episode5-pc | 20972 | 18341 | 9055 | 272 | 87.45 | 97.00
+CelebrityHunter-0.30-pc | 57967 | 57757 | 42203 | 103 | 99.64 | 99.76
+DimitrescuLC-pc | 21668 | 21667 | 22268 | 0 | 100.00 | 100.00
+Eimis_NTS_Life-v0.2.1-pc | 7880 | 7869 | 8082 | 56 | 99.86 | 99.31
+FriendsinNeedSeasonOne.v.0.95b-pc | 50500 | 41418 | 42983 | 0 | 82.02 | 100.00
+FutaInn-0.9.6-pc | 8857 | 8854 | 9162 | 28 | 99.97 | 99.69
+Lukesway0.18r-pc | 15530 | 15530 | 15791 | 1 | 100.00 | 99.99
+Lust-Academy-0.7.1f-pc | 24512 | 24500 | 22217 | 163 | 99.95 | 99.27
+NewFamily-pc | 16467 | 16465 | 15224 | 218 | 99.99 | 98.57
+PhotoHunt-0.20.2-pc | 262283 | 262264 | 269731 | 3240 | 99.99 | 98.80
+ProjektPassion-0.15-pc | 2876 | 2876 | 2972 | 0 | 100.00 | 100.00
+RMAWH-r4.3-pc | 70778 | 70774 | 74913 | 3541 | 99.99 | 95.27
+SRankBreeder-2.0-win | 4947 | 4947 | 5120 | 173 | 100.00 | 96.62
+StarAvenger-CH1-pc | 812 | 738 | 743 | 0 | 90.89 | 100.00
+StarAvenger-CH2_beta-pc | 1177 | 1177 | 1192 | 0 | 100.00 | 100.00
+
+All 16 auto-detected RenPy and exited 0; no selected game was skipped for detection. 1es copies and the other eligible inventory games were not sampled. Loose .rpy and archived .rpy/.rpyc were included. Standalone .rpyc is not traversed by directory extract (renpy.rs:2258,2296).
+
+MISS CLASSES: {"stale tl: statement absent/changed": 11771, "reference drift, statement exists elsewhere": 12, "compiled/archive source unavailable": 202, "empty text": 42, "stale tl: source statement now commented out": 15, "other parser rejection": 4, "menu state suppression": 1, "single-quoted say": 2}
+UNMATCHED CLASSES: {"compiled string not mapped (unresolved)": 1127, "compiled code/expression or locator": 5, "compiled other AST fields (unresolved)": 1, "live unmatched: tl coverage or non-dialogue context unresolved": 7414, "compiled visible text absent from tl": 17}
+Supplemental menu strings: 7,338 current choices located from old-string text in the referenced source file; 0 absent from all extracted sources (917 conditional; 7 argument-clause choices). The strings reference often points at menu: rather than the choice; this is reported separately from dialogue-block recall.
+
+WINNER: menu state suppresses character say statements inside branches. 165,910 current tl statements lost; for example menu prompt/branch lines remain in scripts but produce no database row. menu recognized at renpy.rs:657; exit guesses literal 8-space/2-tab indentation at :679; ordinary say only runs if !in_menu at :775. Narration is accepted as menu at :1267-1273 and omits label/context via :667.
+Minimal executable regression: regression.py / regression/game/script.rpy. Actual CLI exits 0; assertion fails for A visible branch line. and Another visible branch line. Outside say and narration are present; branch narration is mistagged menu without label.
+Suggested change only: crates/formats/src/renpy.rs, RenPyPlugin::extract_content and extract_menu_choice; replace boolean/fixed indentation with actual menu-header/choice/branch scopes, extract say inside branches, keep prompts/narration tagged dialogue with label. Size M, localized parser/state plus nested/tabbed/conditional menu regression tests. No implementation performed.
+Runner-up 1: typed compiled AST extraction, not every Unicode pickle string: 35,055 confirmed non-text extracted rows; 8,740 confirmed Say.what misses (5,214 slash/backslash incl text tags; 2,308 single-word period/underscore; 1,218 no alphabetic/too short). renpy.rs:1605-1609,1715-1738; harvest_rpyc_strings, scan_pickle_strings, is_renpy_dialogue_like. M/L. Compiled injection uses runtime text filter, not direct code substitution (renpy.rs:1550-1552).
+Runner-up 2: loose-dialogue file/path heuristic drops 1,573 markup/text lines and 21 escaped no-space lines. renpy.rs:913,942,1219-1256; extract_say_statement, is_file_reference. S. Examples include {i}tap-tap-tap!{/i} and {size=+50}THIS!!!{/size}.
+Lower priority: 265 dialogue-tagged Python literals from unrecognized python headers (e.g. init 1000 python hide:, recognized headers renpy.rs:632-635); 917 conditional choice misses at renpy.rs:1271-1273.
+All classifications and three complete path:line examples per class are in evidence.txt (two examples for single-quoted say because only two were found). Raw data are summary.json, misses.jsonl, classified-misses.jsonl, extras.jsonl, classified-extras.jsonl, ast-{summary,misses,extras}, menu-summary.json, *.locust.db and *.extract.log.
+Ground-truth parser exclusions: four nvl clear blocks without text, four translate <lang> python sections, one Portuguese first block with no source ref (see unparsed.json). Only quote-bearing original comments from active translate blocks count; nested commented-out blocks and Locust-generated files are excluded. Canonicalization follows renpy.rs:1098-1139.
+Rerun: python "C:\Users\Mike\AppData\Local\Temp\claude\C--Projects-Locust\f67370e7-c43e-4445-93ff-2c347022a384\scratchpad\ground\run_all.py" (regression.py intentionally exits 1).
+Build used: cargo build -p locust-cli (successful); git status --short checked empty; no repo source changes.

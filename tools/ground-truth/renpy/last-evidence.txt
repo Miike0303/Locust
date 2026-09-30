@@ -1,0 +1,107 @@
+MISSED: stale tl: statement absent/changed — 11,771
+  B.E.S.T-Episode5-pc: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\scripts.rpa#script.rpy:127 | "I can't..."
+  Ground truth: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\tl\french\script.rpy:228 | block start_23390470
+  Eimis_NTS_Life-v0.2.1-pc: D:\juegos\renpy\Eimis_NTS_Life-v0.2.1-pc\game\00auto-highlight.rpy:81 | "Transforms"
+  Ground truth: D:\juegos\renpy\Eimis_NTS_Life-v0.2.1-pc\game\tl\Paloslios\Paloslios.rpy:45 | block b9327469
+  CelebrityHunter-0.30-pc: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\priscila.rpy:12124 | "{i}DEISH{/i}"
+  Ground truth: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\tl\english\priscila.rpy:27462 | block priscila_e5_soco_b74e4818
+
+MISSED: reference drift, statement exists elsewhere — 12
+  B.E.S.T-Episode5-pc: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\scripts.rpa#script.rpy:169 | ""
+  Ground truth: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\tl\french\script.rpy:914 | block intro_0ae9bcd0
+  CelebrityHunter-0.30-pc: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\cassia.rpy:352 | ""
+  Ground truth: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\tl\english\cassia.rpy:786 | block cassia_evento1_0ae9bcd0
+  B.E.S.T-Episode5-pc: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\scripts.rpa#scripts/episode3/ep3s2b.rpy:17 | ""
+  Ground truth: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\tl\french\scripts\episode3\ep3s2b.rpy:6 | block ep3s2b_0ae9bcd0
+
+MISSED: compiled/archive source unavailable — 202
+  StarAvenger-CH1-pc: D:\juegos\renpy\StarAvenger-CH1-pc\StarAvengerCH1-pc\game/[compiled source]/sc3.rpy:57 | sa "Hey mom."
+  Ground truth: D:\juegos\renpy\StarAvenger-CH1-pc\StarAvengerCH1-pc\game\tl\Paloslios\Paloslios.rpy:4587 | block sc03_fbeeda8b
+  B.E.S.T-Episode5-pc: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\tl\schinese/[compiled source]/scripts/patch.rpy:54 | d "Who is She ?"
+  Ground truth: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\tl\schinese\scripts\e1\patch.rpy:60 | block e1s1_371dcb1d_1
+  Lust-Academy-0.7.1f-pc: D:\juegos\renpy\Lust-Academy-0.7.1f-pc\game/[compiled source]/logic/episodes_after_first/ep2/sheet_22.rpy:135 | "Victoria" "Next!"
+  Ground truth: D:\juegos\renpy\Lust-Academy-0.7.1f-pc\game\tl\Paloslios\Paloslios.rpy:93435 | block sheet_22_985f9fe4
+
+MISSED: empty text — 42
+  Eimis_NTS_Life-v0.2.1-pc: D:\juegos\renpy\Eimis_NTS_Life-v0.2.1-pc\game\chapters\chapter3.rpy:306 | tr "" with fade
+  Ground truth: D:\juegos\renpy\Eimis_NTS_Life-v0.2.1-pc\game\tl\Paloslios\Paloslios.rpy:26963 | block jeromech3p1_21d1c277
+  B.E.S.T-Episode5-pc: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\scripts.rpa#scripts/episode5/e5s2/e5s2.rpy:196 | ""
+  Ground truth: D:\juegos\renpy\B.E.S.T-Episode5-pc\game\tl\french\scripts\episode5\e5s2\e5s2.rpy:290 | block sexygracee5s2_0ae9bcd0
+  CelebrityHunter-0.30-pc: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\cassia.rpy:369 | ""
+  Ground truth: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\tl\Paloslios\Paloslios.rpy:5547 | block cassia_evento1_0ae9bcd0
+
+MISSED: stale tl: source statement now commented out — 15
+  CelebrityHunter-0.30-pc: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\cassino.rpy:1714 | p rindo "Que bom!"
+  Ground truth: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\tl\english\cassino.rpy:2962 | block casher_menu_2fbc643d
+  CelebrityHunter-0.30-pc: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\cassino.rpy:1730 | p rindo "Não esquente."
+  Ground truth: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\tl\english\cassino.rpy:2986 | block casher_menu_6f59790e
+  CelebrityHunter-0.30-pc: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\cassino.rpy:1722 | "Atendente" "Senhor? Tudo bem?"
+  Ground truth: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\tl\english\cassino.rpy:2974 | block casher_menu_1ebc14f2
+
+MISSED: other parser rejection — 4
+  CelebrityHunter-0.30-pc: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\cenarios.rpy:2231 | mc bravo "..."
+  Ground truth: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\tl\english\cenarios.rpy:9658 | block cenario_tadaima_98e7d804_1
+  PhotoHunt-0.20.2-pc: D:\juegos\renpy\PhotoHunt-0.20.2-pc\game\script_loc\script_events\mon\mon_dates.rpy:1170 | mon 12 ‘ "Ahnn… Fucking me so well I’m… I can’t… think..."
+  Ground truth: D:\juegos\renpy\PhotoHunt-0.20.2-pc\game\tl\Paloslios\Paloslios.rpy:1434069 | block mon_date_2_menu_d6e0c51e
+  CelebrityHunter-0.30-pc: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\cenarios.rpy:2259 | mc safado "..."
+  Ground truth: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\tl\english\cenarios.rpy:9718 | block cenario_tadaima_46a801f8
+
+MISSED: menu state suppression — 1
+  DimitrescuLC-pc: D:\juegos\renpy\DimitrescuLC-pc\game\script5.rpy:989 | y ""
+  Ground truth: D:\juegos\renpy\DimitrescuLC-pc\game\tl\Paloslios\Paloslios.rpy:98529 | block tape5cc_ebe03ff1
+  Only 1 cases exist; no additional examples invented.
+
+MISSED: single-quoted say — 2
+  RMAWH-r4.3-pc: D:\juegos\renpy\RMAWH-r4.3-pc\game\scripts\story\day_0033.rpy:3012 | bt "...I do love how it feels when he finishes inside me."
+  Ground truth: D:\juegos\renpy\RMAWH-r4.3-pc\game\tl\Paloslios\Paloslios.rpy:278187 | block d33_2_1_3_f593d807
+  RMAWH-r4.3-pc: D:\juegos\renpy\RMAWH-r4.3-pc\game\scripts\story\day_0032.rpy:556 | m "But-"
+  Ground truth: D:\juegos\renpy\RMAWH-r4.3-pc\game\tl\Paloslios\Paloslios.rpy:256893 | block d32_2_39b1dd6b_1
+  Only 2 cases exist; no additional examples invented.
+
+UNMATCHED EXTRACT: compiled string not mapped (unresolved) — 1,127
+  Area69-0.83-pc: D:\juegos\renpy\Area69-0.83-pc\game\scripts.rpa#scripts.rpa#screens.rpyc#s37 | "Veloc. texto"
+  DB row: scripts.rpa#screens.rpyc#s37 | tags ["dialogue","rpyc"] | AST [] | current 
+  Lust-Academy-0.7.1f-pc: D:\juegos\renpy\Lust-Academy-0.7.1f-pc\game\scripts.rpa#scripts.rpa#logic/main_interface/quest_log_screen.rpyc#s2 | "HOUSE POINTS"
+  DB row: scripts.rpa#logic/main_interface/quest_log_screen.rpyc#s2 | tags ["dialogue","rpyc"] | AST [] | current 
+  NewFamily-pc: D:\juegos\renpy\NewFamily-pc\game\scripts.rpa#scripts.rpa#screens.rpyc#s87 | "[message!tq]"
+  DB row: scripts.rpa#screens.rpyc#s87 | tags ["dialogue","rpyc"] | AST [] | current 
+
+UNMATCHED EXTRACT: compiled code/expression or locator — 5
+  Area69-0.83-pc: D:\juegos\renpy\Area69-0.83-pc/#game/kGame/kMemotest.rpy:25 | "S"
+  DB row: scripts.rpa#screens.rpyc#s68 | tags ["dialogue","rpyc"] | AST [{"owner": "Image", "field": "imgname", "location": ["game/kGame/kMemotest.rpy", 25], "expr": false}] | current 
+  NewFamily-pc: D:\juegos\renpy\NewFamily-pc/#game/script/sc/image.rpy:1011 | "back"
+  DB row: scripts.rpa#script/gallery/gallery_asuna.rpyc#s0 | tags ["dialogue","rpyc"] | AST [{"owner": "Image", "field": "imgname", "location": ["game/script/sc/image.rpy", 1011], "expr": false}] | current 
+  Area69-0.83-pc: D:\juegos\renpy\Area69-0.83-pc/#game/kGame/kMemotest.rpy:14 | "H"
+  DB row: scripts.rpa#screens.rpyc#s66 | tags ["dialogue","rpyc"] | AST [{"owner": "Image", "field": "imgname", "location": ["game/kGame/kMemotest.rpy", 14], "expr": false}] | current 
+
+UNMATCHED EXTRACT: compiled other AST fields (unresolved) — 1
+  Area69-0.83-pc: D:\juegos\renpy\Area69-0.83-pc/#game/kGame/kNotify.rpy:74 | "x"
+  DB row: scripts.rpa#kGame/3dcamera/camera.rpyc#s23 | tags ["dialogue","rpyc"] | AST [{"owner": "SLFor", "field": "variable", "location": ["game/kGame/kNotify.rpy", 74], "expr": false}] | current 
+  Only 1 cases exist; no additional examples invented.
+
+UNMATCHED EXTRACT: live unmatched: tl coverage or non-dialogue context unresolved — 7,414
+  CelebrityHunter-0.30-pc: D:\juegos\renpy\CelebrityHunter-0.30-pc\game\definicoes.rpy:2141 | "praia_gazebo"
+  DB row: definicoes.rpy#2141 | tags ["dialogue"] | AST [] | current "praia_gazebo"
+  Eimis_NTS_Life-v0.2.1-pc: D:\juegos\renpy\Eimis_NTS_Life-v0.2.1-pc\game\ActionEditor_screens.rpy:1293 | "scene_editor"
+  DB row: ActionEditor_screens.rpy#1293 | tags ["dialogue"] | AST [] | current style_group "scene_editor"
+  PhotoHunt-0.20.2-pc: D:\juegos\renpy\PhotoHunt-0.20.2-pc\game\script_loc\pc\pc.rpy:38 | "pc_icon_1_%s"
+  DB row: pc.rpy#38 | tags ["dialogue"] | AST [] | current imagebutton auto "pc_icon_1_%s" action Call("pic_gal") focus_mask True
+
+UNMATCHED EXTRACT: compiled visible text absent from tl — 17
+  Lust-Academy-0.7.1f-pc: D:\juegos\renpy\Lust-Academy-0.7.1f-pc/#game/logic/events/arthur_2.rpy:388 | "Why are you shaking?"
+  DB row: scripts.rpa#logic/events/arthur_2.rpyc#s143 | tags ["dialogue","rpyc"] | AST [{"owner": "Say", "field": "what", "location": ["game/logic/events/arthur_2.rpy", 388], "expr": false}] | current 
+  NewFamily-pc: D:\juegos\renpy\NewFamily-pc/#game/script/event/event_miho.rpy:871 | "You've never worked in a café before, right?"
+  DB row: scripts.rpa#script/event/event_miho.rpyc#s348 | tags ["dialogue","rpyc"] | AST [{"owner": "Say", "field": "what", "location": ["game/script/event/event_miho.rpy", 871], "expr": false}] | current 
+  Lust-Academy-0.7.1f-pc: D:\juegos\renpy\Lust-Academy-0.7.1f-pc/#game/logic/events/xmas.rpy:143 | "No, bro, don't worry. It's a holiday."
+  DB row: scripts.rpa#logic/events/xmas.rpyc#s45 | tags ["dialogue","rpyc"] | AST [{"owner": "Say", "field": "what", "location": ["game/logic/events/xmas.rpy", 143], "expr": false}] | current 
+
+AST VERIFICATION: compiled Say.what omitted by heuristic — 0
+  Only 0 cases exist; no additional examples invented.
+
+AST VERIFICATION: compiled TL mismatch/unresolved — 14
+  Lust-Academy-0.7.1f-pc: D:\juegos\renpy\Lust-Academy-0.7.1f-pc\game/[compiled source]/logic/episodes_after_first/ep2/sheet_22.rpy:135 | "Victoria" "Next!"
+  Ground truth: D:\juegos\renpy\Lust-Academy-0.7.1f-pc\game\tl\Paloslios\Paloslios.rpy:93435 | block sheet_22_985f9fe4
+  NewFamily-pc: D:\juegos\renpy\NewFamily-pc\game/[compiled source]/script/event/event_miho.rpy:871 | man "You've never worked in a cafe before, right?"
+  Ground truth: D:\juegos\renpy\NewFamily-pc\game\tl\Paloslios\Paloslios.rpy:16347 | block miho_heart_5_e5f63445
+  Lust-Academy-0.7.1f-pc: D:\juegos\renpy\Lust-Academy-0.7.1f-pc\game/[compiled source]/logic/events/xmas.rpy:143 | "Elijah " "No, bro, don't worry. It's a holiday."
+  Ground truth: D:\juegos\renpy\Lust-Academy-0.7.1f-pc\game\tl\Paloslios\Paloslios.rpy:273 | block Xmas_1_label_ae1c1129
