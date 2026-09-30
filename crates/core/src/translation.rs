@@ -98,6 +98,89 @@ fn default_max_batch_tokens() -> Option<usize> {
     Some(6000)
 }
 
+/// Only occurrence locators/state are excluded. Raw source also pins the
+/// placeholder map: two different controls can sanitize to the same request.
+/// Languages, game context, glossary and fit policy are constant within a run.
+#[derive(Hash, PartialEq, Eq)]
+struct RepeatedSourceKey {
+    source: String,
+    context: Option<String>,
+    tags: Vec<String>,
+    char_limit: Option<usize>,
+    physical_source: String,
+    slot_budget: Option<(String, usize)>,
+    // Shared TextAsset acceptance/retry hints depend on its other cells. Keep
+    // these entries independent rather than assume interchangeable output.
+    shared_cell: Option<String>,
+}
+
+struct RepeatedSources {
+    members: HashMap<String, Vec<String>>,
+}
+
+impl RepeatedSources {
+    fn collect(entries: Vec<StringEntry>) -> (Vec<StringEntry>, Self) {
+        let mut representatives = Vec::new();
+        let mut by_key: HashMap<RepeatedSourceKey, String> = HashMap::new();
+        let mut members: HashMap<String, Vec<String>> = HashMap::new();
+        for entry in entries {
+            let key = RepeatedSourceKey {
+                source: entry.source.clone(),
+                context: entry.context.clone(),
+                tags: entry.tags.clone(),
+                char_limit: entry.char_limit,
+                physical_source: entry
+                    .injection_source()
+                    .expect("injection source metadata prevalidated")
+                    .to_owned(),
+                slot_budget: crate::validation::binary_slot_budget(&entry)
+                    .expect("binary slot metadata prevalidated"),
+                shared_cell: crate::textasset_group::is_grouped_entry(&entry)
+                    .then(|| entry.id.clone()),
+            };
+            if let Some(id) = by_key.get(&key) {
+                members.get_mut(id).unwrap().push(entry.id);
+            } else {
+                by_key.insert(key, entry.id.clone());
+                members.insert(entry.id.clone(), vec![entry.id.clone()]);
+                representatives.push(entry);
+            }
+        }
+        (representatives, Self { members })
+    }
+
+    fn expand(
+        &self,
+        results: Vec<TranslationResult>,
+        placeholders: &mut HashMap<String, Vec<Placeholder>>,
+        budgets: &mut HashMap<String, (String, usize)>,
+    ) -> Vec<TranslationResult> {
+        let mut expanded = Vec::new();
+        for result in results {
+            for id in &self.members[&result.entry_id] {
+                let mut member = result.clone();
+                if id != &result.entry_id {
+                    member.entry_id.clone_from(id);
+                    // Provider usage belongs to the representative, never to
+                    // the number of rows that reuse its answer.
+                    member.tokens_used = None;
+                    member.input_tokens = None;
+                    member.output_tokens = None;
+                    member.cost_usd = None;
+                    if let Some(phs) = placeholders.get(&result.entry_id).cloned() {
+                        placeholders.insert(id.clone(), phs);
+                    }
+                    if let Some(budget) = budgets.get(&result.entry_id).cloned() {
+                        budgets.insert(id.clone(), budget);
+                    }
+                }
+                expanded.push(member);
+            }
+        }
+        expanded
+    }
+}
+
 fn translation_batches<'a>(
     entries: &'a [StringEntry],
     opts: &TranslationOptions,
@@ -689,6 +772,11 @@ async fn call_provider_with_limiter(
             if is_retry {
                 limiter.acquire().await;
             }
+            tracing::debug!(
+                provider = provider.id(),
+                strings = requests.len(),
+                "dispatching translation requests"
+            );
             provider.translate(&requests).await
         }
     })
@@ -1279,7 +1367,10 @@ impl TranslationManager {
             Result<ProviderCall>,
         );
         let mut in_flight: tokio::task::JoinSet<BatchOutcome> = tokio::task::JoinSet::new();
-        let chunks = translation_batches(&remaining, &opts);
+        // Group across the entire pending run, before batching/concurrency.
+        // Memory/glossary hits have already taken their normal per-row path.
+        let (representatives, repeated) = RepeatedSources::collect(remaining);
+        let chunks = translation_batches(&representatives, &opts);
         let mut chunk_iter = chunks.into_iter();
         let mut cancelled = false;
         let mut budget_error = None;
@@ -1417,7 +1508,7 @@ impl TranslationManager {
             let Some(joined) = in_flight.join_next().await else {
                 break;
             };
-            let (requests, placeholders_by_id, budgets_by_id, batch_result) = match joined {
+            let (requests, mut placeholders_by_id, mut budgets_by_id, batch_result) = match joined {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     observed_cost.complete &= self.provider.is_free();
@@ -1448,6 +1539,13 @@ impl TranslationManager {
                     if budget_error.is_none() {
                         budget_error = observed_budget_error(observed_cost, opts.cost_limit_usd);
                     }
+                    // Account provider work before validation or fan-out,
+                    // including malformed/partial responses that cannot save.
+                    for result in &results {
+                        total_tokens += result.tokens_used.unwrap_or(0) as u64;
+                        total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
+                        total_output_tokens += result.output_tokens.unwrap_or(0) as u64;
+                    }
                     let expected: std::collections::HashSet<_> =
                         requests.iter().map(|r| r.entry_id.as_str()).collect();
                     let actual: std::collections::HashSet<_> =
@@ -1458,11 +1556,6 @@ impl TranslationManager {
                     {
                         // Invalid IDs prevent storage, not billing: account for
                         // the provider usage before considering another batch.
-                        for result in &results {
-                            total_tokens += result.tokens_used.unwrap_or(0) as u64;
-                            total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
-                            total_output_tokens += result.output_tokens.unwrap_or(0) as u64;
-                        }
                         let _ = tx
                             .send(ProgressEvent::BatchFailed {
                                 entry_id: None,
@@ -1473,6 +1566,11 @@ impl TranslationManager {
                             break;
                         }
                         continue;
+                    }
+                    if cancel.is_cancelled() {
+                        cancelled = true;
+                        in_flight.abort_all();
+                        break;
                     }
                     // Restore placeholders in translations before saving
                     for result in &mut results {
@@ -1630,7 +1728,7 @@ impl TranslationManager {
                                         result.translation = retry_result.translation;
                                         best_len = new_len;
                                         fitted = true;
-                                        retried_ok += 1;
+                                        retried_ok += repeated.members[&result.entry_id].len();
                                         tracing::info!(
                                             entry_id = %result.entry_id,
                                             attempt,
@@ -1703,16 +1801,18 @@ impl TranslationManager {
                                     result.translation = fitted_text;
                                     best_len = new_len;
                                     fitted = true;
-                                    retried_ok += 1;
+                                    retried_ok += repeated.members[&result.entry_id].len();
                                 }
                             }
                         }
                         if !fitted {
-                            oversize_after_retry += 1;
-                            let _ = tx.send(ProgressEvent::BatchFailed {
-                                entry_id: Some(result.entry_id.clone()),
-                                error: "translation exceeds the binary slot; full text preserved for review (no automatic truncation)".into(),
-                            }).await;
+                            for id in &repeated.members[&result.entry_id] {
+                                oversize_after_retry += 1;
+                                let _ = tx.send(ProgressEvent::BatchFailed {
+                                    entry_id: Some(id.clone()),
+                                    error: "translation exceeds the binary slot; full text preserved for review (no automatic truncation)".into(),
+                                }).await;
+                            }
                             tracing::warn!(
                                 entry_id = %result.entry_id,
                                 best_len,
@@ -1723,15 +1823,21 @@ impl TranslationManager {
                         }
                     }
 
+                    if cancel.is_cancelled() {
+                        cancelled = true;
+                        in_flight.abort_all();
+                        break;
+                    }
+                    let results =
+                        repeated.expand(results, &mut placeholders_by_id, &mut budgets_by_id);
+                    // Raw source and budgets pin identical restoration/length
+                    // fitting. Each occurrence still validates its own controls
+                    // and uses its own guarded save/progress event.
                     // Reject broken variables, including damage from length fitting.
                     // Leave those entries pending so they can be retried/reviewed.
                     let mut valid = Vec::with_capacity(results.len());
                     for result in results {
                         group_acc.mark_changed(&result.entry_id);
-                        // Usage includes invalid answers too: those calls were made.
-                        total_tokens += result.tokens_used.unwrap_or(0) as u64;
-                        total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
-                        total_output_tokens += result.output_tokens.unwrap_or(0) as u64;
                         if result.translation.trim().is_empty() {
                             let _ = tx
                                 .send(ProgressEvent::BatchFailed {
@@ -2514,6 +2620,438 @@ mod tests {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let glossary = Arc::new(Glossary::new(db.clone()));
         (db, glossary)
+    }
+
+    #[derive(Clone, Copy)]
+    enum RepeatedReply {
+        Success,
+        TransientOnce,
+        Error,
+        Partial,
+        DuplicateIds,
+        Empty,
+        LengthRetry,
+        Cancel,
+    }
+
+    struct RepeatedProvider {
+        reply: RepeatedReply,
+        calls: Mutex<Vec<Vec<TranslationRequest>>>,
+        cancel: CancellationToken,
+    }
+
+    impl RepeatedProvider {
+        fn new(reply: RepeatedReply) -> Self {
+            Self {
+                reply,
+                calls: Mutex::new(Vec::new()),
+                cancel: CancellationToken::new(),
+            }
+        }
+
+        fn sent(&self) -> usize {
+            self.calls.lock().unwrap().iter().map(Vec::len).sum()
+        }
+    }
+
+    #[async_trait]
+    impl TranslationProvider for RepeatedProvider {
+        fn id(&self) -> &str {
+            "repeat-test"
+        }
+        fn name(&self) -> &str {
+            "Counting provider"
+        }
+        fn is_free(&self) -> bool {
+            false
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                let call = calls.len();
+                calls.push(requests.to_vec());
+                call
+            };
+            match self.reply {
+                RepeatedReply::TransientOnce if call == 0 => {
+                    return Err(LocustError::ProviderError("503 unavailable".into()));
+                }
+                RepeatedReply::Error => {
+                    return Err(LocustError::ProviderError("401 unauthorized".into()));
+                }
+                RepeatedReply::Cancel => self.cancel.cancel(),
+                _ => {}
+            }
+            let mut results: Vec<_> = requests
+                .iter()
+                .map(|r| TranslationResult {
+                    entry_id: r.entry_id.clone(),
+                    translation: match self.reply {
+                        RepeatedReply::Empty => String::new(),
+                        RepeatedReply::LengthRetry if call == 0 => "Much too long".into(),
+                        RepeatedReply::LengthRetry => "OK".into(),
+                        _ => format!("en: {}", r.source),
+                    },
+                    detected_source_lang: None,
+                    provider: self.id().into(),
+                    tokens_used: Some(7),
+                    input_tokens: Some(4),
+                    output_tokens: Some(3),
+                    cost_usd: Some(0.002),
+                })
+                .collect();
+            if matches!(self.reply, RepeatedReply::Partial) {
+                results.pop();
+            }
+            if matches!(self.reply, RepeatedReply::DuplicateIds) && results.len() > 1 {
+                results[1].entry_id = results[0].entry_id.clone();
+            }
+            Ok(results)
+        }
+        async fn estimate_cost(&self, _chars: usize, _lang: &str) -> Option<f64> {
+            Some(0.002)
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn repeated_entries(count: usize, source: &str) -> Vec<StringEntry> {
+        (0..count)
+            .map(|i| StringEntry::new(format!("r-{i}"), source, PathBuf::from("test.json")))
+            .collect()
+    }
+
+    async fn run_repeated_job(
+        entries: Vec<StringEntry>,
+        provider: Arc<RepeatedProvider>,
+        mut opts: TranslationOptions,
+    ) -> (Arc<Database>, Vec<ProgressEvent>) {
+        let (db, glossary) = setup();
+        db.save_entries(&entries).unwrap();
+        opts.use_memory = false;
+        opts.use_glossary = false;
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary)
+            .with_retry_config(RetryConfig {
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                ..Default::default()
+            });
+        let (tx, mut rx) = mpsc::channel(100);
+        manager
+            .translate_entries(
+                entries,
+                opts,
+                tx,
+                "repeat-test".into(),
+                provider.cancel.clone(),
+            )
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        (db, events)
+    }
+
+    #[tokio::test]
+    async fn repeated_sources_stats_count_provider_usage_once_and_all_rows() {
+        let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+        let mut entries = repeated_entries(10, "Source");
+        for (i, entry) in entries.iter_mut().enumerate() {
+            entry.source = format!("Source {}", i % 3);
+        }
+        let (db, events) = run_repeated_job(entries, provider.clone(), Default::default()).await;
+        assert_eq!(provider.sent(), 3);
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
+        let run = db.get_translation_runs().unwrap().remove(0);
+        assert_eq!(run.strings_translated, 10);
+        assert_eq!(
+            (run.tokens_used, run.input_tokens, run.output_tokens),
+            (21, 12, 9)
+        );
+        assert!((run.cost_usd - 0.006).abs() < 1e-10);
+        assert!(run.cost_is_complete);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProgressEvent::BatchCompleted {
+                completed: 10,
+                total: 10,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProgressEvent::Completed {
+                total_translated: 10,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn repeated_sources_keep_context_tags_limits_encoding_and_physical_source_separate() {
+        let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+        let mut entries = repeated_entries(9, "ABC");
+        entries[2].context = Some("speaker".into());
+        entries[3].tags = vec!["name".into()];
+        entries[4].char_limit = Some(20);
+        for (i, encoding, physical) in [
+            (5, "utf8", "long physical"),
+            (6, "utf8", "longer physical"),
+            (7, "utf16le", "long physical"),
+        ] {
+            entries[i]
+                .metadata
+                .insert("binary_slot".into(), serde_json::json!(encoding));
+            entries[i].metadata.insert(
+                crate::models::INJECTION_SOURCE_METADATA_KEY.into(),
+                serde_json::json!(physical),
+            );
+        }
+        entries[8].metadata.insert(
+            crate::models::INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("baseline"),
+        );
+        let (db, _) = run_repeated_job(entries, provider.clone(), Default::default()).await;
+        assert_eq!(
+            provider.sent(),
+            8,
+            "only the first two entries are interchangeable"
+        );
+        assert_eq!(db.get_translation_runs().unwrap()[0].strings_translated, 9);
+    }
+
+    #[tokio::test]
+    async fn repeated_sources_restore_controls_and_do_not_merge_sanitized_collisions() {
+        let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+        let mut entries = repeated_entries(5, r"Hello {alice} \V[1]");
+        entries[4].source = r"Hello {bob} \V[1]".into();
+        let originals = entries.clone();
+        let (db, _) = run_repeated_job(entries, provider.clone(), Default::default()).await;
+        assert_eq!(provider.sent(), 2);
+        for original in originals {
+            let saved = db.get_entry(&original.id).unwrap().unwrap();
+            assert_eq!(saved.translation, Some(format!("en: {}", original.source)));
+            assert_eq!(saved.status, StringStatus::Translated);
+            assert_eq!(saved.provider_used.as_deref(), Some("repeat-test"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_sources_transport_retry_retries_one_representative() {
+        let provider = Arc::new(RepeatedProvider::new(RepeatedReply::TransientOnce));
+        let (db, _) = run_repeated_job(
+            repeated_entries(6, "Source"),
+            provider.clone(),
+            Default::default(),
+        )
+        .await;
+        assert_eq!(provider.sent(), 2);
+        assert_eq!(provider.calls.lock().unwrap().len(), 2);
+        let run = db.get_translation_runs().unwrap().remove(0);
+        assert_eq!(run.strings_translated, 6);
+        assert_eq!(run.tokens_used, 7);
+        assert!(
+            !run.cost_is_complete,
+            "failed paid attempt has unknown cost"
+        );
+        for i in 0..6 {
+            assert_eq!(
+                db.get_entry(&format!("r-{i}")).unwrap().unwrap().status,
+                StringStatus::Translated
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_sources_errors_partial_duplicate_and_empty_results_save_no_members() {
+        for (reply, sent) in [
+            (RepeatedReply::Error, 1),
+            (RepeatedReply::Partial, 2),
+            (RepeatedReply::DuplicateIds, 2),
+            (RepeatedReply::Empty, 1),
+        ] {
+            let provider = Arc::new(RepeatedProvider::new(reply));
+            let mut entries = repeated_entries(6, "Source");
+            if sent == 2 {
+                entries[3].source = "Other".into();
+            }
+            let (db, events) =
+                run_repeated_job(entries, provider.clone(), Default::default()).await;
+            assert_eq!(provider.sent(), sent);
+            for i in 0..6 {
+                let entry = db.get_entry(&format!("r-{i}")).unwrap().unwrap();
+                assert_eq!(entry.status, StringStatus::Pending);
+                assert!(entry.translation.is_none());
+            }
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::BatchFailed { .. })));
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::StringTranslated { .. })));
+            assert!(events.iter().any(|e| matches!(
+                e,
+                ProgressEvent::Completed {
+                    total_translated: 0,
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_sources_length_retry_is_shared_and_usage_is_not_multiplied() {
+        let provider = Arc::new(RepeatedProvider::new(RepeatedReply::LengthRetry));
+        let mut entries = repeated_entries(5, "ABC");
+        for entry in &mut entries {
+            entry
+                .metadata
+                .insert("binary_slot".into(), serde_json::json!("utf8"));
+        }
+        let (db, _) = run_repeated_job(entries, provider.clone(), Default::default()).await;
+        assert_eq!(provider.sent(), 2);
+        let run = db.get_translation_runs().unwrap().remove(0);
+        assert_eq!(run.strings_translated, 5);
+        assert_eq!(
+            (run.tokens_used, run.input_tokens, run.output_tokens),
+            (14, 8, 6)
+        );
+        assert!((run.cost_usd - 0.004).abs() < 1e-10);
+        for i in 0..5 {
+            let entry = db.get_entry(&format!("r-{i}")).unwrap().unwrap();
+            assert_eq!(entry.status, StringStatus::Translated);
+            assert_eq!(entry.translation.as_deref(), Some("OK"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_sources_cost_limit_estimates_only_representatives() {
+        let (db, glossary) = setup();
+        let entries = repeated_entries(10, "Source");
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(MockProvider::new());
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+        let (tx, _rx) = mpsc::channel(100);
+        manager
+            .translate_entries(
+                entries,
+                TranslationOptions {
+                    use_memory: false,
+                    cost_limit_usd: Some(0.0002),
+                    ..Default::default()
+                },
+                tx,
+                "budget".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(db.get_translation_runs().unwrap()[0].strings_translated, 10);
+    }
+
+    #[tokio::test]
+    async fn repeated_sources_cancellation_before_dispatch_and_before_fanout_save_nothing() {
+        for before_dispatch in [true, false] {
+            let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Cancel));
+            if before_dispatch {
+                provider.cancel.cancel();
+            }
+            let (db, events) = run_repeated_job(
+                repeated_entries(5, "Source"),
+                provider.clone(),
+                Default::default(),
+            )
+            .await;
+            assert_eq!(provider.sent(), usize::from(!before_dispatch));
+            assert!(events.iter().any(|e| matches!(e, ProgressEvent::Paused)));
+            for i in 0..5 {
+                assert_eq!(
+                    db.get_entry(&format!("r-{i}")).unwrap().unwrap().status,
+                    StringStatus::Pending
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_sources_translate_ten_entries_with_three_provider_strings() {
+        let (db, glossary) = setup();
+        let entries: Vec<_> = (0..10)
+            .map(|i| {
+                StringEntry::new(
+                    format!("repeat-{i}"),
+                    format!("Source {}", i % 3),
+                    PathBuf::from(format!("file-{i}.json")),
+                )
+            })
+            .collect();
+        db.save_entries(&entries).unwrap();
+        let provider = Arc::new(MockProvider::new());
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        manager
+            .translate_entries(
+                entries.clone(),
+                TranslationOptions {
+                    batch_size: 1,
+                    max_concurrent: 3,
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "repeated-sources".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let mut translated = HashSet::new();
+        let mut finished = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ProgressEvent::Started { total, .. } => assert_eq!(total, 10),
+                ProgressEvent::StringTranslated { entry_id, .. } => {
+                    assert!(translated.insert(entry_id));
+                }
+                ProgressEvent::BatchCompleted {
+                    completed, total, ..
+                } => {
+                    assert_eq!(total, 10);
+                    assert!(completed <= total);
+                }
+                ProgressEvent::Completed {
+                    total_translated, ..
+                } => {
+                    assert_eq!(total_translated, 10);
+                    finished = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(finished);
+        assert_eq!(translated.len(), 10);
+        for original in &entries {
+            let saved = db.get_entry(&original.id).unwrap().unwrap();
+            assert_eq!(saved.status, StringStatus::Translated);
+            assert_eq!(saved.provider_used.as_deref(), Some("mock"));
+            assert_eq!(saved.translation, Some(format!("en: {}", original.source)));
+        }
+        let run = db.get_translation_runs().unwrap().remove(0);
+        assert_eq!(run.strings_translated, 10);
+        let sent = provider.call_count.load(Ordering::SeqCst);
+        eprintln!("10 entries, 3 distinct sources: provider strings sent = {sent}");
+        assert_eq!(sent, 3);
+        assert!((run.cost_usd - 0.0003).abs() < 1e-10);
     }
 
     #[tokio::test]
@@ -4857,6 +5395,9 @@ mod tests {
             for entry in &mut entries {
                 entry.metadata.clear();
                 entry.textasset_original = None;
+                // This test scripts different answers for equal sources; make
+                // their request contexts distinct so those answers are valid.
+                entry.context = Some(entry.id.clone());
             }
         }
         db.save_entries(&entries).unwrap();

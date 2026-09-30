@@ -219,7 +219,7 @@ async fn invalid_ids_check_actual_cost_before_any_next_dispatch() {
     });
     let (db, result) = translate_with_cost_provider(
         provider.clone(),
-        vec![entry("one"), entry("two")],
+        vec![entry("one"), entry("two").with_context("second batch")],
         TranslationOptions {
             batch_size: 1,
             cost_limit_usd: Some(0.5),
@@ -246,7 +246,7 @@ async fn paid_transport_retry_marks_cost_incomplete_and_stops_budgeted_run() {
     });
     let (db, result) = translate_with_cost_provider(
         provider.clone(),
-        vec![entry("one"), entry("two")],
+        vec![entry("one"), entry("two").with_context("second batch")],
         TranslationOptions {
             batch_size: 1,
             cost_limit_usd: Some(1.0),
