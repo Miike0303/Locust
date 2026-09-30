@@ -425,13 +425,19 @@ impl RpgMakerMvPlugin {
             };
 
             match code {
-                // Show Text header — remember the speaker for the lines that follow
+                // Show Text header — extract the MZ name and retain dialogue context.
                 101 => {
                     speaker = params
                         .get(4)
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.trim().is_empty())
                         .map(|s| s.to_string());
+                    if let Some(name) = speaker.as_deref().filter(|s| has_speaker_text(s)) {
+                        let id = format!("{}#cmd_{}#speaker", id_prefix, cmd_idx);
+                        let mut entry = StringEntry::new(id, name, file_path.to_path_buf());
+                        entry.tags = vec!["actor_name".to_string(), "speaker".to_string()];
+                        entries.push(entry);
+                    }
                 }
                 // Show Text / Scrolling Text content. Consecutive lines form ONE
                 // message box, so merge the run into a single entry — the model
@@ -951,7 +957,9 @@ impl RpgMakerMvPlugin {
             None => return,
         };
 
-        if parts.len() == 5 && parts[4].starts_with("choice_") {
+        if parts.last() == Some(&"speaker") {
+            Self::apply_speaker_translation(cmd, translation);
+        } else if parts.len() == 5 && parts[4].starts_with("choice_") {
             let ci: usize = parts[4]
                 .strip_prefix("choice_")
                 .and_then(|s| s.parse().ok())
@@ -978,6 +986,21 @@ impl RpgMakerMvPlugin {
                 } else if let Some(first) = params.first_mut() {
                     *first = serde_json::Value::String(translation.to_string());
                 }
+            }
+        }
+    }
+
+    fn apply_speaker_translation(cmd: &mut serde_json::Value, translation: &str) {
+        if cmd.get("code").and_then(|v| v.as_i64()) != Some(101) {
+            return;
+        }
+        if let Some(name) = cmd
+            .get_mut("parameters")
+            .and_then(|v| v.as_array_mut())
+            .and_then(|p| p.get_mut(4))
+        {
+            if name.as_str().is_some_and(has_speaker_text) {
+                *name = serde_json::Value::String(translation.to_string());
             }
         }
     }
@@ -1081,7 +1104,9 @@ impl RpgMakerMvPlugin {
             None => return,
         };
 
-        if parts.len() == 3 && parts[2].starts_with("choice_") {
+        if parts.last() == Some(&"speaker") {
+            Self::apply_speaker_translation(cmd, translation);
+        } else if parts.len() == 3 && parts[2].starts_with("choice_") {
             let ci: usize = parts[2]
                 .strip_prefix("choice_")
                 .and_then(|s| s.parse().ok())
@@ -1157,7 +1182,9 @@ impl RpgMakerMvPlugin {
             None => return,
         };
 
-        if parts.len() == 4 && parts[3].starts_with("choice_") {
+        if parts.last() == Some(&"speaker") {
+            Self::apply_speaker_translation(cmd, translation);
+        } else if parts.len() == 4 && parts[3].starts_with("choice_") {
             let ci: usize = parts[3]
                 .strip_prefix("choice_")
                 .and_then(|s| s.parse().ok())
@@ -1374,6 +1401,55 @@ impl RpgMakerMvPlugin {
         }
         Ok(all)
     }
+}
+
+/// A displayed speaker needs literal content beyond control codes and whitespace.
+fn has_speaker_text(s: &str) -> bool {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let mut had_letters = false;
+            while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                chars.next();
+                had_letters = true;
+            }
+            // Plugin escapes also use angle/brace arguments, e.g. \tl{A0026}.
+            let end = match chars.peek() {
+                Some('[') => Some(']'),
+                Some('<') if had_letters => Some('>'),
+                Some('{') if had_letters => Some('}'),
+                _ => None,
+            };
+            if let Some(end) = end {
+                for c in chars.by_ref() {
+                    if c == end {
+                        break;
+                    }
+                }
+            } else if !had_letters && chars.peek().is_some_and(|c| "{}$.|!><^".contains(*c)) {
+                chars.next();
+            }
+        } else if c == '<' {
+            // Formatting tags are not a literal speaker name.
+            for c in chars.by_ref() {
+                if c == '>' {
+                    break;
+                }
+            }
+        } else if c == '{' && chars.peek() == Some(&'{') {
+            for c in chars.by_ref() {
+                if c == '}' {
+                    break;
+                }
+            }
+            if chars.peek() == Some(&'}') {
+                chars.next();
+            }
+        } else if c.is_alphabetic() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Visible length of a message line, skipping RPG Maker control codes such
@@ -1958,6 +2034,225 @@ mod tests {
                 fs::copy(entry.path(), &dest).unwrap();
             }
         }
+    }
+
+    fn speaker_fixture(filename: &str, params: serde_json::Value) -> serde_json::Value {
+        let list = serde_json::json!([
+            {"code": 101, "indent": 0, "parameters": params},
+            {"code": 401, "indent": 0, "parameters": ["Hello!"]},
+            {"code": 0, "indent": 0, "parameters": []}
+        ]);
+        match filename {
+            "Map001.json" => serde_json::json!({
+                "events": [null, {"pages": [{"list": list}]}]
+            }),
+            "CommonEvents.json" => serde_json::json!([null, {"list": list}]),
+            "Troops.json" => serde_json::json!([null, {"pages": [{"list": list}]}]),
+            _ => panic!("unexpected speaker fixture: {filename}"),
+        }
+    }
+
+    fn speaker_list_mut<'a>(
+        filename: &str,
+        json: &'a mut serde_json::Value,
+    ) -> &'a mut serde_json::Value {
+        match filename {
+            "Map001.json" => &mut json["events"][1]["pages"][0]["list"],
+            "CommonEvents.json" => &mut json[1]["list"],
+            "Troops.json" => &mut json[1]["pages"][0]["list"],
+            _ => panic!("unexpected speaker fixture: {filename}"),
+        }
+    }
+
+    fn speaker_id(filename: &str) -> String {
+        let prefix = match filename {
+            "Map001.json" => "0#event_1#page_0",
+            "CommonEvents.json" => "1",
+            "Troops.json" => "1#page_0",
+            _ => panic!("unexpected speaker fixture: {filename}"),
+        };
+        format!("{filename}#{prefix}#cmd_0#speaker")
+    }
+
+    fn assert_mz_speaker_roundtrip(filename: &str) {
+        let game = tempfile::tempdir().unwrap();
+        let data = game.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::write(
+            data.join("System.json"),
+            r#"{"gameTitle":"Test","terms":{}}"#,
+        )
+        .unwrap();
+        let file = data.join(filename);
+        let original = speaker_fixture(filename, serde_json::json!(["", 0, 0, 2, "Alice"]));
+        let bytes = serde_json::to_vec(&original).unwrap();
+        fs::write(&file, &bytes).unwrap();
+        let plugin = RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(game.path()).unwrap();
+        let id = speaker_id(filename);
+        let name = entries.iter().find(|e| e.id == id).expect("speaker row");
+        assert_eq!(name.source, "Alice");
+        assert_eq!(name.tags, ["actor_name", "speaker"]);
+        let dialogue = entries.iter().find(|e| e.source == "Hello!").unwrap();
+        assert_eq!(dialogue.context.as_deref(), Some("Alice"));
+
+        // An absent translation must not even rewrite the file.
+        let report = plugin.inject(game.path(), &entries).unwrap();
+        assert_eq!(report.files_modified, 0);
+        assert_eq!(fs::read(&file).unwrap(), bytes);
+        entries.iter_mut().find(|e| e.id == id).unwrap().translation = Some("Alicia".into());
+        let report = plugin.inject(game.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 1);
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        let mut expected = original;
+        speaker_list_mut(filename, &mut expected)[0]["parameters"][4] = serde_json::json!("Alicia");
+        // Full document equality covers face, numbers, dialogue and command metadata.
+        assert_eq!(written, expected);
+        let again = plugin.extract(game.path()).unwrap();
+        assert_eq!(again.iter().find(|e| e.id == id).unwrap().source, "Alicia");
+        assert_eq!(
+            again
+                .iter()
+                .find(|e| e.source == "Hello!")
+                .unwrap()
+                .context
+                .as_deref(),
+            Some("Alicia")
+        );
+    }
+
+    #[test]
+    fn test_mz_speaker_map_roundtrip() {
+        assert_mz_speaker_roundtrip("Map001.json");
+    }
+
+    #[test]
+    fn test_mz_speaker_common_event_roundtrip() {
+        assert_mz_speaker_roundtrip("CommonEvents.json");
+    }
+
+    #[test]
+    fn test_mz_speaker_troop_roundtrip() {
+        assert_mz_speaker_roundtrip("Troops.json");
+    }
+
+    #[test]
+    fn test_mz_speaker_writers_only_change_name_slot() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            let mut json =
+                speaker_fixture(filename, serde_json::json!(["FaceAsset", 3, 1, 2, "Alice"]));
+            let mut expected = json.clone();
+            speaker_list_mut(filename, &mut expected)[0]["parameters"][4] =
+                serde_json::json!("Alicia");
+            RpgMakerMvPlugin::apply_translation(
+                &mut json,
+                filename,
+                &speaker_id(filename),
+                "Alicia",
+            );
+            assert_eq!(json, expected, "{filename}");
+        }
+    }
+
+    #[test]
+    fn test_mz_speaker_skips_control_only_and_mv_headers() {
+        for filename in ["Map001.json", "CommonEvents.json", "Troops.json"] {
+            for params in [
+                serde_json::json!(["FaceAsset", 3, 1, 2, "\\N[1]"]),
+                serde_json::json!(["FaceAsset", 3, 1, 2, " \\N[1] \\V[2]\\C[3]\\G\\. "]),
+                serde_json::json!(["FaceAsset", 3, 1, 2, "\\tl{A0026}"]),
+                serde_json::json!([
+                    "FaceAsset",
+                    3,
+                    1,
+                    2,
+                    "<Center>\\C[4]<b>\\{♦ \\N[1] ♦\\}</b></Center>"
+                ]),
+                serde_json::json!(["FaceAsset", 3, 1, 2, "{{actor_name}}"]),
+                serde_json::json!(["FaceAsset", 3, 1, 2, ""]),
+                serde_json::json!(["FaceAsset", 3, 1, 2]),
+            ] {
+                let game = tempfile::tempdir().unwrap();
+                let file = game.path().join(filename);
+                let mut json = speaker_fixture(filename, params.clone());
+                let bytes = serde_json::to_vec(&json).unwrap();
+                fs::write(&file, &bytes).unwrap();
+                let plugin = RpgMakerMvPlugin::new();
+                let entries = plugin.extract(&file).unwrap();
+                assert!(entries.iter().all(|e| !e.id.ends_with("#speaker")));
+                let context = params
+                    .get(4)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                assert_eq!(
+                    entries
+                        .iter()
+                        .find(|e| e.source == "Hello!")
+                        .unwrap()
+                        .context
+                        .as_deref(),
+                    context
+                );
+                assert_eq!(plugin.inject(&file, &entries).unwrap().files_modified, 0);
+                assert_eq!(fs::read(&file).unwrap(), bytes);
+                // Even a direct speaker-slot write must leave these headers untouched.
+                let before = json.clone();
+                RpgMakerMvPlugin::apply_translation(
+                    &mut json,
+                    filename,
+                    &speaker_id(filename),
+                    "Alicia",
+                );
+                assert_eq!(json, before, "{filename}: {params}");
+            }
+            let mut json =
+                speaker_fixture(filename, serde_json::json!(["FaceAsset", 3, 1, 2, "Alice"]));
+            speaker_list_mut(filename, &mut json)[0]["code"] = serde_json::json!(401);
+            let before = json.clone();
+            RpgMakerMvPlugin::apply_translation(
+                &mut json,
+                filename,
+                &speaker_id(filename),
+                "Alicia",
+            );
+            assert_eq!(json, before);
+        }
+    }
+
+    #[test]
+    fn test_mz_speaker_keeps_literal_names_with_controls() {
+        let list = serde_json::json!([
+            {"code": 101, "parameters": ["", 0, 0, 2, "<b>\\C[2]Alice\\C[0]</b> \\N[1]\\tl{A0026}"]},
+            {"code": 401, "parameters": ["Hello!"]},
+            {"code": 101, "parameters": ["", 0, 0, 2]},
+            {"code": 401, "parameters": ["Goodbye!"]}
+        ]);
+        let mut entries = Vec::new();
+        RpgMakerMvPlugin::extract_event_commands(
+            &mut entries,
+            list.as_array().unwrap(),
+            Path::new("Map001.json"),
+            "test",
+        );
+        let name = entries.iter().find(|e| e.id.ends_with("#speaker")).unwrap();
+        assert_eq!(name.source, "<b>\\C[2]Alice\\C[0]</b> \\N[1]\\tl{A0026}");
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.source == "Hello!")
+                .unwrap()
+                .context
+                .as_deref(),
+            Some(name.source.as_str())
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.source == "Goodbye!")
+                .unwrap()
+                .context,
+            None
+        );
     }
 
     #[test]
