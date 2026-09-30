@@ -160,17 +160,28 @@ impl UnityPlugin {
                 }
 
                 // Dialogue: `CharID Text here` or `CharID Text with \bformatting\b`
-                if let Some((character, text)) = extract_vn_dialogue(trimmed) {
-                    if !text.is_empty() && text.len() >= 2 {
+                if let Some(dialogue) = extract_vn_dialogue(trimmed) {
+                    let text = dialogue.text;
+                    // Sprite dialogue can be a single visible punctuation mark.
+                    let minimum_len = if dialogue.engine_prefix.trim().is_empty() {
+                        2
+                    } else {
+                        1
+                    };
+                    if text.len() >= minimum_len {
                         // Controls remain in the translation source, including
                         // boundaries inside dialogue. Only ignore them when
                         // deciding whether there is any visible text.
                         let clean = vn_visible_text(text);
-                        if !clean.is_empty() && clean.len() >= 2 {
+                        if clean.len() >= minimum_len {
                             let id = format!("{}#{}", filename, line_num);
                             let mut entry = StringEntry::new(&id, text, fpath.to_path_buf());
                             entry.tags = vec!["dialogue".to_string()];
-                            entry.context = Some(character.to_string());
+                            entry.context = Some(dialogue.character.to_string());
+                            entry.metadata.insert(
+                                "vn_engine_prefix".to_string(),
+                                serde_json::Value::String(dialogue.engine_prefix.to_string()),
+                            );
                             // Store original text with format codes in metadata
                             entry.metadata.insert(
                                 "original_with_codes".to_string(),
@@ -248,14 +259,21 @@ impl UnityPlugin {
                         &format!("\"{translation}\""),
                         1,
                     )
-                } else if let Some((character, text)) = extract_vn_dialogue(trimmed) {
+                } else if let Some(dialogue) = extract_vn_dialogue(trimmed) {
+                    let text = dialogue.text;
                     // Exact rich-source matching also rejects legacy stripped
                     // entries instead of silently replacing formatted dialogue.
                     if entry.injection_source().ok() != Some(text)
                         || entry
                             .context
                             .as_deref()
-                            .is_some_and(|expected| expected != character)
+                            .is_some_and(|expected| expected != dialogue.character)
+                        || match entry.metadata.get("vn_engine_prefix") {
+                            Some(expected) => expected.as_str() != Some(dialogue.engine_prefix),
+                            // Old entries can still target plain dialogue, but
+                            // cannot vouch for a previously unextracted prefix.
+                            None => !dialogue.engine_prefix.trim().is_empty(),
+                        }
                     {
                         report.skip("source_changed", 1);
                         continue;
@@ -2012,18 +2030,25 @@ fn extract_quoted_in_line(line: &str) -> Option<&str> {
     }
 }
 
-/// Extract VN dialogue: `CharID Dialogue text here`
-/// Character IDs are 1-5 char identifiers (letters, sometimes digits)
-/// Returns (char_id, text), retaining all embedded engine controls.
-fn extract_vn_dialogue(line: &str) -> Option<(&str, &str)> {
+struct VnDialogue<'a> {
+    character: &'a str,
+    // Exact spacing after the speaker, including any sprite/emotion modifiers.
+    engine_prefix: &'a str,
+    text: &'a str,
+}
+
+/// Parse `CharID [+Sprite ... -Sprite ...] Dialogue text here` once for both
+/// extraction and injection. Only whitespace-delimited identifiers are engine
+/// modifiers; attached punctuation is ambiguous and remains unsupported.
+fn extract_vn_dialogue(line: &str) -> Option<VnDialogue<'_>> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let space_pos = trimmed.find(' ')?;
+    let space_pos = trimmed.find(char::is_whitespace)?;
     let char_id = &trimmed[..space_pos];
-    let text = trimmed[space_pos + 1..].trim();
+    let mut text = trimmed[space_pos..].trim_start();
 
     if char_id.is_empty() || char_id.len() > 8 {
         return None;
@@ -2037,11 +2062,29 @@ fn extract_vn_dialogue(line: &str) -> Option<(&str, &str)> {
     {
         return None;
     }
-    if text.is_empty() || text.starts_with('{') || text.starts_with('+') {
+    if text.starts_with('+') {
+        while text.starts_with(['+', '-']) {
+            let end = text.find(char::is_whitespace).unwrap_or(text.len());
+            let modifier = &text[1..end];
+            if modifier.is_empty()
+                || !modifier
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            {
+                return None;
+            }
+            text = text[end..].trim_start();
+        }
+    }
+    if text.is_empty() || text.starts_with('{') {
         return None;
     }
 
-    Some((char_id, text))
+    Some(VnDialogue {
+        character: char_id,
+        engine_prefix: &trimmed[space_pos..trimmed.len() - text.len()],
+        text,
+    })
 }
 
 /// Byte spans of protected VN escapes and Unity rich-text tags. Unknown escapes
@@ -2683,6 +2726,155 @@ mod tests {
         )
         .unwrap();
         (fixture, file)
+    }
+
+    #[test]
+    fn inline_sprite_dialogue() {
+        let before = "CJ Existing dialogue.\r\nCJ +CJ_Lgr Hello friend.\r\n";
+        let (fixture, file) = vn_controls_fixture(before);
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].id, "Dialogue.txt#2");
+        assert_eq!(entries[1].source, "Hello friend.");
+        assert_eq!(entries[1].context.as_deref(), Some("CJ"));
+        assert_eq!(entries[1].metadata["vn_engine_prefix"], " +CJ_Lgr ");
+        entries[1].translation = Some("Hola amigo.".into());
+        let report = plugin.inject(fixture.path(), &entries[1..]).unwrap();
+        assert_diagnostic_totals(&report, 1);
+        assert_eq!((report.strings_written, report.files_modified), (1, 1));
+        assert_eq!(
+            fs::read(file).unwrap(),
+            b"CJ Existing dialogue.\r\nCJ +CJ_Lgr Hola amigo.\r\n"
+        );
+    }
+
+    #[test]
+    fn inline_sprite_single_visible_character_is_dialogue() {
+        let (fixture, file) = vn_controls_fixture(
+            "CJ +CJ_sur ?\nCJ +CJ_sur !\nCJ +CJ_sur \\bI\\b\nCJ +CJ_sur \\b\\b\n",
+        );
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].source, "?");
+        assert_eq!(entries[1].source, "!");
+        assert_eq!(entries[2].source, r"\bI\b");
+        entries[0].translation = Some("¿?".into());
+        let report = plugin.inject(fixture.path(), &entries[..1]).unwrap();
+        assert_eq!((report.strings_written, report.files_modified), (1, 1));
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            "CJ +CJ_sur ¿?\nCJ +CJ_sur !\nCJ +CJ_sur \\bI\\b\nCJ +CJ_sur \\b\\b\n"
+        );
+    }
+
+    #[test]
+    fn inline_sprite_roundtrip_multiple_modifiers_unicode_quotes_and_controls() {
+        for (prefix, source, translation) in [
+            (" +CJ_Lgr +J_Usur -R ", "W-what?!", "¿Q-qué?!"),
+            (
+                "\t+CJ_Lgr  +J_Usur\t-R\u{2003}",
+                r#"\p<link="journal>entry">Él dijo "\b你好\b".</link>\n\>続き。"#,
+                r#"\p<link="journal>entry">Ella dijo "\bこんにちは\b".</link>\n\>Fin."#,
+            ),
+        ] {
+            for ending in ["\r\n", "\n", ""] {
+                let before = format!("# untouched  \r\n  CJ{prefix}{source}  \t{ending}");
+                let (fixture, file) = vn_controls_fixture(&before);
+                let definitions = file.with_file_name("Definitions.txt");
+                let untouched = fs::read(&definitions).unwrap();
+                let plugin = UnityPlugin::new();
+                let mut entries = plugin.extract(fixture.path()).unwrap();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].source, source);
+                assert_eq!(entries[0].metadata["original_with_codes"], source);
+                assert_eq!(entries[0].metadata["vn_engine_prefix"], prefix);
+                entries[0].translation = Some(translation.into());
+                let report = plugin.inject(fixture.path(), &entries).unwrap();
+                assert_diagnostic_totals(&report, 1);
+                assert_eq!((report.strings_written, report.files_modified), (1, 1));
+                assert_eq!(
+                    fs::read(file).unwrap(),
+                    format!("# untouched  \r\n  CJ{prefix}{translation}  \t{ending}").as_bytes()
+                );
+                assert_eq!(fs::read(definitions).unwrap(), untouched);
+                assert_eq!(vn_control_tokens(source), vn_control_tokens(translation));
+            }
+        }
+    }
+
+    #[test]
+    fn inline_sprite_commands_and_modifier_only_lines_are_not_dialogue() {
+        let script = concat!(
+            "CJ +CJ_Lgr\n",
+            "CJ +CJ_Lgr +J_Usur -R  \t\n",
+            "+CJ_Lgr +J_Usur -R\n",
+            "+CJ_Lgr This remains an engine command.\n",
+            "CJ +CJ_Lgr +J_Usur -R {\n",
+            "CJ +CJ_Lgr \\b\\b\n",
+            "CJ +CJ_Lgr +bad! Ambiguous modifier.\n",
+            "CJ +A_4dumbo...So?\n",
+            "CJ +CA_scr...Wow, what a starter.\n",
+            "CJ +CA_guh......Oh.\n",
+            "CJ -Wait, this is ordinary dialogue.\n",
+        );
+        let (fixture, _) = vn_controls_fixture(script);
+        let entries = UnityPlugin::new().extract(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "-Wait, this is ordinary dialogue.");
+    }
+
+    #[test]
+    fn inline_sprite_changed_prefix_or_source_is_rejected_without_writes() {
+        let before = "  CJ  +CJ_Lgr +J_Usur -R Hello \\bfriend\\b.  \r\n";
+        for changed in [
+            "  CJ  +CJ_ha +J_Usur -R Hello \\bfriend\\b.  \r\n",
+            "  CJ  +cj_Lgr +J_Usur -R Hello \\bfriend\\b.  \r\n",
+            "  CJ  +J_Usur +CJ_Lgr -R Hello \\bfriend\\b.  \r\n",
+            "  CJ  +CJ_Lgr  +J_Usur -R Hello \\bfriend\\b.  \r\n",
+            "  CJ  +CJ_Lgr +J_Usur -S Hello \\bfriend\\b.  \r\n",
+            "  CJ  Hello \\bfriend\\b.  \r\n",
+            "  J  +CJ_Lgr +J_Usur -R Hello \\bfriend\\b.  \r\n",
+            "  CJ  +CJ_Lgr +J_Usur -R Hello \\bstranger\\b.  \r\n",
+            "  CJ  +CJ_Lgr +J_Usur -R Hello friend.  \r\n",
+        ] {
+            let (fixture, file) = vn_controls_fixture(before);
+            let plugin = UnityPlugin::new();
+            let mut entry = plugin.extract(fixture.path()).unwrap().remove(0);
+            entry.translation = Some(r"Hola \bamigo\b.".into());
+            fs::write(&file, changed).unwrap();
+            let report = plugin.inject(fixture.path(), &[entry]).unwrap();
+            assert_diagnostic_totals(&report, 1);
+            assert_eq!((report.strings_written, report.files_modified), (0, 0));
+            assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
+            assert_eq!(fs::read(file).unwrap(), changed.as_bytes());
+        }
+    }
+
+    #[test]
+    fn inline_sprite_rejects_unguarded_prefix_and_unsafe_controls() {
+        let source = r"Hello \bfriend\b and \ineighbor\i.";
+        let before = format!("CJ +CJ_Lgr {source}\r\n");
+        for (translation, remove_prefix, reason) in [
+            (r"Hola \bamigo\b y \ivecino\i.", true, "source_changed"),
+            ("Hola amigo y vecino.", false, "unsafe_controls"),
+            (r"Hola \iamigo\i y \bvecino\b.", false, "unsafe_controls"),
+            (r"Hola \bamigo\b y \ivecino\i.\p", false, "unsafe_controls"),
+        ] {
+            let (fixture, file) = vn_controls_fixture(&before);
+            let plugin = UnityPlugin::new();
+            let mut entry = plugin.extract(fixture.path()).unwrap().remove(0);
+            if remove_prefix {
+                entry.metadata.remove("vn_engine_prefix");
+            }
+            entry.translation = Some(translation.into());
+            let report = plugin.inject(fixture.path(), &[entry]).unwrap();
+            assert_diagnostic_totals(&report, 1);
+            assert_eq!((report.strings_written, report.files_modified), (0, 0));
+            assert_eq!(report.skip_reasons.get(reason), Some(&1));
+            assert_eq!(fs::read(file).unwrap(), before.as_bytes());
+        }
     }
 
     #[test]
