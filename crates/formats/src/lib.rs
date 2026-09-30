@@ -4,6 +4,7 @@ mod discovery;
 pub mod html_game;
 pub mod qsp;
 pub mod renpy;
+mod renpy_pickle;
 pub mod rpgmaker_lang;
 pub mod rpgmaker_mv;
 pub mod rpgmaker_vxa;

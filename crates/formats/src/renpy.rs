@@ -1650,16 +1650,12 @@ fn is_gui_non_translatable(var: &str) -> bool {
         || prop.starts_with("namebox_")
 }
 
-/// Simplified Python pickle parser for RPA index data.
-/// The pickle contains a dict mapping filenames (str) to lists of (offset, length, prefix) tuples.
-/// We only need to extract the filename, offset, and length.
-/// Mine display strings out of a compiled Ren'Py script (.rpyc).
+/// Read typed display strings out of a compiled Ren'Py script (.rpyc).
 ///
 /// Layout: "RENPY RPC2" magic + slot table; slot 1 is a zlib-compressed
-/// Python pickle of the script AST. We don't rebuild the AST — we walk the
-/// pickle opcode stream and harvest unicode strings that look like dialogue
-/// or menu text. Injection happens through a runtime text filter, so any
-/// code-expression strings that slip through simply never match on screen.
+/// Python pickle of the script AST. The inert reader selects visible AST
+/// fields, preserving their exact runtime strings for the injection filter.
+/// Unsupported/malformed pickles use a conservative per-file fallback.
 fn harvest_rpyc_strings(bytes: &[u8]) -> Vec<String> {
     const MAGIC: &[u8] = b"RENPY RPC2";
     if bytes.len() < MAGIC.len() + 12 || &bytes[..MAGIC.len()] != MAGIC {
@@ -1684,9 +1680,9 @@ fn harvest_rpyc_strings(bytes: &[u8]) -> Vec<String> {
     let Some((start, len)) = slot1 else {
         return Vec::new();
     };
-    if start + len > bytes.len() {
+    let Some(end) = start.checked_add(len).filter(|&end| end <= bytes.len()) else {
         return Vec::new();
-    }
+    };
 
     // ponytail: bounded single-shot inflate, ceiling 64 MiB of decompressed pickle.
     // A real rpyc's string table never approaches this; an untrusted/downloaded
@@ -1695,7 +1691,7 @@ fn harvest_rpyc_strings(bytes: &[u8]) -> Vec<String> {
     // stream through `flate2` if legitimate scripts ever need more.
     const MAX_PICKLE_SIZE: usize = 64 * 1024 * 1024;
     let pickle = match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
-        &bytes[start..start + len],
+        &bytes[start..end],
         MAX_PICKLE_SIZE,
     ) {
         Ok(p) => p,
@@ -1713,11 +1709,65 @@ fn harvest_rpyc_strings(bytes: &[u8]) -> Vec<String> {
     };
 
     let mut seen = std::collections::HashSet::new();
-    scan_pickle_strings(&pickle)
+    let strings = match crate::renpy_pickle::visible_text(&pickle) {
+        Ok(strings) => strings,
+        Err(reason) => {
+            tracing::warn!(
+                "typed rpyc reader failed ({reason}); using conservative string fallback"
+            );
+            scan_pickle_strings(&pickle)
+                .into_iter()
+                .filter(|s| is_renpy_fallback_text(s))
+                .collect()
+        }
+    };
+    strings
         .into_iter()
-        .filter(|s| is_renpy_dialogue_like(s))
         .filter(|s| seen.insert(s.clone()))
         .collect()
+}
+
+/// On an unreadable AST, require prose evidence as well as the old guard.
+/// The audit found bare names (sRockyT), image names, and space-containing
+/// expressions (ShowMenu('preferences'), Preference("text speed")) passing
+/// that guard. This fallback deliberately prefers losing uncertain text to
+/// sending code to translation; supported ASTs never use this heuristic.
+fn is_renpy_fallback_text(s: &str) -> bool {
+    let t = s.trim();
+    is_renpy_dialogue_like(s)
+        && t.chars().any(char::is_whitespace)
+        && !t.contains(['(', ')', '=', '\n', '\r', '\t'])
+        && ![
+            "return ", "raise ", "assert ", "from ", "for ", "while ", "lambda ", "hide ", "show ",
+            "scene ", "call ", "jump ", "play ", "stop ",
+        ]
+        .iter()
+        .any(|prefix| t.starts_with(prefix))
+        && !t.split_whitespace().any(|word| {
+            word.contains('_')
+                || word.contains(".rpy")
+                || word.contains(".png")
+                || word.contains(".jpg")
+                || word.contains(".ogg")
+                || matches!(
+                    word,
+                    "and"
+                        | "or"
+                        | "in"
+                        | "is"
+                        | "True"
+                        | "False"
+                        | "None"
+                        | "+"
+                        | "-"
+                        | "*"
+                        | "**"
+                        | "%"
+                        | "&"
+                        | "|"
+                )
+        })
+        && (t.split_whitespace().count() >= 3 || t.contains(['!', '?', ',']))
 }
 
 /// Walk a pickle opcode stream and collect every unicode string payload.
@@ -1741,13 +1791,13 @@ fn scan_pickle_strings(data: &[u8]) -> Vec<String> {
                 }
                 let n = read_u32(data, i);
                 i += 4;
-                if i + n > data.len() {
+                let Some(end) = i.checked_add(n).filter(|&end| end <= data.len()) else {
                     break;
-                }
-                if let Ok(s) = std::str::from_utf8(&data[i..i + n]) {
+                };
+                if let Ok(s) = std::str::from_utf8(&data[i..end]) {
                     out.push(s.to_string());
                 }
-                i += n;
+                i = end;
             }
             0x8c => {
                 // SHORT_BINUNICODE: u8 length + utf8
@@ -1756,13 +1806,13 @@ fn scan_pickle_strings(data: &[u8]) -> Vec<String> {
                 }
                 let n = data[i] as usize;
                 i += 1;
-                if i + n > data.len() {
+                let Some(end) = i.checked_add(n).filter(|&end| end <= data.len()) else {
                     break;
-                }
-                if let Ok(s) = std::str::from_utf8(&data[i..i + n]) {
+                };
+                if let Ok(s) = std::str::from_utf8(&data[i..end]) {
                     out.push(s.to_string());
                 }
-                i += n;
+                i = end;
             }
 
             // Fixed-size arguments
@@ -1786,7 +1836,14 @@ fn scan_pickle_strings(data: &[u8]) -> Vec<String> {
                     break;
                 }
                 let n = read_u32(data, i);
-                i += 4 + n;
+                let Some(end) = i
+                    .checked_add(4)
+                    .and_then(|i| i.checked_add(n))
+                    .filter(|&end| end <= data.len())
+                else {
+                    break;
+                };
+                i = end;
             }
 
             // Newline-terminated text arguments
@@ -3287,6 +3344,341 @@ mod tests {
 
     fn tiny_rpyc(strings: &[&str]) -> Vec<u8> {
         wrap_pickle_as_rpyc(&tiny_pickle(strings))
+    }
+
+    fn ast_text(text: &str) -> Vec<u8> {
+        let mut p = vec![b'X'];
+        p.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        p.extend_from_slice(text.as_bytes());
+        p
+    }
+
+    fn ast_seq(items: Vec<Vec<u8>>, tuple: bool) -> Vec<u8> {
+        let mut p = vec![b'('];
+        for item in items {
+            p.extend(item);
+        }
+        p.push(if tuple { b't' } else { b'l' });
+        p
+    }
+
+    fn ast_global(module: &str, class: &str) -> Vec<u8> {
+        format!("c{module}\n{class}\n").into_bytes()
+    }
+
+    fn ast_object(module: &str, class: &str, fields: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
+        let mut p = ast_global(module, class);
+        p.extend_from_slice(&[b')', 0x81, b'}', b'(']); // NEWOBJ, dict state
+        for (key, value) in fields {
+            p.extend(ast_text(key));
+            p.extend(value);
+        }
+        p.extend_from_slice(b"ub"); // SETITEMS, BUILD
+        p
+    }
+
+    fn ast_expr(source: &str) -> Vec<u8> {
+        let mut p = ast_global("renpy.ast", "PyExpr");
+        p.extend(ast_text(source));
+        p.extend_from_slice(&[0x85, 0x81]); // TUPLE1, NEWOBJ (str subclass)
+        p
+    }
+
+    fn ast_say(text: &str) -> Vec<u8> {
+        ast_object(
+            "renpy.ast",
+            "Say",
+            vec![
+                ("who", ast_text("screenInventory")),
+                ("what", ast_text(text)),
+                ("filename", ast_text("game/script.rpy")),
+                (
+                    "attributes",
+                    ast_seq(vec![ast_text("Background sunset")], false),
+                ),
+            ],
+        )
+    }
+
+    fn typed_ast_fixture() -> (Vec<u8>, Vec<&'static str>) {
+        let screen = |name: &str, displayable: &str, expr: &str, tooltip: &str| {
+            ast_object(
+                "renpy.sl2.slast",
+                "SLDisplayable",
+                vec![
+                    ("name", ast_text(name)),
+                    ("displayable", ast_global("renpy.ui", displayable)),
+                    ("positional", ast_seq(vec![ast_expr(expr)], false)),
+                    (
+                        "keyword",
+                        ast_seq(
+                            vec![
+                                ast_seq(vec![ast_text("tooltip"), ast_expr(tooltip)], true),
+                                ast_seq(
+                                    vec![ast_text("action"), ast_expr("ShowMenu('non text ui')")],
+                                    true,
+                                ),
+                                ast_seq(
+                                    vec![ast_text("idle"), ast_expr("'images/button.png'")],
+                                    true,
+                                ),
+                            ],
+                            false,
+                        ),
+                    ),
+                ],
+            )
+        };
+        let exact = "  A\\B \"quoted\"\n\tline  ";
+        let mut p = vec![0x80, 2];
+        p.extend(ast_seq(
+            vec![
+                ast_object(
+                    "renpy.ast",
+                    "Python",
+                    vec![(
+                        "code",
+                        ast_object(
+                            "renpy.ast",
+                            "PyCode",
+                            vec![
+                                ("source", ast_text("Preference(\"text speed\")")),
+                                ("block", ast_seq(vec![ast_say("Hidden in code")], false)),
+                            ],
+                        ),
+                    )],
+                ),
+                ast_object(
+                    "renpy.ast",
+                    "Image",
+                    vec![("imgname", ast_text("Background sunset"))],
+                ),
+                ast_say("{i}Hm.{/i}"),
+                ast_say("No."),
+                ast_say("Yes/No?"),
+                ast_say(exact),
+                ast_say("No."),
+                ast_object(
+                    "renpy.ast",
+                    "Menu",
+                    vec![
+                        ("set", ast_expr("menu_seen")),
+                        (
+                            "items",
+                            ast_seq(
+                                vec![
+                                    ast_seq(
+                                        vec![
+                                            ast_text("Choose"),
+                                            ast_expr("flag is True"),
+                                            vec![b'N'],
+                                        ],
+                                        true,
+                                    ),
+                                    ast_seq(
+                                        vec![
+                                            ast_text("Go"),
+                                            ast_expr("flag is False"),
+                                            ast_seq(vec![ast_say("Branch")], false),
+                                        ],
+                                        true,
+                                    ),
+                                ],
+                                false,
+                            ),
+                        ),
+                    ],
+                ),
+                ast_object(
+                    "renpy.ast",
+                    "Screen",
+                    vec![(
+                        "screen",
+                        ast_object(
+                            "renpy.sl2.slast",
+                            "SLScreen",
+                            vec![(
+                                "children",
+                                ast_seq(
+                                    vec![
+                                        screen(
+                                            "textbutton",
+                                            "_textbutton",
+                                            "_('Back')",
+                                            "__('Help\\nnow')",
+                                        ),
+                                        screen("label", "_label", "'Status'", "variable"),
+                                        screen("text", "_textbutton", "player.name", "variable"),
+                                        ast_object(
+                                            "renpy.sl2.slast",
+                                            "SLDisplayable",
+                                            vec![
+                                                (
+                                                    "displayable",
+                                                    ast_global("renpy.text.text", "Text"),
+                                                ),
+                                                (
+                                                    "positional",
+                                                    ast_seq(
+                                                        vec![ast_expr("u'\\u00a1Hello!'")],
+                                                        false,
+                                                    ),
+                                                ),
+                                            ],
+                                        ),
+                                    ],
+                                    false,
+                                ),
+                            )],
+                        ),
+                    )],
+                ),
+                ast_object(
+                    "renpy.ast",
+                    "Translate",
+                    vec![("block", ast_seq(vec![ast_say("Translated block")], false))],
+                ),
+                ast_object(
+                    "renpy.ast",
+                    "TranslateString",
+                    vec![
+                        ("old", ast_text("Original UI")),
+                        ("new", ast_text("Not source text")),
+                    ],
+                ),
+                ast_object(
+                    "renpy.ast",
+                    "UserStatement",
+                    vec![("line", ast_text("show screen screenInventory"))],
+                ),
+            ],
+            false,
+        ));
+        p.push(b'.');
+        (
+            p,
+            vec![
+                "{i}Hm.{/i}",
+                "No.",
+                "Yes/No?",
+                exact,
+                "Choose",
+                "Go",
+                "Branch",
+                "Back",
+                "Help\nnow",
+                "Status",
+                "¡Hello!",
+                "Translated block",
+                "Original UI",
+            ],
+        )
+    }
+
+    #[test]
+    fn test_harvest_rpyc_strings_typed_visible_fields() {
+        let (pickle, expected) = typed_ast_fixture();
+        let got = harvest_rpyc_strings(&wrap_pickle_as_rpyc(&pickle));
+        assert_eq!(got, expected);
+        // Injection must see the untouched what, including leading/trailing
+        // whitespace, a literal backslash, quotes, a newline and a tab.
+        assert_eq!(got[3], "  A\\B \"quoted\"\n\tline  ");
+        let mut empty_say = vec![0x80, 2];
+        empty_say.extend(ast_seq(vec![ast_say("")], false));
+        empty_say.push(b'.');
+        assert_eq!(harvest_rpyc_strings(&wrap_pickle_as_rpyc(&empty_say)), [""]);
+    }
+
+    #[test]
+    fn test_harvest_rpyc_strings_conservative_fallback() {
+        let mut p = tiny_pickle(&[
+            "Welcome to Area 69!",
+            "screenInventory",
+            "Background sunset",
+            "Preference(\"text speed\")",
+            "show screen inventory",
+            "game/script.rpy",
+            "screen inventory.png",
+            "flag is True",
+            "player + bonus",
+        ]);
+        // Force unsupported-opcode failure after all the text was seen.
+        *p.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            harvest_rpyc_strings(&wrap_pickle_as_rpyc(&p)),
+            ["Welcome to Area 69!"]
+        );
+    }
+
+    #[test]
+    fn test_harvest_rpyc_strings_malformed_pickle_never_panics() {
+        let (pickle, _) = typed_ast_fixture();
+        for n in 0..pickle.len() {
+            assert!(
+                crate::renpy_pickle::visible_text(&pickle[..n]).is_err(),
+                "prefix {n}"
+            );
+            harvest_rpyc_strings(&wrap_pickle_as_rpyc(&pickle[..n]));
+        }
+        let mut seed = 0x98_1234u32;
+        for n in 0..512 {
+            let bytes: Vec<_> = (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect();
+            let _ = crate::renpy_pickle::visible_text(&bytes);
+            harvest_rpyc_strings(&wrap_pickle_as_rpyc(&bytes));
+        }
+        for bytes in [
+            vec![0x80, 2, b'X', 255, 255, 255, 255], // giant claimed string
+            vec![0x80, 2, b'N', b'r', 255, 255, 255, 255], // sparse memo bomb
+            vec![0x80, 2, b'j', 255, 255, 255, 255], // invalid memo reference
+        ] {
+            assert!(crate::renpy_pickle::visible_text(&bytes).is_err());
+            assert!(harvest_rpyc_strings(&wrap_pickle_as_rpyc(&bytes)).is_empty());
+        }
+        let mut deep = vec![0x80, 2, b'N'];
+        deep.extend(std::iter::repeat_n(0x85, 300)); // nested tuples
+        deep.push(b'.');
+        assert_eq!(
+            crate::renpy_pickle::visible_text(&deep),
+            Err("graph walk limit")
+        );
+        let mut stack = vec![0x80, 2];
+        stack.extend(std::iter::repeat_n(b'N', 32_769));
+        assert_eq!(
+            crate::renpy_pickle::visible_text(&stack),
+            Err("stack limit")
+        );
+    }
+
+    #[test]
+    fn test_harvest_rpyc_strings_memo_identity_and_slot_state() {
+        let mut p = vec![0x80, 2, b']', b'q', 0, b'('];
+        p.extend(ast_global("renpy.ast", "Say"));
+        // Memoize the object BEFORE BUILD, as Python's real pickler does.
+        p.extend_from_slice(&[b')', 0x81, b'q', 1, b'N', b'}', b'q', 2, b'(']);
+        p.extend(ast_text("what"));
+        p.extend(ast_text("{i}Memo{/i}"));
+        p.extend_from_slice(&[b'q', 3, b'u', 0x86, b'b']); // (None, slotdict) state
+        p.extend_from_slice(&[b'h', 1]);
+        p.extend_from_slice(b"g1\n");
+        p.push(b'j');
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.extend_from_slice(b"e.");
+        assert_eq!(
+            harvest_rpyc_strings(&wrap_pickle_as_rpyc(&p)),
+            ["{i}Memo{/i}"]
+        );
+        // A cyclic memo-shared container must terminate too.
+        assert_eq!(
+            crate::renpy_pickle::visible_text(&[0x80, 2, b']', b'q', 0, b'h', 0, b'a', b'.']),
+            Ok(Vec::new())
+        );
     }
 
     /// Multi-member version of the protocol-2 RPA fixture in
