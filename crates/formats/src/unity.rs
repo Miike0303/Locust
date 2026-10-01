@@ -114,6 +114,32 @@ impl UnityPlugin {
                 let line_num = line_idx + 1;
                 let trimmed = line.trim();
 
+                // Declarations have a single display slot, not a dialogue body.
+                if is_character_directive(line) {
+                    if let Some(slot) = character_display_slot(line) {
+                        let id = format!("{}#{}", filename, line_num);
+                        let mut entry = StringEntry::new(id, slot.value, fpath.to_path_buf());
+                        entry.tags = vec!["character_display_name".into()];
+                        entry.context = Some(slot.character.into());
+                        for (key, value) in [
+                            ("record_kind", "character_display_name"),
+                            ("character_id", slot.character),
+                            ("declaration_prefix", &line[..slot.start]),
+                            ("declaration_suffix", &line[slot.end..]),
+                        ] {
+                            entry.metadata.insert(key.into(), serde_json::json!(value));
+                        }
+                        entry
+                            .metadata
+                            .insert("quoted_value_start".into(), serde_json::json!(slot.start));
+                        entry
+                            .metadata
+                            .insert("quoted_value_end".into(), serde_json::json!(slot.end));
+                        all.push(entry);
+                    }
+                    continue;
+                }
+
                 // Skip empty, comments, directives
                 if trimmed.is_empty()
                     || trimmed.starts_with('#')
@@ -143,7 +169,6 @@ impl UnityPlugin {
                     || trimmed.starts_with("#if")
                     || trimmed.starts_with("#else")
                     || trimmed.starts_with("#endif")
-                    || trimmed.starts_with("character ")
                 {
                     continue;
                 }
@@ -244,7 +269,46 @@ impl UnityPlugin {
                     report.skip("error", 1);
                     continue;
                 }
-                let replacement = if trimmed.starts_with("button ") {
+                let declaration = entry.metadata.get("record_kind").and_then(|v| v.as_str())
+                    == Some("character_display_name");
+                let replacement = if declaration {
+                    let Some(slot) = character_display_slot(body) else {
+                        report.skip("source_changed", 1);
+                        continue;
+                    };
+                    if entry.injection_source().ok() != Some(slot.value)
+                        || metadata_usize(entry, "quoted_value_start") != Some(slot.start)
+                        || metadata_usize(entry, "quoted_value_end") != Some(slot.end)
+                        || entry.metadata.get("character_id").and_then(|v| v.as_str())
+                            != Some(slot.character)
+                        || entry
+                            .metadata
+                            .get("declaration_prefix")
+                            .and_then(|v| v.as_str())
+                            != Some(&body[..slot.start])
+                        || entry
+                            .metadata
+                            .get("declaration_suffix")
+                            .and_then(|v| v.as_str())
+                            != Some(&body[slot.end..])
+                    {
+                        report.skip("source_changed", 1);
+                        continue;
+                    }
+                    if !safe_quoted_value(translation) {
+                        report.skip("error", 1);
+                        continue;
+                    }
+                    if vn_control_tokens(slot.value) != vn_control_tokens(translation) {
+                        report.skip("unsafe_controls", 1);
+                        continue;
+                    }
+                    format!("{}{translation}{}", &body[..slot.start], &body[slot.end..])
+                } else if is_character_directive(body) {
+                    // Old or malformed rows cannot use the dialogue route here.
+                    report.skip("invalid_target", 1);
+                    continue;
+                } else if trimmed.starts_with("button ") {
                     if extract_quoted_in_line(trimmed) != Some(entry.source.as_str()) {
                         report.skip("source_changed", 1);
                         continue;
@@ -836,6 +900,8 @@ impl UnityPlugin {
         file_path: &Path,
     ) -> Vec<StringEntry> {
         let mut entries = Vec::new();
+        // Keep newly enabled name rows out of the legacy heuristic ID counter.
+        let mut display_name_entries = Vec::new();
         let mut skip_ranges: Vec<(usize, usize)> = Vec::new();
 
         match SerializedFile::parse(bytes.to_vec(), file_path) {
@@ -846,12 +912,16 @@ impl UnityPlugin {
                 for obj in sf.text_asset_objects() {
                     match sf.read_text_asset_object(obj) {
                         Ok(ta) => {
-                            if !is_unity_textasset_script_worth_extracting(&ta.script) {
+                            let character_names = parse_character_names_lines(&ta.name, &ta.script);
+                            let is_character_names = character_names.is_some();
+                            if character_names.is_none()
+                                && !is_unity_textasset_script_worth_extracting(&ta.script)
+                            {
                                 continue;
                             }
                             // Non-player assets by m_Name (TMP linebreak tables, SFX tech
-                            // packs, CharacterNames lists).
-                            if is_non_player_textasset_name(&ta.name) {
+                            // packs, or unstructured proper-name glossaries).
+                            if is_non_player_textasset_name(&ta.name) && character_names.is_none() {
                                 continue;
                             }
                             // Markdown / internal delivery notes mis-stored as TextAsset.
@@ -864,7 +934,11 @@ impl UnityPlugin {
                                 continue;
                             }
                             // Simple CSV tables (header + data): text columns as cells.
-                            if let Some(csv) = parse_textasset_csv(&ta.script) {
+                            if let Some(csv) = character_names
+                                .is_none()
+                                .then(|| parse_textasset_csv(&ta.script))
+                                .flatten()
+                            {
                                 let newline = if ta.script.contains("\r\n") {
                                     "\r\n"
                                 } else {
@@ -953,7 +1027,9 @@ impl UnityPlugin {
                             }
                             // Naninovel ManagedText / locale docs: split Key: Value lines
                             // so each UI string is a translateable row (inject rebuilds blob).
-                            if let Some(lines) = parse_textasset_loc_lines(&ta.script) {
+                            if let Some(lines) =
+                                character_names.or_else(|| parse_textasset_loc_lines(&ta.script))
+                            {
                                 let newline = if ta.script.contains("\r\n") {
                                     "\r\n"
                                 } else {
@@ -1048,7 +1124,11 @@ impl UnityPlugin {
                                         mark_textasset_rewrite(entry, sf.header.version);
                                     }
                                 }
-                                entries.extend(group_entries);
+                                if is_character_names {
+                                    display_name_entries.extend(group_entries);
+                                } else {
+                                    entries.extend(group_entries);
+                                }
                                 continue;
                             }
                             // Keep every structural instance (unique path_id / inject offset).
@@ -1274,6 +1354,7 @@ impl UnityPlugin {
         // `heuristic_string_at`).
         let len = bytes.len();
         if len < 8 {
+            entries.extend(display_name_entries);
             return entries;
         }
         let mut i = 0;
@@ -1319,6 +1400,7 @@ impl UnityPlugin {
             let aligned = (str_len + 3) & !3;
             i += 4 + aligned;
         }
+        entries.extend(display_name_entries);
         entries
     }
 }
@@ -1454,6 +1536,41 @@ struct TextAssetLocLine {
     value: String,
     /// Total non-empty line count in the document (for inject sanity).
     line_count: usize,
+}
+
+/// Only the known CharacterNames TextAsset's keyed display-value schema opts
+/// out of glossary filtering. A loose list or a different identifier map does
+/// not gain this capability. Short character IDs are not culture codes here.
+fn parse_character_names_lines(name: &str, script: &str) -> Option<Vec<TextAssetLocLine>> {
+    if !name.trim().eq_ignore_ascii_case("CharacterNames") {
+        return None;
+    }
+    let mut out = Vec::new();
+    for line in script.lines().filter(|line| !line.trim().is_empty()) {
+        let (key, sep, value) = split_loc_kv(line)?;
+        if key.is_empty()
+            || !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            || value.trim().is_empty()
+            || value.chars().any(char::is_control)
+            || looks_like_lorem_ipsum(value)
+        {
+            return None;
+        }
+        out.push(TextAssetLocLine {
+            key: Some(key.into()),
+            sep: sep.into(),
+            value: value.into(),
+            line_count: 0,
+        });
+    }
+    let line_count = out.len();
+    if line_count == 0 {
+        return None;
+    }
+    for line in &mut out {
+        line.line_count = line_count;
+    }
+    Some(out)
 }
 
 /// Detect Naninovel ManagedText / locale docs:
@@ -1601,7 +1718,8 @@ fn is_non_player_textasset_name(name: &str) -> bool {
     if lower.contains("technical specifications") {
         return true;
     }
-    // Proper-name tables (Emily/Jake/…) — translate via glossary, not bulk extract.
+    // Unstructured proper-name lists remain glossary-only. The structurally
+    // validated CharacterNames value table gets a narrow exception at extraction.
     if lower == "characternames" || lower.ends_with("character names") {
         return true;
     }
@@ -1891,7 +2009,16 @@ fn apply_table_translations(
     let loc = if csv {
         Vec::new()
     } else {
-        parse_textasset_loc_lines(original).unwrap_or_default()
+        parse_character_names_lines(
+            entries[0]
+                .metadata
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            original,
+        )
+        .or_else(|| parse_textasset_loc_lines(original))
+        .unwrap_or_default()
     };
     let mut loc_rows = Vec::new();
     let mut next = 0;
@@ -2044,6 +2171,81 @@ fn extract_quoted_in_line(line: &str) -> Option<&str> {
     } else {
         Some(text)
     }
+}
+
+struct CharacterDisplaySlot<'a> {
+    character: &'a str,
+    value: &'a str,
+    start: usize,
+    end: usize,
+}
+
+fn is_character_directive(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("character")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+/// Locate the first quoted field after the ID and optional unquoted attributes.
+/// Keep escapes verbatim; a backslash protects exactly the following character.
+fn character_display_slot(line: &str) -> Option<CharacterDisplaySlot<'_>> {
+    if !is_character_directive(line) {
+        return None;
+    }
+    let rest = line.trim_start().strip_prefix("character")?.trim_start();
+    let id_end = rest.find(char::is_whitespace)?;
+    let character = &rest[..id_end];
+    if character.is_empty()
+        || !character
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return None;
+    }
+    let fields = &rest[id_end..];
+    let quote = fields.find('"')?;
+    // Quotes in comments and malformed unquoted escapes are not display fields.
+    if fields[..quote].contains(['#', '\\']) {
+        return None;
+    }
+    let start = line.len() - fields.len() + quote + 1;
+    let mut escaped = false;
+    for (offset, ch) in line[start..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            let end = start + offset;
+            let value = &line[start..end];
+            return (!value.is_empty() && safe_quoted_value(value)).then_some(
+                CharacterDisplaySlot {
+                    character,
+                    value,
+                    start,
+                    end,
+                },
+            );
+        }
+    }
+    None
+}
+
+fn safe_quoted_value(value: &str) -> bool {
+    let mut escaped = false;
+    for ch in value.chars() {
+        if ch.is_control() {
+            return false;
+        }
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return false;
+        }
+    }
+    !escaped
 }
 
 struct VnDialogue<'a> {
@@ -4619,7 +4821,7 @@ script Chapter_1_script chapter 1 {
     }
 
     #[test]
-    fn test_textasset_skips_tech_docs_characternames_and_lorem_loc() {
+    fn test_textasset_skips_tech_docs_and_lorem_loc() {
         assert!(is_non_player_textasset_name(
             "LineBreaking Leading Characters"
         ));
@@ -4641,17 +4843,17 @@ script Chapter_1_script chapter 1 {
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
 
-        // CharacterNames asset → skip
+        // A recognized CharacterNames value table keeps only display values.
         let names = "Carter: Carter\r\nEmily: Emily\r\nJake: Jake\r\n";
-        let bytes = crate::unity_serialized::write_v17_fixture("CharacterNames", names);
+        let bytes = crate::unity_serialized::write_v17_fixture_ex("CharacterNames", names, None);
         fs::write(data_dir.join("sharedassets0.assets"), &bytes).unwrap();
         let entries = UnityPlugin::new().extract(&dir).unwrap();
-        assert!(
-            !entries
+        assert_eq!(
+            entries
                 .iter()
-                .any(|e| e.source == "Emily" || e.source == "Carter"),
-            "CharacterNames must not extract: {:?}",
-            entries.iter().map(|e| &e.source).collect::<Vec<_>>()
+                .map(|e| e.source.as_str())
+                .collect::<Vec<_>>(),
+            ["Carter", "Emily", "Jake"]
         );
 
         // Tech doc by body content (generic m_Name)
@@ -5555,5 +5757,264 @@ Confirmation.Yes: YES\r\n\
             entries.iter().map(|e| &e.source).collect::<Vec<_>>()
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn display_names_declaration_is_one_quoted_slot() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("Characters.txt");
+        let before = "character CJ \"CJ\"\r\nCJ Ordinary dialogue\r\ncharacter Nar\r\ncharacter Bad # \"comment\"\r\n";
+        fs::write(&path, before).unwrap();
+        let mut entries = UnityPlugin::extract_text_scripts(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].source, "CJ");
+        assert_eq!(entries[0].metadata["record_kind"], "character_display_name");
+        assert_eq!(entries[0].metadata["character_id"], "CJ");
+        assert_eq!(entries[1].source, "Ordinary dialogue");
+        entries[0].translation = Some("Carlos".into());
+        let report = UnityPlugin::inject_text_scripts(fixture.path(), &[&entries[0]]).unwrap();
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before.replacen("\"CJ\"", "\"Carlos\"", 1).as_bytes()
+        );
+    }
+
+    #[test]
+    fn display_names_declaration_escapes_and_exact_bytes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("Characters.txt");
+        let before = concat!(
+            "\tcharacter\tTs  000000 \"\\p<link=\\\"s:whiteblack\\\">\\pTsukiko\\p</link>\\p\"  # \"Tsukiko\"\r\n",
+            "  character Q FFFFFF \"A \\\"quoted\\\" name\\\\\" # unchanged\n",
+            "  character CJ \"CJ\""
+        );
+        fs::write(&path, before).unwrap();
+        let mut entries = UnityPlugin::extract_text_scripts(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 3);
+        entries[0].translation = Some(entries[0].source.replace("Tsukiko", "Luna"));
+        entries[1].translation = Some(entries[1].source.replace("name", "nombre"));
+        entries[2].translation = Some("Carlos".into());
+        let refs: Vec<_> = entries.iter().collect();
+        let report = UnityPlugin::inject_text_scripts(fixture.path(), &refs).unwrap();
+        assert_eq!(report.strings_written, 3);
+        let expected = before
+            .replacen("Tsukiko", "Luna", 1)
+            .replacen("name", "nombre", 1)
+            .replacen("\"CJ\"", "\"Carlos\"", 1);
+        assert_eq!(fs::read(&path).unwrap(), expected.as_bytes());
+    }
+
+    #[test]
+    fn display_names_declaration_rejects_stale_or_unsafe_writes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("Characters.txt");
+        let before = "  character CJ FF0253 \"CJ\" # comment\r\n";
+        fs::write(&path, before).unwrap();
+        let mut entry = UnityPlugin::extract_text_scripts(fixture.path())
+            .unwrap()
+            .remove(0);
+        for changed in [
+            before.replace("CJ FF", "XX FF"),
+            before.replace("FF0253", "FFFFFF"),
+            before.replace("\"CJ\"", "\"XX\""),
+            before.replace("# comment", "# changed"),
+            before.replace("character", "CJ       "),
+        ] {
+            fs::write(&path, &changed).unwrap();
+            entry.translation = Some("Carlos".into());
+            let report = UnityPlugin::inject_text_scripts(fixture.path(), &[&entry]).unwrap();
+            assert_eq!(
+                report.skip_reasons.get("source_changed"),
+                Some(&1),
+                "{report:?}"
+            );
+            assert_eq!(report.strings_written, 0);
+            assert_eq!(fs::read(&path).unwrap(), changed.as_bytes());
+        }
+        fs::write(&path, before).unwrap();
+        for (translation, reason) in [
+            ("Carl\"os", "error"),
+            ("Carlos\\", "error"),
+            ("Carl\nos", "error"),
+            ("Carl\ros", "error"),
+            ("Carl\0os", "error"),
+            ("Carl\tos", "error"),
+            ("\\bCarlos\\b", "unsafe_controls"),
+            ("Carlos<link=x>", "unsafe_controls"),
+            ("Carlos\\\"", "unsafe_controls"),
+        ] {
+            entry.translation = Some(translation.into());
+            let report = UnityPlugin::inject_text_scripts(fixture.path(), &[&entry]).unwrap();
+            assert_eq!(
+                report.skip_reasons.get(reason),
+                Some(&1),
+                "{translation:?}: {report:?}"
+            );
+            assert_eq!(report.files_modified, 0);
+            assert_eq!(fs::read(&path).unwrap(), before.as_bytes());
+        }
+        entry.translation = Some(entry.source.clone());
+        let report = UnityPlugin::inject_text_scripts(fixture.path(), &[&entry]).unwrap();
+        assert_eq!(report.skip_reasons.get("unchanged"), Some(&1));
+        entry.metadata.remove("record_kind");
+        entry.translation = Some("Carlos".into());
+        let report = UnityPlugin::inject_text_scripts(fixture.path(), &[&entry]).unwrap();
+        assert_eq!(report.skip_reasons.get("invalid_target"), Some(&1));
+        assert_eq!(fs::read(&path).unwrap(), before.as_bytes());
+    }
+
+    #[test]
+    fn display_names_declaration_uses_physical_source_after_glossary_pivot() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("Characters.txt");
+        fs::write(&path, "character CJ \"CJ\"\n").unwrap();
+        let mut entry = UnityPlugin::extract_text_scripts(fixture.path())
+            .unwrap()
+            .remove(0);
+        entry.metadata.insert(
+            locust_core::models::INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("CJ"),
+        );
+        entry.source = "Charles".into();
+        entry.translation = Some("Carlos".into());
+        let report = UnityPlugin::inject_text_scripts(fixture.path(), &[&entry]).unwrap();
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(fs::read(&path).unwrap(), b"character CJ \"Carlos\"\n");
+    }
+
+    #[test]
+    fn display_names_character_names_table_round_trip() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("resources.assets");
+        let script = "Carter: Carter\r\n\r\nEmily: Emily\r\nJake: Jake\r\n";
+        let before = crate::unity_serialized::write_v17_fixture_ex("CharacterNames", script, None);
+        fs::write(&path, &before).unwrap();
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.source.as_str())
+                .collect::<Vec<_>>(),
+            ["Carter", "Emily", "Jake"]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| &e.id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+        for entry in &mut entries {
+            entry.translation = Some(entry.source.clone());
+        }
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_eq!(report.skip_reasons.get("unchanged"), Some(&3));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        entries[0].translation = Some("Bad\nName".into());
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 0, "{report:?}");
+        assert_eq!(report.skip_reasons.get("error"), Some(&1));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let stale = crate::unity_serialized::write_v17_fixture_ex(
+            "CharacterNames",
+            &script.replacen("Carter:", "Karter:", 1),
+            None,
+        );
+        fs::write(&path, &stale).unwrap();
+        entries[0].translation = Some("Carlos".into());
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 0, "{report:?}");
+        assert_eq!(fs::read(&path).unwrap(), stale);
+        fs::write(&path, &before).unwrap();
+        for (entry, translation) in entries.iter_mut().zip(["Carlos", "Emili", "Juan"]) {
+            entry.translation = Some(translation.into());
+        }
+        entries[0].metadata.insert(
+            locust_core::models::INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("Carter"),
+        );
+        entries[0].source = "Glossary Carter".into();
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 3, "{report:?}");
+        let expected = crate::unity_serialized::write_v17_fixture_ex(
+            "CharacterNames",
+            "Carter: Carlos\r\n\r\nEmily: Emili\r\nJake: Juan\r\n",
+            None,
+        );
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        let changed = fs::read(&path).unwrap();
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 0, "{report:?}");
+        assert!(report.strings_skipped >= 3, "{report:?}");
+        assert_eq!(fs::read(&path).unwrap(), changed);
+    }
+
+    #[test]
+    fn display_names_character_names_schema_and_technical_ids() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("resources.assets");
+        let plugin = UnityPlugin::new();
+        for (name, script) in [
+            ("CharacterNames", "Carter\nEmily\nJake\n"),
+            ("CharacterNames", "Carter: Carter\nnot a table\n"),
+            ("CharacterNames", "A B: Display name\n"),
+            ("Character Names", "Carter: Carter\nEmily: Emily\n"),
+            ("LineBreaking Leading Characters", "Carter: Carter\nEmily: Emily\n"),
+            ("TECHNICAL SPECIFICATIONS", "Carter: Carter\nEmily: Emily\n"),
+            ("CharacterNames", "af: Afrikaans\nes: Spanish\nen: English\nfr: French\nde: German\nit: Italian\npt: Portuguese\nja: Japanese\n"),
+        ] {
+            fs::write(&path, crate::unity_serialized::write_v17_fixture_ex(name, script, None)).unwrap();
+            assert!(plugin.extract(&path).unwrap().is_empty(), "{name}: {script}");
+        }
+        let script = "CJ: CJ\r\nTMP_FontAsset: TMP_FontAsset\r\nLiftGammaGain: LiftGammaGain\r\n";
+        fs::write(
+            &path,
+            crate::unity_serialized::write_v17_fixture_ex("CharacterNames", script, None),
+        )
+        .unwrap();
+        let mut entries = plugin.extract(&path).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].source, "CJ");
+        entries[1].translation = Some("Nombre".into());
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        let sf = SerializedFile::parse(fs::read(&path).unwrap(), &path).unwrap();
+        assert_eq!(
+            sf.read_text_asset(1).unwrap().script,
+            script.replace("TMP_FontAsset: TMP_FontAsset", "TMP_FontAsset: Nombre")
+        );
+    }
+
+    #[test]
+    fn display_names_preserve_legacy_heuristic_ids() {
+        let path = Path::new("resources.assets");
+        let mut bytes = crate::unity_serialized::write_v17_fixture_ex(
+            "CharacterNames",
+            "Carter: Carter\nEmily: Emily\nJake: Jake\n",
+            None,
+        );
+        let dialogue = "Additional visible dialogue!";
+        bytes.extend_from_slice(&(dialogue.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(dialogue.as_bytes());
+        let file_size = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&file_size.to_be_bytes());
+        let mut glossary = bytes.clone();
+        let colon = glossary
+            .windows(b"Carter: Carter".len())
+            .position(|v| v == b"Carter: Carter")
+            .unwrap()
+            + "Carter".len();
+        glossary[colon] = b';'; // same offsets, glossary-only fallback
+        let before = UnityPlugin::extract_strings_from_assets(&glossary, "resources.assets", path);
+        let after = UnityPlugin::extract_strings_from_assets(&bytes, "resources.assets", path);
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 4);
+        let old = &before[0];
+        let new = after.iter().find(|e| e.source == dialogue).unwrap();
+        assert_eq!(new.id, old.id);
+        assert_eq!(new.metadata, old.metadata);
     }
 }
