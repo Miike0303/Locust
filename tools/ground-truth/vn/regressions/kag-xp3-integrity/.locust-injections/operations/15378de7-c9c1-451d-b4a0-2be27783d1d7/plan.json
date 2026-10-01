@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "transaction_id": "15378de7-c9c1-451d-b4a0-2be27783d1d7",
+  "game_root": "\\\\?\\C:\\Users\\Mike\\AppData\\Local\\Temp\\locust-research-vn\\regressions\\kag-xp3-integrity",
+  "files": [
+    {
+      "path": "patch.xp3",
+      "original": {
+        "sha256": "a17637ebfb5d18a2b9c27ed1102bed81c92a486a5652b2d0e76a56a61f23eec2",
+        "size": 164,
+        "readonly": false,
+        "unix_mode": null
+      },
+      "result": {
+        "sha256": "16c68a07915d255cd297000232eee6c2cbde3a21b677c27459970d0f7b020426",
+        "size": 129,
+        "readonly": false,
+        "unix_mode": null
+      }
+    }
+  ],
+  "created_dirs": []
+}

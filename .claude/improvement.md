@@ -148,6 +148,13 @@ Owned by no lane; Claude applies these after the writers finish.
 - Test counts in `CLAUDE.md` and the docs disagree (890/1239/1439/1448/1453).
   Trust only a run you did yourself.
 
+- **Concurrency cap (2026-09-30).** At most 2 Codex sessions at once (writers + researchers together) and none of your own cargo builds beside them: with 3 sessions plus verification builds the Codex command runner hung in all three (log stops growing, 'command still pending'). Verify a finished writer when at most one session is running. Writers run in scratch snapshots, never cargo in the repo directory. Parallel writers must own DISJOINT files; restrict a researcher brief's 'Files to edit' to one file per lane before dispatching.
+- **Stop rules in briefs (2026-09-30).** Never write `if you see the text "X", stop`: a researcher that greps the repo finds it in other briefs and aborts. Write 'stop only on a real tool error in your own calls' and forbid searching the repo's `tmp/`.
+- **Process stops need the user (2026-09-30).** The auto-mode classifier blocks `Stop-Process` on Codex processes it cannot prove are the agent's own (other fleets share the machine). List them read-only and ask.
+- **Verification recipe that worked (2026-09-30).** `git worktree add -f --detach <Temp>/claude-verify-X HEAD`; copy only that writer's file plus `apps/desktop/dist`; run fmt/clippy/test in a background script with `CARGO_TARGET_DIR=<Temp>/claude-verify-target`; wait with `until rg -q DONE out; do sleep 5; done`; `git worktree remove --force`.
+- **Ledger edits via a Python FILE script** (split on a newline only, placeholder `PENDINGnnn` hash replaced with `sed` after the commit, check for U+FFFD). Backslash-U inside an inline Python string literal with a Windows path is a syntax error: use forward slashes or raw strings, and write the script with the file tool.
+- **Audit tooling for Unity and the VN engines** lives in `tools/ground-truth/unity` and `tools/ground-truth/vn` (the UnityPy venv is recreated by `bootstrap.py`).
+
 ## Stopping
 
 The loop runs until the user stops it, the session closes, or there is nothing

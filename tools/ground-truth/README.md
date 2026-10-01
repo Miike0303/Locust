@@ -35,3 +35,17 @@ Paths are hard-coded to this machine: `C:\Projects\Locust\target\debug\locust.ex
 - Claude re-runs the audit himself before accepting a writer's numbers.
 - A researcher must not modify the repo or `D:\juegos`; check `git status --short` afterwards.
 - Write briefs with a file tool, not a shell heredoc: an unbalanced backtick or quote in a briefing broke the shell twice.
+
+## RPG Maker (`rpgm/`)
+
+Original-vs-translated pairs plus an independent JSON parse over the deployed MV/MZ games in `D:\juegos\rpgm`. Drove cycles 101-105 (encoding, speaker names, D_TEXT, non-CJK plugin text, blank lines). Latest numbers: pair visible recall 100%, 0 unexpected injected-copy changes, 0 source-value mismatches. `verify_additional.py` checks raw layout (blank lines, scroll groups) after inject.
+
+## Unity (`unity/`, added 2026-09-30)
+
+Ground truth: the game-authored script lines of Out of Touch (`SCRIPTS~`, speaker set from `Characters.txt`) and the serialized text fields read by **UnityPy 1.25.2 + TypeTreeGeneratorAPI 0.0.10** using each game's shipped `Managed/*.dll` schemas (CCTV, CCTV-USSR, Sunkissed, BOXMAN, Out of Touch under `D:\juegos\unity`). The venv is NOT in the repo: `bootstrap.py` / `install_parser.py` recreate it in scratch. Run `py -3.13 run_all.py --live-unity` from a scratch copy (paths are hard-coded to this machine; `isolate_cli.py` redirects the patch-lock directory into scratch for audit CLIs). `last-report.md` is the first audit (before cycles 107-112); `writer-0N-*.md` are the five writer briefs it produced (all five are merged: cycles 107, 108, 110, 109, 112). Combined recall went 89.26% -> 97.84% (+typed fields 99.99% classified precision), confirmed false positives 792 -> 6.
+
+## Visual-novel engines (`vn/`, added 2026-09-30)
+
+KiriKiri/KAG, YU-RIS, TyranoBuilder, NScripter. Ground truth: the KAG runtime grammar parsed by an independent reader (`readers.py`), the real `ysc.ybn` opcode table with an independent YSTB reader, the engine author's public Tyrano sample scripts and a public Japanese NScripter demo (URLs and SHA256 in the report; fetched into scratch by `fetch_specs.py`). `last-report.md` has the table of misses/false positives with real examples; `regressions/` has minimal failing fixtures; `writer-01..04-*.md` are the writer briefs. Only `writer-01-kirikiri.md` is merged (cycle 111); `writer-02-yuris.md`, `writer-03-tyrano.md` and `writer-04-nscripter.md` are still to do (see `docs/HANDOFF-2026-09-30.md`).
+
+Lessons that cost time on 2026-09-30: never put a literal stop phrase in a brief that a researcher may grep out of other briefs; tell researchers not to search the repo's `tmp/`; keep at most 2 Codex sessions at once and do not run your own cargo builds beside them.

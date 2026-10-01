@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "transaction_id": "1ab4078c-9a9a-46cb-ae4b-595e29aefbac",
+  "game_root": "\\\\?\\C:\\Users\\Mike\\AppData\\Local\\Temp\\locust-research-vn\\regressions\\kag-newline-integrity",
+  "files": [
+    {
+      "path": "story.ks",
+      "original": {
+        "sha256": "bfecc1c87adc37d44ae31328b4bcfdfb8f51a4a82d7d5749a5cd72a4d2142417",
+        "size": 25,
+        "readonly": false,
+        "unix_mode": null
+      },
+      "result": {
+        "sha256": "b1f6a0a6d467692e0170287dbc8c7b2a9f23c4b3ca3eb32b236b26f7565b2504",
+        "size": 33,
+        "readonly": false,
+        "unix_mode": null
+      }
+    }
+  ],
+  "created_dirs": []
+}

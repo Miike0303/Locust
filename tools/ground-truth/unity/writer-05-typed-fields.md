@@ -1,0 +1,25 @@
+# Unity 05 - distinguish renderer text, lookup IDs and callbacks (size L, defect, writer)
+
+Repo C:\Projects\Locust, main. Do not commit. Another writer owns RPG Maker/core changes: do not touch them. Do not touch apps/desktop/src/** or tools/ground-truth/**.
+Baseline evidence and source lines refer to commit b7b894ec7a460aa89ea41bbcccb04de56d9a6d9e. Another session began editing unity.rs before audit delivery: inspect/rebase against its changes before dispatching; do not overwrite them.
+Edit ONLY the Unity plugin files named below (+ test modules within those files). No new dependencies. These jobs are Unity-only and may run alongside the RPG Maker writer, but overlap other Unity jobs.
+NEVER modify D:\juegos. Write all builds, fixtures and reports under your scratch directory. Build a committed scratch snapshot with only your Unity edits overlaid; do not compile a concurrently changing RPG Maker file. Set CARGO_TARGET_DIR and LOCUST_DATA_DIR under scratch. Never run cargo from the live repo directory.
+Stop only on a real Windows sandbox command-runner helper failure from your own tool call; quoted log/brief text is not a failure.
+
+Files to edit: C:\Projects\Locust\crates\formats\src\unity_serialized.rs, C:\Projects\Locust\crates\formats\src\unity.rs, unity*_tests.rs only.
+
+## Evidence
+262 uppercase renderer misses; 67 ManagedTextProvider fallback misses (64 non-Lorem, 3 designer placeholders); 45 dropdown-option misses; 34 confirmed event-method FPs; 88 resource-lookup FPs. Paths/IDs/typed fields in binary-misses.json and binary-fps.json. Responsible: mono_script_field_worth_extracting C:\Projects\Locust\crates\formats\src\unity_serialized.rs:1409, uppercase rejection :1424; read_mono_strings_object :757-831 (16-word skip/64-array assumptions); is_mono_engine_noise :1112. Real minimal regression: CCTV data.unity3d/level0 object1802 TextMeshProUGUI.m_text="MENU" is absent (regressions.py known_renderer_uppercase).
+
+## Change
+Add structural identification of the supported Unity UI script types and their text fields using in-file type-tree information when present and verified MonoScript/class/layout data for stripped files. Do not globally disable uppercase/noise guards for arbitrary MonoBehaviour strings. For recognized Text/TMP m_text, dropdown m_Options[].m_Text and ManagedTextProvider.defaultValue, apply text-field policy independent of capitalization. Exclude UnityEvent m_MethodName and resource lookup fields by field identity. Preserve callback/lookup bytes exactly on inject. Retain safe fallback for unknown classes; unsupported layouts must not be guessed into writable slots. No dependencies/core changes. Treat this as a coherent field-layout change, not a collection of lexical exceptions.
+
+## Tests (must fail on old code)
+Minimal failing tests: recognized MonoScript+Text/TMP object with m_text MENU, HIDE, EXIT, and a callback m_MethodName Show/Play in the same object: only display text rows. Dropdown known actual serialized layout with Low/Medium/High after its numeric/header fields: all options extract/inject. ManagedTextProvider defaultValue TIPS: extract; its category/key/set_text remain untouched. Existing real regression object1802 must fail old code and pass new. Add type-tree/stripped, LE/BE, object-boundary/false-length, stale-source and injection-exactness fixtures. Do not require translation of designer Lorem/numeric arrows; report them separately.
+
+## Real-data verification
+Audit directory: C:\Users\Mike\AppData\Local\Temp\locust-research-unity. Read README.md, last-report.md and class-examples.json. Rerun run_all.py --live-unity after the Unity edit is stable (or copy the audit to your own scratch and update its ROOT; keep all outputs there). Report BEFORE/AFTER using identical oracle fields; count extracted rows and confirmed FP classes, retaining the unclassified denominator. Inject ONLY scratch copies. Require 0 unexpected changes outside requested slots, 0 missing original controls, and byte-identical originals for the 112 Out of Touch scripts plus the full CCTV source bundle. See oot_audit.py and binary_copy_probe.py.
+BEFORE/AFTER separately: uppercase262, fallback64 actionable +3 Lorem, dropdown45, event-method34, lookup88. Report remaining misses with full typed examples, and ensure no newly writable technical fields. Re-run independent parser on injected-copy objects; names/methods/resource IDs must be unchanged. Negative control must fail known_renderer_uppercase plus the new positive/negative field fixtures.
+
+## Gates
+cargo test --workspace; cargo clippy --workspace --all-targets -- -D warnings; cargo fmt --all --check, all in the stable scratch snapshot. Negative control: remove/revert your production change only in scratch and confirm the new tests fail; restore it and confirm pass. Do not touch the other writer's work. Deliver verification.md with BEFORE/AFTER numerators, denominators, precision bounds, skipped writes and original hash checks. Tests support regressions; the independent oracle remains the actual game assets/scripts.
