@@ -27,7 +27,8 @@
 //!   same layout with correct sizes.
 //!
 //! Out of scope: CxDec / Hxv4 encrypted XP3, `.tjs`/compiled `.scn`,
-//! rewriting base `.xp3` archives (patch.xp3 only).
+//! rewriting existing `.xp3` archives. Injection creates `patch.xp3` only when
+//! no patch archive exists; otherwise it explicitly refuses archive writes.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -96,8 +97,11 @@ struct DecodedKs {
     text: String,
     encoding: KsEncoding,
     cipher: CipherMode,
-    /// Prefer `\r\n` when rewriting if the source used it.
-    crlf: bool,
+    /// Original decoded payload, including noncanonical Shift-JIS byte spellings.
+    plain: Vec<u8>,
+    bom: bool,
+    /// Mode-2 bytes beyond the compressed stream must survive an edit.
+    tail: Vec<u8>,
 }
 
 pub struct KirikiriPlugin;
@@ -245,250 +249,196 @@ fn utf16le_bytes_from_str(s: &str) -> Vec<u8> {
     out
 }
 
-fn str_from_utf16le_bytes(data: &[u8]) -> String {
+fn str_from_utf16le_bytes(data: &[u8], label: &str) -> Result<String> {
+    if !data.len().is_multiple_of(2) {
+        return Err(parse_err(label, "odd UTF-16LE payload length"));
+    }
     let units: Vec<u16> = data
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    String::from_utf16_lossy(&units)
+    String::from_utf16(&units).map_err(|_| parse_err(label, "invalid UTF-16LE payload"))
 }
 
-// ─── Decode / encode whole file ────────────────────────────────────────────
-
-fn decode_ks_bytes(bytes: &[u8], file_label: &str) -> Result<DecodedKs> {
-    // Cipher header: FE FE mode FF FE
-    if bytes.len() >= 5
-        && bytes[0] == 0xFE
-        && bytes[1] == 0xFE
-        && bytes[3] == 0xFF
-        && bytes[4] == 0xFE
-    {
-        let mode = bytes[2];
-        let body = &bytes[5..];
-        match mode {
-            0 => {
-                if !body.len().is_multiple_of(2) {
-                    return Err(parse_err(file_label, "mode-0 cipher body has odd length"));
+// Decode strictly: a lossy decoder cannot support byte-preserving editing.
+fn decode_ks_bytes(bytes: &[u8], label: &str) -> Result<DecodedKs> {
+    let mut plain;
+    let encoding;
+    let cipher;
+    let mut bom = false;
+    let mut tail = Vec::new();
+    if bytes.starts_with(&[0xFE, 0xFE]) {
+        if bytes.len() < 5 || bytes[3..5] != [0xFF, 0xFE] {
+            return Err(parse_err(label, "invalid FE FE cipher header"));
+        }
+        encoding = KsEncoding::Utf16Le;
+        match bytes[2] {
+            0 | 1 => {
+                plain = bytes[5..].to_vec();
+                if !plain.len().is_multiple_of(2) {
+                    return Err(parse_err(label, "odd cipher payload length"));
                 }
-                let mut data = body.to_vec();
-                mode0_decode_units(&mut data);
-                let text = str_from_utf16le_bytes(&data);
-                let crlf = text.contains("\r\n");
-                return Ok(DecodedKs {
-                    text,
-                    encoding: KsEncoding::Utf16Le,
-                    cipher: CipherMode::Mode0,
-                    crlf,
-                });
-            }
-            1 => {
-                if !body.len().is_multiple_of(2) {
-                    return Err(parse_err(file_label, "mode-1 cipher body has odd length"));
+                if bytes[2] == 0 {
+                    cipher = CipherMode::Mode0;
+                    mode0_decode_units(&mut plain);
+                } else {
+                    cipher = CipherMode::Mode1;
+                    mode1_swap_units(&mut plain);
                 }
-                let mut data = body.to_vec();
-                mode1_swap_units(&mut data);
-                let text = str_from_utf16le_bytes(&data);
-                let crlf = text.contains("\r\n");
-                return Ok(DecodedKs {
-                    text,
-                    encoding: KsEncoding::Utf16Le,
-                    cipher: CipherMode::Mode1,
-                    crlf,
-                });
             }
             2 => {
-                // Layout (arcusmaximus KirikiriDescrambler Decompress / Scrambler Compress):
-                // u64 compressed_size, u64 uncompressed_size, then zlib blob.
-                if body.len() < 16 {
-                    return Err(parse_err(
-                        file_label,
-                        "mode-2 cipher body too small for size fields",
-                    ));
+                cipher = CipherMode::Mode2;
+                if bytes.len() < 21 {
+                    return Err(parse_err(label, "mode-2 missing size fields"));
                 }
-                let compressed_size = u64::from_le_bytes(body[0..8].try_into().unwrap()) as usize;
-                let uncompressed_size =
-                    u64::from_le_bytes(body[8..16].try_into().unwrap()) as usize;
-                let zlib_start = 16usize;
-                let zlib_end = zlib_start
-                    .checked_add(compressed_size)
-                    .filter(|e| *e <= body.len())
-                    .ok_or_else(|| {
-                        parse_err(
-                            file_label,
-                            &format!(
-                                "mode-2 compressed size {compressed_size} exceeds remaining body"
-                            ),
-                        )
-                    })?;
-                let zlib = &body[zlib_start..zlib_end];
-                let plain = miniz_oxide::inflate::decompress_to_vec_zlib(zlib).map_err(|e| {
-                    parse_err(file_label, &format!("mode-2 zlib inflate failed: {e:?}"))
-                })?;
-                if uncompressed_size != 0 && plain.len() != uncompressed_size {
-                    // Prefer exact match (Descrambler allocates uncompressed_size).
-                    if plain.len() < uncompressed_size {
-                        return Err(parse_err(
-                            file_label,
-                            &format!(
-                                "mode-2 inflated size {} < declared uncompressed {uncompressed_size}",
-                                plain.len()
-                            ),
-                        ));
-                    }
-                    // Extra trailing bytes: take declared length if even.
-                    if !uncompressed_size.is_multiple_of(2) {
-                        return Err(parse_err(
-                            file_label,
-                            "mode-2 uncompressed size is odd (not UTF-16LE)",
-                        ));
-                    }
+                let size = usize::try_from(u64::from_le_bytes(bytes[5..13].try_into().unwrap()))
+                    .map_err(|_| parse_err(label, "mode-2 size overflow"))?;
+                let expected = u64::from_le_bytes(bytes[13..21].try_into().unwrap());
+                let end = 21usize
+                    .checked_add(size)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| parse_err(label, "mode-2 truncated zlib stream"))?;
+                plain = miniz_oxide::inflate::decompress_to_vec_zlib(&bytes[21..end])
+                    .map_err(|e| parse_err(label, &format!("mode-2 zlib inflate: {e:?}")))?;
+                if expected != 0 && plain.len() as u64 != expected {
+                    return Err(parse_err(label, "mode-2 inflated size mismatch"));
                 }
-                let utf16 = if uncompressed_size != 0
-                    && plain.len() >= uncompressed_size
-                    && uncompressed_size.is_multiple_of(2)
-                {
-                    &plain[..uncompressed_size]
-                } else {
-                    if !plain.len().is_multiple_of(2) {
-                        return Err(parse_err(
-                            file_label,
-                            "mode-2 inflated payload has odd length",
-                        ));
-                    }
-                    &plain[..]
-                };
-                let text = str_from_utf16le_bytes(utf16);
-                let crlf = text.contains("\r\n");
-                return Ok(DecodedKs {
-                    text,
-                    encoding: KsEncoding::Utf16Le,
-                    cipher: CipherMode::Mode2,
-                    crlf,
-                });
+                tail.extend_from_slice(&bytes[end..]);
             }
-            _ => {
-                return Err(parse_err(
-                    file_label,
-                    &format!("unsupported FE FE cipher mode {mode}"),
-                ));
-            }
+            _ => return Err(parse_err(label, "unsupported FE FE cipher mode")),
         }
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        encoding = KsEncoding::Utf16Le;
+        cipher = CipherMode::None;
+        bom = true;
+        plain = bytes[2..].to_vec();
+    } else if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        encoding = KsEncoding::Utf8;
+        cipher = CipherMode::None;
+        bom = true;
+        plain = bytes[3..].to_vec();
+    } else {
+        encoding = if std::str::from_utf8(bytes).is_ok() {
+            KsEncoding::Utf8
+        } else {
+            KsEncoding::ShiftJis
+        };
+        cipher = CipherMode::None;
+        plain = bytes.to_vec();
     }
-
-    // Plain UTF-16LE BOM
-    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
-        let text = str_from_utf16le_bytes(&bytes[2..]);
-        let crlf = text.contains("\r\n");
-        return Ok(DecodedKs {
-            text,
-            encoding: KsEncoding::Utf16Le,
-            cipher: CipherMode::None,
-            crlf,
-        });
-    }
-
-    // Plain UTF-8 BOM
-    if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
-        let text = String::from_utf8_lossy(&bytes[3..]).into_owned();
-        let crlf = text.contains("\r\n");
-        return Ok(DecodedKs {
-            text,
-            encoding: KsEncoding::Utf8,
-            cipher: CipherMode::None,
-            crlf,
-        });
-    }
-
-    // No BOM: prefer strict UTF-8, else Shift-JIS (common for JP shipping).
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        // Heuristic: if high bytes look like multi-byte UTF-8, keep UTF-8;
-        // pure ASCII still fine as UTF-8 for roundtrip.
-        let crlf = text.contains("\r\n");
-        return Ok(DecodedKs {
-            text: text.to_string(),
-            encoding: KsEncoding::Utf8,
-            cipher: CipherMode::None,
-            crlf,
-        });
-    }
-
-    let (cow, _, had_errors) = encoding_rs::SHIFT_JIS.decode(bytes);
-    if had_errors {
-        return Err(parse_err(
-            file_label,
-            "could not decode .ks as UTF-16LE/UTF-8/Shift-JIS or FE FE cipher",
-        ));
-    }
-    let text = cow.into_owned();
-    let crlf = text.contains("\r\n");
+    let text = match encoding {
+        KsEncoding::Utf16Le => str_from_utf16le_bytes(&plain, label)?,
+        KsEncoding::Utf8 => String::from_utf8(plain.clone())
+            .map_err(|_| parse_err(label, "invalid UTF-8 payload"))?,
+        KsEncoding::ShiftJis => {
+            let (text, errors) = encoding_rs::SHIFT_JIS.decode_without_bom_handling(&plain);
+            if errors {
+                return Err(parse_err(label, "invalid Shift-JIS payload"));
+            }
+            text.into_owned()
+        }
+    };
     Ok(DecodedKs {
         text,
-        encoding: KsEncoding::ShiftJis,
-        cipher: CipherMode::None,
-        crlf,
+        encoding,
+        cipher,
+        plain,
+        bom,
+        tail,
     })
 }
 
-fn encode_ks_bytes(decoded: &DecodedKs) -> Result<Vec<u8>> {
-    let text = normalize_newlines(&decoded.text, decoded.crlf);
-    match decoded.cipher {
-        CipherMode::Mode0 => {
-            let mut body = utf16le_bytes_from_str(&text);
-            mode0_encode_units(&mut body);
-            let mut out = vec![0xFE, 0xFE, 0x00, 0xFF, 0xFE];
-            out.extend_from_slice(&body);
-            Ok(out)
-        }
-        CipherMode::Mode1 => {
-            let mut body = utf16le_bytes_from_str(&text);
-            mode1_swap_units(&mut body);
-            let mut out = vec![0xFE, 0xFE, 0x01, 0xFF, 0xFE];
-            out.extend_from_slice(&body);
-            Ok(out)
-        }
-        CipherMode::Mode2 => {
-            // Scrambler.Compress: raw UTF-16LE (no BOM), zlib, then patch compressed size.
-            let utf16 = utf16le_bytes_from_str(&text);
-            let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&utf16, 6);
-            let mut out = Vec::with_capacity(5 + 16 + compressed.len());
-            out.extend_from_slice(&[0xFE, 0xFE, 0x02, 0xFF, 0xFE]);
-            out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
-            out.extend_from_slice(&(utf16.len() as u64).to_le_bytes());
-            out.extend_from_slice(&compressed);
-            Ok(out)
-        }
-        CipherMode::None => match decoded.encoding {
-            KsEncoding::Utf16Le => {
-                let mut out = vec![0xFF, 0xFE];
-                out.extend_from_slice(&utf16le_bytes_from_str(&text));
-                Ok(out)
-            }
-            KsEncoding::Utf8 => {
-                let mut out = vec![0xEF, 0xBB, 0xBF];
-                out.extend_from_slice(text.as_bytes());
-                Ok(out)
-            }
-            KsEncoding::ShiftJis => {
-                let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(&text);
-                if had_errors {
-                    return Err(parse_err(
-                        "ks",
-                        "could not re-encode translation as Shift-JIS",
-                    ));
-                }
-                Ok(bytes.into_owned())
-            }
-        },
-    }
+struct KsEdit {
+    start: usize,
+    end: usize,
+    replacement: String,
 }
 
-fn normalize_newlines(text: &str, crlf: bool) -> String {
-    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
-    if crlf {
-        unified.replace('\n', "\r\n")
-    } else {
-        unified
+/// Map Unicode boundaries to the ORIGINAL payload. Re-encoding unchanged SJIS
+/// would corrupt duplicate/noncanonical CP932 spellings even after strict decode.
+fn payload_boundaries(decoded: &DecodedKs) -> HashMap<usize, usize> {
+    let mut offsets = HashMap::new();
+    let mut raw = 0;
+    for (offset, ch) in decoded.text.char_indices() {
+        offsets.insert(offset, raw);
+        raw += match decoded.encoding {
+            KsEncoding::Utf8 => ch.len_utf8(),
+            KsEncoding::Utf16Le => ch.len_utf16() * 2,
+            KsEncoding::ShiftJis => {
+                if matches!(decoded.plain[raw], 0x81..=0x9f | 0xe0..=0xfc) {
+                    2
+                } else {
+                    1
+                }
+            }
+        };
     }
+    offsets.insert(decoded.text.len(), raw);
+    offsets
+}
+
+fn encode_ks_edits(decoded: &DecodedKs, edits: &[KsEdit]) -> Result<Vec<u8>> {
+    let boundaries = payload_boundaries(decoded);
+    let mut plain = Vec::new();
+    let mut cursor = 0;
+    for edit in edits {
+        let start = boundaries[&edit.start];
+        let end = boundaries[&edit.end];
+        plain.extend_from_slice(&decoded.plain[cursor..start]);
+        match decoded.encoding {
+            KsEncoding::Utf8 => plain.extend_from_slice(edit.replacement.as_bytes()),
+            KsEncoding::Utf16Le => {
+                plain.extend_from_slice(&utf16le_bytes_from_str(&edit.replacement))
+            }
+            KsEncoding::ShiftJis => {
+                let (bytes, _, errors) = encoding_rs::SHIFT_JIS.encode(&edit.replacement);
+                let (roundtrip, _) = encoding_rs::SHIFT_JIS.decode_without_bom_handling(&bytes);
+                if errors || roundtrip != edit.replacement {
+                    return Err(parse_err(
+                        "ks",
+                        "translation cannot round-trip as Shift-JIS",
+                    ));
+                }
+                plain.extend_from_slice(&bytes);
+            }
+        }
+        cursor = end;
+    }
+    plain.extend_from_slice(&decoded.plain[cursor..]);
+    let mut out = Vec::new();
+    match decoded.cipher {
+        CipherMode::None => {
+            if decoded.bom {
+                out.extend_from_slice(match decoded.encoding {
+                    KsEncoding::Utf16Le => &[0xFF, 0xFE],
+                    _ => &[0xEF, 0xBB, 0xBF],
+                });
+            }
+            out.extend_from_slice(&plain);
+        }
+        CipherMode::Mode0 | CipherMode::Mode1 => {
+            let mode = if decoded.cipher == CipherMode::Mode0 {
+                mode0_encode_units(&mut plain);
+                0
+            } else {
+                mode1_swap_units(&mut plain);
+                1
+            };
+            out.extend_from_slice(&[0xFE, 0xFE, mode, 0xFF, 0xFE]);
+            out.extend_from_slice(&plain);
+        }
+        CipherMode::Mode2 => {
+            // Compression changes the stream globally; the inflated untouched
+            // bytes, wrapper kind and trailing bytes remain exact.
+            let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            out.extend_from_slice(&[0xFE, 0xFE, 2, 0xFF, 0xFE]);
+            out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+            out.extend_from_slice(&(plain.len() as u64).to_le_bytes());
+            out.extend_from_slice(&compressed);
+            out.extend_from_slice(&decoded.tail);
+        }
+    }
+    Ok(out)
 }
 
 fn parse_err(file: &str, message: &str) -> LocustError {
@@ -603,105 +553,514 @@ fn is_pure_ellipsis_line(t: &str) -> bool {
 /// Uses bracket depth so attribute expressions with nested `[]` still count as
 /// one tag: `[eval exp="sf.x[tf.i]=1"]` (Taimanin / KAG).
 fn is_pure_tag_line(t: &str) -> bool {
-    let mut rest = t;
-    if !rest.starts_with('[') {
-        return false;
-    }
-    while !rest.is_empty() {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            return true;
-        }
-        if !rest.starts_with('[') {
-            return false;
-        }
-        let mut depth = 0i32;
-        let mut end: Option<usize> = None;
-        for (i, c) in rest.char_indices() {
-            match c {
-                '[' => depth += 1,
-                ']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match end {
-            Some(i) => {
-                // advance past `]` (1 byte ASCII)
-                rest = &rest[i + 1..];
-            }
-            None => return false,
-        }
-    }
-    true
+    let tags = kag_tags(t);
+    !tags.is_empty()
+        && text_between_tags(t, &tags)
+            .iter()
+            .all(|(_, text)| text.trim().is_empty())
 }
 
 fn is_player_text_line(line: &str) -> bool {
     !is_non_text_line(line)
 }
 
-/// Extract dialogue lines from decoded `.ks` text. `rel` is the id/source path
-/// prefix (loose relative path or `archive.xp3/inner.ks`). `file_path` is stored
-/// on each entry for inject routing.
-fn extract_lines_from_text(text: &str, rel: &str, file_path: PathBuf) -> Vec<StringEntry> {
-    let mut all = Vec::new();
-    for (idx, line) in text.split('\n').enumerate() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let line_no = idx + 1;
-        if !is_player_text_line(line) {
-            continue;
-        }
-        let id = format!("{rel}#{line_no}");
-        let mut entry = StringEntry::new(id, line, file_path.clone());
-        entry.tags = vec!["dialogue".into()];
-        all.push(entry);
-    }
-    all
+struct KagTag<'a> {
+    start: usize,
+    end: usize,
+    name: &'a str,
+    attrs_start: usize,
 }
 
-/// Apply line translations to a decoded script; returns encoded bytes if changed.
+/// `[[` is a displayed bracket. Quotes shield `]`; KAG escapes attribute
+/// characters with a backtick, NOT a TJS/backslash string escape.
+fn kag_tags(line: &str) -> Vec<KagTag<'_>> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"[[") {
+            i += 2;
+            continue;
+        }
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        let name_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b']' {
+            i += 1;
+        }
+        let name = &line[name_start..i];
+        let attrs_start = i;
+        let mut quote = None;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'`' {
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+            } else if c == b'\'' || c == b'"' {
+                quote = Some(c);
+            } else if c == b']' {
+                break;
+            }
+            i += 1;
+        }
+        if i == bytes.len() {
+            break;
+        }
+        i += 1;
+        out.push(KagTag {
+            start,
+            end: i,
+            name,
+            attrs_start,
+        });
+    }
+    out
+}
+
+fn text_between_tags<'a>(line: &'a str, tags: &[KagTag<'_>]) -> Vec<(usize, &'a str)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for tag in tags {
+        out.push((start, &line[start..tag.start]));
+        start = tag.end;
+    }
+    out.push((start, &line[start..]));
+    out
+}
+
+fn has_unescaped_bracket(text: &str) -> bool {
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '[' && chars.next() != Some('[') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Content ranges exclude CR, LF, and CRLF independently (including a final
+/// separator). Logical row numbers are stable across a text-span edit.
+fn kag_lines(text: &str) -> Vec<(usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\r' | b'\n') {
+            out.push((start, &text[start..i]));
+            i += if bytes[i..].starts_with(b"\r\n") {
+                2
+            } else {
+                1
+            };
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < text.len() {
+        out.push((start, &text[start..]));
+    }
+    out
+}
+
+enum KagSlotKind {
+    Dialogue,
+    Attribute(Option<u8>),
+}
+
+struct KagSlot {
+    locator: String,
+    start: usize,
+    end: usize,
+    source: String,
+    kind: KagSlotKind,
+}
+
+fn unescape_attribute(raw: &str) -> String {
+    let mut chars = raw.chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        if c == '`' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn display_attribute(tag: &str) -> Option<&'static str> {
+    if tag.eq_ignore_ascii_case("name") {
+        Some("text")
+    } else if tag.eq_ignore_ascii_case("name_w") {
+        Some("n")
+    } else {
+        None
+    }
+}
+
+fn attribute_slots(
+    line: &str,
+    tag: &KagTag<'_>,
+    ordinal: usize,
+    no: usize,
+    base: usize,
+) -> Vec<KagSlot> {
+    let Some(wanted) = display_attribute(tag.name) else {
+        return Vec::new();
+    };
+    let bytes = line.as_bytes();
+    let mut i = tag.attrs_start;
+    let mut found = Vec::new();
+    while i < tag.end - 1 {
+        while i < tag.end - 1 && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key_start = i;
+        while i < tag.end - 1 && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let key = &line[key_start..i];
+        while i < tag.end - 1 && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == tag.end - 1 || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < tag.end - 1 && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let expression = i < tag.end - 1 && matches!(bytes[i], b'&' | b'%');
+        if expression {
+            i += 1;
+        }
+        let quote = if i < tag.end - 1 && matches!(bytes[i], b'\'' | b'"') {
+            let q = bytes[i];
+            i += 1;
+            Some(q)
+        } else {
+            None
+        };
+        let start = i;
+        while i < tag.end - 1 {
+            if bytes[i] == b'`' {
+                i = (i + 2).min(tag.end - 1);
+                continue;
+            }
+            if quote.map_or_else(|| bytes[i].is_ascii_whitespace(), |q| bytes[i] == q) {
+                break;
+            }
+            i += 1;
+        }
+        let end = i;
+        if quote.is_some() {
+            i += 1;
+        }
+        if key.eq_ignore_ascii_case(wanted) {
+            // Duplicate attributes are ambiguous, even if one is an expression.
+            let value = unescape_attribute(&line[start..end]);
+            found.push((start, end, quote, expression, value));
+        }
+    }
+    if found.len() != 1 {
+        return Vec::new();
+    }
+    let (start, end, quote, expression, source) = found.pop().unwrap();
+    if expression || source.starts_with(['&', '%']) || source.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![KagSlot {
+        locator: format!("kag:{no}:attr:{ordinal}:{wanted}"),
+        start: base + start,
+        end: base + end,
+        source,
+        kind: KagSlotKind::Attribute(quote),
+    }]
+}
+
+fn kag_slots(text: &str) -> Vec<KagSlot> {
+    let mut out = Vec::new();
+    let mut script = false;
+    for (index, (base, line)) in kag_lines(text).into_iter().enumerate() {
+        let no = index + 1;
+        let trimmed = line.trim();
+        // Only standalone commands end TJS. A quoted "[endscript]" inside
+        // script code must not admit the remainder of the script as dialogue.
+        let command = trimmed.trim_end_matches('\\').trim_end();
+        let ends = command.eq_ignore_ascii_case("[endscript]")
+            || command.eq_ignore_ascii_case("@endscript");
+        if script {
+            if ends {
+                script = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with([';', '*']) {
+            continue;
+        }
+        let starts =
+            command.eq_ignore_ascii_case("[iscript]") || command.eq_ignore_ascii_case("@iscript");
+        if starts {
+            script = true;
+            continue;
+        }
+        if ends {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('@') {
+            // @ commands use the same attribute grammar, with no closing ].
+            let synthetic = format!("[{rest}]");
+            let tags = kag_tags(&synthetic);
+            if let Some(tag) = tags.first() {
+                let indent = line.len() - line.trim_start().len();
+                out.extend(attribute_slots(&synthetic, tag, 0, no, base + indent));
+            }
+            continue;
+        }
+        let tags = kag_tags(line);
+        for (ordinal, tag) in tags.iter().enumerate() {
+            out.extend(attribute_slots(line, tag, ordinal, no, base));
+        }
+        if is_player_text_line(line) {
+            out.push(KagSlot {
+                locator: format!("kag:{no}"),
+                start: base,
+                end: base + line.len(),
+                source: line.into(),
+                kind: KagSlotKind::Dialogue,
+            });
+        }
+    }
+    out
+}
+
+fn extract_lines_from_text(text: &str, rel: &str, file_path: PathBuf) -> Vec<StringEntry> {
+    kag_slots(text)
+        .into_iter()
+        .map(|slot| {
+            let mut entry = StringEntry::new(
+                format!("{rel}#{}", slot.locator),
+                slot.source,
+                file_path.clone(),
+            );
+            entry.tags = vec![match slot.kind {
+                KagSlotKind::Dialogue => "dialogue",
+                KagSlotKind::Attribute(_) => "speaker",
+            }
+            .into()];
+            entry
+        })
+        .collect()
+}
+
+fn add_text_edit(edits: &mut Vec<KsEdit>, start: usize, source: &str, replacement: &str) {
+    if source == replacement {
+        return;
+    }
+    let prefix: usize = source
+        .chars()
+        .zip(replacement.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum();
+    let suffix: usize = source[prefix..]
+        .chars()
+        .rev()
+        .zip(replacement[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum();
+    edits.push(KsEdit {
+        start: start + prefix,
+        end: start + source.len() - suffix,
+        replacement: replacement[prefix..replacement.len() - suffix].into(),
+    });
+}
+
+fn escape_attribute(value: &str, quote: Option<u8>) -> String {
+    let mut out = String::new();
+    for c in value.chars() {
+        if c == '`'
+            || quote == Some(c as u8) && c.is_ascii()
+            || quote.is_none() && (c.is_whitespace() || matches!(c, ']' | '"' | '\''))
+        {
+            out.push('`');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Legacy #N addresses LF-delimited rows, never reinterpret it as a CR logical
+/// row. Both legacy and versioned locators must match the current source exactly.
 fn apply_translations(
     bytes: &[u8],
     label: &str,
     file_entries: &[&StringEntry],
 ) -> Result<Option<(Vec<u8>, usize)>> {
-    let mut decoded = decode_ks_bytes(bytes, label)?;
-    let mut by_line: HashMap<usize, &str> = HashMap::new();
-    for e in file_entries {
-        if let Some(t) = e.translation.as_deref() {
-            if let Some(n) = e.id.rsplit('#').next().and_then(|s| s.parse().ok()) {
-                by_line.insert(n, t);
+    let decoded = decode_ks_bytes(bytes, label)?;
+    let slots = kag_slots(&decoded.text);
+    let mut edits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut written = 0;
+    for entry in file_entries {
+        let Some(translation) = entry.translation.as_deref() else {
+            continue;
+        };
+        let (rel, locator) = entry
+            .id
+            .rsplit_once('#')
+            .ok_or_else(|| parse_err(label, "missing KAG locator"))?;
+        let normalized_label = label.replace('\\', "/");
+        let normalized_rel = rel.replace('\\', "/");
+        if normalized_label != normalized_rel
+            && !normalized_label.ends_with(&format!("/{normalized_rel}"))
+        {
+            return Err(parse_err(label, "locator addresses a different script"));
+        }
+        let slot = if locator.starts_with("kag:") {
+            slots.iter().find(|slot| slot.locator == locator)
+        } else {
+            let no: usize = locator
+                .parse()
+                .map_err(|_| parse_err(label, "invalid legacy KAG locator"))?;
+            let mut offset = 0;
+            let mut found = None;
+            for (i, raw) in decoded.text.split('\n').enumerate() {
+                let line = raw.strip_suffix('\r').unwrap_or(raw);
+                if i + 1 == no && !line.contains('\r') {
+                    found = slots.iter().find(|slot| {
+                        slot.start == offset
+                            && slot.end == offset + line.len()
+                            && matches!(slot.kind, KagSlotKind::Dialogue)
+                    });
+                    break;
+                }
+                offset += raw.len() + 1;
+            }
+            found
+        }
+        .ok_or_else(|| parse_err(label, "stale or unsafe KAG locator"))?;
+        if slot.source != entry.source || !seen.insert(&slot.locator) {
+            return Err(parse_err(label, "stale source or ambiguous KAG row"));
+        }
+        if translation == slot.source {
+            continue;
+        }
+        if translation.contains(['\r', '\n', '\0']) {
+            return Err(parse_err(label, "translation changes line delimiters"));
+        }
+        match slot.kind {
+            KagSlotKind::Attribute(quote) => {
+                if translation.trim().is_empty() || translation.starts_with(['&', '%']) {
+                    return Err(parse_err(label, "display attribute must remain a literal"));
+                }
+                let raw = &decoded.text[slot.start..slot.end];
+                // Keep original spelling/escaping in the shared prefix/suffix.
+                // A raw spelling can differ from canonical escaping. In that
+                // case preserve unchanged displayed characters via raw offsets.
+                let prefix = slot
+                    .source
+                    .chars()
+                    .zip(translation.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let source_chars: Vec<char> = slot.source.chars().collect();
+                let translated_chars: Vec<char> = translation.chars().collect();
+                let suffix = source_chars[prefix..]
+                    .iter()
+                    .rev()
+                    .zip(translated_chars[prefix..].iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let mut boundaries = vec![0];
+                let mut it = raw.char_indices();
+                while let Some((_, ch)) = it.next() {
+                    let end = if ch == '`' {
+                        let (i, c) = it.next().unwrap();
+                        i + c.len_utf8()
+                    } else {
+                        boundaries.last().copied().unwrap() + ch.len_utf8()
+                    };
+                    boundaries.push(end);
+                }
+                let chars: Vec<char> = translation.chars().collect();
+                let middle: String = chars[prefix..chars.len() - suffix].iter().collect();
+                let replacement = format!(
+                    "{}{}{}",
+                    &raw[..boundaries[prefix]],
+                    escape_attribute(&middle, quote),
+                    &raw[boundaries[boundaries.len() - 1 - suffix]..]
+                );
+                add_text_edit(&mut edits, slot.start, raw, &replacement);
+            }
+            KagSlotKind::Dialogue => {
+                let old_tags = kag_tags(&slot.source);
+                let new_tags = kag_tags(translation);
+                if old_tags.len() != new_tags.len()
+                    || old_tags
+                        .iter()
+                        .zip(&new_tags)
+                        .any(|(a, b)| slot.source[a.start..a.end] != translation[b.start..b.end])
+                {
+                    return Err(parse_err(label, "translation changes protected KAG tags"));
+                }
+                let old_text = text_between_tags(&slot.source, &old_tags);
+                let new_text = text_between_tags(translation, &new_tags);
+                let old_tail = slot.source.trim_end();
+                let new_tail = translation.trim_end();
+                if old_tail.ends_with('\\') != new_tail.ends_with('\\')
+                    || !is_player_text_line(translation)
+                {
+                    return Err(parse_err(
+                        label,
+                        "translation changes continuation or command controls",
+                    ));
+                }
+                for ((offset, old), (_, new)) in old_text.iter().zip(new_text) {
+                    // A continuation and its trailing whitespace are protected.
+                    if old.trim_end().ends_with('\\') {
+                        let suffix = &old[old.trim_end().len() - 1..];
+                        if !new.ends_with(suffix) {
+                            return Err(parse_err(label, "translation changes continuation"));
+                        }
+                    }
+                    if has_unescaped_bracket(new) {
+                        return Err(parse_err(
+                            label,
+                            "translation introduces an unterminated KAG tag",
+                        ));
+                    }
+                    add_text_edit(&mut edits, slot.start + offset, old, new);
+                }
             }
         }
+        written += 1;
     }
-
-    let mut out_lines = Vec::new();
-    let mut changed = false;
-    let mut written = 0usize;
-    for (idx, line) in decoded.text.split('\n').enumerate() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let line_no = idx + 1;
-        if let Some(t) = by_line.get(&line_no) {
-            if is_player_text_line(line) && *t != line {
-                out_lines.push((*t).to_string());
-                changed = true;
-                written += 1;
-                continue;
-            }
-        }
-        out_lines.push(line.to_string());
-    }
-
-    if !changed {
+    if edits.is_empty() {
         return Ok(None);
     }
-    decoded.text = out_lines.join("\n");
-    let encoded = encode_ks_bytes(&decoded)?;
+    edits.sort_by_key(|edit| (edit.start, edit.end));
+    if edits
+        .windows(2)
+        .any(|pair| pair[0].end > pair[1].start || pair[0].start == pair[1].start)
+    {
+        return Err(parse_err(label, "overlapping KAG translations"));
+    }
+    let encoded = encode_ks_edits(&decoded, &edits)?;
     Ok(Some((encoded, written)))
 }
 
@@ -1024,8 +1383,25 @@ impl FormatPlugin for KirikiriPlugin {
         // Cache opened base archives: archive file name → archive + name index
         let mut archive_cache: HashMap<String, CachedXp3> = HashMap::new();
 
+        let existing_patch = Self::find_top_level_xp3(&search_root)
+            .into_iter()
+            .find(|path| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.to_ascii_lowercase().starts_with("patch"))
+            });
+        let mut pending_patch_strings = 0;
+
         for (file_path, file_entries) in &by_file {
             if let Some((archive_name, inner)) = split_xp3_virtual_path(file_path) {
+                if let Some(existing) = &existing_patch {
+                    strings_skipped += file_entries
+                        .iter()
+                        .filter(|entry| entry.translation.is_some())
+                        .count();
+                    warnings.push(format!("safe refusal: existing XP3 patch {} must retain all members, encrypted payloads, metadata and active precedence; lossless patch merging is unsupported", existing.display()));
+                    continue;
+                }
                 if !archive_cache.contains_key(&archive_name) {
                     let arch_path = search_root.join(&archive_name);
                     match Xp3Archive::open(&arch_path) {
@@ -1076,8 +1452,7 @@ impl FormatPlugin for KirikiriPlugin {
                 match apply_translations(&bytes, &label, file_entries) {
                     Ok(Some((encoded, written))) => {
                         patch_files.push((inner.replace('\\', "/"), encoded));
-                        strings_written += written;
-                        files_modified += 1;
+                        pending_patch_strings += written;
                     }
                     Ok(None) => {
                         strings_skipped += file_entries.len();
@@ -1134,20 +1509,35 @@ impl FormatPlugin for KirikiriPlugin {
         }
 
         if !patch_files.is_empty() {
-            // Merge by inner name (last write wins)
-            let mut merged: HashMap<String, Vec<u8>> = HashMap::new();
+            let mut merged = BTreeMap::new();
             for (name, data) in patch_files {
-                merged.insert(name, data);
+                if merged.insert(name, data).is_some() {
+                    return Err(parse_err(
+                        "patch.xp3",
+                        "ambiguous duplicate patch output member",
+                    ));
+                }
             }
             let list: Vec<(String, Vec<u8>)> = merged.into_iter().collect();
             match kirikiri_xp3::write_xp3(&list) {
                 Ok(bytes) => {
+                    // create_new is also a last-moment guard against overwriting
+                    // a patch another process installed while we were preparing.
+                    use std::io::Write;
                     let patch_path = search_root.join("patch.xp3");
-                    std::fs::write(&patch_path, &bytes)?;
+                    let mut output = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&patch_path)?;
+                    output.write_all(&bytes)?;
+                    output.sync_all()?;
+                    files_modified += 1;
+                    strings_written += pending_patch_strings;
                     files_written.push(patch_path);
                 }
                 Err(e) => {
-                    warnings.push(format!("failed to build patch.xp3: {e}"));
+                    strings_skipped += pending_patch_strings;
+                    warnings.push(format!("failed to build patch.xp3 (0 archive writes): {e}"));
                 }
             }
         }
@@ -1182,6 +1572,297 @@ mod tests {
 [name] Hello, world!\r\n\
 This is narration.\r\n\
 @jump target=*end\r\n"
+    }
+
+    #[test]
+    fn vn01_bare_cr() {
+        let rows = extract_lines_from_text(
+            ";comment\rHello.\rGoodbye.\r",
+            "story.ks",
+            "story.ks".into(),
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(),
+            ["Hello.", "Goodbye."]
+        );
+    }
+
+    #[test]
+    fn vn01_script_state() {
+        for text in [
+            "[iscript]\nSystem.exit();\n[endscript]\nHello.\n",
+            "  [iscript]\\\r  System.inform('quoted [endscript]');\r\n\t\"player looking text\";\n  System.exit();\r  [endscript]\\\nHello.\n",
+            "@iscript\n  \"Hello inside code\";\n@endscript\nHello.\n",
+            "[iscript]\nSystem.exit();\nHello.\n",
+        ] {
+            let rows = extract_lines_from_text(text, "story.ks", "story.ks".into());
+            assert_eq!(rows.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(),
+                if !text.contains("endscript") { vec![] } else { vec!["Hello."] });
+        }
+    }
+
+    #[test]
+    fn vn01_lossless_encodings_and_separators() {
+        let dir = tempdir();
+        let path = dir.join("story.ks");
+        let original = "Hello.\n;comment\rGoodbye.\r\nAnother.\r";
+        let expected = format!("AUDIT {original}");
+        let mut fixtures = vec![original.as_bytes().to_vec()];
+        fixtures.push([&[0xEF, 0xBB, 0xBF][..], original.as_bytes()].concat());
+        fixtures.push([&[0xFF, 0xFE][..], &utf16le_bytes_from_str(original)].concat());
+        for mode in 0..=2 {
+            let mut body = utf16le_bytes_from_str(original);
+            let mut wrapped = vec![0xFE, 0xFE, mode, 0xFF, 0xFE];
+            match mode {
+                0 => mode0_encode_units(&mut body),
+                1 => mode1_swap_units(&mut body),
+                _ => {
+                    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&body, 6);
+                    wrapped.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+                    wrapped.extend_from_slice(&(body.len() as u64).to_le_bytes());
+                    body = compressed;
+                }
+            }
+            wrapped.extend_from_slice(&body);
+            fixtures.push(wrapped);
+        }
+        for bytes in fixtures {
+            fs::write(&path, &bytes).unwrap();
+            let plugin = KirikiriPlugin::new();
+            let mut rows = plugin.extract(&dir).unwrap();
+            let untouched: Vec<_> = rows
+                .iter()
+                .filter(|r| r.source != "Hello.")
+                .map(|r| (r.id.clone(), r.source.clone()))
+                .collect();
+            rows.iter_mut()
+                .find(|r| r.source == "Hello.")
+                .unwrap()
+                .translation = Some("AUDIT Hello.".into());
+            let report = plugin.inject(&dir, &rows).unwrap();
+            assert_eq!(report.strings_written, 1, "{report:?}");
+            let after = fs::read(&path).unwrap();
+            let decoded = decode_ks_bytes(&after, "story.ks").unwrap();
+            assert_eq!(decoded.text, expected);
+            let before_decoded = decode_ks_bytes(&bytes, "story.ks").unwrap();
+            assert_eq!(decoded.encoding, before_decoded.encoding);
+            assert_eq!(decoded.cipher, before_decoded.cipher);
+            if bytes.starts_with(&[0xFE, 0xFE, 2]) {
+                // The compression stream may change; the entire inflated suffix must not.
+                let plain = miniz_oxide::inflate::decompress_to_vec_zlib(&after[21..]).unwrap();
+                assert_eq!(plain, utf16le_bytes_from_str(&expected));
+            } else {
+                let insertion = if before_decoded.encoding == KsEncoding::Utf16Le {
+                    let mut prefix = utf16le_bytes_from_str("AUDIT ");
+                    match before_decoded.cipher {
+                        CipherMode::Mode0 => mode0_encode_units(&mut prefix),
+                        CipherMode::Mode1 => mode1_swap_units(&mut prefix),
+                        _ => {}
+                    }
+                    prefix
+                } else {
+                    b"AUDIT ".to_vec()
+                };
+                let header = if bytes.starts_with(&[0xFE, 0xFE]) {
+                    5
+                } else if bytes.starts_with(&[0xFF, 0xFE]) {
+                    2
+                } else if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                    3
+                } else {
+                    0
+                };
+                assert_eq!(
+                    after,
+                    [&bytes[..header], insertion.as_slice(), &bytes[header..]].concat()
+                );
+            }
+            let again = plugin.extract(&dir).unwrap();
+            assert!(again.iter().any(|r| r.source == "AUDIT Hello."));
+            for (id, source) in untouched {
+                assert!(again.iter().any(|r| r.id == id && r.source == source));
+            }
+        }
+    }
+
+    #[test]
+    fn vn01_sjis_alias_bytes_and_mode2_tail() {
+        // CP932 has duplicate mappings; full-file encode changes these bytes.
+        let bytes = [b"Hello.\n;".as_slice(), &[0x87, 0x90], b"\rGoodbye.\r"].concat();
+        let mut rows = extract_lines_from_text(
+            &decode_ks_bytes(&bytes, "story.ks").unwrap().text,
+            "story.ks",
+            "story.ks".into(),
+        );
+        rows[0].translation = Some("AUDIT Hello.".into());
+        let refs: Vec<_> = rows.iter().collect();
+        let (after, written) = apply_translations(&bytes, "story.ks", &refs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, 1);
+        assert_eq!(after, [b"AUDIT ".as_slice(), &bytes].concat());
+        let dir = tempdir();
+        let path = dir.join("story.ks");
+        write_mode2_ks(&path, "Hello.\rGoodbye.\n");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"opaque tail");
+        fs::write(&path, &bytes).unwrap();
+        let plugin = KirikiriPlugin::new();
+        let mut rows = plugin.extract(&dir).unwrap();
+        rows[0].translation = Some("AUDIT Hello.".into());
+        assert_eq!(plugin.inject(&dir, &rows).unwrap().strings_written, 1);
+        let after = fs::read(&path).unwrap();
+        assert!(after.ends_with(b"opaque tail"));
+        assert_eq!(
+            decode_ks_bytes(&after, "story.ks").unwrap().text,
+            "AUDIT Hello.\rGoodbye.\n"
+        );
+    }
+
+    #[test]
+    fn vn01_known_display_attributes() {
+        let text = "[NAME_W  n=\"Asagi\" storage=\"a[0].ks\"]\\\r[name text='Mitsuki' other=\"quoted ] [ brackets\"][p]\n@name text=Unquoted storage=label\r[name text=\"Mi`\"tsuki\"][name text=\"Second\"]Hello.[p]\\\r";
+        let mut rows = extract_lines_from_text(text, "story.ks", "story.ks".into());
+        for name in ["Asagi", "Mitsuki", "Unquoted", "Mi\"tsuki", "Second"] {
+            let row = rows
+                .iter_mut()
+                .find(|r| r.source == name)
+                .expect("known literal attribute");
+            row.translation = Some(format!("AUDIT {name}"));
+        }
+        let refs: Vec<_> = rows.iter().collect();
+        let (after, written) = apply_translations(text.as_bytes(), "story.ks", &refs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, 5);
+        let expected = text
+            .replace("Asagi", "AUDIT Asagi")
+            .replace("Mitsuki", "AUDIT Mitsuki")
+            .replace("Unquoted", "AUDIT` Unquoted")
+            .replace("Mi`\"tsuki", "AUDIT Mi`\"tsuki")
+            .replace("Second", "AUDIT Second");
+        assert_eq!(after, expected.as_bytes());
+        let again = extract_lines_from_text(&expected, "story.ks", "story.ks".into());
+        for name in ["Asagi", "Mitsuki", "Unquoted", "Mi\"tsuki", "Second"] {
+            assert!(again.iter().any(|r| r.source == format!("AUDIT {name}")));
+        }
+        let arbitrary = "[macro name=private][jump storage=id text=private][name text=\"%n\"][NAME_W n=&f.name][name text=one text=two]\n";
+        assert!(extract_lines_from_text(arbitrary, "story.ks", "story.ks".into()).is_empty());
+    }
+
+    #[test]
+    fn vn01_stale_ambiguous_and_protected_rows() {
+        let bytes = b"Hello.[p]\\\nGoodbye.\n";
+        let mut row = extract_lines_from_text(
+            std::str::from_utf8(bytes).unwrap(),
+            "story.ks",
+            "story.ks".into(),
+        )
+        .remove(0);
+        row.translation = Some("Hola.".into());
+        assert!(
+            apply_translations(bytes, "story.ks", &[&row]).is_err(),
+            "missing tag and continuation must fail"
+        );
+        row.translation = Some("Hola.[p]\\".into());
+        row.source = "stale source".into();
+        assert!(apply_translations(bytes, "story.ks", &[&row]).is_err());
+        row.source = "Hello.[p]\\".into();
+        assert!(apply_translations(bytes, "story.ks", &[&row, &row]).is_err());
+        // An old LF-row locator remains valid after source validation.
+        row.id = "story.ks#1".into();
+        let (after, _) = apply_translations(bytes, "story.ks", &[&row])
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, b"Hola.[p]\\\nGoodbye.\n");
+        row.id = "story.ks#2".into();
+        assert!(apply_translations(bytes, "story.ks", &[&row]).is_err());
+        row.id = "story.ks#1".into();
+        assert!(apply_translations(b"Hello.[p]\\\rGoodbye.\r", "story.ks", &[&row]).is_err());
+        row.id = "other.ks#1".into();
+        assert!(apply_translations(bytes, "story.ks", &[&row]).is_err());
+    }
+
+    #[test]
+    fn vn01_existing_xp3_retention_and_precedence() {
+        let dir = tempdir();
+        let data =
+            kirikiri_xp3::write_xp3(&[("story.ks".into(), b"Old base.\n".to_vec())]).unwrap();
+        let patch = kirikiri_xp3::write_xp3(&[
+            ("keep.bin".into(), b"UNTOUCHED RESOURCE".to_vec()),
+            ("story.ks".into(), b"Old patch.\n".to_vec()),
+        ])
+        .unwrap();
+        let patch2 = kirikiri_xp3::write_xp3(&[
+            ("story.ks".into(), b"Hello.\n".to_vec()),
+            ("keep2.bin".into(), b"SECOND RESOURCE".to_vec()),
+        ])
+        .unwrap();
+        for (name, bytes) in [
+            ("data.xp3", &data),
+            ("patch.xp3", &patch),
+            ("patch2.xp3", &patch2),
+        ] {
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        let plugin = KirikiriPlugin::new();
+        let mut rows = plugin.extract(&dir).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "Hello.");
+        rows[0].translation = Some("AUDIT Hello.".into());
+        let report = plugin.inject(&dir, &rows).unwrap();
+        let retained = Xp3Archive::open(&dir.join("patch.xp3")).unwrap();
+        let keep = retained
+            .entries
+            .iter()
+            .find(|e| e.name == "keep.bin")
+            .expect("unrelated member survives");
+        assert_eq!(retained.read_entry(keep).unwrap(), b"UNTOUCHED RESOURCE");
+        let effective = plugin
+            .extract(&dir)
+            .unwrap()
+            .iter()
+            .any(|r| r.source == "AUDIT Hello.");
+        assert!(
+            effective
+                || report.strings_written == 0
+                    && report.files_modified == 0
+                    && report.files_written.is_empty()
+                    && !report.warnings.is_empty()
+        );
+        if !effective {
+            for (name, bytes) in [
+                ("data.xp3", &data),
+                ("patch.xp3", &patch),
+                ("patch2.xp3", &patch2),
+            ] {
+                assert_eq!(
+                    fs::read(dir.join(name)).unwrap(),
+                    *bytes,
+                    "{name} metadata and payload bytes survive refusal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vn01_encrypted_existing_patch_refused() {
+        let dir = tempdir();
+        fs::write(
+            dir.join("data.xp3"),
+            kirikiri_xp3::write_xp3(&[("story.ks".into(), b"Hello.\n".to_vec())]).unwrap(),
+        )
+        .unwrap();
+        let protected =
+            kirikiri_xp3::write_xp3_protected("private.bin", b"opaque cipher bytes").unwrap();
+        fs::write(dir.join("patch.xp3"), &protected).unwrap();
+        let plugin = KirikiriPlugin::new();
+        let mut rows = plugin.extract(&dir).unwrap();
+        rows[0].translation = Some("Hola.".into());
+        let report = plugin.inject(&dir, &rows).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.files_modified, 0);
+        assert_eq!(fs::read(dir.join("patch.xp3")).unwrap(), protected);
     }
 
     fn write_utf16le_ks(path: &Path, text: &str) {
@@ -1729,12 +2410,12 @@ This is narration.\r\n\
             "duplicate name must resolve to the first entry"
         );
         assert!(entries.iter().all(|e| !e.source.contains("DUP_SECOND")));
-        assert!(entries
-            .iter()
-            .any(|e| { e.id == "game.xp3/scenario/s000.ks#2" && e.source == "Hello SCRIPT000" }));
-        assert!(entries
-            .iter()
-            .any(|e| { e.id == "game.xp3/scenario/s098.ks#2" && e.source == "Hello SCRIPT098" }));
+        assert!(entries.iter().any(|e| {
+            e.id == "game.xp3/scenario/s000.ks#kag:2" && e.source == "Hello SCRIPT000"
+        }));
+        assert!(entries.iter().any(|e| {
+            e.id == "game.xp3/scenario/s098.ks#kag:2" && e.source == "Hello SCRIPT098"
+        }));
 
         let target = entries
             .iter_mut()
