@@ -1243,6 +1243,81 @@ impl SerializedFile {
             .collect()
     }
 
+    /// Validated injection exclusions, distinct from the broader extraction
+    /// skip ranges. Only the technical base name/alias of a MonoBehaviour is
+    /// forbidden; its display fields remain writable.
+    pub(crate) fn forbidden_injection_byte_ranges(&self) -> Vec<(usize, usize)> {
+        let label = self.path.display().to_string();
+        let mut ranges = Vec::new();
+        for obj in &self.objects {
+            let Some((start, end)) = usize::try_from(obj.data_abs).ok().and_then(|start| {
+                start
+                    .checked_add(obj.byte_size as usize)
+                    .map(|end| (start, end))
+            }) else {
+                continue;
+            };
+            let Some(data) = self.data.get(..end) else {
+                continue;
+            };
+            if start >= end {
+                continue;
+            }
+            if is_heuristic_noise_class(obj.class_id) {
+                ranges.push((start, end));
+                continue;
+            }
+            if !is_monobehaviour_class(obj.class_id) {
+                continue;
+            }
+            // Supported versions (17–22) use 64-bit PPtr path IDs. Read the
+            // release base with the file's endian, bounded by this object.
+            let mut r = R {
+                data,
+                pos: start,
+                file: &label,
+                endian: self.header.endian,
+            };
+            let base = (|| {
+                r.i32()?; // m_GameObject.fileID
+                r.i64()?; // m_GameObject.pathID
+                r.u8()?; // m_Enabled
+                r.align4();
+                let file_id = r.i32()?;
+                let path_id = r.i64()?;
+                let (name, offset, len) = r.aligned_string()?;
+                r.need(0)?; // alignment must also stay inside the object
+                Ok::<_, SerializedError>((file_id, path_id, name, offset, len))
+            })();
+            let Ok((file_id, path_id, name, offset, len)) = base else {
+                continue;
+            };
+            let Some(script) = self.script_identity(&self.data, file_id, path_id) else {
+                continue;
+            };
+            if script.has_technical_object_name() {
+                if let Some(name_end) = offset.checked_add(4).and_then(|n| n.checked_add(len)) {
+                    if name_end <= end {
+                        ranges.push((offset, name_end));
+                    }
+                }
+            }
+            if let Some(range) = technical_font_name_range(&r, script, &name) {
+                ranges.push(range);
+            }
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        merged
+    }
+
     /// Ranges the heuristic length-prefix scan must not re-read: structural
     /// extract classes **plus** known non-text blobs (MonoScript type names,
     /// Shader source and input configuration) that contain engine identifiers.
@@ -1761,8 +1836,9 @@ fn technical_font_name_range(
         return None;
     }
     r.i32().ok()?; // FaceInfo.m_FaceIndex
-    let (family, offset, _) = r.aligned_string().ok()?;
-    (family == name && r.pos <= r.data.len()).then_some((offset, r.pos))
+    let (family, offset, len) = r.aligned_string().ok()?;
+    let end = offset.checked_add(4)?.checked_add(len)?;
+    (family == name && r.pos <= r.data.len()).then_some((offset, end))
 }
 
 fn mono_name_worth_extracting(s: &str) -> bool {
@@ -3355,24 +3431,42 @@ mod tests {
         fields: &[&str],
         script_file: i32,
     ) -> Vec<u8> {
-        fn string(out: &mut Vec<u8>, value: &str) {
-            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        identified_mono_fixture_endian(identity, name, fields, script_file, false)
+    }
+
+    fn identified_mono_fixture_endian(
+        identity: (&str, &str, &str),
+        name: &str,
+        fields: &[&str],
+        script_file: i32,
+        be: bool,
+    ) -> Vec<u8> {
+        fn string(out: &mut Vec<u8>, value: &str, be: bool) {
+            ui05_word(out, value.len() as u32, be);
             out.extend_from_slice(value.as_bytes());
             out.resize((out.len() + 3) & !3, 0);
         }
         let mut mono = vec![0; 16];
         mono[12] = 1;
-        mono.extend_from_slice(&script_file.to_le_bytes());
-        mono.extend_from_slice(&20i64.to_le_bytes());
-        string(&mut mono, name);
+        mono.extend_from_slice(&if be {
+            script_file.to_be_bytes()
+        } else {
+            script_file.to_le_bytes()
+        });
+        mono.extend_from_slice(&if be {
+            20i64.to_be_bytes()
+        } else {
+            20i64.to_le_bytes()
+        });
+        string(&mut mono, name, be);
         for field in fields {
-            string(&mut mono, field);
+            string(&mut mono, field, be);
         }
         let mut script = Vec::new();
-        string(&mut script, identity.0);
+        string(&mut script, identity.0, be);
         script.extend_from_slice(&[0; 20]); // execution order + properties hash
         for value in [identity.0, identity.1, identity.2] {
-            string(&mut script, value);
+            string(&mut script, value, be);
         }
         let payloads = [
             mono.clone(),
@@ -3382,36 +3476,84 @@ mod tests {
         ];
         let classes = [CLASS_ID_MONO_BEHAVIOUR, CLASS_ID_MONO_SCRIPT, 1];
         let mut meta = b"2019.4.0f1\0".to_vec();
-        meta.extend_from_slice(&1u32.to_le_bytes());
+        meta.extend_from_slice(&if be {
+            1u32.to_be_bytes()
+        } else {
+            1u32.to_le_bytes()
+        });
         meta.push(0);
-        meta.extend_from_slice(&3i32.to_le_bytes());
+        meta.extend_from_slice(&if be {
+            3i32.to_be_bytes()
+        } else {
+            3i32.to_le_bytes()
+        });
         for class in classes {
-            meta.extend_from_slice(&class.to_le_bytes());
+            meta.extend_from_slice(&if be {
+                class.to_be_bytes()
+            } else {
+                class.to_le_bytes()
+            });
             meta.push(0);
-            meta.extend_from_slice(&(-1i16).to_le_bytes());
+            meta.extend_from_slice(&if be {
+                (-1i16).to_be_bytes()
+            } else {
+                (-1i16).to_le_bytes()
+            });
             if is_monobehaviour_class(class) {
                 meta.extend_from_slice(&[0; 16]);
             }
             meta.extend_from_slice(&[0; 16]);
         }
-        meta.extend_from_slice(&4i32.to_le_bytes());
+        meta.extend_from_slice(&if be {
+            4i32.to_be_bytes()
+        } else {
+            4i32.to_le_bytes()
+        });
         let mut offset = 0usize;
         for ((id, ty), payload) in [(10i64, 0i32), (11, 0), (20, 1), (30, 2)]
             .into_iter()
             .zip(&payloads)
         {
             meta.resize((meta.len() + 3) & !3, 0);
-            meta.extend_from_slice(&id.to_le_bytes());
-            meta.extend_from_slice(&(offset as u32).to_le_bytes());
-            meta.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            meta.extend_from_slice(&ty.to_le_bytes());
+            meta.extend_from_slice(&if be {
+                id.to_be_bytes()
+            } else {
+                id.to_le_bytes()
+            });
+            meta.extend_from_slice(&if be {
+                (offset as u32).to_be_bytes()
+            } else {
+                (offset as u32).to_le_bytes()
+            });
+            meta.extend_from_slice(&if be {
+                (payload.len() as u32).to_be_bytes()
+            } else {
+                (payload.len() as u32).to_le_bytes()
+            });
+            meta.extend_from_slice(&if be {
+                ty.to_be_bytes()
+            } else {
+                ty.to_le_bytes()
+            });
             offset += payload.len();
         }
-        meta.extend_from_slice(&0i32.to_le_bytes()); // script reference table
-        meta.extend_from_slice(&1i32.to_le_bytes()); // external table
+        meta.extend_from_slice(&if be {
+            0i32.to_be_bytes()
+        } else {
+            0i32.to_le_bytes()
+        }); // script reference table
+        meta.extend_from_slice(&if be {
+            1i32.to_be_bytes()
+        } else {
+            1i32.to_le_bytes()
+        }); // external table
         meta.extend_from_slice(&[0; 21]); // empty string + GUID + external type
         meta.extend_from_slice(b"globalgamemanagers.assets\0");
-        meta.extend_from_slice(&0i32.to_le_bytes());
+        meta.extend_from_slice(&if be {
+            0i32.to_be_bytes()
+        } else {
+            0i32.to_le_bytes()
+        });
         meta.push(0); // user information
         let data_offset = (20 + meta.len() + 15) & !15;
         let mut bytes = Vec::new();
@@ -3423,13 +3565,252 @@ mod tests {
         ] {
             bytes.extend_from_slice(&value.to_be_bytes());
         }
-        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&[u8::from(be), 0, 0, 0]);
         bytes.extend_from_slice(&meta);
         bytes.resize(data_offset, 0);
         for payload in payloads {
             bytes.extend_from_slice(&payload);
         }
         bytes
+    }
+
+    fn inject_legacy_name(
+        root: &Path,
+        path: &Path,
+        source: &str,
+        offset: Option<usize>,
+        be: bool,
+    ) -> locust_core::extraction::InjectionReport {
+        use locust_core::{extraction::FormatPlugin, models::StringEntry};
+        let mut entry = StringEntry::new("legacy-technical-name", source, path.to_path_buf());
+        entry.translation = Some("X".into());
+        entry
+            .metadata
+            .insert("extraction_method".into(), serde_json::json!("heuristic"));
+        if let Some(offset) = offset {
+            entry
+                .metadata
+                .insert("binary_offset".into(), serde_json::json!(offset));
+            entry.metadata.insert(
+                "length_endian".into(),
+                serde_json::json!(if be { "be" } else { "le" }),
+            );
+        }
+        crate::unity::UnityPlugin::new()
+            .inject(root, &[entry])
+            .unwrap()
+    }
+
+    #[test]
+    fn legacy_technical_name_local_external_bundle() {
+        assert_legacy_technical_name_fixture(
+            (
+                "LiftGammaGain",
+                "UnityEngine.Rendering",
+                "Unity.RenderPipelines.Core.Runtime.dll",
+            ),
+            "LiftGammaGain",
+            &["Hello traveler!"],
+        );
+    }
+
+    #[test]
+    fn legacy_technical_font_alias_local_external_bundle() {
+        assert_legacy_technical_name_fixture(
+            ("TMP_FontAsset", "TMPro", "Unity.TextMeshPro.dll"),
+            "OCR-A",
+            &["1.1.0", "", "OCR-A", "Hello traveler!"],
+        );
+    }
+
+    fn assert_legacy_technical_name_fixture(
+        identity: (&str, &str, &str),
+        name: &str,
+        fields: &[&str],
+    ) {
+        for be in [false, true] {
+            for location in ["local", "external", "bundle"] {
+                let dir = tempfile::tempdir().unwrap();
+                let file_id = i32::from(location != "local");
+                let bytes = identified_mono_fixture_endian(identity, name, fields, file_id, be);
+                let scripts =
+                    identified_mono_fixture_endian(identity, "Script metadata", &[], 0, be);
+                let path = if location == "bundle" {
+                    dir.path().join("data.unity3d/resources.assets")
+                } else {
+                    dir.path().join("resources.assets")
+                };
+                let bundle_path = dir.path().join("data.unity3d");
+                let original = if location == "bundle" {
+                    let bundle = crate::unity_fs::build_test_bundle(
+                        &[
+                            ("resources.assets", &bytes),
+                            ("globalgamemanagers.assets", &scripts),
+                        ],
+                        true,
+                        8,
+                        true,
+                        false,
+                    );
+                    std::fs::write(&bundle_path, &bundle).unwrap();
+                    bundle
+                } else {
+                    std::fs::write(&path, &bytes).unwrap();
+                    if location == "external" {
+                        std::fs::write(dir.path().join("globalgamemanagers.assets"), &scripts)
+                            .unwrap();
+                    }
+                    bytes.clone()
+                };
+                let sf = SerializedFile::parse(bytes.clone(), &path).unwrap();
+                let name_offset = sf.objects[0].data_abs as usize + 28;
+                let mut offsets = vec![Some(name_offset), None];
+                if identity.0 == "TMP_FontAsset" {
+                    offsets.insert(0, Some(name_offset + 12 + 12 + 4));
+                }
+                for offset in offsets {
+                    let report = inject_legacy_name(dir.path(), &path, name, offset, be);
+                    assert_eq!(
+                        report.strings_written, 0,
+                        "{identity:?}, {location}, be={be}, {offset:?}"
+                    );
+                    assert_eq!(
+                        report.skip_reasons.get("invalid_target"),
+                        Some(&1),
+                        "{identity:?}, {location}, be={be}, {offset:?}: {report:?}"
+                    );
+                    assert_eq!(report.files_modified, 0);
+                    assert_eq!(
+                        std::fs::read(if location == "bundle" {
+                            &bundle_path
+                        } else {
+                            &path
+                        })
+                        .unwrap(),
+                        original
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_technical_names_keep_equal_display_fields_writable() {
+        use locust_core::extraction::FormatPlugin;
+        for be in [false, true] {
+            for (class, namespace, assembly, field) in [
+                ("Text", "UnityEngine.UI", "UnityEngine.UI", "m_Text"),
+                ("TextMeshPro", "TMPro", "Unity.TextMeshPro", "m_text"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("resources.assets");
+                let tree = [
+                    (0, "MonoBehaviour", "Base", -1, 0),
+                    (1, "int", "goFile", 4, 0),
+                    (1, "SInt64", "goPath", 8, 0),
+                    (1, "UInt8", "m_Enabled", 1, 0x4000),
+                    (1, "int", "scriptFile", 4, 0),
+                    (1, "SInt64", "scriptPath", 8, 0),
+                    (1, "string", "m_Name", -1, 0),
+                    (1, "string", field, -1, 0),
+                ];
+                let p = ui05_payload(
+                    "12 a 1 a 12 a s:m_Name a s:display a",
+                    be,
+                    &[("m_Name", "LiftGammaGain"), ("display", "LiftGammaGain")],
+                    &[],
+                );
+                let bytes = ui05_asset((class, namespace, assembly), [0; 16], p, be, Some(&tree));
+                let sf = SerializedFile::parse(bytes.clone(), &path).unwrap();
+                let display = sf.read_mono_strings(10).unwrap().remove(0);
+                std::fs::write(&path, &bytes).unwrap();
+                let report = inject_legacy_name(
+                    dir.path(),
+                    &path,
+                    "LiftGammaGain",
+                    Some(display.len_offset),
+                    be,
+                );
+                assert_eq!(report.strings_written, 1, "{class}, be={be}: {report:?}");
+                let mut expected = bytes.clone();
+                expected[display.len_offset..display.len_offset + 4].copy_from_slice(&if be {
+                    1u32.to_be_bytes()
+                } else {
+                    1u32.to_le_bytes()
+                });
+                expected[display.len_offset + 4..display.len_offset + 4 + display.byte_len].fill(0);
+                expected[display.len_offset + 4] = b'X';
+                assert_eq!(std::fs::read(&path).unwrap(), expected);
+                std::fs::write(&path, &bytes).unwrap();
+                let mut row = crate::unity::UnityPlugin::new()
+                    .extract(&path)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.metadata.get("path_id").and_then(|v| v.as_i64()) == Some(10))
+                    .unwrap();
+                row.translation = Some("X".into());
+                let report = crate::unity::UnityPlugin::new()
+                    .inject(dir.path(), &[row])
+                    .unwrap();
+                assert_eq!(report.strings_written, 1);
+                let mut expected = bytes.clone();
+                expected[display.len_offset + 4..display.len_offset + 4 + display.byte_len]
+                    .fill(b' ');
+                expected[display.len_offset + 4] = b'X';
+                assert_eq!(std::fs::read(&path).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_technical_names_unresolved_custom_name_still_writes() {
+        for be in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("resources.assets");
+            // The same path ID exists locally, but the real script reference
+            // points at a missing external file. Do not infer its identity.
+            let mut bytes = identified_mono_fixture_endian(
+                (
+                    "LiftGammaGain",
+                    "UnityEngine.Rendering",
+                    "Unity.RenderPipelines.Core.Runtime",
+                ),
+                "Custom UI label",
+                &[],
+                1,
+                be,
+            );
+            let sf = SerializedFile::parse(bytes.clone(), &path).unwrap();
+            // Make the second object's name distinct so an offset-less row
+            // has one candidate, without changing its layout or lengths.
+            let second = sf.objects[1].data_abs as usize + 32;
+            bytes[second..second + 15].copy_from_slice(b"Other UI label!");
+            let offset = sf.objects[0].data_abs as usize + 28;
+            for pinned in [false, true] {
+                std::fs::write(&path, &bytes).unwrap();
+                let report = inject_legacy_name(
+                    dir.path(),
+                    &path,
+                    "Custom UI label",
+                    pinned.then_some(offset),
+                    be,
+                );
+                assert_eq!(
+                    report.strings_written, 1,
+                    "pinned={pinned}, be={be}: {report:?}"
+                );
+                assert_eq!(report.strings_skipped, 0);
+                let mut expected = bytes.clone();
+                expected[offset..offset + 4].copy_from_slice(&if be {
+                    1u32.to_be_bytes()
+                } else {
+                    1u32.to_le_bytes()
+                });
+                expected[offset + 4..offset + 19].fill(0);
+                expected[offset + 4] = b'X';
+                assert_eq!(std::fs::read(&path).unwrap(), expected);
+            }
+        }
     }
 
     #[test]

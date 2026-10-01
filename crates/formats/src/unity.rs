@@ -408,17 +408,7 @@ impl UnityPlugin {
         let (rewriteable, technical_ranges): (_, Vec<_>) =
             SerializedFile::parse(bytes.clone(), label)
                 .map(|sf| {
-                    let ranges = sf
-                        .objects
-                        .iter()
-                        .filter(|object| {
-                            crate::unity_serialized::is_heuristic_noise_class(object.class_id)
-                        })
-                        .map(|object| {
-                            let start = object.data_abs as usize;
-                            (start, start + object.byte_size as usize)
-                        })
-                        .collect();
+                    let ranges = sf.forbidden_injection_byte_ranges();
                     (sf.rewriteable_text_assets().unwrap_or_default(), ranges)
                 })
                 .unwrap_or_default();
@@ -733,6 +723,22 @@ impl UnityPlugin {
                     }
                     let primary = &matches[i * 2];
                     let alternate = &matches[i * 2 + 1];
+                    // Repeated technical names (e.g. a font's base name and
+                    // family alias) are still invalid, even for offset-less
+                    // rows. Mixed display/technical matches remain ambiguous.
+                    if !primary.is_empty() || !alternate.is_empty() {
+                        let forbidden = |positions: &[usize], len: usize| {
+                            positions.iter().all(|&pos| {
+                                pos.checked_add(len)
+                                    .is_some_and(|end| range_overlaps(&technical_ranges, pos, end))
+                            })
+                        };
+                        if forbidden(primary, w.needle.len())
+                            && forbidden(alternate, w.alt_needle.as_ref().map_or(0, Vec::len))
+                        {
+                            return HeuristicTarget::Invalid;
+                        }
+                    }
                     match primary.len() + alternate.len() {
                         0 => HeuristicTarget::Missing,
                         1 if primary.len() == 1 => HeuristicTarget::Found(primary[0], w.endian),
@@ -749,7 +755,11 @@ impl UnityPlugin {
                     } else {
                         w.alt_needle.as_ref().unwrap()
                     };
-                    if bytes.get(pos..pos + expected.len()) != Some(expected.as_slice()) {
+                    let Some(end) = pos.checked_add(expected.len()) else {
+                        report.skip("invalid_target", 1);
+                        continue;
+                    };
+                    if bytes.get(pos..end) != Some(expected.as_slice()) {
                         report.skip("source_changed", 1);
                         continue;
                     }
@@ -757,7 +767,7 @@ impl UnityPlugin {
                     // before technical classes were excluded during extraction.
                     // Their matching bytes still do not make a control binding,
                     // shader or managed type name a valid translation target.
-                    if range_overlaps(&technical_ranges, pos, pos + expected.len()) {
+                    if range_overlaps(&technical_ranges, pos, end) {
                         report.skip("invalid_target", 1);
                         report.warnings.push(format!(
                             "Unity entry '{}' points into a technical object; re-extract the project before translating",
@@ -774,6 +784,8 @@ impl UnityPlugin {
                     }
                     report.strings_written += 1;
                     modified = true;
+                } else if target == HeuristicTarget::Invalid {
+                    report.skip("invalid_target", 1);
                 } else if target == HeuristicTarget::Ambiguous {
                     report.skip("ambiguous_target", 1);
                 } else {
@@ -1321,6 +1333,7 @@ enum LengthEndian {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HeuristicTarget {
     Missing,
+    Invalid,
     Ambiguous,
     Found(usize, LengthEndian),
 }
