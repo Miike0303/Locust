@@ -2,7 +2,7 @@
 
 Repo C:\Projects\Locust, main. Do not commit. Re-audited commit: 09eac768a315225c764091697d9fa8a54859158a; inspect/rebase if HEAD moves. Other writers own yuris.rs and tyrano.rs: do not touch them. Do not touch core, apps/desktop/src/**, or tools/ground-truth/**. Edit only the Unity files named below and their in-file tests. No new dependencies.
 NEVER modify D:\juegos. Fixtures/reports/build outputs belong in a new scratch root, under 5 GB. Archive committed HEAD and overlay only your Unity changes. Never run cargo in the live repo. Use %LOCALAPPDATA%\locust-shared-target, CARGO_INCREMENTAL=0, CARGO_PROFILE_DEV_DEBUG=0; copy only the finished executable. Stop only for an actual Windows sandbox helper failure from your own tool call.
-Evidence root: C:\Users\Mike\AppData\Local\Temp\locust-c113-unity-reaudit. This run could not recreate the pinned custom-schema oracle; do not treat supplementary precision/recall as the original full audit.
+Evidence: the c113 scratch folder was deleted after cycle 113; the numbers and citations in tools/ground-truth/unity/reaudit-2026-10-01.md and in this brief are what remains. Regenerate any probe you need from the real files under D:\juegos\unity in your own scratch root (name it locust-c114-display-names, under 5 GB). This run could not recreate the pinned custom-schema oracle; do not treat supplementary precision/recall as the original full audit.
 
 
 Files: crates/formats/src/unity.rs; optional in-file tests in unity_serialized.rs only if needed.
