@@ -3,7 +3,7 @@
 //!   `m_Name` / `m_Script` reads + validated variable-length reconstruction.
 //!   Legacy fixed-slot rewrite remains available (payload pad with `0x20`;
 //!   length-prefix u32 left byte-identical so BE assets stay valid).
-//! - **Slice 2:** skip type-tree blobs (no field interpretation), MonoBehaviour
+//! - **Slice 2:** bounded type-tree field layouts, MonoBehaviour
 //!   (class_id 114 **or negative** script-type ids) base layout (`m_GameObject`,
 //!   `m_Enabled`, `m_Script`, `m_Name`) plus sequential aligned-string fields
 //!   after the base for extract/in-place rewrite (also recovers Unity `string[]` /
@@ -11,7 +11,8 @@
 //!   **TextMesh** (class_id 141) `m_Text` after `m_GameObject` PPtr; **GUIText**
 //!   (class_id 132) `m_Text` after Behaviour base + `m_PixelOffset`. Heuristic
 //!   scan also skips MonoScript (115), Shader (48) and InputManager (13)
-//!   ranges (type names, HLSL and input bindings). Full type-tree walks remain out of scope.
+//!   ranges (type names, HLSL and input bindings). Supported UI schemas identify
+//!   display fields separately from event callbacks and resource identifiers.
 //!
 //! # Format (AssetStudio / AssetsTools.NET conventions)
 //! Header fields through `data_offset` are **big-endian**. From version ≥ 9 the
@@ -21,9 +22,8 @@
 //!
 //! Metadata (file endian): unity version c-string, target platform u32,
 //! enable_type_tree bool, type count, then per-type class_id and script hashes.
-//! When `enable_type_tree` is set, type-tree **blobs are skipped** (node table +
-//! string buffer) so the object table is still reachable — field-level type
-//! trees are not interpreted.
+//! When `enable_type_tree` is set, the node table and string buffer supply
+//! bounded field layouts. Unsupported schemas remain opaque.
 //!
 //! Object table (v≥16): count i32; each object 4-aligned: path_id i64,
 //! byte_start u32 (u64 when v≥22), byte_size u32, type_id i32 (index into types).
@@ -33,7 +33,9 @@
 //!
 //! MonoBehaviour object body (release, v≥14 path IDs): PPtr `m_GameObject`,
 //! u8 `m_Enabled` + align4, PPtr `m_Script`, aligned string `m_Name`, then
-//! script-defined fields (slice 2 only walks further **aligned strings**).
+//! script-defined fields. UI fields use complete in-file trees or verified
+//! MonoScript properties-hash layouts; unknown stripped classes retain the
+//! conservative sequential-string fallback.
 
 use std::path::Path;
 use std::{
@@ -189,6 +191,8 @@ pub struct SerializedFile {
     pub objects: Vec<ObjectInfo>,
     /// Full file bytes (owned for inject / text-asset reads).
     pub data: Vec<u8>,
+    type_layouts: Vec<Option<Vec<LayoutOp>>>,
+    has_type_tree: bool,
     externals: Vec<String>,
     local_scripts: OnceLock<HashMap<i64, MonoScriptIdentity>>,
     external_scripts: Vec<OnceLock<Arc<HashMap<i64, MonoScriptIdentity>>>>,
@@ -210,9 +214,25 @@ struct MonoScriptIdentity {
     class: String,
     namespace: String,
     assembly: String,
+    properties_hash: [u8; 16],
 }
 
 impl MonoScriptIdentity {
+    fn ui_kind(&self) -> Option<UiKind> {
+        let assembly = self.assembly.trim_end_matches(".dll");
+        match (self.namespace.as_str(), self.class.as_str(), assembly) {
+            ("TMPro", "TextMeshPro" | "TextMeshProUGUI", "Unity.TextMeshPro") => Some(UiKind::Tmp),
+            ("UnityEngine.UI", "Text", "UnityEngine.UI") => Some(UiKind::Text),
+            ("TMPro", "TMP_Dropdown", "Unity.TextMeshPro")
+            | ("UnityEngine.UI", "Dropdown", "UnityEngine.UI") => Some(UiKind::Dropdown),
+            ("Naninovel", "ManagedTextProvider", "Elringus.Naninovel.Runtime") => {
+                Some(UiKind::Managed)
+            }
+            ("", "DialogButton", "Assembly-CSharp") => Some(UiKind::Dialog),
+            ("", "TooltipTargetUI", "Assembly-CSharp") => Some(UiKind::Tooltip),
+            _ => None,
+        }
+    }
     fn is_text_renderer(&self) -> bool {
         (self.namespace == "TMPro"
             && matches!(self.class.as_str(), "TextMeshPro" | "TextMeshProUGUI"))
@@ -221,7 +241,8 @@ impl MonoScriptIdentity {
 
     fn has_technical_object_name(&self) -> bool {
         let assembly = self.assembly.trim_end_matches(".dll");
-        self.is_text_renderer()
+        self.ui_kind().is_some()
+            || self.is_text_renderer()
             || self.namespace == "UnityEngine.Rendering"
             || self.namespace.starts_with("UnityEngine.Rendering.")
             || (self.namespace == "UnityEngine.InputSystem" && self.class == "InputActionAsset")
@@ -449,6 +470,7 @@ impl SerializedFile {
         }
         r.need(type_count as usize * 23)?;
         let mut types = Vec::with_capacity(type_count as usize);
+        let mut type_layouts = Vec::with_capacity(type_count as usize);
         for _ in 0..type_count {
             let class_id = r.i32()?;
             // v >= 16
@@ -460,9 +482,9 @@ impl SerializedFile {
                 let _script_id = r.take(16)?;
             }
             let _old_type_hash = r.take(16)?;
-            // Slice 2: skip type-tree blobs without interpreting nodes.
+            let mut layout = None;
             if enable_type_tree {
-                skip_type_tree_blob(&mut r, version)?;
+                layout = read_type_tree_layout(&mut r, version)?;
                 if version >= 21 {
                     let count = r.i32()?;
                     if count < 0 {
@@ -479,6 +501,7 @@ impl SerializedFile {
                 is_stripped,
                 script_type_index,
             });
+            type_layouts.push(layout);
         }
 
         // Object table (v >= 14 uses i64 path_id; v >= 16 type_id is type index)
@@ -545,6 +568,8 @@ impl SerializedFile {
             types,
             objects,
             data: Vec::new(),
+            type_layouts,
+            has_type_tree: enable_type_tree,
             externals,
             local_scripts: OnceLock::new(),
             external_scripts,
@@ -585,7 +610,7 @@ impl SerializedFile {
                 };
                 r.aligned_string().ok()?; // m_Name
                 r.i32().ok()?; // m_ExecutionOrder
-                r.take(16).ok()?; // m_PropertiesHash (v17+)
+                let properties_hash = r.take(16).ok()?.try_into().ok()?;
                 let (class, _, _) = r.aligned_string().ok()?;
                 let (namespace, _, _) = r.aligned_string().ok()?;
                 let (assembly, _, _) = r.aligned_string().ok()?;
@@ -603,6 +628,7 @@ impl SerializedFile {
                         class,
                         namespace,
                         assembly,
+                        properties_hash,
                     },
                 ))
             })
@@ -966,6 +992,45 @@ impl SerializedFile {
             });
         }
 
+        // A present tree is authoritative. Stripped UI classes require a
+        // verified complete layout; an unsupported variant must not fall back
+        // to guessing numeric words as string lengths.
+        let kind = script.and_then(MonoScriptIdentity::ui_kind);
+        let layout = if self.has_type_tree {
+            self.type_layouts
+                .get(obj.type_index as usize)
+                .and_then(Option::as_deref)
+        } else {
+            script
+                .filter(|s| s.ui_kind().is_some())
+                .and_then(stripped_layout)
+        };
+        if self.has_type_tree || kind.is_some() {
+            if let Some(layout) = layout {
+                let fields =
+                    read_layout_strings(&self.data, obj, self.header.endian, &label, layout);
+                if let Ok(fields) = fields {
+                    for (index, field) in fields
+                        .into_iter()
+                        .filter(|f| f.path != "m_Name")
+                        .enumerate()
+                    {
+                        if field_is_display(kind, &field.path, &field.text) {
+                            out.push(MonoStringData {
+                                path_id,
+                                mono_name: mono_name.clone(),
+                                field_index: index + 1,
+                                text: field.text,
+                                len_offset: field.offset,
+                                byte_len: field.len,
+                            });
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
         // Sequential aligned strings for simple script layouts (no type tree).
         // When a length prefix is implausible (typical int/float between strings),
         // skip up to MAX_MONO_NON_STRING_SKIPS × 4-byte words and keep scanning —
@@ -1282,29 +1347,362 @@ fn try_read_mono_string_array(
     Some(items)
 }
 
-/// Skip a SerializedFile type-tree blob (AssetStudio `TypeTreeBlobRead`).
-/// Supported format versions are ≥17, which always use the blob layout.
-fn skip_type_tree_blob(r: &mut R<'_>, version: u32) -> Result<(), SerializedError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum UiKind {
+    Text,
+    Tmp,
+    Dropdown,
+    Managed,
+    Dialog,
+    Tooltip,
+}
+
+#[derive(Debug, Clone)]
+enum LayoutOp {
+    Bytes(usize),
+    Align,
+    String(String),
+    Array(Vec<LayoutOp>),
+}
+
+struct LayoutString {
+    path: String,
+    text: String,
+    offset: usize,
+    len: usize,
+}
+
+// This small schema notation is internal, immutable data: byte widths, align4,
+// named strings, and repeated element layouts. Both tree and stripped readers
+// execute the same bounded operations and require complete object consumption.
+fn parse_layout_schema(schema: &str) -> Vec<LayoutOp> {
+    fn parse(tokens: &mut std::str::SplitWhitespace<'_>) -> Vec<LayoutOp> {
+        let mut out = Vec::new();
+        while let Some(token) = tokens.next() {
+            out.push(match token {
+                "]" => break,
+                "[" => LayoutOp::Array(parse(tokens)),
+                "a" => LayoutOp::Align,
+                s if s.starts_with("s:") => LayoutOp::String(s[2..].into()),
+                n => LayoutOp::Bytes(n.parse().expect("static layout byte width")),
+            });
+        }
+        out
+    }
+    parse(&mut schema.split_whitespace())
+}
+
+fn read_layout_strings(
+    data: &[u8],
+    obj: &ObjectInfo,
+    endian: Endian,
+    label: &str,
+    layout: &[LayoutOp],
+) -> Result<Vec<LayoutString>, SerializedError> {
+    fn walk(
+        r: &mut R<'_>,
+        ops: &[LayoutOp],
+        out: &mut Vec<LayoutString>,
+        budget: &mut usize,
+    ) -> Result<(), SerializedError> {
+        for op in ops {
+            *budget = budget
+                .checked_sub(1)
+                .ok_or_else(|| err(r.file, "layout operation limit"))?;
+            match op {
+                LayoutOp::Bytes(n) => {
+                    r.take(*n)?;
+                }
+                LayoutOp::Align => {
+                    r.align4();
+                    r.need(0)?;
+                }
+                LayoutOp::String(path) => {
+                    let (text, offset, len) = r.aligned_string()?;
+                    r.need(0)?;
+                    if std::str::from_utf8(&r.data[offset + 4..offset + 4 + len]).is_err() {
+                        return Err(err(r.file, "invalid UTF-8 in typed string"));
+                    }
+                    out.push(LayoutString {
+                        path: path.clone(),
+                        text,
+                        offset,
+                        len,
+                    });
+                }
+                LayoutOp::Array(element) => {
+                    let count = r.i32()?;
+                    if !(0..=100_000).contains(&count) || count as usize > r.data.len() - r.pos {
+                        return Err(err(r.file, "invalid typed array count"));
+                    }
+                    for _ in 0..count {
+                        let start = r.pos;
+                        walk(r, element, out, budget)?;
+                        if r.pos == start {
+                            return Err(err(r.file, "zero-width array element"));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    let start = obj.data_abs as usize;
+    let end = start
+        .checked_add(obj.byte_size as usize)
+        .filter(|&end| end <= data.len())
+        .ok_or_else(|| err(label, "typed object past EOF"))?;
+    let mut r = R {
+        data: &data[..end],
+        pos: start,
+        file: label,
+        endian,
+    };
+    let mut out = Vec::new();
+    walk(&mut r, layout, &mut out, &mut 1_000_000)?;
+    if r.pos != end {
+        return Err(err(label, "unsupported trailing typed object data"));
+    }
+    Ok(out)
+}
+
+fn field_is_display(kind: Option<UiKind>, path: &str, text: &str) -> bool {
+    // Event arguments and animation/resource identifiers are technical even
+    // when their values happen to be normal UI verbs or ordinary words.
+    if path.contains(".m_PersistentCalls.")
+        || path.starts_with("m_AnimationTriggers.")
+        || matches!(
+            path.rsplit('.').next().unwrap_or(path),
+            "m_MethodName" | "TargetObjectBundle" | "TargetObjectInBundle" | "RoomName"
+        )
+    {
+        return false;
+    }
+    let display = match kind {
+        Some(UiKind::Text) => path == "m_Text",
+        Some(UiKind::Tmp) => path == "m_text",
+        Some(UiKind::Dropdown) => path == "m_Options.m_Options[].m_Text",
+        Some(UiKind::Managed) => path == "defaultValue",
+        Some(UiKind::Dialog) => matches!(path, "Text" | "_warningWindowLabel"),
+        Some(UiKind::Tooltip) => path == "Text",
+        None => return mono_script_field_worth_extracting(text),
+    };
+    let t = text.trim();
+    display
+        && !t.is_empty()
+        && t.chars().any(char::is_alphabetic)
+        && !t.contains('\u{FFFD}')
+        && !t
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        && !looks_like_lorem_ipsum(t)
+        && t != "Author Name"
+}
+
+/// Read the blob node table, resolving local and Unity common string offsets.
+/// Unsupported node kinds/trees remain opaque rather than triggering scanning.
+fn read_type_tree_layout(
+    r: &mut R<'_>,
+    version: u32,
+) -> Result<Option<Vec<LayoutOp>>, SerializedError> {
     let node_count = r.i32()?;
     let string_buffer_size = r.i32()?;
-    if !(0..=1_000_000).contains(&node_count) {
-        return Err(err(
-            r.file,
-            format!("implausible type-tree node count {node_count}"),
-        ));
+    if !(0..=1_000_000).contains(&node_count) || !(0..=50_000_000).contains(&string_buffer_size) {
+        return Err(err(r.file, "invalid type-tree blob size"));
     }
-    if !(0..=50_000_000).contains(&string_buffer_size) {
-        return Err(err(
-            r.file,
-            format!("implausible type-tree string buffer size {string_buffer_size}"),
-        ));
+    let node_size = if version >= 19 { 32 } else { 24 };
+    let nodes = r.take(node_count as usize * node_size)?;
+    let strings = r.take(string_buffer_size as usize)?;
+    fn word(bytes: &[u8], endian: Endian) -> u32 {
+        let bytes = bytes.try_into().expect("four-byte tree word");
+        match endian {
+            Endian::Little => u32::from_le_bytes(bytes),
+            Endian::Big => u32::from_be_bytes(bytes),
+        }
     }
-    // Each node: 24 bytes before format 19, 32 bytes with RefTypeHash at ≥19.
-    let node_size: usize = if version >= 19 { 32 } else { 24 };
-    let nodes_bytes = (node_count as usize).saturating_mul(node_size);
-    r.take(nodes_bytes)?;
-    r.take(string_buffer_size as usize)?;
-    Ok(())
+    fn name(offset: u32, strings: &[u8]) -> Option<&str> {
+        if offset & 0x8000_0000 != 0 {
+            // Only common strings needed to interpret structure/primitives.
+            // Unknown leaf types fail closed; compound names are not required.
+            return Some(match offset & 0x7fff_ffff {
+                49 => "Array",
+                55 => "Base",
+                76 => "bool",
+                81 => "char",
+                106 => "data",
+                117 => "double",
+                161 => "float",
+                222 => "int",
+                231 => "long long",
+                263 => "MonoBehaviour",
+                349 => "m_Enabled",
+                374 => "m_GameObject",
+                427 => "m_Name",
+                490 => "m_Script",
+                789 => "short",
+                795 => "size",
+                800 => "SInt16",
+                807 => "SInt32",
+                814 => "SInt64",
+                821 => "SInt8",
+                840 => "string",
+                894 => "TypelessData",
+                907 => "UInt16",
+                914 => "UInt32",
+                921 => "UInt64",
+                928 => "UInt8",
+                934 => "unsigned int",
+                947 => "unsigned long long",
+                966 => "unsigned short",
+                981 => "vector",
+                // These common compound type names have explicit child nodes.
+                _ => "<common compound>",
+            });
+        }
+        let bytes = strings.get(offset as usize..)?;
+        std::str::from_utf8(&bytes[..bytes.iter().position(|&b| b == 0)?]).ok()
+    }
+    struct Node<'a> {
+        level: u8,
+        ty: &'a str,
+        name: &'a str,
+        size: i32,
+        flags: u32,
+    }
+    fn compile(
+        nodes: &[Node<'_>],
+        at: &mut usize,
+        parent: &str,
+        depth: usize,
+    ) -> Option<Vec<LayoutOp>> {
+        if depth > 64 {
+            return None;
+        }
+        let node = nodes.get(*at)?;
+        *at += 1;
+        let begin = *at;
+        while *at < nodes.len() && nodes[*at].level > node.level {
+            *at += 1;
+        }
+        let end = *at;
+        let path = if matches!(node.name, "Base" | "Array" | "data") {
+            parent.to_string()
+        } else if parent.is_empty() {
+            node.name.into()
+        } else {
+            format!("{parent}.{}", node.name)
+        };
+        let mut out = if node.ty == "string" {
+            vec![LayoutOp::String(path)]
+        } else if node.ty == "Array" {
+            if begin + 1 >= end
+                || nodes[begin].name != "size"
+                || nodes[begin].ty != "int"
+                || nodes[begin + 1].name != "data"
+            {
+                return None;
+            }
+            let mut child = begin + 1;
+            let element = compile(nodes, &mut child, &format!("{path}[]"), depth + 1)?;
+            if child != end {
+                return None;
+            }
+            vec![LayoutOp::Array(element)]
+        } else if begin < end {
+            let mut out = Vec::new();
+            let mut child = begin;
+            while child < end {
+                if nodes[child].level != node.level + 1 {
+                    return None;
+                }
+                out.extend(compile(nodes, &mut child, &path, depth + 1)?);
+            }
+            out
+        } else {
+            let size = match node.ty {
+                "bool" | "char" | "UInt8" | "SInt8" => 1,
+                "short" | "unsigned short" | "SInt16" | "UInt16" => 2,
+                "int" | "unsigned int" | "SInt32" | "UInt32" | "float" => 4,
+                "SInt64" | "UInt64" | "long long" | "unsigned long long" | "double" => 8,
+                _ => return None,
+            };
+            if node.size != size && node.size != -1 {
+                return None;
+            }
+            vec![LayoutOp::Bytes(size as usize)]
+        };
+        if node.flags & 0x4000 != 0 {
+            out.push(LayoutOp::Align);
+        }
+        Some(out)
+    }
+    let parsed: Option<Vec<_>> = nodes
+        .chunks_exact(node_size)
+        .map(|n| {
+            Some(Node {
+                level: n[2],
+                ty: name(word(&n[4..8], r.endian), strings)?,
+                name: name(word(&n[8..12], r.endian), strings)?,
+                size: word(&n[12..16], r.endian) as i32,
+                flags: word(&n[20..24], r.endian),
+            })
+        })
+        .collect();
+    Ok(parsed.and_then(|nodes| {
+        if nodes.first()?.level != 0 {
+            return None;
+        }
+        let mut at = 0;
+        let layout = compile(&nodes, &mut at, "", 0)?;
+        (at == nodes.len()).then_some(layout)
+    }))
+}
+
+// Verified release layouts from shipped MonoScript properties hashes and DLL field trees.
+// A hash binds the complete schema, not just the offset of a promising string.
+fn stripped_layout(script: &MonoScriptIdentity) -> Option<&'static [LayoutOp]> {
+    type Profiles = HashMap<(UiKind, [u8; 16]), Vec<LayoutOp>>;
+    static PROFILES: OnceLock<Profiles> = OnceLock::new();
+    let profiles = PROFILES.get_or_init(|| {
+        [
+            // Sunkissed_windows_full/TextMeshPro: TMPro.TextMeshPro (Unity.TextMeshPro).
+            ((UiKind::Tmp, [0xdb, 0x61, 0x33, 0x68, 0x75, 0x72, 0xf9, 0xdc, 0x24, 0xf1, 0xfd, 0x42, 0x38, 0xef, 0x9b, 0x83]),
+             "12 a 1 a 12 a s:m_Name a 29 a 17 a [ 12 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_TargetAssemblyTypeName s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_MethodName 16 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a s:m_text 1 a 24 [ 12 ] a 12 [ 12 ] a 21 a 93 a 17 a 17 a 85 a [ 4 ] a 1 a 1 a 1 a 1 a 1 a 1 a 1 a 17 a 1 a 1 a 21 a 1 a 13 a 16"),
+            // Sunkissed_windows_full/TextMeshProUGUI: TMPro.TextMeshProUGUI (Unity.TextMeshPro).
+            ((UiKind::Tmp, [0xcf, 0x62, 0xaa, 0xd9, 0x7f, 0x6c, 0x2d, 0xd5, 0xd4, 0x82, 0xe2, 0x50, 0x9c, 0x6c, 0x95, 0x28]),
+             "12 a 1 a 12 a s:m_Name a 29 a 17 a [ 12 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_TargetAssemblyTypeName s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_MethodName 16 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a s:m_text 1 a 24 [ 12 ] a 12 [ 12 ] a 21 a 93 a 17 a 17 a 85 a [ 4 ] a 1 a 1 a 1 a 1 a 1 a 1 a 1 a 17 a 1 a 1 a 21 a 1 a 1 a 28"),
+            // Sunkissed_windows_full/TooltipTargetUI: .TooltipTargetUI (Assembly-CSharp).
+            ((UiKind::Tooltip, [0x09, 0xd5, 0xdc, 0xcc, 0xc3, 0x8c, 0xb5, 0xf9, 0x76, 0xad, 0xbb, 0x80, 0x0e, 0xb1, 0xa1, 0x06]),
+             "12 a 1 a 12 a s:m_Name a s:Text"),
+            // CCTV_USSR_WINDOWS_FULL/TMP_Dropdown: TMPro.TMP_Dropdown (Unity.TextMeshPro).
+            ((UiKind::Dropdown, [0xe1, 0x8d, 0xfd, 0x2b, 0x91, 0x3b, 0x09, 0xfb, 0xbb, 0x24, 0x05, 0x16, 0x5a, 0x2e, 0x6a, 0x44]),
+             "12 a 1 a 12 a s:m_Name a 5 a 188 s:m_AnimationTriggers.m_NormalTrigger s:m_AnimationTriggers.m_HighlightedTrigger s:m_AnimationTriggers.m_PressedTrigger s:m_AnimationTriggers.m_SelectedTrigger s:m_AnimationTriggers.m_DisabledTrigger 1 a 89 a [ s:m_Options.m_Options[].m_Text 28 ] a [ 12 s:m_OnValueChanged.m_PersistentCalls.m_Calls[].m_TargetAssemblyTypeName s:m_OnValueChanged.m_PersistentCalls.m_Calls[].m_MethodName 16 s:m_OnValueChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:m_OnValueChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a 4"),
+            // CCTV_USSR_WINDOWS_FULL/DialogButton: .DialogButton (Assembly-CSharp).
+            ((UiKind::Dialog, [0x3e, 0x1b, 0x75, 0x86, 0xbb, 0x85, 0x09, 0x70, 0x32, 0x86, 0x52, 0x35, 0x8a, 0xc0, 0xe3, 0x20]),
+             "12 a 1 a 12 a s:m_Name a s:Text 12 s:TargetObjectBundle s:TargetObjectInBundle 13 a s:_warningWindowLabel [ 12 s:OnClickAlways.m_PersistentCalls.m_Calls[].m_TargetAssemblyTypeName s:OnClickAlways.m_PersistentCalls.m_Calls[].m_MethodName 16 s:OnClickAlways.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:OnClickAlways.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a 1 a s:RequiredSessionRules s:RequiredNOTSessionRules [ s:RequiredStatsAbove[].Key 16 ] a [ s:RequiredStatsBelow[].Key 16 ] a 4 s:AddsSessionRules s:RemovesSessionRules [ s:AddStats[].Key 16 ] a 5 a 1 a s:RelevantCharacterKey"),
+            // Sunkissed_windows_full/Text: UnityEngine.UI.Text (UnityEngine.UI).
+            ((UiKind::Text, [0xb5, 0x00, 0x76, 0x73, 0xbb, 0xbd, 0xb9, 0xd1, 0x25, 0x97, 0xa1, 0xd8, 0x20, 0x13, 0x70, 0xf5]),
+             "12 a 1 a 12 a s:m_Name a 29 a 17 a [ 12 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_TargetAssemblyTypeName s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_MethodName 16 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a 21 a 13 a 1 a 12 s:m_Text"),
+            // Sunkissed_windows_full/DialogButton: .DialogButton (Assembly-CSharp).
+            ((UiKind::Dialog, [0x26, 0x90, 0xb4, 0xd2, 0xd5, 0x27, 0xb6, 0xd3, 0xee, 0xac, 0x54, 0xb7, 0x37, 0x96, 0x0e, 0xdd]),
+             "12 a 1 a 12 a s:m_Name a s:Text 12 s:RoomName s:TargetObjectBundle s:TargetObjectInBundle 13 a s:_warningWindowLabel [ 12 s:OnClickAlways.m_PersistentCalls.m_Calls[].m_TargetAssemblyTypeName s:OnClickAlways.m_PersistentCalls.m_Calls[].m_MethodName 16 s:OnClickAlways.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:OnClickAlways.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a 1 a s:RequiredSessionRules s:RequiredNOTSessionRules [ s:RequiredStatsAbove[].Key 4 ] a [ s:RequiredStatsBelow[].Key 4 ] a s:RequiredMemoriesForCharacter 16 s:RequireSpecificMemories s:AddsSessionRules s:RemovesSessionRules [ s:AddStats[].Key 4 ] a s:AddsMemories s:AddsMemoriesToCharacter 21 a 1 a s:RelevantCharacterKey"),
+            // es/BOXMAN_v0.5.02_x64/Text: UnityEngine.UI.Text (UnityEngine.UI.dll).
+            ((UiKind::Text, [0xae, 0xb6, 0x2f, 0x72, 0x9c, 0x52, 0xc8, 0x14, 0xde, 0xc8, 0x6c, 0x47, 0xdc, 0xac, 0x14, 0x71]),
+             "12 a 1 a 12 a s:m_Name a 29 a 1 a [ 12 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_MethodName 16 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a 21 a 13 a 1 a 12 s:m_Text"),
+            // es/BOXMAN_v0.5.02_x64/Dropdown: UnityEngine.UI.Dropdown (UnityEngine.UI.dll).
+            ((UiKind::Dropdown, [0x2a, 0xee, 0xec, 0x1b, 0x1a, 0x14, 0x4c, 0x46, 0x9c, 0xd2, 0xd3, 0x77, 0x76, 0xbc, 0x23, 0x15]),
+             "12 a 1 a 12 a s:m_Name a 192 s:m_AnimationTriggers.m_NormalTrigger s:m_AnimationTriggers.m_HighlightedTrigger s:m_AnimationTriggers.m_PressedTrigger s:m_AnimationTriggers.m_SelectedTrigger s:m_AnimationTriggers.m_DisabledTrigger 1 a 76 [ s:m_Options.m_Options[].m_Text 12 ] a [ 12 s:m_OnValueChanged.m_PersistentCalls.m_Calls[].m_MethodName 16 s:m_OnValueChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:m_OnValueChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a 4"),
+            // es/BOXMAN_v0.5.02_x64/ManagedTextProvider: Naninovel.ManagedTextProvider (Elringus.Naninovel.Runtime.dll).
+            ((UiKind::Managed, [0xf9, 0x52, 0x43, 0x26, 0xb3, 0xae, 0x4f, 0x11, 0xb6, 0xea, 0xde, 0xe7, 0x49, 0xae, 0xd9, 0xee]),
+             "12 a 1 a 12 a s:m_Name a s:category s:key s:defaultValue [ 12 s:onValueChanged.m_PersistentCalls.m_Calls[].m_MethodName 16 s:onValueChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:onValueChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a"),
+            // es/BOXMAN_v0.5.02_x64/TextMeshProUGUI: TMPro.TextMeshProUGUI (Unity.TextMeshPro.dll).
+            ((UiKind::Tmp, [0x69, 0x39, 0x77, 0x2c, 0xb3, 0xce, 0x77, 0x5a, 0x8e, 0x8d, 0x99, 0xf3, 0x32, 0x53, 0x44, 0x91]),
+             "12 a 1 a 12 a s:m_Name a 29 a 1 a [ 12 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_MethodName 16 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_ObjectArgumentAssemblyTypeName 8 s:m_OnCullStateChanged.m_PersistentCalls.m_Calls[].m_Arguments.m_StringArgument 1 a 4 ] a s:m_text 1 a 24 [ 12 ] a 12 [ 12 ] a 21 a 93 a 17 a 17 a 49 a 33 a 1 a 1 a 1 a 1 a 1 a 1 a 17 a 1 a 1 a 21 a 1 a 1 a 28"),
+        ].into_iter().map(|(hash, schema)| (hash, parse_layout_schema(schema))).collect()
+    });
+    profiles
+        .get(&(script.ui_kind()?, script.properties_hash))
+        .map(Vec::as_slice)
 }
 
 fn read_external_paths(r: &mut R<'_>) -> Result<Vec<String>, SerializedError> {
@@ -1855,10 +2253,15 @@ pub fn rewrite_text_asset_script_inplace(
     // than trusting extraction metadata or a blacklist of the name's text.
     if let Ok(sf) = SerializedFile::parse_metadata(file_bytes, file_label.into()) {
         for obj in sf.mono_behaviour_objects() {
-            let name_offset = obj.data_abs as usize + 28;
             let object_end = obj.data_abs as usize + obj.byte_size as usize;
-            if script_len_offset >= object_end || need <= name_offset {
+            if script_len_offset >= object_end || need <= obj.data_abs as usize {
                 continue;
+            }
+            if script_len_offset < obj.data_abs as usize || need > object_end {
+                return Err(err(
+                    file_label,
+                    "translation slot crosses MonoBehaviour boundary",
+                ));
             }
             let mut r = R {
                 data: &file_bytes[..object_end],
@@ -1870,9 +2273,43 @@ pub fn rewrite_text_asset_script_inplace(
                 let file_id = r.i32()?;
                 let path_id = r.i64()?;
                 let (name, _, _) = r.aligned_string()?;
+                r.need(0)?;
                 Ok::<_, SerializedError>((file_id, path_id, name, r.pos))
             })() {
-                if let Some(script) = sf.script_identity(file_bytes, file_id, path_id) {
+                let script = sf.script_identity(file_bytes, file_id, path_id);
+                let kind = script.and_then(MonoScriptIdentity::ui_kind);
+                if sf.has_type_tree || kind.is_some() {
+                    let layout = if sf.has_type_tree {
+                        sf.type_layouts
+                            .get(obj.type_index as usize)
+                            .and_then(Option::as_deref)
+                    } else {
+                        script.and_then(stripped_layout)
+                    };
+                    let fields = layout.and_then(|layout| {
+                        read_layout_strings(file_bytes, obj, sf.header.endian, file_label, layout)
+                            .ok()
+                    });
+                    if !fields.is_some_and(|fields| {
+                        fields.iter().any(|field| {
+                            field.offset == script_len_offset
+                                && field.len == orig_script_byte_len
+                                && if field.path == "m_Name" {
+                                    !script
+                                        .is_some_and(MonoScriptIdentity::has_technical_object_name)
+                                        && mono_name_worth_extracting(&field.text)
+                                } else {
+                                    field_is_display(kind, &field.path, &field.text)
+                                }
+                        })
+                    }) {
+                        return Err(err(
+                            file_label,
+                            "unsupported or technical MonoBehaviour translation slot",
+                        ));
+                    }
+                }
+                if let Some(script) = script {
                     let font_name = technical_font_name_range(&r, script, &name);
                     if (script_len_offset < name_end && script.has_technical_object_name())
                         || font_name
@@ -1884,6 +2321,8 @@ pub fn rewrite_text_asset_script_inplace(
                         ));
                     }
                 }
+            } else {
+                return Err(err(file_label, "unsupported MonoBehaviour base layout"));
             }
         }
     }
@@ -2021,6 +2460,507 @@ pub fn write_v17_fixture_ex(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Fixtures encode the serialized primitives themselves, without using the
+    // production layout reader. A local MonoScript and a neighbouring opaque
+    // object exercise class resolution and the object boundary in both endians.
+    const UI05_TMP_HASH: [u8; 16] = [
+        0xcf, 0x62, 0xaa, 0xd9, 0x7f, 0x6c, 0x2d, 0xd5, 0xd4, 0x82, 0xe2, 0x50, 0x9c, 0x6c, 0x95,
+        0x28,
+    ];
+    const UI05_TMP_SCHEMA: &str = "12 a 1 a 12 a s:m_Name a 29 a 17 a [ 12 s:m_TargetAssemblyTypeName s:m_MethodName 16 s:m_ObjectArgumentAssemblyTypeName 8 s:m_StringArgument 1 a 4 ] a s:m_text 1 a 24 [ 12 ] a 12 [ 12 ] a 21 a 93 a 17 a 17 a 85 a [ 4 ] a 1 a 1 a 1 a 1 a 1 a 1 a 1 a 17 a 1 a 1 a 21 a 1 a 1 a 28";
+    const UI05_DROPDOWN_HASH: [u8; 16] = [
+        0xe1, 0x8d, 0xfd, 0x2b, 0x91, 0x3b, 0x09, 0xfb, 0xbb, 0x24, 0x05, 0x16, 0x5a, 0x2e, 0x6a,
+        0x44,
+    ];
+    const UI05_DROPDOWN_SCHEMA: &str = "12 a 1 a 12 a s:m_Name a 5 a 188 s:m_NormalTrigger s:m_HighlightedTrigger s:m_PressedTrigger s:m_SelectedTrigger s:m_DisabledTrigger 1 a 89 a [ s:m_Text 28 ] a [ 12 s:m_TargetAssemblyTypeName s:m_MethodName 16 s:m_ObjectArgumentAssemblyTypeName 8 s:m_StringArgument 1 a 4 ] a 4";
+    const UI05_MANAGED_HASH: [u8; 16] = [
+        0xf9, 0x52, 0x43, 0x26, 0xb3, 0xae, 0x4f, 0x11, 0xb6, 0xea, 0xde, 0xe7, 0x49, 0xae, 0xd9,
+        0xee,
+    ];
+    const UI05_MANAGED_SCHEMA: &str = "12 a 1 a 12 a s:m_Name a s:category s:key s:defaultValue [ 12 s:m_MethodName 16 s:m_ObjectArgumentAssemblyTypeName 8 s:m_StringArgument 1 a 4 ] a";
+
+    fn ui05_word(out: &mut Vec<u8>, n: u32, be: bool) {
+        out.extend_from_slice(&if be { n.to_be_bytes() } else { n.to_le_bytes() });
+    }
+    fn ui05_string(out: &mut Vec<u8>, s: &str, be: bool) {
+        ui05_word(out, s.len() as u32, be);
+        out.extend_from_slice(s.as_bytes());
+        out.resize((out.len() + 3) & !3, 0);
+    }
+    fn ui05_payload(schema: &str, be: bool, values: &[(&str, &str)], counts: &[usize]) -> Vec<u8> {
+        fn emit(
+            tokens: &[&str],
+            at: &mut usize,
+            out: &mut Vec<u8>,
+            be: bool,
+            values: &[(&str, &str)],
+            counts: &mut std::slice::Iter<'_, usize>,
+            option: &mut usize,
+        ) {
+            while *at < tokens.len() {
+                let token = tokens[*at];
+                *at += 1;
+                match token {
+                    "]" => return,
+                    "a" => out.resize((out.len() + 3) & !3, 0),
+                    "[" => {
+                        let n = *counts.next().unwrap_or(&0);
+                        ui05_word(out, n as u32, be);
+                        let start = *at;
+                        let mut end = start;
+                        let mut depth = 1;
+                        while depth > 0 {
+                            match tokens[end] {
+                                "[" => depth += 1,
+                                "]" => depth -= 1,
+                                _ => {}
+                            }
+                            end += 1;
+                        }
+                        for _ in 0..n {
+                            let mut pos = start;
+                            emit(&tokens[..end], &mut pos, out, be, values, counts, option);
+                        }
+                        *at = end;
+                    }
+                    s if s.starts_with("s:") => {
+                        let key = &s[2..];
+                        let value = if key == "m_Text" {
+                            let v = ["Low", "Medium", "High"][*option % 3];
+                            *option += 1;
+                            v
+                        } else {
+                            values
+                                .iter()
+                                .find(|(k, _)| *k == key)
+                                .map_or("", |(_, v)| *v)
+                        };
+                        ui05_string(out, value, be);
+                    }
+                    n => {
+                        let n: usize = n.parse().unwrap();
+                        out.resize(out.len() + n, 0);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        emit(
+            &schema.split_whitespace().collect::<Vec<_>>(),
+            &mut 0,
+            &mut out,
+            be,
+            values,
+            &mut counts.iter(),
+            &mut 0,
+        );
+        out[12] = 1;
+        out[20..28].copy_from_slice(&if be {
+            20i64.to_be_bytes()
+        } else {
+            20i64.to_le_bytes()
+        });
+        out
+    }
+
+    type Ui05Node<'a> = (u8, &'a str, &'a str, i32, u32);
+    fn ui05_asset(
+        identity: (&str, &str, &str),
+        hash: [u8; 16],
+        payload: Vec<u8>,
+        be: bool,
+        tree: Option<&[Ui05Node<'_>]>,
+    ) -> Vec<u8> {
+        let mut script = Vec::new();
+        ui05_string(&mut script, identity.0, be);
+        script.extend_from_slice(&[0; 4]);
+        script.extend_from_slice(&hash);
+        for s in [identity.0, identity.1, identity.2] {
+            ui05_string(&mut script, s, be);
+        }
+        let payloads = [
+            payload.clone(),
+            payload,
+            script,
+            b"opaque neighboring object bytes!".to_vec(),
+        ];
+        let mut meta = b"6000.0.24f1\0".to_vec();
+        ui05_word(&mut meta, 1, be);
+        meta.push(u8::from(tree.is_some()));
+        ui05_word(&mut meta, 3, be);
+        for class in [114i32, 115, 1] {
+            ui05_word(&mut meta, class as u32, be);
+            meta.push(0);
+            meta.extend_from_slice(&[255; 2]);
+            if class == 114 {
+                meta.extend_from_slice(&[0; 16]);
+            }
+            meta.extend_from_slice(&[0; 16]);
+            if let Some(nodes) = tree {
+                let nodes = if class == 114 { nodes } else { &[] };
+                let mut strings = Vec::new();
+                let mut blob = Vec::new();
+                for &(level, ty, name, size, flags) in nodes {
+                    blob.extend_from_slice(&if be {
+                        1u16.to_be_bytes()
+                    } else {
+                        1u16.to_le_bytes()
+                    });
+                    blob.extend_from_slice(&[level, 0]);
+                    for text in [ty, name] {
+                        ui05_word(&mut blob, strings.len() as u32, be);
+                        strings.extend_from_slice(text.as_bytes());
+                        strings.push(0);
+                    }
+                    for n in [size as u32, 0, flags] {
+                        ui05_word(&mut blob, n, be);
+                    }
+                }
+                ui05_word(&mut meta, nodes.len() as u32, be);
+                ui05_word(&mut meta, strings.len() as u32, be);
+                meta.extend(blob);
+                meta.extend(strings);
+            }
+        }
+        ui05_word(&mut meta, 4, be);
+        let mut offset = 0;
+        for ((id, ty), p) in [(10i64, 0), (11, 0), (20, 1), (30, 2)]
+            .into_iter()
+            .zip(&payloads)
+        {
+            meta.resize((meta.len() + 3) & !3, 0); // header is four-aligned
+            meta.extend_from_slice(&if be {
+                id.to_be_bytes()
+            } else {
+                id.to_le_bytes()
+            });
+            for n in [offset, p.len() as u32, ty] {
+                ui05_word(&mut meta, n, be);
+            }
+            offset += p.len() as u32;
+        }
+        ui05_word(&mut meta, 0, be);
+        ui05_word(&mut meta, 0, be);
+        meta.push(0);
+        let data_offset = (20 + meta.len() + 15) & !15;
+        let mut out = Vec::new();
+        for n in [
+            meta.len() as u32,
+            data_offset as u32 + offset,
+            17,
+            data_offset as u32,
+        ] {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        out.extend_from_slice(&[u8::from(be), 0, 0, 0]);
+        out.extend(meta);
+        out.resize(data_offset, 0);
+        for p in payloads {
+            out.extend(p);
+        }
+        out
+    }
+    fn ui05_assert_inject(bytes: &[u8], fields: &[MonoStringData]) {
+        let mut actual = bytes.to_vec();
+        let mut expected = bytes.to_vec();
+        for f in fields {
+            rewrite_text_asset_script_inplace(
+                &mut actual,
+                f.len_offset,
+                f.byte_len,
+                "X",
+                "field.assets",
+            )
+            .unwrap();
+            expected[f.len_offset + 4..f.len_offset + 4 + f.byte_len].fill(b' ');
+            expected[f.len_offset + 4] = b'X';
+        }
+        assert_eq!(actual, expected, "only requested payloads may change");
+        let parsed = SerializedFile::parse(actual, "field.assets").unwrap();
+        assert!(parsed
+            .read_mono_strings(10)
+            .unwrap()
+            .iter()
+            .all(|f| f.text.trim_end() == "X"));
+    }
+    #[test]
+    fn ui05_stripped_renderer_uppercase_and_callbacks() {
+        for be in [false, true] {
+            for text in ["MENU", "HIDE", "EXIT", "Welcome friend"] {
+                let p = ui05_payload(
+                    UI05_TMP_SCHEMA,
+                    be,
+                    &[
+                        ("m_text", text),
+                        ("m_MethodName", "Show"),
+                        ("m_StringArgument", "Play"),
+                    ],
+                    &[1, 0, 0, 0],
+                );
+                let bytes = ui05_asset(
+                    ("TextMeshProUGUI", "TMPro", "Unity.TextMeshPro"),
+                    UI05_TMP_HASH,
+                    p,
+                    be,
+                    None,
+                );
+                let sf = SerializedFile::parse(bytes.clone(), "field.assets").unwrap();
+                let fields = sf.read_mono_strings(10).unwrap();
+                assert_eq!(
+                    fields.iter().map(|f| f.text.as_str()).collect::<Vec<_>>(),
+                    [text]
+                );
+                ui05_assert_inject(&bytes, &fields);
+                let callback = bytes.windows(4).position(|x| x == b"Show").unwrap();
+                let mut copy = bytes.clone();
+                assert!(rewrite_text_asset_script_inplace(
+                    &mut copy,
+                    callback - 4,
+                    4,
+                    "Hide",
+                    "field.assets"
+                )
+                .is_err());
+                assert_eq!(copy, bytes);
+            }
+        }
+    }
+    #[test]
+    fn ui05_stripped_dropdown_actual_headers_options_and_event() {
+        for be in [false, true] {
+            let p = ui05_payload(
+                UI05_DROPDOWN_SCHEMA,
+                be,
+                &[("m_NormalTrigger", "Normal"), ("m_MethodName", "Play")],
+                &[3, 1],
+            );
+            let bytes = ui05_asset(
+                ("TMP_Dropdown", "TMPro", "Unity.TextMeshPro"),
+                UI05_DROPDOWN_HASH,
+                p,
+                be,
+                None,
+            );
+            let sf = SerializedFile::parse(bytes.clone(), "field.assets").unwrap();
+            let fields = sf.read_mono_strings(10).unwrap();
+            assert_eq!(
+                fields.iter().map(|f| f.text.as_str()).collect::<Vec<_>>(),
+                ["Low", "Medium", "High"]
+            );
+            ui05_assert_inject(&bytes, &fields);
+        }
+    }
+    #[test]
+    fn ui05_stripped_managed_fallback_preserves_lookup_and_set_text() {
+        for be in [false, true] {
+            let p = ui05_payload(
+                UI05_MANAGED_SCHEMA,
+                be,
+                &[
+                    ("category", "Tips"),
+                    ("key", "Show"),
+                    ("defaultValue", "TIPS"),
+                    ("m_MethodName", "set_text"),
+                ],
+                &[1],
+            );
+            let bytes = ui05_asset(
+                (
+                    "ManagedTextProvider",
+                    "Naninovel",
+                    "Elringus.Naninovel.Runtime.dll",
+                ),
+                UI05_MANAGED_HASH,
+                p,
+                be,
+                None,
+            );
+            let sf = SerializedFile::parse(bytes.clone(), "field.assets").unwrap();
+            let fields = sf.read_mono_strings(10).unwrap();
+            assert_eq!(
+                fields.iter().map(|f| f.text.as_str()).collect::<Vec<_>>(),
+                ["TIPS"]
+            );
+            ui05_assert_inject(&bytes, &fields);
+            for value in [b"Tips".as_slice(), b"Show", b"set_text"] {
+                let at = bytes.windows(value.len()).position(|x| x == value).unwrap();
+                let mut copy = bytes.clone();
+                assert!(rewrite_text_asset_script_inplace(
+                    &mut copy,
+                    at - 4,
+                    value.len(),
+                    "X",
+                    "field.assets"
+                )
+                .is_err());
+                assert_eq!(copy, bytes);
+            }
+        }
+    }
+    #[test]
+    fn ui05_type_tree_renderer_field_identity_and_false_length() {
+        for be in [false, true] {
+            for (class, namespace, assembly, field) in [
+                ("TextMeshProUGUI", "TMPro", "Unity.TextMeshPro", "m_text"),
+                ("Text", "UnityEngine.UI", "UnityEngine.UI", "m_Text"),
+            ] {
+                let tree = [
+                    (0, "MonoBehaviour", "Base", -1, 0),
+                    (1, "int", "header", 4, 0),
+                    (1, "SInt64", "go", 8, 0),
+                    (1, "UInt8", "m_Enabled", 1, 0x4000),
+                    (1, "int", "scriptFile", 4, 0),
+                    (1, "SInt64", "scriptPath", 8, 0),
+                    (1, "string", "m_Name", -1, 0),
+                    (1, "int", "falseLength", 4, 0),
+                    (1, "int", "falseText", 4, 0),
+                    (1, "string", field, -1, 0),
+                    (1, "string", "TargetObjectInBundle", -1, 0),
+                    (1, "UnityEvent", "onClick", -1, 0),
+                    (2, "PersistentCallGroup", "m_PersistentCalls", -1, 0),
+                    (3, "string", "m_MethodName", -1, 0),
+                ];
+                for text in ["MENU", "HIDE", "EXIT", "Welcome friend"] {
+                    let mut p = ui05_payload("12 a 1 a 12 a s:m_Name a", be, &[], &[]);
+                    ui05_word(&mut p, 4, be);
+                    p.extend_from_slice(b"Play");
+                    for s in [text, "morning", "Show"] {
+                        ui05_string(&mut p, s, be);
+                    }
+                    let bytes =
+                        ui05_asset((class, namespace, assembly), [0; 16], p, be, Some(&tree));
+                    let sf = SerializedFile::parse(bytes.clone(), "field.assets").unwrap();
+                    let fields = sf.read_mono_strings(10).unwrap();
+                    assert_eq!(
+                        fields.iter().map(|f| f.text.as_str()).collect::<Vec<_>>(),
+                        [text]
+                    );
+                    ui05_assert_inject(&bytes, &fields);
+                }
+            }
+        }
+    }
+    #[test]
+    fn ui05_unsupported_layouts_and_object_boundaries_fail_closed() {
+        for be in [false, true] {
+            let identity = ("TextMeshProUGUI", "TMPro", "Unity.TextMeshPro");
+            let p = ui05_payload(UI05_TMP_SCHEMA, be, &[("m_text", "MENU")], &[]);
+            for (hash, mut payload) in [
+                ([0; 16], p.clone()),
+                (UI05_TMP_HASH, p.clone()),
+                (UI05_TMP_HASH, p.clone()),
+                (UI05_TMP_HASH, p.clone()),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (h, mut p))| {
+                if i == 1 {
+                    p.extend_from_slice(&[0; 4]);
+                }
+                if i == 2 {
+                    p.truncate(88);
+                }
+                if i == 3 {
+                    p[28..32].copy_from_slice(&if be {
+                        u32::MAX.to_be_bytes()
+                    } else {
+                        u32::MAX.to_le_bytes()
+                    });
+                }
+                (h, p)
+            }) {
+                let bytes = ui05_asset(identity, hash, std::mem::take(&mut payload), be, None);
+                let sf = SerializedFile::parse(bytes.clone(), "field.assets").unwrap();
+                assert!(sf
+                    .read_mono_strings(10)
+                    .map_or(true, |fields| fields.is_empty()));
+                let mut copy = bytes.clone();
+                assert!(rewrite_text_asset_script_inplace(
+                    &mut copy,
+                    sf.objects[0].data_abs as usize + 32,
+                    4,
+                    "X",
+                    "field.assets"
+                )
+                .is_err());
+                assert_eq!(copy, bytes);
+            }
+        }
+        // A class name in another namespace/assembly must retain conservative
+        // fallback policy rather than gaining uppercase display slots.
+        let p = ui05_payload(
+            "12 a 1 a 12 a s:m_Name a s:m_text",
+            false,
+            &[("m_text", "MENU")],
+            &[],
+        );
+        let sf = SerializedFile::parse(
+            ui05_asset(
+                ("TextMeshProUGUI", "Game", "Assembly-CSharp"),
+                UI05_TMP_HASH,
+                p,
+                false,
+                None,
+            ),
+            "unknown.assets",
+        )
+        .unwrap();
+        assert!(sf.read_mono_strings(10).unwrap().is_empty());
+    }
+    #[test]
+    fn ui05_stale_source_and_technical_legacy_entries_are_skipped() {
+        use locust_core::extraction::FormatPlugin;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resources.assets");
+        let p = ui05_payload(
+            UI05_MANAGED_SCHEMA,
+            false,
+            &[
+                ("category", "Tips"),
+                ("key", "Show"),
+                ("defaultValue", "TIPS"),
+                ("m_MethodName", "set_text"),
+            ],
+            &[1],
+        );
+        let bytes = ui05_asset(
+            (
+                "ManagedTextProvider",
+                "Naninovel",
+                "Elringus.Naninovel.Runtime.dll",
+            ),
+            UI05_MANAGED_HASH,
+            p,
+            false,
+            None,
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        let plugin = crate::unity::UnityPlugin::new();
+        let entries = plugin.extract(&path).unwrap();
+        let mut entry = entries
+            .into_iter()
+            .find(|e| e.source == "TIPS")
+            .expect("fallback row");
+        entry.translation = Some("TIP".into());
+        let mut stale = bytes.clone();
+        let off = entry.metadata["mono_string_offset"].as_u64().unwrap() as usize;
+        stale[off + 4] = b'B';
+        std::fs::write(&path, &stale).unwrap();
+        let report = plugin.inject(dir.path(), &[entry.clone()]).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), stale);
+        std::fs::write(&path, &bytes).unwrap();
+        let at = bytes.windows(4).position(|s| s == b"Show").unwrap();
+        entry.source = "Show".into();
+        entry
+            .metadata
+            .insert("mono_string_offset".into(), serde_json::json!(at - 4));
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
 
     #[test]
     fn path_id_readers_preserve_data_and_lookup_errors() {
@@ -2605,22 +3545,31 @@ mod tests {
 
     #[test]
     fn technical_object_name_tmp_menu_keeps_display_and_duplicate_instances() {
-        let bytes = identified_mono_fixture(
-            ("TextMeshProUGUI", "TMPro", "Unity.TextMeshPro"),
-            "MENU",
-            &["MENU", "存"],
-            0,
-        );
-        let sf = SerializedFile::parse(bytes, "menu.assets").unwrap();
-        for id in [10, 11] {
-            let fields = sf.read_mono_strings(id).unwrap();
-            assert_eq!(
-                fields
-                    .iter()
-                    .map(|f| (f.field_index, f.text.as_str()))
-                    .collect::<Vec<_>>(),
-                [(1, "MENU"), (2, "存")]
+        for text in ["MENU", "存"] {
+            let p = ui05_payload(
+                UI05_TMP_SCHEMA,
+                false,
+                &[("m_text", text), ("m_Name", "MENU")],
+                &[],
             );
+            let bytes = ui05_asset(
+                ("TextMeshProUGUI", "TMPro", "Unity.TextMeshPro"),
+                UI05_TMP_HASH,
+                p,
+                false,
+                None,
+            );
+            let sf = SerializedFile::parse(bytes, "menu.assets").unwrap();
+            for id in [10, 11] {
+                let fields = sf.read_mono_strings(id).unwrap();
+                assert_eq!(
+                    fields
+                        .iter()
+                        .map(|f| (f.field_index, f.text.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(1, text)]
+                );
+            }
         }
     }
 
@@ -2684,8 +3633,12 @@ mod tests {
             let fields = sf.read_mono_strings(10).unwrap();
             assert_eq!(
                 fields.iter().map(|f| f.field_index).collect::<Vec<_>>(),
-                [1, 2],
-                "{identity:?}"
+                if matches!(identity.0, "Text" | "TextMeshPro") {
+                    vec![]
+                } else {
+                    vec![1, 2]
+                },
+                "{identity:?}: unsupported UI hashes must stay opaque"
             );
             let mut after = bytes.clone();
             assert!(rewrite_text_asset_script_inplace(
