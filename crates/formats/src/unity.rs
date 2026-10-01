@@ -221,7 +221,10 @@ impl UnityPlugin {
             let mut modified = false;
             for entry in file_entries {
                 let Some(line_num) = entry
-                    .id
+                    .metadata
+                    .get("unity_local_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&entry.id)
                     .strip_prefix(&format!("{filename}#"))
                     .and_then(|n| n.parse::<usize>().ok())
                     .and_then(|n| n.checked_sub(1))
@@ -2541,25 +2544,21 @@ impl FormatPlugin for UnityPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
-        // Prefer text scripts if available
+        let mut all = Vec::new();
         if let Some(scripts_dir) = Self::find_scripts_dir(path) {
-            let entries = Self::extract_text_scripts(&scripts_dir)?;
-            if !entries.is_empty() {
-                return Ok(entries);
-            }
+            all.extend(Self::extract_text_scripts(&scripts_dir)?);
         }
 
-        // Fallback to binary SerializedFiles (loose .assets / UnityFS CABs)
+        // Scripts and binary files can contain different physical text slots.
         let assets = Self::find_assets_files(path);
         let bundles = Self::find_unityfs_files(path);
-        if assets.is_empty() && bundles.is_empty() {
+        if all.is_empty() && assets.is_empty() && bundles.is_empty() {
             return Err(LocustError::ParseError {
                 file: path.display().to_string(),
                 message: "no script files, .assets files, or UnityFS bundles found".to_string(),
             });
         }
 
-        let mut all = Vec::new();
         for asset_file in &assets {
             let bytes = std::fs::read(asset_file)?;
             let filename = asset_file
@@ -2598,6 +2597,38 @@ impl FormatPlugin for UnityPlugin {
                     }
                 }
                 all.extend(node_entries);
+            }
+        }
+        // The database keys rows by ID alone. Preserve legacy IDs when unique,
+        // but qualify every colliding local ID by its physical (or virtual) path.
+        // Never merge identical sources from distinct slots.
+        let mut counts = HashMap::new();
+        for entry in &all {
+            *counts.entry(entry.id.clone()).or_insert(0usize) += 1;
+        }
+        let mut occurrences = HashMap::new();
+        for entry in &mut all {
+            if counts[&entry.id] > 1 {
+                let local_id = entry.id.clone();
+                let relative = entry
+                    .file_path
+                    .strip_prefix(path)
+                    .unwrap_or(&entry.file_path);
+                let physical = relative.to_string_lossy().replace('\\', "/");
+                let occurrence = occurrences
+                    .entry((physical.clone(), local_id.clone()))
+                    .or_insert(0usize);
+                // JSON escaping makes the tuple unambiguous even for paths
+                // containing separators used by local IDs.
+                entry.id = format!(
+                    "unity:{}:{local_id}",
+                    serde_json::json!([physical, *occurrence])
+                );
+                *occurrence += 1;
+                entry.metadata.insert(
+                    "unity_local_id".to_string(),
+                    serde_json::Value::String(local_id),
+                );
             }
         }
         Ok(all)
@@ -2726,6 +2757,244 @@ mod tests {
         )
         .unwrap();
         (fixture, file)
+    }
+
+    fn mixed_textasset_fixture() -> Vec<u8> {
+        crate::unity_serialized::write_v17_fixture_ex("UI", "Welcome traveler!", None)
+    }
+
+    fn expected_textasset_slot(before: &[u8], entry: &StringEntry) -> Vec<u8> {
+        let translation = entry.translation.as_ref().unwrap();
+        assert_eq!(translation.len(), entry.source.len());
+        let start = entry.metadata["textasset_script_offset"].as_u64().unwrap() as usize + 4;
+        let mut expected = before.to_vec();
+        expected[start..start + translation.len()].copy_from_slice(translation.as_bytes());
+        expected
+    }
+
+    fn database_roundtrip(entries: &[StringEntry]) -> Vec<StringEntry> {
+        use locust_core::database::{Database, EntryFilter};
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(entries).unwrap();
+        let stored = db.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(
+            stored.len(),
+            entries.len(),
+            "physical rows must survive the DB"
+        );
+        stored
+    }
+
+    #[test]
+    fn scripts_and_binary_both_extract() {
+        let before = "# untouched\r\n  CJ Hello \\bfriend\\b.  \r\nscene garden\r\n";
+        let (fixture, script) = vn_controls_fixture(before);
+        let definitions = script.parent().unwrap().join("Definitions.txt");
+        let definitions_before = fs::read(&definitions).unwrap();
+        let asset = fixture.path().join("Controls_Data/resources.assets");
+        let binary_before = mixed_textasset_fixture();
+        fs::write(&asset, &binary_before).unwrap();
+        let plugin = UnityPlugin::new();
+        let mut entries = plugin.extract(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries.iter().any(|e| e.file_path == script));
+        assert!(entries.iter().any(|e| e.source == "Welcome traveler!"));
+        for entry in &mut entries {
+            entry.translation = Some(if entry.file_path == script {
+                "Hola \\bamigo\\b.".into()
+            } else {
+                "Bienvenido amigo!".into()
+            });
+        }
+        let entries = database_roundtrip(&entries);
+        let binary = entries.iter().find(|e| e.file_path == asset).unwrap();
+        let expected = expected_textasset_slot(&binary_before, binary);
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_diagnostic_totals(&report, 2);
+        assert_eq!((report.strings_written, report.files_modified), (2, 2));
+        assert_eq!(report.strings_skipped, 0);
+        assert_eq!(
+            fs::read(script).unwrap(),
+            before
+                .replace("Hello \\bfriend\\b.", "Hola \\bamigo\\b.")
+                .as_bytes()
+        );
+        // Includes all headers, alignment padding, and the untouched dummy object.
+        assert_eq!(fs::read(asset).unwrap(), expected);
+        assert_eq!(fs::read(definitions).unwrap(), definitions_before);
+    }
+
+    #[test]
+    fn scripts_and_binary_scripts_only_still_succeeds() {
+        let (fixture, script) = vn_controls_fixture("CJ Welcome traveler!\n");
+        let entries = UnityPlugin::new().extract(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_path, script);
+        assert_eq!(entries[0].id, "Dialogue.txt#1");
+    }
+
+    #[test]
+    fn scripts_and_binary_binary_only_still_succeeds() {
+        let fixture = tempfile::tempdir().unwrap();
+        let data = fixture.path().join("Binary_Data");
+        fs::create_dir(&data).unwrap();
+        let asset = data.join("resources.assets");
+        fs::write(&asset, mixed_textasset_fixture()).unwrap();
+        let entries = UnityPlugin::new().extract(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_path, asset);
+        assert_eq!(entries[0].id, "textasset/1");
+    }
+
+    #[test]
+    fn scripts_and_binary_repeated_physical_rows_survive_database_and_inject() {
+        let before = "# untouched\r\nCJ Welcome traveler!\r\nscene garden\r\n";
+        let (fixture, script) = vn_controls_fixture(before);
+        let other_script = script.parent().unwrap().join("Vol2/Dialogue.txt");
+        fs::create_dir(other_script.parent().unwrap()).unwrap();
+        fs::write(&other_script, before).unwrap();
+        let binary_before = mixed_textasset_fixture();
+        let assets = ["resources.assets", "subdir/resources.assets"].map(|name| {
+            let asset = fixture.path().join("Controls_Data").join(name);
+            fs::create_dir_all(asset.parent().unwrap()).unwrap();
+            fs::write(&asset, &binary_before).unwrap();
+            asset
+        });
+        let plugin = UnityPlugin::new();
+        let entries = plugin.extract(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 4, "same text must retain four physical rows");
+        assert!(entries.iter().all(|e| e.source == "Welcome traveler!"));
+        let first_ids: HashMap<_, _> = entries
+            .iter()
+            .map(|e| (e.file_path.clone(), e.id.clone()))
+            .collect();
+        let second_ids: HashMap<_, _> = plugin
+            .extract(fixture.path())
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.file_path, e.id))
+            .collect();
+        assert_eq!(first_ids, second_ids, "IDs must be deterministic");
+        let mut entries = database_roundtrip(&entries);
+        for entry in &mut entries {
+            entry.translation = Some(if entry.file_path == script {
+                "Hola visitante!".into()
+            } else if entry.file_path == other_script {
+                "Saludos viajero!".into()
+            } else {
+                "Bienvenido amigo!".into()
+            });
+        }
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_diagnostic_totals(&report, 4);
+        assert_eq!((report.strings_written, report.files_modified), (4, 4));
+        for path in [script, other_script] {
+            let entry = entries.iter().find(|e| e.file_path == path).unwrap();
+            assert_eq!(
+                fs::read(path).unwrap(),
+                before
+                    .replace(&entry.source, entry.translation.as_ref().unwrap())
+                    .as_bytes()
+            );
+        }
+        for path in assets {
+            let entry = entries.iter().find(|e| e.file_path == path).unwrap();
+            assert_eq!(
+                fs::read(path).unwrap(),
+                expected_textasset_slot(&binary_before, entry)
+            );
+        }
+    }
+
+    #[test]
+    fn scripts_and_binary_unityfs_virtual_rows_survive_database_and_inject() {
+        let (fixture, script) = vn_controls_fixture("CJ Welcome traveler!\r\n");
+        let binary_before = mixed_textasset_fixture();
+        let asset = fixture.path().join("Controls_Data/resources.assets");
+        fs::write(&asset, &binary_before).unwrap();
+        let bundle = fixture.path().join("Controls_Data/data.unity3d");
+        let nodes = ["CAB-one", "nested/CAB-two"];
+        let untouched = b"untouched resource payload";
+        fs::write(
+            &bundle,
+            crate::unity_fs::build_test_bundle(
+                &[
+                    (nodes[0], &binary_before),
+                    (nodes[1], &binary_before),
+                    ("CAB-one.resS", untouched),
+                ],
+                true,
+                8,
+                true,
+                false,
+            ),
+        )
+        .unwrap();
+        let plugin = UnityPlugin::new();
+        let mut entries = database_roundtrip(&plugin.extract(fixture.path()).unwrap());
+        assert_eq!(entries.len(), 4);
+        for node in nodes {
+            assert!(entries.iter().any(|e| e.file_path == bundle.join(node)));
+        }
+        for entry in &mut entries {
+            entry.translation = Some("Bienvenido amigo!".into());
+        }
+        let report = plugin.inject(fixture.path(), &entries).unwrap();
+        assert_diagnostic_totals(&report, 4);
+        assert_eq!((report.strings_written, report.files_modified), (4, 3));
+        assert_eq!(fs::read(script).unwrap(), b"CJ Bienvenido amigo!\r\n");
+        let archive = crate::unity_fs::UnityFsArchive::parse_path(&bundle).unwrap();
+        for node in nodes {
+            let entry = entries
+                .iter()
+                .find(|e| e.file_path == bundle.join(node))
+                .unwrap();
+            assert_eq!(
+                archive.node_bytes(archive.node(node).unwrap()).unwrap(),
+                expected_textasset_slot(&binary_before, entry)
+            );
+        }
+        assert_eq!(
+            archive
+                .node_bytes(archive.node("CAB-one.resS").unwrap())
+                .unwrap(),
+            untouched
+        );
+        let entry = entries.iter().find(|e| e.file_path == asset).unwrap();
+        assert_eq!(
+            fs::read(asset).unwrap(),
+            expected_textasset_slot(&binary_before, entry)
+        );
+    }
+
+    #[test]
+    fn scripts_and_binary_does_not_hide_bundle_parse_errors() {
+        let (fixture, _) = vn_controls_fixture("CJ Welcome traveler!\n");
+        fs::write(
+            fixture.path().join("Controls_Data/data.unity3d"),
+            b"UnityFS\0broken",
+        )
+        .unwrap();
+        assert!(matches!(
+            UnityPlugin::new().extract(fixture.path()),
+            Err(LocustError::ParseError { .. })
+        ));
+    }
+
+    #[test]
+    fn scripts_and_binary_keeps_serialized_heuristic_fallback() {
+        let (fixture, _) = vn_controls_fixture("CJ Existing dialogue.\n");
+        // A non-SerializedFile still follows the existing logged heuristic fallback.
+        let mut bytes = vec![0; 32];
+        bytes.extend_from_slice(&17u32.to_le_bytes());
+        bytes.extend_from_slice(b"Welcome traveler!");
+        fs::write(fixture.path().join("Controls_Data/resources.assets"), bytes).unwrap();
+        let entries = UnityPlugin::new().extract(fixture.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|e| e.source == "Welcome traveler!"
+                && e.metadata["extraction_method"] == "heuristic"));
     }
 
     #[test]
