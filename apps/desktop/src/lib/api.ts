@@ -52,7 +52,7 @@ function unreachableBackend(base: string, path: string): Error {
   return new Error(msg);
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(path: string, options?: RequestInit, quietStatus?: number): Promise<T> {
   const base = await baseUrl();
   let res: Response;
   try {
@@ -63,6 +63,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   } catch {
     throw unreachableBackend(base, path);
   }
+  // An expected status (for example 404 = no project open) is a signal, not an error.
+  if (quietStatus !== undefined && res.status === quietStatus) return null as T;
   if (!res.ok) {
     const text = await res.text();
     addLog("error", `API ${res.status}: ${path}`, text, "api");
@@ -412,8 +414,9 @@ export const openProjectDb = (
       });
 };
 
+/** 404 means no project is open; resolve to null without logging an error. */
 export const getCurrentProject = () =>
-  request<ProjectInfo | null>("/project/current");
+  request<ProjectInfo | null>("/project/current", undefined, 404);
 
 export const getStrings = (filter: StringFilter): Promise<StringsResponse> =>
   IS_TAURI

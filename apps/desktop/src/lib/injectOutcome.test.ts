@@ -10,6 +10,8 @@ import {
   injectToastLevel,
   outcomeRecordingIssues,
   shouldOfferPackAfterInject,
+  sumFilesModified,
+  sumStringsSkipped,
   sumStringsWritten,
 } from "./injectOutcome.ts";
 
@@ -23,6 +25,19 @@ assert.equal(
   5,
 );
 assert.equal(sumStringsWritten({ reports: { es: { strings_written: 0 } } }), 0);
+
+// --- sumFilesModified / sumStringsSkipped: Add/Replace reports carry counts only per language ---
+assert.equal(sumFilesModified({ files_modified: 4 }), 4);
+assert.equal(
+  sumFilesModified({ reports: { es: { files_modified: 3 }, fr: { files_modified: 1 } } }),
+  4,
+);
+assert.equal(sumFilesModified({}), 0);
+assert.equal(sumStringsSkipped({ strings_skipped: 2 }), 2);
+assert.equal(
+  sumStringsSkipped({ reports: { es: { strings_skipped: 5 }, fr: { strings_skipped: 1 } } }),
+  6,
+);
 
 // --- skip reasons: exact counts, language scope, and legacy remainder ---
 assert.deepEqual(collectSkipReasons({}), []);

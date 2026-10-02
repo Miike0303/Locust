@@ -61,19 +61,37 @@ function asNonNegIntAllowZero(n: unknown): number {
   return typeof n === "number" && Number.isFinite(n) && n >= 0 ? Math.trunc(n) : 0;
 }
 
-export function sumStringsWritten(report: InjectReportLike): number {
-  if (typeof report.strings_written === "number" && Number.isFinite(report.strings_written)) {
-    return asNonNegIntAllowZero(report.strings_written);
+type ReportCount = "strings_written" | "files_modified" | "strings_skipped";
+
+/** Direct reports carry top-level counts; multi-language (Add/Replace)
+ * reports carry them only per language, so fall back to the sum. */
+function sumReportCount(report: InjectReportLike, field: ReportCount): number {
+  const top = report[field];
+  if (typeof top === "number" && Number.isFinite(top)) {
+    return asNonNegIntAllowZero(top);
   }
   let sum = 0;
   if (report.reports) {
     for (const r of Object.values(report.reports)) {
-      if (r && typeof r.strings_written === "number") {
-        sum += asNonNegIntAllowZero(r.strings_written);
+      const value = r?.[field];
+      if (typeof value === "number") {
+        sum += asNonNegIntAllowZero(value);
       }
     }
   }
   return sum;
+}
+
+export function sumStringsWritten(report: InjectReportLike): number {
+  return sumReportCount(report, "strings_written");
+}
+
+export function sumFilesModified(report: InjectReportLike): number {
+  return sumReportCount(report, "files_modified");
+}
+
+export function sumStringsSkipped(report: InjectReportLike): number {
+  return sumReportCount(report, "strings_skipped");
 }
 
 export function collectInjectWarnings(report: InjectReportLike): string[] {

@@ -24,6 +24,8 @@ import {
 	injectToastLevel,
 	outcomeRecordingIssues,
 	shouldOfferPackAfterInject,
+	sumFilesModified,
+	sumStringsSkipped,
 	sumStringsWritten,
 } from "../lib/injectOutcome";
 import { LANGUAGES, languageLabel } from "../lib/languages";
@@ -640,8 +642,8 @@ export default function InjectModal({
 							<p className="text-sm opacity-90">
 								{t("inject.stringsWritten", {
 									written: resultWritten,
-									files: result.files_modified ?? 0,
-									skipped: result.strings_skipped ?? 0,
+									files: sumFilesModified(result),
+									skipped: sumStringsSkipped(result),
 								})}
 							</p>
 							{isDirectResult && result.backup_path && (

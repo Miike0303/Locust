@@ -65,4 +65,11 @@ assert.equal(
   "5 items",
 );
 
+setLocale("es");
+assert.equal(t("welcome.recentCount", { count: 1 }), "1 proyecto reciente");
+assert.equal(t("welcome.recentCount", { count: 3 }), "3 proyectos recientes");
+setLocale("en");
+assert.equal(t("welcome.recentCount", { count: 1 }), "1 recent project");
+assert.equal(t("welcome.recentCount", { count: 3 }), "3 recent projects");
+
 console.log("i18n.test.ts: ok");
