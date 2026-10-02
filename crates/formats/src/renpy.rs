@@ -2487,11 +2487,14 @@ impl FormatPlugin for RenPyPlugin {
                         continue;
                     }
                 }
-                // Skip our own generated runtime filter
-                if fpath
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("zzz_locust"))
-                {
+                // Skip files Locust generates itself: the runtime filter and the
+                // Add-mode language picker (plus its pre-rename spelling).
+                if fpath.file_name().is_some_and(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with("zzz_locust")
+                        || n == "locust_languages.rpy"
+                        || n == "locust_language.rpy"
+                }) {
                     continue;
                 }
                 match Self::extract_file(fpath) {
@@ -4745,6 +4748,35 @@ label start:
 
         let tl_dir = dir.join("game").join("tl").join("es");
         assert!(tl_dir.exists());
+    }
+
+    #[test]
+    fn test_reextract_after_inject_add_ignores_generated_language_picker() {
+        // Add mode writes game/locust_languages.rpy (an in-game language menu).
+        // Reopening the project must not import its labels as game strings.
+        let dir = temp_renpy_dir();
+        let plugin = RenPyPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        let before: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        for entry in &mut entries {
+            entry.translation = Some(format!("[es] {}", entry.source));
+        }
+        plugin.inject_add(&dir, "es", &entries).unwrap();
+        // A file left by an older Locust version is skipped too.
+        fs::write(
+            dir.join("game").join("locust_language.rpy"),
+            "screen locust_old():\n    text \"Old picker\"\n",
+        )
+        .unwrap();
+        assert!(dir.join("game").join("locust_languages.rpy").exists());
+
+        let after: Vec<String> = plugin
+            .extract(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(after, before);
     }
 
     #[test]
