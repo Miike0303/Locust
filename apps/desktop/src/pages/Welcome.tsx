@@ -69,6 +69,7 @@ import {
 	WELCOME_WORKFLOW_STEPS,
 } from "../lib/workflowGuide";
 import { useT } from "../lib/i18n";
+import { formatDescriptionKey } from "../lib/formatDescriptions";
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
@@ -118,6 +119,10 @@ const FORMAT_COLORS: Record<string, string> = {
 
 export default function Welcome() {
 	const t = useT();
+	const formatDescriptionText = (id: string, fallback?: string) => {
+		const key = formatDescriptionKey(id);
+		return key ? t(key) : fallback;
+	};
 	const navigate = useNavigate();
 	const location = useLocation();
 	const queryClient = useQueryClient();
@@ -808,9 +813,9 @@ export default function Welcome() {
 											)}
 											</div>
 										</div>
-										{f.description && (
+										{(formatDescriptionKey(f.id) || f.description) && (
 											<p className="text-xs text-gray-500 line-clamp-2">
-												{f.description}
+												{formatDescriptionText(f.id, f.description)}
 											</p>
 										)}
 										<div className="mt-1.5 flex flex-wrap gap-1">

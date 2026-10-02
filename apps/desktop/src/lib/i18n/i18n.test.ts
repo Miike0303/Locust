@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { en } from "./en.ts";
 import { es } from "./es.ts";
 import { setLocale, t, translate } from "./index.ts";
+import { formatDescriptionKey, KNOWN_FORMAT_IDS } from "../formatDescriptions.ts";
 
 const enKeys = Object.keys(en).sort();
 const esKeys = Object.keys(es).sort();
@@ -64,6 +65,19 @@ assert.equal(
   ),
   "5 items",
 );
+
+// Format cards: translated user-facing descriptions, no developer notes.
+for (const id of KNOWN_FORMAT_IDS) {
+  const key = formatDescriptionKey(id);
+  assert.ok(key, `missing format.desc.${id}`);
+  for (const locale of ["en", "es"] as const) {
+    const text = translate(locale === "en" ? en : es, locale, key);
+    assert.ok(text.length > 0 && text !== key, `${locale} ${id}`);
+    assert.doesNotMatch(text, /synthetic|XOR|0x|FE FE/i, `${locale} ${id}: ${text}`);
+  }
+  assert.notEqual(es[key], en[key], `es ${id} is untranslated`);
+}
+assert.equal(formatDescriptionKey("some-future-format"), null);
 
 setLocale("es");
 assert.equal(t("welcome.recentCount", { count: 1 }), "1 proyecto reciente");
