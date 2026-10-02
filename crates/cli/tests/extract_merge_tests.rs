@@ -135,7 +135,7 @@ async fn cli_reextract_preserves_translations() {
     assert_eq!(after.created_at, before.created_at);
     assert_eq!(summary_count(&output, "Translations preserved"), 1);
     assert_eq!(summary_count(&output, "Added"), 0);
-    assert_eq!(summary_count(&output, "Updated"), 2);
+    assert_eq!(summary_count(&output, "Updated"), 0);
     assert_eq!(
         summary_count(&output, "Source changed (reset to pending)"),
         0

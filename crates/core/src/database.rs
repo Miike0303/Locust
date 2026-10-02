@@ -2334,7 +2334,6 @@ impl Database {
                     if has_saved_translation(&old.translation) {
                         stats.preserved_translations += 1;
                     }
-                    stats.updated += 1;
                     if old.source == source
                         && old.file_path == file_path_str
                         && old.context == entry.context
@@ -2345,6 +2344,7 @@ impl Database {
                     {
                         continue;
                     }
+                    stats.updated += 1;
                     let metadata_json = serde_json::to_string(&metadata)?;
                     update.execute(params![
                         source,
@@ -3917,14 +3917,14 @@ mod tests {
         let after: i64 = lock_connection(&db.conn)
             .query_row("SELECT total_changes()", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(stats.updated, 2);
+        assert_eq!(stats.updated, 1);
         assert_eq!(after - before, 1, "only the changed row should be written");
 
         let stats = db.merge_entries(&[unchanged, changed]).unwrap();
         let final_changes: i64 = lock_connection(&db.conn)
             .query_row("SELECT total_changes()", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(stats.updated, 2);
+        assert_eq!(stats.updated, 0);
         assert_eq!(
             final_changes - after,
             0,

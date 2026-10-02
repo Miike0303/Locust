@@ -681,7 +681,9 @@ fn direct_integration_remaps_virtual_suffix_and_records_real_game_paths() {
     .unwrap();
     assert_eq!(
         report.files_written,
-        vec![root.canonicalize().unwrap().join("game.bundle")]
+        vec![display_path(
+            &root.canonicalize().unwrap().join("game.bundle")
+        )]
     );
     assert!(db.get_injection(Some("es")).unwrap().is_some());
     assert_eq!(fs::read(root.join("game.bundle")).unwrap(), b"Translation");
@@ -1281,6 +1283,51 @@ fn later_readonly_target_vetoes_install_and_restore_before_earlier_files() {
     );
     fs::set_permissions(&later, original_permissions).unwrap();
     recover(&root, Default::default()).unwrap();
+}
+
+#[test]
+fn display_path_strips_only_verbatim_prefixes() {
+    #[cfg(windows)]
+    {
+        assert_eq!(display_path(Path::new(r"\\?\C:\x")), PathBuf::from(r"C:\x"));
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\x")),
+            PathBuf::from(r"\\server\share\x")
+        );
+        assert_eq!(display_path(Path::new(r"C:\x")), PathBuf::from(r"C:\x"));
+    }
+    assert_eq!(display_path(Path::new("rel/a")), PathBuf::from("rel/a"));
+}
+
+#[cfg(windows)]
+#[test]
+fn injection_report_omits_verbatim_windows_prefixes() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let (_, report, _) = run(&root, "fixture", Some("es"), || Ok(()), plugin, |_| Ok(())).unwrap();
+    assert!(
+        !report.files_written.is_empty(),
+        "fixture plugin must report written files"
+    );
+    for path in &report.files_written {
+        let text = path.to_string_lossy();
+        assert!(
+            !text.starts_with(r"\\?\"),
+            "files_written must not be a verbatim path: {text}"
+        );
+    }
+    for warning in &report.warnings {
+        assert!(
+            !warning.starts_with(r"\\?\"),
+            "warning must not be a verbatim path: {warning}"
+        );
+        // The completion notice puts the originals directory after "retained at ",
+        // so the warning string itself does not start with the prefix.
+        assert!(
+            !warning.contains(r"\\?\"),
+            "warning must not embed a verbatim path: {warning}"
+        );
+    }
 }
 
 #[cfg(unix)]

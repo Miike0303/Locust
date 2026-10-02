@@ -1935,7 +1935,7 @@ async fn test_http_reopen_same_game_preserves_translations() {
         .unwrap();
     assert!(second.preserved_translations > 0);
     assert_eq!(second.added, 0);
-    assert!(second.updated >= 1);
+    assert_eq!(second.updated, 0);
 
     let after: StringsResponse = client()
         .get(format!("{}/api/strings?limit=1000", base_url))

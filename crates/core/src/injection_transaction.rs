@@ -779,7 +779,7 @@ fn run_with_backup_hook<B, T>(
         Err(e) => {
             report.warnings.push(format!(
                 "private injection copy retained at {}: {e}",
-                operation.directory.join("work").display()
+                display_path(&operation.directory.join("work")).display()
             ));
             false
         }
@@ -797,9 +797,45 @@ fn run_with_backup_hook<B, T>(
     report.warnings.push(format!(
         "injection {} completed; verified originals retained at {}",
         operation.active.transaction_id,
-        operation.directory.join("originals").display()
+        display_path(&operation.directory.join("originals")).display()
     ));
     Ok((backup, report, recorded))
+}
+
+/// User-facing spelling of a path. `canonicalize` yields `\\?\` verbatim
+/// prefixes on Windows; those stay on paths that are locked, opened, or
+/// compared, and are removed only when a path is shown in a report.
+fn display_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components().peekable();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let mut out = match prefix.kind() {
+        Prefix::VerbatimDisk(disk) => {
+            let letter = disk as char;
+            let rooted = matches!(components.peek(), Some(Component::RootDir));
+            PathBuf::from(if rooted {
+                format!("{letter}:\\")
+            } else {
+                format!("{letter}:")
+            })
+        }
+        Prefix::VerbatimUNC(server, share) => PathBuf::from(format!(
+            r"\\{}\{}",
+            server.to_string_lossy(),
+            share.to_string_lossy()
+        )),
+        _ => return path.to_path_buf(),
+    };
+    for component in components {
+        if matches!(component, Component::RootDir) {
+            continue;
+        }
+        out.push(component.as_os_str());
+    }
+    out
 }
 
 fn new_scratch(path: &str, before: &Inventory) -> bool {
@@ -950,7 +986,7 @@ fn prepare(
     report.files_written = plan
         .files
         .iter()
-        .map(|f| operation.root.join(&f.path))
+        .map(|f| display_path(&operation.root.join(&f.path)))
         .collect();
     report.classify_remaining_skips();
     Ok((report, plan))
