@@ -187,33 +187,24 @@ impl UnityPlugin {
                 // Dialogue: `CharID Text here` or `CharID Text with \bformatting\b`
                 if let Some(dialogue) = extract_vn_dialogue(trimmed) {
                     let text = dialogue.text;
-                    // Sprite dialogue can be a single visible punctuation mark.
-                    let minimum_len = if dialogue.engine_prefix.trim().is_empty() {
-                        2
-                    } else {
-                        1
-                    };
-                    if text.len() >= minimum_len {
-                        // Controls remain in the translation source, including
-                        // boundaries inside dialogue. Only ignore them when
-                        // deciding whether there is any visible text.
-                        let clean = vn_visible_text(text);
-                        if clean.len() >= minimum_len {
-                            let id = format!("{}#{}", filename, line_num);
-                            let mut entry = StringEntry::new(&id, text, fpath.to_path_buf());
-                            entry.tags = vec!["dialogue".to_string()];
-                            entry.context = Some(dialogue.character.to_string());
-                            entry.metadata.insert(
-                                "vn_engine_prefix".to_string(),
-                                serde_json::Value::String(dialogue.engine_prefix.to_string()),
-                            );
-                            // Store original text with format codes in metadata
-                            entry.metadata.insert(
-                                "original_with_codes".to_string(),
-                                serde_json::Value::String(text.to_string()),
-                            );
-                            all.push(entry);
-                        }
+                    // A recognized dialogue record needs only one visible
+                    // character. Keep controls verbatim in the source; ignore
+                    // them only when rejecting empty/control-only bodies.
+                    if !vn_visible_text(text).is_empty() {
+                        let id = format!("{}#{}", filename, line_num);
+                        let mut entry = StringEntry::new(&id, text, fpath.to_path_buf());
+                        entry.tags = vec!["dialogue".to_string()];
+                        entry.context = Some(dialogue.character.to_string());
+                        entry.metadata.insert(
+                            "vn_engine_prefix".to_string(),
+                            serde_json::Value::String(dialogue.engine_prefix.to_string()),
+                        );
+                        // Store original text with format codes in metadata
+                        entry.metadata.insert(
+                            "original_with_codes".to_string(),
+                            serde_json::Value::String(text.to_string()),
+                        );
+                        all.push(entry);
                     }
                 }
             }
@@ -912,6 +903,11 @@ impl UnityPlugin {
                 for obj in sf.text_asset_objects() {
                     match sf.read_text_asset_object(obj) {
                         Ok(ta) => {
+                            // The object's range is already excluded from the
+                            // heuristic scan, even when its script is rejected.
+                            if is_performance_test_config(&ta.name, &ta.script) {
+                                continue;
+                            }
                             let character_names = parse_character_names_lines(&ta.name, &ta.script);
                             let is_character_names = character_names.is_some();
                             if character_names.is_none()
@@ -1697,6 +1693,36 @@ fn looks_like_bcp47_locale_id(key: &str) -> bool {
         }
     }
     true
+}
+
+/// Unity Performance Testing package assets are technical only when both the
+/// owner name and the JSON schema identify settings or a captured test run.
+fn is_performance_test_config(name: &str, script: &str) -> bool {
+    if !matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "performancetestrun"
+            | "performancetestrunsettings"
+            | "performancetestruninfo"
+            | "performancetestconfig"
+    ) {
+        return false;
+    }
+    let Ok(serde_json::Value::Object(config)) = serde_json::from_str(script) else {
+        return false;
+    };
+    config
+        .get("MeasurementCount")
+        .is_some_and(serde_json::Value::is_i64)
+        || (config
+            .get("TestSuite")
+            .is_some_and(serde_json::Value::is_string)
+            && config.get("Date").is_some_and(serde_json::Value::is_number)
+            && ["Player", "Hardware", "Editor"]
+                .iter()
+                .all(|key| config.get(*key).is_some_and(serde_json::Value::is_object))
+            && ["Dependencies", "Results"]
+                .iter()
+                .all(|key| config.get(*key).is_some_and(serde_json::Value::is_array)))
 }
 
 /// TextAsset `m_Name` that is never player-facing copy.
@@ -4109,6 +4135,101 @@ script Chapter_1_script chapter 1 {
     }
 
     #[test]
+    fn test_vn_single_visible_character_extract_inject() {
+        let dir = tempdir();
+        let scripts = dir.join("TestGame_Data/SCRIPTS~");
+        fs::create_dir_all(&scripts).unwrap();
+        let path = scripts.join("Short.txt");
+        let original = concat!(
+            "CJ Existing dialogue.\r\n",
+            "  CJ !\n",
+            "CJ ?\r\n",
+            "CJ I\n",
+            "\tCJ  \\bI\r\n",
+            "CJ 界\n",
+            "CJ ★\r\n",
+            "CJ \\bI\\b\n",
+            "CJ <i>I</i>\r\n",
+            "CJ +CJ_smile  ?\n",
+            "CJ \\b\\i\\i\\b\r\n",
+            "CJ <i></i>\n",
+            "CJ    \r\n",
+            "wait 1\n",
+            "CJ {\r\n",
+            "# CJ !\n",
+            "CJ Untargeted ending."
+        );
+        fs::write(&path, original).unwrap();
+        let plugin = UnityPlugin::new();
+        let rows = plugin.extract(&dir).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.source.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Existing dialogue.",
+                "!",
+                "?",
+                "I",
+                "\\bI",
+                "界",
+                "★",
+                "\\bI\\b",
+                "<i>I</i>",
+                "?",
+                "Untargeted ending."
+            ]
+        );
+        let translations = [
+            (2, "?"),
+            (3, "!"),
+            (4, "J"),
+            (5, "\\bJ"),
+            (6, "字"),
+            (7, "☆"),
+            (8, "\\bJ\\b"),
+            (9, "<i>J</i>"),
+            (10, "!"),
+        ];
+        let mut targets = Vec::new();
+        let mut expected = original
+            .split_inclusive('\n')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for (line, translation) in translations {
+            let mut row = rows
+                .iter()
+                .find(|row| row.id == format!("Short.txt#{line}"))
+                .unwrap()
+                .clone();
+            // Compute the expected file independently, replacing only the body.
+            expected[line - 1] = expected[line - 1].replacen(&row.source, translation, 1);
+            row.translation = Some(translation.into());
+            targets.push(row);
+        }
+        let report = plugin.inject(&dir, &targets).unwrap();
+        assert_eq!(report.strings_written, 9);
+        assert_eq!(report.strings_skipped, 0);
+        assert_eq!(fs::read(&path).unwrap(), expected.concat().as_bytes());
+
+        fs::write(&path, original).unwrap();
+        let mut unsafe_rows = Vec::new();
+        for source in ["\\bI", "\\bI\\b", "<i>I</i>"] {
+            let mut row = rows
+                .iter()
+                .find(|row| row.source == source)
+                .unwrap()
+                .clone();
+            row.translation = Some("J".into());
+            unsafe_rows.push(row);
+        }
+        let report = plugin.inject(&dir, &unsafe_rows).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.skip_reasons.get("unsafe_controls"), Some(&3));
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
     fn test_extract_vn_scripts() {
         let dir = tempdir();
         create_vn_script_fixture(&dir);
@@ -4555,6 +4676,88 @@ script Chapter_1_script chapter 1 {
         assert_eq!(&out[offsets[1] + 4..offsets[1] + 12], b"Only2nd!");
         assert_eq!(&out[offsets[2] + 4..offsets[2] + 12], b"Changed!");
         assert_eq!(&out[offsets[3] + 4..offsets[3] + 12], b"Other!!!");
+    }
+
+    #[test]
+    fn test_performance_textassets_do_not_extract_or_leak_to_heuristics() {
+        // Complete shipped run-info payloads from CCTV/USSR and Sunkissed.
+        let scripts = [
+            r#"{"MeasurementCount":-1}"#,
+            r#"{"TestSuite":"","Date":0,"Player":{"Development":false,"ScreenWidth":0,"ScreenHeight":0,"ScreenRefreshRate":0,"Fullscreen":false,"Vsync":0,"AntiAliasing":0,"Batchmode":false,"RenderThreadingMode":"GraphicsJobs","GpuSkinning":true,"Platform":"","ColorSpace":"","AnisotropicFiltering":"","BlendWeights":"","GraphicsApi":"","ScriptingBackend":"Mono2x","AndroidTargetSdkVersion":"AndroidApiLevelAuto","AndroidBuildSystem":"Gradle","BuildTarget":"StandaloneWindows64","StereoRenderingPath":"MultiPass"},"Hardware":{"OperatingSystem":"","DeviceModel":"","DeviceName":"","ProcessorType":"","ProcessorCount":0,"GraphicsDeviceName":"","SystemMemorySizeMB":0},"Editor":{"Version":"6000.0.24f1","Branch":"6000.0/staging","Changeset":"11fa355cd605","Date":1729086108},"Dependencies":["com.unity.2d.sprite@1.0.0","com.unity.ai.navigation@2.0.4","com.unity.collab-proxy@2.5.2","com.unity.ide.rider@3.0.31","com.unity.ide.visualstudio@2.0.22","com.unity.inputsystem@1.11.1","com.unity.package-validation-suite@0.22.0-preview","com.unity.render-pipelines.universal@17.0.3","com.unity.test-framework@1.4.5","com.unity.timeline@1.8.7","com.unity.ugui@2.0.0","com.unity.visualscripting@1.9.4","com.unity.modules.accessibility@1.0.0","com.unity.modules.ai@1.0.0","com.unity.modules.androidjni@1.0.0","com.unity.modules.animation@1.0.0","com.unity.modules.assetbundle@1.0.0","com.unity.modules.audio@1.0.0","com.unity.modules.cloth@1.0.0","com.unity.modules.director@1.0.0","com.unity.modules.imageconversion@1.0.0","com.unity.modules.imgui@1.0.0","com.unity.modules.jsonserialize@1.0.0","com.unity.modules.particlesystem@1.0.0","com.unity.modules.physics@1.0.0","com.unity.modules.physics2d@1.0.0","com.unity.modules.screencapture@1.0.0","com.unity.modules.terrain@1.0.0","com.unity.modules.terrainphysics@1.0.0","com.unity.modules.tilemap@1.0.0","com.unity.modules.ui@1.0.0","com.unity.modules.uielements@1.0.0","com.unity.modules.umbra@1.0.0","com.unity.modules.unityanalytics@1.0.0","com.unity.modules.unitywebrequest@1.0.0","com.unity.modules.unitywebrequestassetbundle@1.0.0","com.unity.modules.unitywebrequestaudio@1.0.0","com.unity.modules.unitywebrequesttexture@1.0.0","com.unity.modules.unitywebrequestwww@1.0.0","com.unity.modules.vehicles@1.0.0","com.unity.modules.video@1.0.0","com.unity.modules.vr@1.0.0","com.unity.modules.wind@1.0.0","com.unity.modules.xr@1.0.0","com.unity.modules.subsystems@1.0.0","com.unity.modules.hierarchycore@1.0.0","com.unity.ext.nunit@2.0.5","com.unity.render-pipelines.core@17.0.3","com.unity.shadergraph@17.0.3","com.unity.render-pipelines.universal-config@17.0.3","com.unity.nuget.mono-cecil@1.11.4","com.unity.searcher@4.9.2","com.unity.burst@1.8.18","com.unity.mathematics@1.3.2","com.unity.collections@2.5.1","com.unity.rendering.light-transport@1.0.1","com.unity.test-framework.performance@3.0.3"],"Results":[]}"#,
+            r#"{"TestSuite":"","Date":0,"Player":{"Development":false,"ScreenWidth":0,"ScreenHeight":0,"ScreenRefreshRate":0,"Fullscreen":false,"Vsync":0,"AntiAliasing":0,"Batchmode":false,"RenderThreadingMode":"MultiThreaded","GpuSkinning":false,"Platform":"","ColorSpace":"","AnisotropicFiltering":"","BlendWeights":"","GraphicsApi":"","ScriptingBackend":"Mono2x","AndroidTargetSdkVersion":"AndroidApiLevelAuto","AndroidBuildSystem":"Gradle","BuildTarget":"StandaloneWindows64","StereoRenderingPath":"MultiPass"},"Hardware":{"OperatingSystem":"","DeviceModel":"","DeviceName":"","ProcessorType":"","ProcessorCount":0,"GraphicsDeviceName":"","SystemMemorySizeMB":0},"Editor":{"Version":"6000.0.0f1","Branch":"6000.0/release","Changeset":"4ff56b3ea44c","Date":1713989104},"Dependencies":["com.unity.2d.animation@10.1.1","com.unity.2d.pixel-perfect@5.0.3","com.unity.2d.psdimporter@9.0.3","com.unity.2d.sprite@1.0.0","com.unity.2d.spriteshape@10.0.4","com.unity.2d.tilemap@1.0.0","com.unity.ai.navigation@2.0.0","com.unity.collab-proxy@2.3.1","com.unity.ide.rider@3.0.28","com.unity.ide.visualstudio@2.0.22","com.unity.memoryprofiler@1.1.0","com.unity.mobile.android-logcat@1.4.2","com.unity.render-pipelines.universal@17.0.3","com.unity.test-framework@1.4.3","com.unity.timeline@1.8.6","com.unity.toolchain.win-x86_64-linux-x86_64@2.0.6","com.unity.ugui@2.0.0","com.unity.modules.accessibility@1.0.0","com.unity.modules.ai@1.0.0","com.unity.modules.androidjni@1.0.0","com.unity.modules.animation@1.0.0","com.unity.modules.assetbundle@1.0.0","com.unity.modules.audio@1.0.0","com.unity.modules.cloth@1.0.0","com.unity.modules.director@1.0.0","com.unity.modules.imageconversion@1.0.0","com.unity.modules.imgui@1.0.0","com.unity.modules.jsonserialize@1.0.0","com.unity.modules.particlesystem@1.0.0","com.unity.modules.physics@1.0.0","com.unity.modules.physics2d@1.0.0","com.unity.modules.screencapture@1.0.0","com.unity.modules.terrain@1.0.0","com.unity.modules.terrainphysics@1.0.0","com.unity.modules.tilemap@1.0.0","com.unity.modules.ui@1.0.0","com.unity.modules.uielements@1.0.0","com.unity.modules.umbra@1.0.0","com.unity.modules.unityanalytics@1.0.0","com.unity.modules.unitywebrequest@1.0.0","com.unity.modules.unitywebrequestassetbundle@1.0.0","com.unity.modules.unitywebrequestaudio@1.0.0","com.unity.modules.unitywebrequesttexture@1.0.0","com.unity.modules.unitywebrequestwww@1.0.0","com.unity.modules.vehicles@1.0.0","com.unity.modules.video@1.0.0","com.unity.modules.vr@1.0.0","com.unity.modules.wind@1.0.0","com.unity.modules.xr@1.0.0","com.unity.modules.subsystems@1.0.0","com.unity.modules.hierarchycore@1.0.0","com.unity.sysroot@2.0.7","com.unity.sysroot.linux-x86_64@2.0.6","com.unity.ext.nunit@2.0.5","com.unity.mathematics@1.3.1","com.unity.burst@1.8.13","com.unity.render-pipelines.core@17.0.3","com.unity.shadergraph@17.0.3","com.unity.render-pipelines.universal-config@17.0.3","com.unity.editorcoroutines@1.0.0","com.unity.2d.common@9.0.4","com.unity.collections@2.4.0","com.unity.searcher@4.9.2","com.unity.rendering.light-transport@1.0.1","com.unity.nuget.mono-cecil@1.11.4","com.unity.test-framework.performance@3.0.3"],"Results":[]}"#,
+        ];
+        for name in [
+            "PerformanceTestRun",
+            "PerformanceTestRunSettings",
+            "PerformanceTestRunInfo",
+            "PerformanceTestConfig",
+        ] {
+            for script in scripts {
+                let bytes = crate::unity_serialized::write_v17_fixture_ex(name, script, None);
+                let rows = UnityPlugin::extract_strings_from_assets(
+                    &bytes,
+                    "resources.assets",
+                    Path::new("resources.assets"),
+                );
+                assert!(
+                    rows.is_empty(),
+                    "{name} leaked {} rows: {rows:?}",
+                    rows.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_performance_filter_keeps_player_json_and_braces_injectable() {
+        for (name, source, translated) in [
+            (
+                "UI",
+                r#"{"MENU":"Continue","DIALOGUE":"Wait {player}!"}"#,
+                r#"{"MENU":"Adelante","DIALOGUE":"Hola {player}!"}"#,
+            ),
+            (
+                "PerformanceTestRun",
+                r#"{"MENU":"Continue","DIALOGUE":"Wait {player}!"}"#,
+                r#"{"MENU":"Adelante","DIALOGUE":"Hola {player}!"}"#,
+            ),
+            (
+                "PerformanceTestConfig",
+                r#"{"MeasurementCount":"One more try!"}"#,
+                r#"{"MeasurementCount":"Otro intento!"}"#,
+            ),
+            (
+                "Dialogue",
+                "Hello {player}, welcome back!",
+                "Salud {player}, welcome back!",
+            ),
+            (
+                "PerformanceTestRunInfo",
+                "Hello {player}, welcome back!",
+                "Salud {player}, welcome back!",
+            ),
+            (
+                "Dialogue",
+                r#"{"MeasurementCount":-1}"#,
+                r#"{"MeasurementCount":12}"#,
+            ),
+        ] {
+            let dir = tempdir();
+            let path = dir.join("resources.assets");
+            let before = crate::unity_serialized::write_v17_fixture_ex(name, source, None);
+            fs::write(&path, &before).unwrap();
+            let plugin = UnityPlugin::new();
+            let mut rows = plugin.extract(&path).unwrap();
+            assert_eq!(rows.len(), 1, "{name}: {rows:?}");
+            assert_eq!(rows[0].source, source);
+            rows[0].translation = Some(translated.into());
+            let report = plugin.inject(&dir, &rows).unwrap();
+            assert_eq!(report.strings_written, 1, "{name}: {report:?}");
+            assert_eq!(report.strings_skipped, 0);
+            let expected = crate::unity_serialized::write_v17_fixture_ex(name, translated, None);
+            assert_eq!(fs::read(&path).unwrap(), expected, "{name}");
+            assert_eq!(plugin.extract(&path).unwrap()[0].source, translated);
+        }
     }
 
     #[test]
