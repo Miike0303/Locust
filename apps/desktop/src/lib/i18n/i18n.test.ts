@@ -79,6 +79,13 @@ for (const id of KNOWN_FORMAT_IDS) {
 }
 assert.equal(formatDescriptionKey("some-future-format"), null);
 
+// FilterBar inputs are w-32 (file) and w-24 (tag) at 11px; longer placeholders
+// were clipped ("Cualquier archivc"). The "File"/"Tag" label sits beside them.
+for (const catalog of [en, es]) {
+  assert.ok(catalog["filter.anyFile"].length <= 14, catalog["filter.anyFile"]);
+  assert.ok(catalog["filter.anyTag"].length <= 10, catalog["filter.anyTag"]);
+}
+
 setLocale("es");
 assert.equal(t("welcome.recentCount", { count: 1 }), "1 proyecto reciente");
 assert.equal(t("welcome.recentCount", { count: 3 }), "3 proyectos recientes");

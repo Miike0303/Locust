@@ -423,8 +423,8 @@ export const es: Record<keyof typeof en, string> = {
   "filter.searchPlaceholder": "Buscar cadenas...",
   "filter.file": "Archivo",
   "filter.tag": "Etiqueta",
-  "filter.anyFile": "Cualquier archivo",
-  "filter.anyTag": "Cualquier etiqueta",
+  "filter.anyFile": "Todos",
+  "filter.anyTag": "Todas",
   "filter.results": "{from}–{to} de {total}",
   "filter.zeroResults": "0 resultados",
 
