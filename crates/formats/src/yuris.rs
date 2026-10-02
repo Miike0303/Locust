@@ -29,8 +29,8 @@
 //! YPF containers: see [`crate::yuris_ypf`] (GARbro ArcYPF layout; inject rebuilds
 //! the archive in place with an exclusively owned backup and staged replacement).
 //!
-//! Out of scope: ysc.ybn command-name table (WORD/_/GOSUB filtering uses structural
-//! heuristics instead — over-extraction OK); exotic per-title YPF swap schemes.
+//! Command roles come from the shipped YSCM table, with a measured 0x22B fallback.
+//! Unknown indirect string roles retain the conservative lexical filter.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -170,8 +170,7 @@ fn parse_err(file: &str, message: impl Into<String>) -> LocustError {
 
 #[derive(Clone, Debug)]
 struct YstbHeader {
-    /// Format field at 0x04 (e.g. 0x22B v5 family). Kept for layout documentation.
-    #[allow(dead_code)]
+    /// Validated v5 layout (0x22B).
     version: u32,
     /// Format field at 0x08; validated against instructions_size (= n * 4).
     #[allow(dead_code)]
@@ -184,9 +183,13 @@ struct YstbHeader {
 
 #[derive(Clone, Debug)]
 struct AttrDesc {
+    id: i16,
     type_: i16,
     size: u32,
     offset: u32,
+    /// IF/ELSE/LOOP raw descriptors hold an instruction index and a values
+    /// address, not a byte length and payload (measured on 0x22B).
+    branch_target: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -380,8 +383,7 @@ fn parse_attr_descs(
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let off = attr_desc_off + i * ATTR_DESC_SIZE;
-        // id (i16 at +0) unused for extract/inject
-        let _id = read_i16(data, off).ok_or_else(|| parse_err("ystb", "truncated attr id"))?;
+        let id = read_i16(data, off).ok_or_else(|| parse_err("ystb", "truncated attr id"))?;
         let type_ =
             read_i16(data, off + 2).ok_or_else(|| parse_err("ystb", "truncated attr type"))?;
         let size =
@@ -389,14 +391,17 @@ fn parse_attr_descs(
         let offset =
             read_u32(data, off + 8).ok_or_else(|| parse_err("ystb", "truncated attr offset"))?;
         out.push(AttrDesc {
+            id,
             type_,
             size,
             offset,
+            branch_target: false,
         });
     }
     Ok(out)
 }
 
+#[cfg(test)]
 fn decode_sjis(bytes: &[u8]) -> String {
     let (cow, _, _had_errors) = encoding_rs::SHIFT_JIS.decode(bytes);
     cow.into_owned()
@@ -457,8 +462,142 @@ fn escape_c_light(s: &str) -> String {
     out
 }
 
-/// Decode a single attribute value to player-facing text when possible.
+// Decode only at SJIS character boundaries: an 0xEF trail byte is not a control.
+// Literal CR/LF bytes use separate tokens so they cannot turn into engine breaks.
+const RAW_TOKENS: [(&str, &[u8]); 6] = [
+    ("{{yuris:F2}}", &[0xEF, 0xF2]),
+    ("{{yuris:F3}}", &[0xEF, 0xF3]),
+    ("{{yuris:F5}}", &[0xEF, 0xF5]),
+    ("{{yuris:CRLF}}", b"\r\n"),
+    ("{{yuris:CR}}", b"\r"),
+    ("{{yuris:LF}}", b"\n"),
+];
+
+fn sjis_lead(b: u8) -> bool {
+    matches!(b, 0x81..=0x9F | 0xE0..=0xFC)
+}
+
+fn decode_raw(slice: &[u8]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < slice.len() {
+        let rest = &slice[i..];
+        let token = if rest.starts_with(&[0xEF, 0xF0]) {
+            Some(("\r\n", 2))
+        } else {
+            RAW_TOKENS
+                .iter()
+                .find_map(|(token, bytes)| rest.starts_with(bytes).then_some((*token, bytes.len())))
+        };
+        if let Some((token, size)) = token {
+            out.push_str(token);
+            i += size;
+        } else {
+            let size = if sjis_lead(slice[i]) && rest.len() > 1 {
+                2
+            } else {
+                1
+            };
+            let unit = &rest[..size];
+            let (s, _, errors) = encoding_rs::SHIFT_JIS.decode(unit);
+            // Patched games also contain tunneled glyphs (e.g. 81 01) and
+            // literal control bytes. Preserve them as opaque bytes, without
+            // guessing a Unicode character or changing them on re-encoding.
+            if errors
+                || s.chars().any(|c| c.is_control() && c != '\t')
+                || encode_sjis(&s).ok().as_deref() != Some(unit)
+                || rest.starts_with(b"{{yuris:")
+            {
+                out.push_str("{{yuris:bytes:");
+                for byte in unit {
+                    out.push_str(&format!("{byte:02X}"));
+                }
+                out.push_str("}}");
+            } else {
+                out.push_str(&s);
+            }
+            i += size;
+        }
+    }
+    out
+}
+
+fn raw_byte_token(text: &str) -> Option<(usize, Vec<u8>)> {
+    let hex = text.strip_prefix("{{yuris:bytes:")?.split_once("}}")?.0;
+    if !matches!(hex.len(), 2 | 4) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(("{{yuris:bytes:".len() + hex.len() + 2, bytes))
+}
+
+fn encode_raw(text: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut plain = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some((size, bytes)) = raw_byte_token(rest) {
+            out.extend_from_slice(&encode_sjis(&plain)?);
+            plain.clear();
+            out.extend_from_slice(&bytes);
+            rest = &rest[size..];
+            continue;
+        }
+        let token = if rest.starts_with("\r\n") {
+            Some((2, &[0xEF, 0xF0][..]))
+        } else if rest.starts_with('\n') {
+            Some((1, &[0xEF, 0xF0][..]))
+        } else {
+            RAW_TOKENS
+                .iter()
+                .find_map(|(token, bytes)| rest.starts_with(token).then_some((token.len(), *bytes)))
+        };
+        if let Some((size, bytes)) = token {
+            out.extend_from_slice(&encode_sjis(&plain)?);
+            plain.clear();
+            out.extend_from_slice(bytes);
+            rest = &rest[size..];
+        } else {
+            if rest.starts_with("{{yuris:") || rest.starts_with('\r') {
+                return Err(parse_err("ystb", "unknown raw control token or bare CR"));
+            }
+            let c = rest.chars().next().unwrap();
+            plain.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out.extend_from_slice(&encode_sjis(&plain)?);
+    Ok(out)
+}
+
+fn raw_control_sequence(text: &str) -> Vec<&str> {
+    let mut controls = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.starts_with("\r\n") || rest.starts_with('\n') {
+            controls.push("F0");
+            rest = &rest[if rest.starts_with('\r') { 2 } else { 1 }..];
+        } else if let Some((token, _)) = RAW_TOKENS.iter().find(|(t, _)| rest.starts_with(t)) {
+            controls.push(*token);
+            rest = &rest[token.len()..];
+        } else if let Some((size, _)) = raw_byte_token(rest) {
+            controls.push(&rest[..size]);
+            rest = &rest[size..];
+        } else {
+            rest = &rest[rest.chars().next().unwrap().len_utf8()..];
+        }
+    }
+    controls
+}
+
+/// Decode a literal, before applying its command role.
 fn decode_attr_value(data: &[u8], attr_vals_off: usize, attr: &AttrDesc) -> Option<String> {
+    if attr.branch_target {
+        return None;
+    }
     let start = attr_vals_off.checked_add(attr.offset as usize)?;
     let end = start.checked_add(attr.size as usize)?;
     if end > data.len() {
@@ -470,12 +609,7 @@ fn decode_attr_value(data: &[u8], attr_vals_off: usize, attr: &AttrDesc) -> Opti
             if slice.is_empty() {
                 return None;
             }
-            let s = decode_sjis(slice);
-            if looks_player_visible(&s) {
-                Some(s)
-            } else {
-                None
-            }
+            Some(decode_raw(slice))
         }
         ATTR_EXPRESSION => evaluate_push_string(slice),
         _ => None,
@@ -491,18 +625,25 @@ fn evaluate_push_string(slice: &[u8]) -> Option<String> {
     if 3 + arg_len != slice.len() {
         return None;
     }
-    let s = decode_sjis(&slice[3..3 + arg_len]);
+    let body = &slice[3..3 + arg_len];
+    if body.len() < 2 || !matches!(body[0], b'"' | b'\'' | b'`') || body.first() != body.last() {
+        return None;
+    }
+    let (s, _, errors) = encoding_rs::SHIFT_JIS.decode(body);
+    if errors {
+        return None;
+    }
     let s = unquote_string(&s);
     let s = s.replace('\n', "\r\n").replace("\r\r\n", "\r\n");
-    if looks_player_visible(&s) {
-        Some(s)
-    } else {
-        None
-    }
+    Some(s)
 }
 
 fn looks_player_visible(s: &str) -> bool {
     let t = s.trim();
+    // Opaque bytes are admitted only when the command proves a display role.
+    if t.contains("{{yuris:") {
+        return false;
+    }
     if t.chars().count() < 2 {
         return false;
     }
@@ -722,10 +863,7 @@ fn is_cjk(c: char) -> bool {
 
 fn serialize_attr_value(attr_type: i16, text: &str) -> Result<Vec<u8>> {
     match attr_type {
-        ATTR_RAW => {
-            // Map \r\n → YU-RIS control EF F0 is optional for Experimental; keep SJIS as-is.
-            encode_sjis(text)
-        }
+        ATTR_RAW => encode_raw(text),
         ATTR_EXPRESSION => {
             // Quote with backticks so content may contain both " and ' (VNTextPatch).
             if text.contains('`') {
@@ -738,7 +876,8 @@ fn serialize_attr_value(attr_type: i16, text: &str) -> Result<Vec<u8>> {
             let body_bytes = encode_sjis(&body)?;
             let mut out = Vec::with_capacity(3 + body_bytes.len());
             out.push(PUSH_STRING);
-            let n = body_bytes.len() as u16;
+            let n = u16::try_from(body_bytes.len())
+                .map_err(|_| parse_err("ystb", "expression string exceeds u16 length"))?;
             out.extend_from_slice(&n.to_le_bytes());
             out.extend_from_slice(&body_bytes);
             Ok(out)
@@ -753,24 +892,203 @@ fn serialize_attr_value(attr_type: i16, text: &str) -> Result<Vec<u8>> {
 // ─── Parse / extract / inject body ─────────────────────────────────────────
 
 #[derive(Clone, Debug)]
+struct YurisCommand {
+    name: String,
+    params: Vec<String>,
+}
+
+type CommandList = Vec<YurisCommand>;
+
+/// Shipped YSCM: 16-byte header, NUL name, u8 argc, NUL parameter + u16 flags.
+fn parse_commands(bytes: &[u8]) -> Option<CommandList> {
+    if bytes.get(..4)? != b"YSCM" || bytes.len() < 16 || read_u32(bytes, 4)? != 0x22B {
+        return None;
+    }
+    let count = read_u32(bytes, 8)? as usize;
+    if count == 0 || count > 256 {
+        return None;
+    }
+    fn string(bytes: &[u8], pos: &mut usize) -> Option<String> {
+        let size = bytes.get(*pos..)?.iter().position(|&b| b == 0)?;
+        let raw = bytes.get(*pos..*pos + size)?;
+        if !raw.is_ascii() {
+            return None;
+        }
+        *pos += size + 1;
+        Some(String::from_utf8(raw.to_vec()).ok()?.to_ascii_uppercase())
+    }
+    let mut pos = 16;
+    let mut commands = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = string(bytes, &mut pos)?;
+        if name.is_empty() {
+            return None;
+        }
+        let argc = *bytes.get(pos)?;
+        pos += 1;
+        let mut params = Vec::new();
+        for _ in 0..argc {
+            params.push(string(bytes, &mut pos)?);
+            bytes.get(pos..pos + 2)?;
+            pos += 2;
+        }
+        commands.push(YurisCommand { name, params });
+    }
+    Some(commands)
+}
+
+fn sibling_commands(path: &Path) -> Option<CommandList> {
+    parse_commands(&std::fs::read(path.parent()?.join("ysc.ybn")).ok()?)
+}
+
+/// Measured version 0x22B YSCM IDs (audit yuris-commands.json); never reuse for
+/// another version. Only roles needed here are mapped; others stay indirect.
+fn fallback_command(op: u8) -> (&'static str, &'static [&'static str]) {
+    match op {
+        1 => ("CG", &[]),
+        2 => ("CGACT", &[]),
+        10 => ("DIALOG", &["CAPTION", "STR"]),
+        11 => ("ELSE", &[]),
+        20 => ("FILEACT", &[]),
+        21 => ("FILEINFO", &[]),
+        26 => ("FONT", &["BNO", "NO", "NAME"]),
+        42 => ("GO", &["#"]),
+        43 => ("GOSUB", &["#"]),
+        44 => ("IF", &[]),
+        55 => ("LOOP", &[]),
+        105 => ("WINDOW", &["NO", "CAPTION"]),
+        108 => ("WORD", &[""]),
+        117 => ("SYSTEMMODE", &[]),
+        _ => ("", &[]),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TextRole {
+    Display,
+    Technical,
+    Indirect,
+}
+
+fn attr_role(
+    name: &str,
+    param: &str,
+    arg: usize,
+    values: &[Option<String>],
+    text_mode: bool,
+) -> TextRole {
+    match name {
+        "WORD" if arg == 0 => TextRole::Display,
+        "GOSUB" => {
+            if arg == 0 || param == "#" {
+                TextRole::Technical
+            } else if values.first().and_then(|s| s.as_deref()).is_some_and(|t| {
+                t.eq_ignore_ascii_case("ES.CHAR.NAME") || t.eq_ignore_ascii_case("ES.SEL.SET")
+            }) {
+                TextRole::Display
+            } else {
+                TextRole::Indirect
+            }
+        }
+        "GO" | "IF" | "ELSE" | "LOOP" => TextRole::Technical,
+        "DIALOG" if param == "CAPTION" || param.starts_with("STR") || param == "DEFSTR" => {
+            TextRole::Display
+        }
+        "WINDOW" | "SYSTEMMODE" if param == "CAPTION" => TextRole::Display,
+        "CGACT" if param == "SETSTR" => {
+            // TEXT=1 means SETSTR is drawn text, not an asset lookup. 0x42 is
+            // the shipped push-byte expression; Long is the other scalar form.
+            if text_mode {
+                TextRole::Display
+            } else {
+                TextRole::Indirect
+            }
+        }
+        "FONT" if param == "NAME" => TextRole::Technical,
+        "FILEACT" | "FILEINFO" => TextRole::Technical,
+        "CG" | "CGACT" | "CGEND" | "CGINFO" | "SOUND" | "SOUNDINFO" | "SOUNDEND" | "MOVIE"
+        | "SAVE" | "LOAD"
+            if matches!(param, "FILE" | "FILE2" | "FOLDER" | "SET" | "SET2") =>
+        {
+            TextRole::Technical
+        }
+        _ => TextRole::Indirect,
+    }
+}
+
+fn display_literal(text: &str) -> bool {
+    !text.is_empty()
+        && !text.contains('\u{FFFD}')
+        && !text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\r' | '\n' | '\t'))
+}
+
+#[derive(Clone, Debug)]
 struct DecryptedYstb {
     data: Vec<u8>,
     hdr: YstbHeader,
     key: u32,
     attrs: Vec<AttrDesc>,
     strings: Vec<ExtractedString>,
+    caption: bool,
 }
 
+#[cfg(test)]
 fn load_ystb(bytes: &[u8], file_label: &str) -> Result<Option<DecryptedYstb>> {
+    load_ystb_with_commands(bytes, file_label, None)
+}
+
+fn load_ystb_with_commands(
+    bytes: &[u8],
+    file_label: &str,
+    commands: Option<&CommandList>,
+) -> Result<Option<DecryptedYstb>> {
     if bytes.len() < 4 {
         return Ok(None);
     }
-    // Non-YSTB magics (YSTD stub, YSTL, YSCM, …): skip silently — no strings.
+    if &bytes[..4] == b"YSCF" {
+        const CAPTION: usize = 0x4C;
+        let Some(size) = read_i16(bytes, CAPTION).filter(|&n| n >= 0) else {
+            return Ok(None);
+        };
+        if read_u32(bytes, 4) != Some(0x22B) || CAPTION + 2 + size as usize != bytes.len() {
+            return Ok(None);
+        }
+        let (text, _, errors) = encoding_rs::SHIFT_JIS.decode(&bytes[CAPTION + 2..]);
+        if errors || !display_literal(&text) {
+            return Ok(None);
+        }
+        return Ok(Some(DecryptedYstb {
+            data: bytes.to_vec(),
+            hdr: YstbHeader {
+                version: 0,
+                num_instructions: 0,
+                instructions_size: 0,
+                attr_desc_size: 0,
+                attr_values_size: 0,
+                line_numbers_size: 0,
+            },
+            key: 0,
+            attrs: Vec::new(),
+            strings: vec![ExtractedString {
+                arg_index: 0,
+                attr_index: 0,
+                text: text.into_owned(),
+                attr_type: ATTR_RAW,
+            }],
+            caption: true,
+        }));
+    }
+    // Non-text magics (YSTD stub, YSTL, YSCM, …).
     if &bytes[0..4] != YSTB_MAGIC {
         return Ok(None);
     }
 
     let hdr = parse_header(bytes, file_label)?;
+    if hdr.version != 0x22B {
+        return Ok(None);
+    }
     let mut data = bytes.to_vec();
 
     // Attr section shorter than one descriptor → no strings (not an error).
@@ -781,6 +1099,7 @@ fn load_ystb(bytes: &[u8], file_label: &str) -> Result<Option<DecryptedYstb>> {
             key: 0,
             attrs: Vec::new(),
             strings: Vec::new(),
+            caption: false,
         }));
     };
 
@@ -788,19 +1107,88 @@ fn load_ystb(bytes: &[u8], file_label: &str) -> Result<Option<DecryptedYstb>> {
     verify_first_attr_descriptor(&data, &hdr, file_label)?;
 
     let (_, attr_desc_off, attr_vals_off, _) = section_offsets(&hdr);
-    let attrs = parse_attr_descs(&data, attr_desc_off, hdr.attr_desc_size)?;
-
+    let mut attrs = parse_attr_descs(&data, attr_desc_off, hdr.attr_desc_size)?;
     let mut strings = Vec::new();
-    for (attr_index, attr) in attrs.iter().enumerate() {
-        if let Some(text) = decode_attr_value(&data, attr_vals_off, attr) {
-            let arg_index = strings.len();
-            strings.push(ExtractedString {
-                arg_index,
-                attr_index,
-                text,
-                attr_type: attr.type_,
-            });
+    let mut attr_index = 0;
+    for inst in data[HEADER_SIZE..attr_desc_off].chunks_exact(INST_SIZE) {
+        let count = inst[1] as usize;
+        let end = attr_index + count;
+        let Some(group) = attrs.get_mut(attr_index..end) else {
+            return Err(parse_err(
+                file_label,
+                "instruction attribute count exceeds descriptors",
+            ));
+        };
+        let command = commands.and_then(|c| c.get(inst[0] as usize));
+        if commands.is_some() && command.is_none() {
+            return Ok(None);
         }
+        let (fallback_name, fallback_params) = fallback_command(inst[0]);
+        let name = command.map_or(fallback_name, |c| c.name.as_str());
+        for (arg, attr) in group.iter_mut().enumerate() {
+            attr.branch_target = attr.type_ == ATTR_RAW
+                && attr.id == 0
+                && matches!((name, arg), ("IF" | "ELSE", 1 | 2) | ("LOOP", 1));
+            let valid = if attr.branch_target {
+                attr.size <= hdr.num_instructions && attr.offset <= hdr.attr_values_size
+            } else {
+                attr.offset
+                    .checked_add(attr.size)
+                    .is_some_and(|end| end <= hdr.attr_values_size)
+            };
+            if !valid {
+                return Err(parse_err(
+                    file_label,
+                    "invalid attribute payload or branch target",
+                ));
+            }
+        }
+        let values: Vec<_> = group
+            .iter()
+            .map(|a| decode_attr_value(&data, attr_vals_off, a))
+            .collect();
+        let text_id = command.map_or(Some(64), |c| c.params.iter().position(|p| p == "TEXT"));
+        let text_mode = name == "CGACT"
+            && group.iter().any(|a| {
+                if Some(a.id as usize) != text_id {
+                    return false;
+                }
+                let start = attr_vals_off + a.offset as usize;
+                let raw = &data[start..start + a.size as usize];
+                (a.type_ == ATTR_EXPRESSION && raw == [0x42, 1, 0, 1])
+                    || (a.type_ == 1 && raw == 1i32.to_le_bytes())
+            });
+        for (arg, (attr, text)) in group.iter().zip(&values).enumerate() {
+            let fallback_param = if name == "CGACT" && attr.id == 11 {
+                "SETSTR"
+            } else if name == "CG" && attr.id == 46 {
+                "FILE"
+            } else if name == "SYSTEMMODE" && attr.id == 12 {
+                "CAPTION"
+            } else {
+                fallback_params.get(attr.id as usize).copied().unwrap_or("")
+            };
+            let param = command.map_or(fallback_param, |c| {
+                c.params.get(attr.id as usize).map_or("", String::as_str)
+            });
+            let role = attr_role(name, param, arg, &values, text_mode);
+            if let Some(text) = text.as_ref().filter(|t| match role {
+                TextRole::Display => display_literal(t),
+                TextRole::Indirect => looks_player_visible(t),
+                TextRole::Technical => false,
+            }) {
+                strings.push(ExtractedString {
+                    arg_index: strings.len(),
+                    attr_index: attr_index + arg,
+                    text: text.clone(),
+                    attr_type: attr.type_,
+                });
+            }
+        }
+        attr_index = end;
+    }
+    if attr_index != attrs.len() {
+        return Err(parse_err(file_label, "unassociated attribute descriptors"));
     }
 
     Ok(Some(DecryptedYstb {
@@ -809,6 +1197,7 @@ fn load_ystb(bytes: &[u8], file_label: &str) -> Result<Option<DecryptedYstb>> {
         key,
         attrs,
         strings,
+        caption: false,
     }))
 }
 
@@ -816,6 +1205,18 @@ fn inject_into_ystb(
     ystb: &DecryptedYstb,
     translations: &HashMap<usize, String>,
 ) -> Result<Vec<u8>> {
+    if ystb.caption {
+        let Some(text) = translations.get(&0) else {
+            return Ok(ystb.data.clone());
+        };
+        let caption = encode_sjis(text)?;
+        let size = i16::try_from(caption.len())
+            .map_err(|_| parse_err("yscf", "caption exceeds i16 length"))?;
+        let mut out = ystb.data[..0x4C].to_vec();
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&caption);
+        return Ok(out);
+    }
     let (_, attr_desc_off, attr_vals_off, line_off) = section_offsets(&ystb.hdr);
 
     // Build new attribute-values blob; track per-descriptor (size, offset).
@@ -830,20 +1231,64 @@ fn inject_into_ystb(
         }
     }
 
+    let mut edits = Vec::new();
+    for (&index, &text) in &by_attr {
+        let attr = &ystb.attrs[index];
+        let start = attr.offset as usize;
+        let end = start + attr.size as usize;
+        if ystb.attrs.iter().enumerate().any(|(i, a)| {
+            let offset = a.offset as usize;
+            i != index
+                && offset < end
+                && if a.branch_target {
+                    start < offset
+                } else {
+                    start < offset + a.size as usize
+                }
+        }) {
+            return Err(parse_err(
+                "ystb",
+                "cannot edit aliased/overlapping attribute payload",
+            ));
+        }
+        if raw_control_sequence(
+            &ystb
+                .strings
+                .iter()
+                .find(|s| s.attr_index == index)
+                .unwrap()
+                .text,
+        ) != raw_control_sequence(text)
+            && attr.type_ == ATTR_RAW
+        {
+            return Err(parse_err("ystb", "raw control sequence changed"));
+        }
+        edits.push((start, end, index, serialize_attr_value(attr.type_, text)?));
+    }
+    edits.sort_by_key(|e| e.0);
+    let old_values = &ystb.data[attr_vals_off..line_off];
+    let mut cursor = 0;
+    for (start, end, _, bytes) in &edits {
+        new_values.extend_from_slice(&old_values[cursor..*start]);
+        new_values.extend_from_slice(bytes);
+        cursor = *end;
+    }
+    new_values.extend_from_slice(&old_values[cursor..]);
     for (i, attr) in ystb.attrs.iter().enumerate() {
-        let old_start = attr_vals_off + attr.offset as usize;
-        let old_end = old_start + attr.size as usize;
-        let new_bytes = if let Some(text) = by_attr.get(&i) {
-            serialize_attr_value(attr.type_, text)?
-        } else if old_end <= ystb.data.len() {
-            ystb.data[old_start..old_end].to_vec()
-        } else {
-            Vec::new()
-        };
-        let offset = new_values.len() as u32;
-        let size = new_bytes.len() as u32;
-        new_values.extend_from_slice(&new_bytes);
-        new_meta.push((size, offset));
+        let mut offset = i64::from(attr.offset);
+        for (start, end, index, bytes) in &edits {
+            if *index != i && *end <= attr.offset as usize {
+                offset += bytes.len() as i64 - (end - start) as i64;
+            }
+        }
+        let size = edits
+            .iter()
+            .find(|e| e.2 == i)
+            .map_or(attr.size as usize, |e| e.3.len());
+        new_meta.push((
+            u32::try_from(size).map_err(|_| parse_err("ystb", "attribute too large"))?,
+            u32::try_from(offset).map_err(|_| parse_err("ystb", "attribute offset overflow"))?,
+        ));
     }
 
     // Assemble: header + instructions + updated descs + new values + line numbers
@@ -854,7 +1299,12 @@ fn inject_into_ystb(
     let mut out =
         Vec::with_capacity(HEADER_SIZE + inst_size + desc_size + new_values.len() + line_size);
     out.extend_from_slice(&ystb.data[..HEADER_SIZE]);
-    write_u32(&mut out, 0x14, new_values.len() as u32);
+    write_u32(
+        &mut out,
+        0x14,
+        u32::try_from(new_values.len())
+            .map_err(|_| parse_err("ystb", "values section too large"))?,
+    );
 
     let inst_off = HEADER_SIZE;
     out.extend_from_slice(&ystb.data[inst_off..inst_off + inst_size]);
@@ -871,9 +1321,7 @@ fn inject_into_ystb(
     out.extend_from_slice(&descs);
     out.extend_from_slice(&new_values);
 
-    if line_off + line_size <= ystb.data.len() {
-        out.extend_from_slice(&ystb.data[line_off..line_off + line_size]);
-    }
+    out.extend_from_slice(&ystb.data[line_off..]);
 
     // Re-XOR payload sections (header sizes must already be final).
     toggle_encryption(&mut out, ystb.key);
@@ -882,20 +1330,63 @@ fn inject_into_ystb(
 
 /// Extract string entries from one YSTB payload. `rel` is the id prefix;
 /// `file_path` is stored for inject routing (loose path or `archive.ypf/inner`).
+#[cfg(test)]
 fn entries_from_ystb_bytes(
     bytes: &[u8],
     rel: &str,
     file_path: PathBuf,
 ) -> Result<Vec<StringEntry>> {
-    let Some(ystb) = load_ystb(bytes, rel)? else {
+    entries_with_commands(bytes, rel, file_path, None)
+}
+
+/// Fingerprint of everything an injection never rewrites: instructions, each
+/// descriptor's id/type (plus a branch's instruction index), line numbers and
+/// tail. Payloads, offsets and section sizes are excluded, so a script that
+/// Locust already injected (Direct mode) still accepts its own physical rows,
+/// while an added, removed or retyped attribute invalidates every old row.
+fn layout_context(ystb: &DecryptedYstb) -> String {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    if ystb.caption {
+        h.update(&ystb.data[..0x4C.min(ystb.data.len())]);
+    } else {
+        let (inst, attr_desc, _, lines) = section_offsets(&ystb.hdr);
+        h.update(ystb.hdr.version.to_le_bytes());
+        h.update(ystb.hdr.num_instructions.to_le_bytes());
+        h.update(&ystb.data[inst..attr_desc]);
+        for a in &ystb.attrs {
+            h.update(a.id.to_le_bytes());
+            h.update(a.type_.to_le_bytes());
+            h.update([u8::from(a.branch_target)]);
+            if a.branch_target {
+                h.update(a.size.to_le_bytes());
+            }
+        }
+        h.update(&ystb.data[lines..]);
+    }
+    format!("yuris-layout-sha1={:x}", h.finalize())
+}
+
+fn entries_with_commands(
+    bytes: &[u8],
+    rel: &str,
+    file_path: PathBuf,
+    commands: Option<&CommandList>,
+) -> Result<Vec<StringEntry>> {
+    let Some(ystb) = load_ystb_with_commands(bytes, rel, commands)? else {
         return Ok(Vec::new());
     };
     let mut all = Vec::with_capacity(ystb.strings.len());
+    let context = layout_context(&ystb);
     for s in &ystb.strings {
-        let id = format!("{rel}#arg{}", s.arg_index);
+        let id = if ystb.caption {
+            format!("{rel}#caption")
+        } else {
+            format!("{rel}#attr{}", s.attr_index)
+        };
         let mut entry = StringEntry::new(id, &s.text, file_path.clone());
         entry.tags = vec!["dialogue".into()];
-        entry.context = Some(format!("attr_type={}", s.attr_type));
+        entry.context = Some(context.clone());
         all.push(entry);
     }
     Ok(all)
@@ -908,30 +1399,60 @@ fn translations_from_entries(
 ) -> (HashMap<usize, String>, usize) {
     let mut translations = HashMap::new();
     let mut skipped = 0usize;
+    let context = layout_context(ystb);
     for e in file_entries {
         let Some(t) = e.translation.as_deref() else {
             skipped += 1;
             continue;
         };
-        if let Some(pos) = e.id.rfind("#arg") {
-            if let Ok(idx) = e.id[pos + 4..].parse::<usize>() {
+        let index = if ystb.caption && e.id.ends_with("#caption") {
+            Some(0)
+        } else {
+            e.id.rsplit_once("#attr")
+                .and_then(|(_, n)| n.parse::<usize>().ok())
+        };
+        if let Some(index) = index {
+            if let Some(s) = ystb.strings.iter().find(|s| s.attr_index == index) {
+                // The current text is not compared with `e.source`: after a Direct
+                // injection it is the previous translation by design.
+                if e.context.as_deref() != Some(context.as_str()) {
+                    warnings.push(format!("skip {}: physical layout changed", e.id));
+                    skipped += 1;
+                    continue;
+                }
                 // Messages carry the author's own hard wraps; a provider hands
                 // back one flat line. `escape_c_light` drops bare CR, so
                 // rejoining on LF reproduces the file's original `\n` escapes.
-                let text = crate::rpgmaker_mv::rewrap_to_source_width(&e.source, t);
+                let text = if s.attr_type == ATTR_RAW || ystb.caption {
+                    t.to_string()
+                } else {
+                    crate::rpgmaker_mv::rewrap_to_source_width(&e.source, t)
+                };
                 // Reject only this string; other translations in the same script
                 // can still be written, preserving the original attribute bytes.
-                if let Some(s) = ystb.strings.get(idx) {
-                    if let Err(err) = serialize_attr_value(s.attr_type, &text) {
-                        warnings.push(format!("skip {}: {err}", e.id));
-                        skipped += 1;
-                        continue;
-                    }
+                let encoded = if ystb.caption {
+                    encode_sjis(&text)
+                } else {
+                    serialize_attr_value(s.attr_type, &text)
+                };
+                if let Err(err) = encoded {
+                    warnings.push(format!("skip {}: {err}", e.id));
+                    skipped += 1;
+                    continue;
                 }
-                translations.insert(idx, text);
+                if !ystb.caption
+                    && s.attr_type == ATTR_RAW
+                    && raw_control_sequence(&s.text) != raw_control_sequence(&text)
+                {
+                    warnings.push(format!("skip {}: protected control sequence changed", e.id));
+                    skipped += 1;
+                    continue;
+                }
+                translations.insert(s.arg_index, text);
                 continue;
             }
         }
+        warnings.push(format!("skip {}: obsolete or unknown YU-RIS locator", e.id));
         skipped += 1;
     }
     (translations, skipped)
@@ -1042,7 +1563,13 @@ impl FormatPlugin for YurisPlugin {
                 .replace('\\', "/");
             // Loose files stay loud: a corrupt YSTB is an Err naming the file
             // (audited contract; warn+skip is only for entries inside a YPF).
-            all.extend(entries_from_ystb_bytes(&bytes, &rel, fpath.clone())?);
+            let commands = sibling_commands(fpath);
+            all.extend(entries_with_commands(
+                &bytes,
+                &rel,
+                fpath.clone(),
+                commands.as_ref(),
+            )?);
         }
 
         let mut ypf_parse_errors = 0usize;
@@ -1066,6 +1593,17 @@ impl FormatPlugin for YurisPlugin {
                 }
             };
 
+            let commands = archive
+                .ybn_entries()
+                .find(|e| {
+                    e.name
+                        .replace('\\', "/")
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("ysc.ybn"))
+                })
+                .and_then(|e| archive.read_entry(e).ok())
+                .and_then(|b| parse_commands(&b));
             for entry in archive.ybn_entries() {
                 ybn_seen += 1;
                 let payload = match archive.read_entry(entry) {
@@ -1083,7 +1621,7 @@ impl FormatPlugin for YurisPlugin {
                 };
                 let rel = format!("{arch_rel}/{}", entry.name.replace('\\', "/"));
                 let virtual_path = PathBuf::from(&rel);
-                match entries_from_ystb_bytes(&payload, &rel, virtual_path) {
+                match entries_with_commands(&payload, &rel, virtual_path, commands.as_ref()) {
                     Ok(entries) => all.extend(entries),
                     Err(e) => {
                         warn!(
@@ -1195,7 +1733,8 @@ impl FormatPlugin for YurisPlugin {
                 }
             };
             let label = actual.display().to_string();
-            let ystb = match load_ystb(&bytes, &label) {
+            let commands = sibling_commands(&actual);
+            let ystb = match load_ystb_with_commands(&bytes, &label, commands.as_ref()) {
                 Ok(Some(y)) => y,
                 Ok(None) => {
                     warnings.push(format!("skip non-YSTB {}", actual.display()));
@@ -1264,6 +1803,17 @@ impl FormatPlugin for YurisPlugin {
             let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
             let mut arch_written = 0usize;
             let member_index = YpfMemberIndex::new(&archive.entries);
+            let commands = archive
+                .ybn_entries()
+                .find(|e| {
+                    e.name
+                        .replace('\\', "/")
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("ysc.ybn"))
+                })
+                .and_then(|e| archive.read_entry(e).ok())
+                .and_then(|b| parse_commands(&b));
 
             for (inner, file_entries) in inners {
                 let entry = match member_index.find(&inner) {
@@ -1283,7 +1833,7 @@ impl FormatPlugin for YurisPlugin {
                     }
                 };
                 let label = format!("{archive_rel}/{inner}");
-                let ystb = match load_ystb(&bytes, &label) {
+                let ystb = match load_ystb_with_commands(&bytes, &label, commands.as_ref()) {
                     Ok(Some(y)) => y,
                     Ok(None) => {
                         warnings.push(format!("skip non-YSTB {label}"));
@@ -1353,6 +1903,446 @@ impl FormatPlugin for YurisPlugin {
 
 #[cfg(test)]
 mod tests {
+    // Real four-byte instructions and twelve-byte descriptors, including
+    // values padding and a tail that are deliberately outside all attributes.
+    type FixtureCommand = (u8, Vec<(i16, i16, Vec<u8>)>);
+
+    fn real_layout(commands: &[FixtureCommand], key: u32) -> Vec<u8> {
+        let mut inst = Vec::new();
+        let mut desc = Vec::new();
+        let mut values = Vec::new();
+        let mut lines = Vec::new();
+        for (i, (op, attrs)) in commands.iter().enumerate() {
+            inst.extend_from_slice(&[*op, attrs.len() as u8, 0xA7, 0x39]);
+            lines.extend_from_slice(&(900 + i as u32).to_le_bytes());
+            for (id, typ, raw) in attrs {
+                desc.extend_from_slice(&id.to_le_bytes());
+                desc.extend_from_slice(&typ.to_le_bytes());
+                desc.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+                desc.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                values.extend_from_slice(raw);
+                values.extend_from_slice(b"\0GAP\0");
+            }
+        }
+        let mut out = b"YSTB".to_vec();
+        for field in [
+            0x22B,
+            commands.len() as u32,
+            inst.len() as u32,
+            desc.len() as u32,
+            values.len() as u32,
+            lines.len() as u32,
+            0xCAFE1234,
+        ] {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+        out.extend(inst);
+        out.extend(desc);
+        out.extend(values);
+        out.extend(lines);
+        out.extend_from_slice(b"UNRELATED TAIL\0\xFF");
+        toggle_encryption(&mut out, key);
+        out
+    }
+
+    fn fixture_expr(text: &str) -> Vec<u8> {
+        pushstring_double_quoted(text)
+    }
+
+    #[test]
+    fn vn02_display_tunneled_glyphs_and_literal_controls_preserve_opaque_bytes() {
+        let raw = b"Hello\x81\x01\xEF\xF0world\r\x08\x00{{yuris:F2}}\x81".to_vec();
+        let original = real_layout(
+            &[
+                (108, vec![(0, 0, raw.clone())]),
+                (250, vec![(0, 0, raw.clone())]),
+            ],
+            TRUE_KEY_B4626AD8,
+        );
+        let mut rows = entries_from_ystb_bytes(&original, "story.ybn", "story.ybn".into()).unwrap();
+        assert_eq!(rows.len(), 1, "opaque indirect strings must stay excluded");
+        assert!(!rows[0].source.contains('\u{FFFD}'));
+        let parsed = load_ystb(&original, "story").unwrap().unwrap();
+        rows[0].translation = Some(format!("AUDIT {}", rows[0].source));
+        let mut warnings = Vec::new();
+        let (translations, skipped) =
+            translations_from_entries(&[&rows[0]], &parsed, &mut warnings);
+        assert_eq!(skipped, 0, "{warnings:?}");
+        let changed = inject_into_ystb(&parsed, &translations).unwrap();
+        let after = load_ystb(&changed, "story").unwrap().unwrap();
+        let (_, _, off, _) = section_offsets(&after.hdr);
+        assert_eq!(
+            &after.data[off..off + after.attrs[0].size as usize],
+            [b"AUDIT ".as_slice(), &raw].concat()
+        );
+        rows[0].translation = Some(rows[0].source.replace("{{yuris:bytes:8101}}", ""));
+        let (translations, skipped) =
+            translations_from_entries(&[&rows[0]], &parsed, &mut warnings);
+        assert!(translations.is_empty());
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn vn02_branch_addresses_are_relocated_without_treating_indices_as_lengths() {
+        for opcode in [11, 44, 55] {
+            let mut original = real_layout(
+                &[
+                    (108, vec![(0, 0, b"Hello display".to_vec())]),
+                    (opcode, vec![(0, 1, vec![0x42, 1, 0, 1]), (0, 0, vec![])]),
+                ],
+                0,
+            );
+            let hdr = parse_header(&original, "branch").unwrap();
+            let (_, desc, _, _) = section_offsets(&hdr);
+            // Real branch descriptors use size as instruction index, with an
+            // address that may be exactly at the end of the values section.
+            write_u32(&mut original, desc + 2 * ATTR_DESC_SIZE + 4, 2);
+            write_u32(
+                &mut original,
+                desc + 2 * ATTR_DESC_SIZE + 8,
+                hdr.attr_values_size,
+            );
+            toggle_encryption(&mut original, TRUE_KEY_B4626AD8);
+            let before = load_ystb(&original, "branch").unwrap().unwrap();
+            assert_eq!(before.strings.len(), 1);
+            let output =
+                inject_into_ystb(&before, &HashMap::from([(0, "AUDIT Hello display".into())]))
+                    .unwrap();
+            let after = load_ystb(&output, "branch").unwrap().unwrap();
+            assert_eq!(after.attrs[2].size, 2);
+            assert_eq!(after.attrs[2].offset, hdr.attr_values_size + 6);
+            let (_, _, _, old_lines) = section_offsets(&before.hdr);
+            let (_, _, _, new_lines) = section_offsets(&after.hdr);
+            assert_eq!(&before.data[old_lines..], &after.data[new_lines..]);
+        }
+    }
+
+    #[test]
+    fn vn02_word_controls_are_reversible_and_protected() {
+        for key in [0, TRUE_KEY_B4626AD8, 0x12345678] {
+            for raw in [
+                b"Hello\xEF\xF0world".to_vec(),
+                [
+                    encode_sjis("日本語").unwrap(),
+                    b"\xEF\xF0".to_vec(),
+                    encode_sjis("世界").unwrap(),
+                    b"\xEF\xF2\xEF\xF3\xEF\xF5\xEF\xF2\\p".to_vec(),
+                ]
+                .concat(),
+            ] {
+                let original = real_layout(&[(108, vec![(0, ATTR_RAW, raw.clone())])], key);
+                let mut entries =
+                    entries_from_ystb_bytes(&original, "story.ybn", "story.ybn".into()).unwrap();
+                assert_eq!(entries.len(), 1);
+                assert!(entries[0].source.contains("\r\n"));
+                entries[0].translation = Some(format!("AUDIT {}", entries[0].source));
+                let before = load_ystb(&original, "story").unwrap().unwrap();
+                let mut warnings = Vec::new();
+                let (translations, skipped) =
+                    translations_from_entries(&[&entries[0]], &before, &mut warnings);
+                assert_eq!(skipped, 0, "{warnings:?}");
+                let output = inject_into_ystb(&before, &translations).unwrap();
+                let after = load_ystb(&output, "story").unwrap().unwrap();
+                let (_, _, off, _) = section_offsets(&after.hdr);
+                let a = &after.attrs[0];
+                assert_eq!(
+                    &after.data[off..off + a.size as usize],
+                    [b"AUDIT ".as_slice(), &raw].concat()
+                );
+                let again =
+                    entries_from_ystb_bytes(&output, "story.ybn", "story.ybn".into()).unwrap();
+                assert_eq!(again[0].source, entries[0].translation.as_deref().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn vn02_raw_controls_cannot_be_dropped_reordered_or_retyped() {
+        let original = real_layout(
+            &[(
+                108,
+                vec![(0, 0, b"Hello\xEF\xF2world\xEF\xF3\xEF\xF5".to_vec())],
+            )],
+            0,
+        );
+        let mut entries =
+            entries_from_ystb_bytes(&original, "story.ybn", "story.ybn".into()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let parsed = load_ystb(&original, "story").unwrap().unwrap();
+        for text in [
+            "Translated.",
+            "{{yuris:F3}}{{yuris:F2}}{{yuris:F5}}",
+            "{{yuris:F2}}{{yuris:F3}}{{yuris:F2}}",
+        ] {
+            entries[0].translation = Some(text.into());
+            let mut warnings = Vec::new();
+            let (ts, skipped) = translations_from_entries(&[&entries[0]], &parsed, &mut warnings);
+            assert!(ts.is_empty());
+            assert_eq!(skipped, 1);
+        }
+    }
+
+    #[test]
+    fn vn02_literal_newlines_and_sjis_trail_bytes_keep_their_raw_type() {
+        // 88 EF is a complete CP932 character; EF is its trail byte.
+        let raw = b"Hello\r\n\n\r\x88\xEF\xEF\xF2\\p".to_vec();
+        let original = real_layout(&[(108, vec![(0, 0, raw.clone())])], TRUE_KEY_B4626AD8);
+        let rows = entries_from_ystb_bytes(&original, "story.ybn", "story.ybn".into()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed = load_ystb(&original, "story").unwrap().unwrap();
+        let changed = inject_into_ystb(
+            &parsed,
+            &HashMap::from([(0, format!("AUDIT {}", rows[0].source))]),
+        )
+        .unwrap();
+        let after = load_ystb(&changed, "story").unwrap().unwrap();
+        let (_, _, off, _) = section_offsets(&after.hdr);
+        assert_eq!(
+            &after.data[off..off + after.attrs[0].size as usize],
+            [b"AUDIT ".as_slice(), &raw].concat()
+        );
+    }
+
+    #[test]
+    fn vn02_roles_admit_short_display_and_exclude_lookups() {
+        let commands = vec![
+            (108, vec![(0, 0, b"...".to_vec())]),
+            (108, vec![(0, 0, b"A".to_vec())]),
+            (108, vec![(0, 0, b"OK".to_vec())]),
+            (26, vec![(2, 3, fixture_expr("MS Gothic"))]),
+            (43, vec![(0, 3, fixture_expr("Japanese dispatch target"))]),
+            (
+                43,
+                vec![
+                    (0, 3, fixture_expr("ES.CHAR.NAME")),
+                    (33, 3, fixture_expr("Q")),
+                ],
+            ),
+            (
+                43,
+                vec![
+                    (0, 3, fixture_expr("ES.SEL.SET")),
+                    (33, 3, fixture_expr("...")),
+                ],
+            ),
+            (
+                2,
+                vec![(64, 3, vec![0x42, 1, 0, 1]), (11, 3, fixture_expr("UI"))],
+            ),
+        ];
+        let rows = entries_from_ystb_bytes(
+            &real_layout(&commands, TRUE_KEY_B4626AD8),
+            "story.ybn",
+            "story.ybn".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(),
+            ["...", "A", "OK", "Q", "...", "UI"]
+        );
+    }
+
+    #[test]
+    fn vn02_shipped_yscm_overrides_version_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = b"YSCM".to_vec();
+        for n in [0x22Bu32, 2, 0] {
+            table.extend_from_slice(&n.to_le_bytes());
+        }
+        table.extend_from_slice(b"WORD\0\x01\0\0\0FONT\0\x01NAME\0\0\0");
+        fs::write(dir.path().join("ysc.ybn"), table).unwrap();
+        fs::write(
+            dir.path().join("story.ybn"),
+            real_layout(
+                &[
+                    (0, vec![(0, 0, b"X".to_vec())]),
+                    (1, vec![(0, 3, fixture_expr("MS Gothic"))]),
+                ],
+                0,
+            ),
+        )
+        .unwrap();
+        let rows = YurisPlugin::new().extract(dir.path()).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(),
+            ["X"]
+        );
+    }
+
+    #[test]
+    fn vn02_yscf_caption_changes_only_length_and_caption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("yscfg.ybn");
+        let mut original: Vec<_> = (0..0x4Cu8).collect();
+        original[..4].copy_from_slice(b"YSCF");
+        original[4..8].copy_from_slice(&0x22Bu32.to_le_bytes());
+        original.extend_from_slice(&5i16.to_le_bytes());
+        original.extend_from_slice(b"Title");
+        fs::write(&path, &original).unwrap();
+        let plugin = YurisPlugin::new();
+        let mut rows = plugin.extract(dir.path()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "Title");
+        rows[0].translation = Some("New project title".into());
+        assert_eq!(plugin.inject(dir.path(), &rows).unwrap().strings_written, 1);
+        let output = fs::read(path).unwrap();
+        assert_eq!(output[..0x4C], original[..0x4C]);
+        assert_eq!(
+            &output[0x4C..],
+            [17i16.to_le_bytes().as_slice(), b"New project title"].concat()
+        );
+        assert_eq!(
+            plugin.extract(dir.path()).unwrap()[0].source,
+            "New project title"
+        );
+        let mut unsupported = original;
+        unsupported.push(0);
+        assert!(
+            entries_from_ystb_bytes(&unsupported, "yscfg.ybn", "yscfg.ybn".into())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn vn02_stale_dense_and_physical_rows_never_overwrite_shifted_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("story.ybn");
+        let plugin = YurisPlugin::new();
+        let first = real_layout(
+            &[
+                (108, vec![(0, 0, b"Same display".to_vec())]),
+                (108, vec![(0, 0, b"Existing display".to_vec())]),
+            ],
+            0,
+        );
+        fs::write(&path, &first).unwrap();
+        let mut rows = plugin.extract(dir.path()).unwrap();
+        rows[1].translation = Some("DO NOT OVERWRITE".into());
+        let physical = rows[1].clone();
+        rows[1].id = "story.ybn#arg1".into();
+        for changed in [
+            real_layout(
+                &[
+                    (108, vec![(0, 0, b"Inserted display".to_vec())]),
+                    (108, vec![(0, 0, b"Same display".to_vec())]),
+                    (108, vec![(0, 0, b"Existing display".to_vec())]),
+                ],
+                0,
+            ),
+            real_layout(&[(108, vec![(0, 0, b"Existing display".to_vec())])], 0),
+            real_layout(
+                &[
+                    (108, vec![(0, 0, b"Existing display".to_vec())]),
+                    (108, vec![(0, 0, b"Existing display".to_vec())]),
+                    (108, vec![(1, 0, b"Retyped id".to_vec())]),
+                ],
+                0,
+            ),
+        ] {
+            fs::write(&path, &changed).unwrap();
+            for entry in [&rows[1], &physical] {
+                let report = plugin
+                    .inject(dir.path(), std::slice::from_ref(entry))
+                    .unwrap();
+                assert_eq!(report.strings_written, 0, "{report:?}");
+                assert_eq!(report.strings_skipped, 1);
+                assert_eq!(fs::read(&path).unwrap(), changed);
+            }
+        }
+    }
+
+    #[test]
+    fn vn02_reinjection_into_an_injected_script_writes_the_edited_translation() {
+        // Direct mode writes into the game file, so the next injection (after the
+        // user fixes a translation) reads a file whose payloads and section sizes
+        // already changed. Physical rows must still apply.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("story.ybn");
+        let plugin = YurisPlugin::new();
+        let original = real_layout(
+            &[
+                (108, vec![(0, 0, b"First display".to_vec())]),
+                (108, vec![(0, 0, b"Second display".to_vec())]),
+            ],
+            TRUE_KEY_B4626AD8,
+        );
+        fs::write(&path, &original).unwrap();
+        let mut rows = plugin.extract(dir.path()).unwrap();
+        assert_eq!(rows.len(), 2);
+        rows[0].translation = Some("Primera linea".into());
+        rows[1].translation = Some("Segunda linea".into());
+        let first = plugin.inject(dir.path(), &rows).unwrap();
+        assert_eq!(first.strings_written, 2, "{first:?}");
+
+        rows[1].translation = Some("Segunda linea corregida".into());
+        let second = plugin.inject(dir.path(), &rows).unwrap();
+        assert_eq!(second.strings_written, 2, "{second:?}");
+        assert_eq!(second.strings_skipped, 0, "{second:?}");
+        let after: Vec<_> = plugin
+            .extract(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.source)
+            .collect();
+        assert_eq!(after, ["Primera linea", "Segunda linea corregida"]);
+    }
+
+    #[test]
+    fn vn02_changed_attribute_preserves_sections_gaps_tail_and_other_payloads() {
+        let original = real_layout(
+            &[
+                (108, vec![(0, 0, b"Hello\xEF\xF0world".to_vec())]),
+                (26, vec![(2, 3, fixture_expr("MS Gothic"))]),
+                (108, vec![(0, 3, fixture_expr("Untouched display"))]),
+                (250, vec![(78, 1, vec![0xDE, 0xAD, 0xBE, 0xEF])]),
+            ],
+            TRUE_KEY_B4626AD8,
+        );
+        let before = load_ystb(&original, "story").unwrap().unwrap();
+        let output = inject_into_ystb(
+            &before,
+            &HashMap::from([(0, "AUDIT Hello\r\nworld".into())]),
+        )
+        .unwrap();
+        let after = load_ystb(&output, "story").unwrap().unwrap();
+        let (_, bd, bv, bl) = section_offsets(&before.hdr);
+        let (_, ad, av, al) = section_offsets(&after.hdr);
+        assert_eq!(&before.data[..0x14], &after.data[..0x14]);
+        assert_eq!(&before.data[0x18..bd], &after.data[0x18..ad]);
+        assert_eq!(&before.data[bl..], &after.data[al..]);
+        assert_eq!(
+            &after.data[av..al],
+            [b"AUDIT ".as_slice(), &before.data[bv..bl]].concat()
+        );
+        for (i, (a, b)) in before.attrs.iter().zip(&after.attrs).enumerate() {
+            assert_eq!(
+                &before.data[bd + i * 12..bd + i * 12 + 4],
+                &after.data[ad + i * 12..ad + i * 12 + 4]
+            );
+            if i > 0 {
+                assert_eq!(
+                    &before.data[bv + a.offset as usize..bv + a.offset as usize + a.size as usize],
+                    &after.data[av + b.offset as usize..av + b.offset as usize + b.size as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vn02_unknown_layouts_are_safe_skips_or_errors() {
+        let mut original = real_layout(&[(108, vec![(0, 0, b"Visible".to_vec())])], 0);
+        write_u32(&mut original, 4, 0x99);
+        assert!(
+            entries_from_ystb_bytes(&original, "story.ybn", "story.ybn".into())
+                .unwrap()
+                .is_empty()
+        );
+        write_u32(&mut original, 4, 0x22B);
+        original[33] = 0;
+        assert!(entries_from_ystb_bytes(&original, "story.ybn", "story.ybn".into()).is_err());
+    }
+
     fn lookup_members(names: impl IntoIterator<Item = String>) -> Vec<yuris_ypf::YpfEntry> {
         names
             .into_iter()
@@ -1660,8 +2650,8 @@ mod tests {
 
         let num_inst = 2u32 + extra_inst.len() as u32 + zero_inst_pad as u32;
         let mut instructions = Vec::new();
-        instructions.extend_from_slice(&[0x01, 0x01, 0x00, 0x00]);
-        instructions.extend_from_slice(&[0x02, 0x01, 0x00, 0x00]);
+        instructions.extend_from_slice(&[108, 0x01, 0x00, 0x00]);
+        instructions.extend_from_slice(&[108, 0x01, 0x00, 0x00]);
         for inst in extra_inst {
             instructions.extend_from_slice(inst);
         }
@@ -1919,13 +2909,13 @@ mod tests {
             "missing s2: {sources:?}"
         );
         assert!(
-            entries.iter().any(|e| e.id.ends_with("#arg0")),
+            entries.iter().any(|e| e.id.ends_with("#attr0")),
             "ids: {:?}",
             entries.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
         assert!(
-            entries.iter().any(|e| e.id.contains("yst00001.ybn#arg")),
-            "expected relpath#argN ids: {:?}",
+            entries.iter().any(|e| e.id.contains("yst00001.ybn#attr")),
+            "expected relpath#attrN ids: {:?}",
             entries.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
         for e in &entries {
@@ -2184,7 +3174,7 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|e| e.id.contains("ysbin/test.ypf/") && e.id.contains("yst00000.ybn#arg")),
+                .any(|e| e.id.contains("ysbin/test.ypf/") && e.id.contains("yst00000.ybn#attr")),
             "ids: {:?}",
             entries.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
