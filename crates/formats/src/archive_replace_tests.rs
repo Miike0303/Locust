@@ -1,5 +1,90 @@
 use super::*;
 
+fn direct_archive_revisions(root: &Path, archive: &Path, format: &str) {
+    use locust_core::{backup::BackupManager, database::Database, extraction::inject_direct};
+    let original = fs::read(archive).unwrap();
+    let registry = crate::default_registry();
+    let plugin = registry.get(format).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let backups = tempfile::tempdir().unwrap();
+    let manager = BackupManager::new(backups.path().to_owned());
+    let mut pristine = None;
+    for prefix in ["TL ", "R2 "] {
+        // Tyrano's archive writer source-checks the current payload. Refresh
+        // locators/guards from that payload before testing another generation.
+        let mut entries = plugin.extract(root).unwrap();
+        assert!(!entries.is_empty());
+        for entry in &mut entries {
+            entry.translation = Some(format!("{prefix}{}", entry.source));
+        }
+        db.save_entries(&entries).unwrap();
+        let report = inject_direct(&registry, &db, &manager, root, format, &["en".into()])
+            .expect("archive Direct injection must recognize its retained staging backup");
+        assert_eq!(report.strings_written, entries.len(), "{report:?}");
+        assert_eq!(report.strings_skipped, 0, "{report:?}");
+        assert_eq!(report.files_modified, 1);
+        assert!(report.reports["en"].skip_reasons.is_empty());
+        let extracted = plugin.extract(root).unwrap();
+        assert_eq!(extracted.len(), entries.len());
+        for entry in &entries {
+            assert!(extracted
+                .iter()
+                .any(|out| Some(&out.source) == entry.translation.as_ref()));
+        }
+        assert!(
+            walkdir::WalkDir::new(root).into_iter().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".locust-stage-")
+            }),
+            "private staging must not survive a successful Direct injection"
+        );
+        let id = report.pristine_backup_id.unwrap();
+        if let Some(first) = &pristine {
+            assert_eq!(&id, first);
+        } else {
+            pristine = Some(id);
+        }
+    }
+    manager.restore(&pristine.unwrap()).unwrap();
+    assert_eq!(fs::read(archive).unwrap(), original);
+}
+
+#[test]
+fn c121_asar_direct_revisions_exclude_private_backups() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = root.path().join("resources").join("app.asar");
+    fs::create_dir(archive.parent().unwrap()).unwrap();
+    fs::write(
+        &archive,
+        crate::tyrano_asar::write_asar(&[(
+            "data/scenario/main.ks".into(),
+            b"Hello original.[p]\n".to_vec(),
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+    direct_archive_revisions(root.path(), &archive, "tyrano");
+}
+
+#[test]
+fn c121_nw_direct_revisions_exclude_private_backups() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = root.path().join("package.nw");
+    let mut writer = zip::ZipWriter::new(File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "data/scenario/main.ks",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    writer.write_all(b"Hello original.[p]\n").unwrap();
+    writer.finish().unwrap();
+    direct_archive_revisions(root.path(), &archive, "tyrano");
+}
+
 #[test]
 fn partial_write_failure_preserves_exact_original_and_recursive_sentinels() {
     let root = tempfile::tempdir().unwrap();

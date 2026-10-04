@@ -51,7 +51,10 @@ impl Prepared {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let stage = StagingDir::create_prepared(parent)?;
+        // Virtual archive locators can spell Windows verbatim paths with '/'.
+        // Register scratch with the same canonical spelling as the transaction
+        // inventory; ownership still requires the original open file identity.
+        let stage = StagingDir::create_prepared(&parent.canonicalize()?)?;
         let mut next = stage.create_file("replacement")?;
         write(&mut next)?;
         next.sync_all()?;

@@ -920,6 +920,10 @@ fn prepare(
         } else {
             work.join(reported)
         };
+        // Archive virtual locators may use '/' even in a Windows verbatim
+        // prefix. Compare resolved filesystem paths, as for the locked root.
+        // The inventory above has already rejected links in the private copy.
+        let absolute = absolute.canonicalize()?;
         let relative = absolute.strip_prefix(&work).map_err(|_| {
             error(format!(
                 "plugin reported output outside its private copy: {}",

@@ -2523,6 +2523,70 @@ mod tests {
     }
 
     #[test]
+    fn c121_ypf_direct_revisions_exclude_private_backups() {
+        use locust_core::{backup::BackupManager, database::Database, extraction::inject_direct};
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("ysbin.ypf");
+        let ystb = build_minimal_ystb(TRUE_KEY_B4626AD8, "Hello original!", "Welcome home.");
+        let original =
+            crate::yuris_ypf::write_ypf(0x1E4, 0xFF, &[("yst00000.ybn".into(), ystb, true)])
+                .unwrap();
+        fs::write(&archive, &original).unwrap();
+        let registry = crate::default_registry();
+        let plugin = registry.get("yuris").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let manager = BackupManager::new(backups.path().to_owned());
+        let mut entries = plugin.extract(root.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        let mut pristine = None;
+        for prefix in ["TL ", "R2 TL "] {
+            for entry in &mut entries {
+                entry.translation = Some(format!("{prefix}{}", entry.source));
+            }
+            db.save_entries(&entries).unwrap();
+            let report = inject_direct(
+                &registry,
+                &db,
+                &manager,
+                root.path(),
+                "yuris",
+                &["en".into()],
+            )
+            .expect("YPF Direct injection must recognize its retained staging backup");
+            assert_eq!(
+                (report.strings_written, report.strings_skipped),
+                (2, 0),
+                "{report:?}"
+            );
+            assert_eq!(report.files_modified, 1);
+            assert!(report.reports["en"].skip_reasons.is_empty());
+            let extracted = plugin.extract(root.path()).unwrap();
+            assert_eq!(extracted.len(), entries.len());
+            for entry in &entries {
+                assert!(extracted
+                    .iter()
+                    .any(|out| Some(&out.source) == entry.translation.as_ref()));
+            }
+            assert!(walkdir::WalkDir::new(root.path()).into_iter().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".locust-stage-")
+            }));
+            let id = report.pristine_backup_id.unwrap();
+            if let Some(first) = &pristine {
+                assert_eq!(&id, first);
+            } else {
+                pristine = Some(id);
+            }
+        }
+        manager.restore(&pristine.unwrap()).unwrap();
+        assert_eq!(fs::read(archive).unwrap(), original);
+    }
+
+    #[test]
     fn ypf_reinjection_keeps_original_backup_sidecar_and_quoted_text() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("game.ypf");
