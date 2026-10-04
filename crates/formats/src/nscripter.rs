@@ -13,10 +13,15 @@
 //! - Token classes (`readToken`): high-bit first char (`ch & 0x80`) and backtick
 //!   `` ` `` start dialogue; ASCII-letter lines are commands; `*` labels; `;` comments.
 //!
-//! # First-cut line heuristic (over-extraction OK)
-//! After Shift-JIS decode, a line is player text iff the first non-space char is
+//! # Dialogue and literal command fields
+//! After Shift-JIS decode, a line is dialogue if the first non-space char is
 //! non-ASCII (SJIS lead ≥ 0x80 after decode) or a backtick. Inline wait markers
 //! (`@`, `\`, `/` at EOL) and furigana stay inside the extracted string.
+//! Leading `caption` and `rmenu` commands also expose their quoted display
+//! values. `captionCommand` reads one string; `rmenuCommand` alternates strings
+//! and dispatch labels. Expressions and malformed argument lists are excluded.
+//! Injection splices only the selected byte ranges before reapplying container
+//! XOR, preserving separators, dispatch names, and original newline bytes.
 //!
 //! Out of scope: `nscript.___` (mode-3 key table from EXE / `--key-exe`), multi-file
 //! `1.txt`…`99.txt` concat, `pscript.dat` UTF-8, `arc.nsa` / `.sar` archive unpack,
@@ -24,8 +29,10 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use locust_core::backup::RevisionOriginal;
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
@@ -261,43 +268,14 @@ fn decode_container(bytes: &[u8], kind: ContainerKind, file_label: &str) -> Resu
     Ok((text, crlf))
 }
 
-fn encode_container(
-    text: &str,
-    kind: ContainerKind,
-    crlf: bool,
-    file_label: &str,
-) -> Result<Vec<u8>> {
-    let normalized = if crlf {
-        text.replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .replace('\n', "\r\n")
-    } else {
-        text.replace("\r\n", "\n").replace('\r', "\n")
-    };
-    let (encoded, _, had_errors) = encoding_rs::SHIFT_JIS.encode(&normalized);
-    if had_errors {
-        return Err(parse_err(
-            file_label,
-            "could not re-encode NScripter script as Shift-JIS",
-        ));
+/// Both supported XOR transforms are self-inverse. Work on the original plain
+/// bytes so untouched CP932 aliases and mixed newline styles survive injection.
+fn transform_container(bytes: &[u8], kind: ContainerKind) -> Vec<u8> {
+    match kind {
+        ContainerKind::Plain => bytes.to_vec(),
+        ContainerKind::Xor84 => xor_bytes(bytes, NSCRIPT_DAT_XOR),
+        ContainerKind::XorRot5 => xor_rot5_bytes(bytes),
     }
-    let sjis = encoded.into_owned();
-    Ok(match kind {
-        ContainerKind::Plain => sjis,
-        ContainerKind::Xor84 => xor_bytes(&sjis, NSCRIPT_DAT_XOR),
-        ContainerKind::XorRot5 => xor_rot5_bytes(&sjis),
-    })
-}
-
-/// Try to encode a single replacement line as Shift-JIS (strict).
-fn try_encode_sjis_line(s: &str) -> Option<String> {
-    let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(s);
-    if had_errors {
-        return None;
-    }
-    // Round-trip via SJIS so we store what will actually be written.
-    let (cow, _, _) = encoding_rs::SHIFT_JIS.decode(&bytes);
-    Some(cow.into_owned())
 }
 
 // ─── Line classification ───────────────────────────────────────────────────
@@ -324,6 +302,136 @@ fn normalize_dialogue_translation(text: &str) -> Cow<'_, str> {
         }
         _ => Cow::Borrowed(text),
     }
+}
+
+#[derive(Debug)]
+struct DisplayField {
+    command: &'static str,
+    argument: usize,
+    range: Range<usize>,
+}
+
+/// Scan a leading literal caption or an entire literal rmenu argument list.
+/// Engine authority: readToken, readStr/parseStr, readLabel and checkComma.
+/// Quotes have no backslash escape. Expressions/aliases and malformed lists
+/// are deliberately excluded, rather than exposing partial runtime values.
+/// All syntax bytes are below 0x40 (or outside quoted strings), so this also
+/// works on original Shift-JIS bytes without confusing multibyte trail bytes.
+fn display_fields(line: &[u8]) -> Vec<DisplayField> {
+    fn space(line: &[u8], p: &mut usize) {
+        while matches!(line.get(*p), Some(b' ' | b'\t')) {
+            *p += 1;
+        }
+    }
+    fn end(line: &[u8], p: usize) -> bool {
+        matches!(line.get(p), None | Some(b';' | b':'))
+    }
+    fn quoted(line: &[u8], p: &mut usize) -> Option<Range<usize>> {
+        if line.get(*p) != Some(&b'"') {
+            return None;
+        }
+        *p += 1;
+        let start = *p;
+        while !matches!(line.get(*p), None | Some(b'"' | b'\r' | b'\n' | 0)) {
+            *p += 1;
+        }
+        if line.get(*p) != Some(&b'"') {
+            return None;
+        }
+        let range = start..*p;
+        *p += 1;
+        space(line, p);
+        Some(range)
+    }
+    let mut p = 0;
+    space(line, &mut p);
+    let start = p;
+    while line
+        .get(p)
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    {
+        p += 1;
+    }
+    let command = if line[start..p].eq_ignore_ascii_case(b"caption") {
+        "caption"
+    } else if line[start..p].eq_ignore_ascii_case(b"rmenu") {
+        "rmenu"
+    } else {
+        return Vec::new();
+    };
+    space(line, &mut p);
+    let mut fields = Vec::new();
+    loop {
+        let Some(range) = quoted(line, &mut p) else {
+            return Vec::new();
+        };
+        fields.push(DisplayField {
+            command,
+            argument: fields.len() * 2,
+            range,
+        });
+        if command == "caption" {
+            return if end(line, p) { fields } else { Vec::new() };
+        }
+        if line.get(p) != Some(&b',') {
+            return Vec::new();
+        }
+        p += 1;
+        space(line, &mut p);
+        // readLabel: dispatch identifiers, never display strings.
+        if line.get(p) == Some(&b'*') {
+            p += 1;
+            space(line, &mut p);
+        }
+        if !line
+            .get(p)
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        {
+            return Vec::new();
+        }
+        while line
+            .get(p)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            p += 1;
+        }
+        space(line, &mut p);
+        if end(line, p) {
+            return fields;
+        }
+        if line.get(p) != Some(&b',') {
+            return Vec::new();
+        }
+        p += 1;
+        space(line, &mut p);
+    }
+}
+
+fn field_locator(field: &DisplayField) -> String {
+    format!("{}:{}", field.command, field.argument)
+}
+
+fn entry_locator<'a>(id: &'a str, name: &str) -> Option<(usize, Option<&'a str>)> {
+    let (file, locator) = id.split_once('#')?;
+    if !file.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    let (line, field) = match locator.split_once(':') {
+        Some((line, field)) => (line, Some(field)),
+        None => (locator, None),
+    };
+    Some((line.parse::<usize>().ok()?.checked_sub(1)?, field))
+}
+
+fn line_skeleton<'a>(line: &'a [u8], fields: &[DisplayField]) -> Vec<&'a [u8]> {
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for field in fields {
+        parts.push(&line[start..field.range.start]);
+        start = field.range.end;
+    }
+    parts.push(&line[start..]);
+    parts
 }
 
 // ─── Plugin ────────────────────────────────────────────────────────────────
@@ -395,6 +503,16 @@ impl FormatPlugin for NScripterPlugin {
             let line = line.strip_suffix('\r').unwrap_or(line);
             let line_no = idx + 1;
             if !is_player_text_line(line) {
+                for field in display_fields(line.as_bytes()) {
+                    let id = format!("{}#{}:{}", selected.name, line_no, field_locator(&field));
+                    let mut entry =
+                        StringEntry::new(id, &line[field.range.clone()], selected.path.clone());
+                    entry.tags = vec![field.command.into()];
+                    entry
+                        .metadata
+                        .insert("nscripter_line".into(), serde_json::json!(line));
+                    all.push(entry);
+                }
                 continue;
             }
             let id = format!("{}#{}", selected.name, line_no);
@@ -405,141 +523,224 @@ impl FormatPlugin for NScripterPlugin {
         Ok(all)
     }
 
-    fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
-        let mut files_modified = 0;
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
-        let mut warnings = Vec::new();
-        let mut files_written = Vec::new();
+    fn prepare_revision_entries(
+        &self,
+        entries: &mut [StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<()> {
+        // Core supplies these keys only for a verified prior Direct output with
+        // a verified pristine backup. RevisionOriginal's text reader is UTF-8
+        // only, so use the extraction snapshot to validate source/field identity
+        // and all non-value bytes on the line. Never relax normal inject checks.
+        for current_path in originals.keys() {
+            let Some(name) = current_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(kind) = ContainerKind::from_name(&name.to_ascii_lowercase()) else {
+                continue;
+            };
+            let bytes = std::fs::read(current_path)?;
+            let (current, _) = decode_container(&bytes, kind, name)?;
+            let lines: Vec<_> = current
+                .split('\n')
+                .map(|l| l.strip_suffix('\r').unwrap_or(l))
+                .collect();
+            for entry in entries.iter_mut().filter(|e| e.file_path == *current_path) {
+                let Some((line_no, Some(locator))) = entry_locator(&entry.id, name) else {
+                    continue;
+                };
+                let Some(old) = entry
+                    .metadata
+                    .get("nscripter_line")
+                    .and_then(|v| v.as_str())
+                else {
+                    continue;
+                };
+                let Some(new) = lines.get(line_no) else {
+                    continue;
+                };
+                let old_fields = display_fields(old.as_bytes());
+                let new_fields = display_fields(new.as_bytes());
+                if old_fields.len() != new_fields.len()
+                    || line_skeleton(old.as_bytes(), &old_fields)
+                        != line_skeleton(new.as_bytes(), &new_fields)
+                {
+                    continue;
+                }
+                for (a, b) in old_fields.iter().zip(&new_fields) {
+                    if field_locator(a) == locator && entry.source == old[a.range.clone()] {
+                        entry.source = new[b.range.clone()].to_owned();
+                        entry
+                            .metadata
+                            .insert("nscripter_line".into(), serde_json::json!(new));
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
+    fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+        let mut report = InjectionReport {
+            skip_reasons: Default::default(),
+            files_modified: 0,
+            strings_written: 0,
+            strings_skipped: 0,
+            warnings: Vec::new(),
+            files_written: Vec::new(),
+        };
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for e in entries {
             by_file.entry(e.file_path.clone()).or_default().push(e);
         }
-
         let search_root = Self::root_dir(path);
-
-        for (file_path, file_entries) in &by_file {
+        for (file_path, file_entries) in by_file {
             let actual = if file_path.exists() {
                 file_path.clone()
             } else {
                 search_root.join(file_path.file_name().unwrap_or_default())
             };
-            if !actual.exists() {
-                warnings.push(format!("missing script {}", file_path.display()));
-                strings_skipped += file_entries.len();
-                continue;
-            }
-
             let name = actual
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("script");
-            let kind = match ContainerKind::from_name(
-                SUPPORTED_CONTAINERS
-                    .iter()
-                    .find(|n| name.eq_ignore_ascii_case(n))
-                    .copied()
-                    .unwrap_or(name),
-            ) {
-                Some(k) => k,
-                None => {
-                    warnings.push(format!(
-                        "unsupported container for inject: {}",
-                        actual.display()
-                    ));
-                    strings_skipped += file_entries.len();
-                    continue;
-                }
+            let Some(kind) = ContainerKind::from_name(&name.to_ascii_lowercase()) else {
+                report.skip("unsupported_container", file_entries.len());
+                report.warnings.push(format!(
+                    "unsupported container for inject: {}",
+                    actual.display()
+                ));
+                continue;
             };
-
             let bytes = match std::fs::read(&actual) {
-                Ok(b) => b,
-                Err(e) => {
-                    warnings.push(format!("read {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    report.skip("read_error", file_entries.len());
+                    report
+                        .warnings
+                        .push(format!("read {}: {error}", actual.display()));
                     continue;
                 }
             };
-            let (text, crlf) = match decode_container(&bytes, kind, name) {
-                Ok(v) => v,
-                Err(e) => {
-                    warnings.push(format!("cannot decode {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
-                    continue;
-                }
-            };
-
-            let mut by_line: HashMap<usize, &str> = HashMap::new();
-            for e in file_entries {
-                if let Some(t) = e.translation.as_deref() {
-                    if let Some(n) = e.id.rsplit('#').next().and_then(|s| s.parse().ok()) {
-                        by_line.insert(n, t);
-                    }
-                }
-            }
-
-            let mut out_lines = Vec::new();
-            let mut changed = false;
-            let mut file_written = 0usize;
-            let mut file_skipped = 0usize;
-            for (idx, line) in text.split('\n').enumerate() {
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                let line_no = idx + 1;
-                if let Some(t) = by_line.get(&line_no) {
-                    let t = normalize_dialogue_translation(t);
-                    if is_player_text_line(line) && t != line {
-                        match try_encode_sjis_line(&t) {
-                            Some(encoded_line) => {
-                                out_lines.push(encoded_line);
-                                changed = true;
-                                file_written += 1;
-                                continue;
-                            }
-                            None => {
-                                warnings.push(format!(
-                                    "{name}#{line_no}: translation not encodable as Shift-JIS; skipped"
-                                ));
-                                file_skipped += 1;
-                                // Keep original line — do not corrupt the file.
-                            }
-                        }
-                    } else {
-                        file_skipped += 1;
-                    }
-                }
-                out_lines.push(line.to_string());
-            }
-
-            if !changed {
-                strings_skipped += file_entries.len();
+            if let Err(error) = decode_container(&bytes, kind, name) {
+                report.skip("decode_error", file_entries.len());
+                report
+                    .warnings
+                    .push(format!("cannot decode {}: {error}", actual.display()));
                 continue;
             }
-
-            let joined = out_lines.join("\n");
-            let encoded = match encode_container(&joined, kind, crlf, name) {
-                Ok(b) => b,
-                Err(e) => {
-                    warnings.push(format!("cannot re-encode {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
-                    continue;
+            let plain = transform_container(&bytes, kind);
+            let mut start = 0;
+            let lines: Vec<_> = plain
+                .split(|b| *b == b'\n')
+                .map(|line| {
+                    let offset = start;
+                    start += line.len() + 1;
+                    (offset, line.strip_suffix(b"\r").unwrap_or(line))
+                })
+                .collect();
+            let mut counts = HashMap::new();
+            for e in &file_entries {
+                if e.translation.is_some() {
+                    *counts.entry(e.id.as_str()).or_insert(0usize) += 1;
                 }
-            };
-            std::fs::write(&actual, &encoded)?;
-            files_modified += 1;
-            files_written.push(actual);
-            strings_written += file_written;
-            strings_skipped += file_skipped;
+            }
+            let mut edits: Vec<(Range<usize>, Vec<u8>)> = Vec::new();
+            for entry in file_entries {
+                let Some(translation) = entry.translation.as_deref() else {
+                    report.skip("missing_translation", 1);
+                    continue;
+                };
+                // Resolve every row against the unmodified file, before changing
+                // any lengths. Multiple equal labels therefore cannot drift.
+                let replacement = (|| -> std::result::Result<_, &'static str> {
+                    if counts.get(entry.id.as_str()).copied().unwrap_or(0) != 1 {
+                        return Err("ambiguous_locator");
+                    }
+                    let (line_no, locator) =
+                        entry_locator(&entry.id, name).ok_or("invalid_locator")?;
+                    let (offset, raw) = lines.get(line_no).ok_or("invalid_locator")?;
+                    let (line, _, _) = encoding_rs::SHIFT_JIS.decode(raw);
+                    let (range, value) = if let Some(locator) = locator {
+                        let fields = display_fields(raw);
+                        let field = fields
+                            .iter()
+                            .find(|f| field_locator(f) == locator)
+                            .ok_or("invalid_locator")?;
+                        let (source, _, _) =
+                            encoding_rs::SHIFT_JIS.decode(&raw[field.range.clone()]);
+                        if source != entry.source {
+                            return Err("source_mismatch");
+                        }
+                        if entry
+                            .metadata
+                            .get("nscripter_line")
+                            .and_then(|v| v.as_str())
+                            != Some(line.as_ref())
+                        {
+                            return Err("line_mismatch");
+                        }
+                        // parseStr terminates at the first quote, with no escape.
+                        if translation.contains(['"', '\r', '\n', '\0']) {
+                            return Err("unsafe_quoted_value");
+                        }
+                        (field.range.clone(), Cow::Borrowed(translation))
+                    } else {
+                        if !is_player_text_line(&line) {
+                            return Err("not_dialogue");
+                        }
+                        (0..raw.len(), normalize_dialogue_translation(translation))
+                    };
+                    let (encoded, _, errors) = encoding_rs::SHIFT_JIS.encode(&value);
+                    if errors {
+                        return Err("not_encodable_as_Shift-JIS");
+                    }
+                    if raw[range.clone()] == *encoded {
+                        return Err("unchanged");
+                    }
+                    Ok((
+                        offset + range.start..offset + range.end,
+                        encoded.into_owned(),
+                    ))
+                })();
+                match replacement {
+                    Ok(edit) => edits.push(edit),
+                    Err(reason) => {
+                        report.skip(reason, 1);
+                        if reason != "unchanged" {
+                            report
+                                .warnings
+                                .push(format!("{}: {reason}; skipped", entry.id));
+                        }
+                    }
+                }
+            }
+            if edits.is_empty() {
+                continue;
+            }
+            edits.sort_by_key(|(range, _)| range.start);
+            if edits.windows(2).any(|w| w[0].0.end > w[1].0.start) {
+                report.skip("overlapping_locators", edits.len());
+                report
+                    .warnings
+                    .push(format!("{name}: overlapping locators; skipped"));
+                continue;
+            }
+            let mut out = Vec::new();
+            let mut cursor = 0;
+            for (range, replacement) in &edits {
+                out.extend_from_slice(&plain[cursor..range.start]);
+                out.extend_from_slice(replacement);
+                cursor = range.end;
+            }
+            out.extend_from_slice(&plain[cursor..]);
+            std::fs::write(&actual, transform_container(&out, kind))?;
+            report.files_modified += 1;
+            report.files_written.push(actual);
+            report.strings_written += edits.len();
         }
-
-        Ok(InjectionReport {
-            skip_reasons: Default::default(),
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings,
-            files_written,
-        })
+        Ok(report)
     }
 }
 
@@ -1069,5 +1270,280 @@ click"
         let entries = plugin.extract(&dir).unwrap();
         assert!(entries.iter().any(|e| e.source.contains("from 00")));
         assert!(entries.iter().all(|e| e.id.starts_with("00.txt#")));
+    }
+    #[test]
+    fn c120_rmenu_fields_all_containers_and_newlines() {
+        for name in SUPPORTED_CONTAINERS {
+            for newline in ["\n", "\r\n"] {
+                let dir = tempdir();
+                let path = dir.join(name);
+                let kind = ContainerKind::from_name(name).unwrap();
+                let text = format!("; untouched{newline}caption \"題名\"{newline}rmenu \"Skip\",skip,\"Hide\",windowerase,\"Restart\",reset{newline}こんにちは。@{newline}bg \"image.bmp\",0{newline}");
+                fs::write(&path, fixture_container(&text, kind)).unwrap();
+                let plugin = NScripterPlugin::new();
+                let mut entries = plugin.extract(&dir).unwrap();
+                assert_eq!(entries.len(), 5, "{name} {newline:?}");
+                assert_eq!(
+                    entries
+                        .iter()
+                        .map(|e| e.source.as_str())
+                        .collect::<Vec<_>>(),
+                    ["題名", "Skip", "Hide", "Restart", "こんにちは。@"]
+                );
+                assert_eq!(
+                    entries
+                        .iter()
+                        .map(|e| e.id.as_str())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len(),
+                    5
+                );
+                for e in &mut entries {
+                    e.translation = Some(format!("TL {}", e.source));
+                }
+                let report = plugin.inject(&dir, &entries).unwrap();
+                assert_eq!(
+                    (report.strings_written, report.strings_skipped),
+                    (5, 0),
+                    "{report:?}"
+                );
+                let expected = text
+                    .replace("\"題名\"", "\"TL 題名\"")
+                    .replace("\"Skip\"", "\"TL Skip\"")
+                    .replace("\"Hide\"", "\"TL Hide\"")
+                    .replace("\"Restart\"", "\"TL Restart\"")
+                    .replace("こんにちは。@", "`TL こんにちは。@");
+                assert_eq!(fs::read(&path).unwrap(), fixture_container(&expected, kind));
+                let again = plugin.extract(&dir).unwrap();
+                assert_eq!(again.len(), 5);
+                assert_eq!(
+                    again.iter().map(|e| &e.id).collect::<Vec<_>>(),
+                    entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+                );
+                assert!(again
+                    .iter()
+                    .all(|e| e.source.trim_start_matches('`').starts_with("TL ")));
+            }
+        }
+    }
+
+    fn fixture_container(text: &str, kind: ContainerKind) -> Vec<u8> {
+        let bytes = encode_sjis_fixture(text);
+        match kind {
+            ContainerKind::Plain => bytes,
+            ContainerKind::Xor84 => xor_bytes(&bytes, NSCRIPT_DAT_XOR),
+            ContainerKind::XorRot5 => xor_rot5_bytes(&bytes),
+        }
+    }
+
+    #[test]
+    fn c120_caption_japanese_and_syntax_rejections() {
+        for translation in [
+            "新しい題名",
+            "New title",
+            "comma,colon:;backslash\\",
+            "bad\"quote",
+            "bad\nline",
+            "bad\rline",
+            "bad\0nul",
+            "bad😀",
+        ] {
+            let dir = tempdir();
+            let original = " \tCaPtIoN \"Title\" ; comment\r\n";
+            write_0_txt(&dir, original);
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(&dir).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].source, "Title");
+            entries[0].translation = Some(translation.into());
+            let report = plugin.inject(&dir, &entries).unwrap();
+            if translation.starts_with("bad") {
+                assert_eq!(
+                    (report.strings_written, report.strings_skipped),
+                    (0, 1),
+                    "{report:?}"
+                );
+                assert_eq!(report.skip_reasons.values().sum::<usize>(), 1);
+                assert!(!report.warnings.is_empty());
+                assert_eq!(
+                    fs::read(dir.join("0.txt")).unwrap(),
+                    encode_sjis_fixture(original)
+                );
+            } else {
+                assert_eq!(
+                    (report.strings_written, report.strings_skipped),
+                    (1, 0),
+                    "{report:?}"
+                );
+                assert_eq!(
+                    fs::read(dir.join("0.txt")).unwrap(),
+                    encode_sjis_fixture(&original.replace("Title", translation))
+                );
+                assert_eq!(plugin.extract(&dir).unwrap()[0].source, translation);
+            }
+        }
+    }
+
+    #[test]
+    fn c120_duplicate_labels_keep_physical_positions() {
+        let dir = tempdir();
+        let original = "caption\t\"First\"\n\trmenu\t\"Same\" , skip , \"Same\" , reset\r\ncaption \"Last\"\n rmenu \"Other\",windowerase";
+        write_0_txt(&dir, original);
+        let plugin = NScripterPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_ne!(entries[1].id, entries[2].id);
+        entries[2].translation = Some("Only second label".into());
+        let report = plugin.inject(&dir, &entries).unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(
+            fs::read(dir.join("0.txt")).unwrap(),
+            encode_sjis_fixture(
+                &original.replace("\"Same\" , reset", "\"Only second label\" , reset")
+            )
+        );
+    }
+
+    #[test]
+    fn c120_token_scanner_excludes_technical_and_expression_arguments() {
+        let dir = tempdir();
+        write_0_txt(
+            &dir,
+            concat!(
+                "bg \"caption.bmp\",0\n; caption \"Comment\"\n*caption\n",
+                "caption_extra \"Not caption\"\nmov $0,\"Not text\"\n",
+                "caption \"prefix\"+$0\ncaption $0\ncaption \"unterminated\n",
+                "rmenu \"Broken\",\"skip\"\nrmenu \"Partial\",skip,\"Missing dispatch\"\n",
+                "rmenu \"Expression\"+alias,skip\n",
+                "caption\"Literal\\\" ; backslash does not escape the quote\n",
+                "rmenu \"Comma, colon: semicolon;\",skip, \"OK\",reset : bg \"path.bmp\",0\n"
+            ),
+        );
+        let entries = NScripterPlugin::new().extract(&dir).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.source.as_str())
+                .collect::<Vec<_>>(),
+            ["Literal\\", "Comma, colon: semicolon;", "OK"]
+        );
+    }
+
+    #[test]
+    fn c120_inject_rejects_stale_or_ambiguous_fields() {
+        for change in ["source", "dispatch", "command", "locator", "duplicate"] {
+            let dir = tempdir();
+            write_0_txt(&dir, "rmenu \"Old\",skip,\"Other\",reset\n");
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(&dir).unwrap();
+            assert_eq!(entries.len(), 2);
+            entries.truncate(1);
+            entries[0].translation = Some("Replacement".into());
+            match change {
+                "source" => write_0_txt(&dir, "rmenu \"Changed\",skip,\"Other\",reset\n"),
+                "dispatch" => write_0_txt(&dir, "rmenu \"Old\",windowerase,\"Other\",reset\n"),
+                "command" => write_0_txt(&dir, "other \"Old\",skip,\"Other\",reset\n"),
+                "locator" => entries[0].id.push_str(":invalid"),
+                "duplicate" => entries.push(entries[0].clone()),
+                _ => unreachable!(),
+            }
+            let before = fs::read(dir.join("0.txt")).unwrap();
+            let report = plugin.inject(&dir, &entries).unwrap();
+            assert_eq!(report.strings_written, 0, "{change}: {report:?}");
+            assert_eq!(
+                report.strings_skipped,
+                entries.len(),
+                "{change}: {report:?}"
+            );
+            assert_eq!(report.skip_reasons.values().sum::<usize>(), entries.len());
+            assert!(!report.warnings.is_empty());
+            assert_eq!(fs::read(dir.join("0.txt")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn c120_preserves_unmodified_sjis_bytes_and_mixed_newlines() {
+        let dir = tempdir();
+        // ED40 is a valid non-canonical encoding of a CP932 character. Re-encoding
+        // the whole script would change it to FA5C, even in an untouched comment.
+        let original = [
+            b";".as_slice(),
+            &[0xed, 0x40],
+            b"\r\ncaption \"Title\"\n; tail\r\n",
+        ]
+        .concat();
+        fs::write(dir.join("0.txt"), &original).unwrap();
+        let plugin = NScripterPlugin::new();
+        let mut entries = plugin.extract(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        entries[0].translation = Some("New title".into());
+        assert_eq!(plugin.inject(&dir, &entries).unwrap().strings_written, 1);
+        assert_eq!(
+            fs::read(dir.join("0.txt")).unwrap(),
+            [
+                b";".as_slice(),
+                &[0xed, 0x40],
+                b"\r\ncaption \"New title\"\n; tail\r\n"
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn c120_verified_revision_retargets_changed_length_fields() {
+        for name in SUPPORTED_CONTAINERS {
+            let dir = tempdir();
+            let path = dir.join(name);
+            let kind = ContainerKind::from_name(name).unwrap();
+            let text = "caption \"題名\"\nrmenu \"同じ\",skip,\"同じ\",reset\nこんにちは。@\n";
+            fs::write(&path, fixture_container(text, kind)).unwrap();
+            let saved = dir.join("original.bin");
+            fs::copy(&path, &saved).unwrap();
+            let originals = HashMap::from([(
+                path.clone(),
+                locust_core::backup::RevisionOriginal::capture(&saved).unwrap(),
+            )]);
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(&dir).unwrap();
+            assert_eq!(entries.len(), 4);
+            for e in &mut entries {
+                e.translation = Some(format!("TL {}", e.source));
+            }
+            assert_eq!(plugin.inject(&dir, &entries).unwrap().strings_written, 4);
+            for e in &mut entries {
+                e.translation = Some(format!("R2 {}", e.translation.as_ref().unwrap()));
+            }
+            let mut unverified = entries.clone();
+            plugin
+                .prepare_revision_entries(&mut unverified, &HashMap::new())
+                .unwrap();
+            assert_eq!(unverified[0].source, entries[0].source);
+            let mut stale = entries.clone();
+            stale[0].source = "wrong source".into();
+            plugin
+                .prepare_revision_entries(&mut stale, &originals)
+                .unwrap();
+            assert_eq!(stale[0].source, "wrong source");
+            plugin
+                .prepare_revision_entries(&mut entries, &originals)
+                .unwrap();
+            assert_eq!(entries[0].source, "TL 題名");
+            let report = plugin.inject(&dir, &entries).unwrap();
+            assert_eq!(
+                (report.strings_written, report.strings_skipped),
+                (4, 0),
+                "{name}: {report:?}"
+            );
+            let expected = text
+                .replace("\"題名\"", "\"R2 TL 題名\"")
+                .replace("\"同じ\"", "\"R2 TL 同じ\"")
+                .replace("こんにちは。@", "`R2 TL こんにちは。@");
+            assert_eq!(fs::read(&path).unwrap(), fixture_container(&expected, kind));
+            assert!(plugin
+                .extract(&dir)
+                .unwrap()
+                .iter()
+                .all(|e| e.source.trim_start_matches('`').starts_with("R2 ")));
+        }
     }
 }
