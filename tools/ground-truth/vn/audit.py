@@ -78,8 +78,10 @@ def main():
                     slots=[dict(s,kind='speaker_literal') if s['kind']=='speaker_reference' else s for s in slots if s['kind']!='speaker_reference' or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*',s['text'])]
                 physical_lines=text.splitlines(keepends=True);cli_lines={};start=0
                 cli_no=1
+                # KiriKiri kag:N counts CR, LF and CRLF alike (cycle 111);
+                # Tyrano's #N counts LF only.
                 for logical,physical in enumerate(physical_lines,1):
-                    cli_lines[logical]=cli_no;cli_no+=physical.count('\n')
+                    cli_lines[logical]=logical if case['engine']=='kirikiri' else cli_no;cli_no+=physical.count('\n')
                 byline=collections.defaultdict(list)
                 for s in slots:byline[cli_lines[s['line']]].append(s)
                 technical_byline={n:(kind,line) for n,kind,line in technical}
