@@ -47,8 +47,10 @@ def probe(case,label,selected,mode='prefix'):
         else:
             bs=b.decode('cp932') if case['engine']=='nscripter' else decode_ks(b);as_=a.decode('cp932') if case['engine']=='nscripter' else decode_ks(a);expected=bs.split('\n');selected_lines={}
             for i,t in (target.items() if rc==0 else []):
-                rel,no=i.rsplit('#',1)
-                if rel==fn:
+                rel,no=i.split('#',1)
+                # Adapter (cycle 116): KiriKiri locators are now kag:<line> or kag:<line>:attr:...
+                if no.startswith('kag:'):no=no[4:]
+                if rel==fn and ':' not in no:
                     no=int(no);orig=expected[no-1];suffix='\r' if orig.endswith('\r') else ''
                     row=next(r for r in picks if r['id']==i)
                     if 'speaker' in json.loads(row['tags']):

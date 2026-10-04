@@ -39,6 +39,20 @@ def rendered_raw(a):
     if a['type']!=0:return a['text']
     raw=bytes.fromhex(a['raw']);raw=raw.replace(b'\xef\xf0',b'\r\n').replace(b'\xef\xf2',b'\\p').replace(b'\xef\xf3',b'\\c').replace(b'\xef\xf5',b'\\u')
     return raw.decode('cp932',errors='replace')
+def output_text(source):
+    # CLI representation adapter only; oracle and rendered_raw stay unchanged.
+    for token, value in [('F2', r'\p'), ('F3', r'\c'), ('F5', r'\u'),
+                         ('CRLF', '\r\n'), ('CR', '\r'), ('LF', '\n')]:
+        source=source.replace('{{yuris:'+token+'}}', value)
+    source=re.sub(r'\{\{yuris:bytes:([0-9A-F]{2}(?:[0-9A-F]{2})?)\}\}', lambda m:bytes.fromhex(m[1]).decode('cp932',errors='replace'), source)
+    return source
+
+def output_attr(row, attributes):
+    index=int(row['id'].rsplit('#attr',1)[1])
+    a=attributes[index]
+    assert output_text(row['source']) in (a['text'], rendered_raw(a)), row['id']
+    return a
+
 def main():
     cases=json.loads((ROOT/'cases.json').read_text(encoding='utf-8'));stats=[];examples=collections.defaultdict(list);allmiss=[];allfp=[];details={};commands=yscm(Path('D:/juegos/VN/Injuu Kangoku RE/res/ysc.ybn').read_bytes())
     for case in cases:
@@ -48,7 +62,7 @@ def main():
         rs=rows(db);dump(slug+'-rows.json',rs);miss=[];fp=[];oracle=[];tp=set();unknown=0;locs={};line_rows=collections.defaultdict(list)
         if case['engine'] in {'kirikiri','tyrano'}:
             for r in rs:
-                rel,locator=r['id'].split('#',1);m=re.match(r'(\d+)(?:#|$)',locator)
+                rel,locator=r['id'].split('#',1);m=re.match(r'(?:kag:)?(\d+)(?:#|:|$)',locator)
                 if not m:raise ValueError('adapt output locator mapper without changing oracle: '+r['id'])
                 line_rows[(rel,int(m.group(1)))].append(r)
             for rel,original in case['mapping'].items():
@@ -112,12 +126,8 @@ def main():
                     continue
                 if b[:4]!=b'YSTB':continue
                 doc=ystb(b);truth=yuris_truth(doc,commands);aa=doc['attributes'];mapped={};cursor=0
-                for r in sorted(byfile.get(rel,[]),key=lambda x:int(x['id'].rsplit('#arg',1)[1])):
-                    matches=[a for a in aa[cursor:] if a['text']==r['source'] or rendered_raw(a)==r['source']]
-                    if not matches:
-                        matches=[a for a in aa[cursor:] if a['text'] is not None and (norm(a['text'])==norm(r['source']) or norm(rendered_raw(a))==norm(r['source']))]
-                    if not matches:unmapped.append(dict(file=original,id=r['id'],source=r['source']));unknown+=1;continue
-                    a=matches[0];cursor=a['index']+1;mapped[a['index']]=r;locs[r['id']]=a['index']
+                for r in sorted(byfile.get(rel,[]),key=lambda x:int(x['id'].rsplit('#attr',1)[1])):
+                    a=output_attr(r, aa);mapped[a['index']]=r;locs[r['id']]=a['index']
                     q=truth.get(a['index'])
                     if not q or q['truth'] is None:unknown+=1
                     elif q['truth']:tp.add(r['id'])
