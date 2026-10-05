@@ -230,6 +230,9 @@ fn restore_backup_dry_run_checks_payload_without_writing_game() {
     };
     let output = run().assert().success().get_output().stdout.clone();
     let output = String::from_utf8(output).unwrap();
+    // Shown without the Windows `\\?\` verbatim prefix that canonicalize adds.
+    let canonical = game.canonicalize().unwrap().display().to_string();
+    let shown = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
     let expected = format!(
         "Destination: {}\n\
          Would replace 1 file(s):\n  script.rpy\n\
@@ -238,7 +241,7 @@ fn restore_backup_dry_run_checks_payload_without_writing_game() {
          Would remove 0 file(s) created by Locust:\n\
          Would remove 0 empty directory/directories created by Locust:\n\
          Kept 0 added path(s):\n",
-        game.canonicalize().unwrap().display()
+        shown
     );
     assert_eq!(output, expected);
     assert_eq!(std::fs::read(&script).unwrap(), b"translated");
@@ -246,4 +249,31 @@ fn restore_backup_dry_run_checks_payload_without_writing_game() {
     std::fs::write(backup.path.join("payload/script.rpy"), b"corrupted").unwrap();
     run().assert().failure();
     assert_eq!(std::fs::read(&script).unwrap(), b"translated");
+}
+
+#[test]
+fn backups_list_shows_paths_without_verbatim_prefix() {
+    let root = tempfile::tempdir().unwrap();
+    let game = root.path().join("game");
+    let backup_root = root.path().join("backups");
+    std::fs::create_dir(&game).unwrap();
+    std::fs::write(game.join("script.rpy"), b"original").unwrap();
+    BackupManager::new(backup_root.clone())
+        .create_backup(&game.canonicalize().unwrap())
+        .unwrap();
+    let output = assert_cmd::Command::cargo_bin("locust")
+        .unwrap()
+        .env("LOCUST_DATA_DIR", root.path().join("profile"))
+        .env("LOCUST_BACKUP_ROOT", &backup_root)
+        .arg("backups")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(!output.contains(r"\\?\"), "{output}");
+    let canonical = game.canonicalize().unwrap().display().to_string();
+    let shown = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+    assert!(output.contains(shown), "{output}");
 }

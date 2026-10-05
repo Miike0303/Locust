@@ -611,7 +611,7 @@ fn cmd_backups() -> anyhow::Result<()> {
         println!(
             "{}\t{}\t{} file(s), {} bytes\t{}",
             backup.id,
-            backup.source_path.display(),
+            locust_core::injection_transaction::display_path(&backup.source_path).display(),
             backup.file_count,
             backup.size_bytes,
             backup.created_at
@@ -637,7 +637,10 @@ fn cmd_restore_backup(id: &str, dry_run: bool) -> anyhow::Result<()> {
         manager.restore_with_report(id)?
     };
     if dry_run {
-        println!("Destination: {}", preview.destination.display());
+        println!(
+            "Destination: {}",
+            locust_core::injection_transaction::display_path(&preview.destination).display()
+        );
         println!("Would replace {} file(s):", preview.replaced.len());
         for path in &preview.replaced {
             println!("  {}", path.display());

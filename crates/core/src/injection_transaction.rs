@@ -910,7 +910,7 @@ fn run_with_backup_hook<B, T>(
 /// User-facing spelling of a path. `canonicalize` yields `\\?\` verbatim
 /// prefixes on Windows; those stay on paths that are locked, opened, or
 /// compared, and are removed only when a path is shown in a report.
-fn display_path(path: &Path) -> PathBuf {
+pub fn display_path(path: &Path) -> PathBuf {
     use std::path::{Component, Prefix};
 
     let mut components = path.components().peekable();
