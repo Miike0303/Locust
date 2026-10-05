@@ -474,6 +474,67 @@ fn apply_translations(game: &mut QspGame, entries: &[&StringEntry]) {
     }
 }
 
+/// Classify only the rows already counted when an entire file stays unchanged.
+/// The injector's last translation for a suffix wins, including identity edits.
+fn classify_unchanged_entries(
+    game: &QspGame,
+    entries: &[&StringEntry],
+    report: &mut InjectionReport,
+) {
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries.iter().rev() {
+        let reason = if entry.translation.is_none() {
+            "untranslated"
+        } else if let Some((_, suffix)) = entry.id.split_once("#loc") {
+            match qsp_locator_target(game, suffix) {
+                Err(reason) => reason,
+                Ok(()) if !seen.insert(suffix) => "duplicate",
+                Ok(()) => "unchanged",
+            }
+        } else {
+            "invalid_locator"
+        };
+        report.skip(reason, 1);
+    }
+}
+
+fn qsp_locator_target(game: &QspGame, suffix: &str) -> std::result::Result<(), &'static str> {
+    fn index(value: &str) -> std::result::Result<usize, &'static str> {
+        let index: usize = value.parse().map_err(|_| "invalid_locator")?;
+        if index.to_string() != value {
+            return Err("invalid_locator");
+        }
+        Ok(index)
+    }
+    let parts: Vec<_> = suffix.split('#').collect();
+    let location = game
+        .locations
+        .get(index(parts[0])?)
+        .ok_or("target_missing")?;
+    let code = match parts[1..] {
+        ["desc"] => return Ok(()),
+        ["code", literal] => Some((&location.code, literal)),
+        [action, "name"] | [action, "code", _] if action.starts_with("act") => {
+            let action = location
+                .actions
+                .get(index(&action[3..])?)
+                .ok_or("target_missing")?;
+            if parts.len() == 3 {
+                return Ok(());
+            }
+            Some((&action.code, parts[3]))
+        }
+        _ => None,
+    };
+    let (code, literal) = code.ok_or("invalid_locator")?;
+    let literal = index(literal.strip_prefix("str").ok_or("invalid_locator")?)?;
+    if literal < extract_quoted_literals(code).len() {
+        Ok(())
+    } else {
+        Err("target_missing")
+    }
+}
+
 /// Rewrite quoted literals in `code` left-to-right with `replacements`
 /// (same order / filter as [`extract_quoted_literals`]).
 fn replace_quoted_in_order(code: &str, replacements: &[String]) -> String {
@@ -565,11 +626,14 @@ impl FormatPlugin for QspPlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
-        let mut files_modified = 0;
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
-        let mut warnings = Vec::new();
-        let mut files_written = Vec::new();
+        let mut report = InjectionReport {
+            skip_reasons: Default::default(),
+            files_modified: 0,
+            strings_written: 0,
+            strings_skipped: 0,
+            warnings: Vec::new(),
+            files_written: Vec::new(),
+        };
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for e in entries {
@@ -589,8 +653,10 @@ impl FormatPlugin for QspPlugin {
                 search_root.join(file_path.file_name().unwrap_or_default())
             };
             if !actual.exists() {
-                warnings.push(format!("missing game file {}", file_path.display()));
-                strings_skipped += file_entries.len();
+                report
+                    .warnings
+                    .push(format!("missing game file {}", file_path.display()));
+                report.skip("target_missing", file_entries.len());
                 continue;
             }
             let bytes = std::fs::read(&actual)?;
@@ -602,8 +668,10 @@ impl FormatPlugin for QspPlugin {
             let mut game = match parse_game(&bytes, &fname) {
                 Ok(g) => g,
                 Err(e) => {
-                    warnings.push(format!("cannot parse {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
+                    report
+                        .warnings
+                        .push(format!("cannot parse {}: {e}", actual.display()));
+                    report.skip("decode_error", file_entries.len());
                     continue;
                 }
             };
@@ -612,26 +680,19 @@ impl FormatPlugin for QspPlugin {
             apply_translations(&mut game, file_entries);
             let after = serialize_game(&game);
             if after == before {
-                strings_skipped += file_entries.len();
+                classify_unchanged_entries(&game, file_entries, &mut report);
                 continue;
             }
             std::fs::write(&actual, &after)?;
-            files_modified += 1;
-            files_written.push(actual);
-            strings_written += file_entries
+            report.files_modified += 1;
+            report.files_written.push(actual);
+            report.strings_written += file_entries
                 .iter()
                 .filter(|e| e.translation.is_some())
                 .count();
         }
 
-        Ok(InjectionReport {
-            skip_reasons: Default::default(),
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings,
-            files_written,
-        })
+        Ok(report)
     }
 }
 
@@ -639,6 +700,89 @@ impl FormatPlugin for QspPlugin {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn c123_named_skips_for_unchanged_qsp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_qsp_fixture(dir.path()).join("game.qsp");
+        let before = fs::read(&path).unwrap();
+        let plugin = QspPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        entries.truncate(2);
+        entries[1].translation = Some(entries[1].source.clone());
+        let mut report = plugin.inject(&path, &entries).unwrap();
+        assert_eq!((report.strings_written, report.strings_skipped), (0, 2));
+        report.classify_remaining_skips();
+        assert_eq!(
+            report.skip_reasons,
+            [("untranslated".into(), 1), ("unchanged".into(), 1)].into()
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn c123_named_skips_for_missing_and_invalid_qsp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_qsp_fixture(dir.path()).join("game.qsp");
+        let plugin = QspPlugin::new();
+        let entries = plugin.extract(&path).unwrap();
+        for reason in ["decode_error", "target_missing"] {
+            if reason == "decode_error" {
+                fs::write(&path, b"broken").unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(report.strings_skipped, entries.len());
+            assert_eq!(report.skip_reasons, [(reason.into(), entries.len())].into());
+        }
+    }
+
+    #[test]
+    fn c123_named_skips_for_qsp_locators_and_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_qsp_fixture(dir.path()).join("game.qsp");
+        let original = fs::read(&path).unwrap();
+        let plugin = QspPlugin::new();
+        for (id, reason) in [
+            ("game.qsp#loc00#desc", "invalid_locator"),
+            ("game.qsp#loc0#code#str00", "invalid_locator"),
+            ("game.qsp#loc0#act00#name", "invalid_locator"),
+            ("game.qsp#loc0#unknown", "invalid_locator"),
+            ("game.qsp#loc9#desc", "target_missing"),
+            ("game.qsp#loc0#act9#name", "target_missing"),
+            ("game.qsp#loc0#code#str99", "target_missing"),
+            ("game.qsp#loc0#act0#code#str99", "target_missing"),
+            ("bad", "invalid_locator"),
+        ] {
+            let mut entry = StringEntry::new(id, "Old text", path.clone());
+            entry.translation = Some("New text".into());
+            let report = plugin.inject(&path, &[entry]).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (0, 1));
+            assert_eq!(report.skip_reasons, [(reason.into(), 1)].into(), "{id}");
+        }
+        let mut entries = plugin.extract(&path).unwrap();
+        for entry in &mut entries {
+            entry.translation = Some(entry.source.clone());
+        }
+        let mut earlier = entries[0].clone();
+        earlier.translation = Some("Overwritten by the identity row".into());
+        entries.insert(0, earlier);
+        let report = plugin.inject(&path, &entries).unwrap();
+        assert_eq!(
+            (report.strings_written, report.strings_skipped),
+            (0, entries.len())
+        );
+        assert_eq!(
+            report.skip_reasons,
+            [
+                ("duplicate".into(), 1),
+                ("unchanged".into(), entries.len() - 1)
+            ]
+            .into()
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
 
     fn tempdir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("locust_qsp_{}", uuid::Uuid::new_v4()));

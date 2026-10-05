@@ -906,12 +906,34 @@ fn escape_attribute(value: &str, quote: Option<u8>) -> String {
 
 /// Legacy #N addresses LF-delimited rows, never reinterpret it as a CR logical
 /// row. Both legacy and versioned locators must match the current source exactly.
+#[cfg(test)]
 fn apply_translations(
     bytes: &[u8],
     label: &str,
     file_entries: &[&StringEntry],
 ) -> Result<Option<(Vec<u8>, usize)>> {
-    let decoded = decode_ks_bytes(bytes, label)?;
+    apply_translations_classified(bytes, label, file_entries).map_err(|(_, error)| error)
+}
+
+type KsInjectionResult = std::result::Result<Option<(Vec<u8>, usize)>, (&'static str, LocustError)>;
+
+fn apply_translations_classified(
+    bytes: &[u8],
+    label: &str,
+    file_entries: &[&StringEntry],
+) -> KsInjectionResult {
+    let decoded = decode_ks_bytes(bytes, label).map_err(|error| {
+        let reason = match &error {
+            LocustError::ParseError { message, .. }
+                if message == "unsupported FE FE cipher mode" =>
+            {
+                "unsupported"
+            }
+            _ => "decode_error",
+        };
+        (reason, error)
+    })?;
+    let reject = |reason, message| (reason, parse_err(label, message));
     let slots = kag_slots(&decoded.text);
     let mut edits = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -923,20 +945,23 @@ fn apply_translations(
         let (rel, locator) = entry
             .id
             .rsplit_once('#')
-            .ok_or_else(|| parse_err(label, "missing KAG locator"))?;
+            .ok_or_else(|| reject("invalid_locator", "missing KAG locator"))?;
         let normalized_label = label.replace('\\', "/");
         let normalized_rel = rel.replace('\\', "/");
         if normalized_label != normalized_rel
             && !normalized_label.ends_with(&format!("/{normalized_rel}"))
         {
-            return Err(parse_err(label, "locator addresses a different script"));
+            return Err(reject(
+                "invalid_locator",
+                "locator addresses a different script",
+            ));
         }
         let slot = if locator.starts_with("kag:") {
             slots.iter().find(|slot| slot.locator == locator)
         } else {
             let no: usize = locator
                 .parse()
-                .map_err(|_| parse_err(label, "invalid legacy KAG locator"))?;
+                .map_err(|_| reject("invalid_locator", "invalid legacy KAG locator"))?;
             let mut offset = 0;
             let mut found = None;
             for (i, raw) in decoded.text.split('\n').enumerate() {
@@ -953,20 +978,35 @@ fn apply_translations(
             }
             found
         }
-        .ok_or_else(|| parse_err(label, "stale or unsafe KAG locator"))?;
-        if slot.source != entry.source || !seen.insert(&slot.locator) {
-            return Err(parse_err(label, "stale source or ambiguous KAG row"));
+        .ok_or_else(|| reject("invalid_locator", "stale or unsafe KAG locator"))?;
+        if slot.source != entry.source {
+            return Err(reject(
+                "source_changed",
+                "stale source or ambiguous KAG row",
+            ));
+        }
+        if !seen.insert(&slot.locator) {
+            return Err(reject(
+                "ambiguous_target",
+                "stale source or ambiguous KAG row",
+            ));
         }
         if translation == slot.source {
             continue;
         }
         if translation.contains(['\r', '\n', '\0']) {
-            return Err(parse_err(label, "translation changes line delimiters"));
+            return Err(reject(
+                "unsafe_controls",
+                "translation changes line delimiters",
+            ));
         }
         match slot.kind {
             KagSlotKind::Attribute(quote) => {
                 if translation.trim().is_empty() || translation.starts_with(['&', '%']) {
-                    return Err(parse_err(label, "display attribute must remain a literal"));
+                    return Err(reject(
+                        "invalid_translation",
+                        "display attribute must remain a literal",
+                    ));
                 }
                 let raw = &decoded.text[slot.start..slot.end];
                 // Keep original spelling/escaping in the shared prefix/suffix.
@@ -1016,7 +1056,10 @@ fn apply_translations(
                         .zip(&new_tags)
                         .any(|(a, b)| slot.source[a.start..a.end] != translation[b.start..b.end])
                 {
-                    return Err(parse_err(label, "translation changes protected KAG tags"));
+                    return Err(reject(
+                        "invalid_placeholders",
+                        "translation changes protected KAG tags",
+                    ));
                 }
                 let old_text = text_between_tags(&slot.source, &old_tags);
                 let new_text = text_between_tags(translation, &new_tags);
@@ -1025,8 +1068,8 @@ fn apply_translations(
                 if old_tail.ends_with('\\') != new_tail.ends_with('\\')
                     || !is_player_text_line(translation)
                 {
-                    return Err(parse_err(
-                        label,
+                    return Err(reject(
+                        "unsafe_controls",
                         "translation changes continuation or command controls",
                     ));
                 }
@@ -1035,12 +1078,15 @@ fn apply_translations(
                     if old.trim_end().ends_with('\\') {
                         let suffix = &old[old.trim_end().len() - 1..];
                         if !new.ends_with(suffix) {
-                            return Err(parse_err(label, "translation changes continuation"));
+                            return Err(reject(
+                                "unsafe_controls",
+                                "translation changes continuation",
+                            ));
                         }
                     }
                     if has_unescaped_bracket(new) {
-                        return Err(parse_err(
-                            label,
+                        return Err(reject(
+                            "unsupported_markup",
                             "translation introduces an unterminated KAG tag",
                         ));
                     }
@@ -1058,9 +1104,12 @@ fn apply_translations(
         .windows(2)
         .any(|pair| pair[0].end > pair[1].start || pair[0].start == pair[1].start)
     {
-        return Err(parse_err(label, "overlapping KAG translations"));
+        return Err(reject(
+            "overlapping_locators",
+            "overlapping KAG translations",
+        ));
     }
-    let encoded = encode_ks_edits(&decoded, &edits)?;
+    let encoded = encode_ks_edits(&decoded, &edits).map_err(|error| ("not_encodable", error))?;
     Ok(Some((encoded, written)))
 }
 
@@ -1365,11 +1414,14 @@ impl FormatPlugin for KirikiriPlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
-        let mut files_modified = 0;
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
-        let mut warnings = Vec::new();
-        let mut files_written = Vec::new();
+        let mut report = InjectionReport {
+            skip_reasons: Default::default(),
+            files_modified: 0,
+            strings_written: 0,
+            strings_skipped: 0,
+            warnings: Vec::new(),
+            files_written: Vec::new(),
+        };
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for e in entries {
@@ -1395,11 +1447,14 @@ impl FormatPlugin for KirikiriPlugin {
         for (file_path, file_entries) in &by_file {
             if let Some((archive_name, inner)) = split_xp3_virtual_path(file_path) {
                 if let Some(existing) = &existing_patch {
-                    strings_skipped += file_entries
+                    let skipped = file_entries
                         .iter()
                         .filter(|entry| entry.translation.is_some())
                         .count();
-                    warnings.push(format!("safe refusal: existing XP3 patch {} must retain all members, encrypted payloads, metadata and active precedence; lossless patch merging is unsupported", existing.display()));
+                    if skipped > 0 {
+                        report.skip("unsupported_container", skipped);
+                    }
+                    report.warnings.push(format!("safe refusal: existing XP3 patch {} must retain all members, encrypted payloads, metadata and active precedence; lossless patch merging is unsupported", existing.display()));
                     continue;
                 }
                 if !archive_cache.contains_key(&archive_name) {
@@ -1416,10 +1471,10 @@ impl FormatPlugin for KirikiriPlugin {
                             );
                         }
                         Err(e) => {
-                            warnings.push(format!(
+                            report.warnings.push(format!(
                                 "cannot open base archive {archive_name} for inject: {e}"
                             ));
-                            strings_skipped += file_entries.len();
+                            report.skip("archive_error", file_entries.len());
                             continue;
                         }
                     }
@@ -1434,8 +1489,10 @@ impl FormatPlugin for KirikiriPlugin {
                 {
                     Some(e) => e.clone(),
                     None => {
-                        warnings.push(format!("entry {inner} not found in {archive_name}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("entry {inner} not found in {archive_name}"));
+                        report.skip("target_missing", file_entries.len());
                         continue;
                     }
                 };
@@ -1443,23 +1500,37 @@ impl FormatPlugin for KirikiriPlugin {
                 let bytes = match cached.archive.read_entry(&entry) {
                     Ok(b) => b,
                     Err(e) => {
-                        warnings.push(format!("read {archive_name}/{inner}: {e}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("read {archive_name}/{inner}: {e}"));
+                        report.skip("read_error", file_entries.len());
                         continue;
                     }
                 };
                 let label = format!("{archive_name}/{inner}");
-                match apply_translations(&bytes, &label, file_entries) {
+                match apply_translations_classified(&bytes, &label, file_entries) {
                     Ok(Some((encoded, written))) => {
                         patch_files.push((inner.replace('\\', "/"), encoded));
                         pending_patch_strings += written;
                     }
                     Ok(None) => {
-                        strings_skipped += file_entries.len();
+                        // Only a wholly unchanged file counted these rows before.
+                        for entry in file_entries {
+                            report.skip(
+                                if entry.translation.is_none() {
+                                    "untranslated"
+                                } else {
+                                    "unchanged"
+                                },
+                                1,
+                            );
+                        }
                     }
-                    Err(e) => {
-                        warnings.push(format!("cannot translate {label}: {e}"));
-                        strings_skipped += file_entries.len();
+                    Err((reason, e)) => {
+                        report
+                            .warnings
+                            .push(format!("cannot translate {label}: {e}"));
+                        report.skip(reason, file_entries.len());
                     }
                 }
                 continue;
@@ -1477,33 +1548,49 @@ impl FormatPlugin for KirikiriPlugin {
                 }
             };
             if !actual.exists() {
-                warnings.push(format!("missing script {}", file_path.display()));
-                strings_skipped += file_entries.len();
+                report
+                    .warnings
+                    .push(format!("missing script {}", file_path.display()));
+                report.skip("target_missing", file_entries.len());
                 continue;
             }
 
             let bytes = match std::fs::read(&actual) {
                 Ok(b) => b,
                 Err(e) => {
-                    warnings.push(format!("read {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
+                    report
+                        .warnings
+                        .push(format!("read {}: {e}", actual.display()));
+                    report.skip("read_error", file_entries.len());
                     continue;
                 }
             };
             let label = actual.display().to_string();
-            match apply_translations(&bytes, &label, file_entries) {
+            match apply_translations_classified(&bytes, &label, file_entries) {
                 Ok(Some((encoded, written))) => {
                     std::fs::write(&actual, &encoded)?;
-                    files_modified += 1;
-                    files_written.push(actual);
-                    strings_written += written;
+                    report.files_modified += 1;
+                    report.files_written.push(actual);
+                    report.strings_written += written;
                 }
                 Ok(None) => {
-                    strings_skipped += file_entries.len();
+                    // Only a wholly unchanged file counted these rows before.
+                    for entry in file_entries {
+                        report.skip(
+                            if entry.translation.is_none() {
+                                "untranslated"
+                            } else {
+                                "unchanged"
+                            },
+                            1,
+                        );
+                    }
                 }
-                Err(e) => {
-                    warnings.push(format!("cannot re-encode {label}: {e}"));
-                    strings_skipped += file_entries.len();
+                Err((reason, e)) => {
+                    report
+                        .warnings
+                        .push(format!("cannot re-encode {label}: {e}"));
+                    report.skip(reason, file_entries.len());
                 }
             }
         }
@@ -1531,30 +1618,122 @@ impl FormatPlugin for KirikiriPlugin {
                         .open(&patch_path)?;
                     output.write_all(&bytes)?;
                     output.sync_all()?;
-                    files_modified += 1;
-                    strings_written += pending_patch_strings;
-                    files_written.push(patch_path);
+                    report.files_modified += 1;
+                    report.strings_written += pending_patch_strings;
+                    report.files_written.push(patch_path);
                 }
                 Err(e) => {
-                    strings_skipped += pending_patch_strings;
-                    warnings.push(format!("failed to build patch.xp3 (0 archive writes): {e}"));
+                    report.skip("rebuild_error", pending_patch_strings);
+                    report
+                        .warnings
+                        .push(format!("failed to build patch.xp3 (0 archive writes): {e}"));
                 }
             }
         }
 
-        Ok(InjectionReport {
-            skip_reasons: Default::default(),
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings,
-            files_written,
-        })
+        Ok(report)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c123_named_skips_for_existing_patch_preserve_zero_count() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("patch.xp3"), b"existing patch").unwrap();
+        let mut entry = StringEntry::new(
+            "data.xp3/story.ks#kag:1",
+            "Hello",
+            "data.xp3/story.ks".into(),
+        );
+        let plugin = KirikiriPlugin::new();
+        let report = plugin.inject(dir.path(), &[entry.clone()]).unwrap();
+        assert_eq!((report.strings_written, report.strings_skipped), (0, 0));
+        assert!(report.skip_reasons.is_empty(), "{report:?}");
+        entry.translation = Some("Translated".into());
+        let report = plugin.inject(dir.path(), &[entry]).unwrap();
+        assert_eq!((report.strings_written, report.strings_skipped), (0, 1));
+        assert_eq!(
+            report.skip_reasons,
+            [("unsupported_container".into(), 1)].into()
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("patch.xp3")).unwrap(),
+            b"existing patch"
+        );
+    }
+
+    #[test]
+    fn c123_named_skips_for_kag_noops_and_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("story.ks");
+        let original = b"Hello world[l]\n";
+        std::fs::write(&path, original).unwrap();
+        let plugin = KirikiriPlugin::new();
+        let entry = plugin.extract(&path).unwrap().remove(0);
+        for (translation, reason) in [
+            (None, "untranslated"),
+            (Some("Hello world[l]"), "unchanged"),
+            (Some("Hello\nworld[l]"), "unsafe_controls"),
+            (Some("Translated world"), "invalid_placeholders"),
+        ] {
+            let mut row = entry.clone();
+            row.translation = translation.map(str::to_string);
+            let mut report = plugin.inject(&path, &[row]).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (0, 1));
+            report.classify_remaining_skips();
+            assert_eq!(report.skip_reasons, [(reason.into(), 1)].into(), "{reason}");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn c123_named_skips_for_kag_encoding_and_stale_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("story.ks");
+        let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode("こんにちは世界\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let plugin = KirikiriPlugin::new();
+        let entry = plugin.extract(&path).unwrap().remove(0);
+        for reason in [
+            "not_encodable",
+            "source_changed",
+            "invalid_locator",
+            "ambiguous_target",
+        ] {
+            let mut row = entry.clone();
+            row.translation = Some(
+                if reason == "not_encodable" {
+                    "\u{1f600}"
+                } else {
+                    "Hello"
+                }
+                .into(),
+            );
+            if reason == "source_changed" {
+                row.source = "Old source".into();
+            }
+            if reason == "invalid_locator" {
+                row.id = "no locator".into();
+            }
+            let rows = if reason == "ambiguous_target" {
+                vec![row.clone(), row]
+            } else {
+                vec![row]
+            };
+            let report = plugin.inject(&path, &rows).unwrap();
+            assert_eq!(
+                (report.strings_written, report.strings_skipped),
+                (0, rows.len())
+            );
+            assert_eq!(
+                report.skip_reasons,
+                [(reason.into(), rows.len())].into(),
+                "{reason}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes.as_ref());
+        }
+    }
     use super::*;
     use std::fs;
 

@@ -1392,17 +1392,53 @@ fn entries_with_commands(
     Ok(all)
 }
 
+// These errors originate in this module's YSTB serializers. Keep the reason
+// separate from the warning (which includes the script name and error details).
+fn ystb_skip_reason(error: &LocustError) -> &'static str {
+    let LocustError::ParseError { message, .. } = error else {
+        return "rebuild_error";
+    };
+    match message.as_str() {
+        "cannot edit aliased/overlapping attribute payload" => "overlapping_locators",
+        "text cannot be encoded in Shift-JIS" => "not_encodable",
+        "unknown raw control token or bare CR" | "raw control sequence changed" => {
+            "unsafe_controls"
+        }
+        "expression string exceeds u16 length"
+        | "caption exceeds i16 length"
+        | "attribute too large"
+        | "attribute offset overflow"
+        | "values section too large" => "too_long",
+        _ if message.starts_with("message cannot contain backticks [") => "invalid_translation",
+        _ if message.starts_with("cannot serialize attribute type ") => "unsupported",
+        _ => "rebuild_error",
+    }
+}
+
+#[cfg(test)]
 fn translations_from_entries(
     file_entries: &[&StringEntry],
     ystb: &DecryptedYstb,
     warnings: &mut Vec<String>,
 ) -> (HashMap<usize, String>, usize) {
+    let (translations, reasons) = translations_with_skip_reasons(file_entries, ystb, warnings);
+    (translations, reasons.values().sum())
+}
+
+fn translations_with_skip_reasons(
+    file_entries: &[&StringEntry],
+    ystb: &DecryptedYstb,
+    warnings: &mut Vec<String>,
+) -> (
+    HashMap<usize, String>,
+    std::collections::BTreeMap<String, usize>,
+) {
     let mut translations = HashMap::new();
-    let mut skipped = 0usize;
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
     let context = layout_context(ystb);
     for e in file_entries {
         let Some(t) = e.translation.as_deref() else {
-            skipped += 1;
+            *reasons.entry("untranslated".into()).or_default() += 1;
             continue;
         };
         let index = if ystb.caption && e.id.ends_with("#caption") {
@@ -1417,7 +1453,7 @@ fn translations_from_entries(
                 // injection it is the previous translation by design.
                 if e.context.as_deref() != Some(context.as_str()) {
                     warnings.push(format!("skip {}: physical layout changed", e.id));
-                    skipped += 1;
+                    *reasons.entry("source_changed".into()).or_default() += 1;
                     continue;
                 }
                 // Messages carry the author's own hard wraps; a provider hands
@@ -1437,7 +1473,7 @@ fn translations_from_entries(
                 };
                 if let Err(err) = encoded {
                     warnings.push(format!("skip {}: {err}", e.id));
-                    skipped += 1;
+                    *reasons.entry(ystb_skip_reason(&err).into()).or_default() += 1;
                     continue;
                 }
                 if !ystb.caption
@@ -1445,7 +1481,7 @@ fn translations_from_entries(
                     && raw_control_sequence(&s.text) != raw_control_sequence(&text)
                 {
                     warnings.push(format!("skip {}: protected control sequence changed", e.id));
-                    skipped += 1;
+                    *reasons.entry("unsafe_controls".into()).or_default() += 1;
                     continue;
                 }
                 translations.insert(s.arg_index, text);
@@ -1453,9 +1489,9 @@ fn translations_from_entries(
             }
         }
         warnings.push(format!("skip {}: obsolete or unknown YU-RIS locator", e.id));
-        skipped += 1;
+        *reasons.entry("invalid_locator".into()).or_default() += 1;
     }
-    (translations, skipped)
+    (translations, reasons)
 }
 
 /// Split `ysbin/test.ypf/yst00000.ybn` → (`ysbin/test.ypf` relative path, `yst00000.ybn`).
@@ -1677,11 +1713,14 @@ impl FormatPlugin for YurisPlugin {
         game_lock: &GameLock,
     ) -> Result<InjectionReport> {
         game_lock.validate_selection(path)?;
-        let mut files_modified = 0;
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
-        let mut warnings = Vec::new();
-        let mut files_written = Vec::new();
+        let mut report = InjectionReport {
+            skip_reasons: Default::default(),
+            files_modified: 0,
+            strings_written: 0,
+            strings_skipped: 0,
+            warnings: Vec::new(),
+            files_written: Vec::new(),
+        };
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for e in entries {
@@ -1718,8 +1757,10 @@ impl FormatPlugin for YurisPlugin {
                 }
             };
             if !actual.exists() {
-                warnings.push(format!("missing script {}", file_path.display()));
-                strings_skipped += file_entries.len();
+                report
+                    .warnings
+                    .push(format!("missing script {}", file_path.display()));
+                report.skip("target_missing", file_entries.len());
                 continue;
             }
 
@@ -1727,8 +1768,10 @@ impl FormatPlugin for YurisPlugin {
             let bytes = match std::fs::read(&actual) {
                 Ok(b) => b,
                 Err(e) => {
-                    warnings.push(format!("read {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
+                    report
+                        .warnings
+                        .push(format!("read {}: {e}", actual.display()));
+                    report.skip("read_error", file_entries.len());
                     continue;
                 }
             };
@@ -1737,20 +1780,26 @@ impl FormatPlugin for YurisPlugin {
             let ystb = match load_ystb_with_commands(&bytes, &label, commands.as_ref()) {
                 Ok(Some(y)) => y,
                 Ok(None) => {
-                    warnings.push(format!("skip non-YSTB {}", actual.display()));
-                    strings_skipped += file_entries.len();
+                    report
+                        .warnings
+                        .push(format!("skip non-YSTB {}", actual.display()));
+                    report.skip("unsupported", file_entries.len());
                     continue;
                 }
                 Err(e) => {
-                    warnings.push(format!("cannot parse {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
+                    report
+                        .warnings
+                        .push(format!("cannot parse {}: {e}", actual.display()));
+                    report.skip("decode_error", file_entries.len());
                     continue;
                 }
             };
 
             let (translations, skipped) =
-                translations_from_entries(&file_entries, &ystb, &mut warnings);
-            strings_skipped += skipped;
+                translations_with_skip_reasons(&file_entries, &ystb, &mut report.warnings);
+            for (reason, count) in skipped {
+                report.skip(&reason, count);
+            }
             if translations.is_empty() {
                 continue;
             }
@@ -1758,15 +1807,17 @@ impl FormatPlugin for YurisPlugin {
             let new_bytes = match inject_into_ystb(&ystb, &translations) {
                 Ok(b) => b,
                 Err(e) => {
-                    warnings.push(format!("inject {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
+                    report
+                        .warnings
+                        .push(format!("inject {}: {e}", actual.display()));
+                    report.skip(ystb_skip_reason(&e), file_entries.len());
                     continue;
                 }
             };
             std::fs::write(&actual, &new_bytes)?;
-            files_modified += 1;
-            files_written.push(actual);
-            strings_written += translations.len();
+            report.files_modified += 1;
+            report.files_written.push(actual);
+            report.strings_written += translations.len();
         }
 
         // YPF archives — rebuild each affected archive in place with an exclusively owned backup
@@ -1781,9 +1832,11 @@ impl FormatPlugin for YurisPlugin {
                 }
             };
             if !arch_path.exists() {
-                warnings.push(format!("missing archive {archive_rel}"));
+                report
+                    .warnings
+                    .push(format!("missing archive {archive_rel}"));
                 for (_, fe) in &inners {
-                    strings_skipped += fe.len();
+                    report.skip("target_missing", fe.len());
                 }
                 continue;
             }
@@ -1792,9 +1845,11 @@ impl FormatPlugin for YurisPlugin {
             let archive = match YpfArchive::open(&arch_path) {
                 Ok(a) => a,
                 Err(e) => {
-                    warnings.push(format!("cannot open {archive_rel}: {e}"));
+                    report
+                        .warnings
+                        .push(format!("cannot open {archive_rel}: {e}"));
                     for (_, fe) in &inners {
-                        strings_skipped += fe.len();
+                        report.skip("archive_error", fe.len());
                     }
                     continue;
                 }
@@ -1819,16 +1874,20 @@ impl FormatPlugin for YurisPlugin {
                 let entry = match member_index.find(&inner) {
                     Some(e) => e,
                     None => {
-                        warnings.push(format!("entry {inner} not in {archive_rel}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("entry {inner} not in {archive_rel}"));
+                        report.skip("target_missing", file_entries.len());
                         continue;
                     }
                 };
                 let bytes = match archive.read_entry(entry) {
                     Ok(b) => b,
                     Err(e) => {
-                        warnings.push(format!("read {archive_rel}/{inner}: {e}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("read {archive_rel}/{inner}: {e}"));
+                        report.skip("read_error", file_entries.len());
                         continue;
                     }
                 };
@@ -1836,19 +1895,21 @@ impl FormatPlugin for YurisPlugin {
                 let ystb = match load_ystb_with_commands(&bytes, &label, commands.as_ref()) {
                     Ok(Some(y)) => y,
                     Ok(None) => {
-                        warnings.push(format!("skip non-YSTB {label}"));
-                        strings_skipped += file_entries.len();
+                        report.warnings.push(format!("skip non-YSTB {label}"));
+                        report.skip("unsupported", file_entries.len());
                         continue;
                     }
                     Err(e) => {
-                        warnings.push(format!("cannot parse {label}: {e}"));
-                        strings_skipped += file_entries.len();
+                        report.warnings.push(format!("cannot parse {label}: {e}"));
+                        report.skip("decode_error", file_entries.len());
                         continue;
                     }
                 };
                 let (translations, skipped) =
-                    translations_from_entries(&file_entries, &ystb, &mut warnings);
-                strings_skipped += skipped;
+                    translations_with_skip_reasons(&file_entries, &ystb, &mut report.warnings);
+                for (reason, count) in skipped {
+                    report.skip(&reason, count);
+                }
                 if translations.is_empty() {
                     continue;
                 }
@@ -1858,8 +1919,8 @@ impl FormatPlugin for YurisPlugin {
                         arch_written += translations.len();
                     }
                     Err(e) => {
-                        warnings.push(format!("inject {label}: {e}"));
-                        strings_skipped += file_entries.len();
+                        report.warnings.push(format!("inject {label}: {e}"));
+                        report.skip(ystb_skip_reason(&e), file_entries.len());
                     }
                 }
             }
@@ -1871,31 +1932,26 @@ impl FormatPlugin for YurisPlugin {
             match yuris_ypf::rebuild_ypf(&archive, &replacements) {
                 Ok(new_arch) => match replace_files(game_lock, &[(arch_path.clone(), new_arch)]) {
                     Ok(backups) => {
-                        note_backups(backups, &mut warnings);
-                        files_modified += 1;
-                        files_written.push(arch_path.clone());
-                        strings_written += arch_written;
+                        note_backups(backups, &mut report.warnings);
+                        report.files_modified += 1;
+                        report.files_written.push(arch_path.clone());
+                        report.strings_written += arch_written;
                     }
                     Err(e) => {
-                        warnings.push(format!("safe-replace {archive_rel}: {e}"));
-                        strings_skipped += arch_written;
+                        report
+                            .warnings
+                            .push(format!("safe-replace {archive_rel}: {e}"));
+                        report.skip("write_error", arch_written);
                     }
                 },
                 Err(e) => {
-                    warnings.push(format!("rebuild {archive_rel}: {e}"));
-                    strings_skipped += arch_written;
+                    report.warnings.push(format!("rebuild {archive_rel}: {e}"));
+                    report.skip("rebuild_error", arch_written);
                 }
             }
         }
 
-        Ok(InjectionReport {
-            skip_reasons: Default::default(),
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings,
-            files_written,
-        })
+        Ok(report)
     }
 }
 
@@ -1903,6 +1959,71 @@ impl FormatPlugin for YurisPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c123_named_skips_for_yuris_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("story.ybn");
+        let original = real_layout(&[(108, vec![(0, ATTR_RAW, b"Hello world".to_vec())])], 0);
+        fs::write(&path, &original).unwrap();
+        let plugin = YurisPlugin::new();
+        let entry = plugin.extract(dir.path()).unwrap().remove(0);
+        for reason in [
+            "untranslated",
+            "not_encodable",
+            "source_changed",
+            "invalid_locator",
+            "unsafe_controls",
+        ] {
+            let mut row = entry.clone();
+            row.translation = match reason {
+                "untranslated" => None,
+                "not_encodable" => Some("\u{1f600}".into()),
+                "unsafe_controls" => Some("Hello\rworld".into()),
+                _ => Some("Translated".into()),
+            };
+            if reason == "source_changed" {
+                row.context = None;
+            }
+            if reason == "invalid_locator" {
+                row.id = "story.ybn#arg0".into();
+            }
+            let mut report = plugin.inject(dir.path(), &[row]).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (0, 1));
+            report.classify_remaining_skips();
+            assert_eq!(report.skip_reasons, [(reason.into(), 1)].into(), "{reason}");
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn c123_named_skips_for_aliased_yuris_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("story.ybn");
+        let mut original = real_layout(
+            &[
+                (108, vec![(0, ATTR_RAW, b"Hello world".to_vec())]),
+                (108, vec![(0, ATTR_RAW, b"Hello world".to_vec())]),
+            ],
+            0,
+        );
+        let hdr = parse_header(&original, "story").unwrap();
+        let (_, desc, _, _) = section_offsets(&hdr);
+        write_u32(&mut original, desc + ATTR_DESC_SIZE + 8, 0);
+        fs::write(&path, &original).unwrap();
+        let plugin = YurisPlugin::new();
+        let mut entries = plugin.extract(dir.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in &mut entries {
+            entry.translation = Some(format!("TL {}", entry.source));
+        }
+        let report = plugin.inject(dir.path(), &entries).unwrap();
+        assert_eq!((report.strings_written, report.strings_skipped), (0, 2));
+        assert_eq!(
+            report.skip_reasons,
+            [("overlapping_locators".into(), 2)].into()
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
     // Real four-byte instructions and twelve-byte descriptors, including
     // values padding and a tail that are deliberately outside all attributes.
     type FixtureCommand = (u8, Vec<(i16, i16, Vec<u8>)>);

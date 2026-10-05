@@ -248,8 +248,14 @@ impl FormatPlugin for VnTextPatchPlugin {
             by_file.entry(target).or_default().push((index, key, entry));
         }
 
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
+        let mut report = InjectionReport {
+            skip_reasons: Default::default(),
+            files_modified: 0,
+            strings_written: 0,
+            strings_skipped: 0,
+            warnings: Vec::new(),
+            files_written: Vec::new(),
+        };
         let mut prepared = Vec::new();
         for (file_path, file_entries) in by_file {
             let text = std::fs::read_to_string(&file_path)?;
@@ -258,7 +264,7 @@ impl FormatPlugin for VnTextPatchPlugin {
             for (index, key, entry) in file_entries {
                 let Some(translation) = entry.translation.as_deref().filter(|t| !t.is_empty())
                 else {
-                    strings_skipped += 1;
+                    report.skip("untranslated", 1);
                     continue;
                 };
                 if let Some(obj) = arr.get_mut(index).and_then(|v| v.as_object_mut()) {
@@ -267,7 +273,7 @@ impl FormatPlugin for VnTextPatchPlugin {
                             key.to_string(),
                             serde_json::Value::String(translation.to_string()),
                         );
-                        strings_written += 1;
+                        report.strings_written += 1;
                         modified = true;
                     }
                 }
@@ -285,7 +291,6 @@ impl FormatPlugin for VnTextPatchPlugin {
                 })?,
             )?;
         }
-        let mut files_written = Vec::new();
         for (file, output) in prepared {
             ensure_no_links(
                 &dir,
@@ -294,18 +299,11 @@ impl FormatPlugin for VnTextPatchPlugin {
                 })?,
             )?;
             std::fs::write(&file, output)?;
-            files_written.push(file);
+            report.files_written.push(file);
         }
-        let files_modified = files_written.len();
+        report.files_modified = report.files_written.len();
 
-        Ok(InjectionReport {
-            skip_reasons: Default::default(),
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings: Vec::new(),
-            files_written,
-        })
+        Ok(report)
     }
 }
 
@@ -313,6 +311,29 @@ impl FormatPlugin for VnTextPatchPlugin {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn c123_named_untranslated_skips_preserve_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("story.json");
+        fs::write(
+            &path,
+            r#"[{"message":"First"},{"message":"Second"},{"message":"Third"}]"#,
+        )
+        .unwrap();
+        let plugin = VnTextPatchPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        entries[1].translation = Some(String::new());
+        entries[2].translation = Some("Translated".into());
+        let mut report = plugin.inject(&path, &entries).unwrap();
+        assert_eq!((report.strings_written, report.strings_skipped), (1, 2));
+        report.classify_remaining_skips();
+        assert_eq!(report.skip_reasons, [("untranslated".into(), 2)].into());
+        let output: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(output[0]["message"], "First");
+        assert_eq!(output[1]["message"], "Second");
+        assert_eq!(output[2]["message"], "Translated");
+    }
 
     fn tmp() -> PathBuf {
         let d = std::env::temp_dir().join(format!("locust_vntp_{}", uuid::Uuid::new_v4()));

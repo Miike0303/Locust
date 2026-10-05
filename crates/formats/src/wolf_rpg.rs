@@ -247,14 +247,17 @@ impl FormatPlugin for WolfRpgPlugin {
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
         // Same resilience/perf posture as Unity/Unreal: identity skip, oversize
         // skip (not hard fail), first-byte scan, capped pad/length noise.
-        let mut files_modified = 0;
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
+        let mut report = InjectionReport {
+            skip_reasons: Default::default(),
+            files_modified: 0,
+            strings_written: 0,
+            strings_skipped: 0,
+            warnings: Vec::new(),
+            files_written: Vec::new(),
+        };
         let mut length_skipped = 0usize;
         let mut pad_noted = 0usize;
         let mut find_missed = 0usize;
-        let mut warnings = Vec::new();
-        let mut files_written: Vec<PathBuf> = Vec::new();
 
         // Group by file
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
@@ -293,7 +296,7 @@ impl FormatPlugin for WolfRpgPlugin {
                 let translation = match &entry.translation {
                     Some(t) => t,
                     None => {
-                        strings_skipped += 1;
+                        report.skip("untranslated", 1);
                         continue;
                     }
                 };
@@ -302,33 +305,33 @@ impl FormatPlugin for WolfRpgPlugin {
                 let encoding = encoding_rs::SHIFT_JIS;
                 let (orig_bytes, _, orig_err) = encoding.encode(&entry.source);
                 if orig_err {
-                    warnings.push(format!(
+                    report.warnings.push(format!(
                         "could not encode original '{}' to Shift-JIS",
                         entry.id
                     ));
-                    strings_skipped += 1;
+                    report.skip("not_encodable", 1);
                     continue;
                 }
 
                 let (trans_bytes, _, trans_err) = encoding.encode(translation);
                 if trans_err {
-                    warnings.push(format!(
+                    report.warnings.push(format!(
                         "could not encode translation for '{}' to Shift-JIS",
                         entry.id
                     ));
-                    strings_skipped += 1;
+                    report.skip("not_encodable", 1);
                     continue;
                 }
 
                 // Identity: nothing to rewrite; skip the multi-MB scan.
                 if trans_bytes.as_ref() == orig_bytes.as_ref() {
-                    strings_skipped += 1;
+                    report.skip("unchanged", 1);
                     continue;
                 }
 
                 if trans_bytes.len() > orig_bytes.len() {
                     if length_skipped < 5 {
-                        warnings.push(format!(
+                        report.warnings.push(format!(
                             "translation for '{}' longer than original in Shift-JIS ({} > {} bytes), skipping",
                             entry.id,
                             trans_bytes.len(),
@@ -336,7 +339,7 @@ impl FormatPlugin for WolfRpgPlugin {
                         ));
                     }
                     length_skipped += 1;
-                    strings_skipped += 1;
+                    report.skip("too_long", 1);
                     continue;
                 }
 
@@ -350,7 +353,7 @@ impl FormatPlugin for WolfRpgPlugin {
                             *b = 0;
                         }
                         if pad_noted < 5 {
-                            warnings.push(format!(
+                            report.warnings.push(format!(
                                 "padded {} null bytes for '{}'",
                                 orig_bytes.len() - trans_bytes.len(),
                                 entry.id
@@ -358,43 +361,36 @@ impl FormatPlugin for WolfRpgPlugin {
                         }
                         pad_noted += 1;
                     }
-                    strings_written += 1;
+                    report.strings_written += 1;
                     modified = true;
                 } else {
                     if find_missed < 5 {
-                        warnings.push(format!(
+                        report.warnings.push(format!(
                             "could not find original bytes for '{}' in file",
                             entry.id
                         ));
                     }
                     find_missed += 1;
-                    strings_skipped += 1;
+                    report.skip("target_missing", 1);
                 }
             }
 
             if modified {
                 std::fs::write(&actual_path, &bytes)?;
-                files_modified += 1;
-                files_written.push(actual_path);
+                report.files_modified += 1;
+                report.files_written.push(actual_path);
             }
         }
 
         if length_skipped > 0 {
-            warnings.push(format!(
+            report.warnings.push(format!(
                 "{length_skipped} translation(s) skipped because they are longer than the \
                  original Wolf string (Shift-JIS byte length must be ≤ source). Shorten them or \
                  use a length-aware model; equal-length translations inject cleanly."
             ));
         }
 
-        Ok(InjectionReport {
-            skip_reasons: Default::default(),
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings,
-            files_written,
-        })
+        Ok(report)
     }
 }
 
@@ -461,6 +457,34 @@ pub fn build_test_fixture() -> Vec<u8> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn c123_named_skips_cover_all_wolf_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("BasicData.wolf");
+        fs::write(&path, b"Original text\0").unwrap();
+        let cases = [
+            ("Original text", None, "untranslated"),
+            ("\u{1f600}", Some("Hello"), "not_encodable"),
+            ("Original text", Some("\u{1f600}"), "not_encodable"),
+            ("Original text", Some("Original text"), "unchanged"),
+            (
+                "Original text",
+                Some("A much longer translation"),
+                "too_long",
+            ),
+            ("Missing source", Some("Hello"), "target_missing"),
+        ];
+        for (source, translation, reason) in cases {
+            let mut entry = StringEntry::new("test", source, path.clone());
+            entry.translation = translation.map(str::to_string);
+            let mut report = WolfRpgPlugin::new().inject(dir.path(), &[entry]).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (0, 1));
+            report.classify_remaining_skips();
+            assert_eq!(report.skip_reasons, [(reason.into(), 1)].into(), "{reason}");
+            assert_eq!(fs::read(&path).unwrap(), b"Original text\0");
+        }
+    }
 
     /// Every test gets its OWN fixture directory. This used to build into a
     /// fixed, git-tracked path under `tests/fixtures/wolf_rpg`, which four tests
