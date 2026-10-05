@@ -1,9 +1,10 @@
 name: CI
 
+# Pushes to main do not run CI; only version tags (and manual dispatch) do.
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 concurrency:
