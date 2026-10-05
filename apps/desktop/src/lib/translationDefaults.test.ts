@@ -248,3 +248,31 @@ assert.equal(buildTranslationStartParams(budgetForm).options.cost_limit_usd, 0);
 for (const costLimit of ["-1", "NaN", "Infinity", "2oops", "1,5"]) {
   assert.throws(() => buildTranslationStartParams({ ...budgetForm, costLimit }), /cost limit/);
 }
+
+// --- project-aware languages (cycle 116 QA: an English game opened as ja -> en) ---
+import { detectSourceLanguage } from "./translationDefaults.ts";
+const english = ["New Game", "Load Game", "Options", "You really haven't aged a day.", "Where are we going tonight?"];
+const japanese = ["こんにちは、世界。", "今日はいい天気ですね。", "ニューゲーム"];
+assert.equal(detectSourceLanguage(english.concat(english, english)), "en");
+assert.equal(detectSourceLanguage(japanese), "ja");
+assert.equal(detectSourceLanguage(Array(3).fill(["안녕하세요, 반갑습니다.", "새 게임"]).flat()), "ko");
+assert.equal(detectSourceLanguage(Array(3).fill(["你好，世界。", "今天天气很好。", "新游戏开始"]).flat()), "zh-CN");
+assert.equal(detectSourceLanguage(Array(3).fill(["Привет, мир.", "Новая игра"]).flat()), "ru");
+// Accented Latin text is not assumed to be English; tiny samples decide nothing.
+assert.equal(detectSourceLanguage(["¿Adónde vamos esta noche?", "Configuración", "Canción de la mañana"]), null);
+assert.equal(detectSourceLanguage(["OK"]), null);
+assert.equal(detectSourceLanguage([]), null);
+
+const factory = { default_source_lang: "ja", default_target_lang: "en" };
+// The project's own text beats the global source default and a previous project's last-used source.
+assert.equal(resolveTranslationDefaults(factory, undefined, { detectedSource: "en", uiLocale: "es" }).sourceLang, "en");
+assert.equal(resolveTranslationDefaults(factory, { source: "ja" }, { detectedSource: "en", uiLocale: "es" }).sourceLang, "en");
+// Target never equals the source: fall back to the UI language, then English, then Spanish.
+assert.equal(resolveTranslationDefaults(factory, undefined, { detectedSource: "en", uiLocale: "es" }).targetLang, "es");
+assert.equal(resolveTranslationDefaults(factory, undefined, { detectedSource: "en", uiLocale: "en" }).targetLang, "es");
+assert.equal(resolveTranslationDefaults({ default_target_lang: "es" }, undefined, { detectedSource: "es", uiLocale: "es" }).targetLang, "en");
+// A target the user chose that differs from the source is kept.
+assert.equal(resolveTranslationDefaults(factory, { target: "fr" }, { detectedSource: "en", uiLocale: "es" }).targetLang, "fr");
+// Without detection nothing changes.
+assert.deepEqual(resolveTranslationDefaults(factory, undefined, { detectedSource: null, uiLocale: "es" }),
+  resolveTranslationDefaults(factory, undefined));

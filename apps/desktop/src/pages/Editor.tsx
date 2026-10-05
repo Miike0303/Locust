@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -138,6 +138,11 @@ export default function Editor() {
 		staleTime: 30_000,
 		enabled: !!project,
 	});
+
+	const sampleSources = useMemo(
+		() => stringsData?.entries.map((e) => e.source),
+		[stringsData],
+	);
 
 	const { data: statsData } = useQuery({
 		queryKey: ["stats", projectKey],
@@ -582,6 +587,7 @@ export default function Editor() {
 				totalPending={statsData?.pending || 0}
 				onComplete={handleRefetch}
 				onReview={() => navigate("/review")}
+				sampleSources={sampleSources}
 			/>
 
 			{/* Inject Modal */}

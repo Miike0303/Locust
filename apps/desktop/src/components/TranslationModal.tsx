@@ -18,6 +18,7 @@ import {
 	setTranslationModalOpen,
 } from "../lib/translationJobSession";
 import {
+	detectSourceLanguage,
 	resolveTranslationDefaults,
 	coerceProviderId,
 	readLastUsedTranslationPrefs,
@@ -41,7 +42,7 @@ import {
 	type OperationalShortcut,
 } from "../lib/settingsNav";
 import { resolveProviderReadiness, formatProviderOptionLabel } from "../lib/providerReadiness";
-import { useT } from "../lib/i18n";
+import { useLocale, useT } from "../lib/i18n";
 
 interface TranslationModalProps {
 	open: boolean;
@@ -49,6 +50,8 @@ interface TranslationModalProps {
 	totalPending: number;
 	onComplete: () => void;
 	onReview?: () => void;
+	/** Source strings of the open project, used to guess its language. */
+	sampleSources?: readonly string[];
 }
 
 export default function TranslationModal({
@@ -57,8 +60,10 @@ export default function TranslationModal({
 	totalPending,
 	onComplete,
 	onReview,
+	sampleSources,
 }: TranslationModalProps) {
 	const t = useT();
+	const { locale } = useLocale();
 	const navigate = useNavigate();
 	const { data: providers } = useQuery({
 		queryKey: ["providers"],
@@ -116,6 +121,10 @@ export default function TranslationModal({
 		const d = resolveTranslationDefaults(
 			config,
 			readLastUsedTranslationPrefs(),
+			{
+				detectedSource: detectSourceLanguage(sampleSources ?? []),
+				uiLocale: locale,
+			},
 		);
 		setProviderId(coerceProviderId(d.providerId, providers, config));
 		setSourceLang(d.sourceLang);
@@ -124,7 +133,7 @@ export default function TranslationModal({
 		setMaxConcurrent(d.maxConcurrent);
 		setCostLimit(d.costLimit);
 		setFallbackIds(readTranslationFallbacks());
-	}, [open, config, configFetched, configError, providers]);
+	}, [open, config, configFetched, configError, providers, sampleSources, locale]);
 
 	// If the current provider id is missing or not ready, fall back to the first ready one.
 	useEffect(() => {

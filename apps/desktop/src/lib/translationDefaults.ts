@@ -56,9 +56,59 @@ function validBatch(value: unknown): number | null {
   return Math.floor(value);
 }
 
+/** What the open project says about its languages. */
+export interface ProjectLanguageContext {
+  /** From {@link detectSourceLanguage}; null when the sample is inconclusive. */
+  detectedSource?: string | null;
+  /** Current UI locale, used as the target when the configured one equals the source. */
+  uiLocale?: string;
+}
+
+const MIN_LETTERS = 20;
+
+/**
+ * Guess a project's source language from a sample of its source strings by
+ * script: kana -> ja, hangul -> ko, CJK ideographs without kana -> zh-CN,
+ * Cyrillic -> ru, unaccented Latin -> en. Accented Latin (es/fr/de/...) and
+ * small samples return null: the caller then keeps its other defaults.
+ */
+export function detectSourceLanguage(samples: readonly string[]): string | null {
+  let kana = 0, hangul = 0, han = 0, cyrillic = 0, latin = 0, accented = 0, letters = 0;
+  for (const text of samples) {
+    for (const ch of text) {
+      const c = ch.codePointAt(0)!;
+      if (c >= 0x3040 && c <= 0x30ff) kana++;
+      else if ((c >= 0xac00 && c <= 0xd7af) || (c >= 0x1100 && c <= 0x11ff)) hangul++;
+      else if (c >= 0x4e00 && c <= 0x9fff) han++;
+      else if (c >= 0x0400 && c <= 0x04ff) cyrillic++;
+      else if ((c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) latin++;
+      else if (c >= 0xc0 && c <= 0x24f && c !== 0xd7 && c !== 0xf7) { latin++; accented++; }
+      else continue;
+      letters++;
+    }
+  }
+  if (letters < MIN_LETTERS) return null;
+  const share = (n: number) => n / letters;
+  if (kana > 0 && share(kana + han) >= 0.5) return "ja";
+  if (share(hangul) >= 0.5) return "ko";
+  if (share(han) >= 0.5) return "zh-CN";
+  if (share(cyrillic) >= 0.5) return "ru";
+  if (share(latin) >= 0.8 && accented / Math.max(latin, 1) < 0.005) return "en";
+  return null;
+}
+
+function targetDifferentFrom(source: string, preferred: string, uiLocale?: string): string {
+  if (preferred !== source) return preferred;
+  for (const candidate of [uiLocale, "en", "es"]) {
+    if (candidate && candidate !== source) return candidate;
+  }
+  return preferred;
+}
+
 export function resolveTranslationDefaults(
   config?: TranslationDefaultsConfig | null,
-  lastUsed?: LastUsedTranslationPrefs | null
+  lastUsed?: LastUsedTranslationPrefs | null,
+  project?: ProjectLanguageContext | null,
 ): TranslationDefaults {
   const costLimit =
     typeof lastUsed?.costLimit === "string"
@@ -67,10 +117,19 @@ export function resolveTranslationDefaults(
         ? String(config.default_cost_limit)
         : "";
 
+  // The open project's own text outranks a global default or another project's last run.
+  const detected = nonEmpty(project?.detectedSource);
+  const sourceLang =
+    detected ?? nonEmpty(lastUsed?.source) ?? nonEmpty(config?.default_source_lang) ?? "auto";
+  const preferredTarget =
+    nonEmpty(lastUsed?.target) ?? nonEmpty(config?.default_target_lang) ?? "es";
+
   return {
     providerId: nonEmpty(lastUsed?.provider) ?? nonEmpty(config?.default_provider) ?? "",
-    sourceLang: nonEmpty(lastUsed?.source) ?? nonEmpty(config?.default_source_lang) ?? "auto",
-    targetLang: nonEmpty(lastUsed?.target) ?? nonEmpty(config?.default_target_lang) ?? "es",
+    sourceLang,
+    targetLang: detected
+      ? targetDifferentFrom(sourceLang, preferredTarget, project?.uiLocale)
+      : preferredTarget,
     batchSize: validBatch(lastUsed?.batchSize) ?? validBatch(config?.default_batch_size) ?? 40,
     // Translate dialog historically defaulted to 1; queue used 3. Prefer last-used, else 3
     // so batch runs keep the documented escape hatch for large projects.
