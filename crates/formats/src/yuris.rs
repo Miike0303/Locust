@@ -1201,6 +1201,48 @@ fn load_ystb_with_commands(
     }))
 }
 
+// Validate against every original descriptor, including untranslated attributes.
+// The row filter uses this before rebuilding; the writer keeps the same guard so
+// direct callers cannot replace bytes still referenced by another descriptor.
+fn validate_payload_edit(ystb: &DecryptedYstb, index: usize) -> Result<()> {
+    let attr = &ystb.attrs[index];
+    let start = attr.offset as usize;
+    let end = start + attr.size as usize;
+    if let Some((i, other)) = ystb.attrs.iter().enumerate().find(|(i, a)| {
+        let offset = a.offset as usize;
+        *i != index
+            && offset < end
+            && if a.branch_target {
+                start < offset
+            } else {
+                start < offset + a.size as usize
+            }
+    }) {
+        let detail = if other.branch_target {
+            format!(
+                "branch address: attribute {i} points inside at {}",
+                other.offset
+            )
+        } else {
+            let kind = if attr.offset == other.offset && attr.size == other.size {
+                "exact alias"
+            } else {
+                "partial overlap"
+            };
+            format!(
+                "{kind}: attribute {index} [{start},{end}) intersects attribute {i} [{},{})",
+                other.offset,
+                u64::from(other.offset) + u64::from(other.size)
+            )
+        };
+        return Err(parse_err(
+            "ystb",
+            format!("cannot edit overlapping attribute payload: {detail}"),
+        ));
+    }
+    Ok(())
+}
+
 fn inject_into_ystb(
     ystb: &DecryptedYstb,
     translations: &HashMap<usize, String>,
@@ -1236,21 +1278,7 @@ fn inject_into_ystb(
         let attr = &ystb.attrs[index];
         let start = attr.offset as usize;
         let end = start + attr.size as usize;
-        if ystb.attrs.iter().enumerate().any(|(i, a)| {
-            let offset = a.offset as usize;
-            i != index
-                && offset < end
-                && if a.branch_target {
-                    start < offset
-                } else {
-                    start < offset + a.size as usize
-                }
-        }) {
-            return Err(parse_err(
-                "ystb",
-                "cannot edit aliased/overlapping attribute payload",
-            ));
-        }
+        validate_payload_edit(ystb, index)?;
         if raw_control_sequence(
             &ystb
                 .strings
@@ -1399,7 +1427,9 @@ fn ystb_skip_reason(error: &LocustError) -> &'static str {
         return "rebuild_error";
     };
     match message.as_str() {
-        "cannot edit aliased/overlapping attribute payload" => "overlapping_locators",
+        _ if message.starts_with("cannot edit overlapping attribute payload:") => {
+            "overlapping_locators"
+        }
         "text cannot be encoded in Shift-JIS" => "not_encodable",
         "unknown raw control token or bare CR" | "raw control sequence changed" => {
             "unsafe_controls"
@@ -1455,6 +1485,13 @@ fn translations_with_skip_reasons(
                     warnings.push(format!("skip {}: physical layout changed", e.id));
                     *reasons.entry("source_changed".into()).or_default() += 1;
                     continue;
+                }
+                if !ystb.caption {
+                    if let Err(err) = validate_payload_edit(ystb, index) {
+                        warnings.push(format!("skip {}: {err}", e.id));
+                        *reasons.entry(ystb_skip_reason(&err).into()).or_default() += 1;
+                        continue;
+                    }
                 }
                 // Messages carry the author's own hard wraps; a provider hands
                 // back one flat line. `escape_c_light` drops bare CR, so
@@ -2023,6 +2060,144 @@ mod tests {
             [("overlapping_locators".into(), 2)].into()
         );
         assert_eq!(fs::read(path).unwrap(), original);
+    }
+    #[test]
+    fn c128_partial_overlap_skips_only_its_row() {
+        for packed in [false, true] {
+            // The first position reproduces Injuu; the second also requires
+            // relocating the preserved overlap and its exact RETURNCODE aliases.
+            for overlapping in [0, 1] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut original = real_layout(
+                    &[
+                        (108, vec![(0, ATTR_RAW, b"First dialogue".to_vec())]),
+                        (108, vec![(0, ATTR_RAW, b"Second dialogue".to_vec())]),
+                        (108, vec![(0, ATTR_RAW, b"Third dialogue".to_vec())]),
+                        (
+                            108,
+                            vec![(0, ATTR_EXPRESSION, fixture_expr("Fourth dialogue"))],
+                        ),
+                        (81, vec![(5, ATTR_RAW, vec![1])]),
+                        (81, vec![(5, ATTR_RAW, vec![1])]),
+                        (250, vec![(0, 1, vec![0x13, 0x57, 0x9B, 0xDF])]),
+                        (55, vec![(0, 1, vec![0; 4]), (0, ATTR_RAW, vec![])]),
+                    ],
+                    0,
+                );
+                let hdr = parse_header(&original, "partial").unwrap();
+                let (_, desc, _, _) = section_offsets(&hdr);
+                let overlap_offset =
+                    read_u32(&original, desc + overlapping * ATTR_DESC_SIZE + 8).unwrap();
+                for index in [4, 5] {
+                    write_u32(
+                        &mut original,
+                        desc + index * ATTR_DESC_SIZE + 8,
+                        overlap_offset,
+                    );
+                }
+                // Branch size is an instruction index, not a payload length.
+                write_u32(&mut original, desc + 8 * ATTR_DESC_SIZE + 4, 7);
+                write_u32(
+                    &mut original,
+                    desc + 8 * ATTR_DESC_SIZE + 8,
+                    hdr.attr_values_size,
+                );
+                toggle_encryption(&mut original, TRUE_KEY_B4626AD8);
+                let before = load_ystb(&original, "partial").unwrap().unwrap();
+                let path = dir
+                    .path()
+                    .join(if packed { "game.ypf" } else { "story.ybn" });
+                let bytes = if packed {
+                    crate::yuris_ypf::write_ypf(
+                        0x1E4,
+                        0xFF,
+                        &[("story.ybn".into(), original, true)],
+                    )
+                    .unwrap()
+                } else {
+                    original
+                };
+                fs::write(&path, bytes).unwrap();
+                let plugin = YurisPlugin::new();
+                let mut entries = plugin.extract(dir.path()).unwrap();
+                assert_eq!(entries.len(), 4);
+                // Reuse the original physical locators across growth and shrinkage.
+                for prefix in ["TL ", "R2 TL ", ""] {
+                    for entry in &mut entries {
+                        entry.translation = Some(format!("{prefix}{}", entry.source));
+                    }
+                    let report = plugin.inject(dir.path(), &entries).unwrap();
+                    assert_eq!(
+                        (report.strings_written, report.strings_skipped),
+                        (3, 1),
+                        "{report:?}"
+                    );
+                    assert_eq!(
+                        report.skip_reasons,
+                        [("overlapping_locators".into(), 1)].into()
+                    );
+                    assert_eq!(
+                        report
+                            .warnings
+                            .iter()
+                            .filter(|w| w.starts_with("skip "))
+                            .count(),
+                        1,
+                        "{report:?}"
+                    );
+                    assert!(
+                        report
+                            .warnings
+                            .iter()
+                            .any(|w| w
+                                .contains(&format!("partial overlap: attribute {overlapping} ")))
+                    );
+                    let bytes = if packed {
+                        let archive = YpfArchive::open(&path).unwrap();
+                        archive.read_entry(&archive.entries[0]).unwrap()
+                    } else {
+                        fs::read(&path).unwrap()
+                    };
+                    let after = load_ystb(&bytes, "partial").unwrap().unwrap();
+                    assert_eq!(after.key, before.key);
+                    assert_eq!(after.attrs[0].offset, 0);
+                    assert_eq!(layout_context(&before), layout_context(&after));
+                    let (_, _, old_values, _) = section_offsets(&before.hdr);
+                    let (_, _, new_values, _) = section_offsets(&after.hdr);
+                    for (index, (old, new)) in before.attrs.iter().zip(&after.attrs).enumerate() {
+                        if old.branch_target {
+                            assert_eq!(new.size, old.size);
+                            assert_eq!(new.offset, after.hdr.attr_values_size);
+                        } else if index == overlapping || index >= 4 {
+                            assert_eq!(new.size, old.size);
+                            let old_start = old_values + old.offset as usize;
+                            let new_start = new_values + new.offset as usize;
+                            assert_eq!(
+                                &after.data[new_start..new_start + new.size as usize],
+                                &before.data[old_start..old_start + old.size as usize],
+                                "descriptor {index} changed"
+                            );
+                        }
+                    }
+                    for index in [4, 5] {
+                        assert_eq!(after.attrs[index].offset, after.attrs[overlapping].offset);
+                    }
+                    let extracted = plugin.extract(dir.path()).unwrap();
+                    assert_eq!(extracted.len(), entries.len());
+                    for entry in &entries {
+                        let out = extracted.iter().find(|e| e.id == entry.id).unwrap();
+                        assert_eq!(
+                            out.source,
+                            if entry.id.ends_with(&format!("#attr{overlapping}")) {
+                                entry.source.as_str()
+                            } else {
+                                entry.translation.as_deref().unwrap()
+                            }
+                        );
+                    }
+                }
+            }
+        }
     }
     // Real four-byte instructions and twelve-byte descriptors, including
     // values padding and a tail that are deliberately outside all attributes.
