@@ -94,7 +94,7 @@ export default function PivotModal({
 			setResult(created);
 			addLog(
 				"info",
-				`Pivot: ${created.entries} entries → ${created.database_path}`,
+				t("activity.pivot.created", { count: created.entries, path: created.database_path }),
 				undefined,
 				"project",
 			);
@@ -112,7 +112,7 @@ export default function PivotModal({
 				: t("pivot.toast.failed", { error: msg });
 			setError(display);
 			addToast("error", display);
-			addLog("error", "Pivot failed", msg, "project");
+			addLog("error", t("activity.pivot.failed"), msg, "project");
 		} finally {
 			setLoading(false);
 		}
@@ -139,7 +139,7 @@ export default function PivotModal({
 			addToast("success", t("pivot.toast.opened", { path: result.database_path }));
 			addLog(
 				"info",
-				`Opened pivoted project: ${result.database_path}`,
+				t("activity.pivot.opened", { path: result.database_path }),
 				undefined,
 				"project",
 			);
@@ -151,7 +151,7 @@ export default function PivotModal({
 			addToast("error", display);
 			addLog(
 				"error",
-				"Open pivoted project failed; current project unchanged",
+				t("activity.pivot.openFailed"),
 				msg,
 				"project",
 			);

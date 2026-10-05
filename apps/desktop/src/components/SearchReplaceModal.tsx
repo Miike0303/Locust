@@ -163,7 +163,10 @@ export default function SearchReplaceModal({
 			);
 			addLog(
 				"info",
-				`Search-replace batch: ${result.applied}/${result.requested} applied, ${occurrences} hits`,
+				t("activity.replace.completed", {
+					applied: t("activity.replace.applied", { count: result.applied, requested: result.requested }),
+					count: occurrences,
+				}),
 				find.length > 40 ? `${find.slice(0, 40)}…` : find,
 				"replace",
 			);
@@ -172,7 +175,7 @@ export default function SearchReplaceModal({
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addToast("error", t("replace.toast.replaceFailed", { error: msg }));
-			addLog("error", "Search-replace failed", msg, "replace");
+			addLog("error", t("activity.replace.failed"), msg, "replace");
 		} finally {
 			setLoading(false);
 		}

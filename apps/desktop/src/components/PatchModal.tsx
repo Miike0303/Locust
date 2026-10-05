@@ -318,14 +318,14 @@ export default function PatchModal({
 			await refreshStatus();
 			addLog(
 				"info",
-				`Patch verify: ${report.outcome}`,
+				t("activity.patch.verified", { outcome: patchValue(report.outcome) }),
 				report.messages?.join("\n") || "",
 				"patch",
 			);
 			addToast("success", t("patch.toast.verify", { outcome: patchValue(report.outcome) }));
 		} catch (err: any) {
 			setError(err.message);
-			addLog("error", "Patch verify failed", err.message, "patch");
+			addLog("error", t("activity.patch.verifyFailed"), err.message, "patch");
 			addToast("error", t("patch.toast.verifyFailed", { error: err.message }));
 		} finally {
 			setLoading(false);
@@ -341,9 +341,9 @@ export default function PatchModal({
 		await refreshStatus();
 		addLog(
 			"info",
-			report.dry_run
-				? `Patch dry-run: ${report.patch_id}@${report.patch_version}`
-				: `Patch applied: ${report.patch_id}@${report.patch_version}`,
+			t(report.dry_run ? "activity.patch.dryRun" : "activity.patch.applied", {
+				id: report.patch_id, version: report.patch_version,
+			}),
 			`replaced ${report.replaced}, added ${report.added}, baseline ${report.baseline}`,
 			"patch",
 		);
@@ -363,7 +363,7 @@ export default function PatchModal({
 		if (opts.cancelled) {
 			addLog(
 				"warning",
-				"Patch apply cancelled — game left partly patched",
+				t("activity.patch.cancelledPartial"),
 				undefined,
 				"patch",
 			);
@@ -371,7 +371,7 @@ export default function PatchModal({
 		} else {
 			const message = opts.error ?? t("ws.patchJobStreamLost");
 			setError(message);
-			addLog("error", "Patch apply failed", message, "patch");
+			addLog("error", t("activity.patch.applyFailed"), message, "patch");
 			addToast(
 				"warning",
 				t("patch.toast.applyFailedPartial", { error: message }),
@@ -465,7 +465,7 @@ export default function PatchModal({
 						}
 						const message = t("ws.patchJobStreamLost");
 						setError(message);
-						addLog("error", "Patch apply failed", message, "patch");
+						addLog("error", t("activity.patch.applyFailed"), message, "patch");
 						addToast(
 							"error",
 							t("patch.toast.applyFailed", { error: message }),
@@ -479,7 +479,7 @@ export default function PatchModal({
 		} catch (err: any) {
 			applyFinishedRef.current = true;
 			setError(err.message);
-			addLog("error", "Patch apply failed", err.message, "patch");
+			addLog("error", t("activity.patch.applyFailed"), err.message, "patch");
 			addToast("error", t("patch.toast.applyFailed", { error: err.message }));
 			setApplying(false);
 			setCancellingApply(false);
@@ -495,7 +495,7 @@ export default function PatchModal({
 			await cancelPatchApply(jobId);
 			addLog(
 				"info",
-				`Cancel requested for patch job ${jobId}`,
+				t("activity.patch.cancelRequested", { jobId }),
 				undefined,
 				"patch",
 			);
@@ -539,7 +539,7 @@ export default function PatchModal({
 			}
 			addLog(
 				"info",
-				"Patch rollback",
+				t("activity.patch.rollback"),
 				report.messages?.join("\n") ||
 					`restored ${report.restored}, deleted ${report.deleted}`,
 				"patch",
@@ -549,7 +549,7 @@ export default function PatchModal({
 			await refreshStatus();
 		} catch (err: any) {
 			setError(err.message);
-			addLog("error", "Patch rollback failed", err.message, "patch");
+			addLog("error", t("activity.patch.rollbackFailed"), err.message, "patch");
 			addToast("error", t("patch.toast.rollbackFailed", { error: err.message }));
 		} finally {
 			setLoading(false);
@@ -588,7 +588,7 @@ export default function PatchModal({
 			setPackResult(report);
 			addLog(
 				"info",
-				`Patch packed: ${report.patch_id}@${report.patch_version}`,
+				t("activity.patch.packed", { id: report.patch_id, version: report.patch_version }),
 				`${report.files_packed} file(s), ${report.size_bytes} bytes, tier ${report.tier}`,
 				"patch",
 			);
@@ -598,7 +598,7 @@ export default function PatchModal({
 			);
 		} catch (err: any) {
 			setError(err.message);
-			addLog("error", "Patch pack failed", err.message, "patch");
+			addLog("error", t("activity.patch.packFailed"), err.message, "patch");
 			addToast("error", t("patch.toast.packFailed", { error: err.message }));
 		} finally {
 			setLoading(false);

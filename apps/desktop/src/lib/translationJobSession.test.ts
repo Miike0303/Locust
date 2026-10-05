@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { setLocale, t } from "./i18n/index.ts";
 
 // Exercise the real persistent session across terminal/cancel races. Only its
 // network and UI sinks are replaced; lifecycle decisions stay in production code.
@@ -15,7 +16,6 @@ registerHooks({
     const modules: Record<string, string> = {
       "/src/lib/api.ts": `export async function cancelTranslation(id){globalThis.__sessionHarness.cancellations.push(id);}`,
       "/src/lib/ws.ts": `export const JOB_STREAM_LOST_MESSAGE='stream lost'; export function subscribeToJob(id,handlers){globalThis.__sessionHarness.handlers=handlers;return()=>{globalThis.__sessionHarness.unsubscribed++;};}`,
-      "/src/lib/i18n/index.ts": `export function t(key){return key;}`,
       "/src/stores/editorStore.ts": `const h=globalThis.__sessionHarness; export const useEditorStore={getState:()=>({jobId:h.jobId,isTranslating:h.translating,jobSnapshot:h.snapshot,setJob:id=>{h.jobId=id;},setTranslating:v=>{h.translating=v;},setJobSnapshot:v=>{h.snapshot=v;},patchJobSnapshot:v=>{h.snapshot={...h.snapshot,...v};}})};`,
       "/src/stores/queueStore.ts": `export const useQueueStore={getState:()=>({setGlobalProgress:()=>{},globalProgress:null})};`,
       "/src/stores/logStore.ts": `export function addLog(...args){globalThis.__sessionHarness.logs.push(args);}`,
@@ -35,7 +35,7 @@ assert.equal(h.snapshot.error,null);
 assert.equal(h.translating,false);
 assert.equal(h.jobId,null);
 assert.equal(h.toasts.at(-1)[0],"info");
-assert.equal(h.toasts.at(-1)[1],"translate.toast.cancelled");
+assert.equal(h.toasts.at(-1)[1],t("translate.toast.cancelled"));
 const count=h.toasts.length;
 h.handlers.onClosed();
 assert.equal(h.toasts.length,count,"socket close cannot finish cancellation twice");
@@ -62,4 +62,20 @@ h.handlers.onClosed();
 assert.equal(h.snapshot.cancelled,true);
 assert.equal(h.snapshot.error,null);
 assert.equal(session.subscribedTranslationJobId(),null);
+
+// The same live session must read the current locale when events arrive.
+// Raw backend diagnostics, severity, and source stay untouched.
+setLocale("es");
+attach("locale-switch");
+h.handlers.onProviderSwitched({provider_name:"Provider X",remaining_pending:1});
+assert.deepEqual(h.logs.at(-1), ["info", "Se cambió al proveedor Provider X (1 cadena pendiente)", undefined, "translation"]);
+h.handlers.onBatchFailed({error:"raw backend failure: /game/script.rpy"});
+assert.deepEqual(h.logs.at(-1), ["warning", "Falló un lote de traducción; se continuará con los siguientes", "raw backend failure: /game/script.rpy", "translation"]);
+setLocale("en");
+h.handlers.onProviderSwitched({provider_name:"Provider X",remaining_pending:2});
+assert.deepEqual(h.logs.at(-1), ["info", "Switched to provider Provider X (2 strings still pending)", undefined, "translation"]);
+setLocale("es");
+h.handlers.onFailed({type:"failed",entry_id:null,error:"raw backend failure"});
+assert.deepEqual(h.logs.at(-1), ["error", "La traducción falló", "raw backend failure", "translation"]);
+setLocale("en");
 console.log("translationJobSession.test.ts: ok");

@@ -106,7 +106,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     const jobId = activeJobId;
     if (!jobId) return;
     void cancelTranslation(jobId).catch((err: any) => {
-      addLog("error", "Failed to cancel in-flight queue job", err.message ?? String(err), "queue");
+      addLog("error", t("activity.queue.cancelFailed"), err.message ?? String(err), "queue");
     });
   },
 
@@ -120,7 +120,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     set({ isRunning: true, cancelRequested: false });
     activeJobId = null;
     const pending = items.filter((i) => i.status === "pending");
-    addLog("info", `Queue started: ${pending.length} projects`, undefined, "queue");
+    addLog("info", t("activity.queue.started", { count: pending.length }), undefined, "queue");
 
     for (let idx = 0; idx < pending.length; idx++) {
       if (get().cancelRequested) break;
@@ -134,7 +134,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       try {
         // Step 1: Open project
         updateItem({ status: "extracting" });
-        addLog("info", `Opening: ${item.projectPath}`, undefined, "queue");
+        addLog("info", t("activity.queue.opening", { path: item.projectPath }), undefined, "queue");
         set({
           globalProgress: {
             projectName: item.projectName,
@@ -201,7 +201,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
         if (get().cancelRequested) {
           updateItem({ status: "done" });
-          addLog("info", `Completed: ${result.project_name} (${result.total_strings} strings)`, undefined, "queue");
+          addLog("info", t("activity.queue.completed", { name: result.project_name, count: result.total_strings }), undefined, "queue");
           addToast("success", t("queue.toast.itemDone", { name: result.project_name }));
           break;
         }
@@ -214,7 +214,11 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           if (issuesFound > 0) {
             addLog(
               "warning",
-              `Completed: ${result.project_name} (${result.total_strings} strings, ${issuesFound} validation issues)`,
+              t("activity.queue.completedWithIssues", {
+                name: result.project_name,
+                count: result.total_strings,
+                issues: t("activity.count.validationIssues", { count: issuesFound }),
+              }),
               undefined,
               "queue",
             );
@@ -223,7 +227,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
               t("queue.toast.itemIssues", { name: result.project_name, count: issuesFound }),
             );
           } else {
-            addLog("info", `Completed: ${result.project_name} (${result.total_strings} strings)`, undefined, "queue");
+            addLog("info", t("activity.queue.completed", { name: result.project_name, count: result.total_strings }), undefined, "queue");
             addToast("success", t("queue.toast.itemDone", { name: result.project_name }));
           }
         } catch (valErr: unknown) {
@@ -231,7 +235,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           updateItem(queueItemPatchAfterValidation({ ok: false, error: raw }));
           addLog(
             "warning",
-            `Translated ${result.project_name}, but validation could not run`,
+            t("activity.queue.validationFailed", { name: result.project_name }),
             raw,
             "queue",
           );
@@ -246,7 +250,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
             status: "error",
             error: raw === JOB_STREAM_LOST_MESSAGE ? t(JOB_STREAM_LOST_MESSAGE) : raw,
           });
-          addLog("error", `Failed: ${item.projectName}`, raw, "queue");
+          addLog("error", t("activity.queue.itemFailed", { name: item.projectName }), raw, "queue");
           addToast("error", t("queue.toast.itemFailed", { name: item.projectName }));
         }
       }
@@ -254,7 +258,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
     set({ isRunning: false, globalProgress: null });
     if (get().cancelRequested) {
-      addLog("warning", "Queue cancelled by user", undefined, "queue");
+      addLog("warning", t("activity.queue.cancelled"), undefined, "queue");
       addToast("warning", t("queue.toast.cancelled"));
     } else {
       const runIds = new Set(pending.map((i) => i.id));
@@ -266,11 +270,14 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         else if (i.status === "error") failed++;
       }
       if (failed === 0) {
-        addLog("info", "Queue finished", undefined, "queue");
+        addLog("info", t("activity.queue.finished"), undefined, "queue");
         addToast("success", t("queue.toast.allDone"));
       } else {
         const summary = t("queue.toast.summary", { finished, failed });
-        addLog("error", `Queue finished: ${finished} finished, ${failed} failed`, undefined, "queue");
+        addLog("error", t("activity.queue.summary", {
+          finished: t("activity.queue.finishedProjects", { count: finished }),
+          failed: t("activity.queue.failedProjects", { count: failed }),
+        }), undefined, "queue");
         addToast("error", summary);
       }
     }

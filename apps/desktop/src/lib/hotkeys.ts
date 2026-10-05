@@ -20,7 +20,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useEditorStore } from "../stores/editorStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import { useT } from "./i18n";
+import { t } from "./i18n";
 
 export interface HotkeyBinding {
   key: string;
@@ -113,7 +113,6 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
   const queryClient = useQueryClient();
   const setProject = useProjectStore((s) => s.setProject);
   const setFilter = useEditorStore((s) => s.setFilter);
-  const t = useT();
 
   useHotkey("openProject", () => {
     if (openProjectInFlight) return;
@@ -144,10 +143,10 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           if (isDetectionFailure(msg)) {
-            addLog("warning", "Could not auto-detect game engine", path, "project");
+            addLog("warning", t("activity.project.detectFailed"), path, "project");
             navigate("/", { state: { formatPickerPath: path } });
           } else {
-            addLog("error", "Failed to open project", msg, "project");
+            addLog("error", t("activity.project.openFailed"), msg, "project");
             addToast("error", t("welcome.toast.failedOpen", { error: msg }));
           }
         }

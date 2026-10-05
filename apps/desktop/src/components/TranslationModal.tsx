@@ -189,7 +189,7 @@ export default function TranslationModal({
 		const chainLabel = [providerId, ...fallbackIds].join(" → ");
 		addLog(
 			"info",
-			`Starting translation with chain: ${chainLabel}, source: ${sourceLang}, target: ${targetLang}, batch: ${batchSize}`,
+			t("activity.translation.starting", { chain: chainLabel, source: sourceLang, target: targetLang, count: batchSize }),
 			undefined,
 			"translation",
 		);
@@ -214,12 +214,12 @@ export default function TranslationModal({
 			};
 			addLog(
 				"info",
-				`Calling startTranslation API...`,
+				t("activity.translation.callingApi"),
 				JSON.stringify(params, null, 2),
 				"translation",
 			);
 			const result = await startTranslation(params);
-			addLog("info", `Got job_id: ${result.job_id}`, undefined, "translation");
+			addLog("info", t("activity.translation.jobReceived", { jobId: result.job_id }), undefined, "translation");
 
 			const projectName =
 				useProjectStore.getState().project?.name ?? "Project";
@@ -232,14 +232,14 @@ export default function TranslationModal({
 			});
 			addLog(
 				"info",
-				`Translation started (${chainLabel}), subscribing to WebSocket...`,
+				t("activity.translation.started", { chain: chainLabel }),
 				undefined,
 				"translation",
 			);
 		} catch (err: any) {
 			addLog(
 				"error",
-				`Translation start failed: ${err.message ?? err}`,
+				t("activity.translation.startFailed", { error: String(err.message ?? err) }),
 				err.stack ?? String(err),
 				"translation",
 			);

@@ -48,7 +48,7 @@ function baseUrl(): Promise<string> {
 
 function unreachableBackend(base: string, path: string): Error {
   const msg = t("api.unreachable", { base });
-  addLog("error", `API unreachable: ${path}`, msg, "api");
+  addLog("error", t("activity.api.unreachable", { path }), msg, "api");
   return new Error(msg);
 }
 
@@ -67,7 +67,7 @@ async function request<T>(path: string, options?: RequestInit, quietStatus?: num
   if (quietStatus !== undefined && res.status === quietStatus) return null as T;
   if (!res.ok) {
     const text = await res.text();
-    addLog("error", `API ${res.status}: ${path}`, text, "api");
+    addLog("error", t("activity.api.httpError", { status: res.status, path }), text, "api");
     throw new Error(localizeApiError(`${res.status}: ${text}`));
   }
   // 204 / empty body (DELETE, some POSTs) — do not call res.json()
@@ -77,7 +77,7 @@ async function request<T>(path: string, options?: RequestInit, quietStatus?: num
   try {
     return JSON.parse(text) as T;
   } catch {
-    addLog("error", `API invalid JSON: ${path}`, text.slice(0, 500), "api");
+    addLog("error", t("activity.api.invalidJson", { path }), text.slice(0, 500), "api");
     throw new Error(t("api.error.invalidJson", { path }));
   }
 }

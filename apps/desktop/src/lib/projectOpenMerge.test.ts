@@ -3,8 +3,7 @@
  * (run: npx --yes tsx src/lib/projectOpenMerge.test.ts).
  */
 import assert from "node:assert/strict";
-import { translate } from "./i18n/index.ts";
-import type { TranslateFn } from "./i18n";
+import { setLocale, t } from "./i18n/index.ts";
 import {
   PENDING_AFTER_STALE_FILTER,
   projectOpenMergeNotice,
@@ -13,21 +12,7 @@ import {
   type ProjectOpenMergeInput,
 } from "./projectOpenMerge.ts";
 
-const catalog: Record<string, string> = {
-  "welcome.log.openedMerge":
-    "Opened {name} ({format}, {total} strings) — added {added}, updated {updated}, reset to pending {stale}, removed {removed}, translations kept {preserved}",
-  "welcome.toast.sourceChanged": "The game's text changed.",
-  "welcome.toast.staleReset.one":
-    "{count} translation was sent back to pending so you can check it again.",
-  "welcome.toast.staleReset.other":
-    "{count} translations were sent back to pending so you can check them again.",
-  "welcome.toast.removed.one":
-    "{count} line no longer exists and was removed.",
-  "welcome.toast.removed.other":
-    "{count} lines no longer exist and were removed.",
-};
-
-const t: TranslateFn = (key, vars) => translate(catalog, "en", key, vars);
+setLocale("en");
 
 function open(partial: Partial<ProjectOpenMergeInput> = {}): ProjectOpenMergeInput {
   return {
@@ -50,8 +35,8 @@ const firstOpen = projectOpenMergeNotice(
 assert.equal(shouldToastProjectOpenMerge({ stale_source_reset: 0, removed: 0 }), false);
 assert.equal(firstOpen.toast, false);
 assert.equal(firstOpen.toastMessage, null);
-assert.match(firstOpen.logMessage, /added 100/);
-assert.match(firstOpen.logMessage, /translations kept 0/);
+assert.match(firstOpen.logMessage, /100 strings added/);
+assert.match(firstOpen.logMessage, /0 translations kept/);
 
 const staleOpen = projectOpenMergeNotice(
   open({
@@ -71,8 +56,8 @@ assert.ok(staleOpen.toastMessage);
 assert.match(staleOpen.toastMessage, /12/);
 assert.match(staleOpen.toastMessage, /pending/);
 assert.doesNotMatch(staleOpen.toastMessage, /removed/);
-assert.match(staleOpen.logMessage, /reset to pending 12/);
-assert.match(staleOpen.logMessage, /translations kept 85/);
+assert.match(staleOpen.logMessage, /12 translations reset to pending/);
+assert.match(staleOpen.logMessage, /85 translations kept/);
 
 const removedOnly = projectOpenMergeNotice(
   open({
@@ -97,7 +82,7 @@ const unchangedReopen = projectOpenMergeNotice(
 assert.equal(unchangedReopen.toast, false);
 assert.equal(shouldFocusPendingAfterOpen({ stale_source_reset: 0 }), false);
 assert.equal(unchangedReopen.toastMessage, null);
-assert.match(unchangedReopen.logMessage, /translations kept 100/);
-assert.match(unchangedReopen.logMessage, /added 0/);
+assert.match(unchangedReopen.logMessage, /100 translations kept/);
+assert.match(unchangedReopen.logMessage, /0 strings added/);
 
 console.log("projectOpenMerge.test.ts: ok");

@@ -3,7 +3,7 @@
  * the game text moved under existing translations or lines disappeared.
  */
 
-import type { TranslateFn } from "./i18n";
+import { t, type TranslateFn } from "./i18n";
 
 export type ProjectOpenMergeCounts = {
   added: number;
@@ -50,7 +50,7 @@ export function shouldFocusPendingAfterOpen(
 
 export function projectOpenMergeNotice(
   result: ProjectOpenMergeInput,
-  t: TranslateFn,
+  translateToast: TranslateFn,
 ): ProjectOpenMergeNotice {
   const added = asCount(result.added);
   const updated = asCount(result.updated);
@@ -58,27 +58,27 @@ export function projectOpenMergeNotice(
   const removed = asCount(result.removed);
   const preserved = asCount(result.preserved_translations);
 
-  const logMessage = t("welcome.log.openedMerge", {
+  const logMessage = t("activity.project.openedMerge", {
     name: result.project_name,
     format: result.format_name,
-    total: result.total_strings,
-    added,
-    updated,
-    stale,
-    removed,
-    preserved,
+    strings: t("activity.count.strings", { count: result.total_strings }),
+    added: t("activity.project.added", { count: added }),
+    updated: t("activity.project.updated", { count: updated }),
+    stale: t("activity.project.stale", { count: stale }),
+    removed: t("activity.project.removed", { count: removed }),
+    preserved: t("activity.project.preserved", { count: preserved }),
   });
 
   if (!shouldToastProjectOpenMerge({ stale_source_reset: stale, removed })) {
     return { toast: false, logMessage, toastMessage: null };
   }
 
-  const parts = [t("welcome.toast.sourceChanged")];
+  const parts = [translateToast("welcome.toast.sourceChanged")];
   if (stale > 0) {
-    parts.push(t("welcome.toast.staleReset", { count: stale }));
+    parts.push(translateToast("welcome.toast.staleReset", { count: stale }));
   }
   if (removed > 0) {
-    parts.push(t("welcome.toast.removed", { count: removed }));
+    parts.push(translateToast("welcome.toast.removed", { count: removed }));
   }
   return { toast: true, logMessage, toastMessage: parts.join(" ") };
 }

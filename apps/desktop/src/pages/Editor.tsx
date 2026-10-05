@@ -199,18 +199,21 @@ export default function Editor() {
 			if (v.issues_found === 0) {
 				addLog(
 					"info",
-					`Validate: no issues in ${v.total_checked} strings`,
+					t("activity.validation.clean", { count: v.total_checked }),
 					undefined,
 					"validate",
 				);
 			} else {
-				const msg = `${v.issues_found} issue(s) in ${v.entries_with_issues} entries${kinds ? ` (${kinds})` : ""}`;
-				addLog("warning", `Validate: ${msg}`, undefined, "validate");
+				addLog("warning", t("activity.validation.issues", {
+					count: v.issues_found,
+					entries: t("activity.count.entries", { count: v.entries_with_issues }),
+					kinds: kinds ? ` (${kinds})` : "",
+				}), undefined, "validate");
 			}
 		} catch (e) {
 			const err = e instanceof Error ? e.message : String(e);
 			addToast("error", t("editor.toast.validateFailed", { error: err }));
-			addLog("error", "Validate failed", err, "validate");
+			addLog("error", t("activity.validation.failed"), err, "validate");
 		} finally {
 			setValidating(false);
 		}

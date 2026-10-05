@@ -76,7 +76,7 @@ export default function ExportModal({
 			addToast("success", t("export.toast.exported", { format: format.toUpperCase(), path: result.path }));
 			addLog(
 				"info",
-				`Export ${format} (${lang}): ${result.bytes} bytes`,
+				t("activity.export.completed", { format, language: lang, count: result.bytes }),
 				result.path,
 				"export",
 			);
@@ -84,7 +84,7 @@ export default function ExportModal({
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addToast("error", t("export.toast.exportFailed", { error: msg }));
-			addLog("error", "Export failed", msg, "export");
+			addLog("error", t("activity.export.failed"), msg, "export");
 		} finally {
 			setLoading(false);
 		}
@@ -97,7 +97,12 @@ export default function ExportModal({
 		const stale = result.stale_sources ? ` ${t("export.toast.staleSources", { count: result.stale_sources })}` : "";
 		addToast(result.skipped ? "warning" : "success", message + stale);
 		addLog(result.skipped ? "warning" : "info",
-			`Import ${format}: ${result.imported} applied, ${result.skipped} skipped, ${result.stale_sources ?? 0} outdated sources`, name, "import");
+			t("activity.import.completed", {
+				format,
+				applied: t("activity.import.applied", { count: result.imported }),
+				skipped: t("activity.import.skipped", { count: result.skipped }),
+				outdated: t("activity.import.outdated", { count: result.stale_sources ?? 0 }),
+			}), name, "import");
 		onImported?.();
 		onClose();
 	};
@@ -110,7 +115,7 @@ export default function ExportModal({
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addToast("error", t("export.toast.importFailed", { error: msg }));
-			addLog("error", "Import failed", msg, "import");
+			addLog("error", t("activity.import.failed"), msg, "import");
 		} finally {
 			setLoading(false);
 		}
@@ -145,7 +150,7 @@ export default function ExportModal({
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addToast("error", t("export.toast.importFailed", { error: msg }));
-			addLog("error", "Import failed", msg, "import");
+			addLog("error", t("activity.import.failed"), msg, "import");
 		} finally {
 			setLoading(false);
 		}

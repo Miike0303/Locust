@@ -186,7 +186,7 @@ export default function InjectModal({
 				done.push({ lang: code, label, report });
 				addLog(
 					"info",
-					`Registered ${code} (${label}) in game UI`,
+					t("activity.inject.registered", { code, label }),
 					`plugins_js=${report.plugins_js} iavra=${report.iavra_languages} visumz=${report.visumz_options} maps=${report.maps_patched?.length ?? 0}` +
 						(report.notes?.length ? `\n${report.notes.join("\n")}` : ""),
 					"inject",
@@ -215,7 +215,7 @@ export default function InjectModal({
 			return anyChange;
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addLog("error", "Could not register language in game UI", msg, "inject");
+			addLog("error", t("activity.inject.registerFailed"), msg, "inject");
 			addToast("error", t("inject.toast.registerFailed", { error: msg }));
 			return false;
 		} finally {
@@ -256,7 +256,7 @@ export default function InjectModal({
 					);
 					addLog(
 						"warning",
-						`Inject preflight: ${binary} ExceedsBinarySlot`,
+						t("activity.inject.preflight", { count: binary }),
 						"UTF-8 / UTF-16LE / Shift-JIS length must be ≤ source",
 						"inject",
 					);
@@ -298,13 +298,18 @@ export default function InjectModal({
 
 			addLog(
 				outcome === "empty" ? "error" : outcome === "partial" ? "warning" : "info",
-				outcome === "unchanged"
-					? `Inject unchanged: ${report.languages_processed.join(", ")} (${report.mode} mode)`
-					: outcome === "empty"
-					? `Inject wrote nothing: ${report.languages_processed.join(", ") || "(none)"} (${report.mode} mode)`
-					: outcome === "partial"
-						? `Inject partial: ${report.languages_processed.join(", ")} (${report.mode} mode)`
-						: `Inject complete: ${report.languages_processed.join(", ")} (${report.mode} mode)`,
+				t(
+					outcome === "unchanged" ? "activity.inject.unchanged"
+						: outcome === "empty" ? "activity.inject.empty"
+						: outcome === "partial" ? "activity.inject.partial"
+						: "activity.inject.complete",
+					{
+						languages: report.languages_processed.join(", ") || t("inject.selectedNone"),
+						mode: report.mode === "replace" ? t("activity.inject.modeReplace")
+							: report.mode === "add" ? t("activity.inject.modeAdd")
+							: report.mode === "direct" ? t("activity.inject.modeDirect") : report.mode,
+					},
+				),
 				`${destInfo}\nStrings written: ${written}\n${failDetail}${warnDetail}${filesDetail}`,
 				"inject",
 			);
@@ -334,7 +339,7 @@ export default function InjectModal({
 			}
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addLog("error", "Inject failed", msg, "inject");
+			addLog("error", t("activity.inject.failed"), msg, "inject");
 			addToast("error", t("inject.toast.failed", { error: msg }));
 		} finally {
 			setLoading(false);

@@ -51,7 +51,7 @@ function discardSnapshotIfModalClosed(): void {
 
 function finishCancelledJob(): void {
   patchSnapshot({ cancelled: true, cancelling: false, error: null });
-  addLog("info", "Translation cancelled", undefined, "translation");
+  addLog("info", t("activity.translation.cancelled"), undefined, "translation");
   addToast("info", t("translate.toast.cancelled"));
   endJob();
   discardSnapshotIfModalClosed();
@@ -120,7 +120,7 @@ export function attachTranslationJob(opts: {
       patchSnapshot({ activeProviderLabel: e.provider_name });
       addLog(
         "info",
-        `Switched to provider ${e.provider_name} (${e.remaining_pending} still pending)`,
+        t("activity.translation.providerSwitched", { name: e.provider_name, count: e.remaining_pending }),
         undefined,
         "translation",
       );
@@ -138,7 +138,7 @@ export function attachTranslationJob(opts: {
       });
       addLog(
         "info",
-        `Translation complete: ${e.total_translated} strings, ${formatObservedCost(e.total_cost, e.cost_is_complete, t)}`,
+        t("activity.translation.completed", { count: e.total_translated, cost: formatObservedCost(e.total_cost, e.cost_is_complete, t) }),
         undefined,
         "translation",
       );
@@ -155,7 +155,7 @@ export function attachTranslationJob(opts: {
     },
     onBatchFailed: (e) => {
       if (finished) return;
-      addLog("warning", "Translation batch failed; continuing", e.error, "translation");
+      addLog("warning", t("activity.translation.batchFailed"), e.error, "translation");
     },
     onFailed: (e) => {
       if (finished) return;
@@ -167,7 +167,7 @@ export function attachTranslationJob(opts: {
         return;
       }
       patchSnapshot({ error: e.error, cancelling: false });
-      addLog("error", `Translation failed`, e.error, "translation");
+      addLog("error", t("activity.translation.failed"), e.error, "translation");
       addToast("error", t("translate.toast.failed", { error: e.error }));
       endJob();
       discardSnapshotIfModalClosed();
@@ -181,7 +181,7 @@ export function attachTranslationJob(opts: {
       }
       const message = t(JOB_STREAM_LOST_MESSAGE);
       patchSnapshot({ error: message, cancelling: false });
-      addLog("error", "Translation failed", JOB_STREAM_LOST_MESSAGE, "translation");
+      addLog("error", t("activity.translation.failed"), JOB_STREAM_LOST_MESSAGE, "translation");
       addToast("error", t("translate.toast.failed", { error: message }));
       endJob();
       discardSnapshotIfModalClosed();
@@ -206,7 +206,7 @@ export async function requestTranslationCancel(): Promise<void> {
   try {
     await cancelTranslation(jobId);
     if (finished || subscribedJobId !== jobId) return;
-    addLog("info", `Cancel requested for job ${jobId}`, undefined, "translation");
+    addLog("info", t("activity.translation.cancelRequested", { jobId }), undefined, "translation");
     addToast("info", t("translate.toast.cancelling"));
   } catch (err: unknown) {
     if (finished || subscribedJobId !== jobId) return;

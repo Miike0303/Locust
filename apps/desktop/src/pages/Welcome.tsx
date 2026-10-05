@@ -224,11 +224,11 @@ export default function Welcome() {
 			const msg = err?.message ?? String(err);
 			if (!formatId && isDetectionFailure(msg)) {
 				// Auto-detect failed — let the user pick the engine instead of toasting.
-				addLog("warning", "Could not auto-detect game engine", path, "project");
+				addLog("warning", t("activity.project.detectFailed"), path, "project");
 				setSelectedFormat("");
 				setPicker({ path, reason: "detect-failed" });
 			} else {
-				addLog("error", `Failed to open project`, msg, "project");
+				addLog("error", t("activity.project.openFailed"), msg, "project");
 				if (!await offerRecovery(path)) addToast("error", t("welcome.toast.failedOpen", { error: msg }));
 			}
 		} finally {
@@ -250,11 +250,7 @@ export default function Welcome() {
 			});
 			addLog(
 				"info",
-				t("welcome.log.openedDb", {
-					name: result.project_name,
-					db: databasePath,
-					total: result.total_strings,
-				}),
+				t("activity.project.openedDb", { name: result.project_name, db: databasePath, count: result.total_strings }),
 				undefined,
 				"project",
 			);
@@ -264,7 +260,7 @@ export default function Welcome() {
 			navigate("/editor");
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addLog("error", "Failed to open project database", msg, "project");
+			addLog("error", t("activity.project.openDbFailed"), msg, "project");
 			if (!await offerRecovery(gamePath)) addToast("error", t("welcome.toast.failedOpen", { error: msg }));
 		} finally {
 			setOpening(false);
@@ -287,7 +283,7 @@ export default function Welcome() {
 
 	/** A rejected native dialog must toast, not vanish as an unhandled rejection. */
 	const reportDialogFailure = (message: string) => {
-		addLog("error", "Failed to open project", message, "project");
+		addLog("error", t("activity.project.openFailed"), message, "project");
 		addToast("error", t("welcome.toast.failedOpen", { error: message }));
 	};
 
