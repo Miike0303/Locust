@@ -2757,13 +2757,13 @@ async fn list_backups(
 async fn restore_backup(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<locust_core::backup::RestorePreview>, ApiError> {
     let exclusive = try_project_operation(&state).map_err(|e| err(StatusCode::CONFLICT, e))?;
     let manager = state.backup_manager.clone();
     // The blocking task owns exclusion even if its HTTP caller disconnects.
-    tokio::task::spawn_blocking(move || {
+    let report = tokio::task::spawn_blocking(move || {
         let _exclusive = exclusive;
-        manager.restore(&id)
+        manager.restore_with_report(&id)
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
@@ -2783,7 +2783,7 @@ async fn restore_backup(
         };
         err(status, e)
     })?;
-    Ok(StatusCode::OK)
+    Ok(Json(report))
 }
 
 async fn delete_backup(

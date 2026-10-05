@@ -1,5 +1,61 @@
 use super::*;
 
+#[tokio::test]
+async fn c127_http_restore_returns_removed_and_kept_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let game = temp.path().join("renpy");
+    std::fs::create_dir_all(game.join("game")).unwrap();
+    let archive = include_bytes!("../../cli/tests/fixtures/c127-scripts.rpa");
+    std::fs::write(game.join("game/scripts.rpa"), archive).unwrap();
+    let mut state = create_test_state();
+    Arc::get_mut(&mut state).unwrap().backup_manager =
+        Arc::new(BackupManager::new(temp.path().join("backups")));
+    let mut entries = state
+        .format_registry
+        .get("renpy")
+        .unwrap()
+        .extract(&game)
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    entries[0].translation = Some("Translated archive dialogue.".into());
+    entries[0].status = locust_core::models::StringStatus::Translated;
+    state.db.save_entries(&entries).unwrap();
+    locust_core::extraction::inject_direct(
+        &state.format_registry,
+        &state.db,
+        &state.backup_manager,
+        &game,
+        "renpy",
+        &["en".into()],
+    )
+    .unwrap();
+    std::fs::write(game.join("save.dat"), "user save").unwrap();
+    let backup = state.backup_manager.list_backups().unwrap().remove(0);
+    let response = restore_backup(State(state), AxumPath(backup.id))
+        .await
+        .unwrap();
+    let body = serde_json::to_value(&response.0).unwrap();
+    assert_eq!(body["removed"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        PathBuf::from(body["removed"][0].as_str().unwrap()),
+        PathBuf::from("game/scripts/story.rpy")
+    );
+    assert_eq!(body["kept"][0]["path"], "save.dat");
+    assert!(body["kept"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("no recorded"));
+    assert!(!game.join("game/scripts/story.rpy").exists());
+    assert_eq!(
+        std::fs::read(game.join("game/scripts.rpa")).unwrap(),
+        archive
+    );
+    assert_eq!(
+        std::fs::read_to_string(game.join("save.dat")).unwrap(),
+        "user save"
+    );
+}
+
 fn fixture() -> (tempfile::TempDir, Arc<AppState>, BackupEntry, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let game = temp.path().join("game");
@@ -25,12 +81,12 @@ async fn backup_handlers_refuse_project_conflicts_before_mutation() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "Changed");
     assert!(backup.path.exists());
     drop(exclusive);
-    assert_eq!(
-        restore_backup(State(state.clone()), AxumPath(backup.id.clone()))
-            .await
-            .unwrap(),
-        StatusCode::OK
-    );
+    let report = restore_backup(State(state.clone()), AxumPath(backup.id.clone()))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(report.replaced, vec![PathBuf::from("story.html")]);
+    assert!(report.removed.is_empty());
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "Original");
     assert_eq!(
         delete_backup(State(state.clone()), AxumPath(backup.id))

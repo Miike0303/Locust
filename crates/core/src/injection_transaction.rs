@@ -143,6 +143,9 @@ struct Plan {
     schema_version: u32,
     transaction_id: String,
     game_root: PathBuf,
+    /// Missing in old journals: they cannot establish a backup time boundary.
+    #[serde(default)]
+    prepared_at: Option<chrono::DateTime<chrono::Utc>>,
     files: Vec<Change>,
     created_dirs: Vec<String>,
 }
@@ -285,6 +288,108 @@ pub fn ensure_no_pending_under_lock(lock: &GameLock) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Evidence only, never inferred from a filename or from a plugin's report.
+#[derive(Default)]
+pub(crate) struct CreatedOutputs {
+    pub files: BTreeSet<PathBuf>,
+    pub hashes: BTreeMap<PathBuf, BTreeSet<(String, u64)>>,
+    pub directories: BTreeSet<PathBuf>,
+}
+
+pub(crate) fn output_key(path: &Path) -> PathBuf {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        PathBuf::from(crate::database::fold_path_case(
+            &path.to_string_lossy().replace('\\', "/"),
+        ))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    path.to_owned()
+}
+
+/// Read all completed operations under the caller's game lock. A plan records
+/// absence (`original: None`) and every installed digest, including subsequent
+/// injections into that file. Old undated plans grant no deletion authority.
+pub(crate) fn created_outputs_since(
+    lock: &GameLock,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<CreatedOutputs> {
+    let mut outputs = CreatedOutputs::default();
+    if !validate_store(lock.root())? {
+        return Ok(outputs);
+    }
+    let relative = Path::new(STORE_DIR).join("operations");
+    ensure_no_links(lock.root(), &relative)?;
+    let directory = lock.root().join(relative);
+    if !directory.try_exists()? {
+        return Ok(outputs);
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if uuid::Uuid::parse_str(&id)
+            .map(|v| v.to_string())
+            .ok()
+            .as_ref()
+            != Some(&id)
+        {
+            return Err(error("invalid injection history identity"));
+        }
+        ensure_no_links(
+            lock.root(),
+            &Path::new(STORE_DIR).join("operations").join(&id),
+        )?;
+        let phase: Phase = read(&entry.path().join("phase.json"))?;
+        if phase != Phase::Completed {
+            continue;
+        }
+        let plan: Plan = read(&entry.path().join("plan.json"))?;
+        if plan.schema_version != SCHEMA
+            || plan.transaction_id != id
+            || plan.game_root != lock.root()
+            || plan.files.len() > MAX_FILES
+            || plan.created_dirs.len() > MAX_FILES
+        {
+            return Err(error(
+                "invalid completed injection plan version/identity/root/size",
+            ));
+        }
+        let Some(prepared_at) = plan.prepared_at else {
+            continue;
+        };
+        if prepared_at <= since {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        for change in plan.files {
+            let key = output_key(&safe_game_rel(&change.path)?);
+            if !seen.insert(key.clone())
+                || !valid_hash(&change.result)
+                || change.original.as_ref().is_some_and(|v| !valid_hash(v))
+            {
+                return Err(error("invalid or duplicate completed injection file"));
+            }
+            if change.original.is_none() {
+                outputs.files.insert(key.clone());
+            }
+            outputs
+                .hashes
+                .entry(key)
+                .or_default()
+                .insert((change.result.sha256, change.result.size));
+        }
+        let mut seen_dirs = BTreeSet::new();
+        for dir in plan.created_dirs {
+            let key = output_key(&safe_game_rel(&dir)?);
+            if seen.contains(&key) || !seen_dirs.insert(key.clone()) {
+                return Err(error("invalid duplicate completed injection directory"));
+            }
+            outputs.directories.insert(key);
+        }
+    }
+    Ok(outputs)
 }
 
 fn safe_game_rel(raw: &str) -> Result<PathBuf> {
@@ -978,6 +1083,7 @@ fn prepare(
         schema_version: SCHEMA,
         transaction_id: operation.active.transaction_id.clone(),
         game_root: operation.root.clone(),
+        prepared_at: Some(chrono::Utc::now()),
         files: changes,
         created_dirs,
     };

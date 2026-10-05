@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -17,12 +17,31 @@ pub struct BackupManager {
 /// File changes a restore would make after passing its locked preflight.
 /// Paths are relative to `destination` for directory backups; single-file
 /// backups report the destination file's own path.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RestorePreview {
     pub destination: PathBuf,
     pub replaced: Vec<PathBuf>,
     pub recreated: Vec<PathBuf>,
     pub identical: Vec<PathBuf>,
+    /// Planned removals in a preview; actual removals in a restore report.
+    pub removed: Vec<PathBuf>,
+    pub removed_directories: Vec<PathBuf>,
+    pub kept: Vec<RestoreKept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RestoreKept {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+impl RestorePreview {
+    fn keep(&mut self, path: PathBuf, reason: &str) {
+        self.kept.push(RestoreKept {
+            path,
+            reason: reason.into(),
+        });
+    }
 }
 
 /// An original file with an immutable expected digest and size. Readers get
@@ -362,6 +381,109 @@ fn totals(inventory: &BTreeMap<PathBuf, InventoryEntry>) -> Result<(usize, u64)>
     Ok((count, total))
 }
 
+/// Complete the deletion preflight before restoring even the first original.
+/// Only journal-owned files absent from the backup can become candidates.
+fn preview_created_outputs(
+    target: &Path,
+    inventory: &BTreeMap<PathBuf, InventoryEntry>,
+    outputs: crate::injection_transaction::CreatedOutputs,
+    preview: &mut RestorePreview,
+) -> Result<BTreeMap<PathBuf, (String, u64)>> {
+    use crate::injection_transaction::{output_key, STORE_DIR};
+    let originals: BTreeSet<_> = inventory.keys().map(|p| output_key(p)).collect();
+    let mut removals = BTreeMap::new();
+    let mut directories = Vec::new();
+    let mut walk = WalkDir::new(target)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter();
+    while let Some(entry) = walk.next() {
+        let entry = entry.map_err(|e| failure(e.to_string()))?;
+        if entry.depth() == 1
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(STORE_DIR)
+        {
+            // Already validated by created_outputs_since; retain recovery history.
+            walk.skip_current_dir();
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(target)
+            .map_err(|e| failure(e.to_string()))?
+            .to_owned();
+        let key = output_key(&relative);
+        let meta = fs::symlink_metadata(entry.path())?;
+        if reject_link(entry.path(), &meta).is_err() {
+            // WalkDir does not descend symlinks with follow_links(false).
+            // Popping its stack for a file/link would skip its siblings too.
+            if entry.file_type().is_dir() {
+                walk.skip_current_dir();
+            }
+            preview.keep(relative, "link/reparse/special path is not removed");
+            continue;
+        }
+        if originals.contains(&key) {
+            continue;
+        }
+        if meta.is_dir() {
+            if outputs.directories.contains(&key) {
+                if meta.permissions().readonly() {
+                    preview.keep(relative, "created directory is read-only");
+                } else {
+                    directories.push(relative);
+                }
+            } else if outputs.files.contains(&key) {
+                preview.keep(relative, "created file is now a directory");
+            }
+            continue;
+        }
+        if !outputs.files.contains(&key) {
+            preview.keep(relative, "no recorded Locust creation after this backup");
+            continue;
+        }
+        checked_absolute(entry.path())?;
+        let current = sha256_file(entry.path())?;
+        if !outputs
+            .hashes
+            .get(&key)
+            .is_some_and(|hashes| hashes.contains(&current))
+        {
+            preview.keep(relative, "SHA256 differs from recorded Locust output");
+        } else if meta.permissions().readonly() {
+            preview.keep(relative, "file is read-only");
+        } else {
+            removals.insert(relative, current);
+        }
+    }
+    preview.removed = removals.keys().cloned().collect();
+    let mut removable: BTreeSet<_> = removals.keys().map(|p| output_key(p)).collect();
+    directories.sort_by_key(|p| (std::cmp::Reverse(p.components().count()), p.clone()));
+    for relative in directories {
+        checked_absolute(&target.join(&relative))?;
+        let mut empty_after_removal = true;
+        for child in fs::read_dir(target.join(&relative))? {
+            let child = child?;
+            if !removable.contains(&output_key(&relative.join(child.file_name()))) {
+                empty_after_removal = false;
+            }
+        }
+        if empty_after_removal {
+            removable.insert(output_key(&relative));
+            preview.removed_directories.push(relative);
+        } else {
+            preview.keep(
+                relative,
+                "created directory is not empty after planned removals",
+            );
+        }
+    }
+    preview.kept.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(removals)
+}
+
 impl BackupManager {
     /// Storage tree protected from patch output publication.
     pub fn root(&self) -> &Path {
@@ -629,9 +751,15 @@ impl BackupManager {
     /// are checked before the first write. Legacy backups have no historical
     /// hashes: only their count/size and current readable tree can be verified.
     /// Per-file replacement is atomic; this is not a multi-file transaction and
-    /// does not delete files added after backup or merge later user edits.
+    /// removes only unchanged outputs recorded as created by completed Locust
+    /// injections after this backup. Other additions are kept with reasons.
     pub fn restore(&self, backup_id: &str) -> Result<()> {
-        self.restore_inner(backup_id, false).map(|_| ())
+        self.restore_with_report(backup_id).map(|_| ())
+    }
+
+    /// Restore and report actual removals and preserved additions under one lock.
+    pub fn restore_with_report(&self, backup_id: &str) -> Result<RestorePreview> {
+        self.restore_inner(backup_id, false)
     }
 
     /// Check the same backup, game, and destination preconditions as restore
@@ -643,11 +771,10 @@ impl BackupManager {
     /// Check restore preconditions and compare inventoried files with their
     /// destinations while holding the game lock, without changing game files.
     pub fn preview_restore(&self, id: &str) -> Result<RestorePreview> {
-        self.restore_inner(id, true)?
-            .ok_or_else(|| failure("restore preview was not produced"))
+        self.restore_inner(id, true)
     }
 
-    fn restore_inner(&self, backup_id: &str, dry_run: bool) -> Result<Option<RestorePreview>> {
+    fn restore_inner(&self, backup_id: &str, dry_run: bool) -> Result<RestorePreview> {
         let backup_dir = self.resolve_backup_dir(backup_id)?;
         let (summary, v2) = Self::load_manifest(backup_id, &backup_dir)?;
         if !summary.source_path.is_absolute() {
@@ -739,43 +866,55 @@ impl BackupManager {
                 }
             }
         }
-        if dry_run {
-            let mut preview = RestorePreview {
-                destination: target.clone(),
-                replaced: Vec::new(),
-                recreated: Vec::new(),
-                identical: Vec::new(),
+        let mut preview = RestorePreview {
+            destination: target.clone(),
+            replaced: Vec::new(),
+            recreated: Vec::new(),
+            identical: Vec::new(),
+            removed: Vec::new(),
+            removed_directories: Vec::new(),
+            kept: Vec::new(),
+        };
+        for (rel, entry) in &inventory {
+            let InventoryEntry::File { size, sha256 } = entry else {
+                continue;
             };
-            for (rel, entry) in &inventory {
-                let InventoryEntry::File { size, sha256 } = entry else {
-                    continue;
-                };
-                let dest = destination(rel);
-                let path = if kind == SourceKind::File {
-                    dest.clone()
-                } else {
-                    rel.clone()
-                };
-                match fs::symlink_metadata(&dest) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        preview.recreated.push(path);
-                    }
-                    Err(error) => return Err(error.into()),
-                    Ok(meta) if meta.len() != *size => preview.replaced.push(path),
-                    Ok(_) => {
-                        let (digest, actual_size) = sha256_file(&dest)?;
-                        if actual_size == *size && digest == *sha256 {
-                            preview.identical.push(path);
-                        } else {
-                            preview.replaced.push(path);
-                        }
+            let dest = destination(rel);
+            let path = if kind == SourceKind::File {
+                dest.clone()
+            } else {
+                rel.clone()
+            };
+            match fs::symlink_metadata(&dest) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    preview.recreated.push(path);
+                }
+                Err(error) => return Err(error.into()),
+                Ok(meta) if meta.len() != *size => preview.replaced.push(path),
+                Ok(_) => {
+                    let (digest, actual_size) = sha256_file(&dest)?;
+                    if actual_size == *size && digest == *sha256 {
+                        preview.identical.push(path);
+                    } else {
+                        preview.replaced.push(path);
                     }
                 }
             }
-            preview.replaced.sort();
-            preview.recreated.sort();
-            preview.identical.sort();
-            return Ok(Some(preview));
+        }
+        preview.replaced.sort();
+        preview.recreated.sort();
+        preview.identical.sort();
+        let removals = if kind == SourceKind::Directory {
+            let outputs = crate::injection_transaction::created_outputs_since(
+                &game_lock,
+                summary.created_at,
+            )?;
+            preview_created_outputs(&target, &inventory, outputs, &mut preview)?
+        } else {
+            BTreeMap::new()
+        };
+        if dry_run {
+            return Ok(preview);
         }
         for (rel, entry) in &inventory {
             let dest = destination(rel);
@@ -814,7 +953,38 @@ impl BackupManager {
                 }
             }
         }
-        Ok(None)
+        preview.removed.clear();
+        for (relative, expected) in removals {
+            let dest = target.join(&relative);
+            checked_absolute(&dest)?;
+            // Recheck against edits by non-cooperating writers after preflight.
+            // An edit is preserved, never made deletable by an earlier preview.
+            if !dest.is_file() {
+                preview.keep(
+                    relative,
+                    "created file disappeared or changed type during restore",
+                );
+            } else if sha256_file(&dest)? != expected {
+                preview.keep(relative, "SHA256 changed during restore");
+            } else if fs::metadata(&dest)?.permissions().readonly() {
+                preview.keep(relative, "file became read-only during restore");
+            } else {
+                fs::remove_file(dest)?;
+                preview.removed.push(relative);
+            }
+        }
+        let directories = std::mem::take(&mut preview.removed_directories);
+        for relative in directories {
+            let dest = target.join(&relative);
+            checked_absolute(&dest)?;
+            match fs::remove_dir(&dest) {
+                Ok(()) => preview.removed_directories.push(relative),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => preview.keep(relative, &format!("created directory kept: {error}")),
+            }
+        }
+        preview.kept.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(preview)
     }
 
     pub fn list_backups(&self) -> Result<Vec<BackupEntry>> {
@@ -938,6 +1108,323 @@ impl BackupManager {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn c127_inject(manager: &BackupManager, game: &Path, outputs: &[(&str, &str)]) -> BackupEntry {
+        crate::injection_transaction::run(
+            game,
+            "fixture",
+            Some("en"),
+            || manager.create_backup(game),
+            |work, _| {
+                for (path, bytes) in outputs {
+                    let dest = work.join(path);
+                    fs::create_dir_all(dest.parent().unwrap())?;
+                    fs::write(dest, bytes)?;
+                }
+                Ok(crate::extraction::InjectionReport {
+                    files_modified: outputs.len(),
+                    strings_written: outputs.len(),
+                    strings_skipped: 0,
+                    skip_reasons: Default::default(),
+                    warnings: vec![],
+                    files_written: vec![],
+                })
+            },
+            |_| Ok(()),
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn c127_restore_removes_only_unchanged_created_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("patch.xp3"), "original").unwrap();
+        let manager = BackupManager::new(temp.path().join("backups"));
+        let backup = c127_inject(
+            &manager,
+            &game,
+            &[
+                ("patch.xp3", "replacement"),
+                ("patch3.xp3", "translation"),
+                ("tl/en/edited.rpy", "translation"),
+                ("tl/en/clean.rpy", "translation"),
+            ],
+        );
+        fs::write(game.join("tl/en/edited.rpy"), "translatioN").unwrap();
+        fs::write(game.join("save.dat"), "save").unwrap();
+        let preview = manager.preview_restore(&backup.id).unwrap();
+        assert_eq!(
+            preview.removed,
+            [
+                PathBuf::from("patch3.xp3"),
+                PathBuf::from("tl/en/clean.rpy")
+            ]
+        );
+        assert!(preview
+            .kept
+            .iter()
+            .any(|k| k.path == Path::new("tl/en/edited.rpy") && k.reason.contains("SHA256")));
+        assert!(preview
+            .kept
+            .iter()
+            .any(|k| k.path == Path::new("save.dat") && k.reason.contains("no recorded")));
+        assert!(game.join("patch3.xp3").exists(), "preview must not delete");
+        let report = manager.restore_with_report(&backup.id).unwrap();
+        assert_eq!(report.removed, preview.removed);
+        assert_eq!(
+            fs::read_to_string(game.join("patch.xp3")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::read_to_string(game.join("tl/en/edited.rpy")).unwrap(),
+            "translatioN"
+        );
+        assert_eq!(fs::read_to_string(game.join("save.dat")).unwrap(), "save");
+        assert!(
+            !game.join("patch3.xp3").exists(),
+            "restore left a Locust-created patch"
+        );
+        assert!(!game.join("tl/en/clean.rpy").exists());
+        assert!(game.join("tl/en").is_dir(), "non-empty directory must stay");
+    }
+
+    #[test]
+    fn c127_restore_tracks_multiple_injections_and_backup_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("original"), "original").unwrap();
+        let manager = BackupManager::new(temp.path().join("backups"));
+        let first = c127_inject(&manager, &game, &[("tl/en/script.rpy", "v1")]);
+        let second = c127_inject(
+            &manager,
+            &game,
+            &[("tl/en/script.rpy", "v2"), ("patch.xp3", "new")],
+        );
+        manager.restore(&second.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(game.join("tl/en/script.rpy")).unwrap(),
+            "v1"
+        );
+        assert!(!game.join("patch.xp3").exists());
+        // A new completed injection puts the latest recorded bytes back.
+        c127_inject(&manager, &game, &[("tl/en/script.rpy", "v3")]);
+        manager.restore(&first.id).unwrap();
+        assert!(
+            !game.join("tl").exists(),
+            "empty created directories must be removed"
+        );
+        assert!(game.join("original").exists());
+    }
+
+    #[test]
+    fn c127_bad_creation_evidence_fails_before_any_restore_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("original"), "original").unwrap();
+        let manager = BackupManager::new(temp.path().join("backups"));
+        let backup = c127_inject(
+            &manager,
+            &game,
+            &[("original", "changed"), ("patch.xp3", "new")],
+        );
+        let operations = game.join(".locust-injections/operations");
+        let operation = fs::read_dir(operations)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(operation.join("plan.json"), "invalid").unwrap();
+        assert!(manager.preview_restore(&backup.id).is_err());
+        assert!(manager.restore(&backup.id).is_err());
+        assert_eq!(
+            fs::read_to_string(game.join("original")).unwrap(),
+            "changed"
+        );
+        assert_eq!(fs::read_to_string(game.join("patch.xp3")).unwrap(), "new");
+    }
+
+    #[test]
+    fn c127_undated_earlier_and_incomplete_operations_never_authorize_deletion() {
+        for variant in [
+            "undated",
+            "earlier",
+            "aborted",
+            "rolled_back",
+            "not_created",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game");
+            fs::create_dir(&game).unwrap();
+            let manager = BackupManager::new(temp.path().join("backups"));
+            let backup = c127_inject(&manager, &game, &[("patch.xp3", "translation")]);
+            let operation = fs::read_dir(game.join(".locust-injections/operations"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let path = operation.join("plan.json");
+            let mut plan: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            match variant {
+                "undated" => {
+                    plan.as_object_mut().unwrap().remove("prepared_at");
+                }
+                "earlier" => {
+                    plan["prepared_at"] =
+                        serde_json::to_value(backup.created_at - chrono::Duration::seconds(1))
+                            .unwrap();
+                }
+                "not_created" => {
+                    plan["files"][0]["original"] = plan["files"][0]["result"].clone();
+                }
+                _ => fs::write(
+                    operation.join("phase.json"),
+                    serde_json::to_vec(variant).unwrap(),
+                )
+                .unwrap(),
+            }
+            fs::write(path, serde_json::to_vec(&plan).unwrap()).unwrap();
+            let report = manager.restore_with_report(&backup.id).unwrap();
+            assert!(report.removed.is_empty(), "{variant}");
+            assert!(
+                report
+                    .kept
+                    .iter()
+                    .any(|k| k.path == Path::new("patch.xp3") && k.reason.contains("no recorded")),
+                "{variant}"
+            );
+            assert_eq!(
+                fs::read_to_string(game.join("patch.xp3")).unwrap(),
+                "translation"
+            );
+        }
+    }
+
+    #[test]
+    fn c127_foreign_unsafe_or_bad_hash_evidence_is_rejected_before_writes() {
+        for variant in ["root", "path", "hash", "id", "duplicate"] {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game");
+            fs::create_dir(&game).unwrap();
+            fs::write(game.join("original"), "original").unwrap();
+            let manager = BackupManager::new(temp.path().join("backups"));
+            let backup = c127_inject(
+                &manager,
+                &game,
+                &[("original", "changed"), ("patch.xp3", "new")],
+            );
+            let operation = fs::read_dir(game.join(".locust-injections/operations"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let path = operation.join("plan.json");
+            let mut plan: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            match variant {
+                "root" => plan["game_root"] = serde_json::json!(temp.path()),
+                "path" => plan["files"][0]["path"] = serde_json::json!("../outside"),
+                "hash" => plan["files"][0]["result"]["sha256"] = serde_json::json!("invalid"),
+                "id" => {
+                    plan["transaction_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string())
+                }
+                _ => {
+                    let file = plan["files"][0].clone();
+                    plan["files"].as_array_mut().unwrap().push(file);
+                }
+            }
+            fs::write(path, serde_json::to_vec(&plan).unwrap()).unwrap();
+            assert!(manager.preview_restore(&backup.id).is_err(), "{variant}");
+            assert!(manager.restore(&backup.id).is_err(), "{variant}");
+            assert_eq!(
+                fs::read_to_string(game.join("original")).unwrap(),
+                "changed"
+            );
+            assert!(game.join("patch.xp3").exists());
+        }
+    }
+
+    #[test]
+    fn c127_removal_obeys_game_lock_and_preserves_readonly_and_changed_types() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let manager = BackupManager::new(temp.path().join("backups"));
+        let backup = c127_inject(
+            &manager,
+            &game,
+            &[("patch.xp3", "translation"), ("other", "new")],
+        );
+        let lock = GameLock::acquire(&game).unwrap();
+        assert!(manager.restore(&backup.id).is_err());
+        assert!(manager.preview_restore(&backup.id).is_err());
+        assert!(game.join("patch.xp3").exists());
+        drop(lock);
+        let original_permissions = fs::metadata(game.join("patch.xp3")).unwrap().permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(game.join("patch.xp3"), readonly).unwrap();
+        fs::remove_file(game.join("other")).unwrap();
+        fs::create_dir(game.join("other")).unwrap();
+        let report = manager.restore_with_report(&backup.id).unwrap();
+        fs::set_permissions(game.join("patch.xp3"), original_permissions).unwrap();
+        assert!(report.removed.is_empty());
+        assert!(report.kept.iter().any(|k| k.reason.contains("read-only")));
+        assert!(report
+            .kept
+            .iter()
+            .any(|k| k.reason.contains("now a directory")));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn c127_kept_links_do_not_hide_other_created_files() {
+        for directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game");
+            fs::create_dir(&game).unwrap();
+            let manager = BackupManager::new(temp.path().join("backups"));
+            let backup = c127_inject(
+                &manager,
+                &game,
+                &[("a", "translation"), ("z", "translation")],
+            );
+            let outside = temp.path().join("outside");
+            if directory {
+                fs::create_dir(&outside).unwrap();
+            } else {
+                fs::write(&outside, "external").unwrap();
+            }
+            fs::remove_file(game.join("a")).unwrap();
+            #[cfg(windows)]
+            if directory {
+                std::os::windows::fs::symlink_dir(&outside, game.join("a")).unwrap();
+            } else {
+                std::os::windows::fs::symlink_file(&outside, game.join("a")).unwrap();
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside, game.join("a")).unwrap();
+            let report = manager.restore_with_report(&backup.id).unwrap();
+            assert_eq!(report.removed, [PathBuf::from("z")]);
+            assert!(report
+                .kept
+                .iter()
+                .any(|k| k.path == Path::new("a") && k.reason.contains("link")));
+            assert!(outside.exists());
+            assert!(fs::symlink_metadata(game.join("a"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
 
     #[test]
     fn c122_revision_binary_reader_verifies_exact_consumed_bytes() {

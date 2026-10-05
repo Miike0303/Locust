@@ -1,6 +1,93 @@
 use locust_core::backup::BackupManager;
 
 #[test]
+fn c127_cli_restores_created_renpy_overlay_and_reports_kept_mods() {
+    use locust_core::database::{Database, EntryFilter};
+    use std::fs;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let game = root.join("renpy");
+    fs::create_dir_all(game.join("game")).unwrap();
+    let archive = include_bytes!("fixtures/c127-scripts.rpa");
+    fs::write(game.join("game/scripts.rpa"), archive).unwrap();
+    let project = root.join("p.db");
+    let run = || {
+        let mut command = assert_cmd::Command::cargo_bin("locust").unwrap();
+        command
+            .env("LOCUST_DATA_DIR", root.join("profile"))
+            .env("LOCUST_BACKUP_ROOT", root.join("backups"));
+        command
+    };
+    run()
+        .arg("extract")
+        .arg(&game)
+        .arg("-o")
+        .arg(&project)
+        .assert()
+        .success();
+    let db = Database::open(&project).unwrap();
+    let mut entries = db.get_entries(&EntryFilter::default()).unwrap();
+    assert_eq!(entries.len(), 1);
+    entries[0].translation = Some("Translated archive dialogue.".into());
+    entries[0].status = locust_core::models::StringStatus::Translated;
+    db.save_entries(&entries).unwrap();
+    run()
+        .arg("inject")
+        .arg(&game)
+        .arg("-P")
+        .arg(&project)
+        .args(["-l", "en", "--direct"])
+        .assert()
+        .success();
+    let overlay = game.join("game/scripts/story.rpy");
+    assert!(fs::read_to_string(&overlay)
+        .unwrap()
+        .contains("Translated archive dialogue."));
+    fs::write(game.join("game/mod.rpy"), "user mod").unwrap();
+    let manager = BackupManager::new(root.join("backups"));
+    let backup = manager.list_backups().unwrap().remove(0);
+    let preview = run()
+        .args(["restore-backup", &backup.id, "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let preview = String::from_utf8(preview).unwrap().replace('\\', "/");
+    assert!(
+        preview.contains("Would remove 1 file(s) created by Locust:"),
+        "{preview}"
+    );
+    assert!(preview.contains("game/scripts/story.rpy"), "{preview}");
+    assert!(
+        preview.contains("game/mod.rpy: no recorded Locust creation"),
+        "{preview}"
+    );
+    assert!(overlay.exists());
+    let output = run()
+        .args(["restore-backup", &backup.id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(
+        output.contains("Removed 1 file(s) created by Locust:"),
+        "{output}"
+    );
+    assert!(!overlay.exists());
+    assert!(!game.join("game/scripts").exists());
+    assert_eq!(fs::read(game.join("game/scripts.rpa")).unwrap(), archive);
+    assert_eq!(
+        fs::read_to_string(game.join("game/mod.rpy")).unwrap(),
+        "user mod"
+    );
+    let repeated = manager.restore_with_report(&backup.id).unwrap();
+    assert!(repeated.removed.is_empty());
+}
+
+#[test]
 fn cli_lists_readable_backup_and_warns_about_damaged_manifest() {
     let root = tempfile::tempdir().unwrap();
     let game = root.path().join("game");
@@ -148,7 +235,9 @@ fn restore_backup_dry_run_checks_payload_without_writing_game() {
          Would replace 1 file(s):\n  script.rpy\n\
          Would recreate 0 missing file(s):\n\
          Already identical: 0\n\
-         Files added to the game after this backup are not removed.\n",
+         Would remove 0 file(s) created by Locust:\n\
+         Would remove 0 empty directory/directories created by Locust:\n\
+         Kept 0 added path(s):\n",
         game.canonicalize().unwrap().display()
     );
     assert_eq!(output, expected);

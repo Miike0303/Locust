@@ -631,8 +631,12 @@ fn cmd_backups() -> anyhow::Result<()> {
 
 fn cmd_restore_backup(id: &str, dry_run: bool) -> anyhow::Result<()> {
     let manager = BackupManager::new(locust_backup_root());
+    let preview = if dry_run {
+        manager.preview_restore(id)?
+    } else {
+        manager.restore_with_report(id)?
+    };
     if dry_run {
-        let preview = manager.preview_restore(id)?;
         println!("Destination: {}", preview.destination.display());
         println!("Would replace {} file(s):", preview.replaced.len());
         for path in &preview.replaced {
@@ -646,10 +650,27 @@ fn cmd_restore_backup(id: &str, dry_run: bool) -> anyhow::Result<()> {
             println!("  {}", path.display());
         }
         println!("Already identical: {}", preview.identical.len());
-        println!("Files added to the game after this backup are not removed.");
     } else {
-        manager.restore(id)?;
         println!("Restored backup {id} to its original game location.");
+    }
+    let action = if dry_run { "Would remove" } else { "Removed" };
+    println!(
+        "{action} {} file(s) created by Locust:",
+        preview.removed.len()
+    );
+    for path in &preview.removed {
+        println!("  {}", path.display());
+    }
+    println!(
+        "{action} {} empty directory/directories created by Locust:",
+        preview.removed_directories.len()
+    );
+    for path in &preview.removed_directories {
+        println!("  {}", path.display());
+    }
+    println!("Kept {} added path(s):", preview.kept.len());
+    for kept in &preview.kept {
+        println!("  {}: {}", kept.path.display(), kept.reason);
     }
     Ok(())
 }
