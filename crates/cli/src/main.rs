@@ -17,6 +17,11 @@ use locust_core::translation::{load_pending_entries, run_fallback_chain, Transla
 use locust_core::validation::{count_binary_slot_oversize, Validator};
 
 fn open_existing_project(path: &Path) -> anyhow::Result<Database> {
+    require_existing_project(path)?;
+    Ok(Database::open(path)?)
+}
+
+fn require_existing_project(path: &Path) -> anyhow::Result<()> {
     if !path.try_exists()? {
         anyhow::bail!(
             "project database not found: {}. Create it with `locust extract <game> -o \"{}\"`",
@@ -27,7 +32,7 @@ fn open_existing_project(path: &Path) -> anyhow::Result<Database> {
     if path.metadata()?.is_dir() {
         anyhow::bail!("project database path is a directory: {}", path.display());
     }
-    Ok(Database::open(path)?)
+    Ok(())
 }
 
 /// Surface binary inject oversize (Unity/Unreal/Wolf) before the engine silently
@@ -2225,6 +2230,16 @@ fn cmd_glossary(action: GlossaryCommands) -> anyhow::Result<()> {
 }
 
 fn cmd_backup_project(project: PathBuf, output: PathBuf) -> anyhow::Result<()> {
+    // Refuse before opening: on Linux even opening and closing the project
+    // rewrites its file (WAL checkpoint). `snapshot_to` re-checks both.
+    require_existing_project(&project)?;
+    export::check_export_destination(&output, &project)?;
+    if output.try_exists()? {
+        anyhow::bail!(
+            "checkpoint destination already exists: {}",
+            output.display()
+        );
+    }
     let db = open_existing_project(&project)?;
     db.snapshot_to(&output)?;
     let checkpoint = Database::open(&output)?;
