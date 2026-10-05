@@ -164,6 +164,19 @@ impl NwArchive {
     pub fn scenario_ks_entries(&self) -> impl Iterator<Item = &NwEntry> {
         self.entries.iter().filter(|e| is_scenario_ks_path(&e.path))
     }
+
+    /// Resolve only a unique scenario member for a revision proof. ZIP names
+    /// can repeat or alias through slash normalization; those remain strict.
+    pub(crate) fn revision_scenario_bytes(&self, member: &str) -> Result<Option<Vec<u8>>, NwError> {
+        let mut matches = self.scenario_ks_entries().filter(|e| e.path == member);
+        let Some(entry) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        self.read_entry(entry).map(Some)
+    }
 }
 
 fn is_scenario_ks_path(path: &str) -> bool {

@@ -83,6 +83,14 @@ pub trait FormatPlugin: Send + Sync {
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport>;
 
+    /// Physical original needed for a row's revision proof. Container plugins
+    /// may opt in to mapping a virtual member to its archive; the default keeps
+    /// exact entry-file matching. Core still supplies only verified prior writes
+    /// with a pristine counterpart, never arbitrary paths requested here.
+    fn revision_original_path(&self, file_path: &Path) -> PathBuf {
+        file_path.to_path_buf()
+    }
+
     /// Retarget old source locators to a verified previous Direct result.
     /// Keys are files in the private current-game copy; values are their exact
     /// original backup readers. Core verifies the prior result and backup first;
@@ -418,7 +426,7 @@ fn prepare_direct_revision(
             let mut originals = HashMap::new();
             let entry_files: std::collections::HashSet<_> = entries
                 .iter()
-                .map(|entry| entry.file_path.clone())
+                .map(|entry| plugin.revision_original_path(&entry.file_path))
                 .collect();
             for file in &prior.files {
                 let relative =

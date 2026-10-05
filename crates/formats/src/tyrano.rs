@@ -756,6 +756,46 @@ fn revision_aligned(old: &str, old_slots: &[KsSlot], new: &str, new_slots: &[KsS
     old[old_end..] == *tail
 }
 
+fn prepare_ks_revision<'a>(
+    original: &[u8],
+    current: &[u8],
+    label: &str,
+    entries: impl Iterator<Item = &'a mut StringEntry>,
+) -> Result<()> {
+    let old = decode_ks_utf8(original, label)?;
+    let new = decode_ks_utf8(current, label)?;
+    let old_slots = scenario_slots(&old.text);
+    let new_slots = scenario_slots(&new.text);
+    if old.had_bom != new.had_bom || !revision_aligned(&old.text, &old_slots, &new.text, &new_slots)
+    {
+        return Ok(());
+    }
+    let index: HashMap<_, _> = old_slots
+        .iter()
+        .zip(&new_slots)
+        .map(|(a, b)| (a.locator.as_str(), (a, b)))
+        .collect();
+    for entry in entries {
+        let Some((_, locator)) = entry.id.rsplit_once('#') else {
+            continue;
+        };
+        let Some((a, b)) = index.get(locator) else {
+            continue;
+        };
+        if !slot_matches(entry, b, &new.text) && slot_matches(entry, a, &old.text) {
+            entry.source = new.text[b.range.clone()].to_string();
+            // Bare attributes may have gained quotes. Alignment proved that
+            // nothing else changed in the guards or between scenario slots.
+            if entry.metadata.contains_key("tyrano_guard") {
+                entry
+                    .metadata
+                    .insert("tyrano_guard".into(), serde_json::json!(b.guard));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn preserved_tags(source: &str, translation: &str) -> bool {
     let old = scan_line(source, &mut ScanState::default());
     let new = scan_line(translation, &mut ScanState::default());
@@ -807,12 +847,33 @@ fn safe_replacement(slot: &KsSlot, source: &str, translation: &str) -> bool {
     }
 }
 
-/// All offsets refer to the original UTF-8 buffer. Replacing in reverse order
-/// retains untouched bytes, mixed delimiters, BOM and the exact final newline.
+fn empty_injection_report() -> InjectionReport {
+    InjectionReport {
+        skip_reasons: Default::default(),
+        files_modified: 0,
+        strings_written: 0,
+        strings_skipped: 0,
+        warnings: Vec::new(),
+        files_written: Vec::new(),
+    }
+}
+
+#[cfg(test)]
 fn apply_ks_translations(
     bytes: &[u8],
     label: &str,
     file_entries: &[&StringEntry],
+) -> Result<Option<(Vec<u8>, usize, usize)>> {
+    apply_ks_translations_with_report(bytes, label, file_entries, &mut empty_injection_report())
+}
+
+/// All offsets refer to the original UTF-8 buffer. Replacing in reverse order
+/// retains untouched bytes, mixed delimiters, BOM and the exact final newline.
+fn apply_ks_translations_with_report(
+    bytes: &[u8],
+    label: &str,
+    file_entries: &[&StringEntry],
+    report: &mut InjectionReport,
 ) -> Result<Option<(Vec<u8>, usize, usize)>> {
     let mut decoded = decode_ks_utf8(bytes, label)?;
     let slots = scenario_slots(&decoded.text);
@@ -826,21 +887,34 @@ fn apply_ks_translations(
     let mut edits = Vec::new();
     for entry in file_entries {
         let Some(translation) = entry.translation.as_deref() else {
+            report.skip("untranslated", 1);
             continue;
         };
         let Some((_, locator)) = entry.id.rsplit_once('#') else {
+            report.skip("invalid_locator", 1);
             continue;
         };
         let Some(slot) = by_locator.get(locator) else {
+            report.skip("target_missing", 1);
             continue;
         };
-        if counts[locator] != 1
-            || !slot_matches(entry, slot, &decoded.text)
-            || entry.require_current_translation().is_err()
-            || entry.require_preserved_translation_controls().is_err()
-            || !safe_replacement(slot, &entry.source, translation)
-            || translation == entry.source
-        {
+        let reason = if counts[locator] != 1 {
+            Some("duplicate")
+        } else if !slot_matches(entry, slot, &decoded.text) {
+            Some("source_changed")
+        } else if entry.require_current_translation().is_err() {
+            Some("stale_translation")
+        } else if entry.require_preserved_translation_controls().is_err() {
+            Some("invalid_placeholders")
+        } else if !safe_replacement(slot, &entry.source, translation) {
+            Some("invalid_translation")
+        } else if translation == entry.source {
+            Some("unchanged")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            report.skip(reason, 1);
             continue;
         }
         let value = match (&slot.kind, bare_attribute_quote(translation)) {
@@ -1119,54 +1193,91 @@ impl FormatPlugin for TyranoPlugin {
         Ok(all)
     }
 
+    fn revision_original_path(&self, file_path: &Path) -> PathBuf {
+        file_path
+            .ancestors()
+            .find(|path| {
+                is_app_asar(path)
+                    || tyrano_nw::is_package_nw_name(path)
+                    || tyrano_nw::is_exe_name(path)
+            })
+            .unwrap_or(file_path)
+            .to_path_buf()
+    }
+
     fn prepare_revision_entries(
         &self,
         entries: &mut [StringEntry],
         originals: &HashMap<PathBuf, RevisionOriginal>,
     ) -> Result<()> {
-        // Core calls this only after verifying the previous Direct output and
-        // its pristine backup. No unverified source mismatch is accepted by the
-        // normal payload writer. Archive payloads remain source-checked too.
+        // Core verified both the previous Direct output and pristine provenance.
+        // Read the exact verified bytes, then prove alignment separately for each
+        // scenario. A failed proof leaves source/guards and strict writes alone.
         for (current_path, original) in originals {
-            if !Self::is_ks(current_path) {
-                continue;
-            }
-            let original = original.read_text()?;
-            let current = std::fs::read(current_path)?;
             let label = current_path.to_string_lossy();
-            let old = decode_ks_utf8(original.as_bytes(), &label)?;
-            let new = decode_ks_utf8(&current, &label)?;
-            let old_slots = scenario_slots(&old.text);
-            let new_slots = scenario_slots(&new.text);
-            if old_slots.len() != new_slots.len() || old.had_bom != new.had_bom {
+            if Self::is_ks(current_path) {
+                prepare_ks_revision(
+                    original.read_text()?.as_bytes(),
+                    &std::fs::read(current_path)?,
+                    &label,
+                    entries.iter_mut().filter(|e| e.file_path == *current_path),
+                )?;
                 continue;
             }
-            if !revision_aligned(&old.text, &old_slots, &new.text, &new_slots) {
-                continue;
-            }
-            let index: HashMap<_, _> = old_slots
-                .iter()
-                .zip(&new_slots)
-                .map(|(a, b)| (a.locator.as_str(), (a, b)))
-                .collect();
-            for entry in entries.iter_mut().filter(|e| e.file_path == *current_path) {
-                let Some((_, locator)) = entry.id.rsplit_once('#') else {
-                    continue;
-                };
-                let Some((a, b)) = index.get(locator) else {
-                    continue;
-                };
-                if slot_matches(entry, b, &new.text) {
-                    continue;
+            let mut members: HashMap<String, Vec<&mut StringEntry>> = HashMap::new();
+            for entry in entries.iter_mut() {
+                if let Ok(member) = entry.file_path.strip_prefix(current_path) {
+                    members
+                        .entry(member.to_string_lossy().replace('\\', "/"))
+                        .or_default()
+                        .push(entry);
                 }
-                if slot_matches(entry, a, &old.text) {
-                    entry.source = new.text[b.range.clone()].to_string();
-                    // Quotes added to a bare attribute on this line changed
-                    // its guard; the alignment above proved nothing else did.
-                    if entry.metadata.contains_key("tyrano_guard") {
-                        entry
-                            .metadata
-                            .insert("tyrano_guard".into(), serde_json::json!(b.guard));
+            }
+            if members.is_empty() {
+                continue;
+            }
+            if is_app_asar(current_path) {
+                let old = AsarArchive::from_bytes(current_path.clone(), original.read_bytes()?)
+                    .map_err(|e| parse_err(&label, e.to_string()))?;
+                let new = AsarArchive::open(current_path)
+                    .map_err(|e| parse_err(&label, e.to_string()))?;
+                for (member, rows) in members {
+                    let old_bytes = old
+                        .revision_scenario_bytes(&member)
+                        .map_err(|e| parse_err(&label, e.to_string()))?;
+                    let new_bytes = new
+                        .revision_scenario_bytes(&member)
+                        .map_err(|e| parse_err(&label, e.to_string()))?;
+                    if let (Some(a), Some(b)) = (old_bytes, new_bytes) {
+                        prepare_ks_revision(
+                            &a,
+                            &b,
+                            &format!("{label}/{member}"),
+                            rows.into_iter(),
+                        )?;
+                    }
+                }
+            } else if tyrano_nw::is_package_nw_name(current_path)
+                || tyrano_nw::is_exe_name(current_path)
+            {
+                let old = NwArchive::from_bytes(current_path.clone(), original.read_bytes()?)
+                    .map_err(|e| parse_err(&label, e.to_string()))?;
+                let new =
+                    NwArchive::open(current_path).map_err(|e| parse_err(&label, e.to_string()))?;
+                for (member, rows) in members {
+                    let old_bytes = old
+                        .revision_scenario_bytes(&member)
+                        .map_err(|e| parse_err(&label, e.to_string()))?;
+                    let new_bytes = new
+                        .revision_scenario_bytes(&member)
+                        .map_err(|e| parse_err(&label, e.to_string()))?;
+                    if let (Some(a), Some(b)) = (old_bytes, new_bytes) {
+                        prepare_ks_revision(
+                            &a,
+                            &b,
+                            &format!("{label}/{member}"),
+                            rows.into_iter(),
+                        )?;
                     }
                 }
             }
@@ -1191,11 +1302,7 @@ impl FormatPlugin for TyranoPlugin {
         game_lock: &GameLock,
     ) -> Result<InjectionReport> {
         game_lock.validate_selection(path)?;
-        let mut files_modified = 0;
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
-        let mut warnings = Vec::new();
-        let mut files_written = Vec::new();
+        let mut report = empty_injection_report();
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for e in entries {
@@ -1237,34 +1344,37 @@ impl FormatPlugin for TyranoPlugin {
                 }
             };
             if !actual.exists() {
-                warnings.push(format!("missing script {}", file_path.display()));
-                strings_skipped += file_entries.len();
+                report
+                    .warnings
+                    .push(format!("missing script {}", file_path.display()));
+                report.skip("target_missing", file_entries.len());
                 continue;
             }
             guard_target(game_lock, &actual)?;
             let bytes = match std::fs::read(&actual) {
                 Ok(b) => b,
                 Err(e) => {
-                    warnings.push(format!("read {}: {e}", actual.display()));
-                    strings_skipped += file_entries.len();
+                    report
+                        .warnings
+                        .push(format!("read {}: {e}", actual.display()));
+                    report.skip("read_error", file_entries.len());
                     continue;
                 }
             };
             let label = actual.display().to_string();
-            match apply_ks_translations(&bytes, &label, &file_entries) {
-                Ok(Some((encoded, written, skipped))) => {
+            match apply_ks_translations_with_report(&bytes, &label, &file_entries, &mut report) {
+                Ok(Some((encoded, written, _))) => {
                     std::fs::write(&actual, &encoded)?;
-                    files_modified += 1;
-                    files_written.push(actual);
-                    strings_written += written;
-                    strings_skipped += skipped;
+                    report.files_modified += 1;
+                    report.files_written.push(actual);
+                    report.strings_written += written;
                 }
-                Ok(None) => {
-                    strings_skipped += file_entries.len();
-                }
+                Ok(None) => {}
                 Err(e) => {
-                    warnings.push(format!("cannot re-encode {label}: {e}"));
-                    strings_skipped += file_entries.len();
+                    report
+                        .warnings
+                        .push(format!("cannot re-encode {label}: {e}"));
+                    report.skip("decode_error", file_entries.len());
                 }
             }
         }
@@ -1280,9 +1390,11 @@ impl FormatPlugin for TyranoPlugin {
                 }
             };
             if !arch_path.exists() {
-                warnings.push(format!("missing archive {archive_rel}"));
+                report
+                    .warnings
+                    .push(format!("missing archive {archive_rel}"));
                 for (_, fe) in &inners {
-                    strings_skipped += fe.len();
+                    report.skip("target_missing", fe.len());
                 }
                 continue;
             }
@@ -1291,9 +1403,11 @@ impl FormatPlugin for TyranoPlugin {
             let archive = match AsarArchive::open(&arch_path) {
                 Ok(a) => a,
                 Err(e) => {
-                    warnings.push(format!("cannot open {archive_rel}: {e}"));
+                    report
+                        .warnings
+                        .push(format!("cannot open {archive_rel}: {e}"));
                     for (_, fe) in &inners {
-                        strings_skipped += fe.len();
+                        report.skip("archive_error", fe.len());
                     }
                     continue;
                 }
@@ -1311,8 +1425,10 @@ impl FormatPlugin for TyranoPlugin {
                 {
                     Some(e) => e,
                     None => {
-                        warnings.push(format!("entry {inner} not in {archive_rel}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("entry {inner} not in {archive_rel}"));
+                        report.skip("target_missing", file_entries.len());
                         continue;
                     }
                 };
@@ -1325,16 +1441,18 @@ impl FormatPlugin for TyranoPlugin {
                 let bytes = match archive.read_entry(entry) {
                     Ok(b) => b,
                     Err(e) => {
-                        warnings.push(format!("read {archive_rel}/{inner}: {e}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("read {archive_rel}/{inner}: {e}"));
+                        report.skip("read_error", file_entries.len());
                         continue;
                     }
                 };
                 let label = format!("{archive_rel}/{inner}");
-                match apply_ks_translations(&bytes, &label, &file_entries) {
-                    Ok(Some((encoded, written, skipped))) => {
+                match apply_ks_translations_with_report(&bytes, &label, &file_entries, &mut report)
+                {
+                    Ok(Some((encoded, written, _))) => {
                         arch_written += written;
-                        strings_skipped += skipped;
                         let key = inner.replace('\\', "/");
                         if entry.unpacked {
                             let disk = archive
@@ -1347,12 +1465,12 @@ impl FormatPlugin for TyranoPlugin {
                             replacements.insert(key, encoded);
                         }
                     }
-                    Ok(None) => {
-                        strings_skipped += file_entries.len();
-                    }
+                    Ok(None) => {}
                     Err(e) => {
-                        warnings.push(format!("cannot translate {label}: {e}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("cannot translate {label}: {e}"));
+                        report.skip("decode_error", file_entries.len());
                     }
                 }
             }
@@ -1369,20 +1487,24 @@ impl FormatPlugin for TyranoPlugin {
                         outputs.push((arch_path.clone(), new_arch));
                         match replace_files(game_lock, &outputs) {
                             Ok(backups) => {
-                                note_backups(backups, &mut warnings);
-                                files_modified += outputs.len();
-                                files_written.extend(outputs.into_iter().map(|(path, _)| path));
-                                strings_written += arch_written;
+                                note_backups(backups, &mut report.warnings);
+                                report.files_modified += outputs.len();
+                                report
+                                    .files_written
+                                    .extend(outputs.into_iter().map(|(path, _)| path));
+                                report.strings_written += arch_written;
                             }
                             Err(e) => {
-                                warnings.push(format!("safe-replace {archive_rel}: {e}"));
-                                strings_skipped += arch_written;
+                                report
+                                    .warnings
+                                    .push(format!("safe-replace {archive_rel}: {e}"));
+                                report.skip("write_error", arch_written);
                             }
                         }
                     }
                     Err(e) => {
-                        warnings.push(format!("rebuild {archive_rel}: {e}"));
-                        strings_skipped += arch_written;
+                        report.warnings.push(format!("rebuild {archive_rel}: {e}"));
+                        report.skip("rebuild_error", arch_written);
                     }
                 }
             }
@@ -1399,9 +1521,11 @@ impl FormatPlugin for TyranoPlugin {
                 }
             };
             if !arch_path.exists() {
-                warnings.push(format!("missing NW.js package {archive_rel}"));
+                report
+                    .warnings
+                    .push(format!("missing NW.js package {archive_rel}"));
                 for (_, fe) in &inners {
-                    strings_skipped += fe.len();
+                    report.skip("target_missing", fe.len());
                 }
                 continue;
             }
@@ -1410,9 +1534,11 @@ impl FormatPlugin for TyranoPlugin {
             let archive = match NwArchive::open(&arch_path) {
                 Ok(a) => a,
                 Err(e) => {
-                    warnings.push(format!("cannot open {archive_rel}: {e}"));
+                    report
+                        .warnings
+                        .push(format!("cannot open {archive_rel}: {e}"));
                     for (_, fe) in &inners {
-                        strings_skipped += fe.len();
+                        report.skip("archive_error", fe.len());
                     }
                     continue;
                 }
@@ -1429,32 +1555,36 @@ impl FormatPlugin for TyranoPlugin {
                 {
                     Some(e) => e,
                     None => {
-                        warnings.push(format!("entry {inner} not in {archive_rel}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("entry {inner} not in {archive_rel}"));
+                        report.skip("target_missing", file_entries.len());
                         continue;
                     }
                 };
                 let bytes = match archive.read_entry(entry) {
                     Ok(b) => b,
                     Err(e) => {
-                        warnings.push(format!("read {archive_rel}/{inner}: {e}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("read {archive_rel}/{inner}: {e}"));
+                        report.skip("read_error", file_entries.len());
                         continue;
                     }
                 };
                 let label = format!("{archive_rel}/{inner}");
-                match apply_ks_translations(&bytes, &label, &file_entries) {
-                    Ok(Some((encoded, written, skipped))) => {
+                match apply_ks_translations_with_report(&bytes, &label, &file_entries, &mut report)
+                {
+                    Ok(Some((encoded, written, _))) => {
                         arch_written += written;
-                        strings_skipped += skipped;
                         replacements.insert(inner.replace('\\', "/"), encoded);
                     }
-                    Ok(None) => {
-                        strings_skipped += file_entries.len();
-                    }
+                    Ok(None) => {}
                     Err(e) => {
-                        warnings.push(format!("cannot translate {label}: {e}"));
-                        strings_skipped += file_entries.len();
+                        report
+                            .warnings
+                            .push(format!("cannot translate {label}: {e}"));
+                        report.skip("decode_error", file_entries.len());
                     }
                 }
             }
@@ -1464,33 +1594,28 @@ impl FormatPlugin for TyranoPlugin {
                     Ok(new_pkg) => {
                         match replace_files(game_lock, &[(arch_path.clone(), new_pkg)]) {
                             Ok(backups) => {
-                                note_backups(backups, &mut warnings);
-                                files_modified += 1;
-                                files_written.push(arch_path.clone());
-                                strings_written += arch_written;
+                                note_backups(backups, &mut report.warnings);
+                                report.files_modified += 1;
+                                report.files_written.push(arch_path.clone());
+                                report.strings_written += arch_written;
                             }
                             Err(e) => {
-                                warnings.push(format!("safe-replace {archive_rel}: {e}"));
-                                strings_skipped += arch_written;
+                                report
+                                    .warnings
+                                    .push(format!("safe-replace {archive_rel}: {e}"));
+                                report.skip("write_error", arch_written);
                             }
                         }
                     }
                     Err(e) => {
-                        warnings.push(format!("rebuild {archive_rel}: {e}"));
-                        strings_skipped += arch_written;
+                        report.warnings.push(format!("rebuild {archive_rel}: {e}"));
+                        report.skip("rebuild_error", arch_written);
                     }
                 }
             }
         }
 
-        Ok(InjectionReport {
-            skip_reasons: Default::default(),
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings,
-            files_written,
-        })
+        Ok(report)
     }
 }
 
@@ -1498,6 +1623,425 @@ impl FormatPlugin for TyranoPlugin {
 
 #[cfg(test)]
 mod tests {
+    const C122_SCENARIO: &str = "\u{feff}; keep comment\r\n#表示名:face\r\nHello.[p]\n[glink text=Continue target=*next]\r\n@jump target=*done\n";
+
+    fn c122_archive(kind: &str, scenario: &str) -> Vec<u8> {
+        let members = [
+            ("data/scenario/main.ks".into(), scenario.as_bytes().to_vec()),
+            (
+                "data/scenario/untouched.ks".into(),
+                b"; no dialogue\r\n@jump target=*keep\n".to_vec(),
+            ),
+            ("data/keep.bin".into(), vec![0, 255, 128, 42]),
+        ];
+        if kind == "asar" {
+            return tyrano_asar::write_asar(&members).unwrap();
+        }
+        use std::io::{Cursor, Write};
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in &members {
+            writer
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        let mut bytes = if kind == "exe" {
+            b"MZ\x90\0UNRELATED_EXE_STUB".to_vec()
+        } else {
+            Vec::new()
+        };
+        bytes.extend(writer.finish().unwrap().into_inner());
+        bytes
+    }
+
+    fn c122_path(root: &Path, kind: &str) -> PathBuf {
+        root.join(match kind {
+            "asar" => "resources/app.asar",
+            "nw" => "package.nw",
+            "exe" => "data.exe",
+            "loose" => "data/scenario/main.ks",
+            _ => unreachable!(),
+        })
+    }
+
+    fn c122_write(path: &Path, kind: &str, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            if kind == "loose" {
+                text.as_bytes().to_vec()
+            } else {
+                c122_archive(kind, text)
+            },
+        )
+        .unwrap();
+    }
+
+    fn c122_members(path: &Path, kind: &str) -> HashMap<String, Vec<u8>> {
+        if kind == "asar" {
+            let archive = AsarArchive::open(path).unwrap();
+            archive
+                .entries
+                .iter()
+                .map(|e| (e.path.clone(), archive.read_entry(e).unwrap()))
+                .collect()
+        } else {
+            let archive = NwArchive::open(path).unwrap();
+            if kind == "exe" {
+                assert_eq!(archive.exe_prefix(), b"MZ\x90\0UNRELATED_EXE_STUB");
+            }
+            archive
+                .entries
+                .iter()
+                .map(|e| (e.path.clone(), archive.read_entry(e).unwrap()))
+                .collect()
+        }
+    }
+
+    fn c122_direct_revisions(kind: &str) {
+        use locust_core::{
+            backup::BackupManager,
+            database::{Database, EntryFilter},
+            extraction::inject_direct,
+        };
+        for select_file in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let game = dir.path().join("game");
+            let archive = c122_path(&game, kind);
+            c122_write(&archive, kind, C122_SCENARIO);
+            fs::write(game.join("unrelated.bin"), b"outside archive\0\xff").unwrap();
+            let original = fs::read(&archive).unwrap();
+            let members = c122_members(&archive, kind);
+            let selection = if select_file { &archive } else { &game };
+            let registry = crate::default_registry();
+            let plugin = registry.get("tyrano").unwrap();
+            let db = Database::open_in_memory().unwrap();
+            let manager = BackupManager::new(dir.path().join("backups"));
+            let mut entries = plugin.extract(selection).unwrap();
+            assert_eq!(entries.len(), 3);
+            let mut pristine = None;
+            for (generation, prefix) in ["TL ", "R2 TL ", "R3 TL "].into_iter().enumerate() {
+                for entry in &mut entries {
+                    entry.translation = Some(format!("{prefix}{}", entry.source));
+                }
+                // Save only translation edits; never extract/refresh the original rows.
+                db.save_entries(&entries).unwrap();
+                let report = inject_direct(
+                    &registry,
+                    &db,
+                    &manager,
+                    selection,
+                    "tyrano",
+                    &["en".into()],
+                )
+                .unwrap();
+                assert_eq!(
+                    (report.strings_written, report.strings_skipped),
+                    (3, 0),
+                    "{kind}, file={select_file}, generation {}: {report:?}",
+                    generation + 1
+                );
+                assert!(report.reports["en"].skip_reasons.is_empty());
+                let id = report.pristine_backup_id.unwrap();
+                if let Some(first) = &pristine {
+                    assert_eq!(&id, first);
+                } else {
+                    pristine = Some(id);
+                }
+                let extracted = plugin.extract(selection).unwrap();
+                assert_eq!(extracted.len(), entries.len());
+                assert!(extracted.iter().all(|e| e.source.starts_with(prefix)));
+                let after = c122_members(&archive, kind);
+                for (name, bytes) in &members {
+                    if name != "data/scenario/main.ks" {
+                        assert_eq!(&after[name], bytes);
+                    }
+                }
+                let expected = C122_SCENARIO
+                    .replace("表示名", &format!("{prefix}表示名"))
+                    .replace("Hello.", &format!("{prefix}Hello."))
+                    .replace("text=Continue", &format!("text=\"{prefix}Continue\""));
+                assert_eq!(after["data/scenario/main.ks"], expected.as_bytes());
+                assert_eq!(
+                    fs::read(game.join("unrelated.bin")).unwrap(),
+                    b"outside archive\0\xff"
+                );
+                let saved = db.get_entries(&EntryFilter::default()).unwrap();
+                for entry in &entries {
+                    assert_eq!(
+                        saved.iter().find(|e| e.id == entry.id).unwrap().source,
+                        entry.source
+                    );
+                }
+            }
+            manager.restore(&pristine.unwrap()).unwrap();
+            assert_eq!(fs::read(&archive).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn c122_asar_direct_revision_without_refresh() {
+        c122_direct_revisions("asar");
+    }
+
+    #[test]
+    fn c122_nw_direct_revision_without_refresh() {
+        c122_direct_revisions("nw");
+    }
+
+    #[test]
+    fn c122_exe_direct_revision_without_refresh() {
+        c122_direct_revisions("exe");
+    }
+
+    #[test]
+    fn c122_revision_alignment_is_per_member_and_requires_original_match() {
+        for kind in ["asar", "nw", "exe"] {
+            for drift in [
+                "none",
+                "target",
+                "command",
+                "comment",
+                "stale",
+                "unverified",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = c122_path(dir.path(), kind);
+                c122_write(&path, kind, C122_SCENARIO);
+                let plugin = TyranoPlugin::new();
+                let mut entries = plugin.extract(dir.path()).unwrap();
+                for entry in &mut entries {
+                    entry.file_path = dir.path().join(&entry.file_path);
+                    entry.translation = Some(format!("R2 TL {}", entry.source));
+                }
+                let original_path = dir.path().join("original.bin");
+                fs::copy(&path, &original_path).unwrap();
+                let mut originals = HashMap::from([(
+                    path.clone(),
+                    RevisionOriginal::capture(&original_path).unwrap(),
+                )]);
+                let mut current = C122_SCENARIO
+                    .replace("表示名", "TL 表示名")
+                    .replace("Hello.", "TL Hello.")
+                    .replace("text=Continue", "text=\"TL Continue\"");
+                match drift {
+                    "target" => current = current.replace("*next", "*other"),
+                    "command" => current = current.replace("@jump", "@call"),
+                    "comment" => current = current.replace("keep comment", "changed comment"),
+                    "stale" => {
+                        for entry in &mut entries {
+                            entry.source = "Unrelated stale source".into();
+                        }
+                    }
+                    "unverified" => originals.clear(),
+                    _ => {}
+                }
+                c122_write(&path, kind, &current);
+                let before = fs::read(&path).unwrap();
+                let sources: Vec<_> = entries.iter().map(|e| e.source.clone()).collect();
+                plugin
+                    .prepare_revision_entries(&mut entries, &originals)
+                    .unwrap();
+                if drift == "none" {
+                    assert!(
+                        entries.iter().all(|e| e.source.starts_with("TL ")),
+                        "{kind}: verified payload did not retarget"
+                    );
+                } else {
+                    assert_eq!(
+                        entries.iter().map(|e| e.source.clone()).collect::<Vec<_>>(),
+                        sources,
+                        "{kind}/{drift}"
+                    );
+                }
+                let report = plugin.inject(dir.path(), &entries).unwrap();
+                if drift == "none" {
+                    assert_eq!((report.strings_written, report.strings_skipped), (3, 0));
+                } else {
+                    assert_eq!(
+                        (report.strings_written, report.strings_skipped),
+                        (0, 3),
+                        "{kind}/{drift}"
+                    );
+                    assert_eq!(fs::read(&path).unwrap(), before);
+                    assert_eq!(
+                        report.skip_reasons.get("source_changed"),
+                        Some(&3),
+                        "{kind}/{drift}: {report:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c122_archive_and_loose_skips_are_classified() {
+        for kind in ["asar", "nw", "exe", "loose"] {
+            for reason in [
+                "source_changed",
+                "untranslated",
+                "unchanged",
+                "invalid_translation",
+                "invalid_locator",
+                "target_missing",
+                "duplicate",
+                "stale_translation",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = c122_path(dir.path(), kind);
+                c122_write(&path, kind, "Hello.[p]\n");
+                let plugin = TyranoPlugin::new();
+                let mut entries = plugin.extract(dir.path()).unwrap();
+                entries[0].translation = Some("Translated.[p]".into());
+                match reason {
+                    "source_changed" => entries[0].source = "Stale.[p]".into(),
+                    "untranslated" => entries[0].translation = None,
+                    "unchanged" => entries[0].translation = Some(entries[0].source.clone()),
+                    "invalid_translation" => entries[0].translation = Some("bad\n[p]".into()),
+                    "invalid_locator" => entries[0].id = "no-locator".into(),
+                    "target_missing" => entries[0].id = "scene#9999".into(),
+                    "duplicate" => entries.push(entries[0].clone()),
+                    "stale_translation" => {
+                        entries[0]
+                            .metadata
+                            .insert("locust_stale_translation".into(), serde_json::json!({}));
+                    }
+                    _ => unreachable!(),
+                }
+                let before = fs::read(&path).unwrap();
+                let report = plugin.inject(dir.path(), &entries).unwrap();
+                assert_eq!(
+                    (report.strings_written, report.strings_skipped),
+                    (0, entries.len()),
+                    "{kind}/{reason}: {report:?}"
+                );
+                assert_eq!(
+                    report.skip_reasons.get(reason),
+                    Some(&entries.len()),
+                    "{kind}/{reason}: {report:?}"
+                );
+                assert_eq!(
+                    report.skip_reasons.values().sum::<usize>(),
+                    report.strings_skipped
+                );
+                assert_eq!(fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+
+    fn c122_replace_members(path: &Path, kind: &str, replacements: HashMap<String, Vec<u8>>) {
+        let bytes = if kind == "asar" {
+            tyrano_asar::rebuild_asar(&AsarArchive::open(path).unwrap(), &replacements).unwrap()
+        } else {
+            tyrano_nw::rebuild_nw_zip(&NwArchive::open(path).unwrap(), &replacements).unwrap()
+        };
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn c122_only_aligned_archive_members_retarget() {
+        for kind in ["asar", "nw", "exe"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = c122_path(dir.path(), kind);
+            c122_write(&path, kind, C122_SCENARIO);
+            let sibling = "data/scenario/untouched.ks";
+            c122_replace_members(
+                &path,
+                kind,
+                HashMap::from([(sibling.into(), b"Other.[p]\n".to_vec())]),
+            );
+            let plugin = TyranoPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 4);
+            for entry in &mut entries {
+                entry.file_path = dir.path().join(&entry.file_path);
+                entry.translation = Some(format!("R2 TL {}", entry.source));
+            }
+            let original = dir.path().join("original.bin");
+            fs::copy(&path, &original).unwrap();
+            let originals =
+                HashMap::from([(path.clone(), RevisionOriginal::capture(&original).unwrap())]);
+            let drifted = C122_SCENARIO
+                .replace("表示名", "TL 表示名")
+                .replace("Hello.", "TL Hello.")
+                .replace("text=Continue", "text=\"TL Continue\"")
+                .replace("*next", "*different");
+            c122_replace_members(
+                &path,
+                kind,
+                HashMap::from([
+                    ("data/scenario/main.ks".into(), drifted.as_bytes().to_vec()),
+                    (sibling.into(), b"TL Other.[p]\n".to_vec()),
+                ]),
+            );
+            let before = c122_members(&path, kind);
+            plugin
+                .prepare_revision_entries(&mut entries, &originals)
+                .unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .find(|e| e.id.contains("untouched.ks#"))
+                    .unwrap()
+                    .source,
+                "TL Other.[p]"
+            );
+            assert!(entries
+                .iter()
+                .filter(|e| e.id.contains("main.ks#"))
+                .all(|e| !e.source.starts_with("TL ")));
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!((report.strings_written, report.strings_skipped), (1, 3));
+            assert_eq!(report.skip_reasons.get("source_changed"), Some(&3));
+            let after = c122_members(&path, kind);
+            assert_eq!(after[sibling], b"R2 TL Other.[p]\n");
+            for (member, bytes) in before {
+                if member != sibling {
+                    assert_eq!(after[&member], bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c122_changed_archive_original_is_rejected_before_retargeting() {
+        for kind in ["asar", "nw", "exe"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = c122_path(dir.path(), kind);
+            c122_write(&path, kind, C122_SCENARIO);
+            let plugin = TyranoPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            for entry in &mut entries {
+                entry.file_path = dir.path().join(&entry.file_path);
+            }
+            let original = dir.path().join("original.bin");
+            fs::copy(&path, &original).unwrap();
+            let originals =
+                HashMap::from([(path.clone(), RevisionOriginal::capture(&original).unwrap())]);
+            let mut damaged = fs::read(&original).unwrap();
+            let last = damaged.len() - 1;
+            damaged[last] ^= 1;
+            fs::write(&original, damaged).unwrap();
+            c122_write(&path, kind, &C122_SCENARIO.replace("Hello.", "TL Hello."));
+            let before = fs::read(&path).unwrap();
+            let sources: Vec<_> = entries.iter().map(|e| e.source.clone()).collect();
+            assert!(plugin
+                .prepare_revision_entries(&mut entries, &originals)
+                .unwrap_err()
+                .to_string()
+                .contains("changed since verification"));
+            assert_eq!(
+                entries.iter().map(|e| e.source.clone()).collect::<Vec<_>>(),
+                sources
+            );
+            assert_eq!(fs::read(path).unwrap(), before);
+        }
+    }
+
     fn c119_entries(text: &str) -> Vec<StringEntry> {
         entries_from_ks_bytes(text.as_bytes(), "scene.ks", PathBuf::from("scene.ks")).unwrap()
     }

@@ -294,6 +294,25 @@ impl AsarArchive {
         })
     }
 
+    /// Revision proofs may consume only bytes held by the verified archive.
+    /// Unpacked files require their own verified original; never read them via
+    /// the archive's sibling directory or choose between aliased members.
+    pub(crate) fn revision_scenario_bytes(
+        &self,
+        member: &str,
+    ) -> Result<Option<Vec<u8>>, AsarError> {
+        let mut matches = self
+            .scenario_ks_entries()
+            .filter(|e| e.path.replace('\\', "/") == member);
+        let Some(entry) = matches.next() else {
+            return Ok(None);
+        };
+        if entry.unpacked || matches.next().is_some() {
+            return Ok(None);
+        }
+        self.read_entry(entry).map(Some)
+    }
+
     /// Bounded header peek from disk (never loads payloads — game asars can be GBs).
     pub fn peek_header_mentions_scenario(path: &Path) -> bool {
         use std::io::Read;

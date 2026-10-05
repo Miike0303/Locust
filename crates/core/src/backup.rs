@@ -53,6 +53,25 @@ impl RevisionOriginal {
     }
 
     fn read_text_from(&self, reader: &mut dyn std::io::Read) -> Result<String> {
+        String::from_utf8(self.read_bytes_from(reader)?).map_err(|error| {
+            failure(format!(
+                "revision original is not UTF-8 ({}): {error}",
+                self.path.display()
+            ))
+        })
+    }
+
+    /// Read binary originals with the same immutable size/digest check as text.
+    pub fn read_bytes(&self) -> Result<Vec<u8>> {
+        let path = checked_absolute(&self.path)?;
+        let mut file = fs::File::open(&path)?;
+        if !file.metadata()?.is_file() {
+            return Err(failure("revision original is not a regular file"));
+        }
+        self.read_bytes_from(&mut file)
+    }
+
+    fn read_bytes_from(&self, reader: &mut dyn std::io::Read) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         let read = crate::patch::stream::stream_bounded(reader, self.size, Some(&mut bytes))
             .map_err(|error| {
@@ -67,12 +86,7 @@ impl RevisionOriginal {
                 self.path.display()
             )));
         }
-        String::from_utf8(bytes).map_err(|error| {
-            failure(format!(
-                "revision original is not UTF-8 ({}): {error}",
-                self.path.display()
-            ))
-        })
+        Ok(bytes)
     }
 }
 
@@ -924,6 +938,29 @@ impl BackupManager {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn c122_revision_binary_reader_verifies_exact_consumed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.asar");
+        let bytes = [0, 255, 128, 42];
+        fs::write(&path, bytes).unwrap();
+        let original = RevisionOriginal::capture(&path).unwrap();
+        assert_eq!(original.read_bytes().unwrap(), bytes);
+        assert!(original
+            .read_text()
+            .unwrap_err()
+            .to_string()
+            .contains("not UTF-8"));
+        for changed in [vec![0, 255, 128, 43], vec![0], vec![0; 5]] {
+            fs::write(&path, changed).unwrap();
+            assert!(original.read_bytes().is_err());
+        }
+        fs::remove_file(&path).unwrap();
+        assert!(original.read_bytes().is_err());
+        fs::create_dir(&path).unwrap();
+        assert!(original.read_bytes().is_err());
+    }
 
     #[test]
     fn revision_reader_checks_consumed_bytes_not_a_later_path_hash() {
