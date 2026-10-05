@@ -15,6 +15,33 @@ export type InjectLangReport = {
   files_written?: string[];
 };
 
+const SKIP_REASON_KEYS = {
+  untranslated: "inject.skip.untranslated", missing_translation: "inject.skip.untranslated",
+  unchanged: "inject.skip.unchanged", duplicate: "inject.skip.duplicate", too_long: "inject.skip.too_long",
+  target_missing: "inject.skip.target_missing", missing_target: "inject.skip.target_missing",
+  source_changed: "inject.skip.source_changed", stale_translation: "inject.skip.source_changed",
+  invalid_locator: "inject.skip.invalid_target", invalid_target: "inject.skip.invalid_target",
+  overlapping_locators: "inject.skip.invalid_target", ambiguous_target: "inject.skip.ambiguous_target",
+  invalid_placeholders: "inject.skip.invalid_placeholders", unsafe_controls: "inject.skip.unsafe_controls",
+  invalid_translation: "inject.skip.invalid_translation", unsafe_quoted_value: "inject.skip.invalid_translation",
+  not_encodable: "inject.skip.not_encodable", "not_encodable_as_Shift-JIS": "inject.skip.not_encodable",
+  unsupported: "inject.skip.unsupported", unsupported_markup: "inject.skip.unsupported",
+  unsupported_container: "inject.skip.unsupported",
+  error: "inject.skip.error", read_error: "inject.skip.error", write_error: "inject.skip.error",
+  decode_error: "inject.skip.error", archive_error: "inject.skip.error", rebuild_error: "inject.skip.error",
+  unclassified: "inject.skip.unclassified",
+} as const;
+
+export type SkipReasonKey = (typeof SKIP_REASON_KEYS)[keyof typeof SKIP_REASON_KEYS] | "inject.skip.other";
+
+/** i18n key for an engine skip reason. A reason the UI does not know yet is
+ * shown by its code: the engine did report it, so it is never "unclassified". */
+export function skipReasonLabel(reason: string): { key: SkipReasonKey; vars?: { reason: string } } {
+  const key = Object.prototype.hasOwnProperty.call(SKIP_REASON_KEYS, reason)
+    ? SKIP_REASON_KEYS[reason as keyof typeof SKIP_REASON_KEYS] : undefined;
+  return key ? { key } : { key: "inject.skip.other", vars: { reason } };
+}
+
 /** Per-language detail avoids counting a direct report twice. Old engines
  * retain an explicit unclassified remainder instead of guessing its cause. */
 export function collectSkipReasons(report: InjectReportLike): Array<{lang: string; reason: string; count: number}> {

@@ -352,3 +352,25 @@ for (const override of [
 ] as Partial<InjectReportLike>[]) {
   assert.notEqual(classifyInjectReport({ ...unchangedReport, ...override }), "unchanged", JSON.stringify(override));
 }
+
+// --- skipReasonLabel: every reason an engine emits has a real label ---
+import { skipReasonLabel } from "./injectOutcome.ts";
+import { en } from "./i18n/en.ts";
+import { es } from "./i18n/es.ts";
+for (const reason of [
+  "untranslated", "missing_translation", "unchanged", "duplicate", "too_long", "target_missing", "missing_target",
+  "source_changed", "stale_translation", "invalid_locator", "invalid_target", "overlapping_locators", "ambiguous_target",
+  "invalid_placeholders", "unsafe_controls", "invalid_translation", "unsafe_quoted_value", "not_encodable",
+  "not_encodable_as_Shift-JIS", "unsupported", "unsupported_markup", "unsupported_container", "error", "read_error",
+  "write_error", "decode_error", "archive_error", "rebuild_error", "unclassified",
+]) {
+  const { key, vars } = skipReasonLabel(reason);
+  assert.notEqual(key, "inject.skip.other", reason);
+  assert.ok(key in en && key in es, `${reason} -> ${key} missing in i18n`);
+  assert.equal(vars, undefined, reason);
+}
+// A reason only the engine knows is shown by its code, never as "not reported".
+assert.deepEqual(skipReasonLabel("future_reason"), { key: "inject.skip.other", vars: { reason: "future_reason" } });
+assert.ok("inject.skip.other" in en && "inject.skip.other" in es);
+assert.match(en["inject.skip.other"], /\{reason\}/);
+assert.match(es["inject.skip.other"], /\{reason\}/);

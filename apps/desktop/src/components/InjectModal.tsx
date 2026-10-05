@@ -21,6 +21,7 @@ import {
 	injectionRecoveryPath,
 	isRedundantBackupRemoved,
 	collectSkipReasons,
+	skipReasonLabel,
 	injectToastLevel,
 	outcomeRecordingIssues,
 	shouldOfferPackAfterInject,
@@ -679,15 +680,8 @@ export default function InjectModal({
                             <div className="p-3 bg-slate-50 dark:bg-slate-900/40 rounded text-sm">
                                 <p className="font-medium">{t("inject.skipReasons")}</p>
                                 <ul>{resultSkips.map(({lang, reason, count}) => {
-                                    const labels = {
-                                        untranslated: "inject.skip.untranslated", unchanged: "inject.skip.unchanged",
-                                        duplicate: "inject.skip.duplicate", too_long: "inject.skip.too_long",
-                                        target_missing: "inject.skip.target_missing", source_changed: "inject.skip.source_changed",
-                                        ambiguous_target: "inject.skip.ambiguous_target", invalid_placeholders: "inject.skip.invalid_placeholders",
-                                        unsupported: "inject.skip.unsupported", error: "inject.skip.error",
-                                        unclassified: "inject.skip.unclassified",
-                                    } as const;
-                                    return <li key={`${lang}:${reason}`}>{lang && `${lang}: `}{t(labels[reason as keyof typeof labels] ?? labels.unclassified)}: {count}</li>;
+                                    const label = skipReasonLabel(reason);
+                                    return <li key={`${lang}:${reason}`}>{lang && `${lang}: `}{t(label.key, label.vars)}: {count}</li>;
                                 })}</ul>
                             </div>
                         )}

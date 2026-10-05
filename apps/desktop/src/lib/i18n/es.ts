@@ -53,6 +53,11 @@ export const es: Record<keyof typeof en, string> = {
   "inject.skip.unsupported": "Contenido no compatible",
   "inject.skip.error": "Error de escritura o formato",
   "inject.skip.unclassified": "Este motor no informa el motivo",
+  "inject.skip.invalid_target": "Ubicación inválida o superpuesta; vuelva a extraer",
+  "inject.skip.unsafe_controls": "Cambiaría los códigos de control del juego",
+  "inject.skip.invalid_translation": "La traducción rompería la sintaxis del script",
+  "inject.skip.not_encodable": "Caracteres que la codificación del juego no admite",
+  "inject.skip.other": "Otro ({reason})",
 
   "api.error.invalidCostLimit": "Introduce un límite de coste mayor o igual a cero, o déjalo vacío para no limitarlo.",
   "cost.unknown": "Coste desconocido",

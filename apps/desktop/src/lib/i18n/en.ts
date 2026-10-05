@@ -51,6 +51,11 @@ export const en = {
   "inject.skip.unsupported": "Unsupported content",
   "inject.skip.error": "Write or format error",
   "inject.skip.unclassified": "Reason not reported by this engine",
+  "inject.skip.invalid_target": "Invalid or overlapping location; re-extract",
+  "inject.skip.unsafe_controls": "Would change the game's control codes",
+  "inject.skip.invalid_translation": "Translation would break the script syntax",
+  "inject.skip.not_encodable": "Characters the game's encoding cannot store",
+  "inject.skip.other": "Other ({reason})",
 
   "api.error.invalidCostLimit": "Enter a non-negative cost limit, or leave it blank for no limit.",
   "cost.unknown": "Cost unknown",
