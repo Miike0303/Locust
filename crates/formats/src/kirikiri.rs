@@ -12,7 +12,7 @@
 //! - Engine family / KAG script conventions (`;` comments, `*` labels, `@` commands,
 //!   `[tag]` markup): KiriKiri2 / KAG lineage — https://github.com/krkrz/krkr2
 //! - Unencrypted XP3 containers: see [`crate::kirikiri_xp3`] (arcusmaximus Xp3Pack layout;
-//!   inject writes `patch.xp3` — engines load it next to the exe and override base entries).
+//!   inject writes the next contiguous `patchN.xp3`, preserving existing game archives).
 //!
 //! # Mode transforms (UTF-16LE code units, little-endian byte pairs)
 //! - **Mode 0 decode:** for each unit, if high==0 && low<0x20 leave as-is; else
@@ -27,8 +27,8 @@
 //!   same layout with correct sizes.
 //!
 //! Out of scope: CxDec / Hxv4 encrypted XP3, `.tjs`/compiled `.scn`,
-//! rewriting existing `.xp3` archives. Injection creates `patch.xp3` only when
-//! no patch archive exists; otherwise it explicitly refuses archive writes.
+//! rewriting existing game `.xp3` archives. Only a hash-verified, transaction-created
+//! Locust overlay can be revised; other archives remain byte-identical.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -1223,6 +1223,385 @@ fn select_best_script_rels(candidates: &[String]) -> std::collections::HashSet<S
     best.into_values().map(|(_, rel)| rel).collect()
 }
 
+// KAG loads patch.xp3, then patch2, patch3, ... until the first missing number.
+// Later auto paths win: https://www.ultrasync.net/dee/kr2helps/kag3doc/contents/Distribute.html
+fn patch_number(name: &str) -> Option<u32> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".xp3")?.strip_prefix("patch")?;
+    if stem.is_empty() {
+        return Some(1);
+    }
+    let n: u32 = stem.parse().ok()?;
+    (n >= 2 && stem == n.to_string()).then_some(n)
+}
+
+struct PatchTarget {
+    path: PathBuf,
+    /// Only present when a completed transaction proves creation and every revision.
+    owned_hash: Option<(String, u64)>,
+}
+
+type PatchRefusal = (&'static str, String);
+
+fn patch_metadata(path: &Path) -> Result<serde_json::Value> {
+    locust_core::patch::zipsec::ensure_no_links(
+        path.parent().unwrap(),
+        Path::new(path.file_name().unwrap()),
+    )?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.len() > 64 * 1024 * 1024 {
+        return Err(parse_err("XP3 provenance", "invalid transaction metadata"));
+    }
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+fn recorded_hash(value: &serde_json::Value) -> Option<(String, u64)> {
+    let hash = value["sha256"].as_str()?;
+    (hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()))
+        .then(|| (hash.to_owned(), value["size"].as_u64()))
+        .and_then(|(hash, size)| size.map(|size| (hash, size)))
+}
+
+/// Core deliberately excludes journals from its work copy. Read the real journal
+/// only after binding this exact work directory to the active Preparing operation.
+/// This read-only adapter uses schema 1; unknown schemas fail closed.
+fn patch_transaction_root(root: &Path) -> Result<Option<PathBuf>> {
+    use locust_core::injection_transaction::{validate_store, STORE_DIR};
+    let root = root.canonicalize()?;
+    if validate_store(&root)? {
+        return Ok(Some(root));
+    }
+    let Some(operation) = root
+        .parent()
+        .filter(|_| root.file_name().is_some_and(|s| s == "work"))
+    else {
+        return Ok(None);
+    };
+    let Some(operations) = operation
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|s| s == "operations"))
+    else {
+        return Ok(None);
+    };
+    let Some(store) = operations
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|s| s == STORE_DIR))
+    else {
+        return Ok(None);
+    };
+    let game = store
+        .parent()
+        .ok_or_else(|| parse_err("XP3 provenance", "missing game root"))?;
+    if !validate_store(game)? {
+        return Err(parse_err("XP3 provenance", "missing transaction store"));
+    }
+    locust_core::patch::zipsec::ensure_no_links(game, root.strip_prefix(game).unwrap())?;
+    let active = patch_metadata(&store.join("active.json"))?;
+    if active["schema_version"] != 1
+        || active["format"] != "kirikiri"
+        || active["game_root"].as_str().map(Path::new) != Some(game)
+        || active["transaction_id"].as_str() != operation.file_name().and_then(|s| s.to_str())
+        || patch_metadata(&operation.join("phase.json"))? != "preparing"
+    {
+        return Err(parse_err(
+            "XP3 provenance",
+            "work directory is not the active KiriKiri transaction",
+        ));
+    }
+    Ok(Some(game.to_owned()))
+}
+
+/// Reachability from original:null proves creation, including later revisions.
+/// A matching result hash alone does not confer ownership of a game's own patch.
+fn owned_patches(root: &Path) -> Result<BTreeMap<String, Vec<(String, u64)>>> {
+    let mut owned: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+    let Some(game) = patch_transaction_root(root)? else {
+        return Ok(owned);
+    };
+    let operations = game
+        .join(locust_core::injection_transaction::STORE_DIR)
+        .join("operations");
+    locust_core::patch::zipsec::ensure_no_links(&game, operations.strip_prefix(&game).unwrap())?;
+    let mut revisions = Vec::new();
+    for entry in std::fs::read_dir(&operations)? {
+        let entry = entry?;
+        let id = entry.file_name();
+        if id
+            .to_str()
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .is_none()
+        {
+            continue;
+        }
+        let dir = entry.path();
+        locust_core::patch::zipsec::ensure_no_links(&game, dir.strip_prefix(&game).unwrap())?;
+        if patch_metadata(&dir.join("phase.json"))? != "completed" {
+            continue;
+        }
+        let plan = patch_metadata(&dir.join("plan.json"))?;
+        if plan["schema_version"] != 1
+            || plan["game_root"].as_str().map(Path::new) != Some(game.as_path())
+            || plan["transaction_id"].as_str() != id.to_str()
+        {
+            return Err(parse_err(
+                "XP3 provenance",
+                "transaction plan identity mismatch",
+            ));
+        }
+        let files = plan["files"]
+            .as_array()
+            .ok_or_else(|| parse_err("XP3 provenance", "missing transaction files"))?;
+        for change in files {
+            let Some(name) = change["path"]
+                .as_str()
+                .filter(|s| patch_number(s).is_some())
+            else {
+                continue;
+            };
+            let result = recorded_hash(&change["result"])
+                .ok_or_else(|| parse_err("XP3 provenance", "invalid result hash"))?;
+            if change
+                .get("original")
+                .is_some_and(serde_json::Value::is_null)
+            {
+                owned.entry(name.to_owned()).or_default().push(result);
+            } else {
+                let original = recorded_hash(&change["original"])
+                    .ok_or_else(|| parse_err("XP3 provenance", "invalid original hash"))?;
+                revisions.push((name.to_owned(), original, result));
+            }
+        }
+    }
+    loop {
+        let mut progress = false;
+        for (name, before, after) in &revisions {
+            if let Some(hashes) = owned.get_mut(name) {
+                if hashes.contains(before) && !hashes.contains(after) {
+                    hashes.push(after.clone());
+                    progress = true;
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    Ok(owned)
+}
+
+fn choose_patch_target(root: &Path) -> std::result::Result<PatchTarget, PatchRefusal> {
+    let provenance_error = |e: LocustError| ("patch_provenance_invalid", e.to_string());
+    let mut patches = BTreeMap::new();
+    for entry in std::fs::read_dir(root).map_err(|e| provenance_error(e.into()))? {
+        let entry = entry.map_err(|e| provenance_error(e.into()))?;
+        if let Some(n) = entry.file_name().to_str().and_then(patch_number) {
+            if !entry
+                .file_type()
+                .map_err(|e| provenance_error(e.into()))?
+                .is_file()
+                || patches.insert(n, entry.path()).is_some()
+            {
+                return Err((
+                    "patch_target_conflict",
+                    "patch slot is ambiguous or not a regular file".into(),
+                ));
+            }
+        }
+    }
+    for (expected, &actual) in (1u32..).zip(patches.keys()) {
+        if expected != actual {
+            return Err((
+                "patch_sequence_gap",
+                format!(
+                    "missing patch slot {expected}; filling it could activate later game archives"
+                ),
+            ));
+        }
+    }
+    let mut target = None;
+    for (name, hashes) in owned_patches(root).map_err(provenance_error)? {
+        let path = root.join(&name);
+        if !path.try_exists().map_err(|e| provenance_error(e.into()))? {
+            continue;
+        }
+        let hash = locust_core::database::sha256_file(&path).map_err(provenance_error)?;
+        if !hashes.contains(&hash) {
+            return Err((
+                "patch_provenance_mismatch",
+                format!("Locust archive {name} changed since its recorded transaction"),
+            ));
+        }
+        if patch_number(&name) != patches.last_key_value().map(|(&n, _)| n) || target.is_some() {
+            return Err(("patch_precedence_conflict", "Locust overlay is not the unique last patch; refusing to write an ignored revision".into()));
+        }
+        target = Some(PatchTarget {
+            path,
+            owned_hash: Some(hash),
+        });
+    }
+    if let Some(target) = target {
+        return Ok(target);
+    }
+    let next = patches
+        .last_key_value()
+        .map_or(Some(1), |(&n, _)| n.checked_add(1))
+        .ok_or_else(|| ("patch_target_conflict", "patch number overflow".into()))?;
+    Ok(PatchTarget {
+        path: root.join(if next == 1 {
+            "patch.xp3".to_owned()
+        } else {
+            format!("patch{next}.xp3")
+        }),
+        owned_hash: None,
+    })
+}
+
+/// Tokenize just enough TJS to recognize the documented loader without accepting
+/// commented-out code or a string containing it. String tokens retain delimiters.
+fn loader_tokens(text: &str) -> Vec<String> {
+    let mut chars = text.chars().peekable();
+    let mut tokens = Vec::new();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'/') {
+            for ch in chars.by_ref() {
+                if ch == '\n' {
+                    break;
+                }
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+        } else if matches!(c, '\'' | '"') {
+            let mut token = String::from("\"");
+            while let Some(ch) = chars.next() {
+                if ch == c {
+                    break;
+                }
+                token.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        token.push(next);
+                    }
+                }
+            }
+            token.push('"');
+            tokens.push(token);
+        } else if c.is_alphanumeric() || c == '_' {
+            let mut token = c.to_string();
+            while chars
+                .peek()
+                .is_some_and(|ch| ch.is_alphanumeric() || *ch == '_')
+            {
+                token.push(chars.next().unwrap());
+            }
+            tokens.push(token);
+        } else {
+            tokens.push(c.to_string());
+        }
+    }
+    tokens
+}
+
+fn has_numbered_patch_loop(text: &str) -> bool {
+    let tokens = loader_tokens(text);
+    // KAG3's actual Initialize.tjs. Accept whitespace, comments, quote styles,
+    // optional `var`, and any loop variable. Unrecognized custom loaders refuse.
+    for start in 0..tokens.len() {
+        let mut tail = &tokens[start..];
+        if !tail.starts_with(&["for".into(), "(".into()]) {
+            continue;
+        }
+        tail = &tail[2..];
+        if tail.first().is_some_and(|s| s == "var") {
+            tail = &tail[1..];
+        }
+        let Some(variable) = tail.first() else {
+            continue;
+        };
+        let expected = loader_tokens(&format!(
+            r#"{variable}=2;;{variable}++) {{
+            if(Storages.isExistentStorage(System.exePath+"patch"+{variable}+".xp3"))
+                Storages.addAutoPath(System.exePath+"patch"+{variable}+".xp3>");
+            else break;
+        }}"#
+        ));
+        if tail.starts_with(&expected) {
+            return true;
+        }
+    }
+    false
+}
+
+fn check_numbered_patch_loader(
+    root: &Path,
+    report: &mut InjectionReport,
+) -> std::result::Result<(), PatchRefusal> {
+    let mut readable = Vec::new();
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(crate::discovery::is_game_entry)
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() && entry.file_name().eq_ignore_ascii_case("Initialize.tjs") {
+            if let Ok(bytes) = std::fs::read(entry.path()) {
+                if let Ok(decoded) = decode_ks_bytes(&bytes, "Initialize.tjs") {
+                    if looks_like_readable_ks(&decoded.text) {
+                        readable.push((entry.path().display().to_string(), decoded.text));
+                    }
+                }
+            }
+        }
+    }
+    for path in KirikiriPlugin::find_top_level_xp3(root) {
+        let Ok(archive) = Xp3Archive::open(&path) else {
+            continue;
+        };
+        for entry in &archive.entries {
+            if entry.flags & 0x8000_0000 != 0
+                || !entry
+                    .name
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("Initialize.tjs"))
+            {
+                continue;
+            }
+            if let Ok(bytes) = archive.read_entry(entry) {
+                if let Ok(decoded) = decode_ks_bytes(&bytes, "Initialize.tjs") {
+                    if looks_like_readable_ks(&decoded.text) {
+                        readable.push((format!("{}/{}", path.display(), entry.name), decoded.text));
+                    }
+                }
+            }
+        }
+    }
+    // Conservatively refuse if any readable game initializer lacks the known loop:
+    // custom bootstraps can choose a different initializer than script precedence.
+    for (label, text) in &readable {
+        if !has_numbered_patch_loop(text) {
+            return Err((
+                "numbered_patch_loading_unsupported",
+                format!("readable {label} does not contain the documented numbered-patch loop"),
+            ));
+        }
+    }
+    if readable.is_empty() {
+        let message = "Initialize.tjs is not readable; using the documented default KAG numbered-patch loading rule";
+        warn!("{message}");
+        report.warnings.push(message.into());
+    }
+    Ok(())
+}
+
 // ─── Plugin ────────────────────────────────────────────────────────────────
 
 impl FormatPlugin for KirikiriPlugin {
@@ -1235,7 +1614,7 @@ impl FormatPlugin for KirikiriPlugin {
     }
 
     fn description(&self) -> &str {
-        "KiriKiri KAG loose .ks + unencrypted XP3 (UTF-16/UTF-8/SJIS; FE FE 0/1/2; patch.xp3 inject)"
+        "KiriKiri KAG loose .ks + unencrypted XP3 (UTF-16/UTF-8/SJIS; FE FE 0/1/2; numbered patch inject)"
     }
 
     fn stability(&self) -> locust_core::extraction::FormatStability {
@@ -1430,31 +1809,35 @@ impl FormatPlugin for KirikiriPlugin {
 
         let search_root = Self::root_dir(path);
 
-        // Collect modified XP3 payloads for a single patch.xp3
+        // Collect modified XP3 payloads for one new or transaction-owned overlay.
         let mut patch_files: Vec<(String, Vec<u8>)> = Vec::new();
         // Cache opened base archives: archive file name → archive + name index
         let mut archive_cache: HashMap<String, CachedXp3> = HashMap::new();
 
-        let existing_patch = Self::find_top_level_xp3(&search_root)
-            .into_iter()
-            .find(|path| {
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| s.to_ascii_lowercase().starts_with("patch"))
+        let patch_target = if by_file.keys().any(|p| split_xp3_virtual_path(p).is_some()) {
+            let target = choose_patch_target(&search_root).and_then(|target| {
+                check_numbered_patch_loader(&search_root, &mut report)?;
+                Ok(target)
             });
+            if let Err((reason, message)) = &target {
+                report.warnings.push(format!("{reason}: {message}"));
+            }
+            Some(target)
+        } else {
+            None
+        };
         let mut pending_patch_strings = 0;
 
         for (file_path, file_entries) in &by_file {
             if let Some((archive_name, inner)) = split_xp3_virtual_path(file_path) {
-                if let Some(existing) = &existing_patch {
+                if let Some(Err((reason, _))) = &patch_target {
                     let skipped = file_entries
                         .iter()
                         .filter(|entry| entry.translation.is_some())
                         .count();
                     if skipped > 0 {
-                        report.skip("unsupported_container", skipped);
+                        report.skip(reason, skipped);
                     }
-                    report.warnings.push(format!("safe refusal: existing XP3 patch {} must retain all members, encrypted payloads, metadata and active precedence; lossless patch merging is unsupported", existing.display()));
                     continue;
                 }
                 if !archive_cache.contains_key(&archive_name) {
@@ -1596,14 +1979,30 @@ impl FormatPlugin for KirikiriPlugin {
         }
 
         if !patch_files.is_empty() {
+            let target = patch_target.as_ref().unwrap().as_ref().unwrap();
             let mut merged = BTreeMap::new();
+            // Preserve previously translated members omitted from this revision.
+            if target.owned_hash.is_some() {
+                let archive = Xp3Archive::open(&target.path)
+                    .map_err(|e| parse_err("Locust patch", &e.to_string()))?;
+                for entry in &archive.entries {
+                    let data = archive
+                        .read_entry(entry)
+                        .map_err(|e| parse_err("Locust patch", &e.to_string()))?;
+                    if merged.insert(entry.name.clone(), data).is_some() {
+                        return Err(parse_err("Locust patch", "duplicate owned member"));
+                    }
+                }
+            }
+            let mut changed = std::collections::HashSet::new();
             for (name, data) in patch_files {
-                if merged.insert(name, data).is_some() {
+                if !changed.insert(name.clone()) {
                     return Err(parse_err(
                         "patch.xp3",
                         "ambiguous duplicate patch output member",
                     ));
                 }
+                merged.insert(name, data);
             }
             let list: Vec<(String, Vec<u8>)> = merged.into_iter().collect();
             match kirikiri_xp3::write_xp3(&list) {
@@ -1611,11 +2010,21 @@ impl FormatPlugin for KirikiriPlugin {
                     // create_new is also a last-moment guard against overwriting
                     // a patch another process installed while we were preparing.
                     use std::io::Write;
-                    let patch_path = search_root.join("patch.xp3");
-                    let mut output = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&patch_path)?;
+                    let patch_path = target.path.clone();
+                    let mut options = std::fs::OpenOptions::new();
+                    options.write(true);
+                    if let Some(expected) = &target.owned_hash {
+                        if locust_core::database::sha256_file(&patch_path)? != *expected {
+                            return Err(parse_err(
+                                "Locust patch",
+                                "owned archive changed before revision",
+                            ));
+                        }
+                        options.truncate(true);
+                    } else {
+                        options.create_new(true);
+                    }
+                    let mut output = options.open(&patch_path)?;
                     output.write_all(&bytes)?;
                     output.sync_all()?;
                     report.files_modified += 1;
@@ -1637,10 +2046,273 @@ impl FormatPlugin for KirikiriPlugin {
 
 #[cfg(test)]
 mod tests {
+    const C124_INIT: &str = r#"
+useArchiveIfExists("patch.xp3");
+for(var i = 2; ; i++) {
+    if(Storages.isExistentStorage(System.exePath + "patch" + i + ".xp3"))
+        Storages.addAutoPath(System.exePath + "patch" + i + ".xp3>");
+    else break;
+}
+"#;
+
+    fn c124_game(root: &Path) -> Vec<StringEntry> {
+        for (name, text) in [("patch.xp3", "OLD"), ("patch2.xp3", "Hello.")] {
+            fs::write(
+                root.join(name),
+                kirikiri_xp3::write_xp3(&[
+                    (
+                        "scenario/route/story.ks".into(),
+                        format!("{text}\n").into_bytes(),
+                    ),
+                    ("keep.bin".into(), vec![0, 1, 2, 255]),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let mut rows = KirikiriPlugin::new().extract(root).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].file_path.to_string_lossy().contains("patch2.xp3"));
+        rows[0].translation = Some("TL Hello.".into());
+        rows
+    }
+
+    #[test]
+    fn c124_next_patch_preserves_archives_and_member_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = c124_game(dir.path());
+        let originals: Vec<_> = ["patch.xp3", "patch2.xp3"]
+            .iter()
+            .map(|name| (name, fs::read(dir.path().join(name)).unwrap()))
+            .collect();
+        let report = KirikiriPlugin::new().inject(dir.path(), &rows).unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 0);
+        assert_eq!(report.files_written, vec![dir.path().join("patch3.xp3")]);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("Initialize.tjs") && w.contains("documented default")));
+        let archive = Xp3Archive::open(&dir.path().join("patch3.xp3")).unwrap();
+        assert_eq!(archive.entries.len(), 1);
+        assert_eq!(archive.entries[0].name, "scenario/route/story.ks");
+        let extracted = KirikiriPlugin::new().extract(dir.path()).unwrap();
+        assert_eq!(extracted[0].source, "TL Hello.");
+        assert!(extracted[0]
+            .file_path
+            .to_string_lossy()
+            .contains("patch3.xp3"));
+        for (name, bytes) in originals {
+            assert_eq!(fs::read(dir.path().join(name)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn c124_direct_revision_uses_transaction_owned_patch() {
+        use locust_core::{backup::BackupManager, database::Database, extraction::inject_direct};
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let mut rows = c124_game(&game);
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&rows).unwrap();
+        let backups = BackupManager::new(dir.path().join("backups"));
+        let registry = crate::default_registry();
+        let first =
+            inject_direct(&registry, &db, &backups, &game, "kirikiri", &["en".into()]).unwrap();
+        assert_eq!(first.strings_written, 1, "{first:?}");
+        for n in 2..=3 {
+            rows[0].translation = Some(format!("R{n} TL Hello."));
+            db.save_entries(&rows).unwrap();
+            let revised =
+                inject_direct(&registry, &db, &backups, &game, "kirikiri", &["en".into()]).unwrap();
+            assert_eq!(revised.strings_written, 1, "{revised:?}");
+            assert!(!game.join("patch4.xp3").exists());
+            let extracted = KirikiriPlugin::new().extract(&game).unwrap();
+            assert_eq!(extracted[0].source, format!("R{n} TL Hello."));
+        }
+    }
+
+    #[test]
+    fn c124_readable_custom_initialize_refuses_numbered_patch() {
+        for archived in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let rows = c124_game(dir.path());
+            let init = format!("useArchiveIfExists(\"patch.xp3\");\n/* {C124_INIT} */\n");
+            if archived {
+                fs::write(
+                    dir.path().join("system.xp3"),
+                    kirikiri_xp3::write_xp3(&[("system/Initialize.tjs".into(), init.into_bytes())])
+                        .unwrap(),
+                )
+                .unwrap();
+            } else {
+                fs::write(dir.path().join("Initialize.tjs"), init).unwrap();
+            }
+            let report = KirikiriPlugin::new().inject(dir.path(), &rows).unwrap();
+            assert_eq!(report.strings_written, 0);
+            assert_eq!(
+                report
+                    .skip_reasons
+                    .get("numbered_patch_loading_unsupported"),
+                Some(&1),
+                "{report:?}"
+            );
+            assert!(!dir.path().join("patch3.xp3").exists());
+        }
+    }
+
+    #[test]
+    fn c124_readable_standard_initialize_allows_numbered_patch() {
+        for archived in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let rows = c124_game(dir.path());
+            if archived {
+                fs::write(
+                    dir.path().join("system.xp3"),
+                    kirikiri_xp3::write_xp3(&[(
+                        "system/Initialize.tjs".into(),
+                        C124_INIT.as_bytes().to_vec(),
+                    )])
+                    .unwrap(),
+                )
+                .unwrap();
+            } else {
+                fs::write(dir.path().join("Initialize.tjs"), C124_INIT).unwrap();
+            }
+            let report = KirikiriPlugin::new().inject(dir.path(), &rows).unwrap();
+            assert_eq!(report.strings_written, 1, "{report:?}");
+            assert!(report.warnings.is_empty(), "{report:?}");
+        }
+    }
+
+    #[test]
+    fn c124_patch_gap_is_not_silently_activated() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = c124_game(dir.path());
+        fs::rename(dir.path().join("patch2.xp3"), dir.path().join("patch4.xp3")).unwrap();
+        let report = KirikiriPlugin::new().inject(dir.path(), &rows).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(
+            report.skip_reasons.get("patch_sequence_gap"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert!(!dir.path().join("patch2.xp3").exists());
+        assert!(!dir.path().join("patch5.xp3").exists());
+    }
+
+    #[test]
+    fn c124_no_transaction_never_adopts_archive_by_name_or_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = c124_game(dir.path());
+        let plugin = KirikiriPlugin::new();
+        plugin.inject(dir.path(), &rows).unwrap();
+        let previous = fs::read(dir.path().join("patch3.xp3")).unwrap();
+        // A standalone call has no completed Direct transaction proving ownership.
+        let report = plugin.inject(dir.path(), &rows).unwrap();
+        assert_eq!(report.files_written, vec![dir.path().join("patch4.xp3")]);
+        assert_eq!(fs::read(dir.path().join("patch3.xp3")).unwrap(), previous);
+    }
+
+    #[test]
+    fn c124_owned_archive_drift_and_later_game_patch_refuse() {
+        use locust_core::{backup::BackupManager, database::Database, extraction::inject_direct};
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let rows = c124_game(&game);
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&rows).unwrap();
+        inject_direct(
+            &crate::default_registry(),
+            &db,
+            &BackupManager::new(dir.path().join("backups")),
+            &game,
+            "kirikiri",
+            &["en".into()],
+        )
+        .unwrap();
+        let patch = game.join("patch3.xp3");
+        let original = fs::read(&patch).unwrap();
+        let edited = [original.as_slice(), b"USER EDIT"].concat();
+        fs::write(&patch, &edited).unwrap();
+        let report = KirikiriPlugin::new().inject(&game, &rows).unwrap();
+        assert_eq!(
+            report.skip_reasons.get("patch_provenance_mismatch"),
+            Some(&1)
+        );
+        assert_eq!(fs::read(&patch).unwrap(), edited);
+        assert!(!game.join("patch4.xp3").exists());
+        fs::write(&patch, &original).unwrap();
+        fs::write(game.join("patch4.xp3"), &original).unwrap();
+        let report = KirikiriPlugin::new().inject(&game, &rows).unwrap();
+        assert_eq!(
+            report.skip_reasons.get("patch_precedence_conflict"),
+            Some(&1)
+        );
+        assert_eq!(fs::read(&patch).unwrap(), original);
+        assert!(!game.join("patch5.xp3").exists());
+    }
+
+    #[test]
+    fn c124_partial_revision_retains_other_owned_members() {
+        use locust_core::{backup::BackupManager, database::Database, extraction::inject_direct};
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        c124_game(&game);
+        fs::write(
+            game.join("data.xp3"),
+            kirikiri_xp3::write_xp3(&[("other.ks".into(), b"Second.\n".to_vec())]).unwrap(),
+        )
+        .unwrap();
+        let mut rows = KirikiriPlugin::new().extract(&game).unwrap();
+        for row in &mut rows {
+            row.translation = Some(format!("TL {}", row.source));
+        }
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&rows).unwrap();
+        inject_direct(
+            &crate::default_registry(),
+            &db,
+            &BackupManager::new(dir.path().join("backups")),
+            &game,
+            "kirikiri",
+            &["en".into()],
+        )
+        .unwrap();
+        rows.retain(|row| row.source == "Hello.");
+        rows[0].translation = Some("R2 TL Hello.".into());
+        let report = KirikiriPlugin::new().inject(&game, &rows).unwrap();
+        assert_eq!(report.strings_written, 1);
+        assert!(!game.join("patch4.xp3").exists());
+        let extracted = KirikiriPlugin::new().extract(&game).unwrap();
+        assert!(extracted.iter().any(|row| row.source == "TL Second."));
+        assert!(extracted.iter().any(|row| row.source == "R2 TL Hello."));
+    }
+
+    #[test]
+    fn c124_loader_comments_and_strings_are_not_executable_loops() {
+        assert!(!has_numbered_patch_loop(&format!("/*{C124_INIT}*/")));
+        assert!(!has_numbered_patch_loop(&format!(
+            "var text = '{}';",
+            C124_INIT
+        )));
+        assert!(has_numbered_patch_loop(
+            &C124_INIT.replace("var i", "i").replace('"', "'")
+        ));
+    }
+
     #[test]
     fn c123_named_skips_for_existing_patch_preserve_zero_count() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("patch.xp3"), b"existing patch").unwrap();
+        std::fs::write(
+            dir.path().join("Initialize.tjs"),
+            "useArchiveIfExists('patch.xp3');",
+        )
+        .unwrap();
         let mut entry = StringEntry::new(
             "data.xp3/story.ks#kag:1",
             "Hello",
@@ -1655,7 +2327,7 @@ mod tests {
         assert_eq!((report.strings_written, report.strings_skipped), (0, 1));
         assert_eq!(
             report.skip_reasons,
-            [("unsupported_container".into(), 1)].into()
+            [("numbered_patch_loading_unsupported".into(), 1)].into()
         );
         assert_eq!(
             std::fs::read(dir.path().join("patch.xp3")).unwrap(),
@@ -2025,7 +2697,7 @@ This is narration.\r\n\
     }
 
     #[test]
-    fn vn01_encrypted_existing_patch_refused() {
+    fn vn01_encrypted_existing_patch_preserved_with_new_overlay() {
         let dir = tempdir();
         fs::write(
             dir.join("data.xp3"),
@@ -2039,9 +2711,11 @@ This is narration.\r\n\
         let mut rows = plugin.extract(&dir).unwrap();
         rows[0].translation = Some("Hola.".into());
         let report = plugin.inject(&dir, &rows).unwrap();
-        assert_eq!(report.strings_written, 0);
-        assert_eq!(report.files_modified, 0);
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(report.files_modified, 1);
         assert_eq!(fs::read(dir.join("patch.xp3")).unwrap(), protected);
+        assert_eq!(plugin.extract(&dir).unwrap()[0].source, "Hola.");
+        assert_eq!(report.files_written, vec![dir.join("patch2.xp3")]);
     }
 
     fn write_utf16le_ks(path: &Path, text: &str) {
