@@ -172,9 +172,10 @@ fn cli_reports_no_backups_for_an_empty_backup_root() {
 #[test]
 fn cli_can_list_and_restore_an_injection_backup() {
     let root = tempfile::tempdir().unwrap();
-    let game = root.path().join("game");
+    let raw_game = root.path().join("game");
     let backup_root = root.path().join("backups");
-    std::fs::create_dir(&game).unwrap();
+    std::fs::create_dir(&raw_game).unwrap();
+    let game = raw_game.canonicalize().unwrap();
     let script = game.join("script.rpy");
     std::fs::write(&script, b"original").unwrap();
 
@@ -194,8 +195,20 @@ fn cli_can_list_and_restore_an_injection_backup() {
         .stdout
         .clone();
     let listed = String::from_utf8(listed).unwrap();
-    assert!(listed.contains(&backup.id), "{listed}");
-    assert!(listed.contains(&game.display().to_string()), "{listed}");
+    eprintln!("raw game: {raw_game:?}\ncanonical game: {game:?}\nlisted: {listed:?}");
+    let rows: Vec<_> = listed.lines().collect();
+    assert_eq!(rows.len(), 1, "{listed}");
+    let fields: Vec<_> = rows[0].split('\t').collect();
+    assert_eq!(fields.len(), 4, "{listed}");
+    assert!(
+        fields.iter().all(|field| !field.trim().is_empty()),
+        "{listed}"
+    );
+    assert_eq!(fields[0], backup.id, "{listed}");
+    assert!(!fields[1].starts_with(r"\\?\"), "{listed}");
+    // Listing paths are readable, not verbatim: compare filesystem identity.
+    let listed_game = std::path::Path::new(fields[1]).canonicalize().unwrap();
+    assert_eq!(listed_game, game.canonicalize().unwrap(), "{listed}");
 
     assert_cmd::Command::cargo_bin("locust")
         .unwrap()

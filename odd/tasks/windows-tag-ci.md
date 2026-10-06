@@ -6,7 +6,7 @@ Add Windows checks alongside Ubuntu without changing `v*` tag/manual-only CI. Us
 Authorized: work-unit commits, full local checks, temporary feature-branch push, manual CI on that exact candidate, and non-forced fast-forward delivery to `main` only after all gates pass. Not authorized: tags/releases, destructive Git operations, skipping failed checks, original-game writes, unrelated repository edits or purchases.
 
 ## Scope and route
-Implementation: `.github/workflows/ci.yml`; ledger: `docs/IMPROVEMENT-GOAL.md`; tracking: this file and Engram `odd/windows-tag-ci/tasks`. Branch `ci/windows-tag-checks`; original base `d6c1846`. Linux source verification uses an isolated scratch checkout; no concurrent cargo builds. Preserve Ubuntu job, concurrency and environment; no branch-push/PR triggers, dependencies, suppressions, artifacts or release edits.
+Implementation: `.github/workflows/ci.yml`; hosted-blocker regression: `crates/cli/tests/backup_recovery_tests.rs`; ledger: `docs/IMPROVEMENT-GOAL.md`; tracking: this file and Engram `odd/windows-tag-ci/tasks`. Branch `ci/windows-tag-checks`; original base `d6c1846`. Linux source verification uses an isolated scratch checkout; no concurrent cargo builds. Preserve Ubuntu job, concurrency and environment; no branch-push/PR triggers, dependencies, suppressions, artifacts or release edits.
 
 Route: read-only explorer, bounded writer, independent verifier, parent delivery. Approximately 60 workflow/ledger diff lines; delivery strategy ask-on-risk. Prior accumulated history publication was explicitly accepted, not inferred from this small diff.
 
@@ -14,8 +14,9 @@ Route: read-only explorer, bounded writer, independent verifier, parent delivery
 - [x] WCI-1 — Add and structurally check Windows CI. Delegated writer; local outcome verified.
 - [x] WCI-2 — Independent local Windows gates. YAML assertions, frontend/Rust gates passed.
 - [x] WCI-3 — Reconcile stale CI backlog. Current ledger explicitly distinguishes local implementation from hosted validation.
-- [ ] WCI-5 — Verify Linux prepush gates, commit candidate and publish the feature branch. **In progress.** Full Linux gate passed; prepare candidate commit and feature-branch publication.
-- [ ] WCI-4 — Manually run and observe both GitHub CI jobs for the exact candidate SHA, then deliver to `main`. Do not mark complete before hosted success and remote-ref confirmation.
+- [x] WCI-5 — Verify Linux prepush gates, commit candidate and publish the feature branch. Commit `3c8c851`; remote feature ref confirmed at the same full SHA after non-forced push.
+- [ ] WCI-6 — Correct the hosted Windows backup-listing regression with deterministic RED/GREEN. **In progress.** Test-only scope; validate filesystem identity rather than exact displayed path spelling. Preserve restore/byte assertions.
+- [ ] WCI-4 — Observe both GitHub CI jobs for the corrected candidate SHA, then deliver to `main`. **Blocked pending WCI-6.** Do not mark complete before hosted success and remote-ref confirmation.
 
 ## Acceptance
 - Exactly original tag/manual triggers and unchanged Ubuntu job; independent `windows-latest` x64 MSVC job.
@@ -31,8 +32,11 @@ Route: read-only explorer, bounded writer, independent verifier, parent delivery
 - Native assessment unavailable due undeclared untracked task doc; conservative independent verifier used. RDD clone-local off; no native review started.
 - Full isolated Linux gate: Debian12 Bookworm, Rust1.94.0/Node24.21.0; clean npm install, build and frontend98/98 passed; fmt/strictClippy passed; workspace including Tauri1989 passed/0 failed/19 ignored. Logs: host temp `locust-windows-ci-linux-verify/run-Vc9vAB0i`.
 - Initial wrapper exit1 flagged generated `gen/schemas/desktop-schema.json` CRLF-to-LF rewrite. Separate incident exploration and independent byte/JSON comparison confirmed expected generated output only; all513 other baseline paths and host source hashes unchanged. Functional gates all exit0; original integrity exit1 retained and explained. No builds remain running.
-- `actionlint` unavailable; parsed YAML is not full Actions schema validation. Hosted Ubuntu/Windows execution and hosted Windows clean npm install/symlink permissions remain pending. npm reported13 vulnerabilities; no dependency/audit changes authorized in this unit.
-- Commits and pushes for this feature: none yet; now explicitly authorized after passing local gates.
+- `actionlint` unavailable; parsed YAML is not full Actions schema validation. Initial hosted run `37545042216` for3c8c851: Ubuntu success (Rust1989/0/19, frontend98/98); Windows frontend/fmt/Clippy passed but Rust failed before complete workspace coverage. npm reported13 vulnerabilities; no dependency/audit changes authorized in this unit.
+- Work-unit commit `3c8c851fcae5d9ff599a3cfcea73d554778caf9c` (`ci: check Windows on version tags and manual runs`) includes workflow, ledger and task document. Non-forced feature push succeeded; remote branch exact SHA confirmed. Remote main remains `7b367c9c041941675415a5e1152d7a151ed28daf`.
+- Committed-slice assessment reports high risk (`shell_source` in CI YAML); RDD off. Required independent verifier already completed Windows, Linux and structural checks. No native review started.
+
+- Hosted Windows blocker: `cli_can_list_and_restore_an_injection_backup` raw `game.display()` substring assertion at `crates/cli/tests/backup_recovery_tests.rs:198`. Listing intentionally uses presentation-normalized canonical paths; exact hosted fixture spelling was not logged. Separate read-only diagnosis proposes force canonical Windows fixture path for deterministic RED, then parse listing fields and compare canonical filesystem identity. No production path fix justified by current evidence.
 
 ## Next step
-Commit the bounded CI work unit and publish only the feature branch first. Dispatch manual CI and bind observation to its exact SHA; deliver to main only after both hosted jobs succeed.
+Run WCI-6 RED/GREEN and independent checks, commit correction on feature branch, then dispatch a new hosted CI run bound to its exact SHA. Keep main unchanged while any job fails. Do not skip assertions or suppress tests.
