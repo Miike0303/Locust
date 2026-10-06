@@ -65,3 +65,46 @@ jobs:
 
       - name: Rust tests
         run: cargo test --workspace
+
+  # windows-latest uses the native x64 MSVC toolchain.
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Install frontend deps
+        working-directory: apps/desktop
+        run: npm ci
+
+      # tauri-build requires apps/desktop/dist before workspace Rust checks.
+      - name: Build frontend
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Frontend unit tests
+        working-directory: apps/desktop
+        run: npm run test:unit
+
+      - name: Rust format
+        run: cargo fmt --all --check
+
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace
