@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use locust_core::backup::RevisionOriginal;
 use locust_core::error::{LocustError, Result};
@@ -8,15 +9,25 @@ use locust_core::models::{OutputMode, StringEntry};
 
 // ─── Ruby Marshal parser/writer ────────────────────────────────────────────
 
+/// Marshal is a graph, not a JSON-like tree. Parsed definitions have stable IDs;
+/// wire indices are assigned afresh on each write. Wrappers do not occupy slots.
+/// The original syntax tree retains definitions removed by message splices, so a
+/// surviving link can emit its target at its new first occurrence (including cycles).
 #[derive(Clone, Debug)]
 pub enum MarshalValue {
     Nil,
     Bool(bool),
     Int(i64),
+    EncodedInt {
+        value: Box<MarshalValue>,
+        original: i64,
+        bytes: Vec<u8>,
+    },
     Str(String),
     Symbol(String),
     Array(Vec<MarshalValue>),
     Hash(Vec<(MarshalValue, MarshalValue)>),
+    // Kept for callers constructing fixtures. Parsed records use OrderedObject.
     Object {
         class: String,
         ivars: HashMap<String, MarshalValue>,
@@ -26,61 +37,316 @@ pub enum MarshalValue {
         data: Vec<u8>,
     },
     Unsupported,
+    Document {
+        root: Box<MarshalValue>,
+        original: Arc<MarshalValue>,
+    },
+    Definition {
+        id: usize,
+        symbol: bool,
+        value: Box<MarshalValue>,
+    },
+    Link(usize),
+    SymbolLink {
+        id: usize,
+        name: Vec<u8>,
+    },
+    BinaryString(Vec<u8>),
+    BinarySymbol(Vec<u8>),
+    // Retain the exact spelling, including Ruby 1.8's binary mantissa suffix.
+    Float(Vec<u8>),
+    Bignum {
+        sign: u8,
+        words: Vec<u8>,
+    },
+    HashDefault {
+        pairs: Vec<(MarshalValue, MarshalValue)>,
+        default: Box<MarshalValue>,
+    },
+    OrderedObject {
+        kind: u8,
+        class: Box<MarshalValue>,
+        ivars: Vec<(MarshalValue, MarshalValue)>,
+    },
+    Ivar {
+        value: Box<MarshalValue>,
+        ivars: Vec<(MarshalValue, MarshalValue)>,
+    },
+    Named {
+        kind: u8,
+        class: Box<MarshalValue>,
+        value: Box<MarshalValue>,
+    },
+    Regexp {
+        source: Vec<u8>,
+        flags: u8,
+    },
+    ClassRef {
+        kind: u8,
+        name: Vec<u8>,
+    },
 }
+
+fn marshal_error(message: impl Into<String>) -> LocustError {
+    LocustError::ParseError {
+        file: String::new(),
+        message: message.into(),
+    }
+}
+
+type DefinitionKey = (bool, usize);
 
 impl MarshalValue {
     pub fn parse(bytes: &[u8]) -> Result<MarshalValue> {
-        if bytes.len() < 2 || bytes[0] != 4 || bytes[1] != 8 {
-            return Err(LocustError::ParseError {
-                file: String::new(),
-                message: "invalid Ruby Marshal header".to_string(),
-            });
+        if !bytes.starts_with(&[4, 8]) {
+            return Err(marshal_error("invalid Ruby Marshal header"));
         }
         let mut reader = MarshalReader::new(&bytes[2..]);
-        reader.read_value()
+        let root = reader.read_value(false)?;
+        if reader.pos != reader.data.len() {
+            return Err(marshal_error("trailing Ruby Marshal data"));
+        }
+        if reader.objects == 0 && reader.symbols.is_empty() {
+            return Ok(root);
+        }
+        Ok(Self::Document {
+            original: Arc::new(root.clone()),
+            root: Box::new(root),
+        })
+    }
+
+    /// Transparent access to the payload, without dropping its wire metadata.
+    pub fn value(&self) -> &Self {
+        match self {
+            Self::Document { root, .. } => root.value(),
+            Self::Definition { value, .. }
+            | Self::Ivar { value, .. }
+            | Self::EncodedInt { value, .. } => value.value(),
+            Self::Named {
+                kind: b'C' | b'e',
+                value,
+                ..
+            } => value.value(),
+            _ => self,
+        }
+    }
+
+    pub fn value_mut(&mut self) -> &mut Self {
+        match self {
+            Self::Document { root, .. } => root.value_mut(),
+            Self::Definition { value, .. }
+            | Self::Ivar { value, .. }
+            | Self::EncodedInt { value, .. } => value.value_mut(),
+            Self::Named {
+                kind: b'C' | b'e',
+                value,
+                ..
+            } => value.value_mut(),
+            _ => self,
+        }
     }
 
     pub fn as_str(&self) -> Option<&str> {
-        match self {
-            MarshalValue::Str(s) => Some(s),
+        match self.value() {
+            Self::Str(s) => Some(s),
             _ => None,
         }
     }
 
     pub fn as_array(&self) -> Option<&[MarshalValue]> {
-        match self {
-            MarshalValue::Array(a) => Some(a),
+        match self.value() {
+            Self::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    fn symbol_bytes(&self) -> Option<&[u8]> {
+        match self.value() {
+            Self::Symbol(s) => Some(s.as_bytes()),
+            Self::BinarySymbol(s) | Self::SymbolLink { name: s, .. } => Some(s),
             _ => None,
         }
     }
 
     pub fn get_ivar(&self, name: &str) -> Option<&MarshalValue> {
-        match self {
-            MarshalValue::Object { ivars, .. } => ivars.get(name),
+        let value = match self.value() {
+            Self::Object { ivars, .. } => ivars.get(name),
+            Self::OrderedObject { ivars, .. } => ivars
+                .iter()
+                .find(|(k, _)| k.symbol_bytes() == Some(name.as_bytes()))
+                .map(|(_, v)| v),
             _ => None,
-        }
+        };
+        value.map(Self::value)
     }
 
     pub fn get_ivar_mut(&mut self, name: &str) -> Option<&mut MarshalValue> {
-        match self {
-            MarshalValue::Object { ivars, .. } => ivars.get_mut(name),
+        let value = match self.value_mut() {
+            Self::Object { ivars, .. } => ivars.get_mut(name),
+            Self::OrderedObject { ivars, .. } => ivars
+                .iter_mut()
+                .find(|(k, _)| k.symbol_bytes() == Some(name.as_bytes()))
+                .map(|(_, v)| v),
             _ => None,
+        };
+        value.map(Self::value_mut)
+    }
+
+    /// Fallible serialization is used by injection: no unsupported value can
+    /// become nil, and an unresolved graph edge prevents the entire file write.
+    pub fn try_serialize(&self) -> Result<Vec<u8>> {
+        let mut writer = MarshalWriter::new();
+        if let Self::Document { original, .. } = self {
+            writer.index(original);
         }
+        writer.index(self);
+        writer.write_header();
+        writer.write_value(self, None, false)?;
+        Ok(writer.buf)
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut writer = MarshalWriter::new();
-        writer.write_header();
-        writer.write_value(self);
-        writer.buf
+        self.try_serialize()
+            .expect("unrepresentable Ruby Marshal graph")
+    }
+
+    fn children<'v>(&'v self, visit: &mut impl FnMut(&'v Self)) {
+        match self {
+            Self::Document { root, .. } => visit(root),
+            Self::Definition { value, .. } | Self::EncodedInt { value, .. } => visit(value),
+            Self::Array(a) => a.iter().for_each(visit),
+            Self::Hash(pairs) => {
+                for (k, v) in pairs {
+                    visit(k);
+                    visit(v);
+                }
+            }
+            Self::HashDefault { pairs, default } => {
+                for (k, v) in pairs {
+                    visit(k);
+                    visit(v);
+                }
+                visit(default);
+            }
+            Self::Object { ivars, .. } => ivars.values().for_each(visit),
+            Self::OrderedObject { class, ivars, .. } => {
+                visit(class);
+                for (k, v) in ivars {
+                    visit(k);
+                    visit(v);
+                }
+            }
+            Self::Ivar { value, ivars } => {
+                visit(value);
+                for (k, v) in ivars {
+                    visit(k);
+                    visit(v);
+                }
+            }
+            Self::Named { class, value, .. } => {
+                visit(class);
+                visit(value);
+            }
+            _ => {}
+        }
+    }
+
+    fn children_mut(&mut self, visit: &mut impl FnMut(&mut Self)) {
+        match self {
+            Self::Document { root, .. } => visit(root),
+            Self::Definition { value, .. } | Self::EncodedInt { value, .. } => visit(value),
+            Self::Array(a) => a.iter_mut().for_each(visit),
+            Self::Hash(pairs) => {
+                for (k, v) in pairs {
+                    visit(k);
+                    visit(v);
+                }
+            }
+            Self::HashDefault { pairs, default } => {
+                for (k, v) in pairs {
+                    visit(k);
+                    visit(v);
+                }
+                visit(default);
+            }
+            Self::Object { ivars, .. } => ivars.values_mut().for_each(visit),
+            Self::OrderedObject { class, ivars, .. } => {
+                visit(class);
+                for (k, v) in ivars {
+                    visit(k);
+                    visit(v);
+                }
+            }
+            Self::Ivar { value, ivars } => {
+                visit(value);
+                for (k, v) in ivars {
+                    visit(k);
+                    visit(v);
+                }
+            }
+            Self::Named { class, value, .. } => {
+                visit(class);
+                visit(value);
+            }
+            _ => {}
+        }
+    }
+
+    fn next_object_id(&self) -> usize {
+        let mut next = match self {
+            Self::Definition {
+                id, symbol: false, ..
+            } => id + 1,
+            _ => 0,
+        };
+        self.children(&mut |child| next = next.max(child.next_object_id()));
+        next
+    }
+
+    /// New 401 commands are distinct objects. Remap their internal links too;
+    /// symbol identities continue to belong to the document's symbol table.
+    fn fresh_clone(&self, next: &mut usize) -> Self {
+        fn allocate(v: &MarshalValue, next: &mut usize, ids: &mut HashMap<usize, usize>) {
+            if let MarshalValue::Definition {
+                id, symbol: false, ..
+            } = v
+            {
+                ids.entry(*id).or_insert_with(|| {
+                    let id = *next;
+                    *next += 1;
+                    id
+                });
+            }
+            v.children(&mut |child| allocate(child, next, ids));
+        }
+        fn remap(v: &mut MarshalValue, ids: &HashMap<usize, usize>) {
+            match v {
+                MarshalValue::Definition {
+                    id, symbol: false, ..
+                }
+                | MarshalValue::Link(id) => {
+                    if let Some(new) = ids.get(id) {
+                        *id = *new;
+                    }
+                }
+                _ => {}
+            }
+            v.children_mut(&mut |child| remap(child, ids));
+        }
+        let mut ids = HashMap::new();
+        allocate(self, next, &mut ids);
+        let mut copy = self.clone();
+        remap(&mut copy, &ids);
+        copy
     }
 }
 
 struct MarshalReader<'a> {
     data: &'a [u8],
     pos: usize,
-    symbols: Vec<String>,
-    objects: Vec<usize>, // placeholder indices for object refs
+    symbols: Vec<Vec<u8>>,
+    objects: usize,
+    depth: usize,
 }
 
 impl<'a> MarshalReader<'a> {
@@ -89,28 +355,23 @@ impl<'a> MarshalReader<'a> {
             data,
             pos: 0,
             symbols: Vec::new(),
-            objects: Vec::new(),
+            objects: 0,
+            depth: 0,
         }
     }
 
     fn read_byte(&mut self) -> Result<u8> {
-        if self.pos >= self.data.len() {
-            return Err(LocustError::ParseError {
-                file: String::new(),
-                message: "unexpected end of marshal data".to_string(),
-            });
-        }
-        let b = self.data[self.pos];
+        let byte = *self
+            .data
+            .get(self.pos)
+            .ok_or_else(|| marshal_error("unexpected end of marshal data"))?;
         self.pos += 1;
-        Ok(b)
+        Ok(byte)
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.data.len() {
-            return Err(LocustError::ParseError {
-                file: String::new(),
-                message: "unexpected end of marshal data".to_string(),
-            });
+        if n > self.data.len() - self.pos {
+            return Err(marshal_error("unexpected end of marshal data"));
         }
         let slice = &self.data[self.pos..self.pos + n];
         self.pos += n;
@@ -119,302 +380,573 @@ impl<'a> MarshalReader<'a> {
 
     fn read_packed_int(&mut self) -> Result<i64> {
         let c = self.read_byte()? as i8;
-        if c == 0 {
-            return Ok(0);
-        }
-        if c > 0 && c <= 4 {
-            let n = c as usize;
-            let mut val = 0i64;
-            for i in 0..n {
-                val |= (self.read_byte()? as i64) << (8 * i);
+        match c {
+            0 => Ok(0),
+            1..=4 | -4..=-1 => {
+                let mut val = if c < 0 { -1i64 } else { 0i64 };
+                for i in 0..c.unsigned_abs() {
+                    val = (val & !(0xffi64 << (8 * i))) | ((self.read_byte()? as i64) << (8 * i));
+                }
+                Ok(val)
             }
-            return Ok(val);
-        }
-        if (-4..0).contains(&c) {
-            let n = (-c) as usize;
-            let mut val = -1i64;
-            for i in 0..n {
-                val &= !(0xFF << (8 * i));
-                val |= (self.read_byte()? as i64) << (8 * i);
-            }
-            return Ok(val);
-        }
-        // Small integers: c > 5 => c - 5, c < -4 => c + 5
-        if c > 4 {
-            Ok((c as i64) - 5)
-        } else {
-            Ok((c as i64) + 5)
+            5..=127 => Ok(c as i64 - 5),
+            _ => Ok(c as i64 + 5),
         }
     }
 
-    fn read_symbol(&mut self) -> Result<String> {
-        let len = self.read_packed_int()? as usize;
-        let bytes = self.read_bytes(len)?;
-        let s = String::from_utf8_lossy(bytes).to_string();
-        self.symbols.push(s.clone());
-        Ok(s)
+    fn count(&mut self, minimum_bytes: usize) -> Result<usize> {
+        let n = usize::try_from(self.read_packed_int()?)
+            .map_err(|_| marshal_error("negative Marshal length"))?;
+        if n > (self.data.len() - self.pos) / minimum_bytes {
+            return Err(marshal_error("Marshal length exceeds remaining input"));
+        }
+        Ok(n)
     }
 
-    fn read_symbol_or_ref(&mut self) -> Result<String> {
+    fn blob(&mut self) -> Result<Vec<u8>> {
+        let count = self.count(1)?;
+        Ok(self.read_bytes(count)?.to_vec())
+    }
+
+    fn register(&mut self) -> usize {
+        let id = self.objects;
+        self.objects += 1;
+        id
+    }
+
+    fn definition(id: usize, symbol: bool, value: MarshalValue) -> MarshalValue {
+        MarshalValue::Definition {
+            id,
+            symbol,
+            value: Box::new(value),
+        }
+    }
+
+    // Put wrappers INSIDE the definition, so a moved first occurrence keeps them.
+    fn wrap(
+        value: MarshalValue,
+        wrapper: impl FnOnce(MarshalValue) -> MarshalValue,
+    ) -> MarshalValue {
+        match value {
+            MarshalValue::Definition { id, symbol, value } => {
+                Self::definition(id, symbol, wrapper(*value))
+            }
+            value => wrapper(value),
+        }
+    }
+
+    fn symbol(&mut self) -> Result<MarshalValue> {
+        let value = self.read_value(false)?;
+        if value.symbol_bytes().is_none() {
+            return Err(marshal_error("expected Marshal symbol"));
+        }
+        Ok(value)
+    }
+
+    fn ivars(&mut self) -> Result<Vec<(MarshalValue, MarshalValue)>> {
+        let count = self.count(2)?;
+        let mut fields = Vec::with_capacity(count);
+        for _ in 0..count {
+            fields.push((self.symbol()?, self.read_value(false)?));
+        }
+        Ok(fields)
+    }
+
+    fn read_value(&mut self, in_ivar: bool) -> Result<MarshalValue> {
+        if self.depth >= 128 {
+            return Err(marshal_error("Marshal nesting limit exceeded"));
+        }
+        self.depth += 1;
+        let result = self.read_value_inner(in_ivar);
+        self.depth -= 1;
+        result
+    }
+
+    fn read_value_inner(&mut self, in_ivar: bool) -> Result<MarshalValue> {
+        use MarshalValue as V;
         let tag = self.read_byte()?;
-        match tag {
-            b':' => self.read_symbol(),
-            b';' => {
-                let idx = self.read_packed_int()? as usize;
-                self.symbols
-                    .get(idx)
-                    .cloned()
-                    .ok_or_else(|| LocustError::ParseError {
-                        file: String::new(),
-                        message: format!("invalid symbol ref: {}", idx),
-                    })
-            }
-            _ => Err(LocustError::ParseError {
-                file: String::new(),
-                message: format!("expected symbol, got 0x{:02x}", tag),
-            }),
-        }
-    }
-
-    fn read_raw_string(&mut self) -> Result<String> {
-        let len = self.read_packed_int()? as usize;
-        let bytes = self.read_bytes(len)?;
-        Ok(String::from_utf8_lossy(bytes).to_string())
-    }
-
-    fn read_value(&mut self) -> Result<MarshalValue> {
-        let tag = self.read_byte()?;
-        match tag {
-            b'0' => Ok(MarshalValue::Nil),
-            b'T' => Ok(MarshalValue::Bool(true)),
-            b'F' => Ok(MarshalValue::Bool(false)),
+        let value = match tag {
+            b'0' => V::Nil,
+            b'T' => V::Bool(true),
+            b'F' => V::Bool(false),
             b'i' => {
-                let val = self.read_packed_int()?;
-                Ok(MarshalValue::Int(val))
-            }
-            b'"' => {
-                self.objects.push(self.pos);
-                let s = self.read_raw_string()?;
-                Ok(MarshalValue::Str(s))
+                let start = self.pos;
+                let original = self.read_packed_int()?;
+                let bytes = &self.data[start..self.pos];
+                let mut canonical = MarshalWriter::new();
+                canonical.write_packed_int(original);
+                if canonical.buf == bytes {
+                    V::Int(original)
+                } else {
+                    V::EncodedInt {
+                        value: Box::new(V::Int(original)),
+                        original,
+                        bytes: bytes.to_vec(),
+                    }
+                }
             }
             b':' => {
-                let s = self.read_symbol()?;
-                Ok(MarshalValue::Symbol(s))
+                let bytes = self.blob()?;
+                let id = self.symbols.len();
+                self.symbols.push(bytes.clone());
+                let symbol = match String::from_utf8(bytes) {
+                    Ok(s) => V::Symbol(s),
+                    Err(e) => V::BinarySymbol(e.into_bytes()),
+                };
+                Self::definition(id, true, symbol)
             }
             b';' => {
-                let idx = self.read_packed_int()? as usize;
-                let s = self.symbols.get(idx).cloned().unwrap_or_default();
-                Ok(MarshalValue::Symbol(s))
+                let id = usize::try_from(self.read_packed_int()?)
+                    .map_err(|_| marshal_error("negative symbol link"))?;
+                let name = self
+                    .symbols
+                    .get(id)
+                    .ok_or_else(|| marshal_error(format!("invalid symbol link: {id}")))?
+                    .clone();
+                V::SymbolLink { id, name }
             }
             b'@' => {
-                let _idx = self.read_packed_int()?;
-                // Object reference — we can't easily resolve, return Unsupported
-                Ok(MarshalValue::Unsupported)
-            }
-            b'[' => {
-                self.objects.push(self.pos);
-                let count = self.read_packed_int()? as usize;
-                let mut arr = Vec::with_capacity(count);
-                for _ in 0..count {
-                    arr.push(self.read_value()?);
+                let id = usize::try_from(self.read_packed_int()?)
+                    .map_err(|_| marshal_error("negative object link"))?;
+                if id >= self.objects {
+                    return Err(marshal_error(format!("invalid object link: {id}")));
                 }
-                Ok(MarshalValue::Array(arr))
-            }
-            b'{' => {
-                self.objects.push(self.pos);
-                let count = self.read_packed_int()? as usize;
-                let mut pairs = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let k = self.read_value()?;
-                    let v = self.read_value()?;
-                    pairs.push((k, v));
-                }
-                Ok(MarshalValue::Hash(pairs))
-            }
-            b'o' => {
-                self.objects.push(self.pos);
-                let class = self.read_symbol_or_ref()?;
-                let ivar_count = self.read_packed_int()? as usize;
-                let mut ivars = HashMap::new();
-                for _ in 0..ivar_count {
-                    let key = self.read_symbol_or_ref()?;
-                    let val = self.read_value()?;
-                    ivars.insert(key, val);
-                }
-                Ok(MarshalValue::Object { class, ivars })
+                V::Link(id)
             }
             b'I' => {
-                // IVAR wrapper (typically wraps a string with encoding info)
-                self.objects.push(self.pos);
-                let inner = self.read_value()?;
-                let ivar_count = self.read_packed_int()? as usize;
-                for _ in 0..ivar_count {
-                    let _key = self.read_symbol_or_ref()?;
-                    let _val = self.read_value()?;
+                let value = self.read_value(true)?;
+                let late = matches!(value, V::Named { kind: b'u', .. });
+                let ivars = self.ivars()?;
+                let wrapped = Self::wrap(value, |value| V::Ivar {
+                    value: Box::new(value),
+                    ivars,
+                });
+                if late {
+                    Self::definition(self.register(), false, wrapped)
+                } else {
+                    wrapped
                 }
-                // Return the inner value (usually a string)
-                Ok(inner)
             }
-            b'u' => {
-                self.objects.push(self.pos);
-                let class = self.read_symbol_or_ref()?;
-                let len = self.read_packed_int()? as usize;
-                let data = self.read_bytes(len)?.to_vec();
-                Ok(MarshalValue::UserDefined { class, data })
+            b'C' | b'e' => {
+                let class = Box::new(self.symbol()?);
+                let value = self.read_value(false)?;
+                Self::wrap(value, |value| V::Named {
+                    kind: tag,
+                    class,
+                    value: Box::new(value),
+                })
+            }
+            b'o' | b'S' => {
+                let id = self.register();
+                let class = Box::new(self.symbol()?);
+                let ivars = self.ivars()?;
+                Self::definition(
+                    id,
+                    false,
+                    V::OrderedObject {
+                        kind: tag,
+                        class,
+                        ivars,
+                    },
+                )
+            }
+            b'U' | b'd' | b'u' => {
+                let class = Box::new(self.symbol()?);
+                let id = if tag != b'u' {
+                    Some(self.register())
+                } else {
+                    None
+                };
+                let value = Box::new(if tag == b'u' {
+                    V::BinaryString(self.blob()?)
+                } else {
+                    self.read_value(false)?
+                });
+                let value = V::Named {
+                    kind: tag,
+                    class,
+                    value,
+                };
+                if tag == b'u' && in_ivar {
+                    value
+                } else {
+                    Self::definition(id.unwrap_or_else(|| self.register()), false, value)
+                }
+            }
+            b'[' => {
+                let count = self.count(1)?;
+                let id = self.register();
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    values.push(self.read_value(false)?);
+                }
+                Self::definition(id, false, V::Array(values))
+            }
+            b'{' | b'}' => {
+                let count = self.count(2)?;
+                let id = self.register();
+                let mut pairs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    pairs.push((self.read_value(false)?, self.read_value(false)?));
+                }
+                let value = if tag == b'}' {
+                    V::HashDefault {
+                        pairs,
+                        default: Box::new(self.read_value(false)?),
+                    }
+                } else {
+                    V::Hash(pairs)
+                };
+                Self::definition(id, false, value)
+            }
+            b'"' | b'f' | b'/' | b'c' | b'm' | b'M' => {
+                let data = self.blob()?;
+                let value = match tag {
+                    b'"' => match String::from_utf8(data) {
+                        Ok(s) => V::Str(s),
+                        Err(e) => V::BinaryString(e.into_bytes()),
+                    },
+                    b'f' => V::Float(data),
+                    b'/' => V::Regexp {
+                        source: data,
+                        flags: self.read_byte()?,
+                    },
+                    _ => V::ClassRef {
+                        kind: tag,
+                        name: data,
+                    },
+                };
+                Self::definition(self.register(), false, value)
+            }
+            b'l' => {
+                let sign = self.read_byte()?;
+                if sign != b'+' && sign != b'-' {
+                    return Err(marshal_error("invalid Bignum sign"));
+                }
+                let count = self.count(2)?;
+                let words = self.read_bytes(count * 2)?.to_vec();
+                Self::definition(self.register(), false, V::Bignum { sign, words })
             }
             _ => {
-                // Skip unknown types gracefully
-                Ok(MarshalValue::Unsupported)
+                return Err(marshal_error(format!(
+                    "unsupported Marshal tag 0x{tag:02x} at byte {}",
+                    self.pos + 1
+                )))
             }
-        }
+        };
+        Ok(value)
     }
 }
 
-struct MarshalWriter {
+struct MarshalWriter<'a> {
     buf: Vec<u8>,
-    symbols: Vec<String>,
+    definitions: HashMap<DefinitionKey, &'a MarshalValue>,
+    emitted: HashMap<DefinitionKey, usize>,
+    symbols: HashMap<Vec<u8>, usize>,
+    symbol_count: usize,
+    object_count: usize,
+    depth: usize,
 }
 
-impl MarshalWriter {
+impl<'a> MarshalWriter<'a> {
     fn new() -> Self {
         Self {
             buf: Vec::new(),
-            symbols: Vec::new(),
+            definitions: HashMap::new(),
+            emitted: HashMap::new(),
+            symbols: HashMap::new(),
+            symbol_count: 0,
+            object_count: 0,
+            depth: 0,
         }
     }
 
-    fn write_header(&mut self) {
-        self.buf.push(4);
-        self.buf.push(8);
+    fn index(&mut self, value: &'a MarshalValue) {
+        if let MarshalValue::Definition { id, symbol, .. } = value {
+            self.definitions.insert((*symbol, *id), value);
+        }
+        value.children(&mut |child| self.index(child));
     }
 
-    fn write_packed_int(&mut self, val: i64) {
+    fn write_header(&mut self) {
+        self.buf.extend_from_slice(&[4, 8]);
+    }
+
+    fn write_packed_int(&mut self, mut val: i64) {
         if val == 0 {
             self.buf.push(0);
             return;
         }
-        if val > 0 && val < 123 {
+        if (1..123).contains(&val) {
             self.buf.push((val + 5) as u8);
             return;
         }
-        if val < 0 && val > -124 {
+        if (-123..0).contains(&val) {
             self.buf.push((val - 5) as u8);
             return;
         }
-        if val > 0 {
-            let bytes = val.to_le_bytes();
-            let n = if val <= 0xFF {
-                1
-            } else if val <= 0xFFFF {
-                2
-            } else if val <= 0xFF_FFFF {
-                3
-            } else {
-                4
-            };
-            self.buf.push(n as u8);
-            self.buf.extend_from_slice(&bytes[..n]);
-        } else {
-            let bytes = val.to_le_bytes();
-            let n = if val >= -0x80 {
-                1
-            } else if val >= -0x8000 {
-                2
-            } else if val >= -0x80_0000 {
-                3
-            } else {
-                4
-            };
-            self.buf.push((-n_i8(n)) as u8);
-            self.buf.extend_from_slice(&bytes[..n]);
+        let negative = val < 0;
+        let pos = self.buf.len();
+        self.buf.push(0);
+        loop {
+            self.buf.push(val as u8);
+            val >>= 8;
+            if val == 0 || val == -1 {
+                break;
+            }
         }
+        let n = (self.buf.len() - pos - 1) as i8;
+        self.buf[pos] = if negative { -n } else { n } as u8;
     }
 
-    fn write_symbol(&mut self, s: &str) {
-        if let Some(idx) = self.symbols.iter().position(|sym| sym == s) {
-            self.buf.push(b';');
-            self.write_packed_int(idx as i64);
-        } else {
-            self.symbols.push(s.to_string());
-            self.buf.push(b':');
-            let bytes = s.as_bytes();
-            self.write_packed_int(bytes.len() as i64);
-            self.buf.extend_from_slice(bytes);
-        }
-    }
-
-    fn write_string_with_encoding(&mut self, s: &str) {
-        // IVAR wrapper with encoding
-        self.buf.push(b'I');
-        self.buf.push(b'"');
-        let bytes = s.as_bytes();
+    fn blob(&mut self, bytes: &[u8]) {
         self.write_packed_int(bytes.len() as i64);
         self.buf.extend_from_slice(bytes);
-        // 1 ivar: :E => true (UTF-8 encoding)
+    }
+
+    fn register(&mut self, key: Option<DefinitionKey>, symbol: bool) {
+        let count = if symbol {
+            &mut self.symbol_count
+        } else {
+            &mut self.object_count
+        };
+        if let Some(key) = key {
+            self.emitted.insert(key, *count);
+        }
+        *count += 1;
+    }
+
+    fn link(&mut self, key: DefinitionKey) -> Result<()> {
+        if let Some(&index) = self.emitted.get(&key) {
+            self.buf.push(if key.0 { b';' } else { b'@' });
+            self.write_packed_int(index as i64);
+            Ok(())
+        } else {
+            let value = *self
+                .definitions
+                .get(&key)
+                .ok_or_else(|| marshal_error(format!("unresolved Marshal link: {key:?}")))?;
+            self.write_value(value, None, false)
+        }
+    }
+
+    fn write_symbol(&mut self, name: &[u8], key: Option<DefinitionKey>) {
+        if key.is_none() {
+            if let Some(&id) = self.symbols.get(name) {
+                self.buf.push(b';');
+                self.write_packed_int(id as i64);
+                return;
+            }
+        }
+        self.symbols
+            .entry(name.to_vec())
+            .or_insert(self.symbol_count);
+        self.register(key, true);
+        self.buf.push(b':');
+        self.blob(name);
+    }
+
+    #[cfg(test)]
+    fn write_string_with_encoding(&mut self, s: &str) {
+        self.buf.extend_from_slice(b"I\"");
+        self.blob(s.as_bytes());
+        self.register(None, false);
         self.write_packed_int(1);
-        self.write_symbol("E");
+        self.write_symbol(b"E", None);
         self.buf.push(b'T');
     }
 
-    fn write_value(&mut self, val: &MarshalValue) {
-        match val {
-            MarshalValue::Nil => self.buf.push(b'0'),
-            MarshalValue::Bool(true) => self.buf.push(b'T'),
-            MarshalValue::Bool(false) => self.buf.push(b'F'),
-            MarshalValue::Int(v) => {
-                self.buf.push(b'i');
-                self.write_packed_int(*v);
-            }
-            MarshalValue::Str(s) => {
-                self.write_string_with_encoding(s);
-            }
-            MarshalValue::Symbol(s) => {
-                self.write_symbol(s);
-            }
-            MarshalValue::Array(arr) => {
-                self.buf.push(b'[');
-                self.write_packed_int(arr.len() as i64);
-                for item in arr {
-                    self.write_value(item);
-                }
-            }
-            MarshalValue::Hash(pairs) => {
-                self.buf.push(b'{');
-                self.write_packed_int(pairs.len() as i64);
-                for (k, v) in pairs {
-                    self.write_value(k);
-                    self.write_value(v);
-                }
-            }
-            MarshalValue::Object { class, ivars } => {
-                self.buf.push(b'o');
-                self.write_symbol(class);
-                self.write_packed_int(ivars.len() as i64);
-                // HashMap iteration is randomized on each parse. Stable ivar
-                // order is required for identical inputs to produce identical
-                // bytes, including a no-op Direct revision.
-                let mut ordered: Vec<_> = ivars.iter().collect();
-                ordered.sort_by_key(|(key, _)| *key);
-                for (key, val) in ordered {
-                    self.write_symbol(key);
-                    self.write_value(val);
-                }
-            }
-            MarshalValue::UserDefined { class, data } => {
-                self.buf.push(b'u');
-                self.write_symbol(class);
-                self.write_packed_int(data.len() as i64);
-                self.buf.extend_from_slice(data);
-            }
-            MarshalValue::Unsupported => {
-                self.buf.push(b'0'); // write nil for unsupported
-            }
+    fn ivars(&mut self, ivars: &'a [(MarshalValue, MarshalValue)]) -> Result<()> {
+        self.write_packed_int(ivars.len() as i64);
+        for (k, v) in ivars {
+            self.write_value(k, None, false)?;
+            self.write_value(v, None, false)?;
         }
+        Ok(())
     }
-}
 
-fn n_i8(n: usize) -> i8 {
-    n as i8
+    fn write_value(
+        &mut self,
+        value: &'a MarshalValue,
+        key: Option<DefinitionKey>,
+        in_ivar: bool,
+    ) -> Result<()> {
+        if self.depth >= 512 {
+            return Err(marshal_error("Marshal write nesting limit exceeded"));
+        }
+        self.depth += 1;
+        let result = self.write_inner(value, key, in_ivar);
+        self.depth -= 1;
+        result
+    }
+
+    fn write_inner(
+        &mut self,
+        value: &'a MarshalValue,
+        key: Option<DefinitionKey>,
+        in_ivar: bool,
+    ) -> Result<()> {
+        use MarshalValue as V;
+        match value {
+            V::Document { root, .. } => self.write_value(root, key, in_ivar)?,
+            V::Definition { id, symbol, value } => {
+                let key = (*symbol, *id);
+                if self.emitted.contains_key(&key) {
+                    self.link(key)?;
+                } else {
+                    self.write_value(value, Some(key), in_ivar)?;
+                }
+            }
+            V::Link(id) => self.link((false, *id))?,
+            V::SymbolLink { id, .. } => self.link((true, *id))?,
+            V::Nil => self.buf.push(b'0'),
+            V::Bool(b) => self.buf.push(if *b { b'T' } else { b'F' }),
+            V::Int(n) => {
+                if !(-0x1_0000_0000..=0xffff_ffff).contains(n) {
+                    return Err(marshal_error("integer outside Marshal fixnum wire range"));
+                }
+                self.buf.push(b'i');
+                self.write_packed_int(*n);
+            }
+            V::EncodedInt {
+                value,
+                original,
+                bytes,
+            } => {
+                if matches!(value.as_ref(), V::Int(n) if n == original) {
+                    self.buf.push(b'i');
+                    self.buf.extend_from_slice(bytes);
+                } else {
+                    self.write_value(value, key, in_ivar)?;
+                }
+            }
+            V::Str(s) => {
+                self.buf.push(b'"');
+                self.blob(s.as_bytes());
+                self.register(key, false);
+            }
+            V::BinaryString(s) => {
+                self.buf.push(b'"');
+                self.blob(s);
+                self.register(key, false);
+            }
+            V::Symbol(s) => self.write_symbol(s.as_bytes(), key),
+            V::BinarySymbol(s) => self.write_symbol(s, key),
+            V::Float(bytes) => {
+                self.buf.push(b'f');
+                self.blob(bytes);
+                self.register(key, false);
+            }
+            V::Bignum { sign, words } => {
+                if !matches!(sign, b'+' | b'-') || words.len() % 2 != 0 {
+                    return Err(marshal_error("invalid Bignum"));
+                }
+                self.buf.extend_from_slice(&[b'l', *sign]);
+                self.write_packed_int((words.len() / 2) as i64);
+                self.buf.extend_from_slice(words);
+                self.register(key, false);
+            }
+            V::Regexp { source, flags } => {
+                self.buf.push(b'/');
+                self.blob(source);
+                self.buf.push(*flags);
+                self.register(key, false);
+            }
+            V::ClassRef { kind, name } => {
+                if !matches!(kind, b'c' | b'm' | b'M') {
+                    return Err(marshal_error("invalid class/module tag"));
+                }
+                self.buf.push(*kind);
+                self.blob(name);
+                self.register(key, false);
+            }
+            V::Array(values) => {
+                self.buf.push(b'[');
+                self.write_packed_int(values.len() as i64);
+                self.register(key, false);
+                for v in values {
+                    self.write_value(v, None, false)?;
+                }
+            }
+            V::Hash(pairs) | V::HashDefault { pairs, .. } => {
+                self.buf.push(if matches!(value, V::HashDefault { .. }) {
+                    b'}'
+                } else {
+                    b'{'
+                });
+                self.write_packed_int(pairs.len() as i64);
+                self.register(key, false);
+                for (k, v) in pairs {
+                    self.write_value(k, None, false)?;
+                    self.write_value(v, None, false)?;
+                }
+                if let V::HashDefault { default, .. } = value {
+                    self.write_value(default, None, false)?;
+                }
+            }
+            V::Object { class, ivars } => {
+                self.buf.push(b'o');
+                self.register(key, false);
+                self.write_symbol(class.as_bytes(), None);
+                self.write_packed_int(ivars.len() as i64);
+                let mut fields: Vec<_> = ivars.iter().collect();
+                fields.sort_by_key(|(k, _)| *k);
+                for (k, v) in fields {
+                    self.write_symbol(k.as_bytes(), None);
+                    self.write_value(v, None, false)?;
+                }
+            }
+            V::OrderedObject { kind, class, ivars } => {
+                if !matches!(kind, b'o' | b'S') {
+                    return Err(marshal_error("invalid record tag"));
+                }
+                self.buf.push(*kind);
+                self.register(key, false);
+                self.write_value(class, None, false)?;
+                self.ivars(ivars)?;
+            }
+            V::Ivar { value, ivars } => {
+                self.buf.push(b'I');
+                self.write_value(value, key, true)?;
+                self.ivars(ivars)?;
+                if matches!(value.as_ref(), V::Named { kind: b'u', .. }) {
+                    self.register(key, false);
+                }
+            }
+            V::Named { kind, class, value } => {
+                if !matches!(kind, b'C' | b'e' | b'U' | b'd' | b'u') {
+                    return Err(marshal_error("invalid named tag"));
+                }
+                self.buf.push(*kind);
+                self.write_value(class, None, false)?;
+                match kind {
+                    b'C' | b'e' => self.write_value(value, key, false)?,
+                    b'U' | b'd' => {
+                        self.register(key, false);
+                        self.write_value(value, None, false)?;
+                    }
+                    b'u' => {
+                        let V::BinaryString(data) = value.as_ref() else {
+                            return Err(marshal_error("invalid user-defined payload"));
+                        };
+                        self.blob(data);
+                        if !in_ivar {
+                            self.register(key, false);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            V::UserDefined { class, data } => {
+                self.buf.push(b'u');
+                self.write_symbol(class.as_bytes(), None);
+                self.blob(data);
+                self.register(key, false);
+            }
+            V::Unsupported => return Err(marshal_error("unsupported Marshal value")),
+        }
+        Ok(())
+    }
 }
 
 // ─── VXA Plugin ────────────────────────────────────────────────────────────
@@ -557,11 +1089,9 @@ impl RpgMakerVxaPlugin {
                         // Either way the whole box merges into one #msg entry.
                         101 | 401 => {
                             let mut lines: Vec<String> = Vec::new();
-                            match params.first() {
-                                Some(MarshalValue::Str(text))
-                                    if code == 401 || !text.trim().is_empty() =>
-                                {
-                                    lines.push(text.clone());
+                            match params.first().and_then(MarshalValue::as_str) {
+                                Some(text) if code == 401 || !text.trim().is_empty() => {
+                                    lines.push(text.to_string());
                                 }
                                 // VX Ace header, or XP Show Text with an empty
                                 // first line: the 401 run that follows anchors
@@ -591,7 +1121,9 @@ impl RpgMakerVxaPlugin {
                             }
                         }
                         102 => {
-                            if let Some(MarshalValue::Array(choices)) = params.first() {
+                            if let Some(MarshalValue::Array(choices)) =
+                                params.first().map(MarshalValue::value)
+                            {
                                 for (ci, choice) in choices.iter().enumerate() {
                                     if let Some(text) = choice.as_str() {
                                         if !text.trim().is_empty() {
@@ -649,9 +1181,9 @@ impl RpgMakerVxaPlugin {
                 };
                 if code == 101 || code == 401 {
                     let mut lines: Vec<String> = Vec::new();
-                    match params.first() {
-                        Some(MarshalValue::Str(text)) if code == 401 || !text.trim().is_empty() => {
-                            lines.push(text.clone());
+                    match params.first().and_then(MarshalValue::as_str) {
+                        Some(text) if code == 401 || !text.trim().is_empty() => {
+                            lines.push(text.to_string());
                         }
                         _ => continue,
                     }
@@ -700,13 +1232,14 @@ impl RpgMakerVxaPlugin {
         }
 
         let stem_lower = strip_marshal_ext(filename).to_lowercase();
+        let mut next_object_id = root.next_object_id();
 
         if stem_lower.starts_with("map") && stem_lower != "mapinfos" {
             // Map files: navigate @events → @pages → @list → commands
-            Self::apply_map_translations(root, filename, &lookup);
+            Self::apply_map_translations(root, filename, &lookup, &mut next_object_id);
         } else if stem_lower == "commonevents" {
             // CommonEvents: navigate array → @list → commands
-            Self::apply_common_event_translations(root, filename, &lookup);
+            Self::apply_common_event_translations(root, filename, &lookup, &mut next_object_id);
         } else {
             // Array data files (Actors, Items, etc.): update ivars
             Self::apply_array_translations(root, filename, &lookup);
@@ -721,18 +1254,16 @@ impl RpgMakerVxaPlugin {
         let stem = strip_marshal_ext(filename);
         let fields = Self::fields_for_file(stem);
 
-        if let MarshalValue::Array(arr) = root {
+        if let MarshalValue::Array(arr) = root.value_mut() {
             for (idx, item) in arr.iter_mut().enumerate() {
                 if matches!(item, MarshalValue::Nil) {
                     continue;
                 }
-                if let MarshalValue::Object { ivars, .. } = item {
-                    for &(field, _) in fields {
-                        let id = format!("{}#{}#{}", filename, idx, field);
-                        if let Some(&translation) = lookup.get(id.as_str()) {
-                            if let Some(MarshalValue::Str(s)) = ivars.get_mut(field) {
-                                *s = translation.to_string();
-                            }
+                for &(field, _) in fields {
+                    let id = format!("{}#{}#{}", filename, idx, field);
+                    if let Some(&translation) = lookup.get(id.as_str()) {
+                        if let Some(MarshalValue::Str(s)) = item.get_ivar_mut(field) {
+                            *s = translation.to_string();
                         }
                     }
                 }
@@ -744,6 +1275,7 @@ impl RpgMakerVxaPlugin {
         root: &mut MarshalValue,
         filename: &str,
         lookup: &HashMap<&str, &str>,
+        next_object_id: &mut usize,
     ) {
         let events = match root.get_ivar_mut("@events") {
             Some(v) => v,
@@ -770,7 +1302,7 @@ impl RpgMakerVxaPlugin {
                     _ => continue,
                 };
                 let prefix = format!("{}#0#event_{}#page_{}", filename, ev_id, page_idx);
-                Self::apply_list_translations(list, lookup, &prefix);
+                Self::apply_list_translations(list, lookup, &prefix, next_object_id);
             }
         }
     }
@@ -779,8 +1311,9 @@ impl RpgMakerVxaPlugin {
         root: &mut MarshalValue,
         filename: &str,
         lookup: &HashMap<&str, &str>,
+        next_object_id: &mut usize,
     ) {
-        let arr = match root {
+        let arr = match root.value_mut() {
             MarshalValue::Array(a) => a,
             _ => return,
         };
@@ -793,7 +1326,7 @@ impl RpgMakerVxaPlugin {
                 _ => continue,
             };
             let prefix = format!("{}#{}", filename, ev_idx);
-            Self::apply_list_translations(list, lookup, &prefix);
+            Self::apply_list_translations(list, lookup, &prefix, next_object_id);
         }
     }
 
@@ -804,6 +1337,7 @@ impl RpgMakerVxaPlugin {
         list: &mut Vec<MarshalValue>,
         lookup: &HashMap<&str, &str>,
         prefix: &str,
+        next_object_id: &mut usize,
     ) {
         enum Op<'a> {
             Msg(&'a str),
@@ -837,7 +1371,7 @@ impl RpgMakerVxaPlugin {
 
         for (idx, op) in ops {
             match op {
-                Op::Msg(t) => Self::apply_message_block(list, idx, t),
+                Op::Msg(t) => Self::apply_message_block(list, idx, t, next_object_id),
                 Op::Line(t) => {
                     if let Some(cmd) = list.get_mut(idx) {
                         set_cmd_text(cmd, t);
@@ -846,8 +1380,12 @@ impl RpgMakerVxaPlugin {
                 Op::Choice(ci, t) => {
                     if let Some(cmd) = list.get_mut(idx) {
                         if let Some(MarshalValue::Array(params)) = cmd.get_ivar_mut("@parameters") {
-                            if let Some(MarshalValue::Array(choices)) = params.first_mut() {
-                                if let Some(MarshalValue::Str(s)) = choices.get_mut(ci) {
+                            if let Some(MarshalValue::Array(choices)) =
+                                params.first_mut().map(MarshalValue::value_mut)
+                            {
+                                if let Some(MarshalValue::Str(s)) =
+                                    choices.get_mut(ci).map(MarshalValue::value_mut)
+                                {
                                     *s = t.to_string();
                                 }
                             }
@@ -862,7 +1400,12 @@ impl RpgMakerVxaPlugin {
     /// first line; VX Ace: the first 401 of a run) with the translation
     /// re-wrapped to the original line width. Continuation 401s are spliced,
     /// so the run may grow or shrink.
-    fn apply_message_block(list: &mut Vec<MarshalValue>, cmd_idx: usize, translation: &str) {
+    fn apply_message_block(
+        list: &mut Vec<MarshalValue>,
+        cmd_idx: usize,
+        translation: &str,
+        next_object_id: &mut usize,
+    ) {
         let anchor_code = match list.get(cmd_idx).and_then(cmd_code) {
             Some(c @ (101 | 401)) => c,
             _ => return,
@@ -901,8 +1444,13 @@ impl RpgMakerVxaPlugin {
             make_401_like(&list[cmd_idx])
         };
         let new_401s: Vec<MarshalValue> = lines
-            .map(|line| {
-                let mut cmd = template.clone();
+            .enumerate()
+            .map(|(index, line)| {
+                let mut cmd = if cmd_idx + 1 + index < end {
+                    list[cmd_idx + 1 + index].clone()
+                } else {
+                    template.fresh_clone(next_object_id)
+                };
                 set_cmd_text(&mut cmd, &line);
                 cmd
             })
@@ -920,10 +1468,9 @@ fn cmd_code(cmd: &MarshalValue) -> Option<i64> {
 
 fn cmd_first_str(cmd: &MarshalValue) -> Option<String> {
     match cmd.get_ivar("@parameters") {
-        Some(MarshalValue::Array(a)) => match a.first() {
-            Some(MarshalValue::Str(s)) => Some(s.clone()),
-            _ => None,
-        },
+        Some(MarshalValue::Array(a)) => {
+            a.first().and_then(MarshalValue::as_str).map(str::to_string)
+        }
         _ => None,
     }
 }
@@ -931,7 +1478,7 @@ fn cmd_first_str(cmd: &MarshalValue) -> Option<String> {
 fn set_cmd_text(cmd: &mut MarshalValue, text: &str) {
     if let Some(MarshalValue::Array(params)) = cmd.get_ivar_mut("@parameters") {
         if let Some(first) = params.first_mut() {
-            *first = MarshalValue::Str(text.to_string());
+            *first.value_mut() = MarshalValue::Str(text.to_string());
         } else {
             params.push(MarshalValue::Str(text.to_string()));
         }
@@ -941,13 +1488,13 @@ fn set_cmd_text(cmd: &mut MarshalValue, text: &str) {
 /// Clone `anchor` into a continuation-line command (@code 401, single text param).
 fn make_401_like(anchor: &MarshalValue) -> MarshalValue {
     let mut cmd = anchor.clone();
-    if let MarshalValue::Object { ivars, .. } = &mut cmd {
-        ivars.insert("@code".to_string(), MarshalValue::Int(401));
-        ivars.insert(
-            "@parameters".to_string(),
-            MarshalValue::Array(vec![MarshalValue::Str(String::new())]),
-        );
+    if let Some(code) = cmd.get_ivar_mut("@code") {
+        *code = MarshalValue::Int(401);
     }
+    if let Some(MarshalValue::Array(params)) = cmd.get_ivar_mut("@parameters") {
+        params.truncate(1);
+    }
+    set_cmd_text(&mut cmd, "");
     cmd
 }
 
@@ -1076,6 +1623,7 @@ impl RpgMakerVxaPlugin {
         let mut strings_skipped = 0;
         let mut files_written: Vec<PathBuf> = Vec::new();
         let mut skip_reasons = std::collections::BTreeMap::new();
+        let mut warnings = Vec::new();
 
         let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
@@ -1110,7 +1658,17 @@ impl RpgMakerVxaPlugin {
                 Some(original) => original.read_bytes()?,
                 None => std::fs::read(&file_path)?,
             };
-            let mut root = MarshalValue::parse(&bytes)?;
+            let mut root = match MarshalValue::parse(&bytes) {
+                Ok(root) => root,
+                Err(error) => {
+                    strings_skipped += file_entries.len();
+                    *skip_reasons
+                        .entry("unsupported_marshal".into())
+                        .or_default() += file_entries.len();
+                    warnings.push(format!("{}: {error}", file_path.display()));
+                    continue;
+                }
+            };
             let current: HashMap<_, _> = Self::extract_root(filename, &root, &file_path)
                 .into_iter()
                 .map(|entry| (entry.id, entry.source))
@@ -1131,7 +1689,6 @@ impl RpgMakerVxaPlugin {
                     strings_skipped += 1;
                     *skip_reasons.entry(reason.into()).or_default() += 1;
                 } else {
-                    strings_written += 1;
                     valid.push((*entry).clone());
                 }
             }
@@ -1141,8 +1698,19 @@ impl RpgMakerVxaPlugin {
             }
             Self::apply_translations(&mut root, filename, &valid);
 
-            let new_bytes = root.serialize();
+            let new_bytes = match root.try_serialize() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    strings_skipped += valid.len();
+                    *skip_reasons
+                        .entry("unsupported_marshal".into())
+                        .or_default() += valid.len();
+                    warnings.push(format!("{}: {error}", file_path.display()));
+                    continue;
+                }
+            };
             std::fs::write(&file_path, new_bytes)?;
+            strings_written += valid.len();
             files_modified += 1;
             files_written.push(file_path);
         }
@@ -1152,7 +1720,7 @@ impl RpgMakerVxaPlugin {
             files_modified,
             strings_written,
             strings_skipped,
-            warnings: Vec::new(),
+            warnings,
             files_written,
         })
     }
