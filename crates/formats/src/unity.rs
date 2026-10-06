@@ -214,11 +214,22 @@ impl UnityPlugin {
         Ok(all)
     }
 
+    #[cfg(test)]
     fn inject_text_scripts(_path: &Path, entries: &[&StringEntry]) -> Result<InjectionReport> {
+        Self::inject_text_scripts_with_originals(entries, &HashMap::new())
+    }
+
+    fn inject_text_scripts_with_originals(
+        entries: &[&StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<InjectionReport> {
         let mut report = empty_injection_report();
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
-            if entry_needs_write(entry, &mut report) {
+            // Like serialized slots, identity translations restore the source
+            // during a pristine rebuild and must pass the normal validation.
+            let replay = originals.contains_key(&entry.file_path);
+            if binary_entry_needs_write(entry, &mut report, replay) {
                 by_file
                     .entry(entry.file_path.clone())
                     .or_default()
@@ -230,7 +241,13 @@ impl UnityPlugin {
                 report.skip("target_missing", file_entries.len());
                 continue;
             }
-            let content = std::fs::read_to_string(&file_path)?;
+            // Direct has verified the live generation. Replay all current
+            // translations against its verified pristine script, so sources,
+            // declaration spans and controls never depend on a previous pass.
+            let content = match originals.get(&file_path) {
+                Some(original) => original.read_text()?,
+                None => std::fs::read_to_string(&file_path)?,
+            };
             // Preserve original newline style and final newline while editing.
             let mut lines: Vec<String> =
                 content.split_inclusive('\n').map(str::to_string).collect();
@@ -2929,7 +2946,7 @@ impl FormatPlugin for UnityPlugin {
 impl UnityPlugin {
     fn inject_with_originals(
         &self,
-        path: &Path,
+        _path: &Path,
         entries: &[StringEntry],
         originals: &HashMap<PathBuf, RevisionOriginal>,
     ) -> Result<InjectionReport> {
@@ -2937,7 +2954,7 @@ impl UnityPlugin {
         let (text, binary): (Vec<&StringEntry>, Vec<&StringEntry>) = entries
             .iter()
             .partition(|e| e.file_path.extension().is_some_and(|ext| ext == "txt"));
-        let mut report = Self::inject_text_scripts(path, &text)?;
+        let mut report = Self::inject_text_scripts_with_originals(&text, originals)?;
         let entries = binary.as_slice();
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
