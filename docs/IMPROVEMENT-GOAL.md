@@ -20,7 +20,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 ## Backlog
 
 - **[optimization · formats · S] Marshal ivars are written sorted, not in their original order** (cycle 136). Deterministic and semantically neutral for Ruby, but untouched objects still differ byte-wise from the game file. Keeping parse order (a `Vec<(String, MarshalValue)>` instead of `HashMap` in `rpgmaker_vxa.rs`) would make untranslated files and objects byte-identical. Check: extract + inject with no translations leaves every `.rxdata` byte-identical.
-- **[defect · formats · M] Repeated Direct injection may drop edited translations in Unreal `.locres`** (cycle 133 writer, code inspection only). Compares the stored source against the current game bytes (`unreal.rs` ~1275) and has no revision hook. Unity's external `SCRIPTS~/*.txt` path also still uses current-text guards. Measure first with `%TEMP%/locust-c135-reinject-measure/two_pass.py` on Last Hope.
 - **[defect · frontend · S] The patch-state badge never refreshes after injection** (`apps/desktop/src/pages/Editor.tsx:588-597`, only `PatchModal` bumps it at `:155-157`), and the backend status ignores `.locust-injections` (`crates/core/src/patch/store.rs:66-80`), so it says "Prístino" after a successful Direct/Add injection. Product decision: show injection state or relabel (see the "Prístino" wording item).
 
 - **[risk · formats · unmeasured] VX Ace has no fixture** (cycle 100): no deployment found, so no measured recall. Source-level risk: `rpgmaker_vxa.rs:~208-211` turns object references into `Unsupported` and `:~403` writes them back as nil. Needs a real Ace game before ranking.
@@ -45,7 +44,7 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 
 ## In flight
 
-None.
+- **Cycle 137 (Unity `SCRIPTS~/*.txt` repeated Direct injection, writer Codex, launched 2026-10-06).** HEAD on Out of Touch (`OoT_Data/SCRIPTS~` slice): pass 2 writes 0 of 75767 rows (all `source_changed`), 108 of 108 files differ from the one-shot oracle. Brief, HEAD results and log in `%TEMP%/locust-c137-unity/`.
 
 ## Done
 
@@ -315,6 +314,7 @@ None.
 - `a2f7952` — first workspace-wide `cargo fmt`, isolated so it could not bury the change beside it.
 
 ## Rejected
+- **"Repeated Direct injection drops edited Unreal `.locres` translations"** (cycle 133 writer, code inspection) — 2026-10-06, measured false. HEAD on the Last Hope patch pak (`LastHope-WindowsNoEditor_P.pak`, 12769 rows): pass 2 writes 12769, 0 files differ from the one-shot oracle, re-extraction equal (`%TEMP%/locust-c137-unity/result-head-unreal.json`).
 - **"Status colors are defined twice" (`FilterBar.tsx` / `StringTable.tsx`)** — 2026-10-05. Not a duplicate: FilterBar defines filter-pill classes (background + text) and StringTable defines status-dot classes (ring or solid fill); one shared map would couple two different visual treatments.
 - `replace` case-insensitive SQL prefilter misses U+212A (Kelvin) / U+0130 matches for an ASCII `k`/`i` (cycle 84 runner-up, rejected cycle 87): real but practically unreachable; the only fix skips the SQL prefilter for every case-insensitive replace (up to 100k rows fetched) to serve two exotic code points.
 
