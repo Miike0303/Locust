@@ -1,3 +1,4 @@
+import { IS_TAURI } from "./runtime";
 import { invoke } from "@tauri-apps/api/core";
 import { addLog } from "../stores/logStore";
 import { t } from "./i18n";
@@ -10,9 +11,6 @@ import {
   pivotOpenDbTauriArgs,
 } from "./pivot";
 import { projectOpenHttpBody, projectOpenTauriArgs } from "./openProjectFlow";
-
-// ─── Runtime detection ────────────────────────────────────────────────────
-const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 /** Tauri invoke that localizes stable English error bodies for UI toasts. */
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -344,11 +342,6 @@ export function validationKindLabel(kind: ValidationKind): string {
  *  Shift-JIS needs a native encoder — live UI returns null; full check is Rust `validate`.
  */
 export { encodedByteLen } from "./binaryBudget";
-
-export function binarySlotOf(entry: StringEntry): string | null {
-  const v = entry.metadata?.binary_slot;
-  return typeof v === "string" ? v : null;
-}
 
 export interface ProgressEventStarted { type: "started"; total: number; job_id: string }
 export interface ProgressEventBatchCompleted { type: "batch_completed"; completed: number; total: number; cost_so_far: number; cost_is_complete?: boolean; language: string | null }

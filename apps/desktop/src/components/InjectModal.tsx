@@ -1,3 +1,4 @@
+import { IS_TAURI } from "../lib/runtime";
 import { useEffect, useMemo, useState } from "react";
 import { X, FolderOpen, FileCheck, AlertCircle, Package } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -44,8 +45,6 @@ import {
 } from "../lib/modalA11y";
 import { operationalShortcutTarget } from "../lib/settingsNav";
 import { useT } from "../lib/i18n";
-
-const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 const INJECT_LANG_KEY = "locust.inject.langs";
 

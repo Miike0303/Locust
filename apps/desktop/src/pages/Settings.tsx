@@ -1,3 +1,4 @@
+import { IS_TAURI } from "../lib/runtime";
 import { formatObservedCost } from "../lib/translationCost";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -261,8 +262,6 @@ function HistorySection() {
     </div>
   );
 }
-
-const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 async function openExternalUrl(url: string): Promise<void> {
   if (IS_TAURI) {

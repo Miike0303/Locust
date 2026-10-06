@@ -6,6 +6,7 @@
  */
 
 import { t } from "./i18n";
+import { readStorageFlag, writeStorageFlag } from "./storage";
 
 export interface ProviderReadinessMeta {
 	id: string;
@@ -86,36 +87,15 @@ export type ProviderReadinessStorage = Pick<
 	"getItem" | "setItem" | "removeItem"
 >;
 
-function browserStorage(): ProviderReadinessStorage | null {
-	try {
-		return typeof localStorage === "undefined" ? null : localStorage;
-	} catch {
-		return null;
-	}
-}
-
 export function readProviderSetupHintDismissed(
 	storage?: ProviderReadinessStorage | null,
 ): boolean {
-	const target = storage === undefined ? browserStorage() : storage;
-	if (!target) return false;
-	try {
-		return target.getItem(HINT_DISMISSED_KEY) === "1";
-	} catch {
-		return false;
-	}
+	return readStorageFlag(HINT_DISMISSED_KEY, storage);
 }
 
 export function saveProviderSetupHintDismissed(
 	dismissed: boolean,
 	storage?: ProviderReadinessStorage | null,
 ): void {
-	const target = storage === undefined ? browserStorage() : storage;
-	if (!target) return;
-	try {
-		if (dismissed) target.setItem(HINT_DISMISSED_KEY, "1");
-		else target.removeItem(HINT_DISMISSED_KEY);
-	} catch {
-		/* Storage can be unavailable in private or restricted browser contexts. */
-	}
+	writeStorageFlag(HINT_DISMISSED_KEY, dismissed, storage);
 }

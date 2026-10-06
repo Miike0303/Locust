@@ -1,3 +1,4 @@
+import { browserStorage, type StringStorage } from "../storage";
 import {
   createContext,
   createElement,
@@ -10,6 +11,8 @@ import {
 } from "react";
 import { en } from "./en";
 import { es } from "./es";
+
+export type { StringStorage } from "../storage";
 
 export type Locale = "en" | "es";
 export type MessageKey = keyof typeof en;
@@ -30,21 +33,6 @@ export const UI_LANGUAGE_KEY = "locust.ui.language";
 export const LOCALES: readonly Locale[] = ["en", "es"];
 
 const catalogs: Record<Locale, Record<string, string>> = { en, es };
-
-export type StringStorage = {
-  getItem(key: string): string | null;
-  setItem(key: string, value: string): void;
-  removeItem(key: string): void;
-};
-
-function browserStorage(): StringStorage | null {
-  try {
-    if (typeof localStorage === "undefined") return null;
-    return localStorage;
-  } catch {
-    return null;
-  }
-}
 
 export function isLocale(value: unknown): value is Locale {
   return value === "en" || value === "es";

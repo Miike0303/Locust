@@ -1,3 +1,4 @@
+import { pathBasename } from "../lib/path";
 import { useState, useRef, useMemo, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -223,7 +224,7 @@ export default function StringTable({
 				size: 140,
 				cell: ({ getValue }) => {
 					const full = getValue() as string;
-					const name = full.split(/[/\\]/).pop() || full;
+					const name = pathBasename(full);
 					return (
 						<span
 							className="text-[11px] text-gray-500 dark:text-gray-400"

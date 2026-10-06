@@ -1,3 +1,4 @@
+import { IS_TAURI } from "../lib/runtime";
 import { useState, useEffect } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -70,8 +71,6 @@ import {
 } from "../lib/workflowGuide";
 import { useT } from "../lib/i18n";
 import { formatDescriptionKey } from "../lib/formatDescriptions";
-
-const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 const FORMAT_ICONS: Record<string, typeof Globe> = {
 	"rpgmaker-mv": Swords,

@@ -1,3 +1,4 @@
+import { IS_TAURI } from "../lib/runtime";
 import { useEffect, useRef, useState } from "react";
 import {
 	X,
@@ -48,8 +49,6 @@ import {
 	modalPanelClass,
 } from "../lib/modalA11y";
 import { useT } from "../lib/i18n";
-
-const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 type Tab = "apply" | "pack";
 

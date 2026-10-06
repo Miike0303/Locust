@@ -1,9 +1,8 @@
+import { IS_TAURI } from "../lib/runtime";
 import { useEffect, useState } from "react";
 import { Download, CheckCircle, AlertCircle } from "lucide-react";
 import { t as translateStandalone, useT } from "../lib/i18n";
 import { addLog } from "../stores/logStore";
-
-const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 type UpdateState =
   | { kind: "idle" }

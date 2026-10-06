@@ -1,3 +1,4 @@
+import { IS_TAURI } from "../lib/runtime";
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { X, GitBranch, Loader2, FolderOpen } from "lucide-react";
@@ -21,8 +22,6 @@ import {
 } from "../lib/modalA11y";
 import { useT } from "../lib/i18n";
 import clsx from "clsx";
-
-const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 interface PivotModalProps {
 	open: boolean;

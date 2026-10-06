@@ -3,23 +3,10 @@
  * Mirrors CLI `--label` convenience across sessions.
  */
 
+import { browserStorage, type StringStorage } from "./storage";
+export type { StringStorage } from "./storage";
+
 const LS_REG_LABEL = "locust.inject.regLabel";
-
-/** Minimal storage surface (localStorage or test double). */
-export type StringStorage = {
-  getItem(key: string): string | null;
-  setItem(key: string, value: string): void;
-  removeItem(key: string): void;
-};
-
-function browserStorage(): StringStorage | null {
-  try {
-    if (typeof localStorage === "undefined") return null;
-    return localStorage;
-  } catch {
-    return null;
-  }
-}
 
 /** Last non-empty menu label override, or `""`. */
 export function loadRegLabelOverride(storage?: StringStorage | null): string {

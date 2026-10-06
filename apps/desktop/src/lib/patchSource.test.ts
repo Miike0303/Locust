@@ -49,7 +49,7 @@ assert.ok(noHost && "error" in noHost);
 assert.equal(noHost.error, PATCH_SOURCE_ERROR.badUrl);
 
 assert.equal(patchSourceReady(null), false);
-assert.equal(patchSourceReady({ error: "x" }), false);
+assert.equal(patchSourceReady({ error: PATCH_SOURCE_ERROR.both }), false);
 assert.equal(patchSourceReady({ zip_path: "a.zip" }), true);
 assert.equal(patchSourceReady({ zip_url: "https://x/a.zip" }), true);
 

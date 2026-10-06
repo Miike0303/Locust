@@ -19,6 +19,9 @@ const assert = {
   equal(actual: unknown, expected: unknown, message?: string) {
     if (actual !== expected) throw new Error(message ?? `${actual} !== ${expected}`);
   },
+  notEqual(actual: unknown, unexpected: unknown, message?: string) {
+    if (actual === unexpected) throw new Error(message ?? `${actual} === ${unexpected}`);
+  },
   ok(cond: unknown, message?: string) {
     if (!cond) throw new Error(message ?? "expected truthy");
   },
@@ -87,9 +90,9 @@ assert.equal(openedGame.path, "C:\\Games\\Other");
 assert.equal(openedGame.format_id, "renpy");
 
 assert.equal(PIVOT_OPEN_DB_HTTP_PATH, "/project/open-db");
-assert.equal(PIVOT_OPEN_DB_HTTP_PATH === "/project/open", false, "must not hit extract/merge open");
+assert.notEqual(PIVOT_OPEN_DB_HTTP_PATH, "/project/open", "must not hit extract/merge open");
 assert.equal(PIVOT_OPEN_DB_TAURI_CMD, "open_project_db");
-assert.equal(PIVOT_OPEN_DB_TAURI_CMD === "open_project", false, "must not invoke extract/merge command");
+assert.notEqual(PIVOT_OPEN_DB_TAURI_CMD, "open_project", "must not invoke extract/merge command");
 
 const pivotedDb = "C:\\Games\\Title-pivot.locust.db";
 const openDbArgs = pivotOpenDbArgs(pivotedDb, previous);

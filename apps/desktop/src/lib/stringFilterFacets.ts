@@ -12,9 +12,7 @@ export function tagFilterPatch(value: string): Partial<StringFilter> {
   return { tag: coerceExactFilterValue(value), offset: 0 };
 }
 
-export function filePathOptionLabel(path: string): string {
-  return path.split(/[/\\]/).pop() || path;
-}
+export { pathBasename as filePathOptionLabel } from "./path";
 
 /** Drop blank facet values; the server already returns distinct sorted lists. */
 export function facetOptions(values: readonly string[] | undefined): string[] {

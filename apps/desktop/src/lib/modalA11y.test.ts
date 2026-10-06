@@ -36,6 +36,7 @@ assert.equal("aria-label" in labelled, false);
 const directlyLabelled = buildModalDialogProps({
 	ariaLabel: "Keyboard shortcuts",
 });
+if (!("aria-label" in directlyLabelled)) throw new Error("expected aria-label");
 assert.equal(directlyLabelled["aria-label"], "Keyboard shortcuts");
 assert.equal("aria-labelledby" in directlyLabelled, false);
 assert.deepEqual(buildModalTitleProps("translation-title"), {

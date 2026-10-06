@@ -8,7 +8,7 @@ interface DiffViewProps {
   entryId: string;
 }
 
-export default function DiffView({ originalText, translatedText, entryId }: DiffViewProps) {
+export default function DiffView({ originalText, translatedText }: DiffViewProps) {
   const t = useT();
   const diffs = useMemo(() => {
     const dmp = new diff_match_patch();

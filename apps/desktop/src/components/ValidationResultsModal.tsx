@@ -1,3 +1,4 @@
+import { pathBasename } from "../lib/path";
 import { X, Shield, AlertTriangle, Type } from "lucide-react";
 import clsx from "clsx";
 import type {
@@ -111,7 +112,7 @@ function FontSection({
 			<div className="space-y-2 max-h-40 overflow-y-auto">
 				{withMissing.map((f) => {
 					const name =
-						f.font_name || f.font_path.split(/[/\\]/).pop() || f.font_path;
+						f.font_name || pathBasename(f.font_path);
 					const sample = f.missing_chars.slice(0, 24).join(" ");
 					const more =
 						f.missing_count > 24

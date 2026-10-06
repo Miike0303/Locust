@@ -1,3 +1,5 @@
+import { readStorageFlag, writeStorageFlag } from "./storage";
+
 export type WorkflowGuideStep = "translate" | "review" | "inject";
 
 export const WORKFLOW_STEP_LABELS: Record<WorkflowGuideStep, string> = {
@@ -48,63 +50,30 @@ export type WorkflowGuideStorage = Pick<
 	"getItem" | "setItem" | "removeItem"
 >;
 
-function browserStorage(): WorkflowGuideStorage | null {
-	try {
-		return typeof localStorage === "undefined" ? null : localStorage;
-	} catch {
-		return null;
-	}
-}
-
-function readFlag(key: string, storage?: WorkflowGuideStorage | null): boolean {
-	const target = storage === undefined ? browserStorage() : storage;
-	if (!target) return false;
-	try {
-		return target.getItem(key) === "1";
-	} catch {
-		return false;
-	}
-}
-
-function writeFlag(
-	key: string,
-	enabled: boolean,
-	storage?: WorkflowGuideStorage | null,
-): void {
-	const target = storage === undefined ? browserStorage() : storage;
-	if (!target) return;
-	try {
-		if (enabled) target.setItem(key, "1");
-		else target.removeItem(key);
-	} catch {
-		/* Storage can be unavailable in private or restricted browser contexts. */
-	}
-}
-
 export function readWorkflowGuideDismissed(
 	storage?: WorkflowGuideStorage | null,
 ): boolean {
-	return readFlag(DISMISSED_KEY, storage);
+	return readStorageFlag(DISMISSED_KEY, storage);
 }
 
 export function saveWorkflowGuideDismissed(
 	dismissed: boolean,
 	storage?: WorkflowGuideStorage | null,
 ): void {
-	writeFlag(DISMISSED_KEY, dismissed, storage);
+	writeStorageFlag(DISMISSED_KEY, dismissed, storage);
 }
 
 export function readSkipReviewPreference(
 	storage?: WorkflowGuideStorage | null,
 ): boolean {
-	return readFlag(SKIP_REVIEW_KEY, storage);
+	return readStorageFlag(SKIP_REVIEW_KEY, storage);
 }
 
 export function saveSkipReviewPreference(
 	skipReview: boolean,
 	storage?: WorkflowGuideStorage | null,
 ): void {
-	writeFlag(SKIP_REVIEW_KEY, skipReview, storage);
+	writeStorageFlag(SKIP_REVIEW_KEY, skipReview, storage);
 }
 
 const WELCOME_GUIDE_DISMISSED_KEY = "locust.welcomeGuide.dismissed";
@@ -130,12 +99,12 @@ export const WELCOME_WORKFLOW_STEPS = [
 export function readWelcomeGuideDismissed(
 	storage?: WorkflowGuideStorage | null,
 ): boolean {
-	return readFlag(WELCOME_GUIDE_DISMISSED_KEY, storage);
+	return readStorageFlag(WELCOME_GUIDE_DISMISSED_KEY, storage);
 }
 
 export function saveWelcomeGuideDismissed(
 	dismissed: boolean,
 	storage?: WorkflowGuideStorage | null,
 ): void {
-	writeFlag(WELCOME_GUIDE_DISMISSED_KEY, dismissed, storage);
+	writeStorageFlag(WELCOME_GUIDE_DISMISSED_KEY, dismissed, storage);
 }

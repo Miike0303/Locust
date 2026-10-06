@@ -1,3 +1,4 @@
+import { IS_TAURI } from "../lib/runtime";
 import { addToast } from "../stores/toastStore";
 import { localizeApiError } from "../lib/apiError";
 import { useState, useEffect, useMemo, useRef } from "react";
@@ -46,8 +47,6 @@ import {
 import { buildSettingsPath } from "../lib/settingsNav";
 import EmptyState from "./EmptyState";
 import { useT } from "../lib/i18n";
-
-const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 const statusIcons: Record<string, typeof Clock> = {
 	pending: Clock,

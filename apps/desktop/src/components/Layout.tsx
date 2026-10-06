@@ -43,7 +43,6 @@ export default function Layout() {
 
 	const { isOpen: logOpen, setOpen: setLogOpen, unreadErrors } = useLogStore();
 	const {
-		isPanelOpen: queueOpen,
 		setPanelOpen: setQueueOpen,
 		items: queueItems,
 		isRunning: queueRunning,

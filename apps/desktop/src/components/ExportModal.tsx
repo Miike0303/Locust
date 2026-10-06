@@ -1,3 +1,4 @@
+import { IS_TAURI } from "../lib/runtime";
 import { useState, useRef } from "react";
 import clsx from "clsx";
 import { X, Download, Upload, FolderOpen } from "lucide-react";
@@ -18,8 +19,6 @@ import {
 	modalPanelClass,
 } from "../lib/modalA11y";
 import { useT } from "../lib/i18n";
-
-const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
 type Mode = "export" | "import";
 

@@ -1,3 +1,4 @@
+import { isTauri } from "./runtime";
 import type { QueryClient } from "@tanstack/react-query";
 import type { ProjectInfo, ProjectOpenResponse } from "./api";
 import type { TranslateFn } from "./i18n";
@@ -73,7 +74,7 @@ export function dropProjectQueries(queryClient: QueryClient): void {
 }
 
 export async function pickGameFolder(t: TranslateFn): Promise<string | null> {
-  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+  if (isTauri()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
       title: t("welcome.dialog.selectFolder"),
@@ -107,7 +108,7 @@ export type PickLocustDbResult =
   | { status: "invalid" };
 
 export async function pickLocustDbFile(t: TranslateFn): Promise<PickLocustDbResult> {
-  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+  if (isTauri()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
       title: t("welcome.dialog.selectDb"),

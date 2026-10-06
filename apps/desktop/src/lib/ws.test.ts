@@ -97,7 +97,7 @@ function tick() {
 
 async function lastSocket(): Promise<FakeWebSocket> {
 	await tick();
-	const ws = FakeWebSocket.instances.at(-1);
+	const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
 	if (!ws) throw new Error("expected a WebSocket to be constructed");
 	return ws;
 }
@@ -226,7 +226,7 @@ async function lastSocket(): Promise<FakeWebSocket> {
 		"patch",
 	);
 	const socket = await lastSocket();
-	assert.equal(urls.at(-1), "ws://localhost:7842/api/patch/ws/patch-job");
+	assert.equal(urls[urls.length - 1], "ws://localhost:7842/api/patch/ws/patch-job");
 	socket.emitMessage({
 		type: "progress",
 		current: 3,
