@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use locust_core::backup::RevisionOriginal;
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
@@ -389,7 +390,12 @@ impl MarshalWriter {
                 self.buf.push(b'o');
                 self.write_symbol(class);
                 self.write_packed_int(ivars.len() as i64);
-                for (key, val) in ivars {
+                // HashMap iteration is randomized on each parse. Stable ivar
+                // order is required for identical inputs to produce identical
+                // bytes, including a no-op Direct revision.
+                let mut ordered: Vec<_> = ivars.iter().collect();
+                ordered.sort_by_key(|(key, _)| *key);
+                for (key, val) in ordered {
                     self.write_symbol(key);
                     self.write_value(val);
                 }
@@ -458,6 +464,19 @@ impl RpgMakerVxaPlugin {
             "skills" => SKILL_FIELDS,
             "items" | "weapons" | "armors" => ITEM_FIELDS,
             _ => &[],
+        }
+    }
+
+    /// Extract from the exact tree injection will mutate, before any message
+    /// splices change command indices or wrapping widths.
+    fn extract_root(filename: &str, root: &MarshalValue, path: &Path) -> Vec<StringEntry> {
+        let stem = strip_marshal_ext(filename).to_lowercase();
+        if stem.starts_with("map") {
+            Self::extract_map_file(filename, root, path)
+        } else if stem == "commonevents" {
+            Self::extract_common_events(filename, root, path)
+        } else {
+            Self::extract_array_file(filename, root, path)
         }
     }
 
@@ -939,12 +958,13 @@ impl Default for RpgMakerVxaPlugin {
 }
 
 fn is_marshal_ext(ext: &std::ffi::OsStr) -> bool {
-    ext == "rvdata2" || ext == "rxdata"
+    ext == "rvdata2" || ext == "rvdata" || ext == "rxdata"
 }
 
 fn strip_marshal_ext(filename: &str) -> &str {
     filename
         .strip_suffix(".rvdata2")
+        .or_else(|| filename.strip_suffix(".rvdata"))
         .or_else(|| filename.strip_suffix(".rxdata"))
         .unwrap_or(filename)
 }
@@ -955,15 +975,15 @@ impl FormatPlugin for RpgMakerVxaPlugin {
     }
 
     fn name(&self) -> &str {
-        "RPG Maker VX Ace / XP"
+        "RPG Maker VX Ace / VX / XP"
     }
 
     fn description(&self) -> &str {
-        "RPG Maker VX Ace (.rvdata2) and XP (.rxdata) files (Ruby Marshal)"
+        "RPG Maker VX Ace (.rvdata2), VX (.rvdata) and XP (.rxdata) files (Ruby Marshal)"
     }
 
     fn supported_extensions(&self) -> &[&str] {
-        &[".rvdata2", ".rxdata"]
+        &[".rvdata2", ".rvdata", ".rxdata"]
     }
 
     fn supported_modes(&self) -> Vec<OutputMode> {
@@ -998,15 +1018,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let stem_lower = strip_marshal_ext(&filename).to_lowercase();
-
-            if stem_lower.starts_with("map") {
-                return Ok(Self::extract_map_file(&filename, &root, path));
-            }
-            if stem_lower == "commonevents" {
-                return Ok(Self::extract_common_events(&filename, &root, path));
-            }
-            return Ok(Self::extract_array_file(&filename, &root, path));
+            return Ok(Self::extract_root(&filename, &root, path));
         }
 
         let data_dir = Self::find_data_dir(path).ok_or_else(|| LocustError::ParseError {
@@ -1027,14 +1039,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
-                        let stem_lower = strip_marshal_ext(&fname).to_lowercase();
-                        if stem_lower.starts_with("map") {
-                            all.extend(Self::extract_map_file(&fname, &root, &fpath));
-                        } else if stem_lower == "commonevents" {
-                            all.extend(Self::extract_common_events(&fname, &root, &fpath));
-                        } else {
-                            all.extend(Self::extract_array_file(&fname, &root, &fpath));
-                        }
+                        all.extend(Self::extract_root(&fname, &root, &fpath));
                     }
                     Err(e) => {
                         tracing::warn!("Failed to parse {}: {}", fpath.display(), e);
@@ -1046,10 +1051,31 @@ impl FormatPlugin for RpgMakerVxaPlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+        self.inject_with_originals(path, entries, &HashMap::new())
+    }
+
+    fn inject_revision(
+        &self,
+        path: &Path,
+        entries: &mut [StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<InjectionReport> {
+        self.inject_with_originals(path, entries, originals)
+    }
+}
+
+impl RpgMakerVxaPlugin {
+    fn inject_with_originals(
+        &self,
+        path: &Path,
+        entries: &[StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<InjectionReport> {
         let mut files_modified = 0;
         let mut strings_written = 0;
         let mut strings_skipped = 0;
         let mut files_written: Vec<PathBuf> = Vec::new();
+        let mut skip_reasons = std::collections::BTreeMap::new();
 
         let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
@@ -1071,23 +1097,49 @@ impl FormatPlugin for RpgMakerVxaPlugin {
         for (filename, file_entries) in &by_file {
             let file_path = data_dir.join(filename);
             if !file_path.exists() {
+                strings_skipped += file_entries.len();
+                *skip_reasons.entry("missing_target".into()).or_default() += file_entries.len();
                 continue;
             }
 
-            let bytes = std::fs::read(&file_path)?;
+            // Core verifies the previous Direct result and pristine provenance.
+            // Read through the supplied verifier so even a backup changed after
+            // that check cannot be used. Rebuild every translated field from
+            // this baseline, never from an earlier injection's command layout.
+            let bytes = match originals.get(&file_path) {
+                Some(original) => original.read_bytes()?,
+                None => std::fs::read(&file_path)?,
+            };
             let mut root = MarshalValue::parse(&bytes)?;
+            let current: HashMap<_, _> = Self::extract_root(filename, &root, &file_path)
+                .into_iter()
+                .map(|entry| (entry.id, entry.source))
+                .collect();
 
+            let mut valid = Vec::new();
             for entry in file_entries {
-                if entry.translation.is_some() {
-                    strings_written += 1;
+                let reason = if entry.translation.is_none() {
+                    Some("untranslated")
                 } else {
+                    match current.get(&entry.id) {
+                        None => Some("missing_target"),
+                        Some(source) if source != &entry.source => Some("source_changed"),
+                        Some(_) => None,
+                    }
+                };
+                if let Some(reason) = reason {
                     strings_skipped += 1;
+                    *skip_reasons.entry(reason.into()).or_default() += 1;
+                } else {
+                    strings_written += 1;
+                    valid.push((*entry).clone());
                 }
             }
 
-            // Convert Vec<&StringEntry> to Vec<StringEntry> for apply
-            let owned: Vec<StringEntry> = file_entries.iter().map(|e| (*e).clone()).collect();
-            Self::apply_translations(&mut root, filename, &owned);
+            if valid.is_empty() {
+                continue;
+            }
+            Self::apply_translations(&mut root, filename, &valid);
 
             let new_bytes = root.serialize();
             std::fs::write(&file_path, new_bytes)?;
@@ -1096,7 +1148,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
         }
 
         Ok(InjectionReport {
-            skip_reasons: Default::default(),
+            skip_reasons,
             files_modified,
             strings_written,
             strings_skipped,
