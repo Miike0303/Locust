@@ -19,7 +19,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 ## Backlog
 
-- **[defect · frontend · S] The patch-state badge never refreshes after injection** (`apps/desktop/src/pages/Editor.tsx:588-597`, only `PatchModal` bumps it at `:155-157`), and the backend status ignores `.locust-injections` (`crates/core/src/patch/store.rs:66-80`), so it says "Prístino" after a successful Direct/Add injection. Product decision: show injection state or relabel (see the "Prístino" wording item).
 
 - **[capability · core · L] `apply --dry-run` refuses upgrades and patch switches** (cycle 64 research, B). `reject_dry_run_rollback` (`crates/core/src/patch/apply.rs:157`, `:188`, `:276`) — needs a virtual post-rollback baseline. Large; only if a user asks.
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
@@ -27,7 +26,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 - Server/`LocustError` Display strings that are not in the desktop exact/prefix catalog still reach the user in English (framed by `api.error.http` when a status is present). Remaining: dynamic IO/parse messages (and other free-form backend text). Unknown export/import format and xAI `handle not found` were catalogued in cycle 29.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size] what. Evidence. Check that proves it fixed.
-- **[defect · frontend · S] "Prístino"/"Pristine" patch-state wording is developer jargon** (`PatchStatusIndicator.tsx`, i18n). Something like "Juego original"/"Original game" is clearer. Check: an i18n test on the new keys.
 - **[capability · frontend · M] The design pass stopped at the Editor.** Welcome, Settings and the modals still use loose grays, small type and no tokens (screenshots in the 2026-09-26 session, `ux/shots`). Next design cycle: Settings layout, plus design tokens in `index.css`.
 - **[optimization · backend · S] Duplicated Rust helpers written by different agents.** `parse_err` x4, `read_u32` x4, `find_data_dir` x4, `normalize_newlines` x2 (e.g. `crates/formats/src/kirikiri.rs:444`, `crates/formats/src/tyrano.rs:283`), and a Win32 file-identity FFI x2 (`crates/core/src/project.rs:215-228`, `crates/core/src/patch/stream.rs:252-293`). The frontend half shipped in cycle 134. Check: a single definition each where the copies are really equivalent, and gates green.
 - **[capability · backend · S] CI has no Windows job and no pinned toolchain.** The main dev/user platform is Windows, with Win32 FFI and `File::try_lock` in `crates/core/src/patch/lock.rs`. CI is ubuntu-only (`.github/workflows/ci.yml:18`), and no `rust-version`/`rust-toolchain.toml` pins what the file-lock API needs. Check: a `windows-latest` job runs `cargo test --workspace` green, and `rust-version` is set.
@@ -42,7 +40,7 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 
 ## In flight
 
-None.
+- **Cycle 139 (game-state badge shows injections, writer Codex, launched 2026-10-06).** Product decision (user, 2026-10-06): after a Direct/Add injection the badge shows the injection state instead of "Prístino"; the wording item is folded in. Backend status must read the injection store; the editor refreshes the badge after injection, restore and recover. Claude runs tsc/unit/build (Codex cannot spawn node). Brief and log in `%TEMP%/locust-c139-badge/`.
 
 ## Done
 
