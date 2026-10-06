@@ -11,7 +11,7 @@ import { shouldSubscribeToJob } from "./translationJob";
 import { JOB_STREAM_LOST_MESSAGE, subscribeToJob } from "./ws";
 import { useEditorStore } from "../stores/editorStore";
 import { addLog } from "../stores/logStore";
-import { useQueueStore } from "../stores/queueStore";
+import { useQueueStore, type GlobalProgress } from "../stores/queueStore";
 import { addToast } from "../stores/toastStore";
 
 let unsub: (() => void) | null = null;
@@ -37,7 +37,10 @@ function patchSnapshot(
 function endJob(): void {
   useEditorStore.getState().setTranslating(false);
   useEditorStore.getState().setJob(null);
-  useQueueStore.getState().setGlobalProgress(null);
+  const queue = useQueueStore.getState();
+  if (queue.globalProgress?.owner.kind === "single" && queue.globalProgress.owner.jobId === subscribedJobId) {
+    queue.setGlobalProgress(null);
+  }
   subscribedJobId = null;
   unsub?.();
   unsub = null;
@@ -85,11 +88,22 @@ export function attachTranslationJob(opts: {
     cancelling: false,
   });
 
+  const publishProgress = (progress: Omit<GlobalProgress, "owner" | "projectName">) => {
+    const queue = useQueueStore.getState();
+    const owner = queue.globalProgress?.owner;
+    if (finished || subscribedJobId !== opts.jobId || queue.isRunning) return;
+    if (owner && (owner.kind !== "single" || owner.jobId !== opts.jobId)) return;
+    queue.setGlobalProgress({
+      ...progress,
+      owner: { kind: "single", jobId: opts.jobId },
+      projectName: opts.projectName,
+    });
+  };
+
   unsub = subscribeToJob(opts.jobId, {
     onStarted: (e) => {
       patchSnapshot({ total: e.total, completed: 0, costSoFar: 0 });
-      useQueueStore.getState().setGlobalProgress({
-        projectName: opts.projectName,
+      publishProgress({
         completed: 0,
         total: e.total,
         costSoFar: 0,
@@ -103,8 +117,7 @@ export function attachTranslationJob(opts: {
         costSoFar: e.cost_so_far,
         costIsComplete: e.cost_is_complete === true,
       });
-      useQueueStore.getState().setGlobalProgress({
-        projectName: opts.projectName,
+      publishProgress({
         completed: e.completed,
         total: e.total,
         costSoFar: e.cost_so_far,

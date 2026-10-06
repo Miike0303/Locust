@@ -8,6 +8,7 @@ import type {
 	FontSuggestion,
 } from "../lib/api";
 import { validationKindLabel } from "../lib/api";
+import { validationBadgeLabel } from "../lib/validationLabels";
 import { useT, type TranslateFn } from "../lib/i18n";
 import {
 	useModalA11y,
@@ -271,7 +272,7 @@ export default function ValidationResultsModal({
 											"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300",
 									)}
 								>
-									{kind}: {n}
+									{validationBadgeLabel(kind, t)}: {n}
 								</span>
 							))}
 						</div>
@@ -314,7 +315,7 @@ export default function ValidationResultsModal({
 															KIND_BADGE[label] || "bg-gray-100 text-gray-700",
 														)}
 													>
-														{label === "StaleTranslation" ? t("validate.kind.staleLabel") : label}
+														{validationBadgeLabel(label, t)}
 													</span>
 													<div className="min-w-0 flex-1">
 														<div className="font-mono text-xs text-gray-500 truncate">

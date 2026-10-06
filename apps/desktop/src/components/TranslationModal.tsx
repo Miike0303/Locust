@@ -7,12 +7,11 @@ import { useNavigate } from "react-router-dom";
 import {
 	getProviders,
 	getConfig,
-	startTranslation,
 	checkProviderHealth,
 } from "../lib/api";
 import { translationModalStep } from "../lib/translationJob";
+import { startSingleTranslation } from "../lib/translationStart";
 import {
-	attachTranslationJob,
 	clearTranslationSnapshotIfIdle,
 	requestTranslationCancel,
 	setTranslationModalOpen,
@@ -212,24 +211,12 @@ export default function TranslationModal({
 					use_memory: useMemory,
 				},
 			};
-			addLog(
-				"info",
-				t("activity.translation.callingApi"),
-				JSON.stringify(params, null, 2),
-				"translation",
-			);
-			const result = await startTranslation(params);
-			addLog("info", t("activity.translation.jobReceived", { jobId: result.job_id }), undefined, "translation");
-
 			const projectName =
 				useProjectStore.getState().project?.name ?? "Project";
 			const providerLabel =
 				providers?.find((p) => p.id === providerId)?.name ?? providerId;
-			attachTranslationJob({
-				jobId: result.job_id,
-				projectName,
-				providerLabel,
-			});
+			const result = await startSingleTranslation(params, { projectName, providerLabel });
+			if (!result) return;
 			addLog(
 				"info",
 				t("activity.translation.started", { chain: chainLabel }),

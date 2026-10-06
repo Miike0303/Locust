@@ -2,6 +2,8 @@ import { create } from "zustand";
 import { openProject, startTranslation, cancelTranslation, validate, type TranslationStartParams } from "../lib/api";
 import { waitForJob } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
+import { useEditorStore } from "./editorStore";
+import { canStartQueue } from "../lib/translationJob";
 import { addLog } from "./logStore";
 import { addToast } from "./toastStore";
 import { t } from "../lib/i18n";
@@ -30,6 +32,7 @@ export interface QueueItem {
 }
 
 export interface GlobalProgress {
+  owner: { kind: "queue"; itemId: string } | { kind: "single"; jobId: string };
   projectName: string;
   completed: number;
   total: number;
@@ -111,7 +114,12 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   },
 
   startQueue: async () => {
-    const { items, translationParams } = get();
+    const { items, translationParams, isRunning } = get();
+    const singleJobRunning = useEditorStore.getState().isTranslating;
+    if (!canStartQueue({ queueRunning: isRunning, singleJobRunning })) {
+      if (!isRunning) addToast("info", t("queue.toast.singleJobRunning"));
+      return;
+    }
     if (!translationParams) {
       addToast("error", t("queue.toast.configureFirst"));
       return;
@@ -130,6 +138,12 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         set((s) => ({
           items: s.items.map((i) => (i.id === item.id ? { ...i, ...patch } : i)),
         }));
+      const markCancelled = () => {
+        const name = get().items.find((i) => i.id === item.id)?.projectName ?? item.projectName;
+        updateItem({ status: "cancelled", error: null });
+        addLog("info", t("activity.queue.itemCancelled", { name }), undefined, "queue");
+        addToast("info", t("queue.toast.itemCancelled", { name }));
+      };
 
       try {
         // Step 1: Open project
@@ -137,6 +151,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         addLog("info", t("activity.queue.opening", { path: item.projectPath }), undefined, "queue");
         set({
           globalProgress: {
+            owner: { kind: "queue", itemId: item.id },
             projectName: item.projectName,
             completed: 0,
             total: 0,
@@ -163,7 +178,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         });
 
         if (get().cancelRequested) {
-          updateItem({ status: "cancelled", error: null });
+          markCancelled();
           break;
         }
 
@@ -200,9 +215,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         }
 
         if (get().cancelRequested) {
-          updateItem({ status: "done" });
-          addLog("info", t("activity.queue.completed", { name: result.project_name, count: result.total_strings }), undefined, "queue");
-          addToast("success", t("queue.toast.itemDone", { name: result.project_name }));
+          markCancelled();
           break;
         }
 
@@ -243,7 +256,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         }
       } catch (err: any) {
         if (get().cancelRequested) {
-          updateItem({ status: "cancelled", error: null });
+          markCancelled();
         } else {
           const raw = err.message ?? String(err);
           updateItem({
@@ -258,8 +271,8 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
     set({ isRunning: false, globalProgress: null });
     if (get().cancelRequested) {
-      addLog("warning", t("activity.queue.cancelled"), undefined, "queue");
-      addToast("warning", t("queue.toast.cancelled"));
+      addLog("info", t("activity.queue.cancelled"), undefined, "queue");
+      addToast("info", t("queue.toast.cancelled"));
     } else {
       const runIds = new Set(pending.map((i) => i.id));
       let finished = 0;

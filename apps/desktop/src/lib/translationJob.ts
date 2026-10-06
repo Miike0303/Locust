@@ -5,6 +5,20 @@
 
 export type TranslationModalStep = "configure" | "progress";
 
+export interface TranslationExecutionState {
+  queueRunning: boolean;
+  /** Includes the start request before the backend returns a job ID. */
+  singleJobRunning: boolean;
+}
+
+export function canStartQueue(state: TranslationExecutionState): boolean {
+  return !state.queueRunning && !state.singleJobRunning;
+}
+
+export function canStartSingleJob(state: TranslationExecutionState): boolean {
+  return !state.queueRunning && !state.singleJobRunning;
+}
+
 export function shouldReattachTranslationJob(
   jobId: string | null,
   isTranslating: boolean,
