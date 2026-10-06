@@ -1,37 +1,39 @@
 # Windows tag-only CI
 
-## Intent and authorization
-Add Windows checks alongside Ubuntu while preserving `v*` tag/manual-only CI. User requested sequential completion, passing tests and push to `main` before starting another task. After preflight showed162 older unpushed commits, user explicitly authorized publishing accumulated history plus this task through feature-branch hosted validation first.
+## Outcome and authorization
+**Complete: implemented, verified on both hosted platforms, and delivered to main.** User requested sequential task completion with passing tests and main delivery. Publication of 162 older local commits plus this unit was explicitly confirmed after preflight.
 
-Authorized: work-unit commits, local gates, feature-branch push, manual CI bound to candidate SHA, non-forced fast-forward main only after both hosted jobs pass. No tags/releases, destructive Git operations, skipped failed checks, originals-game writes, unrelated repositories or purchases.
+Authorized delivery used work-unit commits, a feature-branch push, manual CI on the exact candidate, and a non-forced fast-forward to main. No tags, releases, skipped failing tests, destructive Git operations, original-game writes, or unrelated repository edits were performed.
 
-## Scope and route
-Workflow `.github/workflows/ci.yml`; test-only hosted blocker `crates/cli/tests/backup_recovery_tests.rs`; ledger `docs/IMPROVEMENT-GOAL.md`; this document/Engram `odd/windows-tag-ci/tasks`. Branch `ci/windows-tag-checks`, base `d6c1846`. Preserve Linux job, triggers, concurrency, environment and test coverage; no dependencies or release edits. Read-only explorers, bounded writers, independent verifiers, parent delivery; writes/builds serial. Feature diff below400-line heuristic; publication of older history explicitly accepted.
+## Scope and routing
+- Workflow: `.github/workflows/ci.yml`.
+- Hosted-blocker regression: `crates/cli/tests/backup_recovery_tests.rs` (test only).
+- Evidence: `docs/IMPROVEMENT-GOAL.md`, this file, Engram `odd/windows-tag-ci/tasks`.
+- Feature branch: `ci/windows-tag-checks`; original base: `d6c1846`.
+- Explorers mapped prerequisites and incidents; bounded writers implemented; independent verifiers ran checks; parent owned delivery. Writes/builds were serial. The feature remained below the 400-line review heuristic; accumulated-history publication was separately authorized.
 
 ## Tasks
-- [x] WCI-1 — Add Windows job; structural YAML/HEAD checks passed. Work unit `3c8c851`.
-- [x] WCI-2 — Independent Windows local gates passed. Work unit `3c8c851`.
-- [x] WCI-3 — Reconcile stale CI ledger without claiming hosted completion. Work units `3c8c851`, `b7feef9`.
-- [x] WCI-5 — Full Linux prepush gate passed; publish feature branch. Remote ref confirmed at `3c8c851`.
-- [x] WCI-6 — Reproduce and correct backup-listing test identity mismatch. Work unit `b7feef9`; RED/GREEN and independent Windows/Linux checks observed.
-- [ ] WCI-4 — Observe both hosted jobs for corrected published SHA and deliver to main. **In progress.** Initial run failed Windows; main remains unchanged until corrected run passes.
+- [x] WCI-1 — Add independent Windows CI without altering Linux or triggers. Work unit `3c8c851`.
+- [x] WCI-2 — Independently validate YAML and local Windows gates. Evidence included with `3c8c851`.
+- [x] WCI-3 — Reconcile the stale backlog and final delivery evidence. Work units `3c8c851`, `b7feef9`, and documentation closeout.
+- [x] WCI-5 — Pass the full Linux prepush gate and publish the feature branch. Commit/ref `3c8c851` verified.
+- [x] WCI-6 — Reproduce and correct the Windows backup-listing test. Work unit `b7feef9`; deterministic RED/GREEN and independent Windows/Linux checks passed.
+- [x] WCI-4 — Observe both hosted jobs for exact candidate `027b82e84849f37f53fdb4447a27b4158dad4ecb`, then deliver that SHA to main. Both jobs and remote-ref confirmation succeeded.
 
-## Acceptance
-- Independent windows-latest x64 MSVC job, Node24/Rust1.94.0/rustfmt/clippy and caches; frontend npm ci/build/unit before Rustfmt/strictworkspaceClippy/workspace tests including Tauri.
-- Original Ubuntu/top-level contract unchanged. Config-only change has no locally runnable hosted-job RED/GREEN; use structural/local/hosted evidence. Test correction has deterministic RED/GREEN; do not remove assertions or ignore tests.
-- Both hosted jobs successful for exact candidate; recheck remote divergence before non-forced main update.
+## Acceptance and observed evidence
+- CI remains `v*` tag/manual only; Ubuntu job, concurrency and global environment preserved. Independent Windows x64 MSVC job uses Node 24, Rust 1.94.0 with rustfmt/clippy and caches. Frontend install/build/tests precede Rust checks, including Tauri.
+- Parsed YAML assertions passed 10/10. Configuration has no locally runnable hosted-job RED/GREEN; structural and functional evidence was used instead. `actionlint` was unavailable; actual hosted execution covers the executable workflow.
+- Local Windows: frontend build and 98 tests passed; Rust fmt/strict Clippy passed; 1999 Rust passed, 0 failed, 19 ignored.
+- Full isolated Debian 12 Linux gate: clean npm install/build and 98 frontend tests passed; fmt/strict Clippy passed; 1989 Rust passed, 0 failed, 19 ignored, including Tauri. Initial wrapper exit 1 flagged a generated Tauri schema CRLF-to-LF rewrite; independent byte-normalized and JSON checks confirmed identical content and all 513 other inputs unchanged. Original diagnostic evidence retained.
+- Initial hosted run `37545042216` at `3c8c851` passed Ubuntu but failed Windows on raw backup-path spelling. A canonical fixture reproduced RED (exit 101). Correction parses exactly one four-field nonblank row, verifies exact backup ID, prefix-free display and canonical directory identity. Restore/original-byte assertions remain; production unchanged. Independent Windows focused 7/7 and full 1999/0/19, Linux focused 7/7 passed.
+- Corrected hosted run [37547390292](https://github.com/Miike0303/Locust/actions/runs/37547390292), exact SHA `027b82e84849f37f53fdb4447a27b4158dad4ecb`: Ubuntu **1989/0/19**, Windows **1999/0/19**, frontend **98/98 on each**. Both completed npm ci/build/unit, fmt, strict workspace Clippy and workspace tests successfully. Ignored tests were not executed.
+- Fetched remote main, verified ancestry, fast-forwarded locally and pushed without force. Remote main confirmed at the exact successful candidate SHA. Documentation-only closeout does not change workflow or code from that tested candidate.
 
-## Evidence
-- Structural YAML10/10, workflow+43lines, diff check passed; CRLF preserved. Actionlint unavailable (no full Actions schema validation).
-- Initial local Windows x64MSVC Node24.17/Rust1.94: frontend build/unit98/98, fmt/strictClippy, Rust1999/0/19 passed. Logs host temp `locust-windows-ci-verify`.
-- Full Docker Linux Debian12/Rust1.94/Node24.21: clean npm ci/build/unit98/98, fmt/strictClippy, Rust1989/0/19 including Tauri passed. Logs `locust-windows-ci-linux-verify/run-Vc9vAB0i`. Wrapper initially exit1 due generated schemaCRLF->LF; independent byte-normalized+parsedJSON checks proved expected output only, all513 other inputs/host source unchanged. Original wrapper evidence retained, no hidden failure.
-- Initial feature commit `3c8c851fcae5d9ff599a3cfcea73d554778caf9c` published non-forced. Hosted run `37545042216` exact SHA: Ubuntu all gates success(Rust1989/0/19,frontend98/98); Windows frontend/fmt/Clippy success, Rust stopped at backup recovery raw path assertion. Expected hosted operand not logged.
-- WCI-6 force canonical fixture and old raw assertion produced local REDexit101; GREEN compares exactly one4-fieldnonblank row, exact backupid, prefixfreepath and canonical filesystemidentity. Restore/originalbyte assertions preserved. Production unchanged; correction commit `b7feef963080fe7dc1f09d5661bc4ee6d03c0ba5`.
-- Independent correction gates: Windows backup7/7, fmt/strictworkspaceClippy and fullRust1999/0/19; isolatedLinux backup7/7. Logs `locust-windows-ci-backup-path`, `locust-windows-ci-backup-verify/run-NFSJvU`.
-- Verifier incident: process-local explicit RUSTUP_TOOLCHAIN1.94 installed versioned alias on host unexpectedly. Read-only diagnosis confirmed defaultstable unchanged and compiler manifests identical; installation preserved, no automatic rollback. Functional exits remain0; future host checks use existing active toolchain.
-- RDD clone-local off. Original committed CI slice assessed high; independentverification completed. Test correction assessed medium/largewriter; independent spot additionally executed.
-- npm13 vulnerabilities and nonblocking frontend warnings observed; no audit/dependency changes bundled.
-- Remote main last confirmed `7b367c9c041941675415a5e1152d7a151ed28daf`. Corrected hosted run/publication/main delivery still pending. No tags/releases.
+## Limits and incidents
+- npm reported 13 vulnerabilities; no dependency/audit fix was bundled. Nonblocking frontend/action-runtime warnings remain.
+- A verifier's process-local exact toolchain alias triggered an unintended host rustup install. Diagnosis confirmed default stable unchanged and identical compiler manifests; installation retained, no destructive rollback. Future host checks use the existing active toolchain.
+- RDD remained clone-local off. CI assessment requested independent verification; completed. No native review started.
+- Logs are retained under host-temp `locust-windows-ci-verify`, `locust-windows-ci-linux-verify`, `locust-windows-ci-backup-path`, `locust-windows-ci-backup-verify`, and `locust-windows-ci-hosted-verify`.
 
 ## Next step
-Commit bookkeeping evidence, publish corrected feature branch non-forced, dispatch CI once and bind to exact new HEAD. Keep main unchanged until both hosted jobs pass; resolve any new blocker within this task before starting another.
+Publish the documentation-only closeout, then start the next bounded Locust backlog unit. No remaining Windows CI implementation or hosted-validation task is pending.
