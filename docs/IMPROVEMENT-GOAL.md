@@ -45,7 +45,7 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 
 ## In flight
 
-None.
+- **Cycle 136 (RPG Maker XP/VX Ace repeated Direct injection, writer Codex, launched 2026-10-06).** Brief and log in `%TEMP%/locust-c136-vxa/`. Also answers whether VX Ace checks the stored source against the live game at all (HEAD pass 2 reported 0 `source_changed`).
 
 ## Done
 
