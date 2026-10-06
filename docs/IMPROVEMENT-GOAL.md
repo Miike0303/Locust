@@ -30,7 +30,6 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 - No web presence of any kind: no landing, no docs site, no deploy. `crates/server` cannot serve static files (`tower-http` is compiled with `cors, trace` only). Deferred by the user, not rejected.
 Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size] what. Evidence. Check that proves it fixed.
 - **[defect · frontend · S] "Prístino"/"Pristine" patch-state wording is developer jargon** (`PatchStatusIndicator.tsx`, i18n). Something like "Juego original"/"Original game" is clearer. Check: an i18n test on the new keys.
-- **[optimization · frontend · S] Status colors are defined twice** (`FilterBar.tsx` and `StringTable.tsx`). Extract one shared map. Check: a single definition, and build green.
 - **[capability · frontend · M] The design pass stopped at the Editor.** Welcome, Settings and the modals still use loose grays, small type and no tokens (screenshots in the 2026-09-26 session, `ux/shots`). Next design cycle: Settings layout, plus design tokens in `index.css`.
 - **[optimization · backend · S] Duplicated helpers written by different agents.** `parse_err` ×4, `read_u32` ×4, `find_data_dir` ×4, `normalize_newlines` ×2 (e.g. `crates/formats/src/kirikiri.rs:444`, `crates/formats/src/tyrano.rs:283`), and a Win32 file-identity FFI ×2 (`crates/core/src/project.rs:215-228`, `crates/core/src/patch/stream.rs:252-293`). Frontend: `IS_TAURI` redefined 9+ times, safe-localStorage ×5, basename ×8. Check: a single definition each, and gates green.
 - **[capability · backend · S] CI has no Windows job and no pinned toolchain.** The main dev/user platform is Windows, with Win32 FFI and `File::try_lock` in `crates/core/src/patch/lock.rs`. CI is ubuntu-only (`.github/workflows/ci.yml:18`), and no `rust-version`/`rust-toolchain.toml` pins what the file-lock API needs. Check: a `windows-latest` job runs `cargo test --workspace` green, and `rust-version` is set.
@@ -46,7 +45,8 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 
 ## In flight
 
-None.
+- **cycle 133 (Unity, writer Codex, dispatched 2026-10-05).** Second Direct injection must apply edited translations (the `source_changed` backlog item above); oracle = one injection of the pass-2 translations on a fresh CCTV copy. Scratch `%TEMP%/locust-c133-unity-reinject`.
+- **cycle 134 (UI debt, writer Codex, dispatched 2026-10-05).** One `IS_TAURI` (9 copies) and other equivalent tiny helpers, `noUnusedLocals`/`noUnusedParameters` on (dead `binarySlotOf`), tests under the type checker. Scratch `%TEMP%/locust-c134-ui-debt`.
 
 ## Done
 
@@ -312,6 +312,7 @@ None.
 - `a2f7952` — first workspace-wide `cargo fmt`, isolated so it could not bury the change beside it.
 
 ## Rejected
+- **"Status colors are defined twice" (`FilterBar.tsx` / `StringTable.tsx`)** — 2026-10-05. Not a duplicate: FilterBar defines filter-pill classes (background + text) and StringTable defines status-dot classes (ring or solid fill); one shared map would couple two different visual treatments.
 - `replace` case-insensitive SQL prefilter misses U+212A (Kelvin) / U+0130 matches for an ASCII `k`/`i` (cycle 84 runner-up, rejected cycle 87): real but practically unreachable; the only fix skips the SQL prefilter for every case-insensitive replace (up to 100k rows fetched) to serve two exotic code points.
 
 - **`.zip` file association / `locust://` protocol handler** — 2026-08-14. The handler exists so a user can click a link on a patch distribution site. No such site exists; the Astro stub points at third-party rule95. Building the receiver now means OS-level registration, per-platform, untestable against anything real. Revisit when the web decision is made.
