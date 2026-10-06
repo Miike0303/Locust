@@ -1336,6 +1336,8 @@ async fn patch_status_detects_receipt_drift() {
     let receipt = store.read_receipt().unwrap().unwrap();
     let receipt_modified = store.receipt_path().metadata().unwrap().modified().unwrap();
     let original_body = serde_json::json!({
+        "injections": [],
+        "injection_pending": false,
         "status": "patched",
         "patch_id": receipt.patch_id,
         "patch_version": receipt.patch_version,

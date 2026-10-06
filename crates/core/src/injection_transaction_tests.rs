@@ -1349,3 +1349,311 @@ fn executable_permission_bits_survive_install_and_recovery() {
         0o755
     );
 }
+
+// Cycle 139: real Direct/Add transactions, queried through the existing status API.
+fn badge_fixture() -> (
+    tempfile::TempDir,
+    PathBuf,
+    std::sync::Arc<Database>,
+    std::sync::Arc<FormatRegistry>,
+    std::sync::Arc<BackupManager>,
+) {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("game");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("game.bundle"), "original").unwrap();
+    let db = std::sync::Arc::new(Database::open(&outer.path().join("project.db")).unwrap());
+    let mut entry = StringEntry::new("badge", "original", root.join("game.bundle/CAB-node"));
+    entry.translation = Some("Translation".into());
+    entry
+        .metadata
+        .insert("resource".into(), serde_json::json!("virtual/unchanged"));
+    db.save_entries(&[entry]).unwrap();
+    let mut registry = FormatRegistry::new();
+    registry.register(Box::new(VirtualPlugin));
+    let manager = std::sync::Arc::new(BackupManager::new(outer.path().join("backups")));
+    (outer, root, db, std::sync::Arc::new(registry), manager)
+}
+
+fn badge_status(root: &Path) -> serde_json::Value {
+    serde_json::to_value(status(root).unwrap()).unwrap()
+}
+
+#[test]
+fn c139_status_clean_folder() {
+    let (_outer, root, _, _, _) = badge_fixture();
+    assert_eq!(badge_status(&root)["applied"], serde_json::json!([]));
+    assert!(matches!(
+        PatchStore::new(root).status().unwrap(),
+        crate::patch::PatchStatus::NotPatched
+    ));
+}
+
+#[test]
+fn c139_status_direct_and_backup_restore() {
+    let (_outer, root, db, registry, manager) = badge_fixture();
+    let report = inject_direct(
+        &registry,
+        &db,
+        &manager,
+        &root,
+        "virtual-fixture",
+        &["es".into()],
+    )
+    .unwrap();
+    let before = badge_status(&root);
+    assert_eq!(before["applied"][0]["mode"], "direct");
+    assert_eq!(before["applied"][0]["language"], "es");
+    assert!(before["applied"][0]["applied_at"].is_string());
+    manager.preview_restore(&report.backup_id).unwrap();
+    assert_eq!(badge_status(&root), before, "preview is read-only");
+    manager.restore(&report.backup_id).unwrap();
+    assert_eq!(badge_status(&root)["applied"], serde_json::json!([]));
+    assert_eq!(
+        fs::read_to_string(root.join("game.bundle")).unwrap(),
+        "original"
+    );
+}
+
+#[tokio::test]
+async fn c139_status_add_and_backup_restore() {
+    let (_outer, root, db, registry, manager) = badge_fixture();
+    let injector = crate::extraction::MultiLangInjector::new(registry, db, manager.clone());
+    let (sender, _receiver) = tokio::sync::mpsc::channel(20);
+    let report = injector
+        .inject(
+            &root,
+            "virtual-fixture",
+            crate::models::OutputMode::Add,
+            vec!["fr".into()],
+            None,
+            sender,
+        )
+        .await
+        .unwrap();
+    assert!(report.languages_failed.is_empty());
+    let applied = badge_status(&root)["applied"].clone();
+    assert_eq!(applied[0]["mode"], "add");
+    assert_eq!(applied[0]["language"], "fr");
+    manager.restore(&report.backup_id).unwrap();
+    assert_eq!(badge_status(&root)["applied"], serde_json::json!([]));
+    assert!(!root.join("tl/fr/translation.txt").exists());
+}
+
+#[test]
+fn c139_status_recovery_excludes_rolled_back_generation() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    interrupted(&root, Step::FilesCommitted);
+    let before = badge_status(&root);
+    assert_eq!(before["applied"], serde_json::json!([]));
+    assert_eq!(before["pending"]["phase"], "committed_unrecorded");
+    recover(&root, Default::default()).unwrap();
+    let after = badge_status(&root);
+    assert_eq!(after["applied"], serde_json::json!([]));
+    assert!(after["pending"].is_null());
+}
+
+#[test]
+fn c139_status_zip_and_injection_coexist() {
+    let (_outer, root, db, registry, manager) = badge_fixture();
+    let receipt = crate::patch::Receipt {
+        schema_version: 1,
+        patch_id: "zip".into(),
+        patch_version: "1".into(),
+        generator_version: "test".into(),
+        language: "de".into(),
+        engine: "fixture".into(),
+        applied_at: "2026-10-06T00:00:00Z".into(),
+        verification: crate::patch::manifest::VerificationTier::Strict,
+        forced: false,
+        baseline: crate::patch::BackupBaseline::Pristine,
+        created_dirs: vec![],
+        replaced: vec![],
+        added: vec![],
+    };
+    PatchStore::new(&root).write_receipt(&receipt).unwrap();
+    inject_direct(
+        &registry,
+        &db,
+        &manager,
+        &root,
+        "virtual-fixture",
+        &["es".into()],
+    )
+    .unwrap();
+    assert_eq!(
+        PatchStore::new(&root).status().unwrap(),
+        crate::patch::PatchStatus::Patched(receipt)
+    );
+    assert_eq!(badge_status(&root)["applied"][0]["language"], "es");
+}
+
+#[test]
+fn c139_status_history_supersession_and_restore_boundary() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let manager = BackupManager::new(outer.path().join("backups"));
+    let inject = |lang: &str| {
+        run(
+            &root,
+            "fixture",
+            Some(lang),
+            || manager.create_backup(&root),
+            |work, _| {
+                fs::write(work.join("keep.bin"), lang)?;
+                Ok(empty_report())
+            },
+            |_| Ok(()),
+        )
+        .unwrap()
+        .0
+    };
+    let first = inject("es");
+    let second = inject("fr");
+    let after = badge_status(&root);
+    assert_eq!(after["applied"].as_array().unwrap().len(), 1);
+    assert_eq!(after["applied"][0]["language"], "fr");
+    manager.restore(&second.id).unwrap();
+    assert_eq!(badge_status(&root)["applied"][0]["language"], "es");
+    manager.restore(&first.id).unwrap();
+    assert_eq!(badge_status(&root)["applied"], serde_json::json!([]));
+}
+
+#[test]
+fn c139_status_partial_restore_keeps_injection_and_single_file_scope() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let manager = BackupManager::new(outer.path().join("backups"));
+    let selected = root.join("keep.bin");
+    let backup = manager.create_backup(&selected).unwrap();
+    run(
+        &root,
+        "fixture",
+        Some("es"),
+        || Ok(()),
+        |work, _| {
+            fs::write(work.join("keep.bin"), "translated")?;
+            fs::write(work.join("added.bin"), "added")?;
+            Ok(empty_report())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    manager.restore(&backup.id).unwrap();
+    assert_eq!(badge_status(&root)["applied"][0]["changed_files"], 1);
+    assert_eq!(fs::read(selected).unwrap(), b"unrelated original");
+    assert_eq!(fs::read(root.join("added.bin")).unwrap(), b"added");
+}
+
+#[tokio::test]
+async fn c139_status_restoring_backup_keeps_edited_add_evidence() {
+    let (_outer, root, db, registry, manager) = badge_fixture();
+    let injector = crate::extraction::MultiLangInjector::new(registry, db, manager.clone());
+    let (sender, _receiver) = tokio::sync::mpsc::channel(20);
+    let report = injector
+        .inject(
+            &root,
+            "virtual-fixture",
+            crate::models::OutputMode::Add,
+            vec!["es".into()],
+            None,
+            sender,
+        )
+        .await
+        .unwrap();
+    fs::write(
+        root.join("tl/es/translation.txt"),
+        "user edited translation",
+    )
+    .unwrap();
+    manager.restore(&report.backup_id).unwrap();
+    assert_eq!(badge_status(&root)["applied"][0]["mode"], "add");
+}
+
+#[test]
+fn c139_status_legacy_mode_is_unknown_without_identity_and_time_is_optional() {
+    let (_outer, root, db, registry, manager) = badge_fixture();
+    inject_direct(
+        &registry,
+        &db,
+        &manager,
+        &root,
+        "virtual-fixture",
+        &["es".into()],
+    )
+    .unwrap();
+    let operation = load(&root.canonicalize().unwrap()).unwrap().unwrap();
+    fs::remove_file(operation.directory.join("identity.json")).unwrap();
+    fs::remove_file(operation.directory.join("applied-at.json")).unwrap();
+    let active_path = root.join(STORE_DIR).join("active.json");
+    let mut active: serde_json::Value = read(&active_path).unwrap();
+    active.as_object_mut().unwrap().remove("mode");
+    fs::write(active_path, serde_json::to_vec(&active).unwrap()).unwrap();
+    let plan_path = operation.directory.join("plan.json");
+    let mut plan: serde_json::Value = read(&plan_path).unwrap();
+    plan.as_object_mut().unwrap().remove("prepared_at");
+    fs::write(plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let applied = badge_status(&root)["applied"].clone();
+    assert_eq!(applied.as_array().unwrap().len(), 1);
+    assert!(
+        applied[0]["mode"].is_null(),
+        "legacy records cannot prove the selected mode"
+    );
+    assert!(applied[0]["applied_at"].is_null());
+    assert_eq!(applied[0]["language"], "es");
+}
+
+#[test]
+fn c139_status_restore_replay_reactivates_translation_in_a_later_backup() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let manager = BackupManager::new(outer.path().join("backups"));
+    let inject = |lang: &str| {
+        run(
+            &root,
+            "fixture",
+            Some(lang),
+            || manager.create_backup(&root),
+            |work, _| {
+                fs::write(work.join("keep.bin"), lang)?;
+                Ok(empty_report())
+            },
+            |_| Ok(()),
+        )
+        .unwrap()
+        .0
+    };
+    let first = inject("es");
+    let later = inject("fr");
+    manager.restore(&first.id).unwrap();
+    assert_eq!(badge_status(&root)["applied"], serde_json::json!([]));
+    manager.restore(&later.id).unwrap();
+    assert_eq!(fs::read(root.join("keep.bin")).unwrap(), b"es");
+    assert_eq!(
+        badge_status(&root)["applied"][0]["language"],
+        "es",
+        "restoring a translated backup must not claim original game"
+    );
+}
+
+#[test]
+fn c139_status_restore_undated_generation_uses_recorded_backup_hashes() {
+    let (_outer, root, db, registry, manager) = badge_fixture();
+    let report = inject_direct(
+        &registry,
+        &db,
+        &manager,
+        &root,
+        "virtual-fixture",
+        &["es".into()],
+    )
+    .unwrap();
+    let operation = load(&root.canonicalize().unwrap()).unwrap().unwrap();
+    let plan_path = operation.directory.join("plan.json");
+    let mut plan: serde_json::Value = read(&plan_path).unwrap();
+    plan.as_object_mut().unwrap().remove("prepared_at");
+    fs::write(plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    manager.restore(&report.backup_id).unwrap();
+    assert_eq!(badge_status(&root)["applied"], serde_json::json!([]));
+}

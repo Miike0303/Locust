@@ -1171,9 +1171,14 @@ fn cmd_patch_status(game_path: PathBuf, verify: bool) -> anyhow::Result<()> {
         None
     };
     let store = PatchStore::new(&game_path);
+    let injections = store.injection_status()?;
     match store.status()? {
         PatchStatus::NotPatched if verify => anyhow::bail!("no completed patch to verify"),
-        PatchStatus::NotPatched => println!("not patched"),
+        PatchStatus::NotPatched => {
+            if injections.injections.is_empty() && !injections.injection_pending {
+                println!("Original game (no recorded Locust changes)");
+            }
+        }
         PatchStatus::Patched(r) => {
             if verify {
                 verify_patch_receipt_files(&game_path, &r)?;
@@ -1206,6 +1211,32 @@ fn cmd_patch_status(game_path: PathBuf, verify: bool) -> anyhow::Result<()> {
                  or patch-rollback if a backup exists)"
             );
         }
+    }
+    if injections.injection_pending {
+        println!("INJECTION UNFINISHED — inspect with locust inject-status and recover with locust inject-recover");
+    }
+    for injection in injections.injections {
+        let label = match injection.mode {
+            Some(locust_core::injection_transaction::InjectionMode::Direct) => {
+                "Translated (direct)"
+            }
+            Some(locust_core::injection_transaction::InjectionMode::Add) => "Language added",
+            None => "Game modified",
+        };
+        println!(
+            "{}: {} ({} file(s), time {}, transaction {})",
+            label,
+            injection
+                .language
+                .as_deref()
+                .unwrap_or("language unavailable"),
+            injection.changed_files,
+            injection
+                .applied_at
+                .map(|time| time.to_rfc3339())
+                .unwrap_or_else(|| "unavailable".into()),
+            injection.transaction_id
+        );
     }
     Ok(())
 }

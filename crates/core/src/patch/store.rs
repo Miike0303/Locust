@@ -63,6 +63,12 @@ impl PatchStore {
         self.locust_dir().join(Journal::FILENAME)
     }
 
+    /// Injection evidence alongside the unchanged ZIP patch status. Metadata-only
+    /// and available while a writer holds the game lock, just like `status`.
+    pub fn injection_status(&self) -> Result<crate::injection_transaction::GameInjectionStatus> {
+        crate::injection_transaction::game_status(&self.game_root)
+    }
+
     pub fn status(&self) -> Result<PatchStatus> {
         let journal_path = self.journal_path();
         if journal_path.is_file() {

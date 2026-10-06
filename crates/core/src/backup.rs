@@ -913,6 +913,7 @@ impl BackupManager {
         } else {
             BTreeMap::new()
         };
+        crate::injection_transaction::game_status(game_lock.root())?;
         if dry_run {
             return Ok(preview);
         }
@@ -983,6 +984,33 @@ impl BackupManager {
                 Err(error) => preview.keep(relative, &format!("created directory kept: {error}")),
             }
         }
+        // These fingerprints come from the verified backup inventory, not a
+        // guess about game contents. A later backup can reinstate a translation
+        // that an earlier restore had removed from the applied history.
+        let mut restored_files: BTreeMap<_, _> = inventory
+            .iter()
+            .filter_map(|(rel, entry)| {
+                let InventoryEntry::File { sha256, size } = entry else {
+                    return None;
+                };
+                let dest = destination(rel);
+                let relative = dest
+                    .strip_prefix(game_lock.root())
+                    .expect("locked restore destination");
+                Some((
+                    crate::injection_transaction::output_key(relative),
+                    Some((sha256.clone(), *size)),
+                ))
+            })
+            .collect();
+        for path in &preview.removed {
+            restored_files.insert(crate::injection_transaction::output_key(path), None);
+        }
+        crate::injection_transaction::record_backup_restore(
+            &game_lock,
+            summary.created_at,
+            &restored_files,
+        )?;
         preview.kept.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(preview)
     }

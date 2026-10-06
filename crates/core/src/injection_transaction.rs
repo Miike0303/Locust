@@ -23,6 +23,30 @@ use std::{
 
 pub const STORE_DIR: &str = ".locust-injections";
 const SCHEMA: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectionMode {
+    Direct,
+    Add,
+}
+
+/// Committed transaction evidence, not a claim that current game bytes were verified.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppliedInjection {
+    pub transaction_id: String,
+    pub mode: Option<InjectionMode>,
+    pub language: Option<String>,
+    pub applied_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub changed_files: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GameInjectionStatus {
+    pub injections: Vec<AppliedInjection>,
+    pub injection_pending: bool,
+}
+
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FILES: usize = 200_000;
 
@@ -56,6 +80,8 @@ pub struct PendingInjection {
 pub struct InjectionStatus {
     pub game_root: PathBuf,
     pub pending: Option<PendingInjection>,
+    #[serde(default)]
+    pub applied: Vec<AppliedInjection>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -100,6 +126,8 @@ struct StoreMarker {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Active {
+    #[serde(default)]
+    mode: Option<InjectionMode>,
     schema_version: u32,
     transaction_id: String,
     game_root: PathBuf,
@@ -392,6 +420,200 @@ pub(crate) fn created_outputs_since(
     Ok(outputs)
 }
 
+/// Add uses the same transaction machinery, recording the user's selected mode.
+pub(crate) fn run_add<B, T>(
+    selection: &Path,
+    format: &str,
+    language: Option<&str>,
+    backup: impl FnOnce() -> Result<B>,
+    inject: impl FnOnce(&Path, &Path) -> Result<InjectionReport>,
+    record: impl FnOnce(&InjectionReport) -> Result<T>,
+) -> Result<(B, InjectionReport, T)> {
+    run_with_mode_hook(
+        selection,
+        (format, language, InjectionMode::Add),
+        backup,
+        |work, selected, _| inject(work, selected),
+        (|report, _| record(report), |_, _, _| Ok(())),
+        &mut |_| Ok(()),
+    )
+}
+
+struct CommittedGeneration {
+    directory: PathBuf,
+    plan: Plan,
+    restored: BTreeSet<PathBuf>,
+}
+
+/// Metadata-only, read-only scan. Never acquire a game lock or hash game files.
+/// A phase marker is published atomically, and only Completed is applied evidence.
+fn committed_generations(root: &Path) -> Result<Vec<CommittedGeneration>> {
+    if !validate_store(root)? {
+        return Ok(Vec::new());
+    }
+    let relative = Path::new(STORE_DIR).join("operations");
+    ensure_no_links(root, &relative)?;
+    let directory = root.join(relative);
+    if !directory.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let mut generations = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if uuid::Uuid::parse_str(&id)
+            .map(|v| v.to_string())
+            .ok()
+            .as_ref()
+            != Some(&id)
+        {
+            return Err(error("invalid injection history identity"));
+        }
+        ensure_no_links(root, &Path::new(STORE_DIR).join("operations").join(&id))?;
+        let phase: Phase = read(&entry.path().join("phase.json"))?;
+        if phase != Phase::Completed {
+            continue;
+        }
+        let plan: Plan = read(&entry.path().join("plan.json"))?;
+        if plan.schema_version != SCHEMA
+            || plan.transaction_id != id
+            || plan.game_root != root
+            || plan.files.len() > MAX_FILES
+            || plan.created_dirs.len() > MAX_FILES
+        {
+            return Err(error(
+                "invalid completed injection plan version/identity/root/size",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for change in &plan.files {
+            if !seen.insert(output_key(&safe_game_rel(&change.path)?))
+                || !valid_hash(&change.result)
+                || change.original.as_ref().is_some_and(|v| !valid_hash(v))
+            {
+                return Err(error("invalid or duplicate completed injection file"));
+            }
+        }
+        let restored_path = entry.path().join("restored.json");
+        let restored: BTreeSet<PathBuf> = if restored_path.try_exists()? {
+            read(&restored_path)?
+        } else {
+            BTreeSet::new()
+        };
+        if !restored.is_subset(&seen) {
+            return Err(error("invalid restored injection paths"));
+        }
+        generations.push(CommittedGeneration {
+            directory: entry.path(),
+            plan,
+            restored,
+        });
+    }
+    generations.sort_by(|a, b| {
+        (a.plan.prepared_at, &a.plan.transaction_id)
+            .cmp(&(b.plan.prepared_at, &b.plan.transaction_id))
+    });
+    Ok(generations)
+}
+
+/// Complements ZIP status without changing its enum or claiming an unfinished
+/// injection is an original game. Older generations may lack language and time.
+pub fn game_status(game_path: &Path) -> Result<GameInjectionStatus> {
+    let root = root_for(game_path)?;
+    let active = load(&root)?;
+    let generations = committed_generations(&root)?;
+    // A later committed writer supersedes earlier evidence for the same path.
+    // Restoring that later generation exposes the earlier generation again.
+    let mut owners = BTreeMap::new();
+    for (index, generation) in generations.iter().enumerate() {
+        for change in &generation.plan.files {
+            let key = output_key(&safe_game_rel(&change.path)?);
+            if !generation.restored.contains(&key) {
+                owners.insert(key, index);
+            }
+        }
+    }
+    let mut injections = Vec::new();
+    for (index, generation) in generations.iter().enumerate() {
+        let changed_files = owners.values().filter(|owner| **owner == index).count();
+        if changed_files == 0 {
+            continue;
+        }
+        let identity_path = generation.directory.join("identity.json");
+        let identity: Option<Active> = if identity_path.try_exists()? {
+            Some(read(&identity_path)?)
+        } else {
+            active
+                .as_ref()
+                .filter(|op| op.active.transaction_id == generation.plan.transaction_id)
+                .map(|op| op.active.clone())
+        };
+        if identity.as_ref().is_some_and(|id| {
+            id.schema_version != SCHEMA
+                || id.game_root != root
+                || id.transaction_id != generation.plan.transaction_id
+        }) {
+            return Err(error("invalid completed injection identity"));
+        }
+        // Old plans cannot distinguish Direct creating a file from Add updating
+        // one. Preserve the evidence without inventing a selected mode.
+        let mode = identity.as_ref().and_then(|id| id.mode);
+        let time_path = generation.directory.join("applied-at.json");
+        let applied_at = if time_path.try_exists()? {
+            Some(read(&time_path)?)
+        } else {
+            generation.plan.prepared_at
+        };
+        injections.push(AppliedInjection {
+            transaction_id: generation.plan.transaction_id.clone(),
+            mode,
+            language: identity.and_then(|id| id.language),
+            applied_at,
+            changed_files,
+        });
+    }
+    Ok(GameInjectionStatus {
+        injections,
+        injection_pending: active.is_some_and(|op| op.phase.pending().is_some()),
+    })
+}
+
+/// Record only paths actually restored/deleted by a successful backup restore.
+/// Preserve history, older injections, and any edited Add outputs that were kept.
+/// Compare committed output hashes to the verified backup inventory; this also
+/// reactivates older translations when restoring a backup which contains them.
+/// Never reactivate a dated generation created after that backup.
+pub(crate) fn record_backup_restore(
+    lock: &GameLock,
+    since: chrono::DateTime<chrono::Utc>,
+    restored_files: &BTreeMap<PathBuf, Option<(String, u64)>>,
+) -> Result<()> {
+    for mut generation in committed_generations(lock.root())? {
+        for change in &generation.plan.files {
+            let key = output_key(&safe_game_rel(&change.path)?);
+            let Some(restored) = restored_files.get(&key) else {
+                continue;
+            };
+            let existed = generation.plan.prepared_at.is_none_or(|time| time <= since);
+            let reinstated = existed
+                && restored.as_ref().is_some_and(|(hash, size)| {
+                    *hash == change.result.sha256 && *size == change.result.size
+                });
+            if reinstated {
+                generation.restored.remove(&key);
+            } else {
+                generation.restored.insert(key);
+            }
+        }
+        publish(
+            lock.root(),
+            &generation.directory.join("restored.json"),
+            &generation.restored,
+        )?;
+    }
+    Ok(())
+}
+
 fn safe_game_rel(raw: &str) -> Result<PathBuf> {
     let rel = safe_stored_rel(raw)?;
     let canonical = rel.to_string_lossy().replace('\\', "/");
@@ -535,6 +757,7 @@ pub fn status(game_path: &Path) -> Result<InjectionStatus> {
     Ok(InjectionStatus {
         game_root: root.to_owned(),
         pending,
+        applied: game_status(root)?.injections,
     })
 }
 
@@ -665,6 +888,7 @@ enum Step {
 /// The backup callback runs under the real GameLock before any transaction
 /// metadata is created. The plugin receives only its independent copy. The
 /// record callback completes SQLite recording before the terminal marker.
+#[cfg(test)]
 pub(crate) fn run<B, T>(
     selection: &Path,
     format: &str,
@@ -684,6 +908,7 @@ pub(crate) fn run<B, T>(
     )
 }
 
+#[cfg(test)]
 fn run_with_hook<B, T>(
     selection: &Path,
     format: &str,
@@ -740,7 +965,29 @@ fn run_with_backup_hook<B, T>(
     ),
     hook: &mut impl FnMut(Step) -> Result<()>,
 ) -> Result<(B, InjectionReport, T)> {
+    run_with_mode_hook(
+        selection,
+        (format, language, InjectionMode::Direct),
+        backup,
+        inject,
+        callbacks,
+        hook,
+    )
+}
+
+fn run_with_mode_hook<B, T>(
+    selection: &Path,
+    identity: (&str, Option<&str>, InjectionMode),
+    backup: impl FnOnce() -> Result<B>,
+    inject: impl FnOnce(&Path, &Path, &B) -> Result<InjectionReport>,
+    callbacks: (
+        impl FnOnce(&InjectionReport, &B) -> Result<T>,
+        impl FnOnce(&mut B, &mut InjectionReport, &T) -> Result<()>,
+    ),
+    hook: &mut impl FnMut(Step) -> Result<()>,
+) -> Result<(B, InjectionReport, T)> {
     let (record, unchanged) = callbacks;
+    let (format, language, mode) = identity;
     let selected = selection.canonicalize()?;
     let lock = GameLock::acquire(&root_for(&selected)?)?;
     ensure_no_pending_under_lock(&lock)?;
@@ -781,6 +1028,7 @@ fn run_with_backup_hook<B, T>(
     let directory = store.join("operations").join(&id);
     fs::create_dir(&directory)?;
     let active = Active {
+        mode: Some(mode),
         schema_version: SCHEMA,
         transaction_id: id,
         game_root: root.to_owned(),
@@ -794,6 +1042,11 @@ fn run_with_backup_hook<B, T>(
         phase: Phase::Preparing,
     };
     operation.set_phase(Phase::Preparing)?;
+    publish(
+        root,
+        &operation.directory.join("identity.json"),
+        &operation.active,
+    )?;
     publish(root, &store.join("active.json"), &operation.active)?;
     hook(Step::Preparing)?;
     let prepared = prepare(&operation, &selected, &before, |work, selected| {
@@ -874,6 +1127,11 @@ fn run_with_backup_hook<B, T>(
             return Err(error(format!("committed output changed: {}", change.path)));
         }
     }
+    publish(
+        root,
+        &operation.directory.join("applied-at.json"),
+        &chrono::Utc::now(),
+    )?;
     operation.set_phase(Phase::CommittedUnrecorded)?;
     hook(Step::FilesCommitted)?;
     let recorded = record(&report, &backup).map_err(|e| error(format!("injection {} committed files but recording failed: {e}; inspect injection status and recover before retry", operation.active.transaction_id)))?;

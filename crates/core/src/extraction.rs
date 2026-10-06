@@ -1017,7 +1017,7 @@ impl MultiLangInjector {
                 &selected
             };
             let mut created_backup = None;
-            let result = crate::injection_transaction::run(
+            let result = crate::injection_transaction::run_add(
                 &selected,
                 plugin.id(),
                 Some(lang),

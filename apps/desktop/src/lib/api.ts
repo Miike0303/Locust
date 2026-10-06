@@ -1,4 +1,5 @@
 import { IS_TAURI } from "./runtime";
+import { refreshGameState } from "./queryClient";
 import { invoke } from "@tauri-apps/api/core";
 import { addLog } from "../stores/logStore";
 import { t } from "./i18n";
@@ -325,7 +326,7 @@ export const recoverInjection = (gamePath: string, transactionId: string, force 
   request<InjectionRecoveryReport>("/inject/recover", {
     method: "POST",
     body: JSON.stringify({ game_path: gamePath, expected_transaction_id: transactionId, force }),
-  });
+  }).finally(refreshGameState);
 
 /** Human label for a ValidationKind discriminant. */
 export function validationKindLabel(kind: ValidationKind): string {
@@ -486,9 +487,10 @@ export const cancelTranslation = (jobId: string): Promise<void> =>
     : request(`/translate/cancel/${jobId}`, { method: "POST" });
 
 export const inject = (params: InjectParams): Promise<MultiLangReport> =>
-  IS_TAURI
-    ? tauriInvoke("run_inject", { params })
-    : request("/inject", { method: "POST", body: JSON.stringify(params) });
+  (IS_TAURI
+    ? tauriInvoke<MultiLangReport>("run_inject", { params })
+    : request<MultiLangReport>("/inject", { method: "POST", body: JSON.stringify(params) }))
+    .finally(refreshGameState);
 
 /** Register a language in RM multi-lang UI (Iavra / VisuMZ / Map choices). */
 export interface RegisterLangParams {
@@ -660,7 +662,7 @@ export const getBackups = (): Promise<BackupEntry[]> =>
   IS_TAURI ? tauriInvoke("get_backups") : request("/backups");
 
 export const restoreBackup = (id: string) =>
-  request<void>(`/backups/${encodeURIComponent(id)}/restore`, { method: "POST" });
+  request<void>(`/backups/${encodeURIComponent(id)}/restore`, { method: "POST" }).finally(refreshGameState);
 
 /** Delete a backup by id (HTTP DELETE — uses baseUrl for Tauri port). */
 export const deleteBackup = (id: string): Promise<void> =>
@@ -710,7 +712,18 @@ export interface PatchRollbackResult {
   torn_deleted: string[];
 }
 
+export interface AppliedInjection {
+  transaction_id: string;
+  mode: "direct" | "add" | null;
+  language: string | null;
+  applied_at: string | null;
+  changed_files: number;
+}
+
 export interface PatchStatusResult {
+  /** Optional for compatibility with older servers; ZIP status keeps its meaning. */
+  injections?: AppliedInjection[];
+  injection_pending?: boolean;
   status: "not_patched" | "patched" | "interrupted" | "unknown";
   patch_id?: string;
   patch_version?: string;

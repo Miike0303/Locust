@@ -2141,7 +2141,8 @@ async fn patch_status(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = locust_core::patch::PatchStore::new(PathBuf::from(&req.game_path));
     let status = store.status().map_err(map_patch_err)?;
-    let body = match status {
+    let injections = store.injection_status().map_err(map_patch_err)?;
+    let mut body = match status {
         locust_core::patch::PatchStatus::NotPatched => {
             serde_json::json!({ "status": "not_patched" })
         }
@@ -2189,6 +2190,8 @@ async fn patch_status(
             serde_json::json!({ "status": "unknown" })
         }
     };
+    body["injections"] = serde_json::json!(injections.injections);
+    body["injection_pending"] = serde_json::json!(injections.injection_pending);
     Ok(Json(body))
 }
 
