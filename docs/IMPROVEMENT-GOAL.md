@@ -19,10 +19,8 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 
 ## Backlog
 
-- **[optimization · formats · S] Marshal ivars are written sorted, not in their original order** (cycle 136). Deterministic and semantically neutral for Ruby, but untouched objects still differ byte-wise from the game file. Keeping parse order (a `Vec<(String, MarshalValue)>` instead of `HashMap` in `rpgmaker_vxa.rs`) would make untranslated files and objects byte-identical. Check: extract + inject with no translations leaves every `.rxdata` byte-identical.
 - **[defect · frontend · S] The patch-state badge never refreshes after injection** (`apps/desktop/src/pages/Editor.tsx:588-597`, only `PatchModal` bumps it at `:155-157`), and the backend status ignores `.locust-injections` (`crates/core/src/patch/store.rs:66-80`), so it says "Prístino" after a successful Direct/Add injection. Product decision: show injection state or relabel (see the "Prístino" wording item).
 
-- **[risk · formats · unmeasured] VX Ace has no fixture** (cycle 100): no deployment found, so no measured recall. Source-level risk: `rpgmaker_vxa.rs:~208-211` turns object references into `Unsupported` and `:~403` writes them back as nil. Needs a real Ace game before ranking.
 - **[capability · core · L] `apply --dry-run` refuses upgrades and patch switches** (cycle 64 research, B). `reject_dry_run_rollback` (`crates/core/src/patch/apply.rs:157`, `:188`, `:276`) — needs a virtual post-rollback baseline. Large; only if a user asks.
 - Unreal extract still reads the whole pak (`crates/formats/src/unreal.rs` extract loop) and scans the full buffer twice — `find_locres_offsets` byte-steps it (`unreal_locres.rs`) and `find_utf16le_strings` walks it again (`unreal.rs`). Larger and riskier than the detection fix; deliberately deferred from cycle 2.
  **Likely stale (cycle 83 researcher B): indexed extraction now reads only selected payloads (`crates/formats/src/unreal.rs:~354`) and the heuristic fallback rejects files above 8 MiB (`:~48`, `:~528`). Re-verify before picking.**
@@ -44,7 +42,7 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 
 ## In flight
 
-None.
+- **Cycle 138 (lossless Marshal for RPG Maker XP/VX/VX Ace, writer Codex, launched 2026-10-06).** Replaces the VX Ace fixture risk item and the cycle-136 ivar-order item. Measured on Opala (XP): HEAD injection kept every non-text value in the 856 rewritten files, but 275 object links (move-route 509 -> 209 `MoveCommand`) live in 9 text-free maps that were never rewritten; a map with dialogue and a linked route would get `nil`. Reading the code also showed unknown types (`f`, `l`, `}`, `S`, ...) return `Unsupported` without consuming their payload, and the `I` wrapper drops its ivars. No VX/VX Ace game on disk. Brief, `compare.py` (rubymarshal) and log in `%TEMP%/locust-c138-marshal/`.
 
 ## Done
 
