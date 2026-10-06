@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use locust_core::backup::RevisionOriginal;
 use locust_core::encoding::EncodingDetector;
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
@@ -394,8 +395,10 @@ impl RpgMakerMvPlugin {
     }
 
     fn extract_file(file_path: &Path) -> Result<Vec<StringEntry>> {
-        let (raw, _enc) = EncodingDetector::read_file_auto(file_path)?;
-        let content = Self::decode_data_file_text(file_path, &raw)?;
+        Self::extract_file_json(file_path, &Self::read_data_json(file_path)?)
+    }
+
+    fn extract_file_json(file_path: &Path, json: &serde_json::Value) -> Result<Vec<StringEntry>> {
         let filename = file_path
             .file_name()
             .unwrap_or_default()
@@ -404,22 +407,20 @@ impl RpgMakerMvPlugin {
         let stem = Self::strip_data_ext(&filename);
         let stem_lower = stem.to_lowercase();
 
-        let json: serde_json::Value = serde_json::from_str(&content)?;
-
         if stem_lower == "system" {
-            return Self::extract_system(&filename, &json, file_path);
+            return Self::extract_system(&filename, json, file_path);
         }
         if stem_lower == "commonevents" {
-            return Self::extract_events_file(&filename, &json, file_path);
+            return Self::extract_events_file(&filename, json, file_path);
         }
         if stem_lower.starts_with("map") {
-            return Self::extract_map(&filename, &json, file_path);
+            return Self::extract_map(&filename, json, file_path);
         }
 
         // Array-of-objects file
         for af in ARRAY_FILES {
             if stem_lower == af.to_lowercase() {
-                return Self::extract_array_file(&filename, &json, file_path);
+                return Self::extract_array_file(&filename, json, file_path);
             }
         }
 
@@ -1452,8 +1453,13 @@ impl RpgMakerMvPlugin {
     }
 
     fn extract_iavra_pack_file(file_path: &Path) -> Result<Vec<StringEntry>> {
-        let (raw, _enc) = EncodingDetector::read_file_auto(file_path)?;
-        let content = Self::decode_data_file_text(file_path, &raw)?;
+        Self::extract_iavra_pack_json(file_path, &Self::read_data_json(file_path)?)
+    }
+
+    fn extract_iavra_pack_json(
+        file_path: &Path,
+        json: &serde_json::Value,
+    ) -> Result<Vec<StringEntry>> {
         let filename = file_path
             .file_name()
             .unwrap_or_default()
@@ -1466,7 +1472,6 @@ impl RpgMakerMvPlugin {
                 message: format!("not an Iavra lang pack name: {filename}"),
             })?;
 
-        let json: serde_json::Value = serde_json::from_str(&content)?;
         let obj = json.as_object().ok_or_else(|| LocustError::ParseError {
             file: file_path.display().to_string(),
             message: "Iavra lang pack root must be a JSON object".to_string(),
@@ -1875,106 +1880,16 @@ impl FormatPlugin for RpgMakerMvPlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
-        let mut files_modified = 0;
-        let mut strings_written = 0;
-        let mut strings_skipped = 0;
-        let mut skip_reasons = std::collections::BTreeMap::new();
-        let warnings = Vec::new();
-        let mut files_written: Vec<PathBuf> = Vec::new();
+        self.inject_with_originals(path, entries, &HashMap::new())
+    }
 
-        // Group entries by file
-        let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
-        for entry in entries {
-            let filename = entry
-                .file_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            by_file.entry(filename).or_default().push(entry);
-        }
-
-        let data_dir = if path.is_dir() {
-            Self::find_data_dir(path).unwrap_or_else(|| path.to_path_buf())
-        } else {
-            path.parent().unwrap_or(path).to_path_buf()
-        };
-
-        for (filename, file_entries) in &by_file {
-            let file_path = data_dir.join(filename);
-            if !file_path.exists() {
-                strings_skipped += file_entries.len();
-                *skip_reasons.entry("missing_target".into()).or_default() += file_entries.len();
-                continue;
-            }
-
-            let mut json = Self::read_data_json(&file_path)?;
-            // Resolve all expected values from the untouched file before any
-            // message-block splice changes command indices.
-            let current_entries = if Self::is_iavra_lang_pack_name(filename) {
-                Self::extract_iavra_pack_file(&file_path)?
-            } else {
-                Self::extract_file(&file_path)?
-            };
-            let current_by_id: HashMap<String, (String, Vec<String>)> = current_entries
-                .into_iter()
-                .map(|entry| (entry.id, (entry.source, entry.tags)))
-                .collect();
-            let mut file_changed = false;
-
-            // Message-block splices change command counts, so apply from the
-            // bottom of each event list up: earlier indices stay valid.
-            let mut ordered = file_entries.clone();
-            ordered.sort_by_key(|e| std::cmp::Reverse(last_cmd_index(&e.id)));
-
-            for entry in ordered {
-                if let Some(ref translation) = entry.translation {
-                    let Some((current, current_tags)) = current_by_id.get(&entry.id) else {
-                        strings_skipped += 1;
-                        *skip_reasons.entry("missing_target".into()).or_default() += 1;
-                        continue;
-                    };
-                    if current != &entry.source
-                        || (entry.tags.iter().any(|t| t == "d_text")
-                            && !current_tags.iter().any(|t| t == "d_text"))
-                    {
-                        strings_skipped += 1;
-                        *skip_reasons.entry("source_changed".into()).or_default() += 1;
-                        continue;
-                    }
-                    if translation == &entry.source {
-                        strings_skipped += 1;
-                        *skip_reasons.entry("unchanged".into()).or_default() += 1;
-                        continue;
-                    }
-                    // Replace mode reaches Iavra packs and multi-line database
-                    // `description` fields too, so restore line width here.
-                    // Message blocks then wrap each paragraph at their width floor.
-                    let translation = rewrap_to_source_width(&entry.source, translation);
-                    Self::apply_translation(&mut json, filename, &entry.id, &translation);
-                    strings_written += 1;
-                    file_changed = true;
-                } else {
-                    strings_skipped += 1;
-                    *skip_reasons.entry("untranslated".into()).or_default() += 1;
-                }
-            }
-
-            if file_changed {
-                Self::write_data_file(&file_path, &json)?;
-                files_modified += 1;
-                files_written.push(file_path.clone());
-            }
-        }
-
-        Ok(InjectionReport {
-            skip_reasons,
-            files_modified,
-            strings_written,
-            strings_skipped,
-            warnings,
-            files_written,
-        })
+    fn inject_revision(
+        &self,
+        path: &Path,
+        entries: &mut [StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<InjectionReport> {
+        self.inject_with_originals(path, entries, originals)
     }
 
     fn inject_add(
@@ -2072,6 +1987,139 @@ impl FormatPlugin for RpgMakerMvPlugin {
 }
 
 impl RpgMakerMvPlugin {
+    fn inject_with_originals(
+        &self,
+        path: &Path,
+        entries: &[StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<InjectionReport> {
+        let mut files_modified = 0;
+        let mut strings_written = 0;
+        let mut strings_skipped = 0;
+        let mut skip_reasons = std::collections::BTreeMap::new();
+        let warnings = Vec::new();
+        let mut files_written: Vec<PathBuf> = Vec::new();
+
+        // Group entries by file
+        let mut by_file: HashMap<String, Vec<&StringEntry>> = HashMap::new();
+        for entry in entries {
+            let filename = entry
+                .file_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            by_file.entry(filename).or_default().push(entry);
+        }
+
+        let data_dir = if path.is_dir() {
+            Self::find_data_dir(path).unwrap_or_else(|| path.to_path_buf())
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+
+        for (filename, file_entries) in &by_file {
+            let file_path = data_dir.join(filename);
+            if !file_path.exists() {
+                strings_skipped += file_entries.len();
+                *skip_reasons.entry("missing_target".into()).or_default() += file_entries.len();
+                continue;
+            }
+
+            // Core supplies originals only for verified prior Direct outputs.
+            // Rebuild in memory from the exact checked bytes so event indices,
+            // source widths and untranslated fields never depend on prior runs.
+            let original = originals
+                .get(&file_path)
+                .map(RevisionOriginal::read_bytes)
+                .transpose()?;
+            let mut json = if let Some(bytes) = &original {
+                Self::parse_data_json(&file_path, bytes)?
+            } else {
+                Self::read_data_json(&file_path)?
+            };
+            // Validate sources/tags against the same baseline before any splice.
+            // Files without revision proof retain the normal live-source checks.
+            let current_entries = if Self::is_iavra_lang_pack_name(filename) {
+                Self::extract_iavra_pack_json(&file_path, &json)?
+            } else {
+                Self::extract_file_json(&file_path, &json)?
+            };
+            let current_by_id: HashMap<String, (String, Vec<String>)> = current_entries
+                .into_iter()
+                .map(|entry| (entry.id, (entry.source, entry.tags)))
+                .collect();
+            let mut file_changed = false;
+            let mut json_changed = false;
+
+            // Message-block splices change command counts, so apply from the
+            // bottom of each event list up: earlier indices stay valid.
+            let mut ordered = file_entries.clone();
+            ordered.sort_by_key(|e| std::cmp::Reverse(last_cmd_index(&e.id)));
+
+            for entry in ordered {
+                if let Some(ref translation) = entry.translation {
+                    let Some((current, current_tags)) = current_by_id.get(&entry.id) else {
+                        strings_skipped += 1;
+                        *skip_reasons.entry("missing_target".into()).or_default() += 1;
+                        continue;
+                    };
+                    if current != &entry.source
+                        || (entry.tags.iter().any(|t| t == "d_text")
+                            && !current_tags.iter().any(|t| t == "d_text"))
+                    {
+                        strings_skipped += 1;
+                        *skip_reasons.entry("source_changed".into()).or_default() += 1;
+                        continue;
+                    }
+                    // On revision, restoring the original text is also an edit.
+                    if translation == &entry.source {
+                        if original.is_some() {
+                            strings_written += 1;
+                            file_changed = true;
+                        } else {
+                            strings_skipped += 1;
+                            *skip_reasons.entry("unchanged".into()).or_default() += 1;
+                        }
+                        // Keep original line breaks, just like a fresh injection.
+                        continue;
+                    }
+                    // Replace mode reaches Iavra packs and multi-line database
+                    // `description` fields too, so restore line width here.
+                    // Message blocks then wrap each paragraph at their width floor.
+                    let translation = rewrap_to_source_width(&entry.source, translation);
+                    Self::apply_translation(&mut json, filename, &entry.id, &translation);
+                    strings_written += 1;
+                    file_changed = true;
+                    json_changed = true;
+                } else {
+                    strings_skipped += 1;
+                    *skip_reasons.entry("untranslated".into()).or_default() += 1;
+                }
+            }
+
+            if file_changed {
+                match &original {
+                    // Restoring only source-valued translations is a pristine
+                    // no-op oracle: preserve its exact serialization and BOM.
+                    Some(bytes) if !json_changed => std::fs::write(&file_path, bytes)?,
+                    _ => Self::write_data_file(&file_path, &json)?,
+                }
+                files_modified += 1;
+                files_written.push(file_path.clone());
+            }
+        }
+
+        Ok(InjectionReport {
+            skip_reasons,
+            files_modified,
+            strings_written,
+            strings_skipped,
+            warnings,
+            files_written,
+        })
+    }
+
     /// Write JSON (pretty for .json, LZString base64 for .jsono).
     fn write_data_file(file_path: &Path, json: &serde_json::Value) -> Result<()> {
         let is_jsono = file_path
@@ -2093,7 +2141,11 @@ impl RpgMakerMvPlugin {
     }
 
     fn read_data_json(file_path: &Path) -> Result<serde_json::Value> {
-        let (raw, _enc) = EncodingDetector::read_file_auto(file_path)?;
+        Self::parse_data_json(file_path, &std::fs::read(file_path)?)
+    }
+
+    fn parse_data_json(file_path: &Path, bytes: &[u8]) -> Result<serde_json::Value> {
+        let (raw, _enc) = EncodingDetector::detect_and_decode(bytes)?;
         let content = Self::decode_data_file_text(file_path, &raw)?;
         Ok(serde_json::from_str(&content)?)
     }
