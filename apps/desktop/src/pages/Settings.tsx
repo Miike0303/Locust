@@ -14,6 +14,7 @@ import {
 import type { GlossaryEntry, TranslationRun, ProviderInfo, ConfigUpdate } from "../lib/api";
 import { applyAppearance, clampTableRowHeight, TABLE_ROW_HEIGHT_MAX, TABLE_ROW_HEIGHT_MIN } from "../lib/appearance";
 import { resolveProviderReadiness } from "../lib/providerReadiness";
+import { settingsQueryState } from "../lib/settingsQueryState";
 import {
   GROK_SUB_PROVIDER_ID,
   XAI_POLL_INTERVAL_MS,
@@ -125,6 +126,7 @@ function HistorySection() {
     queryKey: ["translation-runs"],
     queryFn: getTranslationRuns,
   });
+  const queryState = isError ? settingsQueryState(error) : null;
 
   const totals = useMemo(() => {
     const list = runs ?? [];
@@ -167,7 +169,13 @@ function HistorySection() {
         </div>
       )}
 
-      {isError && (
+      {queryState === "no_project" && (
+        <div role="status" className="text-sm text-gray-500 dark:text-gray-400">
+          {t("settings.history.noProject")}
+        </div>
+      )}
+
+      {queryState === "failed" && (
         <div className="text-sm text-red-600 dark:text-red-400">
           {t("settings.history.loadFailed", {
             error: (error as Error)?.message ?? t("settings.history.unknownError"),
@@ -762,11 +770,12 @@ function GlossarySection() {
   const [langPairOverride, setLangPairOverride] = useState<string | null>(null);
   const activePair = (langPairOverride ?? configPair).trim() || "ja-en";
 
-  const { data: entries, refetch, isLoading } = useQuery({
+  const { data: entries, refetch, isLoading, isError, error } = useQuery({
     queryKey: ["glossary", activePair],
     queryFn: () => getGlossary(activePair),
     enabled: !!activePair,
   });
+  const queryState = isError ? settingsQueryState(error) : null;
 
   const [filter, setFilter] = useState("");
   const [term, setTerm] = useState("");
@@ -900,6 +909,14 @@ function GlossarySection() {
         {isLoading ? (
           <p className="text-sm text-gray-500 dark:text-gray-400 flex items-center gap-2">
             <Loader size={14} className="animate-spin" /> {t("common.loading")}
+          </p>
+        ) : queryState === "no_project" ? (
+          <p role="status" className="text-sm text-gray-500 dark:text-gray-400">
+            {t("settings.glossary.noProject")}
+          </p>
+        ) : queryState === "failed" ? (
+          <p role="alert" className="text-sm text-red-600 dark:text-red-400">
+            {t("settings.glossary.loadFailed", { error: error?.message ?? "" })}
           </p>
         ) : filtered.length === 0 ? (
           <p className="text-sm text-gray-500 dark:text-gray-400">

@@ -2,6 +2,7 @@
  * Lightweight asserts (run: npx --yes tsx src/lib/i18n/i18n.test.ts).
  */
 import assert from "node:assert/strict";
+import { test } from "node:test";
 import { readFileSync, readdirSync } from "node:fs";
 import ts from "typescript";
 import { en } from "./en.ts";
@@ -44,6 +45,34 @@ assert.equal(
   ),
   "Hello, Ada",
 );
+
+for (const value of [String.raw`C:\$&\game`, "a$$b", "$`", "$'"]) {
+  test(`interpolation preserves replacement characters in ${JSON.stringify(value)}`, () => {
+    assert.equal(
+      translate({ message: "Before {path} after {path}." }, "en", "message", { path: value }),
+      `Before ${value} after ${value}.`,
+    );
+  });
+}
+
+test("interpolation only substitutes placeholders in the original template", () => {
+  for (const vars of [
+    { path: String.raw`C:\{name}\game`, name: "Ada" },
+    { name: "Ada", path: String.raw`C:\{name}\game` },
+  ]) {
+    assert.equal(
+      translate({ message: "{name}: {path}; {missing}" }, "en", "message", vars),
+      String.raw`Ada: C:\{name}\game; {missing}`,
+    );
+  }
+});
+
+test("interpolation only uses own, literal variable names", () => {
+  assert.equal(
+    translate({ message: "{a.b} {axb} {toString} {count}" }, "en", "message", { "a.b": "literal", count: 0 }),
+    "literal {axb} {toString} 0",
+  );
+});
 assert.equal(
   translate(
     {

@@ -135,3 +135,14 @@ export function localizeApiError(raw: string): string {
 	}
 	return body;
 }
+
+/** Keep the existing backend message identity when localizing an error for the UI. */
+export class ApiError extends Error {
+	readonly key: MessageKey | undefined;
+
+	constructor(raw: string) {
+		super(localizeApiError(raw));
+		this.name = "ApiError";
+		this.key = EXACT[parseApiError(raw.trim()).body];
+	}
+}

@@ -85,11 +85,9 @@ export function persistLocale(
 
 function interpolate(template: string, vars?: Vars): string {
   if (!vars) return template;
-  let out = template;
-  for (const [name, value] of Object.entries(vars)) {
-    out = out.replace(new RegExp(`\\{${name}\\}`, "g"), String(value));
-  }
-  return out;
+  return template.replace(/\{([^{}]+)\}/g, (placeholder, name: string) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : placeholder,
+  );
 }
 
 function isDev(): boolean {

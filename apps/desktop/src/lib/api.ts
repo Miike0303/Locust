@@ -1,7 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { addLog } from "../stores/logStore";
 import { t } from "./i18n";
-import { localizeApiError } from "./apiError";
+import { ApiError } from "./apiError";
+import { mergeRequestInit } from "./requestInit";
 import {
   PIVOT_OPEN_DB_HTTP_PATH,
   PIVOT_OPEN_DB_TAURI_CMD,
@@ -19,7 +20,7 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
     return await invoke<T>(cmd, args);
   } catch (e) {
     const raw = e instanceof Error ? e.message : String(e);
-    throw new Error(localizeApiError(raw));
+    throw new ApiError(raw);
   }
 }
 
@@ -56,10 +57,7 @@ async function request<T>(path: string, options?: RequestInit, quietStatus?: num
   const base = await baseUrl();
   let res: Response;
   try {
-    res = await fetch(`${base}${path}`, {
-      headers: { "Content-Type": "application/json", ...options?.headers },
-      ...options,
-    });
+    res = await fetch(`${base}${path}`, mergeRequestInit(options));
   } catch {
     throw unreachableBackend(base, path);
   }
@@ -68,7 +66,7 @@ async function request<T>(path: string, options?: RequestInit, quietStatus?: num
   if (!res.ok) {
     const text = await res.text();
     addLog("error", t("activity.api.httpError", { status: res.status, path }), text, "api");
-    throw new Error(localizeApiError(`${res.status}: ${text}`));
+    throw new ApiError(`${res.status}: ${text}`);
   }
   // 204 / empty body (DELETE, some POSTs) — do not call res.json()
   if (res.status === 204) return undefined as T;
@@ -92,7 +90,7 @@ async function requestText(path: string): Promise<string> {
   }
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(localizeApiError(`${res.status}: ${text}`));
+    throw new ApiError(`${res.status}: ${text}`);
   }
   return res.text();
 }
