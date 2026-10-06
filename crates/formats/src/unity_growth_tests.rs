@@ -103,7 +103,7 @@ fn fixture(version: u32, be: bool, tree: bool) -> Vec<u8> {
     out
 }
 
-fn object(sf: &SerializedFile, id: i64) -> &[u8] {
+fn object<'a>(sf: &'a SerializedFile<'_>, id: i64) -> &'a [u8] {
     let o = sf.objects.iter().find(|o| o.path_id == id).unwrap();
     &sf.data[o.data_abs as usize..o.data_abs as usize + o.byte_size as usize]
 }

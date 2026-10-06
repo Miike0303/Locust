@@ -1,11 +1,13 @@
 /// Integration tests against real game directories.
 /// Run with: cargo test -p locust-formats --test real_games -- --ignored --nocapture
-use std::path::Path;
+use std::path::PathBuf;
 
 #[test]
-#[ignore]
+#[ignore = "requires LOCUST_REAL_RPGMAKER_XP pointing to a Legend of Queen Opala - Origin game directory"]
 fn test_rpgmaker_xp_detect_and_extract() {
-    let game_dir = Path::new(r"D:\juegos\rpgm\en\LoQOO\Legend of Queen Opala - Origin");
+    let Some(game_dir) = env_path("LOCUST_REAL_RPGMAKER_XP") else {
+        return;
+    };
     if !game_dir.exists() {
         eprintln!("Skipping: game dir not found");
         return;
@@ -14,7 +16,7 @@ fn test_rpgmaker_xp_detect_and_extract() {
     let registry = locust_formats::default_registry();
 
     let plugin = registry
-        .detect(game_dir)
+        .detect(&game_dir)
         .expect("Should detect RPG Maker XP");
     assert_eq!(plugin.id(), "rpgmaker-vxa");
     println!("Detected as: {}", plugin.name());
@@ -25,7 +27,7 @@ fn test_rpgmaker_xp_detect_and_extract() {
     println!("Resolved exe to: {}", resolved.display());
     assert!(registry.detect(&resolved).is_some());
 
-    let entries = plugin.extract(game_dir).expect("Should extract strings");
+    let entries = plugin.extract(&game_dir).expect("Should extract strings");
     println!("RPG Maker XP: {} strings extracted", entries.len());
     assert!(!entries.is_empty(), "Should have extracted strings");
 
@@ -35,9 +37,11 @@ fn test_rpgmaker_xp_detect_and_extract() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires LOCUST_REAL_SUGARCUBE pointing to a The SUP game directory"]
 fn test_sugarcube_html_detect_and_extract() {
-    let game_dir = Path::new(r"D:\juegos\html\The SUP v1.0 backer version");
+    let Some(game_dir) = env_path("LOCUST_REAL_SUGARCUBE") else {
+        return;
+    };
     if !game_dir.exists() {
         eprintln!("Skipping: game dir not found");
         return;
@@ -45,7 +49,7 @@ fn test_sugarcube_html_detect_and_extract() {
 
     let registry = locust_formats::default_registry();
 
-    let plugin = registry.detect(game_dir).expect("Should detect SugarCube");
+    let plugin = registry.detect(&game_dir).expect("Should detect SugarCube");
     assert_eq!(plugin.id(), "sugarcube");
     println!("Detected as: {}", plugin.name());
 
@@ -54,7 +58,7 @@ fn test_sugarcube_html_detect_and_extract() {
     println!("Resolved html to: {}", resolved.display());
     assert!(registry.detect(&resolved).is_some());
 
-    let entries = plugin.extract(game_dir).expect("Should extract strings");
+    let entries = plugin.extract(&game_dir).expect("Should extract strings");
     println!("SugarCube: {} strings extracted", entries.len());
     assert!(!entries.is_empty(), "Should have extracted strings");
 
@@ -65,9 +69,11 @@ fn test_sugarcube_html_detect_and_extract() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires LOCUST_REAL_RENPY pointing to a FindingCloud9 game directory"]
 fn test_renpy_rpa_detect_and_extract() {
-    let game_dir = Path::new(r"D:\juegos\renpy\FindingCloud9-0.9.2-pc");
+    let Some(game_dir) = env_path("LOCUST_REAL_RENPY") else {
+        return;
+    };
     if !game_dir.exists() {
         eprintln!("Skipping: game dir not found");
         return;
@@ -75,7 +81,7 @@ fn test_renpy_rpa_detect_and_extract() {
 
     let registry = locust_formats::default_registry();
 
-    let plugin = registry.detect(game_dir).expect("Should detect Ren'Py");
+    let plugin = registry.detect(&game_dir).expect("Should detect Ren'Py");
     assert_eq!(plugin.id(), "renpy");
     println!("Detected as: {}", plugin.name());
 
@@ -84,7 +90,7 @@ fn test_renpy_rpa_detect_and_extract() {
     println!("Resolved exe to: {}", resolved.display());
     assert!(registry.detect(&resolved).is_some());
 
-    let entries = plugin.extract(game_dir).expect("Should extract strings");
+    let entries = plugin.extract(&game_dir).expect("Should extract strings");
     println!("Ren'Py: {} strings extracted", entries.len());
     assert!(
         !entries.is_empty(),
@@ -95,4 +101,12 @@ fn test_renpy_rpa_detect_and_extract() {
         let preview = &e.source[..e.source.len().min(80)];
         println!("  [{}] {}", &e.id[..e.id.len().min(50)], preview);
     }
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os(name);
+    if path.is_none() {
+        eprintln!("Skipping: {name} is unset");
+    }
+    path.map(PathBuf::from)
 }

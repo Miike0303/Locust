@@ -453,20 +453,35 @@ impl UnityPlugin {
         }
     }
 
-    fn inject_serialized_bytes(
+    /// Inject entries into a caller-owned SerializedFile buffer.
+    pub fn inject_serialized_bytes(
         bytes: &mut Vec<u8>,
         file_entries: &[&StringEntry],
         label: &str,
         report: &mut InjectionReport,
     ) -> bool {
+        let (modified, rebuilt) = Self::inject_serialized_slice(bytes, file_entries, label, report);
+        if let Some(rebuilt) = rebuilt {
+            *bytes = rebuilt;
+        }
+        modified
+    }
+
+    // Fixed-slot edits borrow the caller's storage. Only structural relayout
+    // needs a new output buffer; bundle nodes use this same path in place.
+    fn inject_serialized_slice(
+        bytes: &mut [u8],
+        file_entries: &[&StringEntry],
+        label: &str,
+        report: &mut InjectionReport,
+    ) -> (bool, Option<Vec<u8>>) {
         let mut modified = false;
-        let (rewriteable, technical_ranges): (_, Vec<_>) =
-            SerializedFile::parse(bytes.clone(), label)
-                .map(|sf| {
-                    let ranges = sf.forbidden_injection_byte_ranges();
-                    (sf.rewriteable_text_assets().unwrap_or_default(), ranges)
-                })
-                .unwrap_or_default();
+        let (rewriteable, technical_ranges): (_, Vec<_>) = SerializedFile::parse(&*bytes, label)
+            .map(|sf| {
+                let ranges = sf.forbidden_injection_byte_ranges();
+                (sf.rewriteable_text_assets().unwrap_or_default(), ranges)
+            })
+            .unwrap_or_default();
         let mut textasset_plan = std::collections::BTreeMap::new();
         let mut planned_writes = 0usize;
         let active: Vec<&StringEntry> = file_entries
@@ -855,7 +870,7 @@ impl UnityPlugin {
         // Fixed-offset edits above refer to the original image. Relayout is
         // deliberately last, including when multiple TextAssets change size.
         if !textasset_plan.is_empty() {
-            match SerializedFile::parse(bytes.clone(), label)
+            match SerializedFile::parse(&*bytes, label)
                 .and_then(|sf| {
                     for id in textasset_plan.keys() {
                         if sf.read_text_asset(*id)?.script != rewriteable[id].script {
@@ -869,9 +884,8 @@ impl UnityPlugin {
                 })
             {
                 Ok(rebuilt) => {
-                    *bytes = rebuilt;
                     report.strings_written += planned_writes;
-                    modified = true;
+                    return (true, Some(rebuilt));
                 }
                 Err(error) => {
                     report
@@ -881,11 +895,12 @@ impl UnityPlugin {
                 }
             }
         }
-        modified
+        (modified, None)
     }
 
     /// Structural TextAsset + heuristic scan (skipping TextAsset ranges).
-    fn extract_strings_from_assets(
+    /// Extract entries from an already loaded SerializedFile or bundle node.
+    pub fn extract_strings_from_assets(
         bytes: &[u8],
         filename: &str,
         file_path: &Path,
@@ -897,7 +912,7 @@ impl UnityPlugin {
         let mut skipped_performance_entries = Vec::new();
         let mut skip_ranges: Vec<(usize, usize)> = Vec::new();
 
-        match SerializedFile::parse(bytes.to_vec(), file_path) {
+        match SerializedFile::parse(bytes, file_path) {
             Ok(sf) => {
                 let rewriteable = sf.rewriteable_text_assets().unwrap_or_default();
                 // Structural ranges + MonoScript/Shader (type names / HLSL noise).
@@ -2953,25 +2968,12 @@ impl FormatPlugin for UnityPlugin {
                     }
                     continue;
                 };
-                let mut bytes = archive
-                    .node_bytes(&node)
-                    .map_err(unityfs_to_locust)?
-                    .to_vec();
                 let label = format!("{} / {node_path}", bundle_path.display());
-                let modified =
-                    Self::inject_serialized_bytes(&mut bytes, &node_entries, &label, &mut report);
-                if modified {
-                    if bytes.len() == node.size as usize {
-                        archive
-                            .replace_node(&node_path, &bytes)
-                            .map_err(unityfs_to_locust)?;
-                    } else {
-                        archive
-                            .resize_node(&node_path, &bytes)
-                            .map_err(unityfs_to_locust)?;
-                    }
-                    bundle_modified = true;
-                }
+                bundle_modified |= archive
+                    .edit_node(&node, |bytes| {
+                        Self::inject_serialized_slice(bytes, &node_entries, &label, &mut report)
+                    })
+                    .map_err(unityfs_to_locust)?;
             }
             if bundle_modified {
                 let out = archive.write_bytes().map_err(unityfs_to_locust)?;

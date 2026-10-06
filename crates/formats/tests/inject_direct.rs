@@ -1,26 +1,30 @@
 use locust_core::extraction::FormatPlugin;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[test]
-#[ignore]
+#[ignore = "requires LOCUST_REAL_SUGARCUBE_COPY pointing to an explicit game copy and LOCUST_REAL_SUGARCUBE_DB pointing to its translated database"]
 fn test_inject_sugarcube_direct() {
-    let game_dir = Path::new(r"D:\juegos\html\The SUP v1.0 backer version");
-    let db_path = Path::new(r"C:\Projects\Locust\The SUP v1.0 backer version.locust.db");
+    let (Some(game_dir), Some(db_path)) = (
+        env_path("LOCUST_REAL_SUGARCUBE_COPY"),
+        env_path("LOCUST_REAL_SUGARCUBE_DB"),
+    ) else {
+        return;
+    };
     if !game_dir.exists() || !db_path.exists() {
+        eprintln!("Skipping: game copy or translated database not found");
         return;
     }
 
     // Make a copy of just the HTML file to avoid modifying original
-    let output_dir = std::env::temp_dir().join("locust_sup_inject");
-    let _ = std::fs::remove_dir_all(&output_dir);
-    std::fs::create_dir_all(&output_dir).unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let output_dir = fixture.path();
     std::fs::copy(
         game_dir.join("The SUP.html"),
         output_dir.join("The SUP.html"),
     )
     .unwrap();
 
-    let db = locust_core::database::Database::open(db_path).unwrap();
+    let db = locust_core::database::Database::open(&db_path).unwrap();
     let mut entries = db
         .get_entries(&locust_core::database::EntryFilter::default())
         .unwrap();
@@ -37,36 +41,35 @@ fn test_inject_sugarcube_direct() {
     }
 
     let plugin = locust_formats::sugarcube::SugarCubePlugin::new();
-    let report = plugin.inject(&output_dir, &entries).unwrap();
+    let report = plugin.inject(output_dir, &entries).unwrap();
 
     println!("Files modified: {}", report.files_modified);
     println!("Strings written: {}", report.strings_written);
     println!("Strings skipped: {}", report.strings_skipped);
 
-    // Copy Images too
-    let src_images = game_dir.join("Images");
-    if src_images.exists() {
-        let _ = copy_dir_recursive(&src_images, &output_dir.join("Images"));
-    }
-
     println!("Output at: {}", output_dir.display());
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires LOCUST_REAL_RPGMAKER_XP_COPY pointing to an explicit game copy and LOCUST_REAL_RPGMAKER_XP_DB pointing to its translated database"]
 fn test_inject_rpgmaker_xp_direct() {
-    let game_dir = Path::new(r"D:\juegos\rpgm\en\LoQOO\Legend of Queen Opala - Origin");
-    let db_path = Path::new(r"C:\Projects\Locust\Legend of Queen Opala - Origin.locust.db");
+    let (Some(game_dir), Some(db_path)) = (
+        env_path("LOCUST_REAL_RPGMAKER_XP_COPY"),
+        env_path("LOCUST_REAL_RPGMAKER_XP_DB"),
+    ) else {
+        return;
+    };
     if !game_dir.exists() || !db_path.exists() {
+        eprintln!("Skipping: game copy or translated database not found");
         return;
     }
 
     // Copy only the Data directory
-    let output_dir = std::env::temp_dir().join("locust_loqo_inject");
-    let _ = std::fs::remove_dir_all(&output_dir);
-    let _ = copy_dir_recursive(game_dir, &output_dir);
+    let fixture = tempfile::tempdir().unwrap();
+    let output_dir = fixture.path();
+    copy_dir_recursive(&game_dir.join("Data"), &output_dir.join("Data")).unwrap();
 
-    let db = locust_core::database::Database::open(db_path).unwrap();
+    let db = locust_core::database::Database::open(&db_path).unwrap();
     let mut entries = db
         .get_entries(&locust_core::database::EntryFilter::default())
         .unwrap();
@@ -88,7 +91,7 @@ fn test_inject_rpgmaker_xp_direct() {
     }
 
     let plugin = locust_formats::rpgmaker_vxa::RpgMakerVxaPlugin::new();
-    let report = plugin.inject(&output_dir, &entries).unwrap();
+    let report = plugin.inject(output_dir, &entries).unwrap();
 
     println!("Files modified: {}", report.files_modified);
     println!("Strings written: {}", report.strings_written);
@@ -109,4 +112,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os(name);
+    if path.is_none() {
+        eprintln!("Skipping: {name} is unset");
+    }
+    path.map(PathBuf::from)
 }

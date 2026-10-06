@@ -193,6 +193,30 @@ impl UnityFsArchive {
         Ok(&self.uncompressed[start..end])
     }
 
+    /// Edit fixed slots directly in storage, accepting a new buffer only when
+    /// the SerializedFile writer must rebuild its object layout.
+    pub(crate) fn edit_node(
+        &mut self,
+        node: &DirectoryNode,
+        edit: impl FnOnce(&mut [u8]) -> (bool, Option<Vec<u8>>),
+    ) -> Result<bool, UnityFsError> {
+        self.node_bytes(node)?;
+        let start = node.offset as usize;
+        let end = start + node.size as usize;
+        let (modified, rebuilt) = edit(&mut self.uncompressed[start..end]);
+        if let Some(bytes) = rebuilt {
+            if bytes.len() == node.size as usize {
+                self.replace_node(&node.path, &bytes)?;
+            } else {
+                self.resize_node(&node.path, &bytes)?;
+            }
+        }
+        if modified {
+            self.info_hash = [0; 16];
+        }
+        Ok(modified)
+    }
+
     /// Overwrite a node's payload. Size must match (in-place SerializedFile padding).
     pub fn replace_node(&mut self, node_path: &str, data: &[u8]) -> Result<(), UnityFsError> {
         let label = self.path.display().to_string();
@@ -538,7 +562,7 @@ fn parse_archive(
         if data.len() < csize {
             return Err(err(label, "truncated blocks-info at end"));
         }
-        data[data.len() - csize..].to_vec()
+        &data[data.len() - csize..]
     } else {
         let end = pos
             .checked_add(csize)
@@ -546,14 +570,14 @@ fn parse_archive(
         if end > data.len() {
             return Err(err(label, "truncated blocks-info"));
         }
-        let slice = data[pos..end].to_vec();
+        let slice = &data[pos..end];
         pos = end;
         slice
     };
 
     let blocks_info = decompress_blob(
         flags & COMPRESSION_MASK,
-        &blocks_info_compr,
+        blocks_info_compr,
         usize_info,
         label,
         "blocks-info",
@@ -601,14 +625,14 @@ fn parse_archive(
         if end > data_limit {
             return Err(err(label, format!("truncated storage block {i}")));
         }
-        let chunk = decompress_blob(
+        decompress_blob_into(
             block.compression(),
             &data[pos..end],
             block.uncompressed_size as usize,
             label,
             &format!("storage block {i}"),
+            &mut uncompressed,
         )?;
-        uncompressed.extend_from_slice(&chunk);
         encoded_spans.push(pos..end);
         pos = end;
     }
@@ -947,6 +971,21 @@ fn decompress_blob(
     label: &str,
     what: &str,
 ) -> Result<Vec<u8>, UnityFsError> {
+    let mut out = Vec::new();
+    decompress_blob_into(kind, src, uncompressed, label, what, &mut out)?;
+    Ok(out)
+}
+
+// Decode directly into the archive's destination allocation. A single storage
+// block can span the entire archive; staging it would duplicate that buffer.
+fn decompress_blob_into(
+    kind: u32,
+    src: &[u8],
+    uncompressed: usize,
+    label: &str,
+    what: &str,
+    out: &mut Vec<u8>,
+) -> Result<(), UnityFsError> {
     match kind {
         COMPRESSION_NONE => {
             if src.len() != uncompressed {
@@ -958,11 +997,18 @@ fn decompress_blob(
                     ),
                 ));
             }
-            Ok(src.to_vec())
+            out.extend_from_slice(src);
+            Ok(())
         }
-        COMPRESSION_LZ4 | COMPRESSION_LZ4HC => lz4_flex::decompress(src, uncompressed)
-            .map_err(|e| err(label, format!("{what}: LZ4 decompress failed: {e}"))),
-        COMPRESSION_LZMA => decompress_lzma(src, uncompressed, label, what),
+        COMPRESSION_LZ4 | COMPRESSION_LZ4HC => {
+            let start = out.len();
+            out.resize(start + uncompressed, 0);
+            let written = lz4_flex::decompress_into(src, &mut out[start..])
+                .map_err(|e| err(label, format!("{what}: LZ4 decompress failed: {e}")))?;
+            out.truncate(start + written);
+            Ok(())
+        }
+        COMPRESSION_LZMA => decompress_lzma_into(src, uncompressed, label, what, out),
         other => Err(err(
             label,
             format!("{what}: unsupported compression type {other}"),
@@ -971,36 +1017,36 @@ fn decompress_blob(
 }
 
 /// Unity LZMA storage: 5-byte properties + payload (no 8-byte unpacked-size field).
-fn decompress_lzma(
+fn decompress_lzma_into(
     src: &[u8],
     uncompressed: usize,
     label: &str,
     what: &str,
-) -> Result<Vec<u8>, UnityFsError> {
+    out: &mut Vec<u8>,
+) -> Result<(), UnityFsError> {
+    use std::io::Read;
     if src.len() < 5 {
         return Err(err(
             label,
             format!("{what}: LZMA blob shorter than 5-byte properties"),
         ));
     }
-    let mut headered = Vec::with_capacity(13 + src.len() - 5);
-    headered.extend_from_slice(&src[..5]);
-    headered.extend_from_slice(&(uncompressed as u64).to_le_bytes());
-    headered.extend_from_slice(&src[5..]);
-    let mut input = Cursor::new(headered);
-    let mut out = Vec::with_capacity(uncompressed);
-    lzma_rs::lzma_decompress(&mut input, &mut out)
+    let mut header = [0; 13];
+    header[..5].copy_from_slice(&src[..5]);
+    header[5..].copy_from_slice(&(uncompressed as u64).to_le_bytes());
+    let mut input = Cursor::new(header).chain(&src[5..]);
+    let start = out.len();
+    out.reserve(uncompressed);
+    lzma_rs::lzma_decompress(&mut input, out)
         .map_err(|e| err(label, format!("{what}: LZMA decompress failed: {e}")))?;
-    if out.len() != uncompressed {
+    let written = out.len() - start;
+    if written != uncompressed {
         return Err(err(
             label,
-            format!(
-                "{what}: LZMA produced {} bytes, expected {uncompressed}",
-                out.len()
-            ),
+            format!("{what}: LZMA produced {written} bytes, expected {uncompressed}"),
         ));
     }
-    Ok(out)
+    Ok(())
 }
 
 fn align_up(pos: usize, n: usize) -> usize {
