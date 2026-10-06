@@ -105,6 +105,21 @@ pub trait FormatPlugin: Send + Sync {
         Ok(())
     }
 
+    /// Inject into a private Direct transaction copy using verified originals.
+    /// Core has verified the previous output and pristine provenance; each
+    /// reader additionally verifies the exact original bytes consumed. Binary
+    /// plugins may rebuild from those bytes instead of retargeting locators.
+    /// Only completed output may be written to `path`, never to the originals.
+    fn inject_revision(
+        &self,
+        path: &Path,
+        entries: &mut [StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<InjectionReport> {
+        self.prepare_revision_entries(entries, originals)?;
+        self.inject(path, entries)
+    }
+
     /// Inject while the caller retains exclusive access to this selection.
     /// Plugins which acquire their own game lock must override this method and
     /// reuse the validated guard instead of acquiring a second lock.
@@ -264,15 +279,15 @@ pub fn inject_direct(
         || prepare_direct_backup(db, backup_manager, game_path, recording_root, languages),
         |work, selected_copy, run| {
             let mut entries = entries_for_copy(translated, game_path, work)?;
-            prepare_direct_revision(
+            inject_direct_revision(
                 plugin,
                 &mut entries,
                 backup_manager,
                 recording_root,
                 work,
+                selected_copy,
                 run,
-            )?;
-            plugin.inject(selected_copy, &entries)
+            )
         },
         |report, run| {
             record_direct_injection(db, backup_manager, languages, recording_root, report, run)
@@ -394,19 +409,20 @@ struct DirectPriorMerge {
     provenance: Option<RecordedBackup>,
 }
 
-fn prepare_direct_revision(
+fn inject_direct_revision(
     plugin: &dyn FormatPlugin,
     entries: &mut [StringEntry],
     backup_manager: &BackupManager,
     recording_root: &Path,
     work: &Path,
+    selected_copy: &Path,
     run: &DirectBackupRun,
-) -> Result<()> {
+) -> Result<InjectionReport> {
     let Some(prior) = &run.prior else {
-        return Ok(());
+        return plugin.inject(selected_copy, entries);
     };
     let Some(provenance) = &prior.provenance else {
-        return Ok(());
+        return plugin.inject(selected_copy, entries);
     };
     let manager = provenance
         .storage_root
@@ -443,7 +459,9 @@ fn prepare_direct_revision(
                     originals.insert(current, original);
                 }
             }
-            plugin.prepare_revision_entries(entries, &originals)
+            // Some backup formats materialize a temporary pristine tree, so
+            // consume the readers while the verified tree is still alive.
+            plugin.inject_revision(selected_copy, entries, &originals)
         })
 }
 
@@ -556,7 +574,7 @@ fn verify_recorded_injection_member(
     match crate::database::sha256_file(&absolute) {
         Ok((hash, size)) if hash == file.hash && size == file.size => Ok(absolute),
         Ok(_) => Err(LocustError::InjectionError(format!(
-            "previously injected file \"{}\" no longer matches its recorded hash/size; refusing to install new output until that file is restored",
+            "source_changed: previously injected file \"{}\" no longer matches its recorded hash/size; refusing to install new output until that file is restored",
             file.rel
         ))),
         Err(error) => Err(LocustError::InjectionError(format!(

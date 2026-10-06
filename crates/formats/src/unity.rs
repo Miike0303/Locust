@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use locust_core::backup::RevisionOriginal;
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
@@ -460,7 +461,8 @@ impl UnityPlugin {
         label: &str,
         report: &mut InjectionReport,
     ) -> bool {
-        let (modified, rebuilt) = Self::inject_serialized_slice(bytes, file_entries, label, report);
+        let (modified, rebuilt) =
+            Self::inject_serialized_slice(bytes, file_entries, label, report, false);
         if let Some(rebuilt) = rebuilt {
             *bytes = rebuilt;
         }
@@ -474,6 +476,7 @@ impl UnityPlugin {
         file_entries: &[&StringEntry],
         label: &str,
         report: &mut InjectionReport,
+        replay: bool,
     ) -> (bool, Option<Vec<u8>>) {
         let mut modified = false;
         let (rewriteable, technical_ranges): (_, Vec<_>) = SerializedFile::parse(&*bytes, label)
@@ -487,7 +490,7 @@ impl UnityPlugin {
         let active: Vec<&StringEntry> = file_entries
             .iter()
             .copied()
-            .filter(|entry| entry_needs_write(entry, report))
+            .filter(|entry| binary_entry_needs_write(entry, report, replay))
             .collect();
         let file_entries = active.as_slice();
         // CSV cells and locale lines share one binary slot. Only changed, valid
@@ -588,10 +591,6 @@ impl UnityPlugin {
                     continue;
                 }
             };
-            if translation == &entry.source {
-                report.skip("unchanged", 1);
-                continue;
-            }
             let (off_key, len_key, kind) = if is_textasset_entry(entry) {
                 (
                     "textasset_script_offset",
@@ -707,10 +706,6 @@ impl UnityPlugin {
             };
             let orig_bytes = entry.source.as_bytes();
             let trans_bytes = translation.as_bytes();
-            if trans_bytes == orig_bytes {
-                report.skip("unchanged", 1);
-                continue;
-            }
             if trans_bytes.len() > orig_bytes.len() {
                 if report.skip_reasons.get("too_long").copied().unwrap_or(0) < 5 {
                     report.warnings.push(format!(
@@ -1974,12 +1969,22 @@ fn empty_injection_report() -> InjectionReport {
 }
 
 fn entry_needs_write(entry: &StringEntry, report: &mut InjectionReport) -> bool {
+    binary_entry_needs_write(entry, report, false)
+}
+
+fn binary_entry_needs_write(
+    entry: &StringEntry,
+    report: &mut InjectionReport,
+    replay: bool,
+) -> bool {
     match entry.translation.as_deref() {
         None | Some("") => {
             report.skip("untranslated", 1);
             false
         }
-        Some(t) if t == entry.source => {
+        // In a pristine rebuild, identity translations restore the source.
+        // They still go through the very same slot/source validation below.
+        Some(t) if t == entry.source && !replay => {
             report.skip("unchanged", 1);
             false
         }
@@ -2902,6 +2907,32 @@ impl FormatPlugin for UnityPlugin {
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
+        self.inject_with_originals(path, entries, &HashMap::new())
+    }
+
+    fn revision_original_path(&self, file_path: &Path) -> PathBuf {
+        Self::resolve_unityfs_virtual_path(file_path)
+            .map(|(bundle, _)| bundle)
+            .unwrap_or_else(|| file_path.to_path_buf())
+    }
+
+    fn inject_revision(
+        &self,
+        path: &Path,
+        entries: &mut [StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<InjectionReport> {
+        self.inject_with_originals(path, entries, originals)
+    }
+}
+
+impl UnityPlugin {
+    fn inject_with_originals(
+        &self,
+        path: &Path,
+        entries: &[StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<InjectionReport> {
         // Route per entry: a single external .txt must not hide binary entries.
         let (text, binary): (Vec<&StringEntry>, Vec<&StringEntry>) = entries
             .iter()
@@ -2911,7 +2942,8 @@ impl FormatPlugin for UnityPlugin {
 
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
         for entry in entries {
-            if entry_needs_write(entry, &mut report) {
+            let replay = originals.contains_key(&self.revision_original_path(&entry.file_path));
+            if binary_entry_needs_write(entry, &mut report, replay) {
                 by_file
                     .entry(entry.file_path.clone())
                     .or_default()
@@ -2923,10 +2955,24 @@ impl FormatPlugin for UnityPlugin {
 
         for (file_path, file_entries) in &by_file {
             if file_path.is_file() {
-                let mut bytes = std::fs::read(file_path)?;
+                // Rebuild each revision from the pristine image. This keeps
+                // all source checks, fixed offsets and resize capabilities
+                // tied to the extraction, independent of previous relayouts.
+                let mut bytes = match originals.get(file_path) {
+                    Some(original) => original.read_bytes()?,
+                    None => std::fs::read(file_path)?,
+                };
                 let label = file_path.display().to_string();
-                let modified =
-                    Self::inject_serialized_bytes(&mut bytes, file_entries, &label, &mut report);
+                let (modified, rebuilt) = Self::inject_serialized_slice(
+                    &mut bytes,
+                    file_entries,
+                    &label,
+                    &mut report,
+                    originals.contains_key(file_path),
+                );
+                if let Some(rebuilt) = rebuilt {
+                    bytes = rebuilt;
+                }
                 if modified {
                     std::fs::write(file_path, &bytes)?;
                     report.files_modified += 1;
@@ -2951,8 +2997,14 @@ impl FormatPlugin for UnityPlugin {
         }
 
         for (bundle_path, nodes) in unityfs_jobs {
-            let mut archive = crate::unity_fs::UnityFsArchive::parse_path(&bundle_path)
-                .map_err(unityfs_to_locust)?;
+            let replay = originals.contains_key(&bundle_path);
+            let mut archive = match originals.get(&bundle_path) {
+                Some(original) => {
+                    crate::unity_fs::UnityFsArchive::parse(original.read_bytes()?, &bundle_path)
+                }
+                None => crate::unity_fs::UnityFsArchive::parse_path(&bundle_path),
+            }
+            .map_err(unityfs_to_locust)?;
             let mut bundle_modified = false;
             for (node_path, node_entries) in nodes {
                 let Some(node) = archive.node(&node_path).cloned() else {
@@ -2971,7 +3023,13 @@ impl FormatPlugin for UnityPlugin {
                 let label = format!("{} / {node_path}", bundle_path.display());
                 bundle_modified |= archive
                     .edit_node(&node, |bytes| {
-                        Self::inject_serialized_slice(bytes, &node_entries, &label, &mut report)
+                        Self::inject_serialized_slice(
+                            bytes,
+                            &node_entries,
+                            &label,
+                            &mut report,
+                            replay,
+                        )
                     })
                     .map_err(unityfs_to_locust)?;
             }
@@ -2993,6 +3051,10 @@ impl FormatPlugin for UnityPlugin {
         Ok(report)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/unity_revision.rs"]
+mod revision_tests;
 
 #[cfg(test)]
 mod tests {
