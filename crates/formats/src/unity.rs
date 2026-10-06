@@ -893,6 +893,8 @@ impl UnityPlugin {
         let mut entries = Vec::new();
         // Keep newly enabled name rows out of the legacy heuristic ID counter.
         let mut display_name_entries = Vec::new();
+        // Removed performance rows still occupy their pre-115 counter slots.
+        let mut skipped_performance_entries = Vec::new();
         let mut skip_ranges: Vec<(usize, usize)> = Vec::new();
 
         match SerializedFile::parse(bytes.to_vec(), file_path) {
@@ -903,11 +905,15 @@ impl UnityPlugin {
                 for obj in sf.text_asset_objects() {
                     match sf.read_text_asset_object(obj) {
                         Ok(ta) => {
-                            // The object's range is already excluded from the
-                            // heuristic scan, even when its script is rejected.
-                            if is_performance_test_config(&ta.name, &ta.script) {
-                                continue;
-                            }
+                            // Use the same extraction path to count exactly the
+                            // legacy rows, including split or rejected scripts.
+                            // The object's range remains excluded from heuristics.
+                            let textasset_entries =
+                                if is_performance_test_config(&ta.name, &ta.script) {
+                                    &mut skipped_performance_entries
+                                } else {
+                                    &mut entries
+                                };
                             let character_names = parse_character_names_lines(&ta.name, &ta.script);
                             let is_character_names = character_names.is_some();
                             if character_names.is_none()
@@ -1018,7 +1024,7 @@ impl UnityPlugin {
                                         mark_textasset_rewrite(entry, sf.header.version);
                                     }
                                 }
-                                entries.extend(group_entries);
+                                textasset_entries.extend(group_entries);
                                 continue;
                             }
                             // Naninovel ManagedText / locale docs: split Key: Value lines
@@ -1123,7 +1129,7 @@ impl UnityPlugin {
                                 if is_character_names {
                                     display_name_entries.extend(group_entries);
                                 } else {
-                                    entries.extend(group_entries);
+                                    textasset_entries.extend(group_entries);
                                 }
                                 continue;
                             }
@@ -1164,7 +1170,7 @@ impl UnityPlugin {
                             if rewriteable.contains_key(&ta.path_id) {
                                 mark_textasset_rewrite(&mut entry, sf.header.version);
                             }
-                            entries.push(entry);
+                            textasset_entries.push(entry);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1371,7 +1377,12 @@ impl UnityPlugin {
                 // Keep every offset occurrence (do not de-dupe by text). Repeated
                 // UI labels in binary blobs each need their own inject needle.
                 if is_unity_translatable(text) {
-                    let id = format!("{}#offset_{}#{}", filename, i, entries.len());
+                    let id = format!(
+                        "{}#offset_{}#{}",
+                        filename,
+                        i,
+                        entries.len() + skipped_performance_entries.len()
+                    );
                     let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
                     entry.tags = vec!["unknown".to_string()];
                     entry.metadata.insert(
@@ -4676,6 +4687,65 @@ script Chapter_1_script chapter 1 {
         assert_eq!(&out[offsets[1] + 4..offsets[1] + 12], b"Only2nd!");
         assert_eq!(&out[offsets[2] + 4..offsets[2] + 12], b"Changed!");
         assert_eq!(&out[offsets[3] + 4..offsets[3] + 12], b"Other!!!");
+    }
+
+    fn assert_performance_textasset_preserves_heuristic_ids(script: &str, legacy_rows: usize) {
+        let name = "PerformanceTestRunSettings";
+        assert!(is_performance_test_config(name, script));
+        let path = Path::new("resources.assets");
+        let mut bytes = crate::unity_serialized::write_v17_fixture_ex(name, script, None);
+        let dialogue = "Additional visible dialogue!";
+        let offset = bytes.len();
+        for _ in 0..2 {
+            bytes.extend_from_slice(&(dialogue.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(dialogue.as_bytes());
+            bytes.resize((bytes.len() + 3) & !3, 0);
+        }
+        let file_size = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&file_size.to_be_bytes());
+        let mut unfiltered = bytes.clone();
+        let name_offset = unfiltered
+            .windows(name.len())
+            .position(|v| v == name.as_bytes())
+            .unwrap();
+        // Disable only the performance-name filter without moving any bytes:
+        // the same script follows the pre-115 TextAsset extraction path.
+        unfiltered[name_offset] = b'X';
+        let before =
+            UnityPlugin::extract_strings_from_assets(&unfiltered, "resources.assets", path);
+        let after = UnityPlugin::extract_strings_from_assets(&bytes, "resources.assets", path);
+        assert_eq!(before.len(), legacy_rows + 2, "{before:?}");
+        assert_eq!(
+            after.len(),
+            2,
+            "performance rows must stay hidden: {after:?}"
+        );
+        assert_eq!(
+            before[legacy_rows].id,
+            format!("resources.assets#offset_{offset}#{legacy_rows}")
+        );
+        for (old, new) in before[legacy_rows..].iter().zip(&after) {
+            assert_eq!(old.source, dialogue);
+            assert_eq!(new.source, old.source);
+            assert_eq!(new.metadata, old.metadata);
+            assert_eq!(
+                new.id, old.id,
+                "filtered TextAsset must reserve legacy slots"
+            );
+        }
+    }
+
+    #[test]
+    fn performance_textasset_preserves_legacy_heuristic_ids() {
+        assert_performance_textasset_preserves_heuristic_ids(r#"{"MeasurementCount":-1}"#, 1);
+    }
+
+    #[test]
+    fn performance_textasset_preserves_multiline_legacy_heuristic_ids() {
+        assert_performance_textasset_preserves_heuristic_ids(
+            "{\"MeasurementCount\": -1,\n\"WarmupCount\": 1,\n\"Iterations\": 2}",
+            3,
+        );
     }
 
     #[test]
