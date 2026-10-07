@@ -821,44 +821,15 @@ struct PatchIdentityArgs {
 
 impl PatchIdentityArgs {
     fn resolve(&self, path: &Path) -> anyhow::Result<locust_core::patch::GameIdentity> {
-        use locust_core::patch::{detect_dlsite_code, normalize_dlsite_code, GameIdentity};
-
-        let mut game = GameIdentity::default();
-        if let Some(code) = &self.rj {
-            game.store_ids
-                .insert("dlsite".into(), normalize_dlsite_code(code)?);
-        }
-        for value in &self.store_id {
-            let (store, id) = value.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!("invalid --store-id {value:?}: expected store=id")
-            })?;
-            let store = store.trim().to_lowercase();
-            let id = id.trim();
-            if store.is_empty() || id.is_empty() {
-                anyhow::bail!("invalid --store-id {value:?}: store and id must not be empty");
-            }
-            if game.store_ids.contains_key(&store) {
-                anyhow::bail!("duplicate store key {store:?}; supply each store only once");
-            }
-            let id = if store == "dlsite" {
-                normalize_dlsite_code(id)?
-            } else {
-                id.to_string()
-            };
-            game.store_ids.insert(store, id);
-        }
-        if let Some(version) = &self.game_version {
-            let version = version.trim();
-            if version.is_empty() {
-                anyhow::bail!("game version must not be empty (--game-version)");
-            }
-            game.game_version = Some(version.to_string());
-        }
-        if !self.no_detect_id && !game.store_ids.contains_key("dlsite") {
-            if let Some(code) = detect_dlsite_code(path) {
-                println!("Detected DLsite id {code} from path");
-                game.store_ids.insert("dlsite".into(), code);
-            }
+        let (game, detected) = locust_core::patch::identity::resolve_patch_identity(
+            self.rj.as_deref(),
+            &self.store_id,
+            self.game_version.as_deref(),
+            !self.no_detect_id,
+            path,
+        )?;
+        if let Some(code) = detected {
+            println!("Detected DLsite id {code} from path");
         }
         Ok(game)
     }
@@ -957,134 +928,34 @@ fn cmd_patch(
     Ok(())
 }
 
-/// Validate the optional companion file before publishing any patch output.
 fn validate_astro_output(
-    path: &std::path::Path,
-    game_path: &std::path::Path,
-    project: &std::path::Path,
-    zip: &std::path::Path,
-    pristine: Option<&std::path::Path>,
+    path: &Path,
+    game_path: &Path,
+    project: &Path,
+    zip: &Path,
+    pristine: Option<&Path>,
 ) -> anyhow::Result<()> {
-    use locust_core::patch::ensure_pack_output_outside;
-    if path.try_exists()? {
-        anyhow::bail!(
-            "Astro output already exists; choose a new file: {}",
-            path.display()
-        );
-    }
-    for protected in [game_path, project, zip, locust_backup_root().as_path()] {
-        ensure_pack_output_outside(path, protected)?;
-    }
-    if let Some(pristine) = pristine {
-        ensure_pack_output_outside(path, pristine)?;
-    }
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = project.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        ensure_pack_output_outside(path, std::path::Path::new(&sidecar))?;
-    }
-    Ok(())
+    locust_core::patch::release_entry::validate_release_entry_output(
+        path,
+        game_path,
+        project,
+        zip,
+        pristine,
+        &locust_backup_root(),
+    )
 }
 
-/// Write a starter rule95 content file without replacing an existing file.
 fn write_astro_stub(
-    path: &std::path::Path,
-    game_path: &std::path::Path,
+    path: &Path,
+    game_path: &Path,
     lang: Option<&str>,
     zip_path: &Path,
 ) -> anyhow::Result<()> {
-    use locust_core::database::sha256_file;
-    use locust_core::patch::PatchManifest;
-
-    let mut zip = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
-    let manifest: PatchManifest = serde_json::from_reader(zip.by_name(PatchManifest::FILENAME)?)?;
-    let (zip_sha256, zip_size) = sha256_file(zip_path)?;
-    // JSON strings are also valid YAML strings, including quotes and newlines.
-    let quoted = |text: &str| serde_json::to_string(text).expect("string serialization");
-    let game = manifest.game.as_ref();
-    let rj = game
-        .and_then(|g| g.store_ids.get("dlsite"))
-        .map(|code| format!("rjCode: {}\n", quoted(code)))
-        .unwrap_or_default();
-    let game_version = quoted(
-        game.and_then(|g| g.game_version.as_deref())
-            .unwrap_or("TODO"),
-    );
-    let file = zip_path.file_name().unwrap_or_default().to_string_lossy();
-    let mut patch = format!(
-        "patch:\n  id: {}\n  file: {}\n  size: {zip_size}\n  sha256: {}\n  language: {}\n",
-        quoted(&manifest.patch_id),
-        quoted(&file),
-        quoted(&zip_sha256),
-        quoted(&manifest.language)
-    );
-    let fingerprint = game.map(|g| g.fingerprint.as_slice()).unwrap_or_default();
-    if fingerprint.is_empty() {
-        patch.push_str("  fingerprint: []\n");
-    } else {
-        patch.push_str("  fingerprint:\n");
-        for entry in fingerprint {
-            patch.push_str(&format!(
-                "    - path: {}\n      size: {}\n      sha256: {}\n",
-                quoted(&entry.path),
-                entry.size,
-                quoted(&entry.sha256)
-            ));
-        }
-    }
-    let title = game_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let engine_hint = locust_formats::default_registry()
+    let engine = locust_formats::default_registry()
         .detect(game_path)
         .map(|p| p.id().to_string())
-        .unwrap_or_else(|| "other".to_string());
-    let target = lang.unwrap_or("es");
-    let yaml_title = quoted(&title);
-
-    let md = format!(
-        "---\n\
-         gameTitle: {yaml_title}\n\
-         {rj}\
-         sourceLang: \"en\"        # TODO: ja | en | zh | ko | other\n\
-         engine: \"{engine_hint}\"  # TODO: pick from the schema enum (rpgmaker-mv/mz/xp/vxace, ...)\n\
-         tags: []\n\
-         platforms: []            # F95 | DLsite | Ryuugames | Steam | Itch | Other\n\
-         originalCreator:\n\
-         \x20 name: \"TODO\"\n\
-         \x20 links: []            # [{{ label: \"Patreon\", url: \"https://...\" }}]\n\
-         storePage: \"\"           # TODO original game page\n\
-         gameVersion: {game_version}\n\
-         translationVersion: \"1.0\"\n\
-         translationStatus: \"complete\"   # complete | in-progress\n\
-         gameStatus: \"ongoing\"           # completed | ongoing\n\
-         cover: \"\"               # TODO R2 URL\n\
-         screenshots: []          # TODO R2 URLs\n\
-         mirrors: []              # fill after uploading the patch zip to R2\n\
-         dateAdded: TODO-YYYY-MM-DD\n\
-         {patch}\
-         ---\n\n\
-         Translation into {target} of *{title}*, made with Locust.\n\n\
-         **How to apply:** Download the patch ZIP, then select it in Rule95 Patcher. \
-         Select the original game folder and choose Apply patch. The patcher \
-         verifies the game files and creates a restorable backup. Choose \
-         Undo last patch in Rule95 Patcher to restore the game.\n"
-    );
-
-    // Never truncate a destination (including one created after preflight).
-    // Publish only a complete file; a failed write leaves no partial stub.
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::Write::write_all(&mut temporary, md.as_bytes())?;
-    temporary.as_file().sync_all()?;
-    temporary.persist_noclobber(path)?;
-    Ok(())
+        .unwrap_or_else(|| "other".into());
+    locust_core::patch::release_entry::write_release_entry(path, game_path, lang, zip_path, &engine)
 }
 
 fn detect_engine_label(game_path: &std::path::Path) -> String {

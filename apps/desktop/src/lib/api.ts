@@ -779,6 +779,11 @@ export const patchStatus = (params: Pick<PatchPathsParams, "game_path">): Promis
   request("/patch/status", { method: "POST", body: JSON.stringify(params) });
 
 export interface PatchPackParams {
+  rj_code?: string;
+  store_ids?: string[];
+  game_version?: string;
+  detect_id?: boolean;
+  entry_path?: string;
   game_path: string;
   output_path: string;
   /** At most one language; empty = auto when a single recording exists. */
@@ -791,6 +796,12 @@ export interface PatchPackParams {
 }
 
 export interface PatchPackResult {
+  game: {
+    store_ids: Record<string, string>;
+    game_version: string | null;
+    fingerprint_count: number;
+  } | null;
+  entry_path?: string;
   output_path: string;
   recording_lang: string | null;
   recorded_root: string;
@@ -807,6 +818,9 @@ export interface PatchPackResult {
 
 export const patchPack = (params: PatchPackParams): Promise<PatchPackResult> =>
   request("/patch/pack", { method: "POST", body: JSON.stringify(params) });
+
+export const patchIdentity = (gamePath: string): Promise<{ detected_dlsite_code: string | null }> =>
+  request(`/patch/identity?${new URLSearchParams({ game_path: gamePath })}`);
 
 export interface PatchRecordings {
   languages: Array<string | null>;

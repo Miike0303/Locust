@@ -519,6 +519,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/patch/rollback", post(patch_rollback))
         .route("/api/patch/status", post(patch_status))
         .route("/api/patch/pack", post(patch_pack))
+        .route("/api/patch/identity", get(patch_identity))
         .route("/api/patch/font", post(font_patch::generate))
         .route("/api/patch/recordings", get(patch_recordings))
         .route("/api/validate", post(validate))
@@ -1767,6 +1768,49 @@ struct PatchPackRequest {
     /// Exact BackupManager id returned by the injection being packaged.
     #[serde(default)]
     pristine_backup_id: Option<String>,
+    #[serde(default)]
+    rj_code: Option<String>,
+    #[serde(default)]
+    store_ids: Vec<String>,
+    #[serde(default)]
+    game_version: Option<String>,
+    #[serde(default = "default_detect_id")]
+    detect_id: bool,
+    #[serde(default)]
+    entry_path: Option<String>,
+}
+
+fn default_detect_id() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct PatchIdentityQuery {
+    game_path: String,
+}
+
+#[derive(Serialize)]
+struct PatchIdentityResponse {
+    detected_dlsite_code: Option<String>,
+}
+
+async fn patch_identity(
+    Query(req): Query<PatchIdentityQuery>,
+) -> Result<Json<PatchIdentityResponse>, ApiError> {
+    if req.game_path.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "game_path required"));
+    }
+    Ok(Json(PatchIdentityResponse {
+        detected_dlsite_code: locust_core::patch::detect_dlsite_code(Path::new(&req.game_path)),
+    }))
+}
+
+#[derive(Serialize)]
+struct PatchPackResponse {
+    #[serde(flatten)]
+    report: locust_core::patch::PackReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_path: Option<String>,
 }
 
 fn map_patch_err(e: locust_core::error::LocustError) -> ApiError {
@@ -1786,10 +1830,38 @@ fn map_patch_err(e: locust_core::error::LocustError) -> ApiError {
     err(status, e)
 }
 
+/// A project opened from its database reports the DB file as its path, so the
+/// desktop sends it as `game_path`. Resolve exactly that case to the recorded
+/// injection root (selected language, or the only recording). Any other path
+/// keeps its existing meaning, including the different-tree refusal.
+fn project_db_game_root(db: &Database, lang: Option<&str>, game_path: &Path) -> Option<PathBuf> {
+    if !game_path.is_file() || !locust_core::database::paths_identical(game_path, &db.path()) {
+        return None;
+    }
+    let recorded = match lang {
+        Some(lang) => db.get_injection(Some(lang)).ok().flatten(),
+        None => match db.list_recorded_langs().ok().as_deref() {
+            Some([only]) => db.get_injection(only.as_deref()).ok().flatten(),
+            _ => None,
+        },
+    };
+    recorded.map(|record| record.root)
+}
+
+/// Game folder a site entry describes and protects: the recorded root for a
+/// project DB path, the folder itself, or a single file's containing folder.
+fn entry_game_root(game_path: &Path) -> PathBuf {
+    if game_path.is_file() {
+        game_path.parent().unwrap_or(game_path).to_path_buf()
+    } else {
+        game_path.to_path_buf()
+    }
+}
+
 async fn patch_pack(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PatchPackRequest>,
-) -> Result<Json<locust_core::patch::PackReport>, ApiError> {
+) -> Result<Json<PatchPackResponse>, ApiError> {
     let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
@@ -1807,8 +1879,26 @@ async fn patch_pack(
         ));
     }
     let lang = req.languages.into_iter().next();
-    let game_path = PathBuf::from(&req.game_path);
+    let requested = PathBuf::from(&req.game_path);
+    let game_path =
+        project_db_game_root(&state.db, lang.as_deref(), &requested).unwrap_or(requested);
+    let game_root = entry_game_root(&game_path);
+    let (game, _) = locust_core::patch::identity::resolve_patch_identity(
+        req.rj_code.as_deref(),
+        &req.store_ids,
+        req.game_version.as_deref(),
+        req.detect_id,
+        &game_root,
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let output = PathBuf::from(&req.output_path);
+    let entry_path = req.entry_path;
+    if entry_path
+        .as_ref()
+        .is_some_and(|path| path.trim().is_empty())
+    {
+        return Err(err(StatusCode::BAD_REQUEST, "entry_path required"));
+    }
     let pristine = req.pristine_path.map(PathBuf::from);
     if req.pristine_backup_id.is_some() && (pristine.is_some() || !req.pristine) {
         return Err(err(
@@ -1820,20 +1910,50 @@ async fn patch_pack(
     let backups = state.backup_manager.clone();
     let require_pristine = req.pristine;
     let engine = locust_formats::default_registry()
-        .detect(&game_path)
+        .detect(&game_root)
         .map(|p| p.id().to_string());
 
     let db = state.db.clone();
     let db_path_for_errors = db.path();
     let report = tokio::task::spawn_blocking(move || {
         let _guard = guard;
+        if let Some(path) = &entry_path {
+            let path = Path::new(path);
+            locust_core::patch::release_entry::validate_release_entry_output(
+                path,
+                &game_root,
+                &db_path_for_errors,
+                &output,
+                pristine.as_deref(),
+                backups.root(),
+            )
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+            for language in db.list_recorded_langs().map_err(map_patch_err)? {
+                if let Some(record) = db
+                    .get_injection(language.as_deref())
+                    .map_err(map_patch_err)?
+                {
+                    // Every recorded game tree and its backup store stays protected.
+                    locust_core::patch::ensure_pack_output_outside(path, &record.root)
+                        .map_err(map_patch_err)?;
+                    if let Some(storage) = record
+                        .pristine_backup
+                        .and_then(|backup| backup.storage_root)
+                    {
+                        locust_core::patch::ensure_pack_output_outside(path, &storage)
+                            .map_err(map_patch_err)?;
+                    }
+                }
+            }
+        }
+        let entry_engine = engine.clone().unwrap_or_else(|| "other".into());
         // Extraction can target one file, while injection recordings are
         // always rooted at its containing game directory.
-        locust_core::patch::pack_with_pristine_backup(
+        let report = locust_core::patch::pack_with_pristine_backup(
             &db,
             locust_core::patch::PackOptions {
-                game: None,
-                game_path,
+                game: Some(game),
+                game_path: game_path.clone(),
                 lang,
                 output,
                 pristine,
@@ -1845,10 +1965,29 @@ async fn patch_pack(
             pristine_backup_id.as_deref(),
             require_pristine,
         )
+        .map_err(map_patch_err)?;
+        if let Some(path) = &entry_path {
+            locust_core::patch::release_entry::write_release_entry(
+                Path::new(path),
+                &game_root,
+                report.recording_lang.as_deref(),
+                Path::new(&report.output_path),
+                &entry_engine,
+            )
+            .map_err(|e| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Patch written to {}; entry could not be written: {e}",
+                        report.output_path
+                    ),
+                )
+            })?;
+        }
+        Ok::<_, ApiError>(PatchPackResponse { report, entry_path })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .map_err(map_patch_err)?;
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))??;
 
     Ok(Json(report))
 }

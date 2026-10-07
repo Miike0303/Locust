@@ -16,6 +16,7 @@ import {
 	cancelPatchApply,
 	patchApply,
 	patchPack,
+	patchIdentity,
 	patchRollback,
 	patchStatus,
 	getPatchRecordings,
@@ -40,6 +41,7 @@ import {
 	rememberPatchSource,
 	resolvePatchSource,
 } from "../lib/patchSource";
+import { defaultEntryPath, patchPublishFields, publishCommand } from "../lib/patchPublish";
 import { subscribeToJob } from "../lib/ws";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -107,6 +109,16 @@ export default function PatchModal({
 	const [zipPath, setZipPath] = useState(remembered.zipPath);
 	const [zipUrl, setZipUrl] = useState(remembered.zipUrl);
 	const [outputPath, setOutputPath] = useState("");
+	const [rjCode, setRjCode] = useState("");
+	const rjEdited = useRef(false);
+	const [detectId, setDetectId] = useState(true);
+	const [gameVersion, setGameVersion] = useState("");
+	const [createEntry, setCreateEntry] = useState(() => {
+		try { return localStorage.getItem("locust.patch.createEntry") === "true"; }
+		catch { return false; }
+	});
+	const [entryPathOverride, setEntryPathOverride] = useState<string | null>(null);
+	const entryPath = entryPathOverride ?? defaultEntryPath(outputPath);
 	const [languages, setLanguages] = useState("");
 	const [recordings, setRecordings] = useState<RecordedLang[]>([]);
 	const [pristineRecordings, setPristineRecordings] = useState<RecordedLang[]>([]);
@@ -169,6 +181,20 @@ export default function PatchModal({
 			});
 		return () => { cancelled = true; };
 	}, [open, defaultGamePath, initialZipPath, initialBackupId, initialTab, allowPack]);
+
+	useEffect(() => {
+		if (!open || !allowPack || tab !== "pack") return;
+		let cancelled = false;
+		if (!rjEdited.current) setRjCode("");
+		if (gamePath.trim() && detectId) {
+			void patchIdentity(gamePath.trim()).then((identity) => {
+				if (!cancelled && !rjEdited.current) setRjCode(identity.detected_dlsite_code ?? "");
+			}).catch(() => {
+				// Pack still validates and detects identity if the preview is unavailable.
+			});
+		}
+		return () => { cancelled = true; };
+	}, [open, allowPack, tab, gamePath, detectId]);
 
 	useEffect(() => {
 		if (!allowPack && tab === "pack") setTab("apply");
@@ -255,6 +281,31 @@ export default function PatchModal({
 				outputPath || "locust-patch.zip",
 			);
 			if (path) setOutputPath(path);
+		}
+	};
+
+	const pickEntry = async () => {
+		if (IS_TAURI) {
+			const { save } = await import("@tauri-apps/plugin-dialog");
+			const selected = await save({
+				title: t("patch.publish.saveEntry"),
+				defaultPath: entryPath || "locust-patch.md",
+				filters: [{ name: t("patch.publish.entryFilter"), extensions: ["md"] }],
+			});
+			if (typeof selected === "string" && selected) setEntryPathOverride(selected);
+		} else {
+			const path = prompt(t("patch.publish.entryPath"), entryPath || "locust-patch.md");
+			if (path) setEntryPathOverride(path);
+		}
+	};
+
+	const copyPublishCommand = async () => {
+		if (!packResult?.entry_path) return;
+		try {
+			await navigator.clipboard.writeText(publishCommand(packResult.output_path, packResult.entry_path));
+			addToast("success", t("common.copied"));
+		} catch {
+			addToast("error", t("patch.publish.copyFailed"));
 		}
 	};
 
@@ -564,6 +615,10 @@ export default function PatchModal({
 			addToast("error", t("patch.toast.chooseOutput"));
 			return;
 		}
+		if (createEntry && !entryPath.trim()) {
+			addToast("error", t("patch.publish.chooseEntry"));
+			return;
+		}
 		if (!canPackFromRecordings(recordings, languages)) {
 			addToast("error", t("patch.recordedLangsEmpty"));
 			return;
@@ -577,6 +632,11 @@ export default function PatchModal({
 				.map((s) => s.trim())
 				.filter(Boolean);
 			const report = await patchPack({
+				...patchPublishFields({
+					// Let pack detect again from the current folder if its preview is still loading.
+					rjCode: rjEdited.current ? rjCode : "",
+					gameVersion, detectId, createEntry, entryPath,
+				}),
 				game_path: gamePath.trim(),
 				output_path: outputPath.trim(),
 				languages: langs,
@@ -585,6 +645,8 @@ export default function PatchModal({
 				pristine_backup_id: pristine && !pristinePath.trim() && gamePath.trim() === defaultGamePath?.trim() ? initialBackupId : undefined,
 			});
 			setPackResult(report);
+			try { localStorage.setItem("locust.patch.createEntry", String(createEntry)); }
+			catch { /* Preferences are optional when storage is unavailable. */ }
 			addLog(
 				"info",
 				t("activity.patch.packed", { id: report.patch_id, version: report.patch_version }),
@@ -1123,6 +1185,35 @@ export default function PatchModal({
 								</p>
 							</div>
 
+							<details className="border rounded dark:border-gray-700 p-3">
+								<summary className="text-sm font-medium cursor-pointer">{t("patch.publish.title")}</summary>
+								<div className="mt-3 space-y-3">
+									<label className="block text-sm">
+										{t("patch.publish.rjCode")}
+										<input value={rjCode} onChange={(e) => { rjEdited.current = true; setRjCode(e.target.value); }} className="block w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600" />
+									</label>
+									<label className="flex items-center gap-2 text-sm cursor-pointer">
+										<input type="checkbox" checked={!detectId} onChange={(e) => setDetectId(!e.target.checked)} />
+										{t("patch.publish.noDetect")}
+									</label>
+									<label className="block text-sm">
+										{t("patch.publish.gameVersion")}
+										<input value={gameVersion} onChange={(e) => setGameVersion(e.target.value)} className="block w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600" />
+									</label>
+									<label className="flex items-center gap-2 text-sm cursor-pointer">
+										<input type="checkbox" checked={createEntry} onChange={(e) => setCreateEntry(e.target.checked)} />
+										{t("patch.publish.createEntry")}
+									</label>
+									{createEntry && <div className="flex items-end gap-2">
+										<label className="flex-1 min-w-0 text-sm">
+											{t("patch.publish.entryPath")}
+											<input value={entryPath} onChange={(e) => setEntryPathOverride(e.target.value)} className="block w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600" />
+										</label>
+										<button type="button" onClick={() => { void pickEntry(); }} title={t("common.browse")} aria-label={t("patch.publish.saveEntry")} className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"><FolderOpen size={16} /></button>
+									</div>}
+								</div>
+							</details>
+
 							<button
 								onClick={handlePack}
 								disabled={
@@ -1163,6 +1254,14 @@ export default function PatchModal({
 										</div>
 										<div className="break-all">{packResult.output_path}</div>
 									</div>
+									<div className="text-xs">
+										{t("patch.publish.identity", { code: packResult.game?.store_ids.dlsite ?? t("patch.publish.noCode"), count: packResult.game?.fingerprint_count ?? 0 })}
+									</div>
+									{packResult.entry_path && <div className="pt-2 space-y-2">
+										<p className="text-xs">{t("patch.publish.commandHint")}</p>
+										<pre className="text-xs whitespace-pre-wrap break-all select-text">{publishCommand(packResult.output_path, packResult.entry_path)}</pre>
+										<button type="button" onClick={() => { void copyPublishCommand(); }} className="px-3 py-1 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-xs">{t("common.copy")}</button>
+									</div>}
 									{packResult.messages?.map((m, i) => (
 										<div
 											key={i}

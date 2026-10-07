@@ -37,9 +37,18 @@ pub struct PackOptions {
     pub game: Option<GameIdentity>,
 }
 
+/// Catalog identity actually embedded in the finished archive.
+#[derive(Debug, Clone, Serialize)]
+pub struct PackedGameIdentity {
+    pub store_ids: std::collections::BTreeMap<String, String>,
+    pub game_version: Option<String>,
+    pub fingerprint_count: usize,
+}
+
 /// Summary returned after a successful pack (JSON-friendly for the HTTP API).
 #[derive(Debug, Clone, Serialize)]
 pub struct PackReport {
+    pub game: Option<PackedGameIdentity>,
     pub output_path: String,
     pub recording_lang: Option<String>,
     pub recorded_root: String,
@@ -696,6 +705,11 @@ fn pack_selected_recording(
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
 
     Ok(PackReport {
+        game: patch_manifest.game.map(|game| PackedGameIdentity {
+            store_ids: game.store_ids,
+            game_version: game.game_version,
+            fingerprint_count: game.fingerprint.len(),
+        }),
         output_path: out.display().to_string(),
         recording_lang: recording.lang.clone(),
         recorded_root: recording.root.display().to_string(),

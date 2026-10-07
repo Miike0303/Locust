@@ -235,3 +235,12 @@ assert.equal(t("activity.queue.started", { count: 1 }), "Queue started: 1 projec
 assert.equal(t("activity.queue.started", { count: 3 }), "Queue started: 3 projects");
 console.log(`activity log i18n: ${logCallCount} calls checked; ${activityKeys.length} bilingual keys checked`);
 console.log("i18n.test.ts: ok");
+
+test("Rule95 publishing strings have catalog and placeholder parity", () => {
+  const keys = ["patch.publish.title", "patch.publish.rjCode", "patch.publish.noDetect", "patch.publish.gameVersion", "patch.publish.createEntry", "patch.publish.entryPath", "patch.publish.saveEntry", "patch.publish.entryFilter", "patch.publish.chooseEntry", "patch.publish.identity", "patch.publish.noCode", "patch.publish.commandHint", "patch.publish.copyFailed"] as const;
+  for (const key of keys) {
+    assert.ok(en[key], key);
+    assert.ok(es[key], key);
+    assert.deepEqual(es[key].match(/\{\w+\}/g)?.sort(), en[key].match(/\{\w+\}/g)?.sort(), key);
+  }
+});

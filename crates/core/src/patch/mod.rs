@@ -20,6 +20,7 @@ pub mod identity;
 mod lock;
 pub mod manifest;
 pub mod pack;
+pub mod release_entry;
 pub mod rollback;
 pub mod store;
 pub mod stream;
