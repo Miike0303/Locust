@@ -7,7 +7,7 @@
  * (wrapped in a localized HTTP frame when a status prefix is present).
  */
 
-import { t, type MessageKey } from "./i18n";
+import { getLocale, t, type MessageKey } from "./i18n";
 
 /** Mirrors `locust_server::TRANSLATION_IN_FLIGHT_MESSAGE`. */
 export const TRANSLATION_IN_FLIGHT_EN =
@@ -102,6 +102,18 @@ export function parseApiError(raw: string): { status: number | null; body: strin
 	return { status: Number(m[1]), body: m[2] };
 }
 
+/** Owned PO parser family; keep excerpts opaque and line numbers as exact text. */
+function malformedPoStringLine(body: string): string | undefined {
+	const match = /^parse error in po: line ([1-9][0-9]*): malformed PO string: ([^\r\n]*)$/.exec(body);
+	// JS `$` also matches before a final newline; require the entire original body.
+	return match?.[0] === body ? match[1] : undefined;
+}
+
+/** Bare Tauri diagnostics only; HTTP request() already logs its original body. */
+export function isMalformedPoStringError(raw: string): boolean {
+	return malformedPoStringLine(raw) !== undefined;
+}
+
 function mapBody(body: string): string | null {
 	const exact = EXACT[body];
 	if (exact) return t(exact);
@@ -123,6 +135,13 @@ function mapBody(body: string): string | null {
  * Activity logs should keep the raw string; toasts should use this.
  */
 export function localizeApiError(raw: string): string {
+	// Strip only request()'s frame, before legacy trimming can hide extra text/newlines.
+	const poLine = malformedPoStringLine(raw.replace(/^\d{3}: /, ""));
+	// English retains its existing bare diagnostic or HTTP frame byte-for-byte.
+	if (poLine !== undefined && getLocale() === "es") {
+		return t("api.error.poMalformedString", { line: poLine });
+	}
+
 	const trimmed = raw.trim();
 	if (!trimmed) return trimmed;
 

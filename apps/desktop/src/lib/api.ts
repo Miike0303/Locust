@@ -3,7 +3,7 @@ import { refreshGameState } from "./queryClient";
 import { invoke } from "@tauri-apps/api/core";
 import { addLog } from "../stores/logStore";
 import { t } from "./i18n";
-import { ApiError } from "./apiError";
+import { ApiError, isMalformedPoStringError } from "./apiError";
 import { mergeRequestInit } from "./requestInit";
 import {
   PIVOT_OPEN_DB_HTTP_PATH,
@@ -19,6 +19,9 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
     return await invoke<T>(cmd, args);
   } catch (e) {
     const raw = e instanceof Error ? e.message : String(e);
+    if (isMalformedPoStringError(raw)) {
+      addLog("error", t("activity.api.tauriError", { cmd }), raw, "api");
+    }
     throw new ApiError(raw);
   }
 }

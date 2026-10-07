@@ -106,6 +106,7 @@ export const en = {
   "activity.validation.failed": "Validation failed",
   "activity.api.unreachable": "API unreachable: {path}",
   "activity.api.httpError": "API {status}: {path}",
+  "activity.api.tauriError": "Tauri error: {cmd}",
   "activity.api.invalidJson": "API invalid JSON: {path}",
 
   "patch.injectionBackup": "Verifies and uses the original backup associated with the recorded injection.",
@@ -1101,6 +1102,7 @@ export const en = {
     "Inject needs at least one language (for example es).",
   "api.error.noStrings": "No strings in this project — open a game and extract first.",
   "api.error.importEmpty": "The import file is empty.",
+  "api.error.poMalformedString": "Invalid quoted text in the PO file, line {line}. Check the opening and closing quotation marks.",
   "api.error.batchTooLarge": "Too many updates in one batch (maximum 50,000).",
   "api.error.nothingToPack":
     "Nothing to pack yet — translate some strings, then inject, then pack.",

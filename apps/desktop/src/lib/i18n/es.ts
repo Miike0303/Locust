@@ -108,6 +108,7 @@ export const es: Record<keyof typeof en, string> = {
   "activity.validation.failed": "La validación falló",
   "activity.api.unreachable": "No se puede acceder a la API: {path}",
   "activity.api.httpError": "API {status}: {path}",
+  "activity.api.tauriError": "Error de Tauri: {cmd}",
   "activity.api.invalidJson": "JSON no válido de la API: {path}",
 
   "patch.injectionBackup": "Se verificará y usará el respaldo original asociado a la inserción registrada.",
@@ -1072,6 +1073,7 @@ export const es: Record<keyof typeof en, string> = {
     "La inyección necesita al menos un idioma (por ejemplo es).",
   "api.error.noStrings": "Este proyecto no tiene cadenas — abra un juego y extraiga primero.",
   "api.error.importEmpty": "El archivo de importación está vacío.",
+  "api.error.poMalformedString": "Texto entre comillas no válido en el archivo PO, línea {line}. Compruebe las comillas de apertura y cierre.",
   "api.error.batchTooLarge": "Demasiadas actualizaciones en un lote (máximo 50.000).",
   "api.error.nothingToPack":
     "Aún no hay nada que empaquetar — traduzca, inyecte y después empaquete.",
