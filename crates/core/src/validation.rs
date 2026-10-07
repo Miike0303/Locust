@@ -8,12 +8,17 @@ use crate::models::{StringEntry, StringStatus, ValidationIssue, ValidationKind};
 
 pub struct Validator;
 
+/// UTF-16 byte length of `text`, with no implicit BOM or terminator.
+pub fn utf16_byte_len(text: &str) -> usize {
+    text.encode_utf16().count() * 2
+}
+
 /// Byte length of `text` under a binary inject encoding.
 /// Returns `None` if the text cannot be encoded (e.g. unmappable Shift-JIS).
 pub fn encoded_byte_len(encoding: &str, text: &str) -> Option<usize> {
     match encoding {
         "utf8" => Some(text.len()),
-        "utf16le" => Some(text.encode_utf16().count() * 2),
+        "utf16le" => Some(utf16_byte_len(text)),
         "sjis" | "shift_jis" | "shift-jis" => {
             let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(text);
             if had_errors {
@@ -784,6 +789,29 @@ mod tests {
         assert!(Validator::validate_entry(&entry)
             .iter()
             .any(|i| matches!(i.kind, ValidationKind::InvalidInjectionProvenance)));
+    }
+
+    #[test]
+    fn test_encoded_byte_len_utf16le_literal_lengths() {
+        let cases = [
+            ("", 0),
+            ("A", 2),
+            ("漢", 2),
+            ("😀", 4),
+            ("e\u{301}", 4),
+            ("\0", 2),
+            ("\r\n", 4),
+            ("\u{feff}", 2),
+            ("A漢😀e\u{301}\0\r\n\u{feff}", 20),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                encoded_byte_len("utf16le", text),
+                Some(expected),
+                "{text:?}"
+            );
+            assert_eq!(utf16_byte_len(text), expected, "{text:?}");
+        }
     }
 
     #[test]

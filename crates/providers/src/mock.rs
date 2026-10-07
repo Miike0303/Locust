@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use locust_core::error::{LocustError, Result};
 use locust_core::models::{TranslationRequest, TranslationResult};
 use locust_core::translation::TranslationProvider;
+use locust_core::validation::utf16_byte_len;
 
 pub struct MockProvider;
 
@@ -31,10 +32,6 @@ fn mock_fit(source: &str, target_lang: &str) -> String {
         return mock_fit_preserving_pl(source, target_lang);
     }
     mock_fit_plain(source, target_lang, source.len(), utf16_byte_len(source))
-}
-
-fn utf16_byte_len(s: &str) -> usize {
-    s.encode_utf16().count() * 2
 }
 
 fn fits_slots(s: &str, max_utf8: usize, max_utf16: usize) -> bool {
@@ -284,6 +281,47 @@ impl TranslationProvider for AlwaysErrorProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf16_byte_len_literal_lengths() {
+        let cases = [
+            ("", 0),
+            ("A", 2),
+            ("漢", 2),
+            ("😀", 4),
+            ("e\u{301}", 4),
+            ("\0", 2),
+            ("\r\n", 4),
+            ("\u{feff}", 2),
+            ("A漢😀e\u{301}\0\r\n\u{feff}", 20),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(utf16_byte_len(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn fits_slots_supplementary_character_requires_four_bytes() {
+        assert!(fits_slots("😀", 4, 4));
+        assert!(!fits_slots("😀", 4, 3));
+        assert!(!fits_slots("😀", 3, 4));
+    }
+
+    #[test]
+    fn mock_fit_supplementary_characters_preserve_slots_and_tokens() {
+        let cases = [
+            ("A😀", "😀A", 5, 6),
+            ("😀😀😀😀", "😀😀😀😀", 16, 16),
+            ("😀😀😀😀😀", "[MOCK:es] ", 10, 20),
+            ("{PL_0}😀😀😀😀😀{PL_1}", "{PL_0}[MOCK:es] {PL_1}", 22, 44),
+        ];
+        for (source, expected, expected_utf8, expected_utf16) in cases {
+            let out = mock_fit(source, "es");
+            assert_eq!(out, expected, "{source:?}");
+            assert_eq!(out.len(), expected_utf8, "{source:?}");
+            assert_eq!(utf16_byte_len(&out), expected_utf16, "{source:?}");
+        }
+    }
 
     #[test]
     fn mock_fit_never_exceeds_source_utf8_or_utf16() {
