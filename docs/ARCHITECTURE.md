@@ -54,7 +54,7 @@ Always registered: google, mock, argos, lmstudio, ollama. Key-gated: deepl, open
 
 ## Frontend state
 
-`projectStore` (open project), `editorStore` (filter/selection/single job/validation worklist), `queueStore` (batch queue, module-level `activeJobId`), `draftStore` (localStorage drafts, cross-tab sync) — `apps/desktop/src/stores/*`. Single-job and queue tracking are separate and do not exclude each other (`apps/desktop/src/lib/translationJobSession.ts:17-40`, `apps/desktop/src/stores/queueStore.ts:43-60`). UI i18n: `en.ts`/`es.ts`, 892 keys each; `es` is typed against `en`, so a missing key fails `tsc` (`apps/desktop/src/lib/i18n/es.ts:4`).
+`projectStore` (open project), `editorStore` (filter/selection/single job/validation worklist), `queueStore` (batch queue, module-level `activeJobId`), `draftStore` (localStorage drafts, cross-tab sync) — `apps/desktop/src/stores/*`. Frontend single-job and queue starts are mutually exclusive through `canStartSingleJob`/`canStartQueue` (`apps/desktop/src/lib/translationJob.ts:8-19`), while their session tracking remains separate. UI i18n uses matching `en.ts`/`es.ts` catalogs: `es` is typed against `en`, and tests check key parity (`apps/desktop/src/lib/i18n/es.ts:4`, `apps/desktop/src/lib/i18n/i18n.test.ts`).
 
 ## Tests and CI
 
