@@ -1,6 +1,6 @@
 # Architecture
 
-Map of Project Locust as of 2026-09-25 (branch `feat/desktop-ux-kimi-k3-p2`, working tree — see "State" below). Every claim cites code; if code and this file disagree, the code wins and this file is stale.
+Map at the observed `main` checkpoint `fe9d7b0`, a documentation-only closeout of hosted-tested source `530d705`. Start with the [improvement ledger](IMPROVEMENT-GOAL.md), especially its latest **Done** entry and backlog; dated handoffs are historical evidence, not the current queue. Code is authoritative when this map disagrees; this snapshot is not a promise about later changes.
 
 ## What it is
 
@@ -8,16 +8,16 @@ A game-translation tool: **extract** strings from a game into a per-game SQLite 
 
 ## Workspace
 
-Six Cargo members (`Cargo.toml:2-9`):
+Six Cargo members (`Cargo.toml:2-9`), workspace package version **0.1.0** (`Cargo.toml:13`):
 
 | Crate | Role | Entry |
 |---|---|---|
 | `crates/core` | models, SQLite, `FormatPlugin` trait, translation engine (retry + rate limit), validation, placeholders, patch pack/apply/rollback, injection transactions, fonts, export | `crates/core/src/lib.rs:1-19` |
-| `crates/formats` | 14 format plugins | `default_registry()` `crates/formats/src/lib.rs:33` |
+| `crates/formats` | 14 format plugins | `default_registry()` `crates/formats/src/lib.rs:34-54` |
 | `crates/providers` | translation providers | `default_registry(&AppConfig)` `crates/providers/src/lib.rs:109` |
-| `crates/server` | Axum JSON + WS API, loopback only | `create_router` `crates/server/src/lib.rs:369`, bind `:428` |
-| `crates/cli` | `locust` binary, 23 subcommands | enum `crates/cli/src/main.rs:49-278` |
-| `apps/desktop/src-tauri` | Tauri 2 shell; runs the Axum server in-process on `127.0.0.1:0` and exposes 26 commands | `apps/desktop/src-tauri/src/main.rs:27-86` |
+| `crates/server` | Axum JSON + WS API, loopback by default | `create_router` `crates/server/src/lib.rs:489`, bind `:549-568` |
+| `crates/cli` | `locust` binary; use `locust --help` for subcommands | enum `crates/cli/src/main.rs:68-351` |
+| `apps/desktop/src-tauri` | Tauri 2 shell; runs the Axum server in-process on an OS-allocated loopback port | `apps/desktop/src-tauri/src/main.rs:25-57` |
 
 Frontend: React 19 + Vite 6 + TS, react-router, react-query, zustand (`apps/desktop/package.json`). Routes `/`, `/editor`, `/review`, `/memory`, `/settings` (`apps/desktop/src/App.tsx:36-41`).
 
@@ -32,8 +32,8 @@ locust CLI ───────────────────────
 ```
 
 - **Dual transport.** `IS_TAURI` picks `tauriInvoke` or `fetch` per call (`apps/desktop/src/lib/api.ts:14`, `:368-652`). Many calls use HTTP even inside Tauri (patch, memory, inject status, backups: `api.ts:321-330`, `:668-673`, `:733-854`).
-- **Port.** Tauri: `invoke("get_server_port")` (`api.ts:30-39`). Plain browser: `/api` via the Vite proxy in dev (`apps/desktop/vite.config.ts:8-15`, port 1420), hard-coded `http://localhost:7842/api` in a production build (`api.ts:41`). WebSockets always go straight to the port (`api.ts:859-869`).
-- **HTTP API.** 48 route paths / 52 handlers (`crates/server/src/lib.rs:371-419`). `/health` is at the root, everything else under `/api`. Two WebSockets: `/api/translate/ws/:job_id` (`:389`) and `/api/patch/ws/:id` (`:397`). CORS is `permissive()` (`:420`).
+- **Port.** CLI `locust server` defaults to **7842** (`crates/cli/src/main.rs:347-350`). Tauri keeps an OS-allocated `127.0.0.1:0` listener bound and reports its port through `invoke("get_server_port")` (`apps/desktop/src-tauri/src/main.rs:25-57`, `apps/desktop/src/lib/api.ts:30-44`). Plain browser: `/api` via the Vite proxy in dev (UI port 1420, backend 7842; `apps/desktop/vite.config.ts:7-15`), `http://localhost:7842/api` in a production build (`api.ts:44`). WebSockets go straight to the backend port (`api.ts:869-880`).
+- **HTTP API and local-client protection.** See `create_router` (`crates/server/src/lib.rs:489-547`) for routes rather than a fixed total. `/health` is at the root, everything else under `/api`. Two WebSockets: `/api/translate/ws/:job_id` (`:510`) and `/api/patch/ws/:job_id` (`:518`). CORS permits the supported Tauri origins and loopback HTTP origins with an explicit port (`:371-408`, `:460-470`); the outer Host/Origin guard rejects foreign clients before handlers or CORS preflights run (`:473-486`, `:541-545`). Methods/headers are unrestricted within that origin policy, not globally permissive CORS.
 - **Concurrency.** Server admission uses a CAS guard per project (`crates/server/src/lib.rs:101-106`, `:172-177`). Game writes take a per-game, non-reentrant file lock (`crates/core/src/patch/lock.rs:96-105`, `:197-207`).
 
 ## Data
@@ -44,7 +44,9 @@ Config: `config_dir()/config.json`. `LOCUST_DATA_DIR` overrides the root (`crate
 
 ## Formats (14)
 
-Registered at `crates/formats/src/lib.rs:35-52`. Stable is the trait default (`crates/core/src/extraction.rs:66-67`), inherited by `rpgmaker-mv`, `rpgmaker-vxa` and `renpy`. The other 11 override it to Experimental: html, nscripter, kirikiri, qsp, tyrano, sugarcube, unity, unreal, vntextpatch, wolf, yuris (e.g. `crates/formats/src/unity.rs:2465`). `wasm-plugins` is a non-default feature that nothing enables (`crates/core/Cargo.toml:48-49`).
+Registered at `crates/formats/src/lib.rs:34-54`. Stable is the trait default (`crates/core/src/extraction.rs:66-68`), inherited by `rpgmaker-mv`, `rpgmaker-vxa` and `renpy`. The other 11 override it to Experimental: html, nscripter, kirikiri, qsp, tyrano, sugarcube, unity, unreal, vntextpatch, wolf, yuris (e.g. `crates/formats/src/unity.rs:2812-2815`). No registered plugin is ComingSoon. `wasm-plugins` remains non-default and inert in shipped builds (`crates/core/Cargo.toml:47-49`).
+
+Unity SerializedFile supports **v17–v22** containers (`crates/formats/src/unity_serialized.rs:82-84`, `:407-415`). Structural readers and bounded type-tree layouts cover TextAsset, TextMesh, GUIText and identified MonoBehaviour display fields; unsupported schemas stay opaque (`:6-26`, `:488-489`, `:1581-1730`). Supported UI fields use complete in-file layouts or verified MonoScript properties-hash layouts (`:34-38`); this is not arbitrary full-tree serialization or general object-table rewriting. Validated TextAsset resizing is separate from fixed-size field injection.
 
 ## Providers
 
@@ -56,24 +58,19 @@ Always registered: google, mock, argos, lmstudio, ollama. Key-gated: deepl, open
 
 ## Tests and CI
 
-- **Rust:** 1453 pass / 17 ignored across 59 suites (run 2026-09-25). Tests with real-game paths are `#[ignore]` (`crates/formats/tests/real_games.rs:6`).
-- **Frontend:** 31 `node:assert` files run by `tsx`, chained in `npm run test:unit`. There is no vitest or ESLint, and test files are excluded from `tsc` (`apps/desktop/tsconfig.json:21`).
-- **CI:** Ubuntu only (`.github/workflows/ci.yml:18`), on push to `main` and on PRs. It runs build → unit → fmt → clippy → test.
+Observed [hosted run 37551095569](https://github.com/Miike0303/Locust/actions/runs/37551095569) at exact tested source **`530d705`**, subsequently delivered to `main` (see the ledger's latest **Done** entry):
 
-## Sibling apps (`C:\Projects`)
-
-| App | What | Tie to Locust |
+| Job | Rust passed / failed / ignored | Frontend passed / failed / ignored |
 |---|---|---|
-| `rule95-patcher` (git, `main`, 1 commit `dc74ffd` + uncommitted `install.rs` +598) | Tauri 2 end-user app that installs Locust patch ZIPs in place or into a copy, with Undo. Vanilla JS UI (`ui/main.js`). 5 commands: `scan_games`, `dlsite_info`, `install_patch`, `verify_patch`, `rollback_patch` (`src/lib.rs:141-147`). Headless `apply_once` (`src/bin/apply_once.rs`). | Path dependency `../Locust/crates/core` (`Cargo.toml:27`). Uses `patch::{verify, apply, rollback, GameLock}`, `verify_with_lock`, `enforce_verify_gates` and `injection_transaction::*`, some of which exist only as untracked files in Locust, so a clean clone of both repos does not build. |
-| `rule95` (**not a git repo**) | Static Astro 5 EN/ES patch catalog (`src/content.config.ts` schema, `src/data/patches/<lang>/*.md`). Target is Cloudflare Pages; MinIO for images (`deploy/`). | `locust patch --astro <path>` emits a frontmatter stub for it. The site does not link to or mention rule95-patcher. |
+| Ubuntu 22.04 | 1989 / 0 / 19 | 104 / 0 / 0 |
+| Windows | 1999 / 0 / 19 | 104 / 0 / 0 |
 
-Verified pipeline (2026-09-25):
-1. `locust extract`, `translate -p mock`, `inject --direct` and `patch --pristine` produce a strict-tier ZIP.
-2. `apply_once --verify-only` reports `Clean`, apply succeeds, and the game's hashes then equal Locust's injected tree.
-3. A re-verify reports `AlreadyApplied`, and `--rollback` restores the original hashes exactly.
-4. A game the user modified is refused with a hash mismatch (exit 1).
-5. Copy mode leaves the original untouched.
+Both jobs passed clean `npm ci`, frontend build/type-check, frontend unit tests, `cargo fmt --all --check`, strict workspace/all-target Clippy and `cargo test --workspace`, including the Tauri crate. Ignored tests were not run. The frontend runner is `tsx --test` (`apps/desktop/package.json:11`); this is not native Tauri UI or game-runtime coverage. The separate headless PO error check passed 3/3 against mocked responses, not a live backend.
 
-## State (read before trusting HEAD)
+**CI triggers:** only `v*` tag pushes and `workflow_dispatch`, not pushes to `main` or PRs (`.github/workflows/ci.yml:3-8`). Jobs run on Ubuntu 22.04 and `windows-latest` (`:18-19`, `:70-72`), each with Node 24 and Rust 1.94.0, frontend install/build/unit checks followed by fmt → strict Clippy → workspace tests (`:30-67`, `:75-110`). Workspace checks include Tauri; they require the frontend build first.
 
-The last commit is `c71d7e7` (2026-09-03). Since then the working tree holds 97 modified files (+23145/−4234) and 98 untracked files. Tracked files declare modules that exist only as untracked files, for example `crates/core/src/lib.rs` → `injection_transaction`, `font_patch` and `textasset_group`, and `crates/server/src/lib.rs:3-4`. So HEAD plus only the tracked changes does not build. `tmp/` holds all QA evidence, and it is ignored only through `.git/info/exclude:19`.
+## State and continuation
+
+The parent confirmed remote and local `main` at **`fe9d7b0`**, a documentation-only closeout with source/workflow unchanged from hosted-tested `530d705`. This records that checkpoint, not an evergreen clean-tree or verification claim. Older dirty/incomplete-checkout and unpublished-commit snapshots are not current state.
+
+Use the [ledger](IMPROVEMENT-GOAL.md) for current backlog, completed evidence and remaining limits, including cross-repository work. No sibling checkout was inspected for this refresh. The authorized sequence is one bounded work unit → complete checks → publish the feature branch and pass manual CI → fast-forward `main` before the next unit.

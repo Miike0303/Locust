@@ -119,7 +119,7 @@ cargo build --release -p locust-desktop
 1. **Launch the app** and click *Open Game Folder* (or *Open Game File*).
 2. Pick the game's directory (the one containing `Game.exe`, `index.html`, etc.).
 3. Locust auto-detects the format and extracts all translatable strings.
-4. Click **Translate** in the editor toolbar, choose a provider and target language (Spanish by default).
+4. Click **Translate** in the editor toolbar, choose a provider, and confirm both **source** and **target** languages before starting. Defaults depend on project text, saved preferences/settings and, when the target matches the detected source, the UI language; Spanish is not a universal default.
 5. Watch the progress — translations are saved to the database as they come in.
 6. Edit in the desktop editor as needed:
    - **Validate** (Ctrl+Shift+V) — placeholders + binary inject-slot length (Unity/Unreal/Wolf).
@@ -194,7 +194,7 @@ MIT. See [LICENSE](LICENSE).
 
 ## Contributing
 
-Pull requests welcome. See [CLAUDE.md](CLAUDE.md) for the project architecture overview and [RELEASE.md](RELEASE.md) for the release process.
+Pull requests welcome. Start with the [architecture map](docs/ARCHITECTURE.md) and the [improvement ledger](docs/IMPROVEMENT-GOAL.md) (latest **Done** entry and backlog). See [CLAUDE.md](CLAUDE.md) for agent instructions and [RELEASE.md](RELEASE.md) for the release process.
 
 Priority areas:
 - NScripter NSA / nscript.___; KiriKiri cxdec/Hxv4; YU-RIS exotic YPF schemes
