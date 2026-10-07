@@ -4,9 +4,9 @@
 User authorized sequential pending-task completion and repeatedly requested continuation. Branch `build/pinned-frontend-test-runner`, base `b50875b`. Declare the already-used tsx4.23.15 as an exact development dependency and replace only `npx --yes tsx --test` with `tsx --test`; retain all38 test paths and their order. Source: `apps/desktop/package.json`, `package-lock.json`; parent ledger/task evidence only. No test-framework replacement, production dependency updates, audit-fix, Rust/UI/workflow edits, original games or releases.
 
 ## Tasks
-- [ ] RUN-1 — Reproduce runner RED with empty offline cache, pin the existing runner and observe GREEN with the same38 files. **In progress.** Bounded writer; config behavior is testable by exit status and actual execution, not a contrived compile failure.
-- [ ] RUN-2 — Independently verify dependency/version scope, clean installation, empty-cache tests and build. Follow native assessment; no implicit review switch changes.
-- [ ] RUN-3 — Commit, publish feature, observe exact hosted Linux/Windows CI and deliver main before another unit; reconcile ledger/task evidence.
+- [x] RUN-1 — Original empty-cache runner RED observed; exact existing runner pinned, same38 files GREEN104/0/0 and build passed. Work unit `184ec7d0bbd828ecff2c31dc937f93681687c50b`.
+- [x] RUN-2 — Clean owned fixture installed the exact locked graph; empty-cache suite104/0/0 and TypeScript/Vite build passed. Native medium/large-writer plan honored; no separate code adjudication. Evidence accompanies documentation work unit.
+- [ ] RUN-3 — Publish feature, observe exact hosted Linux/Windows CI and deliver main before another unit; reconcile ledger/task evidence. **In progress.**
 
 ## Acceptance and risks
 - Node24 compatibility: cached tsx4.23.15 supports Node>=18; baseline direct cached runner already passed104 tests. Existing suite no paths removed or filtered.
@@ -15,4 +15,12 @@ User authorized sequential pending-task completion and repeatedly requested cont
 - RED must execute the original command under empty offline metadata cache and show ENOTCACHED/no tests; then GREEN runs normal local command under another empty cache, actual104/0/0 and build. Independent clean npm ci fixture checks manifest/lock completeness; hosted jobs also install cleanly.
 
 ## Evidence and next step
-Current package/lock are unchanged from prior ENOTCACHED observation. Explorer found no declared tsx dependency, exact cached4.23.15, and existing Vite/esbuild0.25.12 incompatibility with new runner range. No configuration edits or new RED/GREEN yet. Next: writer with explicit generated-artifact surfaces; parent owns scope decisions and delivery.
+- Writer reproduced original REDexit1/ENOTCACHED with no tests and unchanged package files. Offline exact dev install succeeded from existing cache; no fallback network/global install/audit fix.
+- GREEN with fresh empty cache:104/0/0, no npx or metadata cache creation; build passed. Same38 paths and their order byte-identical. All191 existing non-root lock records preserved;28 new records/504 generated additions only. Source manifest+2/-1. TSX4.23.15 uses nested esbuild0.28.2; Vite6.4.1 retains0.25.12.
+- Initial artifact path/quoting probes failed before writes and were corrected; evidence retained under ignored `tmp/pinned-tsx-writer`. Stale Browserslist/mixed-import warnings untouched.
+- Native assessment:medium configuration, large writer/runtime,525lines3paths, self-checks stand/no separate code verifier. RDDoff. reviewDue=true/slice_budget_reached; exact returned continuation relayed unchanged: `gentle-ai review status '--cwd=C:\Projects\Locust' --contract=gentle-ai.review-integration/v2 --next-transition=true`. No native review/switch changes.
+- First clean fixture contains129 tracked frontend files, verified byte-identical. Offline npm ci exited1 because existing react-refresh0.17.0 archive was absent; no tests ran and source remained unchanged. Initial attempt preserved.
+- Parent permitted necessary locked public-npm downloads only inside the owned temporary fixture. Clean npm ci then passed with ignore-scripts/no-audit/no-fund:114 installed packages and observed fetches matched219 integrity-bearing public-registry lock records. No global install, version churn or source edits.
+- Functional verifier: actual native Windows invocation ran all38 files,104/0/0; empty cache remained empty with no_npx/_cacache or test/build fetches. An initial exit0 without results was not counted as GREEN. TypeScript5.9.3/Vite6.4.1 build passed; actual runner/Vite esbuild isolation confirmed.
+- All129 fixture/source hashes and package-pair bytes match before/after install/tests/build; root only parent task doc modified. Setup quoting probe failed before writes; logs retained under host-temp `locust-pinned-tsx-verify`.
+- Next: commit evidence, publish and observe exact hosted candidate. No hosted/main success claim yet.
