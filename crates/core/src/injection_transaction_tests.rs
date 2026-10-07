@@ -522,6 +522,7 @@ fn database_recording_failure_leaves_recoverable_committed_state() {
     let packed = crate::patch::pack_injection_recording(
         &db,
         crate::patch::PackOptions {
+            game: None,
             game_path: root,
             lang: Some("es".into()),
             output: outer.path().join("stale.zip"),

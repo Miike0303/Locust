@@ -1154,6 +1154,7 @@ fn make_patch_fixture(
     locust_core::patch::pack_injection_recording(
         &db,
         locust_core::patch::PackOptions {
+            game: None,
             game_path: recorded,
             lang: Some("es".into()),
             output: zip.clone(),

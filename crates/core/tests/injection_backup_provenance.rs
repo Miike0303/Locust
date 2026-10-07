@@ -157,6 +157,7 @@ fn pack_rejects_a_changed_generation_before_publishing_output() {
     let result = pack_recorded_generation(
         &db,
         PackOptions {
+            game: None,
             game_path: game,
             lang: Some("es".into()),
             output: output.clone(),
@@ -212,6 +213,7 @@ fn pack_recovers_the_recorded_store_after_reopen_for_directory_and_file() {
         let db = Database::open(&db_path).unwrap();
         let other_store = BackupManager::new(temp.path().join("another-profile"));
         let options = PackOptions {
+            game: None,
             game_path: selection.clone(),
             lang: None,
             output: temp.path().join("patch.zip"),

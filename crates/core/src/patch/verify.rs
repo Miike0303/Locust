@@ -1067,6 +1067,7 @@ mod tests {
         let patched = b"patched";
         std::fs::write(game.path().join("script.rpy"), patched).unwrap();
         let manifest = PatchManifest {
+            game: None,
             schema_version: PatchManifest::SCHEMA_VERSION,
             patch_id: "test".into(),
             game_name: "test".into(),

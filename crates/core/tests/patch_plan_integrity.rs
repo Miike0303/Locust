@@ -9,6 +9,7 @@ use std::path::Path;
 
 fn manifest() -> PatchManifest {
     PatchManifest {
+        game: None,
         schema_version: 1,
         patch_id: "font-safe".into(),
         game_name: "fixture".into(),

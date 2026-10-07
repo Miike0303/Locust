@@ -72,6 +72,7 @@ fn pending_insertion_blocks_other_operations_until_public_recovery() {
     assert!(locust_core::project::lock_game_source(&game).is_err());
     let output = temp.path().join("output/patch.zip");
     let options = PackOptions {
+        game: None,
         game_path: game.clone(),
         lang: Some("es".into()),
         output: output.clone(),

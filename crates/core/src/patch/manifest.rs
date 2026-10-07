@@ -1,5 +1,7 @@
 //! Patch archive manifest, backup manifest, and apply receipt schemas.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// `locust-patch.json` at the root of a patch zip.
@@ -14,6 +16,27 @@ pub struct PatchManifest {
     pub generator_version: String,
     pub created_at: String,
     pub files: Vec<PatchFileEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<GameIdentity>,
+}
+
+/// Optional catalog identity. Store keys are lowercase; DLsite codes are uppercase.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameIdentity {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub store_ids: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fingerprint: Vec<FingerprintEntry>,
+}
+
+/// Original (pristine) file identity, never the patched payload's size or hash.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FingerprintEntry {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,6 +189,7 @@ mod tests {
     #[test]
     fn manifest_round_trip() {
         let m = PatchManifest {
+            game: None,
             schema_version: 1,
             patch_id: "id".into(),
             game_name: "g".into(),
@@ -190,6 +214,7 @@ mod tests {
     #[test]
     fn structural_when_originals_missing() {
         let m = PatchManifest {
+            game: None,
             schema_version: 1,
             patch_id: "id".into(),
             game_name: "g".into(),
@@ -211,6 +236,7 @@ mod tests {
     #[test]
     fn strict_when_at_least_one_original_even_with_adds() {
         let m = PatchManifest {
+            game: None,
             schema_version: 1,
             patch_id: "id".into(),
             game_name: "g".into(),

@@ -89,7 +89,7 @@ locust validate <db>                    # Placeholders + binary slot length (Uni
 locust replace <db> --find X --replace Y  # Find/replace inside translations (--dry-run)
 locust stats <db>                       # Tokens / time / cost per translation run
 locust pivot <src.db> -o <new.db>       # New project whose SOURCE is another's translations
-locust patch <injected> -P <db> -l es -o patch.zip   # Package patch zip
+locust patch <injected> -P <db> -l es -o patch.zip [--rj CODE] [--store-id store=id] [--game-version TEXT] [--no-detect-id] [--astro release.md]   # Package patch zip with optional game identity
 locust apply <game> <patch.zip>         # Apply local zip (or --url https://…)
 locust patch-rollback <game>            # Restore .locust/backup
 locust patch-status <game>              # Whether a Locust patch is applied

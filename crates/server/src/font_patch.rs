@@ -458,6 +458,7 @@ mod tests {
         locust_core::patch::pack_injection_recording(
             &f.state.db,
             locust_core::patch::PackOptions {
+                game: None,
                 game_path: injected,
                 lang: Some(language.into()),
                 output: output.clone(),

@@ -38,6 +38,8 @@ locust CLI ───────────────────────
 
 ## Data
 
+Patch ZIPs contain `locust-patch.json` (schema version 1): patch metadata and file hashes, plus an optional `game` block with lowercase store keys, uppercase DLsite codes, a game version, and up to three pristine file fingerprints (smallest original size first, then path). `locust patch` accepts `--rj`, repeatable `--store-id`, and `--game-version`; it detects DLsite codes from the nearest game-path component unless `--no-detect-id` is set. `--astro` includes the identity and the written ZIP's size/hash in its catalog stub. Existing manifests without `game` remain compatible with apply/verify.
+
 Per-game project DB at `<game-parent>/<game-name>.locust.db`, with a fallback under the config dir (`resolve_project_db_path`, see `CLAUDE.md` "Project database"). Opening an existing project merges into it and never wipes it. `init_schema` (`crates/core/src/database.rs:337`) sets WAL + foreign keys (`:361-363`) and creates the tables `project_metadata`, `textasset_originals`, `strings` (13 columns), `glossary`, `translation_memory`, `validation_issues`, `translation_runs`, `injected_files` (`:365-434`). Migrations are ad hoc (`PRAGMA table_info` + `ALTER`, `:446-484`) with no `user_version`. Global translation memory lives in `global_memory.db`, which uses the same schema (`:1938-1957`).
 
 Config: `config_dir()/config.json`. `LOCUST_DATA_DIR` overrides the root (`crates/core/src/config.rs:180-208`). API keys live in `config.providers[id].api_key` and are never read from env (`crates/providers/src/lib.rs:18`, `:131`). Other env vars: `LOCUST_CONFIG` (`crates/cli/src/main.rs:44`), `LOCUST_BACKUP_ROOT` (`crates/cli/src/main.rs:498`).

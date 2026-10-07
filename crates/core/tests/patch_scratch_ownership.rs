@@ -32,6 +32,7 @@ fn patch(root: &Path, entry_name: &str, added: bool) -> PathBuf {
         });
     }
     let manifest = PatchManifest {
+        game: None,
         schema_version: 1,
         patch_id: "font".into(),
         game_name: "game".into(),

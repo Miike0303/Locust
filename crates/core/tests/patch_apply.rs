@@ -38,6 +38,7 @@ type PatchZipFile<'a> = (&'a str, &'a [u8], Option<&'a [u8]>);
 
 fn build_patch_zip(path: &Path, files: &[PatchZipFile<'_>], version: &str, patch_id: &str) {
     let manifest = PatchManifest {
+        game: None,
         schema_version: 1,
         patch_id: patch_id.into(),
         game_name: "test".into(),

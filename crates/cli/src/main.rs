@@ -224,6 +224,8 @@ enum Commands {
         /// <game>/.locust/backup/ if valid. Missing recorded backups are errors.
         #[arg(long)]
         pristine: Option<PathBuf>,
+        #[command(flatten)]
+        identity: PatchIdentityArgs,
     },
     /// Apply a patch zip to a game folder (verify → backup → write → receipt)
     Apply {
@@ -520,7 +522,8 @@ async fn main() -> anyhow::Result<()> {
             output,
             astro,
             pristine,
-        } => cmd_patch(game_path, project, lang, output, astro, pristine)?,
+            identity,
+        } => cmd_patch(game_path, project, lang, output, astro, pristine, identity)?,
         Commands::Apply {
             game_path,
             zip,
@@ -800,6 +803,67 @@ fn print_record_outcome(
     }
 }
 
+#[derive(Debug, Default, clap::Args)]
+struct PatchIdentityArgs {
+    /// DLsite product code (RJ, RE, VJ, BJ, or RG and 6 or 8 digits)
+    #[arg(long, value_name = "CODE")]
+    rj: Option<String>,
+    /// Store product identity; repeat for different stores
+    #[arg(long, value_name = "store=id")]
+    store_id: Vec<String>,
+    /// Original game version (trimmed, non-empty)
+    #[arg(long, value_name = "TEXT")]
+    game_version: Option<String>,
+    /// Disable automatic DLsite code detection from the game path
+    #[arg(long)]
+    no_detect_id: bool,
+}
+
+impl PatchIdentityArgs {
+    fn resolve(&self, path: &Path) -> anyhow::Result<locust_core::patch::GameIdentity> {
+        use locust_core::patch::{detect_dlsite_code, normalize_dlsite_code, GameIdentity};
+
+        let mut game = GameIdentity::default();
+        if let Some(code) = &self.rj {
+            game.store_ids
+                .insert("dlsite".into(), normalize_dlsite_code(code)?);
+        }
+        for value in &self.store_id {
+            let (store, id) = value.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("invalid --store-id {value:?}: expected store=id")
+            })?;
+            let store = store.trim().to_lowercase();
+            let id = id.trim();
+            if store.is_empty() || id.is_empty() {
+                anyhow::bail!("invalid --store-id {value:?}: store and id must not be empty");
+            }
+            if game.store_ids.contains_key(&store) {
+                anyhow::bail!("duplicate store key {store:?}; supply each store only once");
+            }
+            let id = if store == "dlsite" {
+                normalize_dlsite_code(id)?
+            } else {
+                id.to_string()
+            };
+            game.store_ids.insert(store, id);
+        }
+        if let Some(version) = &self.game_version {
+            let version = version.trim();
+            if version.is_empty() {
+                anyhow::bail!("game version must not be empty (--game-version)");
+            }
+            game.game_version = Some(version.to_string());
+        }
+        if !self.no_detect_id && !game.store_ids.contains_key("dlsite") {
+            if let Some(code) = detect_dlsite_code(path) {
+                println!("Detected DLsite id {code} from path");
+                game.store_ids.insert("dlsite".into(), code);
+            }
+        }
+        Ok(game)
+    }
+}
+
 fn cmd_patch(
     game_path: PathBuf,
     project: PathBuf,
@@ -807,9 +871,11 @@ fn cmd_patch(
     output: Option<PathBuf>,
     astro: Option<PathBuf>,
     pristine: Option<PathBuf>,
+    identity: PatchIdentityArgs,
 ) -> anyhow::Result<()> {
     use locust_core::patch::{pack_with_pristine_backup, PackOptions};
 
+    let game = identity.resolve(&game_path)?;
     let db = open_existing_project(&project)?;
     let out = output.unwrap_or_else(|| {
         let base = game_path.file_name().unwrap_or_default().to_string_lossy();
@@ -835,6 +901,7 @@ fn cmd_patch(
     let report = pack_with_pristine_backup(
         &db,
         PackOptions {
+            game: Some(game),
             game_path: game_path.clone(),
             lang: lang.clone(),
             output: out,
@@ -853,7 +920,12 @@ fn cmd_patch(
     }
 
     if let Some(astro_path) = astro {
-        write_astro_stub(&astro_path, &game_path, report.recording_lang.as_deref())?;
+        write_astro_stub(
+            &astro_path,
+            &game_path,
+            report.recording_lang.as_deref(),
+            Path::new(&report.output_path),
+        )?;
         println!("Astro stub written to {}", astro_path.display());
     }
 
@@ -919,7 +991,47 @@ fn write_astro_stub(
     path: &std::path::Path,
     game_path: &std::path::Path,
     lang: Option<&str>,
+    zip_path: &Path,
 ) -> anyhow::Result<()> {
+    use locust_core::database::sha256_file;
+    use locust_core::patch::PatchManifest;
+
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
+    let manifest: PatchManifest = serde_json::from_reader(zip.by_name(PatchManifest::FILENAME)?)?;
+    let (zip_sha256, zip_size) = sha256_file(zip_path)?;
+    // JSON strings are also valid YAML strings, including quotes and newlines.
+    let quoted = |text: &str| serde_json::to_string(text).expect("string serialization");
+    let game = manifest.game.as_ref();
+    let rj = game
+        .and_then(|g| g.store_ids.get("dlsite"))
+        .map(|code| format!("rjCode: {}\n", quoted(code)))
+        .unwrap_or_default();
+    let game_version = quoted(
+        game.and_then(|g| g.game_version.as_deref())
+            .unwrap_or("TODO"),
+    );
+    let file = zip_path.file_name().unwrap_or_default().to_string_lossy();
+    let mut patch = format!(
+        "patch:\n  id: {}\n  file: {}\n  size: {zip_size}\n  sha256: {}\n  language: {}\n",
+        quoted(&manifest.patch_id),
+        quoted(&file),
+        quoted(&zip_sha256),
+        quoted(&manifest.language)
+    );
+    let fingerprint = game.map(|g| g.fingerprint.as_slice()).unwrap_or_default();
+    if fingerprint.is_empty() {
+        patch.push_str("  fingerprint: []\n");
+    } else {
+        patch.push_str("  fingerprint:\n");
+        for entry in fingerprint {
+            patch.push_str(&format!(
+                "    - path: {}\n      size: {}\n      sha256: {}\n",
+                quoted(&entry.path),
+                entry.size,
+                quoted(&entry.sha256)
+            ));
+        }
+    }
     let title = game_path
         .file_name()
         .unwrap_or_default()
@@ -930,10 +1042,12 @@ fn write_astro_stub(
         .map(|p| p.id().to_string())
         .unwrap_or_else(|| "other".to_string());
     let target = lang.unwrap_or("es");
+    let yaml_title = quoted(&title);
 
     let md = format!(
         "---\n\
-         gameTitle: \"{title}\"\n\
+         gameTitle: {yaml_title}\n\
+         {rj}\
          sourceLang: \"en\"        # TODO: ja | en | zh | ko | other\n\
          engine: \"{engine_hint}\"  # TODO: pick from the schema enum (rpgmaker-mv/mz/xp/vxace, ...)\n\
          tags: []\n\
@@ -942,7 +1056,7 @@ fn write_astro_stub(
          \x20 name: \"TODO\"\n\
          \x20 links: []            # [{{ label: \"Patreon\", url: \"https://...\" }}]\n\
          storePage: \"\"           # TODO original game page\n\
-         gameVersion: \"TODO\"\n\
+         gameVersion: {game_version}\n\
          translationVersion: \"1.0\"\n\
          translationStatus: \"complete\"   # complete | in-progress\n\
          gameStatus: \"ongoing\"           # completed | ongoing\n\
@@ -950,6 +1064,7 @@ fn write_astro_stub(
          screenshots: []          # TODO R2 URLs\n\
          mirrors: []              # fill after uploading the patch zip to R2\n\
          dateAdded: TODO-YYYY-MM-DD\n\
+         {patch}\
          ---\n\n\
          Translation into {target} of *{title}*, made with Locust.\n\n\
          **How to apply:** Download the patch ZIP, then select it in Rule95 Patcher. \
@@ -2654,6 +2769,26 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn astro_test_zip(directory: &Path) -> PathBuf {
+        use std::io::Write;
+        let path = directory.join("patch.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        zip.start_file(
+            "locust-patch.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "schema_version": 1, "patch_id": "test", "game_name": "game",
+            "engine": "renpy", "language": "es", "patch_version": "1.0.0",
+            "generator_version": "0.1.0", "created_at": "t", "files": []
+        });
+        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
     #[test]
     fn astro_stub_guides_players_to_rule95_patcher() {
         let dir = std::env::temp_dir().join(format!("locust_astro_{}", uuid::Uuid::new_v4()));
@@ -2661,9 +2796,12 @@ mod tests {
         let stub = dir.join("release.md");
         let game = dir.join("MyGame");
         fs::create_dir_all(&game).unwrap();
-        write_astro_stub(&stub, &game, Some("es")).unwrap();
+        write_astro_stub(&stub, &game, Some("es"), &astro_test_zip(&dir)).unwrap();
         let md = fs::read_to_string(&stub).unwrap();
         let _ = fs::remove_dir_all(&dir);
+        assert!(md.contains("gameVersion: \"TODO\"\n"));
+        assert!(md.contains("  fingerprint: []\n"));
+        assert!(!md.contains("rjCode:"));
         assert!(
             md.contains("Rule95 Patcher"),
             "must name the player app:\n{md}"
@@ -2789,6 +2927,155 @@ mod tests {
     }
 
     #[test]
+    fn patch_identity_flags_parse_and_normalize() {
+        let cli = Cli::try_parse_from([
+            "locust",
+            "patch",
+            "game",
+            "-P",
+            "project.db",
+            "--rj",
+            "re01234567",
+            "--store-id",
+            "Steam=123",
+            "--store-id",
+            "VNDB=v42",
+            "--game-version",
+            " 1.2 ",
+            "--no-detect-id",
+        ])
+        .unwrap();
+        let Commands::Patch { identity, .. } = cli.command else {
+            panic!("expected patch");
+        };
+        let game = identity.resolve(Path::new("RJ123456")).unwrap();
+        assert_eq!(game.store_ids["dlsite"], "RE01234567");
+        assert_eq!(game.store_ids["steam"], "123");
+        assert_eq!(game.store_ids["vndb"], "v42");
+        assert_eq!(game.game_version.as_deref(), Some("1.2"));
+        assert!(identity.no_detect_id);
+    }
+
+    #[test]
+    fn patch_identity_rejects_invalid_store_ids_duplicates_and_empty_version() {
+        for (ids, rj, version, expected) in [
+            (vec!["steam"], None, None, "store=id"),
+            (vec!["=123"], None, None, "empty"),
+            (vec!["steam= "], None, None, "empty"),
+            (vec![" =123"], None, None, "empty"),
+            (vec!["dlsite=XX123456"], None, None, "DLsite"),
+            (vec!["steam=1", "STEAM=2"], None, None, "duplicate"),
+            (vec!["dlsite=RJ123456"], Some("RJ123456"), None, "duplicate"),
+            (vec![], None, Some(" \t "), "game version"),
+        ] {
+            let args = PatchIdentityArgs {
+                rj: rj.map(str::to_string),
+                store_id: ids.into_iter().map(str::to_string).collect(),
+                game_version: version.map(str::to_string),
+                no_detect_id: false,
+            };
+            let error = args.resolve(Path::new("RJ123456")).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn patch_identity_detection_can_be_disabled_or_overridden() {
+        let path = Path::new("D:/RJ123456/[RE01234567] Game/");
+        let mut args = PatchIdentityArgs::default();
+        assert_eq!(
+            args.resolve(path).unwrap().store_ids["dlsite"],
+            "RE01234567"
+        );
+        args.no_detect_id = true;
+        assert!(args.resolve(path).unwrap().store_ids.is_empty());
+        args.rj = Some("vj123456".into());
+        assert_eq!(args.resolve(path).unwrap().store_ids["dlsite"], "VJ123456");
+        args.rj = None;
+        args.no_detect_id = false;
+        args.store_id = vec!["DLSITE=bj123456".into()];
+        assert_eq!(args.resolve(path).unwrap().store_ids["dlsite"], "BJ123456");
+    }
+
+    #[test]
+    fn patch_invalid_rj_fails_before_packing_or_opening_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("patch.zip");
+        let error = cmd_patch(
+            dir.path().join("missing-game"),
+            dir.path().join("missing.db"),
+            None,
+            Some(output.clone()),
+            None,
+            None,
+            PatchIdentityArgs {
+                rj: Some("RJ12345".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("DLsite") && error.contains("6 or 8 digits"),
+            "{error}"
+        );
+        assert!(!output.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn patch_identity_and_astro_metadata_match_written_zip() {
+        let _profile = TestProfile::new();
+        let base = tempfile::tempdir().unwrap();
+        let (game, script, db_path, _) = make_renpy_game(base.path());
+        let pristine = base.path().join("pristine");
+        fs::create_dir_all(pristine.join("game")).unwrap();
+        let original = b"label start:\n    \"Hello, adventurer!\"\n";
+        fs::write(pristine.join("game/script.rpy"), original).unwrap();
+        let db = Database::open(&db_path).unwrap();
+        db.record_injection(Some("es"), &game, &[script]).unwrap();
+        drop(db);
+        let output = base.path().join("patch.zip");
+        let stub = base.path().join("release.md");
+        cmd_patch(
+            game,
+            db_path,
+            None,
+            Some(output.clone()),
+            Some(stub.clone()),
+            Some(pristine),
+            PatchIdentityArgs {
+                rj: Some("rj01234567".into()),
+                store_id: vec!["Steam=123".into()],
+                game_version: Some(" 1.2 \"test\" ".into()),
+                no_detect_id: false,
+            },
+        )
+        .unwrap();
+        let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_reader(zip.by_name("locust-patch.json").unwrap()).unwrap();
+        let fingerprint = serde_json::json!([{
+            "path": "game/script.rpy", "size": original.len(), "sha256": sha256_hex(original)
+        }]);
+        assert_eq!(
+            manifest["game"],
+            serde_json::json!({
+                "store_ids": {"dlsite": "RJ01234567", "steam": "123"},
+                "game_version": "1.2 \"test\"", "fingerprint": fingerprint
+            })
+        );
+        let md = fs::read_to_string(stub).unwrap();
+        let bytes = fs::read(output).unwrap();
+        assert!(md.contains("rjCode: \"RJ01234567\"\n"), "{md}");
+        assert!(md.contains("gameVersion: \"1.2 \\\"test\\\"\"\n"), "{md}");
+        let expected = format!("patch:\n  id: {}\n  file: \"patch.zip\"\n  size: {}\n  sha256: \"{}\"\n  language: \"es\"\n  fingerprint:\n    - path: \"game/script.rpy\"\n      size: {}\n      sha256: \"{}\"\n",
+            manifest["patch_id"], bytes.len(), sha256_hex(&bytes), original.len(), sha256_hex(original));
+        assert!(md.contains(&expected), "{md}");
+        assert!(md.contains("Rule95 Patcher"));
+    }
+
+    #[test]
     fn test_patch_astro_refuses_protected_or_existing_outputs_before_packing() {
         let _profile = TestProfile::new();
         for case in [
@@ -2829,6 +3116,7 @@ mod tests {
                 Some(zip.clone()),
                 Some(output.clone()),
                 Some(pristine),
+                PatchIdentityArgs::default(),
             );
             assert!(result.is_err(), "{case} unexpectedly accepted");
             assert!(
@@ -2862,6 +3150,7 @@ mod tests {
             Some(base.join("patch.zip")),
             Some(stub.clone()),
             None,
+            PatchIdentityArgs::default(),
         )
         .unwrap();
         assert!(fs::read_to_string(stub)
@@ -2875,9 +3164,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("release.md");
         fs::write(&stub, "user notes").unwrap();
-        assert!(write_astro_stub(&stub, dir.path(), Some("es")).is_err());
+        let zip = astro_test_zip(dir.path());
+        assert!(write_astro_stub(&stub, dir.path(), Some("es"), &zip).is_err());
         assert_eq!(fs::read_to_string(&stub).unwrap(), "user notes");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]
@@ -2894,7 +3184,16 @@ mod tests {
         drop(db);
 
         let out_zip = base.join("out-patch.zip");
-        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None, None).unwrap();
+        cmd_patch(
+            game_dir,
+            db_path,
+            None,
+            Some(out_zip.clone()),
+            None,
+            None,
+            PatchIdentityArgs::default(),
+        )
+        .unwrap();
 
         let file = fs::File::open(&out_zip).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -2923,8 +3222,16 @@ mod tests {
 
         let respelled = base.join("MYGAME");
         let out_zip = base.join("out-patch.zip");
-        cmd_patch(respelled, db_path, None, Some(out_zip.clone()), None, None)
-            .expect("a case-divergent spelling of the recorded root must still pack");
+        cmd_patch(
+            respelled,
+            db_path,
+            None,
+            Some(out_zip.clone()),
+            None,
+            None,
+            PatchIdentityArgs::default(),
+        )
+        .expect("a case-divergent spelling of the recorded root must still pack");
 
         let file = fs::File::open(&out_zip).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -2958,8 +3265,16 @@ mod tests {
         drop(db);
 
         let out_zip = base.join("out-patch.zip");
-        cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None, None)
-            .expect("an all-archive database with recorded injection output must pack");
+        cmd_patch(
+            game_dir,
+            db_path,
+            None,
+            Some(out_zip.clone()),
+            None,
+            None,
+            PatchIdentityArgs::default(),
+        )
+        .expect("an all-archive database with recorded injection output must pack");
 
         let file = fs::File::open(&out_zip).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -2999,6 +3314,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("no recording must be a hard error, never an entry-derived guess");
         let msg = err.to_string();
@@ -3046,6 +3362,7 @@ mod tests {
             Some(out_zip),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("a language with no recording must be a hard error");
         let msg = err.to_string();
@@ -3087,6 +3404,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect("the language-unspecified recording must pack without -l");
         assert!(out_zip.exists());
@@ -3098,6 +3416,7 @@ mod tests {
             Some(base.join("other.zip")),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("a named language must never silently match the unspecified key");
         let msg = err.to_string();
@@ -3134,6 +3453,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("multiple keys without -l must be a hard error, not a guess");
         let msg = err.to_string();
@@ -3164,6 +3484,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect("choosing a key with -l must unblock");
         assert!(out_zip.exists());
@@ -3238,6 +3559,7 @@ mod tests {
             None,
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("no recording must be a hard error");
         let msg = err.to_string();
@@ -3252,7 +3574,16 @@ mod tests {
         // no longer gated on the stale four-engine list.
         let base2 = patch_test_tempdir();
         let (game2, _script, db2, _) = make_renpy_game(&base2);
-        let err2 = cmd_patch(game2, db2, Some("es".to_string()), None, None, None).unwrap_err();
+        let err2 = cmd_patch(
+            game2,
+            db2,
+            Some("es".to_string()),
+            None,
+            None,
+            None,
+            PatchIdentityArgs::default(),
+        )
+        .unwrap_err();
         assert!(err2.to_string().contains("restore the original"), "{err2}");
 
         let base3 = patch_test_tempdir();
@@ -3273,7 +3604,16 @@ mod tests {
             "Hola",
         );
         drop(dbh);
-        let err3 = cmd_patch(game3, db3, Some("es".to_string()), None, None, None).unwrap_err();
+        let err3 = cmd_patch(
+            game3,
+            db3,
+            Some("es".to_string()),
+            None,
+            None,
+            None,
+            PatchIdentityArgs::default(),
+        )
+        .unwrap_err();
         let msg3 = err3.to_string();
         assert!(msg3.contains("no injection has been recorded"), "{msg3}");
         assert!(
@@ -3295,8 +3635,16 @@ mod tests {
             .unwrap();
         drop(db);
 
-        let err = cmd_patch(game_dir, db_path, Some("es".to_string()), None, None, None)
-            .expect_err("a key miss must be a hard error");
+        let err = cmd_patch(
+            game_dir,
+            db_path,
+            Some("es".to_string()),
+            None,
+            None,
+            None,
+            PatchIdentityArgs::default(),
+        )
+        .expect_err("a key miss must be a hard error");
         let msg = err.to_string();
         assert!(
             msg.contains("no injection recorded for language \"es\""),
@@ -3345,6 +3693,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("an absolute recorded rel must be refused, never packed");
         assert!(
@@ -3358,8 +3707,16 @@ mod tests {
         conn.execute("UPDATE injected_files SET rel = '../evil.txt'", [])
             .unwrap();
         drop(conn);
-        let err = cmd_patch(game_dir, db_path, None, Some(out_zip.clone()), None, None)
-            .expect_err("a parent-dir rel must be refused");
+        let err = cmd_patch(
+            game_dir,
+            db_path,
+            None,
+            Some(out_zip.clone()),
+            None,
+            None,
+            PatchIdentityArgs::default(),
+        )
+        .expect_err("a parent-dir rel must be refused");
         assert!(err.to_string().contains("escapes the game root"), "{err}");
         assert!(!out_zip.exists());
     }
@@ -3385,8 +3742,16 @@ mod tests {
             db.save_entries(&[entry]).unwrap();
             drop(db);
 
-            let err = cmd_patch(game_dir, db_path, Some("es".to_string()), None, None, None)
-                .expect_err("no recording exists, so patch still errors — but LATER");
+            let err = cmd_patch(
+                game_dir,
+                db_path,
+                Some("es".to_string()),
+                None,
+                None,
+                None,
+                PatchIdentityArgs::default(),
+            )
+            .expect_err("no recording exists, so patch still errors — but LATER");
             let msg = err.to_string();
             assert!(
                 msg.contains("no injection has been recorded"),
@@ -3409,7 +3774,16 @@ mod tests {
         db.save_entries(&[StringEntry::new("script.rpy#2", "Hello", script)])
             .unwrap();
         drop(db);
-        let err = cmd_patch(game_dir, db_path, None, None, None, None).unwrap_err();
+        let err = cmd_patch(
+            game_dir,
+            db_path,
+            None,
+            None,
+            None,
+            None,
+            PatchIdentityArgs::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("nothing to pack yet"),
             "an untranslated project must still be told to translate: {err}"
@@ -3444,6 +3818,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("packing recorded rels out of a different tree must be refused");
         let msg = err.to_string();
@@ -3461,6 +3836,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect("patch pointed at the recorded root must pack");
         assert!(out_zip.exists());
@@ -3490,6 +3866,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("a changed file must refuse to pack");
         let msg = err.to_string();
@@ -3531,6 +3908,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("a missing recorded file must be an error, not a silent skip");
         let msg = err.to_string();
@@ -3763,6 +4141,7 @@ mod tests {
             Some(out_zip.clone()),
             None,
             None,
+            PatchIdentityArgs::default(),
         )
         .expect_err("a recording that cannot be honored must remain an error");
         assert!(err.to_string().contains("missing from disk"), "{err}");

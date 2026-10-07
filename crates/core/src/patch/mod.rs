@@ -16,6 +16,7 @@
 //!   any version/id/file-set change is rollback-then-fresh.
 
 pub mod apply;
+pub mod identity;
 mod lock;
 pub mod manifest;
 pub mod pack;
@@ -26,8 +27,12 @@ pub mod verify;
 pub mod zipsec;
 
 pub use apply::{apply, apply_cancellable, ApplyOptions, ApplyReport, PatchProgress};
+pub use identity::{detect_dlsite_code, normalize_dlsite_code};
 pub use lock::GameLock;
-pub use manifest::{BackupBaseline, BackupManifest, PatchFileEntry, PatchManifest, Receipt};
+pub use manifest::{
+    BackupBaseline, BackupManifest, FingerprintEntry, GameIdentity, PatchFileEntry, PatchManifest,
+    Receipt,
+};
 pub use pack::{
     ensure_pack_output_outside, pack_injection_recording, pack_recorded_generation,
     pack_with_pristine_backup, PackOptions, PackReport,

@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::database::{paths_identical, sha256_file, Database, InjectionRecording};
 use crate::error::{LocustError, Result};
-use crate::patch::manifest::{PatchFileEntry, PatchManifest};
+use crate::patch::manifest::{FingerprintEntry, GameIdentity, PatchFileEntry, PatchManifest};
 use crate::patch::store::PatchStore;
 use crate::patch::stream::{stream_bounded, StreamError};
 
@@ -33,6 +33,8 @@ pub struct PackOptions {
     pub project: PathBuf,
     /// Require pristine hashes: error if neither `pristine` nor a valid backup exist.
     pub require_pristine: bool,
+    /// Optional catalog metadata. Its fingerprint is filled from pristine files.
+    pub game: Option<GameIdentity>,
 }
 
 /// Summary returned after a successful pack (JSON-friendly for the HTTP API).
@@ -65,10 +67,10 @@ fn pack_err(msg: impl Into<String>) -> LocustError {
 ///
 /// `NotFound` is a legitimate added file (`None`). Any other I/O failure
 /// (sharing, permission, directory/non-file) is an error with path context.
-fn hash_original_file(root: &Path, rel: &Path) -> Result<Option<String>> {
+fn hash_original_file(root: &Path, rel: &Path) -> Result<Option<(String, u64)>> {
     let path = root.join(rel.components().collect::<PathBuf>());
     match sha256_file(&path) {
-        Ok((hash, _)) => Ok(Some(hash)),
+        Ok(original) => Ok(Some(original)),
         Err(LocustError::IoError(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(pack_err(format!(
             "cannot hash original {}: {err}",
@@ -512,6 +514,7 @@ fn pack_selected_recording(
     let mut missing: Vec<PathBuf> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
     let mut manifest_files: Vec<PatchFileEntry> = Vec::new();
+    let mut fingerprint = Vec::new();
 
     for f in &recording.files {
         let rel = Path::new(&f.rel);
@@ -545,10 +548,11 @@ fn pack_selected_recording(
             changed.push(f.rel.clone());
             continue;
         }
-        let original_sha256 = match &pristine_root {
+        let original = match &pristine_root {
             Some(root) => hash_original_file(root, rel)?,
             None => None,
         };
+        let original_sha256 = original.as_ref().map(|(hash, _)| hash.clone());
         if let Some(pristine) = verified_pristine {
             if original_sha256.as_deref() != pristine.original_sha256(rel)? {
                 return Err(pack_err(format!(
@@ -581,6 +585,13 @@ fn pack_selected_recording(
             Err(StreamError::Write(error)) => {
                 return Err(pack_err(format!("zip write {}: {error}", f.rel)));
             }
+        }
+        if let Some((sha256, size)) = original {
+            fingerprint.push(FingerprintEntry {
+                path: f.rel.clone(),
+                size,
+                sha256,
+            });
         }
         manifest_files.push(PatchFileEntry {
             path: f.rel.clone(),
@@ -630,6 +641,16 @@ fn pack_selected_recording(
     let patch_id = uuid::Uuid::new_v4().to_string();
     let patch_version = "1.0.0".to_string();
 
+    fingerprint.sort_by(|a, b| a.size.cmp(&b.size).then_with(|| a.path.cmp(&b.path)));
+    fingerprint.truncate(3);
+    let game = opts
+        .game
+        .map(|mut game| {
+            game.fingerprint = fingerprint;
+            game
+        })
+        .filter(|game| *game != GameIdentity::default());
+
     let patch_manifest = PatchManifest {
         schema_version: PatchManifest::SCHEMA_VERSION,
         patch_id: patch_id.clone(),
@@ -643,6 +664,7 @@ fn pack_selected_recording(
         generator_version: env!("CARGO_PKG_VERSION").into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         files: manifest_files,
+        game,
     };
     let tier = if patch_manifest.supports_strict_tier() {
         "strict"
@@ -761,6 +783,7 @@ mod tests {
         db.save_entries(&entries).unwrap();
         db.record_injection(Some("es"), &game, &[script]).unwrap();
         let options = PackOptions {
+            game: None,
             game_path: game,
             lang: Some("es".into()),
             output: fixture.path().join("patch.zip"),
@@ -817,6 +840,7 @@ mod tests {
         let output = base.path().join("existing.zip");
         fs::write(&output, "existing archive").unwrap();
         let options = PackOptions {
+            game: None,
             game_path: game.clone(),
             lang: Some("es".into()),
             output: output.clone(),
@@ -916,6 +940,7 @@ mod tests {
         let output = base.path().join("existing.zip");
         fs::write(&output, "existing archive").unwrap();
         let options = PackOptions {
+            game: None,
             game_path: game.clone(),
             lang: Some("es".into()),
             output: output.clone(),
@@ -1016,6 +1041,7 @@ mod tests {
         let output = base.path().join("existing.zip");
         fs::write(&output, "existing archive").unwrap();
         let options = PackOptions {
+            game: None,
             game_path: game.clone(),
             lang: lang.map(str::to_owned),
             output: output.clone(),
@@ -1136,6 +1162,7 @@ mod tests {
             let result = pack_injection_recording(
                 &db,
                 PackOptions {
+                    game: None,
                     game_path: game.clone(),
                     lang: Some("es".into()),
                     output: output.clone(),
@@ -1174,6 +1201,7 @@ mod tests {
                 let result = pack_injection_recording(
                     &db,
                     PackOptions {
+                        game: None,
                         game_path: game.clone(),
                         lang: Some("es".into()),
                         output,
@@ -1219,6 +1247,7 @@ mod tests {
         let report = pack_injection_recording(
             &db,
             PackOptions {
+                game: None,
                 game_path: game,
                 lang: Some("es".into()),
                 output: out.clone(),
@@ -1260,6 +1289,7 @@ mod tests {
         db.record_injection(Some("es"), &game, &[script]).unwrap();
         let out = base.path().join("new/output.zip");
         let options = PackOptions {
+            game: None,
             game_path: game.clone(),
             lang: Some("es".into()),
             output: out.clone(),
@@ -1308,6 +1338,7 @@ mod tests {
                     pack_injection_recording(
                         &db,
                         PackOptions {
+                            game: None,
                             game_path: game,
                             lang: Some("es".into()),
                             output: out,
@@ -1360,6 +1391,7 @@ mod tests {
         let err = pack_injection_recording(
             &db,
             PackOptions {
+                game: None,
                 game_path: game,
                 lang: None,
                 output: base.join("x.zip"),
@@ -1395,6 +1427,7 @@ mod tests {
         let err = pack_injection_recording(
             &db,
             PackOptions {
+                game: None,
                 game_path: game,
                 lang: Some("es".into()),
                 output: base.join("p.zip"),
@@ -1416,6 +1449,7 @@ mod tests {
         project: PathBuf,
     ) -> PackOptions {
         PackOptions {
+            game: None,
             game_path: game,
             lang: Some("es".into()),
             output,

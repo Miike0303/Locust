@@ -793,6 +793,7 @@ mod tests {
         let path = "Content/Paks/translation.pak";
         let content = b"patched pak";
         let mut manifest = PatchManifest {
+            game: None,
             schema_version: PatchManifest::SCHEMA_VERSION,
             patch_id: "reapply-hash-fixture".into(),
             game_name: "fixture".into(),

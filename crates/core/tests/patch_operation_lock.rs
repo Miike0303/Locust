@@ -16,6 +16,7 @@ fn fixture(base: &Path, version: &str) -> (PathBuf, PathBuf) {
     fs::write(game.join("asset.txt"), b"ORIGINAL").unwrap();
     let zip_path = base.join(format!("patch-{version}.zip"));
     let manifest = PatchManifest {
+        game: None,
         schema_version: 1,
         patch_id: "locking-fixture".into(),
         game_name: "Neutral fixture".into(),

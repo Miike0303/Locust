@@ -1832,6 +1832,7 @@ async fn patch_pack(
         locust_core::patch::pack_with_pristine_backup(
             &db,
             locust_core::patch::PackOptions {
+                game: None,
                 game_path,
                 lang,
                 output,

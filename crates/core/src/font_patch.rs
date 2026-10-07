@@ -114,6 +114,7 @@ pub fn build_font_patch(
     }
     let archive_path = rel.to_string_lossy().replace('\\', "/");
     let manifest = PatchManifest {
+        game: None,
         schema_version: PatchManifest::SCHEMA_VERSION,
         patch_id: uuid::Uuid::new_v4().to_string(),
         game_name: root
@@ -442,6 +443,7 @@ mod tests {
     fn base_zip(dir: &Path, file_path: &str, old: &[u8], new: &[u8]) -> (PathBuf, PatchManifest) {
         let path = dir.join("base.zip");
         let manifest = PatchManifest {
+            game: None,
             schema_version: 1,
             patch_id: "base-translation".into(),
             game_name: "fixture".into(),
