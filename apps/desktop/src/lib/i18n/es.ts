@@ -855,7 +855,7 @@ export const es: Record<keyof typeof en, string> = {
   "patch.publish.chooseEntry": "Seleccione una ruta de salida para la entrada del sitio",
   "patch.publish.identity": "DLsite: {code} · {count} huella(s)",
   "patch.publish.noCode": "Ninguno",
-  "patch.publish.commandHint": "Complete los metadatos de la entrada y ejecute este comando en el repositorio del sitio Rule95:",
+  "patch.publish.commandHint": "Complete los metadatos de la entrada y ejecute este comando en PowerShell desde el repositorio del sitio Rule95:",
   "patch.publish.copyFailed": "No se pudo copiar el comando",
   "patch.packBtn": "Empaquetar",
   "patch.packed": "Empaquetado {id}@{version}",

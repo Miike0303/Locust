@@ -236,6 +236,12 @@ assert.equal(t("activity.queue.started", { count: 3 }), "Queue started: 3 projec
 console.log(`activity log i18n: ${logCallCount} calls checked; ${activityKeys.length} bilingual keys checked`);
 console.log("i18n.test.ts: ok");
 
+for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
+  test(`Rule95 publishing guidance identifies PowerShell in ${locale}`, () => {
+    assert.match(catalog["patch.publish.commandHint"], /\bPowerShell\b/);
+  });
+}
+
 test("Rule95 publishing strings have catalog and placeholder parity", () => {
   const keys = ["patch.publish.title", "patch.publish.rjCode", "patch.publish.noDetect", "patch.publish.gameVersion", "patch.publish.createEntry", "patch.publish.entryPath", "patch.publish.saveEntry", "patch.publish.entryFilter", "patch.publish.chooseEntry", "patch.publish.identity", "patch.publish.noCode", "patch.publish.commandHint", "patch.publish.copyFailed"] as const;
   for (const key of keys) {

@@ -9,8 +9,10 @@ export function defaultEntryPath(zipPath: string): string {
   return `${dot > separator + 1 ? path.slice(0, dot) : path}.md`;
 }
 
+/** PowerShell command with literal path arguments, not portable shell syntax. */
 export function publishCommand(zipPath: string, entryPath: string): string {
-  const quote = (path: string) => `"${path.replaceAll('"', '\\"')}"`;
+  // PowerShell recognizes ASCII and U+2018-U+201B quotes; double each in place.
+  const quote = (path: string) => `'${path.replace(/['\u2018-\u201b]/g, "$&$&")}'`;
   return `npm run publish-patch -- ${quote(zipPath)} ${quote(entryPath)}`;
 }
 

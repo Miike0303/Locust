@@ -876,7 +876,7 @@ export const en = {
   "patch.publish.chooseEntry": "Choose an output path for the site entry",
   "patch.publish.identity": "DLsite: {code} · {count} fingerprint(s)",
   "patch.publish.noCode": "None",
-  "patch.publish.commandHint": "Complete the entry metadata, then run this command in the Rule95 site repository:",
+  "patch.publish.commandHint": "Complete the entry metadata, then run this command in PowerShell from the Rule95 site repository:",
   "patch.publish.copyFailed": "Could not copy the command",
   "patch.packBtn": "Pack",
   "patch.packed": "Packed {id}@{version}",
