@@ -448,6 +448,13 @@ struct CommittedGeneration {
 /// Metadata-only, read-only scan. Never acquire a game lock or hash game files.
 /// A phase marker is published atomically, and only Completed is applied evidence.
 fn committed_generations(root: &Path) -> Result<Vec<CommittedGeneration>> {
+    committed_generations_with(root, false)
+}
+
+fn committed_generations_with(
+    root: &Path,
+    refuse_pending: bool,
+) -> Result<Vec<CommittedGeneration>> {
     if !validate_store(root)? {
         return Ok(Vec::new());
     }
@@ -471,6 +478,11 @@ fn committed_generations(root: &Path) -> Result<Vec<CommittedGeneration>> {
         }
         ensure_no_links(root, &Path::new(STORE_DIR).join("operations").join(&id))?;
         let phase: Phase = read(&entry.path().join("phase.json"))?;
+        if refuse_pending && phase.pending().is_some() {
+            return Err(error(
+                "unfinished injection history; recover before resuming this project",
+            ));
+        }
         if phase != Phase::Completed {
             continue;
         }
@@ -516,6 +528,129 @@ fn committed_generations(root: &Path) -> Result<Vec<CommittedGeneration>> {
     Ok(generations)
 }
 
+fn committed_identity(
+    root: &Path,
+    generation: &CommittedGeneration,
+    active: Option<&Operation>,
+) -> Result<Option<Active>> {
+    let path = generation.directory.join("identity.json");
+    let identity: Option<Active> = if path.try_exists()? {
+        Some(read(&path)?)
+    } else {
+        active
+            .filter(|op| op.active.transaction_id == generation.plan.transaction_id)
+            .map(|op| op.active.clone())
+    };
+    if identity.as_ref().is_some_and(|id| {
+        id.schema_version != SCHEMA
+            || id.game_root != root
+            || id.transaction_id != generation.plan.transaction_id
+    }) {
+        return Err(error("invalid completed injection identity"));
+    }
+    Ok(identity)
+}
+
+fn committed_owners(
+    generations: &[CommittedGeneration],
+) -> Result<BTreeMap<PathBuf, (usize, &Change)>> {
+    let mut owners = BTreeMap::new();
+    for (index, generation) in generations.iter().enumerate() {
+        for change in &generation.plan.files {
+            let key = output_key(&safe_game_rel(&change.path)?);
+            if !generation.restored.contains(&key) {
+                owners.insert(key, (index, change));
+            }
+        }
+    }
+    Ok(owners)
+}
+
+/// Prove the entire recording union against current committed ownership, not
+/// status labels. No pristine-backup bytes are needed to resume saved DB rows.
+/// Read-only and lock-free here: advisory callers may race; confirmation must
+/// call this again while retaining the source lock.
+pub(crate) fn verify_saved_direct_recordings(
+    selection: &Path,
+    recordings: &[crate::database::InjectionRecording],
+) -> Result<Option<String>> {
+    let root = root_for(selection)?;
+    let active = load(&root)?;
+    if active
+        .as_ref()
+        .is_some_and(|op| op.phase.pending().is_some())
+    {
+        return Err(error(
+            "unfinished injection; recover before resuming this project",
+        ));
+    }
+    let generations = committed_generations_with(&root, true)?;
+    let owners = committed_owners(&generations)?;
+    if owners.is_empty() && recordings.is_empty() {
+        return Ok(None);
+    }
+    // Undated or simultaneous competing writers cannot prove which generation
+    // owns the bytes; UUID ordering is not approval. Scan once, not per member.
+    let mut written_at = BTreeMap::new();
+    for generation in &generations {
+        for change in &generation.plan.files {
+            let key = output_key(&safe_game_rel(&change.path)?);
+            if !generation.restored.contains(&key) {
+                if let Some(previous) = written_at.insert(key, generation.plan.prepared_at) {
+                    if previous.is_none()
+                        || generation.plan.prepared_at.is_none()
+                        || previous == generation.plan.prepared_at
+                    {
+                        return Err(error("ambiguous committed injection ownership"));
+                    }
+                }
+            }
+        }
+    }
+    let identities = generations
+        .iter()
+        .map(|generation| committed_identity(&root, generation, active.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut seen = BTreeSet::new();
+    let mut format = None;
+    for recording in recordings {
+        if !crate::database::paths_identical(&recording.root, &root) {
+            return Err(error(
+                "saved injection recording belongs to a different game root",
+            ));
+        }
+        crate::extraction::refuse_incompatible_direct_scope(selection, recording)?;
+        for file in &recording.files {
+            let key = output_key(&safe_game_rel(&file.rel)?);
+            if !seen.insert(key.clone()) {
+                return Err(error("duplicate or ambiguous saved injection member"));
+            }
+            let (index, change) = owners
+                .get(&key)
+                .ok_or_else(|| error("saved injection member has no current committed owner"))?;
+            let identity = identities[*index]
+                .as_ref()
+                .ok_or_else(|| error("saved injection member has unknown injection mode"))?;
+            if identity.mode != Some(InjectionMode::Direct)
+                || identity.language != recording.lang
+                || change.result.sha256 != file.hash
+                || change.result.size != file.size
+                || format.as_ref().is_some_and(|fid| fid != &identity.format)
+            {
+                return Err(error("saved injection member does not match committed Direct mode/format/language/hash/size"));
+            }
+            format.get_or_insert_with(|| identity.format.clone());
+            crate::extraction::verify_recorded_injection_member(&root, file)?;
+        }
+    }
+    if seen.len() != owners.len() || format.is_none() {
+        return Err(error(
+            "current injection ownership is not fully covered by the saved project",
+        ));
+    }
+    Ok(format)
+}
+
 /// Complements ZIP status without changing its enum or claiming an unfinished
 /// injection is an original game. Older generations may lack language and time.
 pub fn game_status(game_path: &Path) -> Result<GameInjectionStatus> {
@@ -524,37 +659,14 @@ pub fn game_status(game_path: &Path) -> Result<GameInjectionStatus> {
     let generations = committed_generations(&root)?;
     // A later committed writer supersedes earlier evidence for the same path.
     // Restoring that later generation exposes the earlier generation again.
-    let mut owners = BTreeMap::new();
-    for (index, generation) in generations.iter().enumerate() {
-        for change in &generation.plan.files {
-            let key = output_key(&safe_game_rel(&change.path)?);
-            if !generation.restored.contains(&key) {
-                owners.insert(key, index);
-            }
-        }
-    }
+    let owners = committed_owners(&generations)?;
     let mut injections = Vec::new();
     for (index, generation) in generations.iter().enumerate() {
-        let changed_files = owners.values().filter(|owner| **owner == index).count();
+        let changed_files = owners.values().filter(|(owner, _)| *owner == index).count();
         if changed_files == 0 {
             continue;
         }
-        let identity_path = generation.directory.join("identity.json");
-        let identity: Option<Active> = if identity_path.try_exists()? {
-            Some(read(&identity_path)?)
-        } else {
-            active
-                .as_ref()
-                .filter(|op| op.active.transaction_id == generation.plan.transaction_id)
-                .map(|op| op.active.clone())
-        };
-        if identity.as_ref().is_some_and(|id| {
-            id.schema_version != SCHEMA
-                || id.game_root != root
-                || id.transaction_id != generation.plan.transaction_id
-        }) {
-            return Err(error("invalid completed injection identity"));
-        }
+        let identity = committed_identity(&root, generation, active.as_ref())?;
         // Old plans cannot distinguish Direct creating a file from Add updating
         // one. Preserve the evidence without inventing a selected mode.
         let mode = identity.as_ref().and_then(|id| id.mode);

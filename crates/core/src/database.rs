@@ -694,6 +694,15 @@ impl Database {
         })
     }
 
+    /// Consistent saved-project reads without schema/configuration writes.
+    /// Uses normal read-only SQLite (including committed WAL), not immutable
+    /// mode. SQLite may create WAL/SHM sidecars alongside the saved database.
+    pub(crate) fn read_project_snapshot(path: &Path) -> Result<Self> {
+        let db = Self::open_for_snapshot(path)?;
+        lock_connection(&db.conn).execute_batch("BEGIN DEFERRED TRANSACTION")?;
+        Ok(db)
+    }
+
     /// Copy `src` with [`Database::snapshot_to`] without modifying that file.
     /// A read-only snapshot can leave an empty `-wal`/`-shm` behind; those are
     /// removed when this call created them. Sidecars that were already there stay.

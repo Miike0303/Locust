@@ -45,6 +45,124 @@ pub struct ProjectOpenOutcome {
     pub extraction_warnings: Vec<String>,
 }
 
+/// Advisory choice for folder opening; confirmation must revalidate the proof.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectOpenPreflight {
+    Extract,
+    ResumeAvailable {
+        database_path: PathBuf,
+        project_path: PathBuf,
+        format_id: String,
+    },
+    NeedsAttention {
+        reason: String,
+    },
+}
+
+/// Advisory, read-only verification: no extraction, merge, writability probe,
+/// or game lock. SQLite reads include WAL and may create WAL/SHM sidecars.
+pub fn preflight_project_open(
+    registry: &FormatRegistry,
+    raw_path: &Path,
+    format_id: Option<&str>,
+) -> Result<ProjectOpenPreflight> {
+    preflight_project_open_with(registry, raw_path, format_id, &AppConfig::config_dir())
+}
+
+fn preflight_project_open_with(
+    registry: &FormatRegistry,
+    raw_path: &Path,
+    format_id: Option<&str>,
+    config_dir: &Path,
+) -> Result<ProjectOpenPreflight> {
+    let verify = || -> Result<ProjectOpenPreflight> {
+        let path = resolve_game_root(raw_path, registry);
+        let existing = unique_existing_saved_dbs_with(
+            &saved_project_db_candidates(&path, config_dir),
+            |candidate| std::fs::metadata(candidate),
+        )?;
+        if existing.len() > 1 {
+            return Err(ambiguous_saved_dbs_error(&existing));
+        }
+        let mut recordings = Vec::new();
+        if let Some(database_path) = existing.first() {
+            probe_locust_project_db(database_path)?;
+            let saved = Database::read_project_snapshot(database_path)?;
+            for lang in saved.list_recorded_langs()? {
+                if let Some(recording) = saved.get_injection(lang.as_deref())? {
+                    recordings.push(recording);
+                }
+            }
+            saved_extraction_warnings(&saved)?;
+        }
+        let Some(committed_format) =
+            crate::injection_transaction::verify_saved_direct_recordings(&path, &recordings)?
+        else {
+            return Ok(ProjectOpenPreflight::Extract);
+        };
+        let plugin = registry.get(&committed_format).ok_or_else(|| {
+            LocustError::UnsupportedFormat(format!("Unknown format: {committed_format}"))
+        })?;
+        if format_id.is_some_and(|fid| fid != committed_format)
+            || !plugin.supported_modes().contains(&OutputMode::Replace)
+            || plugin.stability() == crate::extraction::FormatStability::ComingSoon
+        {
+            return Err(LocustError::InjectionError(
+                "saved Direct project format is incompatible".into(),
+            ));
+        }
+        Ok(ProjectOpenPreflight::ResumeAvailable {
+            database_path: existing[0].clone(),
+            project_path: path,
+            format_id: committed_format,
+        })
+    };
+    Ok(match verify() {
+        Ok(outcome) => outcome,
+        Err(error) => ProjectOpenPreflight::NeedsAttention {
+            reason: error.to_string(),
+        },
+    })
+}
+
+/// Confirm a saved Direct project under the same source lock as extraction.
+/// Revalidate candidate selection and every physical member before switching
+/// the live database. Never recursively acquire the non-reentrant game lock.
+pub fn open_verified_saved_project(
+    db: &Database,
+    registry: &FormatRegistry,
+    database_path: &Path,
+    game_path: &Path,
+    format_id: &str,
+) -> Result<ProjectOpenOutcome> {
+    let path = resolve_game_root(game_path, registry);
+    let _source_lock = lock_game_source(&path)?;
+    match preflight_project_open(registry, &path, Some(format_id))? {
+        ProjectOpenPreflight::ResumeAvailable {
+            database_path: candidate,
+            ..
+        } if same_saved_db(&candidate, database_path) => {
+            let saved = Database::read_project_snapshot(&candidate)?;
+            let total = saved.get_stats()?.total;
+            let warnings = saved_extraction_warnings(&saved)?;
+            open_project_db_under_lock(
+                db,
+                registry,
+                &candidate,
+                &path,
+                format_id,
+                total,
+                Some(warnings),
+            )
+        }
+        ProjectOpenPreflight::NeedsAttention { reason } => Err(LocustError::InjectionError(reason)),
+        _ => Err(LocustError::InjectionError(
+            "saved Direct project selection is no longer verified".into(),
+        )),
+    }
+}
+
 /// Project-level diagnostics carried by Unreal extraction. Bound the persisted
 /// presentation separately from the archive parser's detailed diagnostics.
 pub fn extraction_warnings(entries: &[StringEntry]) -> Vec<String> {
@@ -434,7 +552,7 @@ pub fn open_project_db(
     game_path: &Path,
     format_id: &str,
 ) -> Result<ProjectOpenOutcome> {
-    let plugin = registry
+    registry
         .get(format_id)
         .ok_or_else(|| LocustError::UnsupportedFormat(format!("Unknown format: {format_id}")))?;
 
@@ -444,6 +562,29 @@ pub fn open_project_db(
         .exists()
         .then(|| lock_game_source(game_path))
         .transpose()?;
+    open_project_db_under_lock(
+        db,
+        registry,
+        database_path,
+        game_path,
+        format_id,
+        total_strings,
+        None,
+    )
+}
+
+fn open_project_db_under_lock(
+    db: &Database,
+    registry: &FormatRegistry,
+    database_path: &Path,
+    game_path: &Path,
+    format_id: &str,
+    total_strings: usize,
+    verified_warnings: Option<Vec<String>>,
+) -> Result<ProjectOpenOutcome> {
+    let plugin = registry
+        .get(format_id)
+        .ok_or_else(|| LocustError::UnsupportedFormat(format!("Unknown format: {format_id}")))?;
     db.reopen(database_path)?;
 
     let project_name = game_path
@@ -465,7 +606,10 @@ pub fn open_project_db(
         stale_source_reset: 0,
         removed: 0,
         preserved_translations: 0,
-        extraction_warnings: saved_extraction_warnings(db)?,
+        extraction_warnings: match verified_warnings {
+            Some(warnings) => warnings,
+            None => saved_extraction_warnings(db)?,
+        },
     })
 }
 
@@ -1291,6 +1435,69 @@ mod tests {
         let _ = std::fs::remove_file(&candidates[0]);
         let _ = std::fs::remove_file(&candidates[1]);
         let _ = std::fs::remove_dir_all(&game);
+    }
+
+    #[test]
+    fn direct_project_resume_deduplicates_aliases_but_rejects_distinct_candidates() {
+        for case in ["alias", "distinct", "fallback"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let game = fixture.path().join("game");
+            std::fs::create_dir(&game).unwrap();
+            std::fs::write(game.join("extract.tsv"), "hero\tOriginal").unwrap();
+            let reg = registry();
+            let db = Database::open_in_memory().unwrap();
+            let opened = open_project(&db, &reg, &game, None).unwrap();
+            crate::injection_transaction::run(
+                &game,
+                "tsv-test",
+                Some("en"),
+                || Ok(()),
+                |_, selected| {
+                    let file = selected.join("extract.tsv");
+                    std::fs::write(&file, "hero\tTranslated")?;
+                    Ok(InjectionReport {
+                        files_modified: 1,
+                        strings_written: 1,
+                        strings_skipped: 0,
+                        warnings: vec![],
+                        files_written: vec![file],
+                        skip_reasons: Default::default(),
+                    })
+                },
+                |report| db.record_injection(Some("en"), &game, &report.files_written),
+            )
+            .unwrap();
+            drop(db);
+            let config = fixture.path().join("profile");
+            let fallback = saved_project_db_candidates(&game, &config)[1].clone();
+            std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+            match case {
+                "alias" => std::fs::hard_link(&opened.database_path, &fallback).unwrap(),
+                "distinct" => {
+                    std::fs::copy(&opened.database_path, &fallback).unwrap();
+                }
+                _ => std::fs::rename(&opened.database_path, &fallback).unwrap(),
+            }
+            let preflight = preflight_project_open_with(&reg, &game, None, &config).unwrap();
+            match preflight {
+                ProjectOpenPreflight::ResumeAvailable { database_path, .. }
+                    if case != "distinct" =>
+                {
+                    assert_eq!(
+                        database_path,
+                        if case == "fallback" {
+                            fallback
+                        } else {
+                            opened.database_path
+                        }
+                    );
+                }
+                ProjectOpenPreflight::NeedsAttention { reason } if case == "distinct" => {
+                    assert!(reason.contains("multiple distinct project databases"));
+                }
+                other => panic!("{case}: {other:?}"),
+            }
+        }
     }
 
     struct FilePlugin;

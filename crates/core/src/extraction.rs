@@ -519,7 +519,7 @@ fn prepare_same_root_direct_merge(
 /// A selected file and a leftover folder inventory share the parent
 /// `recording_root`. Hashing those siblings would attribute a foreign file to
 /// this invocation; refuse the incompatible scope instead of guessing.
-fn refuse_incompatible_direct_scope(
+pub(crate) fn refuse_incompatible_direct_scope(
     selection: &Path,
     prior: &crate::database::InjectionRecording,
 ) -> Result<()> {
@@ -552,7 +552,7 @@ fn refuse_incompatible_direct_scope(
     )))
 }
 
-fn verify_recorded_injection_member(
+pub(crate) fn verify_recorded_injection_member(
     recording_root: &Path,
     file: &crate::database::RecordedFile,
 ) -> Result<PathBuf> {
