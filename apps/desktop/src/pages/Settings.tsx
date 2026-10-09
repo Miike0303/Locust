@@ -31,7 +31,7 @@ import {
 } from "../lib/settingsNav";
 import { useT, useLocale, type Locale, type TranslateFn } from "../lib/i18n";
 import ConfirmDialog from "../components/ConfirmDialog";
-import BufferedSetting from "../components/BufferedSetting";
+import BufferedSetting, { SETTINGS_INPUT_CLASS } from "../components/BufferedSetting";
 import { addToast } from "../stores/toastStore";
 
 export default function Settings() {
@@ -50,25 +50,25 @@ export default function Settings() {
   };
 
   return (
-    <div className="flex h-full">
-      <nav className="w-48 border-r border-gray-200 dark:border-gray-700 p-4 space-y-1">
+    <div className="flex h-full min-h-0 bg-surface-muted text-text text-body">
+      <nav className="w-56 shrink-0 overflow-y-auto border-r border-border bg-surface p-4 space-y-2">
         {SETTINGS_SECTIONS.map(({ id, labelKey }) => (
           <button
             key={id}
             onClick={() => selectSection(id)}
             aria-current={section === id ? "page" : undefined}
             className={clsx(
-              "block w-full text-left px-3 py-2 rounded text-sm font-medium",
+              "block w-full rounded-lg border text-left px-3 py-2 text-body font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg",
               section === id
-                ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
-                : "text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800"
+                ? "border-accent-fg bg-accent-muted text-accent-fg font-semibold"
+                : "border-transparent text-text-muted hover:bg-surface-muted hover:text-text"
             )}
           >
             {t(labelKey)}
           </button>
         ))}
       </nav>
-      <div className="flex-1 p-6 overflow-y-auto">
+      <div className="flex-1 min-w-0 p-6 lg:p-8 overflow-y-auto [&>div]:mx-auto [&>div]:w-full [&>div]:max-w-5xl">
         {section === "providers" && <ProvidersSection />}
         {section === "defaults" && <DefaultsSection />}
         {section === "appearance" && <AppearanceSection />}
@@ -147,37 +147,37 @@ function HistorySection() {
   }, [runs]);
 
   return (
-    <div className="space-y-4 max-w-5xl">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h2 className="text-xl font-bold">{t("settings.history.title")}</h2>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h2 className="text-page font-bold">{t("settings.history.title")}</h2>
+          <p className="text-body text-text-muted mt-1">
             {t("settings.history.description")}
           </p>
         </div>
         <button
           type="button"
           onClick={() => refetch()}
-          className="text-sm text-emerald-700 hover:underline dark:text-emerald-400"
+          className="text-body text-accent-fg hover:underline"
         >
           {t("common.refresh")}
         </button>
       </div>
 
       {isLoading && (
-        <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+        <div className="flex items-center gap-2 text-body text-text-muted">
           <Loader size={16} className="animate-spin" /> {t("settings.history.loading")}
         </div>
       )}
 
       {queryState === "no_project" && (
-        <div role="status" className="text-sm text-gray-500 dark:text-gray-400">
+        <div role="status" className="text-body text-text-muted">
           {t("settings.history.noProject")}
         </div>
       )}
 
       {queryState === "failed" && (
-        <div className="text-sm text-red-600 dark:text-red-400">
+        <div className="text-body text-danger">
           {t("settings.history.loadFailed", {
             error: (error as Error)?.message ?? t("settings.history.unknownError"),
           })}
@@ -185,16 +185,16 @@ function HistorySection() {
       )}
 
       {!isLoading && !isError && (runs?.length ?? 0) === 0 && (
-        <div className="border border-dashed border-gray-300 dark:border-gray-600 rounded-lg p-8 text-center text-sm text-gray-500 dark:text-gray-400">
+        <div className="border border-dashed border-border bg-surface rounded-xl p-8 text-center text-body text-text-muted">
           {t("settings.history.empty")}
         </div>
       )}
 
       {!isLoading && !isError && (runs?.length ?? 0) > 0 && (
-        <div className="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
-          <table className="w-full text-sm">
+        <div className="overflow-x-auto border border-border bg-surface rounded-xl">
+          <table className="w-full min-w-[56rem] text-body">
             <thead>
-              <tr className="bg-gray-50 dark:bg-gray-800/80 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide">
+              <tr className="bg-surface-muted text-left text-caption font-semibold text-text-muted uppercase tracking-wide">
                 <th className="px-3 py-2">{t("settings.history.col.date")}</th>
                 <th className="px-3 py-2">{t("settings.history.col.provider")}</th>
                 <th className="px-3 py-2">{t("settings.history.col.langs")}</th>
@@ -206,13 +206,13 @@ function HistorySection() {
                 <th className="px-3 py-2 text-right">{t("settings.history.col.duration")}</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+            <tbody className="divide-y divide-border">
               {runs!.map((r: TranslationRun) => (
-                <tr key={r.id} className="hover:bg-gray-50/80 dark:hover:bg-gray-800/40">
-                  <td className="px-3 py-2 whitespace-nowrap text-gray-700 dark:text-gray-300">
+                <tr key={r.id} className="hover:bg-surface-muted">
+                  <td className="px-3 py-2 whitespace-nowrap text-text">
                     {formatRunDate(r.started_at)}
                   </td>
-                  <td className="px-3 py-2 font-mono text-xs" title={r.provider}>
+                  <td className="px-3 py-2 font-mono text-caption" title={r.provider}>
                     {r.provider}
                   </td>
                   <td className="px-3 py-2 whitespace-nowrap">
@@ -220,10 +220,10 @@ function HistorySection() {
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">{r.strings_translated}</td>
                   <td className="px-3 py-2 text-right tabular-nums">{r.tokens_used}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-gray-500 dark:text-gray-400">
+                  <td className="px-3 py-2 text-right tabular-nums text-text-muted">
                     {r.input_tokens}
                   </td>
-                  <td className="px-3 py-2 text-right tabular-nums text-gray-500 dark:text-gray-400">
+                  <td className="px-3 py-2 text-right tabular-nums text-text-muted">
                     {r.output_tokens}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">
@@ -236,16 +236,16 @@ function HistorySection() {
               ))}
             </tbody>
             <tfoot>
-              <tr className="bg-gray-50 dark:bg-gray-800/80 font-semibold text-gray-800 dark:text-gray-200 border-t border-gray-200 dark:border-gray-700">
+              <tr className="bg-surface-muted font-semibold text-text border-t border-border">
                 <td className="px-3 py-2" colSpan={3}>
                   {t("settings.history.totalRuns", { count: runs!.length })}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums">{totals.strings}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{totals.tokens}</td>
-                <td className="px-3 py-2 text-right tabular-nums text-gray-500 dark:text-gray-400">
+                <td className="px-3 py-2 text-right tabular-nums text-text-muted">
                   {totals.input}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums text-gray-500 dark:text-gray-400">
+                <td className="px-3 py-2 text-right tabular-nums text-text-muted">
                   {totals.output}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums">
@@ -387,46 +387,46 @@ function GrokSubCard({
   };
 
   return (
-    <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-      <div className="flex items-center gap-2 mb-2">
-        <h3 className="font-semibold">
+    <div className="border border-border bg-surface rounded-xl p-5">
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <h3 className="text-section font-semibold">
           {provider?.name ?? t("settings.providers.grokSubName")}
         </h3>
-        <span className="px-2 py-0.5 rounded-full text-xs bg-amber-100 text-amber-700">
+        <span className="px-2 py-0.5 rounded-full text-caption bg-warning-muted text-warning">
           {t("settings.providers.paid")}
         </span>
         <span className={clsx(
-          "px-2 py-0.5 rounded-full text-xs font-medium",
+          "px-2 py-0.5 rounded-full text-caption font-medium",
           ready
-            ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
-            : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+            ? "bg-success-muted text-success"
+            : "bg-warning-muted text-warning"
         )}>
           {ready ? t("settings.providers.signedIn") : t("settings.providers.needsSignIn")}
         </span>
       </div>
-      <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
+      <p className="text-body text-text-muted mb-3">
         {t("settings.providers.grokSubHint")}
       </p>
-      <label className="block mb-3 text-sm text-gray-600 dark:text-gray-300">
+      <label className="block mb-3 text-body text-text-muted">
         {t("settings.providers.model")}
         <input key={model ?? "default"} defaultValue={model || "grok-4.6"}
           onBlur={(e) => { const value = e.target.value.trim(); if (value && value !== (model || "grok-4.6")) onModelChange(value); }}
-          className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
+          className={`mt-1 ${SETTINGS_INPUT_CLASS}`} />
       </label>
 
       {phase === "pending" && session && (
-        <div className="mb-3 p-3 rounded border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 space-y-2">
-          <div className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">
+        <div className="mb-3 p-4 rounded-lg border border-accent-fg bg-accent-muted space-y-3">
+          <div className="text-caption font-medium text-accent-fg uppercase">
             {t("settings.providers.userCode")}
           </div>
-          <div className="flex items-center gap-2">
-            <code className="text-2xl font-mono tracking-widest font-semibold">
+          <div className="flex flex-wrap items-center gap-2">
+            <code className="text-page font-mono tracking-widest font-semibold break-all">
               {session.user_code}
             </code>
             <button
               type="button"
               onClick={() => void copyCode()}
-              className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600"
+              className="flex items-center gap-1 px-2 py-1 text-caption text-text font-medium rounded-md bg-surface border border-border"
             >
               <Copy size={12} />
               {copied ? t("common.copied") : t("common.copy")}
@@ -435,22 +435,22 @@ function GrokSubCard({
           <button
             type="button"
             onClick={() => void openVerification()}
-            className="flex items-center gap-1.5 text-sm font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+            className="flex items-center gap-1.5 text-body font-medium text-accent-fg hover:underline"
           >
             <ExternalLink size={14} />
             {t("settings.providers.openVerification")}
           </button>
-          <p className="text-xs text-gray-500 dark:text-gray-400">
+          <p className="text-caption text-accent-fg">
             {t("settings.providers.waitingApproval")}
           </p>
         </div>
       )}
 
       {phase === "denied" && (
-        <p className="mb-3 text-sm text-red-600">{t("settings.providers.denied")}</p>
+        <p className="mb-3 text-body text-danger">{t("settings.providers.denied")}</p>
       )}
       {phase === "expired" && (
-        <p className="mb-3 text-sm text-amber-700 dark:text-amber-300">
+        <p className="mb-3 text-body text-warning">
           {t("settings.providers.expired")}
         </p>
       )}
@@ -460,7 +460,7 @@ function GrokSubCard({
           type="button"
           onClick={() => void startSignIn()}
           disabled={starting || phase === "pending"}
-          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded text-sm font-medium"
+          className="px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded-md text-body font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
         >
           {starting
             ? t("settings.providers.startingSignIn")
@@ -474,13 +474,13 @@ function GrokSubCard({
           <button
             type="button"
             onClick={onTest}
-            className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium"
+            className="px-3 py-2 border border-border bg-surface-muted hover:bg-surface text-text rounded-md text-body font-medium"
           >
             {testing ? <Loader size={14} className="animate-spin" /> : t("settings.providers.testConnection")}
           </button>
         )}
         {testResult && (
-          <span className={clsx("flex items-center gap-1 text-sm", testResult.ok ? "text-green-600" : "text-red-600")}>
+          <span className={clsx("flex items-center gap-1 text-body break-words", testResult.ok ? "text-success" : "text-danger")}>
             {testResult.ok ? <CheckCircle size={14} /> : <XCircle size={14} />}
             {testResult.ok ? t("settings.providers.connected") : testResult.message.slice(0, 60)}
           </span>
@@ -533,24 +533,24 @@ function ProvidersSection() {
   const grokSub = providers?.find((p) => p.id === GROK_SUB_PROVIDER_ID);
 
   return (
-    <div className="space-y-4">
-      <h2 className="text-xl font-bold">{t("settings.providers.title")}</h2>
+    <div className="space-y-6">
+      <h2 className="text-page font-bold">{t("settings.providers.title")}</h2>
       <GrokSubCard provider={grokSub} model={config?.providers?.[GROK_SUB_PROVIDER_ID]?.model} onModelChange={(model) => void saveKey(GROK_SUB_PROVIDER_ID, "model", model)} onTest={() => handleTest(GROK_SUB_PROVIDER_ID)} testing={!!testing[GROK_SUB_PROVIDER_ID]} testResult={results[GROK_SUB_PROVIDER_ID]} />
       {providers?.filter((p) => p.id !== GROK_SUB_PROVIDER_ID).map((p) => {
         const readiness = resolveProviderReadiness(p.id, providers, config);
         return (
-        <div key={p.id} className="border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-          <div className="flex items-center gap-2 mb-3">
-            <h3 className="font-semibold">{p.name}</h3>
-            <span className={clsx("px-2 py-0.5 rounded-full text-xs", p.is_free ? "bg-green-100 text-green-700" : "bg-amber-100 text-amber-700")}>
+        <div key={p.id} className="border border-border bg-surface rounded-xl p-5">
+          <div className="flex flex-wrap items-center gap-2 mb-3">
+            <h3 className="text-section font-semibold break-words">{p.name}</h3>
+            <span className={clsx("px-2 py-0.5 rounded-full text-caption", p.is_free ? "bg-success-muted text-success" : "bg-warning-muted text-warning")}>
               {p.is_free ? t("settings.providers.free") : t("settings.providers.paid")}
             </span>
             {p.requires_api_key && (
               <span className={clsx(
-                "px-2 py-0.5 rounded-full text-xs font-medium",
+                "px-2 py-0.5 rounded-full text-caption font-medium",
                 readiness.ready
-                  ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
-                  : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+                  ? "bg-success-muted text-success"
+                  : "bg-warning-muted text-warning"
               )}>
                 {readiness.ready ? t("settings.providers.configured") : t("settings.providers.needsApiKey")}
               </span>
@@ -559,55 +559,55 @@ function ProvidersSection() {
 
           {p.requires_api_key && (
             <div className="mb-3">
-              <label className="text-sm text-gray-600">{t("settings.providers.apiKey")}</label>
+              <label className="text-body text-text-muted">{t("settings.providers.apiKey")}</label>
               <input
                 type="password"
                 defaultValue={config?.providers?.[p.id]?.api_key === "***" ? "" : config?.providers?.[p.id]?.api_key || ""}
                 onBlur={(e) => saveKey(p.id, "api_key", e.target.value)}
                 placeholder={t("settings.providers.enterApiKey")}
-                className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+                className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
               />
             </div>
           )}
 
           {(p.id === "argos" || p.id === "ollama") && (
             <div className="mb-3">
-              <label className="text-sm text-gray-600">{t("settings.providers.baseUrl")}</label>
+              <label className="text-body text-text-muted">{t("settings.providers.baseUrl")}</label>
               <input
                 defaultValue={config?.providers?.[p.id]?.base_url || (p.id === "argos" ? "http://localhost:5000" : "http://localhost:11434")}
                 onBlur={(e) => saveKey(p.id, "base_url", e.target.value)}
-                className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+                className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
               />
             </div>
           )}
 
           {p.id === "ollama" && (
             <div className="mb-3">
-              <label className="text-sm text-gray-600">{t("settings.providers.model")}</label>
+              <label className="text-body text-text-muted">{t("settings.providers.model")}</label>
               <input
                 defaultValue={config?.providers?.[p.id]?.model || "llama3.2"}
                 onBlur={(e) => saveKey(p.id, "model", e.target.value)}
-                className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+                className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
               />
             </div>
           )}
 
           {p.id === "grok" && (
-            <label className="block mb-3 text-sm text-gray-600 dark:text-gray-300">
+            <label className="block mb-3 text-body text-text-muted">
               {t("settings.providers.model")}
               <input key={config?.providers?.[p.id]?.model ?? "default"}
                 defaultValue={config?.providers?.[p.id]?.model || "grok-4.6"}
                 onBlur={(e) => { const value = e.target.value.trim(); if (value && value !== (config?.providers?.[p.id]?.model || "grok-4.6")) void saveKey(p.id, "model", value); }}
-                className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600" />
+                className={`mt-1 ${SETTINGS_INPUT_CLASS}`} />
             </label>
           )}
           {(p.id === "openai" || p.id === "claude") && (
             <div className="mb-3">
-              <label className="text-sm text-gray-600">{t("settings.providers.model")}</label>
+              <label className="text-body text-text-muted">{t("settings.providers.model")}</label>
               <select
                 defaultValue={config?.providers?.[p.id]?.model || ""}
                 onChange={(e) => saveKey(p.id, "model", e.target.value)}
-                className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+                className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
               >
                 {p.id === "openai" && <>
                   <option value="gpt-4o-mini">gpt-4o-mini</option>
@@ -623,13 +623,13 @@ function ProvidersSection() {
             </div>
           )}
 
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <button onClick={() => handleTest(p.id)}
-              className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium">
+              className="px-3 py-2 border border-border bg-surface-muted hover:bg-surface text-text rounded-md text-body font-medium">
               {testing[p.id] ? <Loader size={14} className="animate-spin" /> : t("settings.providers.testConnection")}
             </button>
             {results[p.id] && (
-              <span className={clsx("flex items-center gap-1 text-sm", results[p.id].ok ? "text-green-600" : "text-red-600")}>
+              <span className={clsx("flex items-center gap-1 text-body break-words", results[p.id].ok ? "text-success" : "text-danger")}>
                 {results[p.id].ok ? <CheckCircle size={14} /> : <XCircle size={14} />}
                 {results[p.id].ok ? t("settings.providers.connected") : results[p.id].message.slice(0, 60)}
               </span>
@@ -655,21 +655,21 @@ function DefaultsSection() {
   if (!config) return null;
 
   return (
-    <div className="space-y-6 max-w-md">
-      <h2 className="text-xl font-bold">{t("settings.defaults.title")}</h2>
+    <div className="space-y-6 border border-border bg-surface rounded-xl p-5">
+      <h2 className="text-page font-bold">{t("settings.defaults.title")}</h2>
       <div>
-        <label className="text-sm font-medium">{t("settings.defaults.provider")}</label>
+        <label className="text-body font-medium">{t("settings.defaults.provider")}</label>
         <select value={config.default_provider || ""} onChange={(e) => save("default_provider", e.target.value || null)}
-          className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600">
+          className={`mt-1 ${SETTINGS_INPUT_CLASS}`}>
           <option value="">{t("common.none")}</option>
           {providers?.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select>
       </div>
-      <div className="grid grid-cols-2 gap-4 [&_label]:block [&_label]:min-h-10">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 [&_label]:block [&_label]:min-h-10">
         <BufferedSetting label={t("settings.defaults.sourceLang")} value={config.default_source_lang} required normalize={value => value.trim()} onSave={value => save("default_source_lang", value)} />
         <BufferedSetting label={t("settings.defaults.targetLang")} value={config.default_target_lang} required normalize={value => value.trim()} onSave={value => save("default_target_lang", value)} />
       </div>
-      <p className="text-xs text-gray-500 dark:text-gray-400 -mt-2">{t("settings.defaults.langHint")}</p>
+      <p className="text-caption text-text-muted -mt-2">{t("settings.defaults.langHint")}</p>
       <BufferedSetting label={value => t("settings.defaults.batchSize", { size: value })} type="range" min={10} max={100} value={config.default_batch_size} onSave={value => save("default_batch_size", Number(value))} />
       <BufferedSetting label={t("settings.defaults.costLimit")} type="number" min={0} step={0.01} value={config.default_cost_limit ?? ""} placeholder={t("settings.defaults.noLimit")} onSave={value => save("default_cost_limit", value ? Number(value) : null)} />
     </div>
@@ -701,11 +701,11 @@ function AppearanceSection() {
   if (!config) return null;
 
   return (
-    <div className="space-y-6 max-w-md">
-      <h2 className="text-xl font-bold">{t("settings.appearance.title")}</h2>
+    <div className="space-y-6 border border-border bg-surface rounded-xl p-5">
+      <h2 className="text-page font-bold">{t("settings.appearance.title")}</h2>
       <div>
-        <label className="text-sm font-medium">{t("settings.appearance.theme")}</label>
-        <div className="flex gap-3 mt-2">
+        <label className="text-body font-medium">{t("settings.appearance.theme")}</label>
+        <div className="flex flex-wrap gap-4 mt-2">
           {(
             [
               ["system", "settings.appearance.theme.system"],
@@ -714,8 +714,8 @@ function AppearanceSection() {
             ] as const
           ).map(([theme, labelKey]) => (
             <label key={theme} className="flex items-center gap-2 cursor-pointer">
-              <input type="radio" name="theme" checked={config.ui.theme === theme} onChange={() => setTheme(theme)} />
-              <span className="text-sm">{t(labelKey)}</span>
+              <input type="radio" name="theme" className="accent-accent" checked={config.ui.theme === theme} onChange={() => setTheme(theme)} />
+              <span className="text-body">{t(labelKey)}</span>
             </label>
           ))}
         </div>
@@ -724,32 +724,32 @@ function AppearanceSection() {
       <label className="flex items-start gap-2 cursor-pointer">
         <input
           type="checkbox"
-          className="mt-0.5"
+          className="mt-0.5 accent-accent"
           checked={config.ui.show_source_column !== false}
           onChange={(e) => setShowSourceColumn(e.target.checked)}
         />
         <span>
-          <span className="text-sm font-medium">{t("settings.appearance.showSourceColumn")}</span>
-          <span className="block text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <span className="text-body font-medium">{t("settings.appearance.showSourceColumn")}</span>
+          <span className="block text-caption text-text-muted mt-0.5">
             {t("settings.appearance.showSourceColumnHint")}
           </span>
         </span>
       </label>
       <div>
         <BufferedSetting label={value => t("settings.appearance.tableRowHeight", { size: value })} type="range" min={TABLE_ROW_HEIGHT_MIN} max={TABLE_ROW_HEIGHT_MAX} value={clampTableRowHeight(config.ui.table_row_height)} onSave={value => setTableRowHeight(Number(value))} />
-        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+        <p className="text-caption text-text-muted mt-0.5">
           {t("settings.appearance.tableRowHeightHint")}
         </p>
       </div>
       <div>
-        <label className="text-sm font-medium" htmlFor="ui-language">
+        <label className="text-body font-medium" htmlFor="ui-language">
           {t("settings.appearance.interfaceLanguage")}
         </label>
         <select
           id="ui-language"
           value={locale}
           onChange={(e) => setLocale(e.target.value as Locale)}
-          className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+          className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
         >
           <option value="en">{t("settings.appearance.locale.en")}</option>
           <option value="es">{t("settings.appearance.locale.es")}</option>
@@ -838,118 +838,119 @@ function GlossarySection() {
   };
 
   return (
-    <div className="space-y-6 max-w-3xl">
-      <h2 className="text-xl font-bold">{t("settings.glossary.title")}</h2>
-      <p className="text-sm text-gray-500 dark:text-gray-400">
+    <div className="space-y-6">
+      <h2 className="text-page font-bold">{t("settings.glossary.title")}</h2>
+      <p className="text-body text-text-muted -mt-4">
         {t("settings.glossary.description")}
       </p>
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end border border-border bg-surface rounded-xl p-5">
         <div>
-          <label className="text-sm font-medium">{t("settings.glossary.langPair")}</label>
+          <label className="text-body font-medium">{t("settings.glossary.langPair")}</label>
           <input
             value={langPairOverride ?? configPair}
             onChange={(e) => setLangPairOverride(e.target.value)}
             placeholder="ja-en"
-            className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+            className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
           />
         </div>
         <div className="sm:col-span-2 relative">
-          <label className="text-sm font-medium">{t("settings.glossary.filter")}</label>
+          <label className="text-body font-medium">{t("settings.glossary.filter")}</label>
           <div className="relative mt-1">
-            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-muted" />
             <input
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               placeholder={t("settings.glossary.filterPlaceholder")}
-              className="w-full pl-8 pr-3 py-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+              className={`${SETTINGS_INPUT_CLASS} pl-8 pr-3`}
             />
           </div>
         </div>
       </div>
 
-      <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 space-y-3">
-        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase">{t("settings.glossary.addEntry")}</h3>
+      <div className="border border-border bg-surface rounded-xl p-5 space-y-4">
+        <h3 className="text-section font-semibold">{t("settings.glossary.addEntry")}</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
-            <label className="text-sm text-gray-600">{t("settings.glossary.term")}</label>
+            <label className="text-body text-text-muted">{t("settings.glossary.term")}</label>
             <input
               value={term}
               onChange={(e) => setTerm(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
               placeholder={t("settings.glossary.sourceTerm")}
-              className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+              className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
             />
           </div>
           <div>
-            <label className="text-sm text-gray-600">{t("settings.glossary.translation")}</label>
+            <label className="text-body text-text-muted">{t("settings.glossary.translation")}</label>
             <input
               value={translation}
               onChange={(e) => setTranslation(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
               placeholder={t("settings.glossary.preferredTranslation")}
-              className="mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"
+              className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
             />
           </div>
         </div>
         <button
           onClick={handleAdd}
           disabled={saving}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded text-sm font-medium"
+          className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded-md text-body font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
         >
           <Plus size={14} /> {saving ? t("settings.glossary.adding") : t("settings.glossary.addEntry")}
         </button>
       </div>
 
       <div>
-        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase mb-2">
+        <h3 className="text-section font-semibold mb-3">
           {entries ? t("settings.glossary.entries", { count: filtered.length }) : t("settings.glossary.entriesBare")}
         </h3>
         {isLoading ? (
-          <p className="text-sm text-gray-500 dark:text-gray-400 flex items-center gap-2">
+          <p className="text-body text-text-muted flex items-center gap-2">
             <Loader size={14} className="animate-spin" /> {t("common.loading")}
           </p>
         ) : queryState === "no_project" ? (
-          <p role="status" className="text-sm text-gray-500 dark:text-gray-400">
+          <p role="status" className="text-body text-text-muted">
             {t("settings.glossary.noProject")}
           </p>
         ) : queryState === "failed" ? (
-          <p role="alert" className="text-sm text-red-600 dark:text-red-400">
+          <p role="alert" className="text-body text-danger">
             {t("settings.glossary.loadFailed", { error: error?.message ?? "" })}
           </p>
         ) : filtered.length === 0 ? (
-          <p className="text-sm text-gray-500 dark:text-gray-400">
+          <p className="text-body text-text-muted">
             {filter
               ? t("settings.glossary.emptyFilter")
               : t("settings.glossary.empty")}
           </p>
         ) : (
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto border border-border bg-surface rounded-xl">
+          <table className="w-full min-w-[36rem] text-body">
             <thead>
-              <tr className="text-left text-gray-500 dark:text-gray-400 text-xs uppercase">
-                <th className="pb-2">{t("settings.glossary.col.term")}</th>
-                <th className="pb-2">{t("settings.glossary.col.translation")}</th>
-                <th className="pb-2 w-24">{t("settings.glossary.col.pair")}</th>
-                <th className="pb-2 w-12"></th>
+              <tr className="bg-surface-muted text-left text-text-muted text-caption uppercase tracking-wide">
+                <th className="px-3 py-2">{t("settings.glossary.col.term")}</th>
+                <th className="px-3 py-2">{t("settings.glossary.col.translation")}</th>
+                <th className="px-3 py-2 w-24">{t("settings.glossary.col.pair")}</th>
+                <th className="px-3 py-2 w-12"></th>
               </tr>
             </thead>
             <tbody>
               {filtered.map((e) => (
                 <tr
                   key={`${e.lang_pair}:${e.term}`}
-                  className="border-t border-gray-100 dark:border-gray-800"
+                  className="border-t border-border hover:bg-surface-muted"
                 >
-                  <td className="py-2 font-medium">{e.term}</td>
-                  <td className="py-2">{e.translation}</td>
-                  <td className="py-2">
-                    <span className="px-2 py-0.5 bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 rounded text-xs">
+                  <td className="px-3 py-2 font-medium break-words">{e.term}</td>
+                  <td className="px-3 py-2 break-words">{e.translation}</td>
+                  <td className="px-3 py-2">
+                    <span className="px-2 py-0.5 bg-accent-muted text-accent-fg rounded text-caption whitespace-nowrap">
                       {e.lang_pair}
                     </span>
                   </td>
-                  <td className="py-2">
+                  <td className="px-3 py-2">
                     <button
                       onClick={() => setEntryToDelete(e)}
-                      className="text-red-500 hover:text-red-700"
+                      className="inline-flex items-center justify-center rounded-md p-2 text-danger hover:bg-danger-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
                       title={t("settings.glossary.deleteTitle")}
                     >
                       <Trash2 size={14} />
@@ -959,6 +960,7 @@ function GlossarySection() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 
@@ -1012,26 +1014,27 @@ function DataSection() {
 
   return (
     <div className="space-y-6">
-      <h2 className="text-xl font-bold">{t("settings.data.title")}</h2>
+      <h2 className="text-page font-bold">{t("settings.data.title")}</h2>
       <div>
-        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase mb-2">{t("settings.data.backups")}</h3>
+        <h3 className="text-section font-semibold mb-3">{t("settings.data.backups")}</h3>
         {isPending ? (
-          <p className="text-sm text-gray-500 dark:text-gray-400" role="status">{t("common.loading")}</p>
+          <p className="text-body text-text-muted" role="status">{t("common.loading")}</p>
         ) : isError ? (
-          <p className="text-sm text-red-600 dark:text-red-400" role="alert">
+          <p className="text-body text-danger" role="alert">
             {t("settings.data.loadFailed", { error: error.message })}
           </p>
         ) : backups.length === 0 && unreadable.length === 0 ? (
-          <p className="text-sm text-gray-500 dark:text-gray-400">{t("settings.data.noBackups")}</p>
+          <p className="text-body text-text-muted">{t("settings.data.noBackups")}</p>
         ) : backups.length > 0 ? (
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto border border-border bg-surface rounded-xl">
+          <table className="w-full min-w-[48rem] text-body">
             <thead>
-              <tr className="text-left text-gray-500 dark:text-gray-400">
-                <th className="pb-2">{t("settings.data.col.game")}</th>
-                <th className="pb-2">{t("settings.data.col.id")}</th>
-                <th className="pb-2">{t("settings.data.col.created")}</th>
-                <th className="pb-2">{t("settings.data.col.files")}</th>
-                <th className="pb-2">{t("settings.data.col.actions")}</th>
+              <tr className="bg-surface-muted text-left text-text-muted text-caption uppercase tracking-wide">
+                <th className="px-3 py-2">{t("settings.data.col.game")}</th>
+                <th className="px-3 py-2">{t("settings.data.col.id")}</th>
+                <th className="px-3 py-2">{t("settings.data.col.created")}</th>
+                <th className="px-3 py-2">{t("settings.data.col.files")}</th>
+                <th className="px-3 py-2">{t("settings.data.col.actions")}</th>
               </tr>
             </thead>
             <tbody>
@@ -1039,38 +1042,39 @@ function DataSection() {
                 const game = gameLabel(b.source_path);
                 const pending = { id: b.id, game, sourcePath: b.source_path };
                 return (
-                  <tr key={b.id} className="border-t border-gray-100 dark:border-gray-800">
-                    <td className="py-2" title={b.source_path || undefined}>
+                  <tr key={b.id} className="border-t border-border hover:bg-surface-muted">
+                    <td className="px-3 py-2 max-w-[24rem]" title={b.source_path || undefined}>
                       <div className="font-medium break-words">{game}</div>
                       {b.source_path ? (
-                        <div className="text-xs text-gray-500 dark:text-gray-400 break-all">{b.source_path}</div>
+                        <div className="text-caption text-text-muted break-all">{b.source_path}</div>
                       ) : null}
                     </td>
-                    <td className="py-2 font-mono text-xs">{b.id}</td>
-                    <td className="py-2">{new Date(b.created_at).toLocaleString()}</td>
-                    <td className="py-2">{b.file_count}</td>
-                    <td className="py-2 flex gap-2">
-                      <button onClick={() => setPendingAction({ kind: "restore", ...pending })} className="text-emerald-600 hover:text-emerald-800" title={t("settings.data.restore")}><RotateCcw size={14} /></button>
-                      <button onClick={() => setPendingAction({ kind: "delete", ...pending })} className="text-red-500 hover:text-red-700" title={t("settings.data.delete")}><Trash2 size={14} /></button>
+                    <td className="px-3 py-2 font-mono text-caption">{b.id}</td>
+                    <td className="px-3 py-2 whitespace-nowrap">{new Date(b.created_at).toLocaleString()}</td>
+                    <td className="px-3 py-2 tabular-nums">{b.file_count}</td>
+                    <td className="px-3 py-2 flex gap-2">
+                      <button onClick={() => setPendingAction({ kind: "restore", ...pending })} className="inline-flex items-center justify-center rounded-md p-2 text-accent-fg hover:bg-accent-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg" title={t("settings.data.restore")}><RotateCcw size={14} /></button>
+                      <button onClick={() => setPendingAction({ kind: "delete", ...pending })} className="inline-flex items-center justify-center rounded-md p-2 text-danger hover:bg-danger-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger" title={t("settings.data.delete")}><Trash2 size={14} /></button>
                     </td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
+          </div>
         ) : null}
         {!isPending && !isError && unreadable.length > 0 && (
-          <div className="mt-4 p-3 border border-amber-300 dark:border-amber-800 rounded space-y-2">
-            <h4 className="text-sm font-semibold">{t("settings.data.damagedBackups")}</h4>
-            <p className="text-xs text-gray-600 dark:text-gray-400">{t("settings.data.damagedHint")}</p>
-            <ul className="space-y-2 text-sm">
+          <div className="mt-4 p-4 border border-warning bg-warning-muted text-warning rounded-xl space-y-2">
+            <h4 className="text-section font-semibold">{t("settings.data.damagedBackups")}</h4>
+            <p className="text-caption">{t("settings.data.damagedHint")}</p>
+            <ul className="space-y-2 text-body">
               {unreadable.map((backup) => {
                 const diagnostic = backup.error.replace(/\s+/g, " ").trim();
                 const shortError = diagnostic.length > 200 ? `${diagnostic.slice(0, 200)}…` : diagnostic;
                 return (
                   <li key={backup.id}>
-                    <div className="font-mono text-xs break-all">{backup.id}</div>
-                    <div className="text-xs text-gray-600 dark:text-gray-400 break-words">{shortError}</div>
+                    <div className="font-mono text-caption break-all">{backup.id}</div>
+                    <div className="text-caption break-words">{shortError}</div>
                   </li>
                 );
               })}

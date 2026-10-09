@@ -7,6 +7,8 @@ import { MemoryRouter } from "react-router-dom";
 import { setLocale, translate } from "./i18n/index.ts";
 import { en } from "./i18n/en.ts";
 import { es } from "./i18n/es.ts";
+import { SETTINGS_SECTIONS, type SettingsSectionId } from "./settingsNav.ts";
+import type { AppConfig, ProviderInfo, TranslationRun } from "./api.ts";
 
 let Settings: typeof import("../pages/Settings.tsx").default;
 let api: typeof import("./api.ts");
@@ -99,6 +101,7 @@ for (const [locale, catalog, hints] of [
       assert.ok(html.includes(hints[section]), html);
       assert.ok(!html.includes(catalog[`settings.${section}.empty`]));
       assert.ok(!html.includes(catalog["api.error.noProjectOpen"]));
+      assertSemanticPalette(html);
     });
 
     test(`${locale} ${section} keeps unrelated query failures visible`, async () => {
@@ -111,6 +114,7 @@ for (const [locale, catalog, hints] of [
       assert.ok(html.includes(message), html);
       assert.ok(!html.includes(hints[section]));
       assert.ok(!html.includes(catalog[`settings.${section}.empty`]));
+      assertSemanticPalette(html);
     });
   }
 }
@@ -165,6 +169,75 @@ for (const [locale, catalog, damagedTitle, failedText] of [
         assert.ok(html.includes("manifest unreadable &lt;unsafe&gt;"), html);
         assert.ok(!html.includes("x".repeat(300)), "damaged diagnostics should stay short");
       }
+      assertSemanticPalette(html);
+    });
+  }
+}
+
+function assertSemanticPalette(html: string): void {
+  const looseGrays = html.match(/(?:text|border)-gray-[\w/]+/g) ?? [];
+  assert.equal(looseGrays.length, 0, `Settings still renders loose grays: ${looseGrays.slice(0, 5).join(", ")}`);
+}
+
+async function renderPopulatedSection(section: SettingsSectionId): Promise<string> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, retryOnMount: false, gcTime: Infinity } },
+  });
+  try {
+    const providers: ProviderInfo[] = [
+      { id: "mock", name: "Mock", is_free: true, requires_api_key: false, configured: true },
+      ...["openai", "claude", "grok"].map(id => ({
+        id, name: id, is_free: false, requires_api_key: true, configured: true,
+      })),
+      ...["argos", "ollama", "grok-sub"].map(id => ({
+        id, name: id, is_free: id !== "grok-sub", requires_api_key: false, configured: true,
+      })),
+    ];
+    const config: AppConfig = {
+      providers: { openai: { api_key: "***", model: "gpt-4o-mini" } },
+      default_provider: "mock", default_source_lang: "ja", default_target_lang: "en",
+      default_batch_size: 20, default_cost_limit: null, recent_projects: [],
+      ui: { theme: "dark", font_size: 18, show_source_column: true, table_row_height: 36 },
+    };
+    const run: TranslationRun = {
+      id: 1, started_at: "2026-01-01T00:00:00Z", provider: "mock", source_lang: "ja", target_lang: "en",
+      strings_translated: 2, tokens_used: 12, input_tokens: 8, output_tokens: 4,
+      cost_usd: 0, cost_is_complete: true, duration_secs: 3,
+    };
+    client.setQueryData(["config"], config);
+    client.setQueryData(["providers"], providers);
+    client.setQueryData(["glossary", "ja-en"], [
+      { term: "Greeting", translation: "Hello", lang_pair: "ja-en", context: null, case_sensitive: false },
+    ]);
+    client.setQueryData(["translation-runs"], [run]);
+    client.setQueryData(["backups", "report"], { entries: [healthyBackup], unreadable: [] });
+    return renderToStaticMarkup(createElement(QueryClientProvider, { client },
+      createElement(MemoryRouter, { initialEntries: [`/settings?section=${section}`] },
+        createElement(Settings))));
+  } finally { client.clear(); }
+}
+
+for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
+  for (const { id: section, labelKey } of SETTINGS_SECTIONS) {
+    test(`${locale} ${section} uses semantic colors and retains localized headings and controls`, async () => {
+      setLocale(locale);
+      const html = await renderPopulatedSection(section);
+      assert.ok(html.includes(catalog[`settings.${section}.title`]), "localized section heading");
+      for (const { labelKey: navLabel } of SETTINGS_SECTIONS) {
+        assert.ok(html.includes(catalog[navLabel]), `localized navigation: ${navLabel}`);
+      }
+      assert.ok(html.includes(`aria-current="page"`));
+      assert.ok(html.includes(`>${catalog[labelKey]}</button>`), "active section label");
+      const retainedText = {
+        providers: [catalog["settings.providers.testConnection"], catalog["settings.providers.needsApiKey"]],
+        defaults: [catalog["settings.defaults.sourceLang"], catalog["settings.defaults.langHint"]],
+        appearance: [catalog["settings.appearance.interfaceLanguage"], catalog["settings.appearance.tableRowHeightHint"]],
+        glossary: [catalog["settings.glossary.addEntry"], "Greeting", "Hello"],
+        history: [catalog["settings.history.col.provider"], catalog["settings.history.col.cost"]],
+        data: [catalog["settings.data.backups"], "/games/Demo", "healthy"],
+      }[section];
+      for (const text of retainedText) assert.ok(html.includes(text), `retained copy: ${text}`);
+      assertSemanticPalette(html);
     });
   }
 }

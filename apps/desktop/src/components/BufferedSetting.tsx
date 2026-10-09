@@ -1,6 +1,9 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { useT } from "../lib/i18n";
 
+/** Shared by buffered fields and the Settings page's inputs/selects. */
+export const SETTINGS_INPUT_CLASS = "w-full min-w-0 rounded-md border border-border bg-surface p-2 text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg";
+
 /** Keep intermediate typing local; persist a text edit on blur/Enter and a
  * slider edit on release. Responses cannot replace a newer local edit. */
 export default function BufferedSetting({
@@ -66,7 +69,7 @@ export default function BufferedSetting({
   };
   const dirty = draft !== String(value);
   return <div>
-    <label htmlFor={id} className="text-sm font-medium">{typeof label === "function" ? label(draft) : label}</label>
+    <label htmlFor={id} className="text-body font-medium">{typeof label === "function" ? label(draft) : label}</label>
     <input id={id} ref={input} type={type} value={draft} min={min} max={max} step={step} required={required} placeholder={placeholder}
       aria-invalid={invalid || undefined} aria-describedby={dirty || saving || invalid ? `${id}-status` : undefined}
       onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setInvalid(false); }}
@@ -74,8 +77,8 @@ export default function BufferedSetting({
       onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); } }}
       onKeyUp={type === "range" ? () => void commit() : undefined}
       onPointerUp={type === "range" ? () => void commit() : undefined}
-      className={type === "range" ? "mt-1 w-full" : "mt-1 w-full p-2 border rounded text-sm dark:bg-gray-800 dark:border-gray-600"} />
-    {(dirty || saving > 0 || invalid) && <p id={`${id}-status`} role="status" className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+      className={type === "range" ? "mt-1 w-full accent-accent" : `mt-1 ${SETTINGS_INPUT_CLASS}`} />
+    {(dirty || saving > 0 || invalid) && <p id={`${id}-status`} role="status" className="text-caption text-text-muted mt-1">
       {invalid ? t("settings.field.invalid") : saving ? t("settings.field.saving") : t("settings.field.unsaved")}
     </p>}
   </div>;

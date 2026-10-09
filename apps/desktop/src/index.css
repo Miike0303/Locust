@@ -4,6 +4,84 @@
    applyAppearance before toggling this class. */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Semantic sRGB equivalents of the Editor's gray/emerald/status palette.
+   Muted text uses gray-600/400 (AA on both surface variants); accent buttons
+   use emerald-700/800 so their white labels also meet AA. */
+:root {
+  --surface: #ffffff;
+  --surface-muted: #f9fafb;
+  --border: #e5e7eb;
+  --text: #111827;
+  --text-muted: #4b5563;
+  --accent: #047857;
+  --accent-hover: #065f46;
+  --accent-muted: #d1fae5;
+  --accent-fg: #047857;
+  --danger: #b91c1c;
+  --danger-muted: #fee2e2;
+  --warning: #92400e;
+  --warning-muted: #fef3c7;
+  --success: #065f46;
+  --success-muted: #d1fae5;
+}
+
+.dark {
+  --surface: #111827;
+  /* Recessed like light gray-50: the dark body base (gray-950), so cards on it read as raised. */
+  --surface-muted: #030712;
+  --border: #374151;
+  --text: #f3f4f6;
+  --text-muted: #9ca3af;
+  --accent: #047857;
+  --accent-hover: #065f46;
+  --accent-muted: #064e3b;
+  --accent-fg: #6ee7b7;
+  --danger: #fca5a5;
+  --danger-muted: #450a0a;
+  --warning: #fcd34d;
+  --warning-muted: #451a03;
+  --success: #6ee7b7;
+  --success-muted: #064e3b;
+}
+
+/* Type is identical in both modes and scales with applyAppearance's root size. */
+:root, .dark {
+  --type-caption: .75rem;
+  --type-caption-line-height: 1rem;
+  --type-body: .875rem;
+  --type-body-line-height: 1.25rem;
+  --type-section: 1rem;
+  --type-section-line-height: 1.5rem;
+  --type-page: 1.25rem;
+  --type-page-line-height: 1.75rem;
+}
+
+@theme inline {
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-border: var(--border);
+  --color-text: var(--text);
+  --color-text-muted: var(--text-muted);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-muted: var(--accent-muted);
+  --color-accent-fg: var(--accent-fg);
+  --color-danger: var(--danger);
+  --color-danger-muted: var(--danger-muted);
+  --color-warning: var(--warning);
+  --color-warning-muted: var(--warning-muted);
+  --color-success: var(--success);
+  --color-success-muted: var(--success-muted);
+  --text-caption: var(--type-caption);
+  --text-caption--line-height: var(--type-caption-line-height);
+  --text-body: var(--type-body);
+  --text-body--line-height: var(--type-body-line-height);
+  --text-section: var(--type-section);
+  --text-section--line-height: var(--type-section-line-height);
+  --text-page: var(--type-page);
+  --text-page--line-height: var(--type-page-line-height);
+}
+
 @layer base {
   html { color-scheme: light; }
   html.dark { color-scheme: dark; }
