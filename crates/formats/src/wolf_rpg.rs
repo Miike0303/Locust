@@ -5,6 +5,8 @@ use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
+use crate::discovery::find_capital_data_dir;
+
 /// Minimum string length (in chars) to extract via heuristic scan
 const MIN_STRING_LEN: usize = 2;
 
@@ -13,16 +15,6 @@ pub struct WolfRpgPlugin;
 impl WolfRpgPlugin {
     pub fn new() -> Self {
         Self
-    }
-
-    fn find_data_dir(path: &Path) -> Option<PathBuf> {
-        if path.is_dir() {
-            let data = path.join("Data");
-            if data.is_dir() {
-                return Some(data);
-            }
-        }
-        None
     }
 
     /// Heuristic: scan bytes for Shift-JIS encoded string regions.
@@ -194,7 +186,7 @@ impl FormatPlugin for WolfRpgPlugin {
             return path.extension().is_some_and(|ext| ext == "wolf");
         }
         if path.is_dir() {
-            if let Some(data_dir) = Self::find_data_dir(path) {
+            if let Some(data_dir) = find_capital_data_dir(path) {
                 return std::fs::read_dir(&data_dir)
                     .map(|entries| {
                         entries
@@ -220,7 +212,7 @@ impl FormatPlugin for WolfRpgPlugin {
             ));
         }
 
-        let data_dir = Self::find_data_dir(path).ok_or_else(|| LocustError::ParseError {
+        let data_dir = find_capital_data_dir(path).ok_or_else(|| LocustError::ParseError {
             file: path.display().to_string(),
             message: "could not find Data directory".to_string(),
         })?;
@@ -269,7 +261,7 @@ impl FormatPlugin for WolfRpgPlugin {
         }
 
         let data_dir = if path.is_dir() {
-            Self::find_data_dir(path).unwrap_or_else(|| path.to_path_buf())
+            find_capital_data_dir(path).unwrap_or_else(|| path.to_path_buf())
         } else {
             path.parent().unwrap_or(path).to_path_buf()
         };

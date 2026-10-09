@@ -1,6 +1,17 @@
-//! Shared pruning for Locust-owned filesystem recovery namespaces.
-//! Only directory names match; similarly named game resources remain eligible.
+//! Shared filesystem discovery helpers for format plugins.
+//! Recovery pruning only matches directory names; similarly named game resources remain eligible.
 use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn find_capital_data_dir(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        let data = path.join("Data");
+        if data.is_dir() {
+            return Some(data);
+        }
+    }
+    None
+}
 
 pub(crate) fn is_internal_directory_name(name: &OsStr) -> bool {
     #[cfg(windows)]
@@ -20,6 +31,51 @@ pub(crate) fn is_game_entry(entry: &walkdir::DirEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_data_dir(path: &Path, expected: Option<PathBuf>) {
+        assert_eq!(find_capital_data_dir(path), expected);
+    }
+
+    #[test]
+    fn capital_data_dir_finds_data_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("Data");
+        std::fs::create_dir(&data).unwrap();
+        assert_data_dir(root.path(), Some(data));
+    }
+
+    #[test]
+    fn capital_data_dir_rejects_directory_without_data() {
+        let root = tempfile::tempdir().unwrap();
+        assert_data_dir(root.path(), None);
+    }
+
+    #[test]
+    fn capital_data_dir_rejects_file_path() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("game.exe");
+        std::fs::write(&file, b"not a directory").unwrap();
+        std::fs::create_dir(root.path().join("Data")).unwrap();
+        assert_data_dir(&file, None);
+    }
+
+    #[test]
+    fn capital_data_dir_rejects_data_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Data"), b"not a directory").unwrap();
+        assert_data_dir(root.path(), None);
+    }
+
+    #[test]
+    fn capital_data_dir_uses_host_case_sensitivity() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("data")).unwrap();
+        // The old helpers probe the literal "Data", not a case-folded path.
+        // Whether it resolves to "data" depends on the host filesystem.
+        let data = root.path().join("Data");
+        let expected = data.is_dir().then_some(data);
+        assert_data_dir(root.path(), expected);
+    }
 
     #[test]
     fn recovery_discovery_prunes_only_exact_internal_directories() {

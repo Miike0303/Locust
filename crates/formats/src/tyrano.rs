@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use crate::archive_replace::{guard_target, note_backups, replace_files};
 use locust_core::backup::RevisionOriginal;
-use locust_core::error::{LocustError, Result};
+use locust_core::error::Result;
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 use locust_core::patch::GameLock;
@@ -40,6 +40,7 @@ use tracing::warn;
 
 use crate::tyrano_asar::{self, AsarArchive};
 use crate::tyrano_nw::{self, NwArchive};
+use crate::util::parse_err;
 
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
@@ -235,13 +236,6 @@ fn collect_ks_under(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
     out.sort();
-}
-
-fn parse_err(file: &str, message: impl Into<String>) -> LocustError {
-    LocustError::ParseError {
-        file: file.into(),
-        message: message.into(),
-    }
 }
 
 // ─── Decode / encode (UTF-8, optional BOM) ─────────────────────────────────

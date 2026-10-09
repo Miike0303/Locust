@@ -37,7 +37,7 @@ pub fn check_export_destination(output: &Path, project_db: &Path) -> Result<()> 
         let same_path = crate::database::paths_identical(&destination, &protected);
         let same_file = match &output_handle {
             Some(output) if protected.try_exists()? => {
-                crate::project::saved_db_handles_match(output, &std::fs::File::open(&protected)?)
+                crate::file_identity::same_file(output, &std::fs::File::open(&protected)?)
             }
             _ => false,
         };

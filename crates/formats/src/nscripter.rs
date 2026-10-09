@@ -33,9 +33,11 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use locust_core::backup::RevisionOriginal;
-use locust_core::error::{LocustError, Result};
+use locust_core::error::Result;
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
+
+use crate::util::parse_err;
 
 /// ONScripter `nscript.dat` / encrypt_mode 1 XOR constant (`readScriptSub`).
 const NSCRIPT_DAT_XOR: u8 = 0x84;
@@ -219,13 +221,6 @@ impl NScripterPlugin {
 impl Default for NScripterPlugin {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn parse_err(file: &str, message: impl Into<String>) -> LocustError {
-    LocustError::ParseError {
-        file: file.into(),
-        message: message.into(),
     }
 }
 

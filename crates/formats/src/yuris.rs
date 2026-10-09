@@ -42,6 +42,7 @@ use locust_core::models::{OutputMode, StringEntry};
 use locust_core::patch::GameLock;
 use tracing::warn;
 
+use crate::util::parse_err;
 use crate::yuris_ypf::{self, YpfArchive};
 
 const YSTB_MAGIC: &[u8; 4] = b"YSTB";
@@ -156,13 +157,6 @@ impl YurisPlugin {
 impl Default for YurisPlugin {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn parse_err(file: &str, message: impl Into<String>) -> LocustError {
-    LocustError::ParseError {
-        file: file.into(),
-        message: message.into(),
     }
 }
 

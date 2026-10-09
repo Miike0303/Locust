@@ -17,6 +17,7 @@ pub mod unreal_iostore;
 pub mod unreal_iostore_native;
 pub mod unreal_locres;
 pub mod unreal_pak;
+mod util;
 pub mod vntextpatch;
 pub mod wolf_rpg;
 // tyrano before kirikiri: both may see loose .ks; Tyrano claims data/scenario/ + tyrano/ trees.

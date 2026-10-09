@@ -41,6 +41,7 @@ use locust_core::models::{OutputMode, StringEntry};
 use tracing::warn;
 
 use crate::kirikiri_xp3::{self, Xp3Archive, Xp3Entry};
+use crate::util::parse_err;
 
 // One increment per archive-entry name inspected by a lookup. `None` means this
 // thread is not measuring (production tests stay quiet under --test-threads>1).
@@ -299,7 +300,7 @@ fn decode_ks_bytes(bytes: &[u8], label: &str) -> Result<DecodedKs> {
                     .filter(|end| *end <= bytes.len())
                     .ok_or_else(|| parse_err(label, "mode-2 truncated zlib stream"))?;
                 plain = miniz_oxide::inflate::decompress_to_vec_zlib(&bytes[21..end])
-                    .map_err(|e| parse_err(label, &format!("mode-2 zlib inflate: {e:?}")))?;
+                    .map_err(|e| parse_err(label, format!("mode-2 zlib inflate: {e:?}")))?;
                 if expected != 0 && plain.len() as u64 != expected {
                     return Err(parse_err(label, "mode-2 inflated size mismatch"));
                 }
@@ -439,13 +440,6 @@ fn encode_ks_edits(decoded: &DecodedKs, edits: &[KsEdit]) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
-}
-
-fn parse_err(file: &str, message: &str) -> LocustError {
-    LocustError::ParseError {
-        file: file.into(),
-        message: message.into(),
-    }
 }
 
 // ─── KAG line classification ───────────────────────────────────────────────
@@ -1772,7 +1766,7 @@ impl FormatPlugin for KirikiriPlugin {
             if xp3_parse_errors > 0 && xp3_ks_seen == 0 {
                 return Err(parse_err(
                     &path.display().to_string(),
-                    &format!("failed to parse XP3 archive(s): {last_xp3_err}"),
+                    format!("failed to parse XP3 archive(s): {last_xp3_err}"),
                 ));
             }
             if xp3_ks_seen == 0 {
@@ -1984,11 +1978,11 @@ impl FormatPlugin for KirikiriPlugin {
             // Preserve previously translated members omitted from this revision.
             if target.owned_hash.is_some() {
                 let archive = Xp3Archive::open(&target.path)
-                    .map_err(|e| parse_err("Locust patch", &e.to_string()))?;
+                    .map_err(|e| parse_err("Locust patch", e.to_string()))?;
                 for entry in &archive.entries {
                     let data = archive
                         .read_entry(entry)
-                        .map_err(|e| parse_err("Locust patch", &e.to_string()))?;
+                        .map_err(|e| parse_err("Locust patch", e.to_string()))?;
                     if merged.insert(entry.name.clone(), data).is_some() {
                         return Err(parse_err("Locust patch", "duplicate owned member"));
                     }

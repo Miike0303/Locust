@@ -7,6 +7,7 @@ use crate::config::AppConfig;
 use crate::database::{sha256_hex, Database};
 use crate::error::{LocustError, Result};
 use crate::extraction::{resolve_game_root, FormatRegistry};
+use crate::file_identity::same_file;
 use crate::models::{OutputMode, StringEntry};
 
 /// Hold the shared game lock throughout extraction and database merge, so an
@@ -303,55 +304,6 @@ fn saved_project_db_candidates(game_root: &Path, config_dir: &Path) -> Vec<PathB
     out
 }
 
-pub(crate) fn saved_db_handles_match(left: &std::fs::File, right: &std::fs::File) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        left.metadata()
-            .ok()
-            .zip(right.metadata().ok())
-            .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        #[repr(C)]
-        #[derive(Default)]
-        struct FileInformation {
-            attributes: u32,
-            creation: [u32; 2],
-            access: [u32; 2],
-            write: [u32; 2],
-            volume: u32,
-            size_high: u32,
-            size_low: u32,
-            links: u32,
-            index_high: u32,
-            index_low: u32,
-        }
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetFileInformationByHandle(
-                handle: *mut std::ffi::c_void,
-                info: *mut FileInformation,
-            ) -> i32;
-        }
-        let mut a = FileInformation::default();
-        let mut b = FileInformation::default();
-        // SAFETY: both handles remain open; structs match BY_HANDLE_FILE_INFORMATION.
-        let ok = unsafe {
-            GetFileInformationByHandle(left.as_raw_handle(), &mut a) != 0
-                && GetFileInformationByHandle(right.as_raw_handle(), &mut b) != 0
-        };
-        ok && (a.volume, a.index_high, a.index_low) == (b.volume, b.index_high, b.index_low)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (left, right);
-        false
-    }
-}
-
 fn same_saved_db(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -368,7 +320,7 @@ fn same_saved_db(left: &Path, right: &Path) -> bool {
         }
     }
     match (std::fs::File::open(left), std::fs::File::open(right)) {
-        (Ok(a), Ok(b)) => saved_db_handles_match(&a, &b),
+        (Ok(a), Ok(b)) => same_file(&a, &b),
         _ => false,
     }
 }
