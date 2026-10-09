@@ -18,7 +18,7 @@ Existing candidate enumeration and read-only DB probe in core project.rs; get_in
 ## Tasks
 - [x] RES-1 — Core preflight and locked verified resume with deterministic tests; ordinary folder behavior unchanged. Work unit `b351eb4b0f1af49ab6cf5dd8d488694337f9c9dd`. Delegated writer and independent safety verifier; source/test825 lines plus task document38. Review slice1.
 - [x] RES-2 — HTTP/Tauri adapters and shared accessible Resume/Refresh/Cancel choice before extraction; Welcome, hotkey and queue use common flow, explicit saved/recent unchanged. Delegated writer (multi-file); pure flow/transport tests and browser functional checks. Review slice2.
-- [ ] RES-3 — Verify whole feature, current evidence/docs/ledger and authorized delivery. Delegated command verifier/ledger writer; parent Git. Applicable full tests/builds, exact hosted candidate before main if publication authorization applies.
+- [x] RES-3 — Verify whole feature, current evidence/docs/ledger and authorized delivery. Delegated command verifier/ledger writer; parent Git. Applicable full tests/builds, exact hosted candidate before main if publication authorization applies.
 
 ## Acceptance and checks
 - Verified Direct root with sole valid matching DB and committed nonpending ownership offers resume. Resume retains stored row source/status/provider/warnings and returns zero merge counters without extraction.
@@ -37,4 +37,4 @@ Verifier incident: existing indexed_path_union_preserves_alias_identity_and_orde
 RES-2 implemented by a delegated writer (18 files, +1199/-38): POST /api/project/preflight and /api/project/resume, equivalent Tauri commands, shared successful-open state/config path, app-wide ResumeProjectDialog (Resume initial focus, Refresh explicit, Escape/Cancel no change), Welcome/hotkey/queue through one folder flow; needs_attention evidence offers only Refresh/Cancel. Writer RED: HTTP 404 on 4 tests, 8 flow and 6 queue tests failing before behavior; GREEN. Parent rerun: fmt, strict Clippy, locust-server + locust-desktop all green, core direct_project_resume 6/0, tsc, frontend 148/0, build. Not verified: native Tauri focus, live-backend browser, real games.
 
 ## Next step
-RES-3: full workspace tests, push branch, hosted CI on the exact SHA, fast-forward main only if green.
+None. RES-3 done: workspace 2045/0/19 locally; hosted run 37983908888 green at 845b259 (Ubuntu 2035/0/19, Windows 2045/0/19, frontend 148/0); main fast-forwarded to 845b259.
