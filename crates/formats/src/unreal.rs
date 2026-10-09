@@ -28,6 +28,7 @@ use crate::unreal_pak::{
 thread_local! {
     static FIND_PAK_FILES_CALLS: Cell<Option<usize>> = const { Cell::new(None) };
     static PAK_MAGIC_PROBES: Cell<Option<usize>> = const { Cell::new(None) };
+    static HEURISTIC_INJECT_BYTES_READ: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// Plugin for Unreal Engine games.
@@ -1812,7 +1813,30 @@ impl FormatPlugin for UnrealPlugin {
             }
 
             // ── Heuristic UTF-16LE slot inject ─────────────────────────────
-            let mut bytes = std::fs::read(file_path)?;
+            // Cap the read itself: metadata alone cannot bound a growing target.
+            let mut bytes = Vec::new();
+            std::fs::File::open(file_path)?
+                .take(HEURISTIC_PAK_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            #[cfg(test)]
+            HEURISTIC_INJECT_BYTES_READ.with(|c| {
+                if let Some(n) = c.get() {
+                    c.set(Some(n + bytes.len()));
+                }
+            });
+            if bytes.len() as u64 > HEURISTIC_PAK_MAX_BYTES {
+                let skipped = file_entries.iter().filter(|e| !is_locres_entry(e)).count();
+                strings_skipped += skipped;
+                *skip_reasons
+                    .entry("heuristic_target_too_large".into())
+                    .or_default() += skipped;
+                warnings.push(format!(
+                    "skipping heuristic UTF-16LE injection for {}: target exceeds the \
+                     {HEURISTIC_PAK_MAX_BYTES}-byte limit",
+                    file_path.display()
+                ));
+                continue;
+            }
             let mut modified = false;
 
             struct Work<'a> {
@@ -2247,6 +2271,180 @@ mod tests {
         let sources: Vec<&str> = entries.iter().map(|e| e.source.as_str()).collect();
         assert!(sources.contains(&"Hello World"), "got: {:?}", sources);
         assert!(sources.contains(&"Press Start"), "got: {:?}", sources);
+    }
+
+    fn write_heuristic_inject_target(dir: &Path, name: &str, len: u64) -> StringEntry {
+        let path = dir.join(name);
+        let source: Vec<u8> = "Hello World"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        fs::write(&path, source).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len)
+            .unwrap();
+        let mut entry = StringEntry::new(name, "Hello World", path);
+        entry.translation = Some("Hola Mundo".into());
+        entry
+    }
+
+    #[test]
+    fn test_inject_heuristic_oversized_target_is_bounded_and_unchanged() {
+        for len in [HEURISTIC_PAK_MAX_BYTES + 4096, HEURISTIC_PAK_MAX_BYTES + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let entry = write_heuristic_inject_target(dir.path(), "large.pak", len);
+            let original = fs::read(&entry.file_path).unwrap();
+
+            HEURISTIC_INJECT_BYTES_READ.with(|c| c.set(Some(0)));
+            let report = UnrealPlugin::new()
+                .inject(dir.path(), std::slice::from_ref(&entry))
+                .unwrap();
+            let bytes_read = HEURISTIC_INJECT_BYTES_READ
+                .with(|c| c.replace(None))
+                .unwrap();
+            assert!(
+                bytes_read as u64 <= HEURISTIC_PAK_MAX_BYTES + 1,
+                "heuristic injection read {bytes_read} bytes from a {len}-byte target; cap is {}",
+                HEURISTIC_PAK_MAX_BYTES + 1
+            );
+            assert_eq!(report.strings_written, 0, "{report:?}");
+            assert_eq!(report.strings_skipped, 1, "{report:?}");
+            assert_eq!(report.files_modified, 0, "{report:?}");
+            assert!(report.files_written.is_empty(), "{report:?}");
+            assert_eq!(
+                report.skip_reasons.get("heuristic_target_too_large"),
+                Some(&1)
+            );
+            assert!(
+                report.warnings.iter().any(|warning| {
+                    warning.contains("large.pak")
+                        && warning.contains("heuristic UTF-16LE injection")
+                        && warning.contains("8388608-byte limit")
+                }),
+                "{report:?}"
+            );
+            assert_eq!(fs::read(&entry.file_path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn test_inject_heuristic_target_at_limit_preserves_slot_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry =
+            write_heuristic_inject_target(dir.path(), "boundary.pak", HEURISTIC_PAK_MAX_BYTES);
+        let mut expected = fs::read(&entry.file_path).unwrap();
+        let translation: Vec<u8> = "Hola Mundo"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        expected[..translation.len()].copy_from_slice(&translation);
+        expected[translation.len()..22].fill(0);
+
+        HEURISTIC_INJECT_BYTES_READ.with(|c| c.set(Some(0)));
+        let report = UnrealPlugin::new()
+            .inject(dir.path(), std::slice::from_ref(&entry))
+            .unwrap();
+        let bytes_read = HEURISTIC_INJECT_BYTES_READ
+            .with(|c| c.replace(None))
+            .unwrap();
+        assert_eq!(bytes_read as u64, HEURISTIC_PAK_MAX_BYTES);
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 0, "{report:?}");
+        assert_eq!(report.files_modified, 1, "{report:?}");
+        assert_eq!(report.files_written, vec![entry.file_path.clone()]);
+        assert!(report.skip_reasons.is_empty(), "{report:?}");
+        assert_eq!(fs::read(&entry.file_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_inject_heuristic_oversized_target_does_not_block_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let large =
+            write_heuristic_inject_target(dir.path(), "large.pak", HEURISTIC_PAK_MAX_BYTES + 4096);
+        let original = fs::read(&large.file_path).unwrap();
+        let small = write_heuristic_inject_target(dir.path(), "small.pak", 64);
+        let small_path = small.file_path.clone();
+        let mut another_large = large.clone();
+        another_large.id = "another_large_row".into();
+
+        let report = UnrealPlugin::new()
+            .inject(dir.path(), &[large.clone(), another_large, small])
+            .unwrap();
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 2, "{report:?}");
+        assert_eq!(report.files_modified, 1, "{report:?}");
+        assert_eq!(report.files_written, vec![small_path.clone()]);
+        assert_eq!(
+            report.skip_reasons.get("heuristic_target_too_large"),
+            Some(&2)
+        );
+        assert_eq!(fs::read(&large.file_path).unwrap(), original);
+        let expected: Vec<u8> = "Hola Mundo"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .chain(std::iter::repeat_n(0, 44))
+            .collect();
+        assert_eq!(fs::read(small_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_inject_heuristic_limit_does_not_reject_structural_rows_in_same_pak() {
+        let dir = tempfile::tempdir().unwrap();
+        let locres = write_loose_locres(dir.path(), crate::unreal_locres::LocresVersion::Compact);
+        let original = write_pak(
+            DEFAULT_MOUNT_POINT,
+            8,
+            &[
+                PakWriteFile {
+                    name: "TestGame/Content/Localization/Game/es/Game.locres".into(),
+                    data: fs::read(locres).unwrap(),
+                },
+                PakWriteFile {
+                    name: "TestGame/Content/Padding.bin".into(),
+                    data: vec![0; HEURISTIC_PAK_MAX_BYTES as usize],
+                },
+            ],
+            "mixed.pak",
+        )
+        .unwrap();
+        let pak = dir.path().join("mixed.pak");
+        fs::write(&pak, &original).unwrap();
+        let plugin = UnrealPlugin::new();
+        let mut entries = plugin.extract(&pak).unwrap();
+        entries.retain(|entry| entry.source == "Hello traveler");
+        assert_eq!(entries.len(), 1);
+        assert!(is_locres_entry(&entries[0]));
+        entries[0].translation = Some("Hola viajero".into());
+        let mut heuristic = StringEntry::new("synthetic", "Hello World", pak.clone());
+        heuristic.translation = Some("Hola Mundo".into());
+        entries.push(heuristic);
+
+        HEURISTIC_INJECT_BYTES_READ.with(|c| c.set(Some(0)));
+        let report = plugin.inject(dir.path(), &entries).unwrap();
+        let bytes_read = HEURISTIC_INJECT_BYTES_READ
+            .with(|c| c.replace(None))
+            .unwrap();
+        assert_eq!(bytes_read as u64, HEURISTIC_PAK_MAX_BYTES + 1);
+        assert_eq!(report.strings_written, 1, "{report:?}");
+        assert_eq!(report.strings_skipped, 1, "{report:?}");
+        assert_eq!(report.files_modified, 1, "{report:?}");
+        assert_eq!(
+            report.files_written,
+            vec![dir.path().join("mixed_LOCUST_P.pak")]
+        );
+        assert_eq!(
+            report.skip_reasons.get("heuristic_target_too_large"),
+            Some(&1)
+        );
+        assert_eq!(fs::read(pak).unwrap(), original);
+        assert!(plugin
+            .extract(&report.files_written[0])
+            .unwrap()
+            .iter()
+            .any(|entry| entry.source == "Hola viajero"));
     }
 
     #[test]
