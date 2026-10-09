@@ -38,6 +38,11 @@ const EXACT: Record<string, MessageKey> = {
 	"path not found": "api.error.pathNotFound",
 	"entry not found": "api.error.entryNotFound",
 	"job not found": "api.error.jobNotFound",
+	"provider not found": "api.error.providerNotFound",
+	"patch backup incomplete: no backup found — factory pristine is unrecoverable":
+		"api.error.patchBackupMissing",
+	"One project database can inject only one target language. Use a separate pivot database for each target language.":
+		"api.error.injectSingleTargetLanguage",
 	cancelled: "api.error.cancelled",
 	"zip_path or zip_url required": "api.error.zipSourceRequired",
 	"game_path required": "api.error.gamePathRequired",
@@ -58,6 +63,15 @@ const EXACT: Record<string, MessageKey> = {
 type PrefixRule = { prefix: string; key: MessageKey; detail?: boolean };
 
 const PREFIXES: PrefixRule[] = [
+	// Recovery guidance replaces opaque paths and CLI instructions; do not interpolate detail.
+	{
+		prefix: 'patch error: no injection has been recorded in "',
+		key: "api.error.injectionNotRecorded",
+	},
+	{
+		prefix: "patch apply interrupted — run rollback first: ",
+		key: "api.error.patchInterrupted",
+	},
 	{ prefix: "format not found: ", key: "api.error.formatNotFound", detail: true },
 	{ prefix: "zip_path not found: ", key: "api.error.zipPathNotFound", detail: true },
 	{ prefix: "invalid zip_url: ", key: "api.error.invalidZipUrl", detail: true },

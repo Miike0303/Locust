@@ -100,6 +100,101 @@ assert.equal(
 	"That xAI login session expired or was not found. Start login again.",
 );
 
+// Mirrors the owned Display/server messages, including the CLI-oriented pack suffix.
+const recoveryErrors = [
+	{
+		name: "missing injection recording",
+		body: 'patch error: no injection has been recorded in "C:\\fixtures\\project.locust.db". `locust patch` packs exactly ' +
+			'the files a recorded injection wrote — never a list guessed from the database. Run ' +
+			'`locust inject "C:\\fixtures\\game" -P "C:\\fixtures\\project.locust.db" --direct -l es` first, then re-run patch.',
+		en: "No injection has been recorded for this project. Inject the translation first, then create the patch in Patch → Pack.",
+		es: "No hay ninguna inyección registrada para este proyecto. Inyecte la traducción primero y después cree el parche en Parche → Empaquetar.",
+	},
+	{
+		name: "interrupted patch application",
+		body: "patch apply interrupted — run rollback first: run patch-rollback first",
+		en: "Patch application was interrupted. Roll back the patch before applying it again.",
+		es: "La aplicación del parche se interrumpió. Revierta el parche antes de volver a aplicarlo.",
+	},
+	{
+		name: "missing patch backup",
+		body: "patch backup incomplete: no backup found — factory pristine is unrecoverable",
+		en: "No patch backup was found. Locust cannot restore the original game files.",
+		es: "No se encontró ninguna copia de seguridad del parche. Locust no puede restaurar los archivos originales del juego.",
+	},
+	{
+		name: "missing provider",
+		body: "provider not found",
+		en: "Provider not found. Choose another provider or configure its API key in Settings.",
+		es: "No se encontró el proveedor. Seleccione otro proveedor o configure su clave API en Ajustes.",
+	},
+	{
+		name: "multiple injection target languages",
+		body: "One project database can inject only one target language. Use a separate pivot database for each target language.",
+		en: "One project database can inject only one target language. Use a separate pivot database for each target language.",
+		es: "Una base de datos de proyecto solo puede inyectar un idioma de destino. Use un proyecto intermedio con su propia base de datos para cada idioma de destino.",
+	},
+] as const;
+
+for (const recovery of recoveryErrors) {
+	for (const locale of ["es", "en"] as const) {
+		test(`${recovery.name} shows desktop guidance for bare and HTTP errors in ${locale}`, () => {
+			setLocale(locale);
+			assert.equal(localizeApiError(recovery.body), recovery[locale]);
+			for (const status of [400, 409, 500]) {
+				assert.equal(localizeApiError(`${status}: ${recovery.body}`), recovery[locale]);
+			}
+		});
+	}
+}
+
+const recoveryPrefixes = [
+	{ prefix: 'patch error: no injection has been recorded in "', recovery: recoveryErrors[0] },
+	{ prefix: "patch apply interrupted — run rollback first: ", recovery: recoveryErrors[1] },
+];
+
+test("recovery prefix guidance never interpolates opaque paths, CLI commands or other suffixes", () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const { prefix, recovery } of recoveryPrefixes) {
+			for (const suffix of [String.raw`C:\fixtures\日本語\$&\{detail}" --direct`, "opaque\nsecond line", "$' $$ $`"]) {
+				assert.equal(localizeApiError(`${prefix}${suffix}`), recovery[locale]);
+				assert.equal(localizeApiError(`500: ${prefix}${suffix}`), recovery[locale]);
+			}
+		}
+	}
+});
+
+test("near-miss recovery messages retain unknown-error fallback in both locales", () => {
+	const nearMisses = [
+		...recoveryErrors.map(({ body }) => `extra prefix: ${body}`),
+		...recoveryErrors.slice(2).map(({ body }) => `${body} extra detail`),
+		String.raw`patch error: no injection has been recorded in C:\fixtures\project.locust.db`,
+		'patch error: no injection has been recorded for "project.locust.db"',
+		'no injection has been recorded in "project.locust.db"',
+		"patch apply interrupted - run rollback first: run patch-rollback first",
+		"patch apply interrupted — run recovery first: run patch-rollback first",
+		"patch apply interrupted — run rollback first",
+		"patch apply interrupted — run rollback first:",
+		"patch backup incomplete: interrupted apply has no valid backup/manifest.json — refusing",
+		"patch backup incomplete: no backup found — pristine is unrecoverable",
+		"provider not found: example",
+		"provider not configured: example",
+		"Provider not found",
+		recoveryErrors[4].body.replace("only one", "multiple"),
+		"weird backend detail",
+	];
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const raw of nearMisses) {
+			assert.equal(localizeApiError(raw), raw);
+			assert.equal(localizeApiError(`400: ${raw}`),
+				`${locale === "es" ? "Error del servidor" : "Server error"} 400: ${raw}`);
+			assert.equal(new ApiError(raw).key, undefined);
+		}
+	}
+});
+
 const excerpts = ['"unterminated', String.raw`"$& C:\games\日本語\dialog.po`, '"café" extra', ""];
 const poError = (line: string, excerpt: string) =>
 	`parse error in po: line ${line}: malformed PO string: ${excerpt}`;
@@ -216,6 +311,44 @@ test("real HTTP PO import retains its raw body log without duplicate localizatio
 		assert.equal(entries.length, 1);
 		assert.equal(entries[0].detail, rawFailure);
 		assert.equal(entries[0].message, "API 400: /import/po");
+	}
+});
+
+test("Tauri string/Error rejections use recovery guidance without changing existing logging", async () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const asError of [false, true]) {
+			rejectWithError = asError;
+			for (const recovery of recoveryErrors) {
+				rawFailure = `${recovery.body}   `;
+				useLogStore.getState().clear();
+				await assert.rejects(api.importTranslations("po", "fixture.po"), (error: unknown) => {
+					assert.ok(error instanceof ApiError);
+					assert.equal(error.message, recovery[locale]);
+					return true;
+				});
+				assert.equal(useLogStore.getState().entries.length, 0);
+			}
+		}
+	}
+});
+
+test("HTTP recovery failures localize guidance and preserve the complete raw activity-log detail", async () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const recovery of recoveryErrors) {
+			rawFailure = `${recovery.body}   `;
+			useLogStore.getState().clear();
+			await assert.rejects(api.patchPack({ game_path: "fixture", output_path: "fixture.zip" }), (error: unknown) => {
+				assert.ok(error instanceof ApiError);
+				assert.equal(error.message, recovery[locale]);
+				return true;
+			});
+			const entries = useLogStore.getState().entries;
+			assert.equal(entries.length, 1);
+			assert.deepEqual([entries[0].level, entries[0].message, entries[0].detail, entries[0].source],
+				["error", "API 400: /patch/pack", rawFailure, "api"]);
+		}
 	}
 });
 

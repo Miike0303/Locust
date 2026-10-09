@@ -1100,6 +1100,16 @@ export const es: Record<keyof typeof en, string> = {
   "api.error.batchTooLarge": "Demasiadas actualizaciones en un lote (máximo 50.000).",
   "api.error.nothingToPack":
     "Aún no hay nada que empaquetar — traduzca, inyecte y después empaquete.",
+  "api.error.injectionNotRecorded":
+    "No hay ninguna inyección registrada para este proyecto. Inyecte la traducción primero y después cree el parche en Parche → Empaquetar.",
+  "api.error.patchInterrupted":
+    "La aplicación del parche se interrumpió. Revierta el parche antes de volver a aplicarlo.",
+  "api.error.patchBackupMissing":
+    "No se encontró ninguna copia de seguridad del parche. Locust no puede restaurar los archivos originales del juego.",
+  "api.error.providerNotFound":
+    "No se encontró el proveedor. Seleccione otro proveedor o configure su clave API en Ajustes.",
+  "api.error.injectSingleTargetLanguage":
+    "Una base de datos de proyecto solo puede inyectar un idioma de destino. Use un proyecto intermedio con su propia base de datos para cada idioma de destino.",
   "api.error.noTranslatedToPivot":
     "No hay traducciones para pivotar. Traduzca o importe primero.",
   "api.error.unknownExportFormat":

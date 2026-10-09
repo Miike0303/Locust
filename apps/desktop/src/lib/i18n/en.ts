@@ -1129,6 +1129,16 @@ export const en = {
   "api.error.batchTooLarge": "Too many updates in one batch (maximum 50,000).",
   "api.error.nothingToPack":
     "Nothing to pack yet — translate some strings, then inject, then pack.",
+  "api.error.injectionNotRecorded":
+    "No injection has been recorded for this project. Inject the translation first, then create the patch in Patch → Pack.",
+  "api.error.patchInterrupted":
+    "Patch application was interrupted. Roll back the patch before applying it again.",
+  "api.error.patchBackupMissing":
+    "No patch backup was found. Locust cannot restore the original game files.",
+  "api.error.providerNotFound":
+    "Provider not found. Choose another provider or configure its API key in Settings.",
+  "api.error.injectSingleTargetLanguage":
+    "One project database can inject only one target language. Use a separate pivot database for each target language.",
   "api.error.noTranslatedToPivot":
     "No translations to pivot from. Translate or import first.",
   "api.error.unknownExportFormat":
