@@ -7,7 +7,7 @@ import { CheckCircle, XCircle, Loader, Trash2, RotateCcw, Plus, Search, Copy, Ex
 import clsx from "clsx";
 import {
   getProviders, checkProviderHealth, getConfig, updateConfig,
-  getBackups, restoreBackup, deleteBackup,
+  getBackupsReport, restoreBackup, deleteBackup,
   getGlossary, addGlossaryEntry, deleteGlossaryEntry,
   getTranslationRuns,
   xaiAuthStart, xaiAuthPoll,
@@ -977,7 +977,11 @@ function GlossarySection() {
 
 function DataSection() {
   const t = useT();
-  const { data: backups, refetch } = useQuery({ queryKey: ["backups"], queryFn: getBackups });
+  const { data: listing, isPending, isError, error, refetch } = useQuery({
+    queryKey: ["backups", "report"], queryFn: getBackupsReport,
+  });
+  const backups = listing?.entries ?? [];
+  const unreadable = listing?.unreadable ?? [];
   const [pendingAction, setPendingAction] = useState<
     { kind: "restore" | "delete"; id: string; game: string; sourcePath: string } | null
   >(null);
@@ -1011,9 +1015,15 @@ function DataSection() {
       <h2 className="text-xl font-bold">{t("settings.data.title")}</h2>
       <div>
         <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase mb-2">{t("settings.data.backups")}</h3>
-        {(!backups || backups.length === 0) ? (
+        {isPending ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400" role="status">{t("common.loading")}</p>
+        ) : isError ? (
+          <p className="text-sm text-red-600 dark:text-red-400" role="alert">
+            {t("settings.data.loadFailed", { error: error.message })}
+          </p>
+        ) : backups.length === 0 && unreadable.length === 0 ? (
           <p className="text-sm text-gray-500 dark:text-gray-400">{t("settings.data.noBackups")}</p>
-        ) : (
+        ) : backups.length > 0 ? (
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-gray-500 dark:text-gray-400">
@@ -1048,6 +1058,24 @@ function DataSection() {
               })}
             </tbody>
           </table>
+        ) : null}
+        {!isPending && !isError && unreadable.length > 0 && (
+          <div className="mt-4 p-3 border border-amber-300 dark:border-amber-800 rounded space-y-2">
+            <h4 className="text-sm font-semibold">{t("settings.data.damagedBackups")}</h4>
+            <p className="text-xs text-gray-600 dark:text-gray-400">{t("settings.data.damagedHint")}</p>
+            <ul className="space-y-2 text-sm">
+              {unreadable.map((backup) => {
+                const diagnostic = backup.error.replace(/\s+/g, " ").trim();
+                const shortError = diagnostic.length > 200 ? `${diagnostic.slice(0, 200)}…` : diagnostic;
+                return (
+                  <li key={backup.id}>
+                    <div className="font-mono text-xs break-all">{backup.id}</div>
+                    <div className="text-xs text-gray-600 dark:text-gray-400 break-words">{shortError}</div>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
         )}
       </div>
 

@@ -114,3 +114,57 @@ for (const [locale, catalog, hints] of [
     });
   }
 }
+
+const healthyBackup = {
+  id: "healthy", path: "/backups/healthy", source_path: "/games/Demo",
+  created_at: "2026-01-01T00:00:00Z", file_count: 2, size_bytes: 16,
+};
+
+async function renderBackups(state: "loading" | "failed" | "empty" | "damaged" | "mixed"): Promise<string> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, retryOnMount: false, gcTime: Infinity } },
+  });
+  try {
+    // An old array cache must not satisfy the new report query.
+    if (state !== "loading" && state !== "failed") client.setQueryData(["backups"], []);
+    if (state === "failed") {
+      await assert.rejects(client.fetchQuery({
+        queryKey: ["backups", "report"], queryFn: async () => { throw new Error("backup root unavailable"); },
+      }));
+    } else if (state !== "loading") {
+      client.setQueryData(["backups", "report"], {
+        entries: state === "mixed" ? [healthyBackup] : [],
+        unreadable: state === "empty" ? [] : [
+          { id: "damaged<id>", error: `manifest\n  unreadable <unsafe> ${"x".repeat(300)}` },
+        ],
+      });
+    }
+    return renderToStaticMarkup(createElement(QueryClientProvider, { client },
+      createElement(MemoryRouter, { initialEntries: ["/settings?section=data"] },
+        createElement(Settings))));
+  } finally { client.clear(); }
+}
+
+for (const [locale, catalog, damagedTitle, failedText] of [
+  ["en", en, "Damaged backups", "Could not load backups: backup root unavailable"],
+  ["es", es, "Copias de seguridad dañadas", "No se pudieron cargar las copias de seguridad: backup root unavailable"],
+] as const) {
+  for (const state of ["loading", "failed", "empty", "damaged", "mixed"] as const) {
+    test(`${locale} Data renders ${state} backup state without misleading empty text or unsafe actions`, async () => {
+      setLocale(locale);
+      const html = await renderBackups(state);
+      assert.equal(html.includes(catalog["settings.data.noBackups"]), state === "empty", html);
+      assert.equal(html.includes(catalog["common.loading"]), state === "loading", html);
+      assert.equal(html.includes(failedText), state === "failed", html);
+      assert.equal(html.includes(damagedTitle), state === "damaged" || state === "mixed", html);
+      assert.equal(html.includes('title="' + catalog["settings.data.restore"] + '"'), state === "mixed", html);
+      assert.equal(html.includes('title="' + catalog["settings.data.delete"] + '"'), state === "mixed", html);
+      if (state === "mixed") assert.ok(html.includes("/games/Demo") && html.includes("healthy"), html);
+      if (state === "damaged" || state === "mixed") {
+        assert.ok(html.includes("damaged&lt;id&gt;"), html);
+        assert.ok(html.includes("manifest unreadable &lt;unsafe&gt;"), html);
+        assert.ok(!html.includes("x".repeat(300)), "damaged diagnostics should stay short");
+      }
+    });
+  }
+}

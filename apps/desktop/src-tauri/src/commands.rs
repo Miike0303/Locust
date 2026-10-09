@@ -800,12 +800,27 @@ pub async fn save_config(
 #[tauri::command]
 pub fn get_backups(
     state: State<AppStateWrapper>,
-) -> Result<Vec<locust_core::backup::BackupEntry>, String> {
-    state
-        .0
-        .backup_manager
-        .list_backups()
-        .map_err(|e| e.to_string())
+    report: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    backup_response(&state.0.backup_manager, report.unwrap_or(false))
+}
+
+fn backup_response(
+    manager: &locust_core::backup::BackupManager,
+    report: bool,
+) -> Result<serde_json::Value, String> {
+    if report {
+        let listing = manager.list_backups_report().map_err(|e| e.to_string())?;
+        let unreadable: Vec<_> = listing
+            .unreadable
+            .into_iter()
+            .map(|(id, error)| serde_json::json!({"id": id, "error": error}))
+            .collect();
+        Ok(serde_json::json!({"entries": listing.entries, "unreadable": unreadable}))
+    } else {
+        serde_json::to_value(manager.list_backups().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[tauri::command]
@@ -848,6 +863,51 @@ async fn apply_add_glossary_entry(s: &AppState, entry: &GlossaryEntry) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_response_supports_report_and_legacy_modes() {
+        let state = locust_server::create_test_state();
+        let root = state.config_path.parent().unwrap();
+        std::fs::create_dir_all(root).unwrap();
+        let manager = locust_core::backup::BackupManager::new(root.join("backups"));
+        assert_eq!(
+            backup_response(&manager, false).unwrap(),
+            serde_json::json!([])
+        );
+        assert_eq!(
+            backup_response(&manager, true).unwrap(),
+            serde_json::json!({"entries": [], "unreadable": []})
+        );
+        let game = root.join("game");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("story.txt"), b"original").unwrap();
+        let healthy = manager.create_backup(&game).unwrap();
+        let damaged = manager.root().join("damaged");
+        std::fs::create_dir(&damaged).unwrap();
+        std::fs::write(damaged.join("manifest.json"), b"{").unwrap();
+        let report = backup_response(&manager, true).unwrap();
+        assert_eq!(report["entries"][0]["id"], healthy.id);
+        assert_eq!(report["unreadable"][0]["id"], "damaged");
+        assert!(report["unreadable"][0]["error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()));
+        assert_eq!(backup_response(&manager, false).unwrap(), report["entries"]);
+        std::fs::write(healthy.path.join("manifest.json"), b"{").unwrap();
+        let all_damaged = backup_response(&manager, true).unwrap();
+        assert_eq!(all_damaged["entries"], serde_json::json!([]));
+        assert_eq!(all_damaged["unreadable"].as_array().unwrap().len(), 2);
+        assert!(
+            backup_response(&manager, false).is_err(),
+            "legacy all-damaged failure stays unchanged"
+        );
+        let fatal_root = root.join("not-a-directory");
+        std::fs::write(&fatal_root, b"file").unwrap();
+        let failed = locust_core::backup::BackupManager::new(fatal_root);
+        assert!(
+            backup_response(&failed, true).is_err(),
+            "fatal errors must not become empty reports"
+        );
+    }
 
     async fn direct_resume_fixture() -> (Arc<AppState>, PathBuf, String, String) {
         let mut state = locust_server::create_test_state();

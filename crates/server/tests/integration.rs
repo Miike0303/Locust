@@ -908,6 +908,142 @@ fn urlencoding(s: &str) -> String {
 // ─── Backup and restore ────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn backup_report_lists_mixed_backups_and_preserves_legacy_array() {
+    let fixture = TempDir::new().unwrap();
+    let game = fixture.path().join("game");
+    std::fs::create_dir(&game).unwrap();
+    std::fs::write(game.join("story.txt"), b"original").unwrap();
+    let state = locust_server::create_test_state();
+    let healthy = state.backup_manager.create_backup(&game).unwrap();
+    let damaged = state.backup_manager.root().join("damaged");
+    std::fs::create_dir(&damaged).unwrap();
+    std::fs::write(damaged.join("manifest.json"), b"{").unwrap();
+    let before = snapshot_tree(state.backup_manager.root());
+    let root = state.backup_manager.root().to_path_buf();
+    let (url, server) = locust_server::start_test_server(state).await;
+
+    let response = client()
+        .get(format!("{url}/api/backups?report=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let report: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(report["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(report["entries"][0]["id"], healthy.id);
+    assert_eq!(report["unreadable"].as_array().unwrap().len(), 1);
+    assert_eq!(report["unreadable"][0]["id"], "damaged");
+    assert!(report["unreadable"][0]["error"]
+        .as_str()
+        .is_some_and(|e| !e.is_empty()));
+    for query in ["", "?report=false"] {
+        let legacy: serde_json::Value = client()
+            .get(format!("{url}/api/backups{query}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy, report["entries"],
+            "legacy response must stay an array"
+        );
+    }
+    assert_eq!(
+        snapshot_tree(&root),
+        before,
+        "listing must not change backup bytes"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn backup_report_handles_all_damaged_without_changing_legacy_failure() {
+    let state = locust_server::create_test_state();
+    let damaged = state.backup_manager.root().join("damaged-only");
+    std::fs::create_dir_all(&damaged).unwrap();
+    std::fs::write(damaged.join("manifest.json"), b"not JSON").unwrap();
+    let (url, server) = locust_server::start_test_server(state).await;
+    let response = client()
+        .get(format!("{url}/api/backups?report=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let report: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(report["entries"], serde_json::json!([]));
+    assert_eq!(report["unreadable"][0]["id"], "damaged-only");
+    assert!(report["unreadable"][0]["error"]
+        .as_str()
+        .is_some_and(|e| !e.is_empty()));
+    for query in ["", "?report=false"] {
+        assert_eq!(
+            client()
+                .get(format!("{url}/api/backups{query}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            500
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn backup_report_distinguishes_empty_and_fatal_listing_failure() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().join("backups");
+    let mut state = locust_server::create_test_state();
+    std::sync::Arc::get_mut(&mut state).unwrap().backup_manager =
+        std::sync::Arc::new(locust_core::backup::BackupManager::new(root.clone()));
+    let (url, server) = locust_server::start_test_server(state).await;
+    for exists in [false, true] {
+        if exists {
+            std::fs::create_dir(&root).unwrap();
+        }
+        let report: serde_json::Value = client()
+            .get(format!("{url}/api/backups?report=true"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(report, serde_json::json!({"entries": [], "unreadable": []}));
+        let legacy: serde_json::Value = client()
+            .get(format!("{url}/api/backups"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(legacy, serde_json::json!([]));
+    }
+    // A non-directory root is a fatal I/O error, not an empty/damaged report.
+    let bad_root = fixture.path().join("not-a-directory");
+    std::fs::write(&bad_root, b"file").unwrap();
+    let mut failed_state = locust_server::create_test_state();
+    std::sync::Arc::get_mut(&mut failed_state)
+        .unwrap()
+        .backup_manager = std::sync::Arc::new(locust_core::backup::BackupManager::new(bad_root));
+    let (failed_url, failed_server) = locust_server::start_test_server(failed_state).await;
+    assert_eq!(
+        client()
+            .get(format!("{failed_url}/api/backups?report=true"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        500
+    );
+    failed_server.abort();
+    server.abort();
+}
+
+#[tokio::test]
 async fn test_backup_restore() {
     let tmpdir = TempDir::new().unwrap();
     create_rpgmaker_mv_fixture(tmpdir.path());
@@ -1254,6 +1390,37 @@ async fn patch_rollback_dry_run_changes_nothing() {
     assert!(store.receipt_path().is_file());
     assert!(store.backup_manifest_path().is_file());
     assert!(!before_store.is_empty());
+
+    let response = client()
+        .post(format!("{base_url}/api/patch/rollback"))
+        .json(&serde_json::json!({"game_path": game, "dry_run": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let blocked: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(blocked["dry_run"], true);
+    assert_eq!(blocked["restored"], 0);
+    assert_eq!(blocked["deleted"], 0);
+    assert_eq!(blocked["baseline"], "Pristine");
+    assert_eq!(
+        blocked["aborted_edited"],
+        serde_json::json!(["data/f1.txt"])
+    );
+    assert_eq!(blocked["torn_deleted"], serde_json::json!([]));
+    assert!(blocked["messages"]
+        .as_array()
+        .is_some_and(|m| !m.is_empty()));
+    assert_eq!(
+        snapshot_tree(&game),
+        before_game,
+        "blocked preview must preserve game bytes"
+    );
+    assert_eq!(
+        snapshot_tree(&store.locust_dir()),
+        before_store,
+        "blocked preview must preserve store bytes"
+    );
 
     let response = client()
         .post(format!("{base_url}/api/patch/rollback"))

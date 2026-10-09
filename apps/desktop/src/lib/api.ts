@@ -178,6 +178,11 @@ export interface BackupEntry {
   source_path: string; file_count: number; size_bytes: number;
 }
 
+export interface BackupListing {
+  entries: BackupEntry[];
+  unreadable: { id: string; error: string }[];
+}
+
 export interface AppConfig {
   /** Protected startup fallback: original configuration could not be read. */
   load_warning?: string;
@@ -694,6 +699,10 @@ export const updateConfig = (partial: ConfigUpdate): Promise<AppConfig> => {
 export const getBackups = (): Promise<BackupEntry[]> =>
   IS_TAURI ? tauriInvoke("get_backups") : request("/backups");
 
+/** Includes per-backup manifest diagnostics without changing the legacy array API. */
+export const getBackupsReport = (): Promise<BackupListing> =>
+  IS_TAURI ? tauriInvoke("get_backups", { report: true }) : request("/backups?report=true");
+
 export const restoreBackup = (id: string) =>
   request<void>(`/backups/${encodeURIComponent(id)}/restore`, { method: "POST" }).finally(refreshGameState);
 
@@ -737,6 +746,8 @@ export interface PatchApplyResult {
 }
 
 export interface PatchRollbackResult {
+  /** Optional for compatibility with older servers. */
+  dry_run?: boolean;
   restored: number;
   deleted: number;
   baseline: string | null;

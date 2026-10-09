@@ -2919,15 +2919,38 @@ async fn memory_lang_pairs(
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
+#[derive(Default, Deserialize)]
+struct BackupListQuery {
+    #[serde(default)]
+    report: bool,
+}
+
 async fn list_backups(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<BackupEntry>>, ApiError> {
+    Query(params): Query<BackupListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let manager = state.backup_manager.clone();
-    tokio::task::spawn_blocking(move || manager.list_backups())
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .map(Json)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+    tokio::task::spawn_blocking(move || {
+        if params.report {
+            let listing = manager
+                .list_backups_report()
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let unreadable: Vec<_> = listing
+                .unreadable
+                .into_iter()
+                .map(|(id, error)| serde_json::json!({"id": id, "error": error}))
+                .collect();
+            Ok(serde_json::json!({"entries": listing.entries, "unreadable": unreadable}))
+        } else {
+            manager
+                .list_backups()
+                .map(|entries: Vec<BackupEntry>| serde_json::json!(entries))
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+        }
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map(Json)
 }
 
 async fn restore_backup(

@@ -23,6 +23,7 @@ import {
 	patchVerify,
 	type PatchApplyResult,
 	type PatchPackResult,
+	type PatchRollbackResult,
 	type PatchStatusResult,
 	type PatchVerifyResult,
 } from "../lib/api";
@@ -130,6 +131,11 @@ export default function PatchModal({
 	const [loading, setLoading] = useState(false);
 	const [verify, setVerify] = useState<PatchVerifyResult | null>(null);
 	const [applyResult, setApplyResult] = useState<PatchApplyResult | null>(null);
+	const [rollbackPreview, setRollbackPreview] = useState<{
+		gamePath: string;
+		force: boolean;
+		report: PatchRollbackResult;
+	} | null>(null);
 	const [packResult, setPackResult] = useState<PatchPackResult | null>(null);
 	const [status, setStatus] = useState<PatchStatusResult | null>(null);
 	const [error, setError] = useState<string | null>(null);
@@ -159,6 +165,7 @@ export default function PatchModal({
 		if (initialZipPath) { setZipPath(initialZipPath); setZipUrl(""); setVerify(null); setApplyResult(null); }
 		setTab(allowPack ? initialTab : "apply");
 		setError(null);
+		setRollbackPreview(null);
 		if (!allowPack) {
 			setRecordings([]);
 			setPristineRecordings([]);
@@ -211,6 +218,9 @@ export default function PatchModal({
 	const resolvedSource = resolvePatchSource(zipPath, zipUrl);
 	const sourceOk = patchSourceReady(resolvedSource);
 	const canVerifyApply = Boolean(gamePath.trim()) && sourceOk;
+	// A plan is a snapshot for the exact game and Force choice that was previewed.
+	const preview = rollbackPreview?.gamePath === gamePath.trim() && rollbackPreview.force === force
+		? rollbackPreview.report : null;
 	const urlFieldError =
 		zipUrl.trim() && !isHttpPatchUrl(zipUrl)
 			? t("patch.urlError")
@@ -331,6 +341,7 @@ export default function PatchModal({
 
 	const refreshStatus = async () => {
 		if (!gamePath.trim()) return;
+		setRollbackPreview(null);
 		try {
 			const s = await patchStatus({ game_path: gamePath.trim() });
 			setStatus(s);
@@ -560,6 +571,29 @@ export default function PatchModal({
 		}
 	};
 
+	const handlePreviewRollback = async () => {
+		if (!gamePath.trim()) {
+			setError(t("patch.toast.selectGame"));
+			return;
+		}
+		const scope = { gamePath: gamePath.trim(), force };
+		setLoading(true);
+		setError(null);
+		setRollbackPreview(null);
+		try {
+			const report = await patchRollback({
+				game_path: scope.gamePath,
+				force: scope.force,
+				dry_run: true,
+			});
+			setRollbackPreview({ ...scope, report });
+		} catch (err: any) {
+			setError(err.message);
+		} finally {
+			setLoading(false);
+		}
+	};
+
 	const handleRollback = async () => {
 		if (!gamePath.trim()) {
 			addToast("error", t("patch.toast.selectGame"));
@@ -567,6 +601,7 @@ export default function PatchModal({
 		}
 		setLoading(true);
 		setError(null);
+		setRollbackPreview(null);
 		try {
 			const report = await patchRollback({
 				game_path: gamePath.trim(),
@@ -891,6 +926,14 @@ export default function PatchModal({
 									{dryRun ? t("patch.planApply") : t("patch.applyBtn")}
 								</button>
 								<button
+									type="button"
+									onClick={handlePreviewRollback}
+									disabled={loading || applying || !gamePath.trim()}
+									className="flex items-center gap-1.5 px-3 py-2 border border-amber-300 dark:border-amber-700 rounded text-sm font-medium disabled:opacity-50"
+								>
+									<RotateCcw size={16} /> {t("patch.rollbackPreview")}
+								</button>
+								<button
 									onClick={handleRollback}
 									disabled={loading || applying}
 									className={
@@ -981,12 +1024,47 @@ export default function PatchModal({
 									</div>
 									<button
 										type="button"
+										onClick={handlePreviewRollback}
+										disabled={loading || !gamePath.trim()}
+										className="w-full flex items-center justify-center gap-1.5 py-2 border border-amber-400 dark:border-amber-700 rounded text-sm font-medium disabled:opacity-50"
+									>
+										<RotateCcw size={16} /> {t("patch.rollbackPreview")}
+									</button>
+									<button
+										type="button"
 										onClick={handleRollback}
 										disabled={loading}
 										className="w-full flex items-center justify-center gap-1.5 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded text-sm font-medium"
 									>
 										<RotateCcw size={16} /> {t("patch.rollbackNow")}
 									</button>
+								</div>
+							)}
+
+							{preview && (
+								<div role="status" className="p-3 border border-amber-300 dark:border-amber-800 rounded text-sm space-y-2">
+									<h3 className="font-medium">{t("patch.rollbackPreview.title")}</h3>
+									<p className="text-xs">{t("patch.rollbackPreview.hint")}</p>
+									<p>{t("patch.rollbackPreview.counts", { restored: preview.restored, deleted: preview.deleted })}</p>
+									{preview.messages?.map((message, index) => (
+										<p key={index} className="text-xs break-words">{message}</p>
+									))}
+									{preview.aborted_edited?.length > 0 && (
+										<div className="text-amber-800 dark:text-amber-200">
+											<p>{t("patch.rollbackPreview.blocked")}</p>
+											<ul className="list-disc pl-5 text-xs break-all">
+												{preview.aborted_edited.map((path) => <li key={path}>{path}</li>)}
+											</ul>
+										</div>
+									)}
+									{preview.torn_deleted?.length > 0 && (
+										<div className="text-amber-800 dark:text-amber-200">
+											<p>{t("patch.rollbackPreview.forcedDeletes")}</p>
+											<ul className="list-disc pl-5 text-xs break-all">
+												{preview.torn_deleted.map((path) => <li key={path}>{path}</li>)}
+											</ul>
+										</div>
+									)}
 								</div>
 							)}
 
