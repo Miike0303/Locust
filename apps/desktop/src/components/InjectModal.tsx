@@ -368,13 +368,13 @@ export default function InjectModal({
 				className={modalPanelClass("max-w-lg p-6 max-h-[90vh] overflow-y-auto")}
 			>
 				<div className="flex justify-between items-center mb-4">
-					<h2 {...titleProps} className="text-lg font-bold">
+					<h2 {...titleProps} className="text-section font-bold">
 						{t("inject.title")}
 					</h2>
 					<button
 						onClick={onClose}
 						aria-label={t("common.close")}
-						className="text-gray-400 hover:text-gray-600"
+						className="text-text-muted hover:text-text"
 					>
 						<X size={20} />
 					</button>
@@ -383,12 +383,12 @@ export default function InjectModal({
 				{!result ? (
 					<div className="space-y-4">
 						<div>
-							<label htmlFor="inject-mode" className="text-sm font-medium">{t("inject.mode")}</label>
+							<label htmlFor="inject-mode" className="text-body font-medium">{t("inject.mode")}</label>
 							<select
 								id="inject-mode"
 								value={mode}
 								onChange={(e) => setMode(e.target.value as InjectUiMode)}
-								className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+								className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 							>
 								{injectModes.includes("replace") && (
 									<option value="replace">
@@ -406,7 +406,7 @@ export default function InjectModal({
 									</option>
 								)}
 							</select>
-							<p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+							<p className="text-caption text-text-muted mt-1">
 								{mode === "replace" &&
 									t("inject.hint.replace", { gameName })}
 								{mode === "add" && t("inject.hint.add")}
@@ -420,11 +420,11 @@ export default function InjectModal({
 						</div>
 
 						{mode === "direct" && (
-							<div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded text-sm text-amber-900 dark:text-amber-100 space-y-1">
+							<div className="p-3 bg-warning-muted border border-warning rounded text-body text-warning space-y-1">
 								<p className="font-medium flex items-center gap-1.5">
 									<AlertCircle size={16} /> {t("inject.direct.warnTitle")}
 								</p>
-								<ul className="list-disc pl-5 text-xs space-y-0.5">
+								<ul className="list-disc pl-5 text-caption space-y-0.5">
 									<li>
 										{t("inject.direct.li1")}
 									</li>
@@ -439,20 +439,20 @@ export default function InjectModal({
 						)}
 
 						<div>
-							<label className="text-sm font-medium">
+							<label className="text-body font-medium">
 								{t("inject.languages")}
 								{mode === "direct" && (
-									<span className="font-normal text-gray-500 dark:text-gray-400">
+									<span className="font-normal text-text-muted">
 										{" "}
 										{t("inject.recordingKey")}
 									</span>
 								)}
 							</label>
-							<div className="mt-1 grid grid-cols-3 gap-2 p-2 border rounded dark:border-gray-600 max-h-40 overflow-y-auto">
+							<div className="mt-1 grid grid-cols-3 gap-2 p-2 border border-border rounded bg-surface-muted max-h-40 overflow-y-auto">
 								{LANGUAGES.map((l) => (
 									<label
 										key={l.code}
-										className="flex items-center gap-1 text-sm cursor-pointer"
+										className="flex items-center gap-1 text-body cursor-pointer"
 									>
 										<input
 											type="radio"
@@ -464,7 +464,7 @@ export default function InjectModal({
 									</label>
 								))}
 							</div>
-							<p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+							<p className="text-caption text-text-muted mt-1">
 								{t("inject.selected", {
 									langs:
 										selectedLangs.length === 0
@@ -479,32 +479,32 @@ export default function InjectModal({
 
 						{mode === "replace" && (
 							<div>
-								<label className="text-sm font-medium">
-									{t("inject.outputFolder")} <span className="text-red-500">*</span>
+								<label className="text-body font-medium">
+									{t("inject.outputFolder")} <span className="text-danger">*</span>
 								</label>
 								<div className="flex gap-2 mt-1">
 									<input
 										value={outputDir}
 										onChange={(e) => setOutputDir(e.target.value)}
 										placeholder={t("inject.outputPlaceholder")}
-										className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+										className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 									/>
 									<button
 										onClick={handlePickFolder}
-										className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm transition-colors"
+										className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body transition-colors"
 										title={t("inject.browseTitle")}
 									>
 										<FolderOpen size={16} />
 									</button>
 								</div>
 								{!outputDir.trim() && (
-									<p className="flex items-center gap-1 text-xs text-amber-500 mt-1">
+									<p className="flex items-center gap-1 text-caption text-warning mt-1">
 										<AlertCircle size={12} />
 										{t("inject.outputRequired")}
 									</p>
 								)}
 								{outputDir.trim() && (
-									<p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+									<p className="text-caption text-text-muted mt-1">
 										{t("inject.willCreate", {
 											path: `${outputDir}/${gameName}-${selectedLangs[0] || "lang"}/`,
 										})}
@@ -513,7 +513,7 @@ export default function InjectModal({
 							</div>
 						)}
 
-						<div className="pt-2 flex items-center gap-3 text-xs text-gray-500 dark:text-gray-400">
+						<div className="pt-2 flex items-center gap-3 text-caption text-text-muted">
 							<FileCheck size={14} />
 							<span>
 								{t("inject.source", { name: project.name, format: project.format_id })}
@@ -523,7 +523,7 @@ export default function InjectModal({
 						<button
 							onClick={handleInject}
 							disabled={loading || !canInject}
-							className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
+							className="w-full py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
 						>
 							{loading
 								? t("inject.injecting")
@@ -533,11 +533,11 @@ export default function InjectModal({
 						</button>
 
 						{isRpgMaker && (
-							<div className="pt-1 border-t dark:border-gray-700 space-y-2">
-								<p className="text-xs text-gray-500 dark:text-gray-400">
+							<div className="pt-1 border-t border-border space-y-2">
+								<p className="text-caption text-text-muted">
 									{t("inject.rpgHint")}
 								</p>
-								<label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400 cursor-pointer">
+								<label className="flex items-center gap-2 text-caption text-text-muted cursor-pointer">
 									<input
 										type="checkbox"
 										checked={autoRegisterAfterInject}
@@ -558,7 +558,7 @@ export default function InjectModal({
 								</label>
 								{selectedLangs.length === 1 && (
 									<div>
-										<label className="text-xs font-medium text-gray-600 dark:text-gray-400">
+										<label className="text-caption font-medium text-text-muted">
 											{t("inject.menuLabel")}
 										</label>
 										<input
@@ -566,9 +566,9 @@ export default function InjectModal({
 											value={regLabelOverride}
 											onChange={(e) => setRegLabelAndRemember(e.target.value)}
 											placeholder={defaultLabelFor(selectedLangs[0])}
-											className="w-full mt-0.5 p-1.5 text-sm border rounded dark:bg-gray-800 dark:border-gray-600"
+											className="w-full mt-0.5 p-1.5 text-body border border-border rounded bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 										/>
-										<p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">
+										<p className="text-caption text-text-muted mt-0.5">
 											{t("inject.menuLabelHint", {
 												label: defaultLabelFor(selectedLangs[0]),
 											})}
@@ -579,7 +579,7 @@ export default function InjectModal({
 									type="button"
 									onClick={handleRegisterLang}
 									disabled={regLoading || selectedLangs.length === 0}
-									className="w-full py-1.5 text-sm border border-violet-300 dark:border-violet-700 text-violet-800 dark:text-violet-200 hover:bg-violet-50 dark:hover:bg-violet-950/40 disabled:opacity-50 rounded font-medium"
+									className="w-full py-1.5 text-body border border-accent-fg text-accent-fg hover:bg-accent-muted disabled:opacity-50 rounded font-medium"
 								>
 									{regLoading
 										? t("inject.registering")
@@ -588,7 +588,7 @@ export default function InjectModal({
 											})}
 								</button>
 								{regReports.length > 0 && (
-									<div className="text-xs text-violet-700 dark:text-violet-300 space-y-0.5">
+									<div className="text-caption text-accent-fg space-y-0.5">
 										{regReports.map(({ lang, label, report }) => (
 											<p key={lang}>
 												{t("inject.regReport", {
@@ -609,12 +609,12 @@ export default function InjectModal({
 						<div
 							className={
 								resultKind === "unchanged"
-									? "p-3 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 rounded text-sm"
+									? "p-3 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 rounded text-body"
 									: resultKind === "empty"
-									? "p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm"
+									? "p-3 bg-danger-muted border border-danger rounded text-body"
 									: resultKind === "partial"
-										? "p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-sm"
-										: "p-3 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 rounded text-sm"
+										? "p-3 bg-warning-muted border border-warning rounded text-body"
+										: "p-3 bg-success-muted border border-success rounded text-body"
 							}
 						>
 							<p
@@ -622,10 +622,10 @@ export default function InjectModal({
 									resultKind === "unchanged"
 										? "font-medium text-sky-800 dark:text-sky-200"
 										: resultKind === "empty"
-										? "font-medium text-red-700 dark:text-red-300"
+										? "font-medium text-danger"
 										: resultKind === "partial"
-											? "font-medium text-amber-800 dark:text-amber-200"
-											: "font-medium text-emerald-700 dark:text-emerald-300"
+											? "font-medium text-warning"
+											: "font-medium text-success"
 								}
 							>
 								{resultKind === "unchanged"
@@ -636,15 +636,15 @@ export default function InjectModal({
 										? t("inject.injectionPartial")
 										: t("inject.injectionComplete")}
 							</p>
-							<p className="text-sm mt-1 opacity-90">
+							<p className="text-body mt-1 opacity-90">
 								{t("inject.languagesLine", {
 									langs: result.languages_processed.join(", ") || t("inject.selectedNone"),
 								})}
 							</p>
-							<p className="text-sm opacity-90">
+							<p className="text-body opacity-90">
 								{t("inject.modeLine", { mode: result.mode })}
 							</p>
-							<p className="text-sm opacity-90">
+							<p className="text-body opacity-90">
 								{t("inject.stringsWritten", {
 									written: resultWritten,
 									files: sumFilesModified(result),
@@ -652,19 +652,19 @@ export default function InjectModal({
 								})}
 							</p>
 							{isDirectResult && result.backup_path && (
-								<p className="text-xs mt-1 break-all opacity-90">
+								<p className="text-caption mt-1 break-all opacity-90">
 									{t("inject.backup", { path: result.backup_path })}
 								</p>
 							)}
 							{!isDirectResult && mode === "replace" && outputDir && (
-								<p className="text-sm opacity-90">
+								<p className="text-body opacity-90">
 									{t("inject.output", { path: outputDir })}
 								</p>
 							)}
 							{result.reports && Object.keys(result.reports).length > 0 && (
 								<div className="mt-2 space-y-1">
 									{Object.entries(result.reports).map(([lang, report]) => (
-										<p key={lang} className="text-xs opacity-80">
+										<p key={lang} className="text-caption opacity-80">
 											{t("inject.langReport", {
 												lang,
 												written:
@@ -681,7 +681,7 @@ export default function InjectModal({
 						</div>
 
 						{resultSkips.length > 0 && (
-                            <div className="p-3 bg-slate-50 dark:bg-slate-900/40 rounded text-sm">
+                            <div className="p-3 bg-surface-muted rounded text-body">
                                 <p className="font-medium">{t("inject.skipReasons")}</p>
                                 <ul>{resultSkips.map(({lang, reason, count}) => {
                                     const label = skipReasonLabel(reason);
@@ -690,11 +690,11 @@ export default function InjectModal({
                             </div>
                         )}
 						{resultFiles.length > 0 && (
-							<div className="p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 rounded text-sm">
-								<p className="font-medium text-slate-800 dark:text-slate-100">
+							<div className="p-3 bg-surface-muted border border-border rounded text-body">
+								<p className="font-medium text-text">
 									{t("inject.filesWritten")}
 								</p>
-								<ul className="mt-1 space-y-0.5 text-xs text-slate-700 dark:text-slate-300 break-all">
+								<ul className="mt-1 space-y-0.5 text-caption text-text-muted break-all">
 									{resultFiles.map((path) => (
 										<li key={path}>{path}</li>
 									))}
@@ -703,19 +703,19 @@ export default function InjectModal({
 						)}
 
 						{recoveryPaths.length > 0 && (
-							<div className="p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 rounded text-sm text-slate-800 dark:text-slate-200">
+							<div className="p-3 bg-surface-muted border border-border rounded text-body text-text">
 								<p className="font-medium">{t("inject.recoveryOriginals")}</p>
-								<p className="text-xs mt-1">{t("inject.recoveryOriginalsHint")}</p>
-								<ul className="mt-1 text-xs break-all">{recoveryPaths.map((path) => <li key={path}>{path}</li>)}</ul>
+								<p className="text-caption mt-1">{t("inject.recoveryOriginalsHint")}</p>
+								<ul className="mt-1 text-caption break-all">{recoveryPaths.map((path) => <li key={path}>{path}</li>)}</ul>
 							</div>
 						)}
 
 						{resultWarnings.length > 0 && (
-							<div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-sm">
-								<p className="font-medium text-amber-900 dark:text-amber-100 flex items-center gap-1.5">
+							<div className="p-3 bg-warning-muted border border-warning rounded text-body">
+								<p className="font-medium text-warning flex items-center gap-1.5">
 									<AlertCircle size={16} /> {t("inject.warnings")}
 								</p>
-								<ul className="mt-1 space-y-0.5 text-xs text-amber-800 dark:text-amber-200">
+								<ul className="mt-1 space-y-0.5 text-caption text-warning">
 									{resultWarnings.map((w) => (
 										<li key={w}>{w}</li>
 									))}
@@ -724,17 +724,17 @@ export default function InjectModal({
 						)}
 
 						{removedRedundantBackup && (
-							<p className="text-sm text-slate-600 dark:text-slate-300">{t("inject.redundantBackupRemoved")}</p>
+							<p className="text-body text-text-muted">{t("inject.redundantBackupRemoved")}</p>
 						)}
 
 						{resultRecording.length > 0 && (
 							<div className={resultKind === "unchanged"
-								? "p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 rounded text-sm text-slate-800 dark:text-slate-200"
-								: "p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-sm text-amber-900 dark:text-amber-100"}>
+								? "p-3 bg-surface-muted border border-border rounded text-body text-text"
+								: "p-3 bg-warning-muted border border-warning rounded text-body text-warning"}>
 								<p className="font-medium">
 									{t("inject.recordingIssues")}
 								</p>
-								<ul className="mt-1 space-y-0.5 text-xs">
+								<ul className="mt-1 space-y-0.5 text-caption">
 									{resultRecording.map((issue) => (
 										<li key={`${issue.lang}-${issue.kind}`}>
 											{issue.kind === "nothing"
@@ -750,11 +750,11 @@ export default function InjectModal({
 						)}
 
 						{offerPack && (
-							<div className="p-3 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 rounded text-sm text-sky-900 dark:text-sky-100">
+							<div className="p-3 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 rounded text-body text-sky-900 dark:text-sky-100">
 								<p className="font-medium flex items-center gap-1.5">
 									<Package size={16} /> {t("inject.recordingSaved")}
 								</p>
-								<p className="text-xs mt-1">
+								<p className="text-caption mt-1">
 									{t("inject.recordingHint")}
 								</p>
 								{onOpenPack && (
@@ -764,7 +764,7 @@ export default function InjectModal({
 											onClose();
 											onOpenPack(result?.pristine_backup_id || undefined);
 										}}
-										className="mt-2 text-xs font-medium text-sky-700 dark:text-sky-300 hover:underline"
+										className="mt-2 text-caption font-medium text-sky-700 dark:text-sky-300 hover:underline"
 									>
 										{t("inject.openPack")}
 									</button>
@@ -773,10 +773,10 @@ export default function InjectModal({
 						)}
 
 						{result.languages_failed?.length > 0 && (
-							<div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 rounded text-sm">
-								<p className="font-medium text-red-700">{t("inject.failedLanguages")}</p>
+							<div className="p-3 bg-danger-muted border border-danger rounded text-body">
+								<p className="font-medium text-danger">{t("inject.failedLanguages")}</p>
 								{result.languages_failed.map(([lang, err]) => (
-									<p key={lang} className="text-red-600 text-xs mt-1">
+									<p key={lang} className="text-danger text-caption mt-1">
 										{lang}: {err}
 									</p>
 								))}
@@ -784,18 +784,18 @@ export default function InjectModal({
 						)}
 
 						{isRpgMaker && (
-							<div className="p-3 bg-violet-50 dark:bg-violet-950/30 border border-violet-200 dark:border-violet-800 rounded text-sm space-y-2">
-								<p className="font-medium text-violet-900 dark:text-violet-100">
+							<div className="p-3 bg-accent-muted border border-accent-fg rounded text-body space-y-2">
+								<p className="font-medium text-accent-fg">
 									{t("inject.registerInUi")}
 								</p>
-								<p className="text-xs text-violet-800 dark:text-violet-200">
+								<p className="text-caption text-accent-fg">
 									{t("inject.registerInUiHint")}
 									<code className="px-0.5">*.bak-locust</code>
 									).
 								</p>
 								{selectedLangs.length === 1 && (
 									<div>
-										<label className="text-xs font-medium text-violet-900 dark:text-violet-100">
+										<label className="text-caption font-medium text-accent-fg">
 											{t("inject.menuLabel")}
 										</label>
 										<input
@@ -803,9 +803,9 @@ export default function InjectModal({
 											value={regLabelOverride}
 											onChange={(e) => setRegLabelAndRemember(e.target.value)}
 											placeholder={defaultLabelFor(selectedLangs[0])}
-											className="w-full mt-0.5 p-1.5 text-sm border border-violet-200 dark:border-violet-700 rounded dark:bg-gray-900"
+											className="w-full mt-0.5 p-1.5 text-body border border-border rounded bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 										/>
-										<p className="text-[11px] text-violet-700 dark:text-violet-300 mt-0.5">
+										<p className="text-caption text-accent-fg mt-0.5">
 											{t("inject.menuLabelHintShort", {
 												label: defaultLabelFor(selectedLangs[0]),
 											})}
@@ -816,7 +816,7 @@ export default function InjectModal({
 									type="button"
 									onClick={handleRegisterLang}
 									disabled={regLoading || selectedLangs.length === 0}
-									className="w-full py-1.5 text-sm bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded font-medium"
+									className="w-full py-1.5 text-body bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded font-medium"
 								>
 									{regLoading
 										? t("inject.registering")
@@ -825,7 +825,7 @@ export default function InjectModal({
 											})}
 								</button>
 								{regReports.length > 0 && (
-									<div className="text-xs text-violet-700 dark:text-violet-300 space-y-1">
+									<div className="text-caption text-accent-fg space-y-1">
 										{regReports.map(({ lang, label, report }) => (
 											<p key={lang}>
 												{t("inject.regReportFull", {
@@ -851,13 +851,13 @@ export default function InjectModal({
 								onClose();
 								navigate(operationalShortcutTarget("manage-backups").path);
 							}}
-							className="text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+							className="text-caption font-medium text-accent-fg hover:underline"
 						>
 							{t("inject.manageBackups")}
 						</button>
 						<button
 							onClick={onClose}
-							className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
+							className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
 						>
 							{t("common.close")}
 						</button>

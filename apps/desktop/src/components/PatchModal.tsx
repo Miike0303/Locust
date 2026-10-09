@@ -711,10 +711,10 @@ export default function PatchModal({
 				setTab(id);
 				setError(null);
 			}}
-			className={`px-3 py-1.5 text-sm font-medium rounded-t border-b-2 ${
+			className={`px-3 py-1.5 text-body font-medium rounded-t border-b-2 ${
 				tab === id
-					? "border-emerald-600 text-emerald-700 dark:text-emerald-400"
-					: "border-transparent text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+					? "border-accent-fg text-accent-fg"
+					: "border-transparent text-text-muted hover:text-text"
 			}`}
 		>
 			{label}
@@ -731,21 +731,21 @@ export default function PatchModal({
 				<div className="flex justify-between items-center mb-2">
 					<h2
 						{...titleProps}
-						className="text-lg font-bold flex items-center gap-2"
+						className="text-section font-bold flex items-center gap-2"
 					>
 						<Package size={20} /> {t("patch.title")}
 					</h2>
 					<button
 						onClick={onClose}
 						aria-label={t("common.close")}
-						className="text-gray-400 hover:text-gray-600"
+						className="text-text-muted hover:text-text"
 					>
 						<X size={20} />
 					</button>
 				</div>
 
 				{allowPack ? (
-					<div className="flex gap-1 border-b dark:border-gray-700 mb-4">
+					<div className="flex gap-1 border-b border-border mb-4">
 						{tabBtn("apply", t("patch.apply"))}
 						{tabBtn("pack", t("patch.pack"))}
 					</div>
@@ -755,7 +755,7 @@ export default function PatchModal({
 
 				<div className="space-y-4">
 					<div>
-						<label className="text-sm font-medium">
+						<label className="text-body font-medium">
 							{tab === "pack" ? t("patch.recordedFolder") : t("patch.gameFolder")}
 						</label>
 						<div className="flex gap-2 mt-1">
@@ -767,11 +767,11 @@ export default function PatchModal({
 										? t("patch.placeholder.recorded")
 										: t("patch.placeholder.game")
 								}
-								className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+								className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 							/>
 							<button
 								onClick={pickGame}
-								className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"
+								className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"
 								title={t("common.browse")}
 							>
 								<FolderOpen size={16} />
@@ -782,7 +782,7 @@ export default function PatchModal({
 					{tab === "apply" && (
 						<>
 							<div>
-								<label className="text-sm font-medium">{t("patch.zipLocal")}</label>
+								<label className="text-body font-medium">{t("patch.zipLocal")}</label>
 								<div className="flex gap-2 mt-1">
 									<input
 										value={zipPath}
@@ -791,11 +791,11 @@ export default function PatchModal({
 											if (e.target.value.trim()) setZipUrl("");
 										}}
 										placeholder={t("patch.zipPlaceholder")}
-										className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+										className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 									/>
 									<button
 										onClick={pickZip}
-										className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"
+										className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"
 										title={t("common.browse")}
 									>
 										<FileArchive size={16} />
@@ -804,7 +804,7 @@ export default function PatchModal({
 							</div>
 
 							<div>
-								<label className="text-sm font-medium">{t("patch.orUrl")}</label>
+								<label className="text-body font-medium">{t("patch.orUrl")}</label>
 								<input
 									value={zipUrl}
 									onChange={(e) => {
@@ -812,29 +812,29 @@ export default function PatchModal({
 										if (e.target.value.trim()) setZipPath("");
 									}}
 									placeholder={t("patch.urlPlaceholder")}
-									className={`w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm ${
+									className={`w-full mt-1 p-2 border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg ${
 										urlFieldError
-											? "border-red-400 dark:border-red-600"
+											? "border-danger"
 											: zipUrl.trim() && isHttpPatchUrl(zipUrl)
-												? "border-emerald-400 dark:border-emerald-700"
-												: ""
+												? "border-success"
+												: "border-border"
 									}`}
 								/>
 								{urlFieldError ? (
-									<p className="text-xs text-red-600 dark:text-red-400 mt-1">
+									<p className="text-caption text-danger mt-1">
 										{urlFieldError}
 									</p>
 								) : urlZipHint ? (
-									<p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+									<p className="text-caption text-warning mt-1">
 										{urlZipHint}
 									</p>
 								) : (
-									<p className="text-xs text-gray-500 mt-1">
+									<p className="text-caption text-text-muted mt-1">
 										{t("patch.urlHelp")}
 									</p>
 								)}
 								{patchSourceReady(resolvedSource) && (
-									<p className="text-xs text-emerald-700 dark:text-emerald-400 mt-0.5">
+									<p className="text-caption text-success mt-0.5">
 										{"zip_url" in resolvedSource
 											? t("patch.activeUrl", {
 													url: `${resolvedSource.zip_url.slice(0, 48)}${
@@ -846,17 +846,17 @@ export default function PatchModal({
 								)}
 							</div>
 
-							<div className="space-y-2 text-sm">
+							<div className="space-y-2 text-body">
 								<label className="flex items-start gap-2 cursor-pointer">
 									<input
 										type="checkbox"
-										className="mt-0.5"
+										className="mt-0.5 border border-border bg-surface text-text accent-accent focus:outline-none focus:ring-2 focus:ring-accent-fg"
 										checked={force}
 										onChange={(e) => setForce(e.target.checked)}
 									/>
 									<span>
 										<span className="font-medium">{t("patch.force")}</span>
-										<span className="block text-xs text-gray-500 mt-0.5">
+										<span className="block text-caption text-text-muted mt-0.5">
 											{t("patch.forceHint")}
 										</span>
 									</span>
@@ -864,13 +864,13 @@ export default function PatchModal({
 								<label className="flex items-start gap-2 cursor-pointer">
 									<input
 										type="checkbox"
-										className="mt-0.5"
+										className="mt-0.5 border border-border bg-surface text-text accent-accent focus:outline-none focus:ring-2 focus:ring-accent-fg"
 										checked={confirmLegacy}
 										onChange={(e) => setConfirmLegacy(e.target.checked)}
 									/>
 									<span>
 										<span className="font-medium">{t("patch.legacy")}</span>
-										<span className="block text-xs text-gray-500 mt-0.5">
+										<span className="block text-caption text-text-muted mt-0.5">
 											{t("patch.legacyHint")}
 										</span>
 									</span>
@@ -878,13 +878,13 @@ export default function PatchModal({
 								<label className="flex items-start gap-2 cursor-pointer">
 									<input
 										type="checkbox"
-										className="mt-0.5"
+										className="mt-0.5 border border-border bg-surface text-text accent-accent focus:outline-none focus:ring-2 focus:ring-accent-fg"
 										checked={dryRun}
 										onChange={(e) => setDryRun(e.target.checked)}
 									/>
 									<span>
 										<span className="font-medium">{t("patch.dryRun")}</span>
-										<span className="block text-xs text-gray-500 mt-0.5">
+										<span className="block text-caption text-text-muted mt-0.5">
 											{t("patch.dryRunHint")}
 										</span>
 									</span>
@@ -902,7 +902,7 @@ export default function PatchModal({
 												? t("patch.selectSource")
 												: undefined
 									}
-									className="flex items-center gap-1.5 px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium disabled:opacity-50"
+									className="flex items-center gap-1.5 px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body font-medium disabled:opacity-50"
 								>
 									<ShieldCheck size={16} /> {t("patch.verify")}
 								</button>
@@ -916,7 +916,7 @@ export default function PatchModal({
 												? t("patch.selectSource")
 												: undefined
 									}
-									className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium disabled:opacity-50"
+									className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50"
 								>
 									{applying ? (
 										<Loader2 size={16} className="animate-spin" />
@@ -929,7 +929,7 @@ export default function PatchModal({
 									type="button"
 									onClick={handlePreviewRollback}
 									disabled={loading || applying || !gamePath.trim()}
-									className="flex items-center gap-1.5 px-3 py-2 border border-amber-300 dark:border-amber-700 rounded text-sm font-medium disabled:opacity-50"
+									className="flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-surface hover:bg-warning-muted rounded text-body font-medium disabled:opacity-50"
 								>
 									<RotateCcw size={16} /> {t("patch.rollbackPreview")}
 								</button>
@@ -938,8 +938,8 @@ export default function PatchModal({
 									disabled={loading || applying}
 									className={
 										showPartialWarning
-											? "flex items-center gap-1.5 px-3 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded text-sm font-medium disabled:opacity-50 ring-2 ring-amber-400 ring-offset-1 dark:ring-offset-gray-900"
-											: "flex items-center gap-1.5 px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100 dark:hover:bg-amber-900/60 rounded text-sm font-medium disabled:opacity-50"
+											? "flex items-center gap-1.5 px-3 py-2 bg-amber-700 hover:bg-amber-800 text-white rounded text-body font-medium disabled:opacity-50 ring-2 ring-warning ring-offset-1 ring-offset-surface"
+											: "flex items-center gap-1.5 px-3 py-2 bg-warning-muted hover:bg-warning-muted/80 text-warning rounded text-body font-medium disabled:opacity-50"
 									}
 								>
 									<RotateCcw size={16} /> {t("patch.rollback")}
@@ -947,33 +947,33 @@ export default function PatchModal({
 								<button
 									onClick={refreshStatus}
 									disabled={loading || applying || !gamePath.trim()}
-									className="px-3 py-2 text-sm text-gray-600 hover:underline disabled:opacity-50"
+									className="px-3 py-2 text-body text-text-muted hover:underline disabled:opacity-50"
 								>
 									{t("patch.refreshStatus")}
 								</button>
 							</div>
 
 							{applying && (
-								<div className="p-3 border border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 rounded text-sm space-y-2">
+								<div className="p-3 border border-success bg-success-muted rounded text-body space-y-2">
 									<div className="flex items-center gap-2 font-medium">
 										<Loader2
 											size={16}
-											className="animate-spin text-emerald-600"
+											className="animate-spin text-accent-fg"
 										/>
 										{t("patch.applying")}
 									</div>
 									{applyProgress && (
 										<>
 											{applyProgress.phase && (
-												<div className="text-xs text-gray-600 dark:text-gray-400">
+												<div className="text-caption text-text-muted">
 													{t("patch.progress.phase", {
 														phase: applyProgress.phase,
 													})}
 												</div>
 											)}
-											<div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+											<div className="w-full bg-border rounded-full h-2">
 												<div
-													className="bg-emerald-500 h-2 rounded-full transition-all"
+													className="bg-accent h-2 rounded-full transition-all"
 													style={{
 														width: `${
 															applyProgress.total > 0
@@ -988,14 +988,14 @@ export default function PatchModal({
 													}}
 												/>
 											</div>
-											<div className="text-xs tabular-nums">
+											<div className="text-caption tabular-nums">
 												{t("patch.progress.counts", {
 													current: applyProgress.current,
 													total: applyProgress.total,
 												})}
 											</div>
 											{applyProgress.path && (
-												<div className="text-xs text-gray-500 truncate" title={applyProgress.path}>
+												<div className="text-caption text-text-muted truncate" title={applyProgress.path}>
 													{t("patch.progress.file", {
 														path: applyProgress.path,
 													})}
@@ -1007,7 +1007,7 @@ export default function PatchModal({
 										type="button"
 										onClick={handleCancelApply}
 										disabled={cancellingApply}
-										className="w-full py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded text-sm font-medium"
+										className="w-full py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded text-body font-medium"
 									>
 										{cancellingApply
 											? t("patch.cancelling")
@@ -1017,8 +1017,8 @@ export default function PatchModal({
 							)}
 
 							{!applying && showPartialWarning && (
-								<div className="p-3 border border-amber-400 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 rounded text-sm space-y-2">
-									<div className="flex gap-2 text-amber-950 dark:text-amber-100">
+								<div className="p-3 border border-warning bg-warning-muted rounded text-body space-y-2">
+									<div className="flex gap-2 text-warning">
 										<AlertCircle size={16} className="shrink-0 mt-0.5" />
 										<span>{t("patch.partialWarning")}</span>
 									</div>
@@ -1026,7 +1026,7 @@ export default function PatchModal({
 										type="button"
 										onClick={handlePreviewRollback}
 										disabled={loading || !gamePath.trim()}
-										className="w-full flex items-center justify-center gap-1.5 py-2 border border-amber-400 dark:border-amber-700 rounded text-sm font-medium disabled:opacity-50"
+										className="w-full flex items-center justify-center gap-1.5 py-2 border border-warning text-warning bg-surface hover:bg-warning-muted rounded text-body font-medium disabled:opacity-50"
 									>
 										<RotateCcw size={16} /> {t("patch.rollbackPreview")}
 									</button>
@@ -1034,7 +1034,7 @@ export default function PatchModal({
 										type="button"
 										onClick={handleRollback}
 										disabled={loading}
-										className="w-full flex items-center justify-center gap-1.5 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded text-sm font-medium"
+										className="w-full flex items-center justify-center gap-1.5 py-2 bg-amber-700 hover:bg-amber-800 disabled:opacity-50 text-white rounded text-body font-medium"
 									>
 										<RotateCcw size={16} /> {t("patch.rollbackNow")}
 									</button>
@@ -1042,25 +1042,25 @@ export default function PatchModal({
 							)}
 
 							{preview && (
-								<div role="status" className="p-3 border border-amber-300 dark:border-amber-800 rounded text-sm space-y-2">
+								<div role="status" className="p-3 border border-warning rounded text-body space-y-2">
 									<h3 className="font-medium">{t("patch.rollbackPreview.title")}</h3>
-									<p className="text-xs">{t("patch.rollbackPreview.hint")}</p>
+									<p className="text-caption">{t("patch.rollbackPreview.hint")}</p>
 									<p>{t("patch.rollbackPreview.counts", { restored: preview.restored, deleted: preview.deleted })}</p>
 									{preview.messages?.map((message, index) => (
-										<p key={index} className="text-xs break-words">{message}</p>
+										<p key={index} className="text-caption break-words">{message}</p>
 									))}
 									{preview.aborted_edited?.length > 0 && (
-										<div className="text-amber-800 dark:text-amber-200">
+										<div className="text-warning">
 											<p>{t("patch.rollbackPreview.blocked")}</p>
-											<ul className="list-disc pl-5 text-xs break-all">
+											<ul className="list-disc pl-5 text-caption break-all">
 												{preview.aborted_edited.map((path) => <li key={path}>{path}</li>)}
 											</ul>
 										</div>
 									)}
 									{preview.torn_deleted?.length > 0 && (
-										<div className="text-amber-800 dark:text-amber-200">
+										<div className="text-warning">
 											<p>{t("patch.rollbackPreview.forcedDeletes")}</p>
-											<ul className="list-disc pl-5 text-xs break-all">
+											<ul className="list-disc pl-5 text-caption break-all">
 												{preview.torn_deleted.map((path) => <li key={path}>{path}</li>)}
 											</ul>
 										</div>
@@ -1069,10 +1069,10 @@ export default function PatchModal({
 							)}
 
 							{status && (
-								<div className="p-3 bg-gray-50 dark:bg-gray-800/60 rounded text-sm space-y-1">
+								<div className="p-3 bg-surface-muted rounded text-body space-y-1">
 									<div className="font-medium">{t("patch.status", { status: patchValue(status.status) })}</div>
 									{status.status === "patched" && (
-										<div className="text-xs text-gray-600 dark:text-gray-400">
+										<div className="text-caption text-text-muted">
 											{t("patch.statusDetail", {
 												id: status.patch_id ?? "",
 												version: status.patch_version ?? "",
@@ -1085,7 +1085,7 @@ export default function PatchModal({
 										</div>
 									)}
 									{status.status === "interrupted" && (
-										<div className="text-xs text-amber-600">
+										<div className="text-caption text-warning">
 											{t("patch.interrupted", { id: status.patch_id ?? "" })}
 										</div>
 									)}
@@ -1093,12 +1093,12 @@ export default function PatchModal({
 							)}
 
 							{verify && (
-								<div className="p-3 border rounded dark:border-gray-700 text-sm space-y-1">
+								<div className="p-3 border border-border rounded text-body space-y-1">
 									<div className="font-medium">{t("patch.verifyLine", { outcome: patchValue(verify.outcome) })}</div>
 									{verify.tier && (
-										<div className="text-xs">{t("patch.tier", { tier: patchValue(verify.tier) })}</div>
+										<div className="text-caption">{t("patch.tier", { tier: patchValue(verify.tier) })}</div>
 									)}
-									<div className="text-xs text-gray-600 dark:text-gray-400">
+									<div className="text-caption text-text-muted">
 										{t("patch.plan", {
 											replace: verify.replaced?.length ?? 0,
 											add: verify.added?.length ?? 0,
@@ -1107,12 +1107,12 @@ export default function PatchModal({
 											t("patch.conflicts", { count: verify.conflicts.length })}
 									</div>
 									{verify.backup_compromised && (
-										<div className="text-xs text-amber-600">
+										<div className="text-caption text-warning">
 											{t("patch.backupCompromised")}
 										</div>
 									)}
 									{verify.messages?.map((m, i) => (
-										<div key={i} className="text-xs text-gray-500">
+										<div key={i} className="text-caption text-text-muted">
 											{m}
 										</div>
 									))}
@@ -1120,7 +1120,7 @@ export default function PatchModal({
 							)}
 
 							{applyResult && (
-								<div className="p-3 border border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 rounded text-sm space-y-1">
+								<div className="p-3 border border-success bg-success-muted rounded text-body space-y-1">
 									<div className="font-medium">
 										{t(
 											applyResult.dry_run ? "patch.planned" : "patch.applied",
@@ -1130,7 +1130,7 @@ export default function PatchModal({
 											},
 										)}
 									</div>
-									<div className="text-xs">
+									<div className="text-caption">
 										{t("patch.applyDetail", {
 											replaced: applyResult.replaced,
 											added: applyResult.added,
@@ -1138,7 +1138,7 @@ export default function PatchModal({
 										})}
 									</div>
 									{applyResult.user_edits_overwritten?.length > 0 && (
-										<div className="text-xs text-amber-700">
+										<div className="text-caption text-warning">
 											{t("patch.overwrote", {
 												files: applyResult.user_edits_overwritten.join(", "),
 											})}
@@ -1147,7 +1147,7 @@ export default function PatchModal({
 								</div>
 							)}
 
-							<p className="text-xs text-gray-500">
+							<p className="text-caption text-text-muted">
 								{t("patch.applyHelp")}
 							</p>
 						</>
@@ -1156,17 +1156,17 @@ export default function PatchModal({
 					{tab === "pack" && (
 						<>
 							<div>
-								<label className="text-sm font-medium">{t("patch.outputZip")}</label>
+								<label className="text-body font-medium">{t("patch.outputZip")}</label>
 								<div className="flex gap-2 mt-1">
 									<input
 										value={outputPath}
 										onChange={(e) => setOutputPath(e.target.value)}
 										placeholder={t("patch.outputPlaceholder")}
-										className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+										className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 									/>
 									<button
 										onClick={pickOutputZip}
-										className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"
+										className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"
 										title={t("common.saveAs")}
 									>
 										<FileArchive size={16} />
@@ -1175,18 +1175,18 @@ export default function PatchModal({
 							</div>
 
 							<div>
-								<label className="text-sm font-medium">{t("patch.languages")}</label>
+								<label className="text-body font-medium">{t("patch.languages")}</label>
 								<input
 									value={languages}
 									onChange={(e) => setLanguages(e.target.value)}
 									placeholder={t("patch.languagesPlaceholder")}
-									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								/>
-								<p className="text-xs font-medium text-gray-600 dark:text-gray-400 mt-2">
+								<p className="text-caption font-medium text-text-muted mt-2">
 									{t("patch.recordedLangs")}
 								</p>
 								{recordings.length === 0 ? (
-									<p className="text-xs text-amber-700 dark:text-amber-400 mt-1">
+									<p className="text-caption text-warning mt-1">
 										{t("patch.recordedLangsEmpty")}
 									</p>
 								) : (
@@ -1201,10 +1201,10 @@ export default function PatchModal({
 													onClick={() =>
 														setLanguages(packLangFromRecording(lang))
 													}
-													className={`px-2 py-0.5 rounded text-xs font-medium border ${
+													className={`px-2 py-0.5 rounded text-caption font-medium border ${
 														selected
-															? "border-emerald-500 bg-emerald-50 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-200"
-															: "border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800"
+															? "border-accent-fg bg-accent-muted text-accent-fg"
+															: "border-border text-text hover:bg-surface-muted"
 													}`}
 												>
 													{lang ?? t("patch.recordedUnspecified")}
@@ -1213,29 +1213,29 @@ export default function PatchModal({
 										})}
 									</div>
 								)}
-								<p className="text-xs text-gray-500 mt-1">
+								<p className="text-caption text-text-muted mt-1">
 									{t("patch.languagesHint")}
 								</p>
 							</div>
 
-							<label className="flex items-start gap-2 text-sm cursor-pointer">
+							<label className="flex items-start gap-2 text-body cursor-pointer">
 								<input
 									type="checkbox"
-									className="mt-0.5"
+									className="mt-0.5 border border-border bg-surface text-text accent-accent focus:outline-none focus:ring-2 focus:ring-accent-fg"
 									checked={pristine}
 									onChange={(e) => setPristine(e.target.checked)}
 								/>
 								<span>
 									<span className="font-medium">{t("patch.pristine")}</span>
-									<span className="block text-xs text-gray-500 mt-0.5">
+									<span className="block text-caption text-text-muted mt-0.5">
 										{t("patch.pristineHint")}
 									</span>
 								</span>
 							</label>
 
 							<div>
-							<label className="text-sm font-medium">{t("patch.pristinePath")}</label>
-							{pristine && (initialBackupId || pristineRecordings.some(lang => isPackLangSelected(languages, lang))) && gamePath.trim() === defaultGamePath?.trim() && !pristinePath.trim() && <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-300">{t("patch.injectionBackup")}</p>}
+							<label className="text-body font-medium">{t("patch.pristinePath")}</label>
+							{pristine && (initialBackupId || pristineRecordings.some(lang => isPackLangSelected(languages, lang))) && gamePath.trim() === defaultGamePath?.trim() && !pristinePath.trim() && <p className="mt-1 text-caption text-success">{t("patch.injectionBackup")}</p>}
 								<div className="flex gap-2 mt-1">
 									<input
 										value={pristinePath}
@@ -1245,49 +1245,49 @@ export default function PatchModal({
 											if (value.trim()) setPristine(true);
 										}}
 										placeholder={t("patch.pristinePathPlaceholder")}
-										className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+										className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 									/>
 									<button
 										type="button"
 										onClick={() => {
 											void pickPristineFolder();
 										}}
-										className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"
+										className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"
 										title={t("common.browse")}
 									>
 										<FolderOpen size={16} />
 									</button>
 								</div>
-								<p className="text-xs text-gray-500 mt-1">
+								<p className="text-caption text-text-muted mt-1">
 									{t("patch.pristinePathHint")}
 								</p>
 							</div>
 
-							<details className="border rounded dark:border-gray-700 p-3">
-								<summary className="text-sm font-medium cursor-pointer">{t("patch.publish.title")}</summary>
+							<details className="border border-border rounded p-3">
+								<summary className="text-body font-medium cursor-pointer">{t("patch.publish.title")}</summary>
 								<div className="mt-3 space-y-3">
-									<label className="block text-sm">
+									<label className="block text-body">
 										{t("patch.publish.rjCode")}
-										<input value={rjCode} onChange={(e) => { rjEdited.current = true; setRjCode(e.target.value); }} className="block w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600" />
+										<input value={rjCode} onChange={(e) => { rjEdited.current = true; setRjCode(e.target.value); }} className="block w-full mt-1 p-2 border border-border rounded bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg" />
 									</label>
-									<label className="flex items-center gap-2 text-sm cursor-pointer">
+									<label className="flex items-center gap-2 text-body cursor-pointer">
 										<input type="checkbox" checked={!detectId} onChange={(e) => setDetectId(!e.target.checked)} />
 										{t("patch.publish.noDetect")}
 									</label>
-									<label className="block text-sm">
+									<label className="block text-body">
 										{t("patch.publish.gameVersion")}
-										<input value={gameVersion} onChange={(e) => setGameVersion(e.target.value)} className="block w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600" />
+										<input value={gameVersion} onChange={(e) => setGameVersion(e.target.value)} className="block w-full mt-1 p-2 border border-border rounded bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg" />
 									</label>
-									<label className="flex items-center gap-2 text-sm cursor-pointer">
+									<label className="flex items-center gap-2 text-body cursor-pointer">
 										<input type="checkbox" checked={createEntry} onChange={(e) => setCreateEntry(e.target.checked)} />
 										{t("patch.publish.createEntry")}
 									</label>
 									{createEntry && <div className="flex items-end gap-2">
-										<label className="flex-1 min-w-0 text-sm">
+										<label className="flex-1 min-w-0 text-body">
 											{t("patch.publish.entryPath")}
-											<input value={entryPath} onChange={(e) => setEntryPathOverride(e.target.value)} className="block w-full mt-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600" />
+											<input value={entryPath} onChange={(e) => setEntryPathOverride(e.target.value)} className="block w-full mt-1 p-2 border border-border rounded bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg" />
 										</label>
-										<button type="button" onClick={() => { void pickEntry(); }} title={t("common.browse")} aria-label={t("patch.publish.saveEntry")} className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded"><FolderOpen size={16} /></button>
+										<button type="button" onClick={() => { void pickEntry(); }} title={t("common.browse")} aria-label={t("patch.publish.saveEntry")} className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"><FolderOpen size={16} /></button>
 									</div>}
 								</div>
 							</details>
@@ -1299,20 +1299,20 @@ export default function PatchModal({
 									applying ||
 									!canPackFromRecordings(recordings, languages)
 								}
-								className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium disabled:opacity-50"
+								className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50"
 							>
 								<Archive size={16} /> {t("patch.packBtn")}
 							</button>
 
 							{packResult && (
-								<div className="p-3 border border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 rounded text-sm space-y-1">
+								<div className="p-3 border border-success bg-success-muted rounded text-body space-y-1">
 									<div className="font-medium">
 										{t("patch.packed", {
 											id: packResult.patch_id,
 											version: packResult.patch_version,
 										})}
 									</div>
-									<div className="text-xs text-gray-600 dark:text-gray-400 space-y-0.5">
+									<div className="text-caption text-text-muted space-y-0.5">
 										<div>
 											{t("patch.packedStats", {
 												files: packResult.files_packed,
@@ -1332,18 +1332,18 @@ export default function PatchModal({
 										</div>
 										<div className="break-all">{packResult.output_path}</div>
 									</div>
-									<div className="text-xs">
+									<div className="text-caption">
 										{t("patch.publish.identity", { code: packResult.game?.store_ids.dlsite ?? t("patch.publish.noCode"), count: packResult.game?.fingerprint_count ?? 0 })}
 									</div>
 									{packResult.entry_path && <div className="pt-2 space-y-2">
-										<p className="text-xs">{t("patch.publish.commandHint")}</p>
-										<pre className="text-xs whitespace-pre-wrap break-all select-text">{publishCommand(packResult.output_path, packResult.entry_path)}</pre>
-										<button type="button" onClick={() => { void copyPublishCommand(); }} className="px-3 py-1 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-xs">{t("common.copy")}</button>
+										<p className="text-caption">{t("patch.publish.commandHint")}</p>
+										<pre className="text-caption whitespace-pre-wrap break-all select-text">{publishCommand(packResult.output_path, packResult.entry_path)}</pre>
+										<button type="button" onClick={() => { void copyPublishCommand(); }} className="px-3 py-1 bg-surface-muted text-text hover:bg-surface rounded text-caption">{t("common.copy")}</button>
 									</div>}
 									{packResult.messages?.map((m, i) => (
 										<div
 											key={i}
-											className="text-xs text-amber-700 dark:text-amber-300"
+											className="text-caption text-warning"
 										>
 											{m}
 										</div>
@@ -1351,14 +1351,14 @@ export default function PatchModal({
 								</div>
 							)}
 
-							<p className="text-xs text-gray-500">
+							<p className="text-caption text-text-muted">
 								{t("patch.packHelp")}
 							</p>
 						</>
 					)}
 
 					{error && (
-						<div className="flex gap-2 p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded text-sm text-red-700 dark:text-red-300">
+						<div className="flex gap-2 p-3 bg-danger-muted border border-danger rounded text-body text-danger">
 							<AlertCircle size={16} className="shrink-0 mt-0.5" />
 							<pre className="whitespace-pre-wrap break-words font-sans">
 								{error}

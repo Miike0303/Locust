@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { MODAL_BACKDROP_CLASS, MODAL_FOOTER_CLASS, modalPanelClass } from "./modalA11y.ts";
 
 // Inspect every authored branch, including closed/conditional modal content.
-// Larger modals inherit only shared chrome and are deliberately not guard targets.
+// Guard each migrated modal's shared chrome and local styling.
 const files = [
   "./modalA11y.ts",
   "../components/ConfirmDialog.tsx",
@@ -12,6 +12,8 @@ const files = [
   "../components/FontPatchDialog.tsx",
   "../components/InjectionRecoveryModal.tsx",
   "../components/ExportModal.tsx",
+  "../components/PatchModal.tsx",
+  "../components/InjectModal.tsx",
   "../components/PivotModal.tsx",
   "../components/SearchReplaceModal.tsx",
   "../components/HotkeyHelp.tsx",
