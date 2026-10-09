@@ -137,6 +137,12 @@ export interface ProjectOpenResponse {
   removed: number; preserved_translations: number;
 }
 
+/** Matches core ProjectOpenPreflight on HTTP and Tauri. */
+export type ProjectOpenPreflight =
+  | { kind: "extract" }
+  | { kind: "resume_available"; database_path: string; project_path: string; format_id: string }
+  | { kind: "needs_attention"; reason: string };
+
 export interface StringEntry {
   id: string; source: string; translation: string | null;
   file_path: string; context: string | null; tags: string[];
@@ -392,6 +398,30 @@ export const openProject = (
     : request("/project/open", {
         method: "POST",
         body: JSON.stringify(projectOpenHttpBody(path, formatId, preferSaved)),
+      });
+
+export const preflightProjectOpen = (
+  gamePath: string,
+  format?: string,
+): Promise<ProjectOpenPreflight> =>
+  IS_TAURI
+    ? tauriInvoke("preflight_project_open", { gamePath, format })
+    : request("/project/preflight", {
+        method: "POST",
+        body: JSON.stringify({ game_path: gamePath, format }),
+      });
+
+/** Locked revalidation; no fallback to extract when verification fails. */
+export const resumeProject = (
+  databasePath: string,
+  gamePath: string,
+  formatId: string,
+): Promise<ProjectOpenResponse> =>
+  IS_TAURI
+    ? tauriInvoke("resume_project", { databasePath, gamePath, formatId })
+    : request("/project/resume", {
+        method: "POST",
+        body: JSON.stringify({ database_path: databasePath, game_path: gamePath, format_id: formatId }),
       });
 
 /** Reopen a .locust.db without extracting or merging (pivoted projects). */

@@ -204,6 +204,7 @@ export default function Welcome() {
 				setProject,
 				queryClient,
 			}, preferSaved);
+			if (!result) return;
 			const notice = projectOpenMergeNotice(result, t);
 			addLog(
 				notice.toast ? "warning" : "info",

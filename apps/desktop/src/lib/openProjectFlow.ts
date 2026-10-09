@@ -1,6 +1,7 @@
 import { isTauri } from "./runtime";
 import type { QueryClient } from "@tanstack/react-query";
-import type { ProjectInfo, ProjectOpenResponse } from "./api";
+import type { ProjectInfo, ProjectOpenPreflight, ProjectOpenResponse } from "./api";
+import { t } from "./i18n";
 import type { TranslateFn } from "./i18n";
 
 /** Backend detection failure (Tauri: "Could not detect game format"; HTTP 422: "format not detected"). */
@@ -130,17 +131,88 @@ export async function pickLocustDbFile(t: TranslateFn): Promise<PickLocustDbResu
   return { status: "picked", path: typed.trim() };
 }
 
+export type ProjectOpenChoice = "resume" | "refresh" | "cancel";
+export interface ProjectOpenChoiceRequest {
+  gamePath: string;
+  preflight: Exclude<ProjectOpenPreflight, { kind: "extract" }>;
+}
+
+// One app-wide choice host also serves store-driven queue opening. A second
+// caller cancels rather than replacing somebody else's unanswered decision.
+let choiceSequence = 0;
+let pendingChoice: (ProjectOpenChoiceRequest & { id: number }) | null = null;
+let settleChoice: ((choice: ProjectOpenChoice) => void) | null = null;
+const choiceListeners = new Set<() => void>();
+export const getProjectOpenChoice = () => pendingChoice;
+export function subscribeProjectOpenChoice(listener: () => void): () => void {
+  choiceListeners.add(listener);
+  return () => { choiceListeners.delete(listener); };
+}
+export function resolveProjectOpenChoice(request: ProjectOpenChoiceRequest, choice: ProjectOpenChoice): void {
+  if (pendingChoice === request) settleChoice?.(choice);
+}
+
+export function requestProjectOpenChoice(
+  request: ProjectOpenChoiceRequest,
+  signal?: AbortSignal,
+): Promise<ProjectOpenChoice> {
+  if (pendingChoice || signal?.aborted) return Promise.resolve("cancel");
+  return new Promise((resolve) => {
+    const cancel = () => settleChoice?.("cancel");
+    pendingChoice = { ...request, id: ++choiceSequence };
+    settleChoice = (choice) => {
+      signal?.removeEventListener("abort", cancel);
+      pendingChoice = null;
+      settleChoice = null;
+      for (const listener of choiceListeners) listener();
+      resolve(choice);
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
+    for (const listener of choiceListeners) listener();
+  });
+}
+
+export interface FolderOpenOptions {
+  choose?: (request: ProjectOpenChoiceRequest, signal?: AbortSignal) => Promise<ProjectOpenChoice>;
+  signal?: AbortSignal;
+}
+
+/** Folder opening only. Explicit DB and legacy recent opening bypass this flow. */
+export async function openFolderProject(
+  path: string,
+  formatId?: string,
+  options: FolderOpenOptions = {},
+): Promise<ProjectOpenResponse | null> {
+  if (options.signal?.aborted) return null;
+  const { preflightProjectOpen, openProject, resumeProject } = await import("./api");
+  const preflight = await preflightProjectOpen(path, formatId);
+  if (options.signal?.aborted) return null;
+  if (preflight.kind === "extract") return openProject(path, formatId);
+  if (preflight.kind !== "resume_available" && preflight.kind !== "needs_attention") {
+    throw new Error(t("resume.invalidPreflight"));
+  }
+  const choice = await (options.choose ?? requestProjectOpenChoice)({ gamePath: path, preflight }, options.signal);
+  if (options.signal?.aborted || choice === "cancel") return null;
+  if (choice === "refresh") return openProject(path, formatId);
+  // An erroneous/custom chooser cannot promote unverified evidence to resume.
+  if (choice !== "resume" || preflight.kind !== "resume_available") return null;
+  return resumeProject(preflight.database_path, preflight.project_path, preflight.format_id);
+}
+
 export async function completeOpenProject(
   path: string,
   formatId: string | undefined,
   deps: {
     setProject: (p: ProjectInfo) => void;
     queryClient: QueryClient;
-  },
+  } & FolderOpenOptions,
   preferSaved = false,
-): Promise<ProjectOpenResponse> {
+): Promise<ProjectOpenResponse | null> {
   const { openProject } = await import("./api");
-  const result = await openProject(path, formatId, preferSaved);
+  const result = preferSaved
+    ? await openProject(path, formatId, true)
+    : await openFolderProject(path, formatId, deps);
+  if (!result) return null;
   deps.setProject(projectFromOpenResponse(result));
   dropProjectQueries(deps.queryClient);
   return result;

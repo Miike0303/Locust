@@ -126,6 +126,7 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
             setProject,
             queryClient,
           });
+          if (!result) return;
           const notice = projectOpenMergeNotice(result, t);
           addLog(
             notice.toast ? "warning" : "info",

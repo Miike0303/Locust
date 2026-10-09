@@ -493,6 +493,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/formats/:id/modes", get(get_format_modes))
         .route("/api/providers", get(list_providers))
         .route("/api/providers/:id/health", post(provider_health))
+        .route("/api/project/preflight", post(project_preflight))
+        .route("/api/project/resume", post(project_resume))
         .route("/api/project/open", post(project_open))
         .route("/api/project/open-db", post(project_open_db))
         .route("/api/project/current", get(project_current))
@@ -718,6 +720,46 @@ fn map_open_err(e: locust_core::error::LocustError) -> ApiError {
     }
 }
 
+#[derive(Deserialize)]
+struct ProjectPreflightRequest {
+    game_path: String,
+    #[serde(alias = "format_id")]
+    format: Option<String>,
+}
+
+async fn project_preflight(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ProjectPreflightRequest>,
+) -> Result<Json<project::ProjectOpenPreflight>, ApiError> {
+    project::preflight_project_open(
+        &state.format_registry,
+        Path::new(&req.game_path),
+        req.format.as_deref(),
+    )
+    .map(Json)
+    .map_err(map_open_err)
+}
+
+async fn project_resume(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OpenProjectDbRequest>,
+) -> Result<Json<ProjectOpenResponse>, ApiError> {
+    let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    run_owned_project_operation(guard, async move {
+        let outcome = project::open_verified_saved_project(
+            &state.db,
+            &state.format_registry,
+            Path::new(&req.database_path),
+            Path::new(&req.game_path),
+            &req.format_id,
+        )
+        .map_err(map_open_err)?;
+        finish_project_open(&state, outcome).await
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+}
+
 async fn project_open(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenProjectRequest>,
@@ -750,7 +792,14 @@ async fn project_open_owned(
     }
     .map_err(map_open_err)?;
 
-    let persistence_warning = remember_open_project(&state, &outcome, true).await;
+    finish_project_open(&state, outcome).await
+}
+
+async fn finish_project_open(
+    state: &AppState,
+    outcome: ProjectOpenOutcome,
+) -> Result<Json<ProjectOpenResponse>, ApiError> {
+    let persistence_warning = remember_open_project(state, &outcome, true).await;
     {
         let mut proj = state.current_project.write().await;
         *proj = Some(ProjectInfo {
@@ -817,23 +866,7 @@ async fn project_open_db_owned(
     )
     .map_err(map_open_db_err)?;
 
-    let persistence_warning = remember_open_project(&state, &outcome, true).await;
-    {
-        let mut proj = state.current_project.write().await;
-        *proj = Some(ProjectInfo {
-            path: outcome.project_path.clone(),
-            format_id: outcome.format_id.clone(),
-            name: outcome.project_name.clone(),
-            extraction_warnings: outcome.extraction_warnings.clone(),
-            database_path: Some(outcome.database_path.clone()),
-            supported_modes: outcome.supported_modes.clone(),
-            persistence_warning: persistence_warning.clone(),
-        });
-    }
-
-    let mut response = ProjectOpenResponse::from(outcome);
-    response.persistence_warning = persistence_warning;
-    Ok(Json(response))
+    finish_project_open(&state, outcome).await
 }
 
 async fn project_current(

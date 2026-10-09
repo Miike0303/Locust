@@ -1,5 +1,7 @@
 import { create } from "zustand";
-import { openProject, startTranslation, cancelTranslation, validate, type TranslationStartParams } from "../lib/api";
+import { startTranslation, cancelTranslation, validate, type TranslationStartParams } from "../lib/api";
+import { completeOpenProject } from "../lib/openProjectFlow";
+import { queryClient } from "../lib/queryClient";
 import { waitForJob } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
 import { useEditorStore } from "./editorStore";
@@ -14,6 +16,7 @@ import {
 } from "../lib/queueValidation";
 
 let activeJobId: string | null = null;
+let activeOpening: AbortController | null = null;
 
 export type QueueItemStatus = "pending" | "extracting" | "translating" | "validating" | "done" | "error" | "cancelled";
 
@@ -106,6 +109,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
   cancelQueue: () => {
     set({ cancelRequested: true });
+    activeOpening?.abort();
     const jobId = activeJobId;
     if (!jobId) return;
     void cancelTranslation(jobId).catch((err: any) => {
@@ -162,19 +166,21 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           },
         });
 
-        const result = await openProject(item.projectPath);
+        const opening = new AbortController();
+        activeOpening = opening;
+        const result = await completeOpenProject(item.projectPath, undefined, {
+          setProject: useProjectStore.getState().setProject,
+          queryClient,
+          signal: opening.signal,
+        }).finally(() => { activeOpening = null; });
+        if (!result) {
+          markCancelled();
+          if (get().cancelRequested) break;
+          continue;
+        }
         updateItem({
           projectName: result.project_name,
           formatId: result.format_id,
-        });
-
-        useProjectStore.getState().setProject({
-          path: result.project_path,
-          format_id: result.format_id,
-          name: result.project_name,
-          supported_modes: result.supported_modes,
-          database_path: result.database_path,
-          extraction_warnings: result.extraction_warnings,
         });
 
         if (get().cancelRequested) {
@@ -277,12 +283,17 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       const runIds = new Set(pending.map((i) => i.id));
       let finished = 0;
       let failed = 0;
+      let cancelled = 0;
       for (const i of get().items) {
         if (!runIds.has(i.id)) continue;
         if (i.status === "done") finished++;
         else if (i.status === "error") failed++;
+        else if (i.status === "cancelled") cancelled++;
       }
-      if (failed === 0) {
+      if (failed === 0 && cancelled > 0) {
+        addLog("info", t("activity.queue.finishedWithCancelled", { finished, cancelled }), undefined, "queue");
+        addToast("info", t("queue.toast.finishedWithCancelled", { finished, cancelled }));
+      } else if (failed === 0) {
         addLog("info", t("activity.queue.finished"), undefined, "queue");
         addToast("success", t("queue.toast.allDone"));
       } else {

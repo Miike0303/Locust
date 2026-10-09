@@ -31,6 +31,8 @@ registerHooks({
     const modules: Record<string, string> = {
       "/src/lib/api.ts": `const h=globalThis.__queueExecution;
         export const getProviders=()=>[]; export const getConfig=()=>({}); export const checkProviderHealth=()=>({});
+        export async function preflightProjectOpen(){return {kind:'extract'};}
+        export async function resumeProject(){throw new Error('plain fixture must not resume');}
         export async function openProject(path){h.calls.push('open');h.onOpen();return {project_path:path,project_name:'Fixture',format_id:'test',total_strings:3,supported_modes:[],database_path:'fixture.db',extraction_warnings:[]};}
         export async function startTranslation(){h.calls.push('start');return h.start();}
         export async function cancelTranslation(){h.calls.push('cancel');}

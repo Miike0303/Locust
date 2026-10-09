@@ -58,6 +58,8 @@ fn main() {
         .manage(commands::ServerPort(port))
         .invoke_handler(tauri::generate_handler![
             commands::get_server_port,
+            commands::preflight_project_open,
+            commands::resume_project,
             commands::open_project,
             commands::open_project_db,
             commands::get_formats,

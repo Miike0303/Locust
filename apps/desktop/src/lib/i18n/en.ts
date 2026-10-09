@@ -267,6 +267,14 @@ export const en = {
   "welcome.formatsAvailable": "{count} formats available",
   "welcome.recentCount.one": "{count} recent project",
   "welcome.recentCount.other": "{count} recent projects",
+  "resume.title": "Resume saved project?",
+  "resume.message": "Locust verified a Direct injection in this folder and its matching saved project. Resume keeps your saved sources, translations and approvals without extracting the game text again.",
+  "resume.attentionTitle": "Saved project could not be verified",
+  "resume.attentionMessage": "Locust cannot safely offer resume. Review the details below, cancel, or explicitly refresh from the current files.",
+  "resume.refreshWarning": "Refresh reads the current game files again. Injected text may become the new source and source approvals may reset.",
+  "resume.resume": "Resume",
+  "resume.refresh": "Refresh",
+  "resume.invalidPreflight": "The project preflight response was not recognized. No project was opened.",
   "welcome.dialog.selectFolder": "Select game folder",
   "welcome.dialog.selectFile": "Select game executable or main file",
   "welcome.dialog.selectDb": "Select Locust project database",
@@ -668,6 +676,8 @@ export const en = {
   "queue.toast.itemFailed": "Queue error: {name}",
   "queue.toast.cancelled": "Queue cancelled",
   "queue.toast.allDone": "All projects in queue completed",
+  "queue.toast.finishedWithCancelled": "Queue finished: {finished} completed, {cancelled} cancelled",
+  "activity.queue.finishedWithCancelled": "Queue finished: {finished} completed, {cancelled} cancelled",
   "queue.toast.summary": "{finished} finished, {failed} failed",
 
   // ── toast ───────────────────────────────────────────────────────────────

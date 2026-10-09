@@ -50,6 +50,31 @@ pub struct ProjectOpenResponse {
     pub persistence_warning: Option<String>,
 }
 
+/// Advisory verification only; confirmation revalidates under the source lock.
+#[tauri::command]
+pub fn preflight_project_open(
+    game_path: String,
+    format: Option<String>,
+    state: State<'_, AppStateWrapper>,
+) -> Result<project::ProjectOpenPreflight, String> {
+    project::preflight_project_open(
+        &state.0.format_registry,
+        Path::new(&game_path),
+        format.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn resume_project(
+    database_path: String,
+    game_path: String,
+    format_id: String,
+    state: State<'_, AppStateWrapper>,
+) -> Result<ProjectOpenResponse, String> {
+    apply_saved_project(&state.0, database_path, game_path, format_id, true).await
+}
+
 #[tauri::command]
 pub async fn open_project(
     path: String,
@@ -118,10 +143,25 @@ async fn apply_open_project_db(
     game_path: String,
     format_id: String,
 ) -> Result<ProjectOpenResponse, String> {
+    apply_saved_project(s, database_path, game_path, format_id, false).await
+}
+
+async fn apply_saved_project(
+    s: &Arc<AppState>,
+    database_path: String,
+    game_path: String,
+    format_id: String,
+    verified_resume: bool,
+) -> Result<ProjectOpenResponse, String> {
     let s = s.clone();
     let exclusive = try_project_operation(&s)?;
     run_owned_project_operation(exclusive, async move {
-        let outcome = project::open_project_db(
+        let open = if verified_resume {
+            project::open_verified_saved_project
+        } else {
+            project::open_project_db
+        };
+        let outcome = open(
             &s.db,
             &s.format_registry,
             Path::new(&database_path),
@@ -808,6 +848,135 @@ async fn apply_add_glossary_entry(s: &AppState, entry: &GlossaryEntry) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn direct_resume_fixture() -> (Arc<AppState>, PathBuf, String, String) {
+        let mut state = locust_server::create_test_state();
+        let root = state.config_path.parent().unwrap();
+        let game = root.join("game");
+        let backups = root.join("backups");
+        Arc::get_mut(&mut state).unwrap().backup_manager =
+            Arc::new(locust_core::backup::BackupManager::new(backups));
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("story.html"), "<p>Original source</p>").unwrap();
+        let opened = apply_open_project(
+            &state,
+            game.to_string_lossy().into_owned(),
+            Some("html-game".into()),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut row = state
+            .db
+            .get_entries(&EntryFilter::default())
+            .unwrap()
+            .remove(0);
+        let id = row.id.clone();
+        row.translation = Some("Translated".into());
+        row.status = StringStatus::Approved;
+        row.provider_used = Some("fixture".into());
+        state.db.save_entries(&[row]).unwrap();
+        locust_core::extraction::inject_direct(
+            &state.format_registry,
+            &state.db,
+            &state.backup_manager,
+            &game,
+            "html-game",
+            &["en".into()],
+        )
+        .unwrap();
+        (state, game, opened.database_path, id)
+    }
+
+    #[tokio::test]
+    async fn verified_resume_adapter_keeps_saved_approvals_and_zero_merge_counters() {
+        let (state, game, database, id) = direct_resume_fixture().await;
+        let preflight =
+            project::preflight_project_open(&state.format_registry, &game, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(preflight).unwrap()["kind"],
+            "resume_available"
+        );
+        let result = apply_saved_project(
+            &state,
+            database.clone(),
+            game.to_string_lossy().into_owned(),
+            "html-game".into(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                result.added,
+                result.updated,
+                result.stale_source_reset,
+                result.removed,
+                result.preserved_translations
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        let row = state.db.get_entry(&id).unwrap().unwrap();
+        assert_eq!(row.source, "Original source");
+        assert_eq!(row.translation.as_deref(), Some("Translated"));
+        assert_eq!(row.status, StringStatus::Approved);
+        assert_eq!(row.provider_used.as_deref(), Some("fixture"));
+        assert_eq!(result.database_path, database);
+        assert_eq!(
+            state.current_project.read().await.as_ref().unwrap().path,
+            game
+        );
+        assert!(state.config_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn verified_resume_adapter_rechecks_drift_and_admission_without_switching_project() {
+        let (state, game, database, id) = direct_resume_fixture().await;
+        let before_project =
+            serde_json::to_value(state.current_project.read().await.clone()).unwrap();
+        let before_config = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        let guard = try_project_operation(&state).unwrap();
+        assert_eq!(
+            apply_saved_project(
+                &state,
+                database.clone(),
+                game.to_string_lossy().into_owned(),
+                "html-game".into(),
+                true,
+            )
+            .await
+            .unwrap_err(),
+            locust_server::PROJECT_BUSY_MESSAGE
+        );
+        drop(guard);
+        std::fs::write(game.join("story.html"), "<p>Drift</p>").unwrap();
+        assert!(apply_saved_project(
+            &state,
+            database.clone(),
+            game.to_string_lossy().into_owned(),
+            "html-game".into(),
+            true,
+        )
+        .await
+        .is_err());
+        assert_eq!(state.db.path(), PathBuf::from(database));
+        assert_eq!(
+            state.db.get_entry(&id).unwrap().unwrap().source,
+            "Original source"
+        );
+        assert_eq!(
+            state.db.get_entry(&id).unwrap().unwrap().status,
+            StringStatus::Approved
+        );
+        assert_eq!(
+            serde_json::to_value(state.current_project.read().await.clone()).unwrap(),
+            before_project
+        );
+        assert_eq!(
+            serde_json::to_value(state.config.read().await.clone()).unwrap(),
+            before_config
+        );
+    }
 
     #[test]
     fn string_facets_and_pivot_json_keep_contract_field_names() {
