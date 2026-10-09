@@ -35,19 +35,19 @@ interface ValidationResultsModalProps {
 
 const KIND_BADGE: Record<string, string> = {
 	MissingPlaceholder:
-		"bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
+		"bg-warning-muted text-warning",
 	ExtraPlaceholder:
-		"bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300",
+		"bg-warning-muted text-warning",
 	ExceedsCharLimit:
-		"bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
+		"bg-danger-muted text-danger",
 	ExceedsBinarySlot:
-		"bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
+		"bg-danger-muted text-danger",
 	EmptyTranslation:
-		"bg-gray-200 text-gray-800 dark:bg-gray-700 dark:text-gray-200",
+		"bg-surface-muted text-text",
 	IdenticalToSource:
 		"bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
 	StaleTranslation:
-		"bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
+		"bg-danger-muted text-danger",
 };
 
 function kindDetail(
@@ -92,19 +92,19 @@ function FontSection({
 
 	return (
 		<div className="mt-4">
-			<h3 className="text-sm font-semibold text-gray-500 uppercase mb-2 flex items-center gap-1.5">
+			<h3 className="text-body font-semibold text-text-muted uppercase mb-2 flex items-center gap-1.5">
 				<Type size={14} /> {t("validate.fontCoverage")}
 			</h3>
-			<p className="text-xs text-gray-600 dark:text-gray-400 mb-2">
+			<p className="text-caption text-text-muted mb-2">
 				{fonts.length ? t("validate.fontsChecked", { count: fonts.length }) : t("validate.noLooseFonts")}
 			</p>
 			{limitations && (
-				<p className="text-xs text-gray-600 dark:text-gray-400 mb-2">
+				<p className="text-caption text-text-muted mb-2">
 					{t("validate.fontLimitations")}
 				</p>
 			)}
 			{issues.map((issue, index) => (
-				<div key={`${issue.font_path}:${index}`} className="text-xs border border-amber-300 dark:border-amber-800 rounded p-2 mb-2 break-words">
+				<div key={`${issue.font_path}:${index}`} className="text-caption border border-warning rounded p-2 mb-2 break-words">
 					<div className="font-medium">{t("validate.fontUnreadable")}: {issue.font_path}</div>
 					<div>{issue.message}</div>
 				</div>
@@ -121,19 +121,19 @@ function FontSection({
 					return (
 						<div
 							key={`${f.font_path}:${f.face_index ?? 0}`}
-							className="text-sm border border-gray-200 dark:border-gray-700 rounded p-2"
+							className="text-body border border-border rounded p-2"
 						>
 							<div className="font-medium truncate" title={f.font_path}>
 								{name}
 							</div>
-							<div className="text-xs text-gray-500 mt-0.5">
+							<div className="text-caption text-text-muted mt-0.5">
 								{t("validate.missingGlyphs", {
 									count: f.missing_count,
 									percent: f.coverage_percent.toFixed(1),
 								})}
 							</div>
 							{sample && (
-								<div className="text-xs font-mono mt-1 text-gray-600 dark:text-gray-400 break-all">
+								<div className="text-caption font-mono mt-1 text-text-muted break-all">
 									{sample}
 									{more}
 								</div>
@@ -144,27 +144,27 @@ function FontSection({
 			</div>
 			{suggestions.length > 0 && (
 				<div className="mt-3 space-y-2">
-					<h4 className="text-xs font-semibold text-gray-500 uppercase">
+					<h4 className="text-caption font-semibold text-text-muted uppercase">
 						{t("validate.fontSuggestions")}
 					</h4>
 					{suggestions.map((s) => (
 						<div
 							key={s.font_name}
-							className="text-sm border border-violet-200 dark:border-violet-800 bg-violet-50/50 dark:bg-violet-950/20 rounded p-2"
+							className="text-body border border-accent-fg bg-accent-muted rounded p-2"
 						>
-							<div className="font-medium text-violet-900 dark:text-violet-100">
+							<div className="font-medium text-accent-fg">
 								{s.font_name}
 							</div>
-							<div className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">
+							<div className="text-caption text-text-muted mt-0.5">
 								{t("validate.fontCovers", {
 									scripts: s.covers_scripts.join(", "),
 								})}
 							</div>
-							<div className="text-[11px] text-gray-500 mt-0.5">{s.license}</div>
+							<div className="text-caption text-text-muted mt-0.5">{s.license}</div>
 							<button
 								type="button"
 								onClick={() => window.open(s.download_url, "_blank", "noopener,noreferrer")}
-								className="text-xs font-medium text-violet-700 dark:text-violet-300 hover:underline mt-1"
+								className="text-caption font-medium text-accent-fg hover:underline mt-1"
 							>
 								{t("validate.fontDownload")}
 							</button>
@@ -217,16 +217,16 @@ export default function ValidationResultsModal({
 				{...dialogProps}
 				className={modalPanelClass("max-w-2xl max-h-[85vh] flex flex-col")}
 			>
-				<div className="flex justify-between items-center px-5 py-4 border-b border-gray-200 dark:border-gray-700">
+				<div className="flex justify-between items-center px-5 py-4 border-b border-border">
 					<div className="flex items-center gap-2">
-						<Shield size={18} className="text-emerald-600" />
-						<h2 {...titleProps} className="text-lg font-bold">
+						<Shield size={18} className="text-accent-fg" />
+						<h2 {...titleProps} className="text-section font-bold">
 							{t("validate.title")}
 						</h2>
 					</div>
 					<button
 						onClick={onClose}
-						className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+						className="text-text-muted hover:text-text"
 					>
 						<X size={20} />
 					</button>
@@ -234,32 +234,32 @@ export default function ValidationResultsModal({
 
 				<div className="px-5 py-4 overflow-y-auto flex-1 space-y-4">
 					{/* Summary */}
-					<div className="flex flex-wrap gap-3 text-sm">
-						<span className="text-gray-600 dark:text-gray-400">
+					<div className="flex flex-wrap gap-3 text-body">
+						<span className="text-text-muted">
 							{t("validate.checked")}{" "}
-							<strong className="text-gray-900 dark:text-gray-100">
+							<strong className="text-text">
 								{validation.total_checked}
 							</strong>
 						</span>
-						<span className="text-gray-600 dark:text-gray-400">
+						<span className="text-text-muted">
 							{t("validate.issues")}{" "}
 							<strong
 								className={
 									validation.issues_found > 0
-										? "text-red-600 dark:text-red-400"
-										: "text-emerald-600"
+										? "text-danger"
+										: "text-success"
 								}
 							>
 								{validation.issues_found}
 							</strong>
 						</span>
-						<span className="text-gray-600 dark:text-gray-400">
+						<span className="text-text-muted">
 							{t("validate.entries")}{" "}
-							<strong className="text-gray-900 dark:text-gray-100">
+							<strong className="text-text">
 								{validation.entries_with_issues}
 							</strong>
 						</span>
-						{fontProblems > 0 && <span className="font-medium text-amber-700 dark:text-amber-400">{t("validate.fontProblems", { count: fontProblems })}</span>}
+						{fontProblems > 0 && <span className="font-medium text-warning">{t("validate.fontProblems", { count: fontProblems })}</span>}
 					</div>
 
 					{kindEntries.length > 0 && (
@@ -268,9 +268,9 @@ export default function ValidationResultsModal({
 								<span
 									key={kind}
 									className={clsx(
-										"px-2 py-0.5 rounded-full text-xs font-medium",
+										"px-2 py-0.5 rounded-full text-caption font-medium",
 										KIND_BADGE[kind] ||
-											"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300",
+											"bg-surface-muted text-text-muted",
 									)}
 								>
 									{validationBadgeLabel(kind, t)}: {n}
@@ -281,24 +281,24 @@ export default function ValidationResultsModal({
 
 					{/* Issue list */}
 					{issues.length === 0 ? (
-						<div className="py-10 text-center text-gray-500">
+						<div className="py-10 text-center text-text-muted">
 							<ResultIcon
 								size={32}
-								className={clsx("mx-auto mb-2 opacity-80", fontProblems > 0 ? "text-amber-500" : "text-emerald-500")}
+								className={clsx("mx-auto mb-2 opacity-80", fontProblems > 0 ? "text-warning" : "text-success")}
 							/>
-							<p className="font-medium text-gray-700 dark:text-gray-300">
+							<p className="font-medium text-text">
 								{t(fontProblems > 0 ? "validate.textPassedFontsPending" : "validate.noIssues")}
 							</p>
-							<p className="text-sm mt-1">
+							<p className="text-body mt-1">
 								{t("validate.validated", { count: validation.total_checked })}
 							</p>
 						</div>
 					) : (
 						<div>
-							<h3 className="text-sm font-semibold text-gray-500 uppercase mb-2 flex items-center gap-1.5">
+							<h3 className="text-body font-semibold text-text-muted uppercase mb-2 flex items-center gap-1.5">
 								<AlertTriangle size={14} /> {t("validate.issuesHeading")}
 							</h3>
-							<ul className="divide-y divide-gray-100 dark:divide-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+							<ul className="divide-y divide-border border border-border rounded-lg overflow-hidden">
 								{issues.map((issue, i) => {
 									const label = validationKindLabel(issue.kind);
 									const detail = kindDetail(issue.kind, t);
@@ -307,30 +307,30 @@ export default function ValidationResultsModal({
 											<button
 												type="button"
 												onClick={() => handleClick(issue)}
-												className="w-full text-left px-3 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-800/60 transition-colors"
+												className="w-full text-left px-3 py-2.5 hover:bg-surface-muted transition-colors"
 											>
 												<div className="flex items-start gap-2">
 													<span
 														className={clsx(
-															"shrink-0 px-2 py-0.5 rounded text-xs font-medium mt-0.5",
-															KIND_BADGE[label] || "bg-gray-100 text-gray-700",
+															"shrink-0 px-2 py-0.5 rounded text-caption font-medium mt-0.5",
+															KIND_BADGE[label] || "bg-surface-muted text-text-muted",
 														)}
 													>
 														{validationBadgeLabel(label, t)}
 													</span>
 													<div className="min-w-0 flex-1">
-														<div className="font-mono text-xs text-gray-500 truncate">
+														<div className="font-mono text-caption text-text-muted truncate">
 															{issue.entry_id}
 														</div>
 														{issue.source && (
 															<div
-																className="text-sm text-gray-800 dark:text-gray-200 truncate mt-0.5"
+																className="text-body text-text truncate mt-0.5"
 																title={issue.source}
 															>
 																{issue.source}
 															</div>
 														)}
-														<div className="text-xs text-gray-500 mt-0.5">
+														<div className="text-caption text-text-muted mt-0.5">
 															{detail || issue.message}
 														</div>
 													</div>
@@ -340,7 +340,7 @@ export default function ValidationResultsModal({
 									);
 								})}
 							</ul>
-							<p className="text-xs text-gray-400 mt-2">
+							<p className="text-caption text-text-muted mt-2">
 								{t("validate.clickHint")}
 							</p>
 						</div>
@@ -350,7 +350,7 @@ export default function ValidationResultsModal({
 				</div>
 
 				<div className={MODAL_FOOTER_CLASS}>
-					{onFontPatch && <button type="button" onClick={onFontPatch} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded text-sm font-medium">{t("fontPatch.title")}</button>}
+					{onFontPatch && <button type="button" onClick={onFontPatch} className="px-4 py-2 border border-border bg-surface text-text hover:bg-surface-muted rounded text-body font-medium">{t("fontPatch.title")}</button>}
 					{onReviewInEditor && (
 						<button
 							type="button"
@@ -361,14 +361,14 @@ export default function ValidationResultsModal({
 									? t("validate.reviewInEditorTitle")
 									: t("validate.reviewInEditorDisabled")
 							}
-							className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium"
+							className="px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-body font-medium"
 						>
 							{t("validate.reviewInEditor")}
 						</button>
 					)}
 					<button
 						onClick={onClose}
-						className="px-4 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium"
+						className="px-4 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body font-medium"
 					>
 						{t("common.close")}
 					</button>

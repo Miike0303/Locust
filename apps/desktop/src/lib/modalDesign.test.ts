@@ -17,6 +17,9 @@ const files = [
   "../components/PivotModal.tsx",
   "../components/SearchReplaceModal.tsx",
   "../components/HotkeyHelp.tsx",
+  "../components/TranslationModal.tsx",
+  "../components/ValidationResultsModal.tsx",
+  "../components/QueuePanel.tsx",
 ] as const;
 
 for (const file of files) {

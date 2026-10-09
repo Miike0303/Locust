@@ -302,7 +302,7 @@ export default function TranslationModal({
 				className={modalPanelClass("max-w-lg p-6")}
 			>
 				<div className="flex justify-between items-center mb-4">
-					<h2 {...titleProps} className="text-lg font-bold">
+					<h2 {...titleProps} className="text-section font-bold">
 						{step === "configure"
 							? t("translate.title")
 							: t("translate.progressTitle")}
@@ -310,7 +310,7 @@ export default function TranslationModal({
 					<button
 						onClick={handleClose}
 						aria-label={t("translate.closeAria")}
-						className="text-gray-400 hover:text-gray-600"
+						className="text-text-muted hover:text-text"
 					>
 						<X aria-hidden="true" size={20} />
 					</button>
@@ -320,12 +320,12 @@ export default function TranslationModal({
 					<div className="space-y-4">
 						<div>
 							<div className="flex items-end justify-between gap-2">
-								<label className="text-sm font-medium">{t("translate.provider")}</label>
+								<label className="text-body font-medium">{t("translate.provider")}</label>
 								<button
 									type="button"
 									onClick={handleTestConnection}
 									disabled={!providerId || testingHealth}
-									className="text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
+									className="text-caption font-medium text-accent-fg hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
 								>
 									{testingHealth ? t("translate.testing") : t("translate.testConnection")}
 								</button>
@@ -338,7 +338,7 @@ export default function TranslationModal({
 										prev.filter((id) => id !== e.target.value),
 									);
 								}}
-								className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+								className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 							>
 								{providers?.map((p) => (
 									<option key={p.id} value={p.id}>
@@ -348,12 +348,12 @@ export default function TranslationModal({
 							</select>
 							{!providerReadiness.ready &&
 								providerReadiness.reason === "missing_key" && (
-									<div className="mt-2 p-2 rounded border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20 text-sm text-amber-800 dark:text-amber-200">
+									<div className="mt-2 p-2 rounded border border-warning bg-warning-muted text-body text-warning">
 										{t("translate.needsKey")}{" "}
 										<button
 											type="button"
 											onClick={() => openSettings("provider-settings")}
-											className="font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+											className="font-medium text-accent-fg hover:underline"
 										>
 											{t("translate.openSettings")}
 										</button>
@@ -361,10 +361,10 @@ export default function TranslationModal({
 								)}
 							{healthResult && (
 								<div
-									className={`mt-2 p-2 rounded border text-sm ${
+									className={`mt-2 p-2 rounded border text-body ${
 										healthResult.ok
-											? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-200"
-											: "border-red-200 bg-red-50 text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300"
+											? "border-success bg-success-muted text-success"
+											: "border-danger bg-danger-muted text-danger"
 									}`}
 								>
 									{healthResult.message}
@@ -373,23 +373,23 @@ export default function TranslationModal({
 							<button
 								type="button"
 								onClick={() => openSettings("provider-settings")}
-								className="mt-1 text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+								className="mt-1 text-caption font-medium text-accent-fg hover:underline"
 							>
 								{t("translate.providerSettings")}
 							</button>
 						</div>
 						<div>
-							<label className="text-sm font-medium">
+							<label className="text-body font-medium">
 								{t("translate.fallbacks")}
 							</label>
-							<p className="text-xs text-gray-500 mt-0.5 mb-1">
+							<p className="text-caption text-text-muted mt-0.5 mb-1">
 								{t("translate.fallbacksHint")}
 							</p>
 							<div className="flex gap-2">
 								<select
 									value={fallbackPick}
 									onChange={(e) => setFallbackPick(e.target.value)}
-									className="flex-1 p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+									className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								>
 									<option value="">{t("translate.addFallback")}</option>
 									{providers
@@ -406,7 +406,7 @@ export default function TranslationModal({
 									type="button"
 									onClick={addFallback}
 									disabled={!fallbackPick}
-									className="px-3 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm font-medium disabled:opacity-50"
+									className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body font-medium disabled:opacity-50"
 								>
 									{t("common.add")}
 								</button>
@@ -419,16 +419,16 @@ export default function TranslationModal({
 										return (
 											<li
 												key={id}
-												className="flex items-center justify-between text-sm px-2 py-1 bg-gray-50 dark:bg-gray-800/60 rounded"
+												className="flex items-center justify-between text-body px-2 py-1 bg-surface-muted rounded"
 											>
 												<span>
-													<span className="text-gray-400 mr-2">{i + 1}.</span>
+													<span className="text-text-muted mr-2">{i + 1}.</span>
 													{name}
 												</span>
 												<button
 													type="button"
 													onClick={() => removeFallback(id)}
-													className="text-red-500 hover:text-red-700 text-xs font-medium"
+													className="text-danger hover:underline text-caption font-medium"
 												>
 													{t("common.remove")}
 												</button>
@@ -440,11 +440,11 @@ export default function TranslationModal({
 						</div>
 						<div className="grid grid-cols-2 gap-3">
 							<div>
-								<label className="text-sm font-medium">{t("translate.source")}</label>
+								<label className="text-body font-medium">{t("translate.source")}</label>
 								<select
 									value={sourceLang}
 									onChange={(e) => setSourceLang(e.target.value)}
-									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								>
 									<option value="auto">{t("translate.autoDetect")}</option>
 									{LANGUAGES.map((l) => (
@@ -455,11 +455,11 @@ export default function TranslationModal({
 								</select>
 							</div>
 							<div>
-								<label className="text-sm font-medium">{t("translate.target")}</label>
+								<label className="text-body font-medium">{t("translate.target")}</label>
 								<select
 									value={targetLang}
 									onChange={(e) => setTargetLang(e.target.value)}
-									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								>
 									{LANGUAGES.map((l) => (
 										<option key={l.code} value={l.code}>
@@ -470,17 +470,17 @@ export default function TranslationModal({
 							</div>
 						</div>
 						<div>
-							<label className="text-sm font-medium">{t("translate.gameContext")}</label>
+							<label className="text-body font-medium">{t("translate.gameContext")}</label>
 							<textarea
 								value={gameContext}
 								onChange={(e) => setGameContext(e.target.value)}
 								rows={2}
 								placeholder={t("translate.gameContextPlaceholder")}
-								className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+								className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 							/>
 						</div>
 						<div className="flex items-center gap-4">
-							<label className="flex items-center gap-2 text-sm">
+							<label className="flex items-center gap-2 text-body">
 								<input
 									type="checkbox"
 									checked={useGlossary}
@@ -491,11 +491,11 @@ export default function TranslationModal({
 							<button
 								type="button"
 								onClick={() => openSettings("manage-glossary")}
-								className="text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+								className="text-caption font-medium text-accent-fg hover:underline"
 							>
 								{t("translate.manageGlossary")}
 							</button>
-							<label className="flex items-center gap-2 text-sm">
+							<label className="flex items-center gap-2 text-body">
 								<input
 									type="checkbox"
 									checked={useMemory}
@@ -505,26 +505,26 @@ export default function TranslationModal({
 							</label>
 						</div>
                         {(providerId === "grok" || providerId === "grok-sub") && (
-                            <button type="button" className="text-sm text-emerald-700 dark:text-emerald-400 underline"
+                            <button type="button" className="text-body text-accent-fg underline"
                                 onClick={() => { setBatchSize(10); setMaxConcurrent(10); }}>
                                 {t("translate.grokThroughputPreset")}
                             </button>
                         )}
 						<div className="grid grid-cols-3 gap-3">
 							<div>
-								<label className="text-sm font-medium">{t("translate.batchSize")}</label>
+								<label className="text-body font-medium">{t("translate.batchSize")}</label>
 								<input
 									type="number"
 									value={batchSize}
 									onChange={(e) => setBatchSize(+e.target.value)}
 									min={1}
 									max={100}
-									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								/>
 							</div>
 							<div>
 								<label
-									className="text-sm font-medium"
+									className="text-body font-medium"
 									title={t("translate.parallelTitle")}
 								>
 									{t("translate.parallelRequests")}
@@ -532,7 +532,7 @@ export default function TranslationModal({
 								<select
 									value={maxConcurrent}
 									onChange={(e) => setMaxConcurrent(+e.target.value)}
-									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								>
 									{Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
 										<option key={n} value={n}>
@@ -542,26 +542,26 @@ export default function TranslationModal({
 								</select>
 							</div>
 							<div>
-								<label className="text-sm font-medium">{t("translate.costLimit")}</label>
+								<label className="text-body font-medium">{t("translate.costLimit")}</label>
 								<input
 									value={costLimit}
 									onChange={(e) => setCostLimit(e.target.value)}
 									placeholder={t("translate.noLimit")}
-									className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								/>
 							</div>
 						</div>
-						<p className="text-sm text-gray-500">
+						<p className="text-body text-text-muted">
 							{t("translate.pending", { count: totalPending })}
 						</p>
 						{startError && (
-							<div className="p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 rounded text-sm text-red-600">
+							<div className="p-2 bg-danger-muted border border-danger rounded text-body text-danger">
 								{startError}
 							</div>
 						)}
 						<button
 							onClick={handleStart}
-							className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium transition-colors"
+							className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium transition-colors"
 						>
 							{t("translate.start")}
 						</button>
@@ -570,13 +570,13 @@ export default function TranslationModal({
 
 				{step === "progress" && (
 					<div className="space-y-4">
-						<div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-3">
+						<div className="w-full bg-border rounded-full h-3">
 							<div
-								className="bg-emerald-500 h-3 rounded-full transition-all"
+								className="bg-accent h-3 rounded-full transition-all"
 								style={{ width: `${progressPercent}%` }}
 							/>
 						</div>
-						<div className="text-center text-sm">
+						<div className="text-center text-body">
 							{done
 								? t("translate.complete")
 								: cancelled
@@ -585,17 +585,17 @@ export default function TranslationModal({
 							{` · ${formatObservedCost(costSoFar, jobSnapshot?.costIsComplete, t)}`}
 						</div>
 						{activeProviderLabel && !done && !cancelled && !error && (
-							<div className="text-xs text-center text-emerald-700 dark:text-emerald-400">
+							<div className="text-caption text-center text-accent-fg">
 								{t("translate.usingProvider", { name: activeProviderLabel })}
 							</div>
 						)}
 						{lastTranslated && !done && !cancelled && !error && (
-							<div className="text-xs text-gray-500 truncate">
+							<div className="text-caption text-text-muted truncate">
 								{t("translate.last", { text: lastTranslated })}
 							</div>
 						)}
 						{error && (
-							<div className="p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 rounded text-sm text-red-600">
+							<div className="p-2 bg-danger-muted border border-danger rounded text-body text-danger">
 								{error}
 							</div>
 						)}
@@ -614,8 +614,8 @@ export default function TranslationModal({
 									onClick={handleClose}
 									className={`w-full py-2 rounded font-medium ${
 										done && onReview
-											? "bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
-											: "bg-emerald-600 hover:bg-emerald-700 text-white"
+											? "bg-surface-muted text-text hover:bg-surface"
+											: "bg-accent hover:bg-accent-hover text-white"
 									}`}
 								>
 									{t("common.close")}
@@ -623,7 +623,7 @@ export default function TranslationModal({
 								{done && onReview && (
 									<button
 										onClick={handleReview}
-										className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-medium"
+										className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
 									>
 										{t("translate.review")}
 									</button>

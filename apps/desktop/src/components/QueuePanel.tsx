@@ -61,11 +61,11 @@ const statusIcons: Record<string, typeof Clock> = {
 const statusRowStyles: Record<string, string> = {
 	pending: "border-l-transparent",
 	extracting: "bg-blue-50/70 dark:bg-blue-950/30 border-l-blue-500",
-	translating: "bg-emerald-50/70 dark:bg-emerald-950/30 border-l-emerald-500",
-	validating: "bg-amber-50/70 dark:bg-amber-950/30 border-l-amber-500",
-	done: "bg-gray-50 dark:bg-gray-800/50 border-l-emerald-500/60",
-	error: "bg-red-50 dark:bg-red-950/30 border-l-red-500",
-	cancelled: "opacity-60 border-l-gray-400",
+	translating: "bg-accent-muted border-l-accent-fg",
+	validating: "bg-warning-muted border-l-warning",
+	done: "bg-surface-muted border-l-success/60",
+	error: "bg-danger-muted border-l-danger",
+	cancelled: "opacity-60 border-l-text-muted",
 };
 
 const STATUS_LABEL_KEYS: Record<QueueItemStatus, MessageKey> = {
@@ -79,19 +79,19 @@ const STATUS_LABEL_KEYS: Record<QueueItemStatus, MessageKey> = {
 };
 
 const statusIconColors: Record<string, string> = {
-	pending: "text-gray-400 dark:text-gray-500",
+	pending: "text-text-muted",
 	extracting: "text-blue-500 dark:text-blue-400 animate-spin",
-	translating: "text-emerald-500 dark:text-emerald-400 animate-spin",
-	validating: "text-amber-500 dark:text-amber-400 animate-spin",
-	done: "text-emerald-600 dark:text-emerald-400",
-	error: "text-red-500 dark:text-red-400",
-	cancelled: "text-gray-500 dark:text-gray-500",
+	translating: "text-accent-fg animate-spin",
+	validating: "text-warning animate-spin",
+	done: "text-success",
+	error: "text-danger",
+	cancelled: "text-text-muted",
 };
 
 const settingsInputClass =
-	"mt-1 w-full p-1.5 border rounded text-sm dark:bg-gray-900 dark:border-gray-600 dark:text-gray-100";
+	"mt-1 w-full p-1.5 border border-border rounded text-body bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg";
 const settingsLabelClass =
-	"text-xs font-medium text-gray-500 dark:text-gray-400";
+	"text-caption font-medium text-text-muted";
 
 export default function QueuePanel() {
 	const t = useT();
@@ -314,8 +314,8 @@ export default function QueuePanel() {
 				className={modalPanelClass("max-w-2xl max-h-[80vh] flex flex-col")}
 			>
 				{/* Header */}
-				<div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
-					<h2 {...titleProps} className="font-bold text-lg">
+				<div className="flex items-center justify-between p-4 border-b border-border">
+					<h2 {...titleProps} className="font-bold text-section">
 						{t("queue.title")}
 					</h2>
 					<div className="flex items-center gap-2">
@@ -323,7 +323,7 @@ export default function QueuePanel() {
 							<button
 								type="button"
 								onClick={clearCompleted}
-								className="text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded px-1"
+								className="text-caption text-text-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent-fg rounded px-1"
 							>
 								{t("queue.clearCompleted", { count: doneCount })}
 							</button>
@@ -332,7 +332,7 @@ export default function QueuePanel() {
 							type="button"
 							onClick={() => setPanelOpen(false)}
 							aria-label={t("queue.closeAria")}
-							className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded p-0.5"
+							className="text-text-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent-fg rounded p-0.5"
 						>
 							<X size={20} />
 						</button>
@@ -347,7 +347,7 @@ export default function QueuePanel() {
 							description={t("queue.empty.description")}
 						/>
 					) : (
-						<div className="divide-y divide-gray-100 dark:divide-gray-800 border-b border-gray-100 dark:border-gray-800">
+						<div className="divide-y divide-border border-b border-border">
 							{items.map((item, idx) => (
 								<QueueItemRow
 									key={item.id}
@@ -368,14 +368,14 @@ export default function QueuePanel() {
 						<div className="flex gap-2 p-4">
 							<button
 								onClick={handleAddFile}
-								className="flex items-center gap-2 px-3 py-2 text-sm border border-dashed border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+								className="flex items-center gap-2 px-3 py-2 text-body border border-dashed border-border rounded-lg hover:bg-surface-muted transition-colors"
 							>
 								<File size={14} />
 								{t("queue.addFile")}
 							</button>
 							<button
 								onClick={handleAddFolder}
-								className="flex items-center gap-2 px-3 py-2 text-sm border border-dashed border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+								className="flex items-center gap-2 px-3 py-2 text-body border border-dashed border-border rounded-lg hover:bg-surface-muted transition-colors"
 							>
 								<FolderOpen size={14} />
 								{t("queue.addFolder")}
@@ -385,8 +385,8 @@ export default function QueuePanel() {
 
 					{/* Translation settings */}
 					{!isRunning && items.length > 0 && (
-						<div className="p-4 border-t border-gray-200 dark:border-gray-700 space-y-3 bg-gray-50/50 dark:bg-gray-800/30">
-							<h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">
+						<div className="p-4 border-t border-border space-y-3 bg-surface-muted">
+							<h3 className="text-caption font-semibold text-text-muted uppercase">
 								{t("queue.settings")}
 							</h3>
 							<div className="grid grid-cols-3 gap-3">
@@ -467,7 +467,7 @@ export default function QueuePanel() {
 							</div>
 							<div>
 								<label className={settingsLabelClass}>{t("queue.fallbacks")}</label>
-								<p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">
+								<p className="text-caption text-text-muted mt-0.5">
 									{t("queue.fallbacksHint")}
 								</p>
 								<div className="mt-1 flex gap-2">
@@ -492,7 +492,7 @@ export default function QueuePanel() {
 										type="button"
 										onClick={addFallback}
 										disabled={!fallbackPick}
-										className="px-2 py-1.5 text-xs border rounded disabled:opacity-50 dark:border-gray-600"
+										className="px-2 py-1.5 text-caption border border-border bg-surface text-text hover:bg-surface-muted rounded disabled:opacity-50"
 									>
 										{t("queue.addFallback")}
 									</button>
@@ -502,7 +502,7 @@ export default function QueuePanel() {
 										{fallbackIds.map((id) => (
 											<li
 												key={id}
-												className="text-[11px] px-1.5 py-0.5 rounded bg-gray-200 dark:bg-gray-700 flex items-center gap-1"
+												className="text-caption px-1.5 py-0.5 rounded bg-surface text-text flex items-center gap-1"
 											>
 												{id}
 												<button
@@ -525,12 +525,12 @@ export default function QueuePanel() {
 				</div>
 
 				{/* Footer */}
-				<div className="p-4 border-t border-gray-200 dark:border-gray-700">
+				<div className="p-4 border-t border-border">
 					{!providerReadiness.ready &&
 						providerReadiness.reason === "missing_key" &&
 						!isRunning &&
 						pendingCount > 0 && (
-							<div className="mb-3 p-2 rounded border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20 text-sm text-amber-800 dark:text-amber-200">
+							<div className="mb-3 p-2 rounded border border-warning bg-warning-muted text-body text-warning">
 								{t("queue.needsKey")}{" "}
 								<button
 									type="button"
@@ -538,14 +538,14 @@ export default function QueuePanel() {
 										setPanelOpen(false);
 										navigate(buildSettingsPath("providers"));
 									}}
-									className="font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+									className="font-medium text-accent-fg hover:underline"
 								>
 									{t("queue.openSettings")}
 								</button>
 							</div>
 						)}
 					<div className="flex items-center justify-between gap-4">
-						<div className="text-sm text-gray-600 dark:text-gray-300 tabular-nums">
+						<div className="text-body text-text-muted tabular-nums">
 							{isRunning ? (
 								<span>
 									{t(activeCount > 0 ? "queue.running" : "queue.starting", {
@@ -563,7 +563,7 @@ export default function QueuePanel() {
 							<button
 								type="button"
 								onClick={cancelQueue}
-								className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-red-400 focus:ring-offset-2 dark:focus:ring-offset-gray-900"
+								className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-body font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-danger focus:ring-offset-2 focus:ring-offset-surface"
 							>
 								<Square size={14} aria-hidden="true" />
 								{t("queue.cancel")}
@@ -573,7 +573,7 @@ export default function QueuePanel() {
 								type="button"
 								onClick={handleStart}
 								disabled={pendingCount === 0}
-								className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 dark:focus:ring-offset-gray-900"
+								className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-body font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-accent-fg focus:ring-offset-2 focus:ring-offset-surface"
 							>
 								<Play size={14} aria-hidden="true" />
 								{t("queue.start", { count: pendingCount })}
@@ -630,50 +630,50 @@ function QueueItemRow({
 			/>
 			<div className="flex-1 min-w-0">
 				<div className="flex items-center gap-2">
-					<div className="text-sm font-medium truncate text-gray-900 dark:text-gray-100">
+					<div className="text-body font-medium truncate text-text">
 						{item.projectName}
 					</div>
-					<span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+					<span className="shrink-0 text-caption font-semibold uppercase tracking-wide text-text-muted">
 						{t(STATUS_LABEL_KEYS[item.status])}
 					</span>
 				</div>
-				<div className="text-xs text-gray-500 dark:text-gray-400 truncate">
+				<div className="text-caption text-text-muted truncate">
 					{item.projectPath}
 				</div>
 				<div className="mt-1 h-4 flex items-center gap-2">
 					{item.status === "validating" ? (
-						<span className="text-[11px] text-amber-600 dark:text-amber-400">
+						<span className="text-caption text-warning">
 							{t("queue.validatingTranslations")}
 						</span>
 					) : showProgress && item.progress.total > 0 ? (
 						<>
-							<div className="flex-1 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+							<div className="flex-1 h-1.5 bg-border rounded-full overflow-hidden">
 								<div
 									className={clsx(
 										"h-full rounded-full transition-all duration-300",
 										item.status === "done"
-											? "bg-emerald-500"
-											: "bg-emerald-500",
+											? "bg-accent"
+											: "bg-accent",
 									)}
 									style={{
 										width: `${item.status === "done" ? 100 : percent}%`,
 									}}
 								/>
 							</div>
-							<span className="text-[11px] text-gray-500 dark:text-gray-400 tabular-nums w-24 text-right shrink-0">
+							<span className="text-caption text-text-muted tabular-nums w-24 text-right shrink-0">
 								{item.progress.completed}/{item.progress.total} ·{" "}
 								{item.status === "done" ? 100 : percent}%
 							</span>
 						</>
 					) : item.status === "extracting" ? (
-						<span className="text-[11px] text-blue-600 dark:text-blue-400">
+						<span className="text-caption text-blue-600 dark:text-blue-400">
 							{t("queue.extractingStrings")}
 						</span>
 					) : null}
 				</div>
 				{item.status === "done" && item.validationError && (
 					<div
-						className="text-xs text-amber-700 dark:text-amber-400 mt-0.5 truncate"
+						className="text-caption text-warning mt-0.5 truncate"
 						title={item.validationError}
 					>
 						{t("queue.validation.failed")}
@@ -685,8 +685,8 @@ function QueueItemRow({
 						<div
 							className={
 								item.validationIssues > 0
-									? "text-xs text-amber-700 dark:text-amber-400 mt-0.5"
-									: "text-xs text-gray-500 dark:text-gray-400 mt-0.5"
+									? "text-caption text-warning mt-0.5"
+									: "text-caption text-text-muted mt-0.5"
 							}
 						>
 							{item.validationIssues > 0
@@ -696,7 +696,7 @@ function QueueItemRow({
 					)}
 				{item.error && (
 					<div
-						className="text-xs text-red-600 dark:text-red-400 mt-0.5 truncate"
+						className="text-caption text-danger mt-0.5 truncate"
 						title={item.error}
 					>
 						{item.error}
@@ -710,7 +710,7 @@ function QueueItemRow({
 						onClick={onMoveUp}
 						disabled={index === 0}
 						aria-label={t("queue.moveUp")}
-						className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded"
+						className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
 					>
 						<ChevronUp size={14} />
 					</button>
@@ -719,7 +719,7 @@ function QueueItemRow({
 						onClick={onMoveDown}
 						disabled={index === total - 1}
 						aria-label={t("queue.moveDown")}
-						className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded"
+						className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
 					>
 						<ChevronDown size={14} />
 					</button>
@@ -727,7 +727,7 @@ function QueueItemRow({
 						type="button"
 						onClick={onRemove}
 						aria-label={t("queue.remove")}
-						className="p-1 text-gray-400 hover:text-red-500 dark:hover:text-red-400 focus:outline-none focus:ring-2 focus:ring-red-400 rounded"
+						className="p-1 text-text-muted hover:text-danger focus:outline-none focus:ring-2 focus:ring-danger rounded"
 					>
 						<Trash2 size={14} />
 					</button>
@@ -738,7 +738,7 @@ function QueueItemRow({
 					type="button"
 					onClick={onRemove}
 					aria-label={t("queue.dismiss")}
-					className="shrink-0 px-2 py-1 text-[11px] font-medium text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 border border-gray-200 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-emerald-500"
+					className="shrink-0 px-2 py-1 text-caption font-medium text-text-muted hover:text-text border border-border rounded focus:outline-none focus:ring-2 focus:ring-accent-fg"
 				>
 					{t("common.dismiss")}
 				</button>
