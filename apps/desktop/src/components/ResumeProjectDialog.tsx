@@ -34,14 +34,14 @@ export default function ResumeProjectDialog({ request, onChoose }: Props) {
       <div ref={dialogRef} {...dialogProps} aria-describedby={descriptionId}
         className={modalPanelClass("max-w-lg p-5 max-h-[90vh] overflow-y-auto")}
         onClick={(event) => event.stopPropagation()}>
-        <h2 {...titleProps} className="text-base font-bold mb-2">
+        <h2 {...titleProps} className="text-section font-bold mb-2">
           {t(verified ? "resume.title" : "resume.attentionTitle")}
         </h2>
-        <div id={descriptionId} className="text-sm text-gray-600 dark:text-gray-300 space-y-3 mb-4">
+        <div id={descriptionId} className="text-body text-text-muted space-y-3 mb-4">
           <p>{t(verified ? "resume.message" : "resume.attentionMessage")}</p>
-          <p className="break-all font-mono text-xs">{request.gamePath}</p>
+          <p className="break-all font-mono text-caption">{request.gamePath}</p>
           {request.preflight.kind === "needs_attention" && (
-            <p className="whitespace-pre-wrap break-words text-amber-700 dark:text-amber-300">
+            <p className="whitespace-pre-wrap break-words text-warning">
               {request.preflight.reason}
             </p>
           )}
@@ -49,16 +49,16 @@ export default function ResumeProjectDialog({ request, onChoose }: Props) {
         </div>
         <div className={`${MODAL_FOOTER_CLASS} -mx-5 -mb-5 flex-wrap`}>
           <button ref={cancelRef} type="button" onClick={cancel}
-            className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700">
+            className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted">
             {t("common.cancel")}
           </button>
           <button type="button" onClick={() => onChoose("refresh")}
-            className="px-3 py-2 text-sm rounded border border-amber-600 text-amber-700 dark:text-amber-300">
+            className="px-3 py-2 text-body rounded border border-warning bg-warning-muted text-warning hover:bg-warning-muted/80">
             {t("resume.refresh")}
           </button>
           {verified && (
             <button ref={resumeRef} type="button" onClick={() => onChoose("resume")}
-              className="px-4 py-2 text-sm font-medium rounded bg-emerald-600 hover:bg-emerald-700 text-white">
+              className="px-4 py-2 text-body font-medium rounded bg-accent hover:bg-accent-hover text-white">
               {t("resume.resume")}
             </button>
           )}

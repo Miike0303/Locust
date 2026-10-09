@@ -165,27 +165,27 @@ export default function ExportModal({
 				<div className="flex justify-between items-center mb-4">
 					<h2
 						{...titleProps}
-						className="text-lg font-bold flex items-center gap-2"
+						className="text-section font-bold flex items-center gap-2"
 					>
 						{mode === "export" ? <Download size={18} /> : <Upload size={18} />}
 						{mode === "export" ? t("export.exportTitle") : t("export.importTitle")}
 					</h2>
 					<button
 						onClick={onClose}
-						className="text-gray-400 hover:text-gray-600"
+						className="text-text-muted hover:text-text"
 					>
 						<X size={20} />
 					</button>
 				</div>
 
-				<div className="flex gap-1 mb-4 p-1 bg-gray-100 dark:bg-gray-800 rounded">
+				<div className="flex gap-1 mb-4 p-1 bg-surface-muted rounded">
 					<button
 						type="button"
 						onClick={() => setMode("export")}
-						className={`flex-1 py-1.5 text-sm rounded transition-colors ${
+						className={`flex-1 py-1.5 text-body rounded transition-colors ${
 							mode === "export"
-								? "bg-white dark:bg-gray-700 shadow font-medium"
-								: "text-gray-500 hover:text-gray-700"
+								? "bg-surface text-text shadow font-medium"
+								: "text-text-muted hover:text-text"
 						}`}
 					>
 						{t("export.export")}
@@ -193,10 +193,10 @@ export default function ExportModal({
 					<button
 						type="button"
 						onClick={() => setMode("import")}
-						className={`flex-1 py-1.5 text-sm rounded transition-colors ${
+						className={`flex-1 py-1.5 text-body rounded transition-colors ${
 							mode === "import"
-								? "bg-white dark:bg-gray-700 shadow font-medium"
-								: "text-gray-500 hover:text-gray-700"
+								? "bg-surface text-text shadow font-medium"
+								: "text-text-muted hover:text-text"
 						}`}
 					>
 						{t("export.import")}
@@ -205,11 +205,11 @@ export default function ExportModal({
 
 				<div className="space-y-4">
 					<div>
-						<label className="text-sm font-medium">{t("export.format")}</label>
+						<label className="text-body font-medium">{t("export.format")}</label>
 						<select
 							value={format}
 							onChange={(e) => setFormat(e.target.value as ExportFormat)}
-							className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+							className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 						>
 							<option value="po">Gettext PO (.po)</option>
 							<option value="xliff">XLIFF 1.2 (.xliff)</option>
@@ -218,11 +218,11 @@ export default function ExportModal({
 
 					{mode === "export" && (
 						<div>
-							<label className="text-sm font-medium">{t("export.targetLang")}</label>
+							<label className="text-body font-medium">{t("export.targetLang")}</label>
 							<select
 								value={lang}
 								onChange={(e) => setLang(e.target.value)}
-								className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm"
+								className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 							>
 								{LANGUAGES.map((l) => (
 									<option key={l.code} value={l.code}>
@@ -234,7 +234,7 @@ export default function ExportModal({
 					)}
 
 					{mode === "import" && (
-						<p className="text-xs text-gray-500">
+						<p className="text-caption text-text-muted">
 							{t("export.importHint")}
 						</p>
 					)}
@@ -257,7 +257,7 @@ export default function ExportModal({
 					<div className={clsx(MODAL_FOOTER_CLASS, "-mx-6 -mb-6")}>
 						<button
 							onClick={onClose}
-							className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
+							className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted"
 						>
 							{t("common.cancel")}
 						</button>
@@ -266,7 +266,7 @@ export default function ExportModal({
 								void (mode === "export" ? handleExport() : handleImport());
 							}}
 							disabled={loading}
-							className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white"
+							className="flex items-center gap-1.5 px-4 py-2 text-body font-medium rounded bg-accent hover:bg-accent-hover disabled:opacity-50 text-white"
 						>
 							{loading ? (
 								mode === "export" ? (

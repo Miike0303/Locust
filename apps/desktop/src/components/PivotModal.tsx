@@ -169,14 +169,14 @@ export default function PivotModal({
 				<div className="flex justify-between items-center mb-4">
 					<h2
 						{...titleProps}
-						className="text-lg font-bold flex items-center gap-2"
+						className="text-section font-bold flex items-center gap-2"
 					>
 						<GitBranch size={18} />
 						{t("pivot.title")}
 					</h2>
 					<button
 						onClick={onClose}
-						className="text-gray-400 hover:text-gray-600"
+						className="text-text-muted hover:text-text"
 					>
 						<X size={20} />
 					</button>
@@ -184,24 +184,24 @@ export default function PivotModal({
 
 				{result ? (
 					<div className="space-y-4">
-						<p className="text-sm text-gray-700 dark:text-gray-300">
+						<p className="text-body text-text">
 							{t("pivot.success", {
 								count: result.entries,
 								path: result.database_path,
 							})}
 						</p>
-						<p className="text-xs text-gray-500 break-all">
+						<p className="text-caption text-text-muted break-all">
 							{result.database_path}
 						</p>
 						{error && (
-							<p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+							<p className="text-body text-danger">{error}</p>
 						)}
 						<div className={clsx(MODAL_FOOTER_CLASS, "-mx-6 -mb-6")}>
 							<button
 								type="button"
 								onClick={stayHere}
 								disabled={opening}
-								className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
+								className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted"
 							>
 								{t("pivot.stay")}
 							</button>
@@ -211,7 +211,7 @@ export default function PivotModal({
 									void openCreated();
 								}}
 								disabled={opening}
-								className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50"
+								className="flex items-center gap-1.5 px-4 py-2 text-body font-medium rounded text-white bg-accent hover:bg-accent-hover disabled:opacity-50"
 							>
 								{opening ? (
 									<Loader2 size={16} className="animate-spin" />
@@ -224,25 +224,25 @@ export default function PivotModal({
 					</div>
 				) : (
 					<div className="space-y-4">
-						<p className="text-sm text-gray-700 dark:text-gray-300">
+						<p className="text-body text-text">
 							{t("pivot.explain")}
 						</p>
-						<p className="text-sm text-gray-600 dark:text-gray-400">
+						<p className="text-body text-text-muted">
 							{t("pivot.skipNote")}
 						</p>
 						{carryOverCount !== null && (
-							<p className="text-sm font-medium">
+							<p className="text-body font-medium">
 								{t("pivot.carry", { count: carryOverCount })}
 							</p>
 						)}
 						{error && (
-							<p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+							<p className="text-body text-danger">{error}</p>
 						)}
 						<div className={clsx(MODAL_FOOTER_CLASS, "-mx-6 -mb-6")}>
 							<button
 								type="button"
 								onClick={onClose}
-								className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
+								className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted"
 							>
 								{t("common.cancel")}
 							</button>
@@ -252,7 +252,7 @@ export default function PivotModal({
 									void pickAndCreate();
 								}}
 								disabled={loading || carryOverCount === 0}
-								className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50"
+								className="flex items-center gap-1.5 px-4 py-2 text-body font-medium rounded text-white bg-accent hover:bg-accent-hover disabled:opacity-50"
 							>
 								{loading ? (
 									<Loader2 size={16} className="animate-spin" />

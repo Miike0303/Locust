@@ -191,13 +191,13 @@ export default function SearchReplaceModal({
 				<div className="flex justify-between items-center mb-4">
 					<h2
 						{...titleProps}
-						className="text-lg font-bold flex items-center gap-2"
+						className="text-section font-bold flex items-center gap-2"
 					>
 						<Replace size={18} /> {t("replace.title")}
 					</h2>
 					<button
 						onClick={onClose}
-						className="text-gray-400 hover:text-gray-600"
+						className="text-text-muted hover:text-text"
 					>
 						<X size={20} />
 					</button>
@@ -205,33 +205,34 @@ export default function SearchReplaceModal({
 
 				<div className="space-y-3">
 					<div>
-						<label className="text-sm font-medium">{t("replace.find")}</label>
+						<label className="text-body font-medium">{t("replace.find")}</label>
 						<input
 							value={find}
 							onChange={(e) => {
 								setFind(e.target.value);
 								setPreview(null);
 							}}
-							className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm font-mono"
+							className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg font-mono"
 							placeholder={t("replace.findPlaceholder")}
 							autoFocus
 						/>
 					</div>
 					<div>
-						<label className="text-sm font-medium">{t("replace.replaceWith")}</label>
+						<label className="text-body font-medium">{t("replace.replaceWith")}</label>
 						<input
 							value={replace}
 							onChange={(e) => {
 								setReplace(e.target.value);
 								setPreview(null);
 							}}
-							className="mt-1 w-full p-2 border rounded dark:bg-gray-800 dark:border-gray-600 text-sm font-mono"
+							className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg font-mono"
 							placeholder={t("replace.replacePlaceholder")}
 						/>
 					</div>
 
-					<label className="flex items-center gap-2 text-sm cursor-pointer">
+					<label className="flex items-center gap-2 text-body cursor-pointer">
 						<input
+							className="border border-border bg-surface text-text accent-accent focus:outline-none focus:ring-2 focus:ring-accent-fg"
 							type="checkbox"
 							checked={caseSensitive}
 							onChange={(e) => {
@@ -242,13 +243,13 @@ export default function SearchReplaceModal({
 						{t("replace.caseSensitive")}
 					</label>
 
-					<p className="text-xs text-gray-500 flex items-start gap-1">
+					<p className="text-caption text-text-muted flex items-start gap-1">
 						<AlertCircle size={12} className="mt-0.5 shrink-0" />
 						{t("replace.hint")}
 					</p>
 
 					{preview && (
-						<div className="text-sm border rounded p-3 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
+						<div className="text-body border border-border rounded p-3 bg-surface-muted">
 							<p>
 								{t("replace.preview", {
 									entries: preview.entries,
@@ -256,17 +257,17 @@ export default function SearchReplaceModal({
 								})}
 							</p>
 							{preview.samples.length > 0 && (
-								<ul className="mt-2 space-y-2 text-xs font-mono max-h-32 overflow-y-auto">
+								<ul className="mt-2 space-y-2 text-caption font-mono max-h-32 overflow-y-auto">
 									{preview.samples.map((s) => (
 										<li
 											key={s.id}
-											className="border-t dark:border-gray-700 pt-1"
+											className="border-t border-border pt-1"
 										>
-											<div className="text-gray-500 truncate">{s.id}</div>
-											<div className="text-red-600/80 truncate">
+											<div className="text-text-muted truncate">{s.id}</div>
+											<div className="text-danger truncate">
 												− {s.before}
 											</div>
-											<div className="text-emerald-600/80 truncate">
+											<div className="text-success truncate">
 												+ {s.after}
 											</div>
 										</li>
@@ -279,7 +280,7 @@ export default function SearchReplaceModal({
 					<div className={clsx(MODAL_FOOTER_CLASS, "-mx-6 -mb-6")}>
 						<button
 							onClick={onClose}
-							className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700"
+							className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted"
 						>
 							{t("common.cancel")}
 						</button>
@@ -288,7 +289,7 @@ export default function SearchReplaceModal({
 								void runPreview();
 							}}
 							disabled={loading || !find}
-							className="px-3 py-2 text-sm rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50"
+							className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted disabled:opacity-50"
 						>
 							{loading ? "…" : t("replace.previewBtn")}
 						</button>
@@ -297,7 +298,7 @@ export default function SearchReplaceModal({
 								void runReplace();
 							}}
 							disabled={loading || !find}
-							className="px-4 py-2 text-sm font-medium rounded bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white"
+							className="px-4 py-2 text-body font-medium rounded border border-danger bg-danger-muted hover:bg-danger-muted/80 disabled:opacity-50 text-danger"
 						>
 							{loading ? t("replace.replacing") : t("replace.replaceAll")}
 						</button>
