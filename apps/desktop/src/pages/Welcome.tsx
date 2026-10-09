@@ -56,7 +56,6 @@ import { useEditorStore } from "../stores/editorStore";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
-	modalPanelClass,
 } from "../lib/modalA11y";
 import {
 	hasAnyReadyProvider,
@@ -99,17 +98,14 @@ const FORMAT_COLORS: Record<string, string> = {
 		"bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300",
 	"wolf-rpg":
 		"bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300",
-	sugarcube:
-		"bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300",
+	sugarcube: "bg-accent-muted text-accent-fg",
 	"html-game":
 		"bg-cyan-100 text-cyan-700 dark:bg-cyan-900/40 dark:text-cyan-300",
-	unreal: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
-	kirikiri:
-		"bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
+	unreal: "bg-danger-muted text-danger",
+	kirikiri: "bg-warning-muted text-warning",
 	yuris:
 		"bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300",
-	nscripter:
-		"bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
+	nscripter: "bg-surface-muted text-text-muted",
 	tyrano: "bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300",
 	qsp: "bg-teal-100 text-teal-700 dark:bg-teal-900/40 dark:text-teal-300",
 	vntextpatch:
@@ -393,12 +389,12 @@ export default function Welcome() {
 	};
 
 	return (
-		<div className="flex flex-col min-h-full p-8 max-w-4xl mx-auto">
+		<div className="flex flex-col min-h-full p-8 max-w-4xl mx-auto text-text text-body">
 			{/* Hero */}
 			<div className="text-center mb-8">
-				<Globe size={48} className="mx-auto mb-3 text-emerald-500" />
-				<h1 className="text-3xl font-bold mb-1">{t("nav.appName")}</h1>
-				<p className="text-gray-500 dark:text-gray-400">
+				<Globe size={48} className="mx-auto mb-3 text-accent-fg" />
+				<h1 className="text-page font-bold mb-1">{t("nav.appName")}</h1>
+				<p className="text-section text-text-muted">
 					{t("welcome.tagline")}
 				</p>
 			</div>
@@ -406,14 +402,14 @@ export default function Welcome() {
 			{showWelcomeGuide && (
 				<section
 					aria-label={t("welcome.guide.aria")}
-					className="mb-8 rounded-lg border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 p-4"
+					className="mb-8 rounded-lg border border-border bg-surface p-4"
 				>
 					<div className="flex items-start justify-between gap-3 mb-3">
 						<div>
-							<h2 className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">
+							<h2 className="text-body font-semibold text-accent-fg">
 								{t("welcome.guide.title")}
 							</h2>
-							<p className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">
+							<p className="text-caption text-text-muted mt-0.5">
 								{t("welcome.guide.subtitle")}
 							</p>
 						</div>
@@ -421,7 +417,7 @@ export default function Welcome() {
 							type="button"
 							onClick={dismissWelcomeGuide}
 							aria-label={t("welcome.guide.dismiss")}
-							className="shrink-0 text-emerald-700 hover:text-emerald-900 dark:text-emerald-300 dark:hover:text-emerald-100 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded p-0.5"
+							className="shrink-0 text-accent-fg hover:text-text focus:outline-none focus:ring-2 focus:ring-accent-fg rounded p-0.5"
 						>
 							<X size={16} />
 						</button>
@@ -437,21 +433,21 @@ export default function Welcome() {
 							return (
 								<li
 									key={step.id}
-									className="flex items-start gap-2 rounded-md border border-emerald-100 bg-white/70 p-3 dark:border-emerald-900/50 dark:bg-gray-900/40"
+									className="flex items-start gap-2 rounded-md border border-border bg-surface p-3"
 								>
-									<span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-xs font-bold text-white">
+									<span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-accent text-caption font-bold text-white">
 										{index + 1}
 									</span>
 									<div className="min-w-0">
-										<div className="flex items-center gap-1.5 text-sm font-medium text-gray-800 dark:text-gray-200">
+										<div className="flex items-center gap-1.5 text-body font-medium text-text">
 											<StepIcon
 												size={14}
-												className="text-emerald-600 dark:text-emerald-400"
+												className="text-accent-fg"
 												aria-hidden="true"
 											/>
 											{t(step.labelKey)}
 										</div>
-										<p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+										<p className="text-caption text-text-muted mt-0.5">
 											{t(step.descriptionKey)}
 										</p>
 									</div>
@@ -468,7 +464,7 @@ export default function Welcome() {
 					<button
 						onClick={handleOpenFolder}
 						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors"
+						className="flex items-center gap-2 px-6 py-3 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-body font-medium transition-colors"
 					>
 						{opening ? (
 							<Loader size={18} className="animate-spin" />
@@ -480,7 +476,7 @@ export default function Welcome() {
 					<button
 						onClick={handleOpenFile}
 						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
+						className="flex items-center gap-2 px-6 py-3 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors"
 					>
 						{opening ? (
 							<Loader size={18} className="animate-spin" />
@@ -493,7 +489,7 @@ export default function Welcome() {
 						type="button"
 						onClick={handleOpenProjectDb}
 						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
+						className="flex items-center gap-2 px-6 py-3 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors"
 					>
 						{opening ? (
 							<Loader size={18} className="animate-spin" />
@@ -506,13 +502,13 @@ export default function Welcome() {
 						type="button"
 						onClick={() => setShowPatchModal(true)}
 						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors"
+						className="flex items-center gap-2 px-6 py-3 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors"
 					>
 						<Package size={18} />
 						{t("welcome.applyPatch")}
 					</button>
 					<button type="button" onClick={() => setRecoveryPath(project?.path ?? "")} disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50 rounded-lg text-sm font-medium">
+						className="flex items-center gap-2 px-6 py-3 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 rounded-lg text-body font-medium">
 						<RotateCcw size={18} />{t("recovery.action")}
 					</button>
 				</div>
@@ -520,28 +516,28 @@ export default function Welcome() {
 					<button
 						onClick={handleChooseFormatManually}
 						disabled={opening}
-						className="flex items-center gap-1 text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-50"
+						className="flex items-center gap-1 text-caption text-text-muted hover:text-text disabled:opacity-50"
 					>
 						<Settings2 size={12} />
 						{t("welcome.chooseFormat")}
 					</button>
 				</div>
 				{opening && (
-					<p className="text-center text-xs text-gray-400 mt-2">
+					<p className="text-center text-caption text-text-muted mt-2">
 						{t("welcome.extracting")}
 					</p>
 				)}
 			</div>
 
 			{showProviderHint && (
-				<div className="mb-8 p-4 rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20">
+				<div className="mb-8 p-4 rounded-lg border border-border bg-warning-muted">
 					<div className="flex items-start justify-between gap-3">
-						<p className="text-sm text-amber-900 dark:text-amber-100">
+						<p className="text-body text-warning">
 							{t("welcome.providerHint")}{" "}
 							<button
 								type="button"
 								onClick={() => navigate(buildSettingsPath("providers"))}
-								className="font-medium text-emerald-700 dark:text-emerald-400 hover:underline"
+								className="font-medium text-accent-fg hover:underline"
 							>
 								{t("welcome.providerHintLink")}
 							</button>
@@ -551,7 +547,7 @@ export default function Welcome() {
 							type="button"
 							onClick={dismissProviderHint}
 							aria-label={t("welcome.providerHintDismiss")}
-							className="shrink-0 text-amber-700 dark:text-amber-300 hover:text-amber-900 dark:hover:text-amber-100"
+							className="shrink-0 text-warning hover:text-text"
 						>
 							<X size={16} />
 						</button>
@@ -565,10 +561,10 @@ export default function Welcome() {
 					<div
 						ref={dialogRef}
 						{...dialogProps}
-						className={modalPanelClass("max-w-md p-6")}
+						className="bg-surface text-text border border-border rounded-lg shadow-xl w-full max-w-md p-6"
 					>
 						<div className="flex justify-between items-center mb-4">
-							<h2 {...titleProps} className="text-lg font-bold">
+							<h2 {...titleProps} className="text-section font-bold">
 								{t("welcome.format.title")}
 							</h2>
 							<button
@@ -576,7 +572,7 @@ export default function Welcome() {
 									setPicker(null);
 									setOpenDbDraft(null);
 								}}
-								className="text-gray-400 hover:text-gray-600"
+								className="text-text-muted hover:text-text"
 							>
 								<X size={20} />
 							</button>
@@ -584,29 +580,29 @@ export default function Welcome() {
 
 						{openDbDraft ? (
 							<>
-								<p className="text-sm text-gray-500 mb-1 truncate" title={openDbDraft.databasePath}>
+								<p className="text-body text-text-muted mb-1 truncate" title={openDbDraft.databasePath}>
 									{openDbDraft.databasePath}
 								</p>
-								<p className="text-xs text-gray-400 mb-1 truncate" title={openDbDraft.gamePath}>
+								<p className="text-caption text-text-muted mb-1 truncate" title={openDbDraft.gamePath}>
 									{t("welcome.recentGame", { path: openDbDraft.gamePath })}
 								</p>
-								<p className="text-xs text-gray-400 mb-4">
+								<p className="text-caption text-text-muted mb-4">
 									{t("welcome.format.openDbHint")}
 								</p>
 							</>
 						) : (
 							<>
 								{picker?.path && (
-									<p className="text-sm text-gray-500 mb-1 truncate">
+									<p className="text-body text-text-muted mb-1 truncate">
 										{picker.path}
 									</p>
 								)}
 								{picker?.reason === "detect-failed" ? (
-									<p className="text-xs text-amber-600 dark:text-amber-400 mb-4">
+									<p className="text-caption text-warning mb-4">
 										{t("welcome.format.detectFailed")}
 									</p>
 								) : (
-									<p className="text-xs text-gray-400 mb-4">
+									<p className="text-caption text-text-muted mb-4">
 										{t("welcome.format.manualHint")}
 									</p>
 								)}
@@ -619,16 +615,16 @@ export default function Welcome() {
 									onClick={() => setSelectedFormat("auto")}
 									className={`w-full text-left p-3 rounded-lg border transition-colors flex items-center gap-3 ${
 										selectedFormat === "auto"
-											? "border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20"
-											: "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
+											? "border-accent-fg bg-accent-muted"
+											: "border-border bg-surface hover:bg-surface-muted"
 									}`}
 								>
-									<div className="p-1.5 rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
+									<div className="p-1.5 rounded bg-accent-muted text-accent-fg">
 										<Wand2 size={16} />
 									</div>
 									<div>
-										<div className="text-sm font-medium">{t("welcome.format.auto")}</div>
-										<div className="text-xs text-gray-500">
+										<div className="text-body font-medium">{t("welcome.format.auto")}</div>
+										<div className="text-caption text-text-muted">
 											{t("welcome.format.autoHint")}
 										</div>
 									</div>
@@ -641,7 +637,7 @@ export default function Welcome() {
 									const Icon = FORMAT_ICONS[f.id] ?? Globe;
 									const colorClass =
 										FORMAT_COLORS[f.id] ??
-										"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+										"bg-surface-muted text-text-muted";
 									const experimental = f.stability === "experimental";
 									return (
 										<button
@@ -649,23 +645,23 @@ export default function Welcome() {
 											onClick={() => setSelectedFormat(f.id)}
 											className={`w-full text-left p-3 rounded-lg border transition-colors flex items-center gap-3 ${
 												selectedFormat === f.id
-													? "border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20"
-													: "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
+													? "border-accent-fg bg-accent-muted"
+													: "border-border bg-surface hover:bg-surface-muted"
 											}`}
 										>
 											<div className={`p-1.5 rounded ${colorClass}`}>
 												<Icon size={16} />
 											</div>
 											<div className="min-w-0 flex-1">
-												<div className="text-sm font-medium flex items-center gap-2">
+												<div className="text-body font-medium flex items-center gap-2">
 													<span className="truncate">{f.name}</span>
 													{experimental && (
-														<span className="shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+														<span className="shrink-0 text-caption uppercase tracking-wide px-1.5 py-0.5 rounded bg-warning-muted text-warning">
 															{t("welcome.format.experimental")}
 														</span>
 													)}
 												</div>
-												<div className="text-xs text-gray-500">
+												<div className="text-caption text-text-muted">
 													{f.extensions.join(", ")}
 												</div>
 											</div>
@@ -686,7 +682,7 @@ export default function Welcome() {
 										selectedFormat,
 									))
 							}
-							className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg font-medium transition-colors"
+							className="w-full py-2.5 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded-lg text-section font-medium transition-colors"
 						>
 							{opening
 								? t("welcome.openingDots")
@@ -703,7 +699,7 @@ export default function Welcome() {
 			{/* Recent Projects */}
 			{recentProjects.length > 0 && (
 				<div className="mb-10">
-					<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
+					<h2 className="text-body font-semibold text-text-muted uppercase mb-3">
 						{t("welcome.recent")}
 					</h2>
 					<div className="space-y-2">
@@ -711,12 +707,12 @@ export default function Welcome() {
 							const Icon = FORMAT_ICONS[p.format_id] ?? Globe;
 							const colorClass =
 								FORMAT_COLORS[p.format_id] ??
-								"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+								"bg-surface-muted text-text-muted";
 							const isDbRecent = shouldOpenProjectDb(p.database_path);
 							return (
 								<div
 									key={i}
-									className="w-full p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-emerald-300 hover:bg-gray-50 dark:hover:border-emerald-700 dark:hover:bg-gray-800 transition-colors flex items-center gap-3"
+									className="w-full p-3 rounded-lg border border-border bg-surface hover:border-accent-fg hover:bg-surface-muted transition-colors flex items-center gap-3"
 								>
 									<button
 										onClick={() => openRecent(p)}
@@ -727,27 +723,27 @@ export default function Welcome() {
 											<Icon size={18} />
 										</div>
 										<div className="flex-1 min-w-0">
-											<div className="font-medium truncate flex items-center gap-2">
+											<div className="text-section font-medium truncate flex items-center gap-2">
 												<span className="truncate">{p.name}</span>
 												{isDbRecent && (
-													<span className="shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-200">
+													<span className="shrink-0 text-caption uppercase tracking-wide px-1.5 py-0.5 rounded bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-200">
 														{t("welcome.recentDbBadge")}
 													</span>
 												)}
 											</div>
-											<div className="text-xs text-gray-500 truncate">
+											<div className="text-caption text-text-muted truncate">
 												{isDbRecent ? p.database_path : p.path}
 											</div>
 											{isDbRecent && (
-												<div className="text-[11px] text-gray-400 truncate">
+												<div className="text-caption text-text-muted truncate">
 													{t("welcome.recentGame", { path: p.path })}
 												</div>
 											)}
 										</div>
 									</button>
-									<div className="flex items-center gap-2 text-xs text-gray-400 shrink-0">
+									<div className="flex items-center gap-2 text-caption text-text-muted shrink-0">
 										<span
-											className={`px-2 py-0.5 rounded-full text-xs ${colorClass}`}
+											className={`px-2 py-0.5 rounded-full text-caption ${colorClass}`}
 										>
 											{p.format_id}
 										</span>
@@ -762,7 +758,7 @@ export default function Welcome() {
 												e.stopPropagation();
 												handleAddToQueue(p.path);
 											}}
-											className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-400 hover:text-emerald-500"
+											className="p-1 rounded hover:bg-accent-muted text-text-muted hover:text-accent-fg"
 											title={t("welcome.addToQueue")}
 										>
 											<Plus size={14} />
@@ -777,7 +773,7 @@ export default function Welcome() {
 
 			{formats && formats.length > 0 && (
 				<div>
-					<h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">
+					<h2 className="text-body font-semibold text-text-muted uppercase mb-3">
 						{t("welcome.availableFormats")}
 					</h2>
 					<div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))] gap-3">
@@ -787,30 +783,30 @@ export default function Welcome() {
 								const Icon = FORMAT_ICONS[f.id] ?? Globe;
 								const colorClass =
 									FORMAT_COLORS[f.id] ??
-									"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300";
+									"bg-surface-muted text-text-muted";
 								const experimental = f.stability === "experimental";
 								return (
 									<div
 										key={f.id}
-										className="p-3 rounded-lg border border-gray-200 dark:border-gray-700"
+										className="p-3 rounded-lg border border-border bg-surface"
 									>
 										<div className="flex items-start gap-2 mb-2">
 											<div className={`p-1.5 rounded shrink-0 ${colorClass}`}>
 												<Icon size={14} />
 											</div>
 											<div className="min-w-0 flex-1">
-											<span className="block text-sm font-medium break-words">
+											<span className="block text-body font-medium break-words">
 												{f.name}
 											</span>
 											{experimental && (
-												<span className="inline-block mt-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+												<span className="inline-block mt-1 text-caption uppercase tracking-wide px-1.5 py-0.5 rounded bg-warning-muted text-warning">
 													{t("welcome.format.experimental")}
 												</span>
 											)}
 											</div>
 										</div>
 										{(formatDescriptionKey(f.id) || f.description) && (
-											<p className="text-xs text-gray-500 line-clamp-2">
+											<p className="text-caption text-text-muted line-clamp-2">
 												{formatDescriptionText(f.id, f.description)}
 											</p>
 										)}
@@ -818,7 +814,7 @@ export default function Welcome() {
 											{f.extensions.slice(0, 3).map((ext) => (
 												<span
 													key={ext}
-													className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-gray-500"
+													className="px-1.5 py-0.5 bg-surface-muted rounded text-caption text-text-muted"
 												>
 													{ext}
 												</span>
@@ -832,7 +828,7 @@ export default function Welcome() {
 			)}
 
 			{/* Footer stats */}
-			<div className="mt-auto pt-8 flex justify-center gap-6 text-xs text-gray-400">
+			<div className="mt-auto pt-8 flex justify-center gap-6 text-caption text-text-muted">
 				<span>
 					{t("welcome.formatsAvailable", {
 						count: formats?.filter((f) => f.stability !== "comingsoon").length ?? 0,
