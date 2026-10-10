@@ -4,14 +4,14 @@
 
 Leer primero [docs/IMPROVEMENT-GOAL.md](docs/IMPROVEMENT-GOAL.md), especialmente la ultima entrada **Done** y el backlog; el mapa tecnico esta en [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Los HANDOFF y checkpoints fechados de abajo son historia, no la cola actual ni el estado de publicacion. Sus preferencias y restricciones explicitas del usuario siguen vigentes salvo autorizacion posterior.
 
-Checkpoint observado por el padre (2026-10-09): `main` remoto y local con el codigo del candidato probado `4796c35` (el commit siguiente es solo documental). [GitHub Actions run 38011595735](https://github.com/Miike0303/Locust/actions/runs/38011595735):
+Checkpoint observado por el padre (2026-10-09): `main` remoto y local con el codigo del candidato probado `fcc07c9` (el commit siguiente es solo documental). [GitHub Actions run 38019068285](https://github.com/Miike0303/Locust/actions/runs/38019068285):
 
 | Plataforma | Rust (pasan / fallan / ignorados) | Frontend (pasan / fallan / ignorados) |
 |---|---|---|
-| Ubuntu | 2058 / 0 / 19 | 313 / 0 / 0 |
-| Windows | 2068 / 0 / 19 | 313 / 0 / 0 |
+| Ubuntu | 2064 / 0 / 19 | 406 / 0 / 0 |
+| Windows | 2074 / 0 / 19 | 406 / 0 / 0 |
 
-Ambas plataformas pasaron `npm ci`, build frontend, fmt, Clippy estricto y tests del workspace, incluido el crate Tauri. Los tests ignorados no se ejecutaron. No verifica la UI Tauri nativa ni juegos reales; las capturas headless usaron el build de produccion con un backend real aislado y fixtures sinteticos. Ese dia se entregaron 14 unidades de codigo (ver las entradas Done del 2026-10-09 en el ledger).
+Ambas plataformas pasaron `npm ci`, build frontend, fmt, Clippy estricto y tests del workspace, incluido el crate Tauri. Los tests ignorados no se ejecutaron. No verifica la UI Tauri nativa ni juegos reales; las capturas headless usaron el build de produccion con un backend real aislado y fixtures sinteticos. Ese dia se entregaron 21 unidades de codigo (ver las entradas Done del 2026-10-09 en el ledger).
 
 Secuencia autorizada: una unidad acotada, checks completos, publicacion de la rama de trabajo y CI manual, luego fast-forward de `main` antes de empezar otra unidad. Este checkpoint registra una observacion; no garantiza que `main` permanezca limpio o verificado tras futuros cambios.
 
