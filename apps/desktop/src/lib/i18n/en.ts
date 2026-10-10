@@ -772,6 +772,8 @@ export const en = {
   "inject.injectAction": "Inject Translations",
   "inject.rpgHint": "For RPG Maker games with an in-game language menu: add the selected language(s) to that menu without writing any translations.",
   "inject.autoRegister": "After inject, also register language(s) in game UI",
+  "inject.registerDirectHint": "Registering a language would change files recorded by Direct injection and block packing or re-injection. Use Add mode to register a selectable language.",
+  "inject.registerAddOnlyHint": "Use Add mode to register a selectable language in the game UI.",
   "inject.menuLabel": "Menu label (optional)",
   "inject.menuLabelHint": "Name shown in the game's language menu. Leave empty for “{label}”. Remembered across sessions.",
   "inject.menuLabelHintShort": "Name shown in the game's language menu. Leave empty for “{label}”.",

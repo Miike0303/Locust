@@ -109,7 +109,7 @@ export default function InjectModal({
 	const [regLabelOverride, setRegLabelOverride] = useState(() =>
 		loadRegLabelOverride(),
 	);
-	/** After inject, also run register-lang for RPG Maker multi-lang UI. */
+	/** After Add inject, also run register-lang for RPG Maker multi-lang UI. */
 	const [autoRegisterAfterInject, setAutoRegisterAfterInject] = useState(() => {
 		try {
 			return localStorage.getItem("locust.inject.autoRegister") === "1";
@@ -164,8 +164,16 @@ export default function InjectModal({
 		project.format_id === "rpgmaker-mv" ||
 		project.format_id === "rpgmaker-mz" ||
 		project.format_id.startsWith("rpgmaker");
+	const registrationMode = result?.mode ?? mode;
+	const canRegisterLang = isRpgMaker && registrationMode === "add";
+	const registrationHint = canRegisterLang ? null : t(
+		registrationMode === "direct"
+			? "inject.registerDirectHint"
+			: "inject.registerAddOnlyHint",
+	);
 
 	const runRegisterLang = async (quiet = false): Promise<boolean> => {
+		if (!canRegisterLang) return false;
 		if (selectedLangs.length === 0) {
 			if (!quiet) addToast("error", t("inject.toast.selectLangRegister"));
 			return false;
@@ -331,9 +339,10 @@ export default function InjectModal({
 							  });
 			addToast(toastLevel, toastMsg);
 
-			// Optional: register selected lang(s) in RM multi-lang UI after inject.
+			// Registration rewrites game files, invalidating Direct recording hashes.
+			// Keep the stored preference, but only apply it to Add injections.
 			// Skip when nothing was written — registering a language with no text is noise.
-			if (autoRegisterAfterInject && isRpgMaker && written > 0) {
+			if (mode === "add" && autoRegisterAfterInject && isRpgMaker && written > 0) {
 				await runRegisterLang(true);
 			}
 		} catch (err: unknown) {
@@ -534,13 +543,15 @@ export default function InjectModal({
 
 						{isRpgMaker && (
 							<div className="pt-1 border-t border-border space-y-2">
-								<p className="text-caption text-text-muted">
-									{t("inject.rpgHint")}
+								<p id="inject-register-mode-hint" className="text-caption text-text-muted">
+									{registrationHint ?? t("inject.rpgHint")}
 								</p>
 								<label className="flex items-center gap-2 text-caption text-text-muted cursor-pointer">
 									<input
 										type="checkbox"
 										checked={autoRegisterAfterInject}
+										disabled={!canRegisterLang}
+										aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
 										onChange={(e) => {
 											const on = e.target.checked;
 											setAutoRegisterAfterInject(on);
@@ -578,7 +589,8 @@ export default function InjectModal({
 								<button
 									type="button"
 									onClick={handleRegisterLang}
-									disabled={regLoading || selectedLangs.length === 0}
+									disabled={!canRegisterLang || regLoading || selectedLangs.length === 0}
+									aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
 									className="w-full py-1.5 text-body border border-accent-fg text-accent-fg hover:bg-accent-muted disabled:opacity-50 rounded font-medium"
 								>
 									{regLoading
@@ -788,10 +800,12 @@ export default function InjectModal({
 								<p className="font-medium text-accent-fg">
 									{t("inject.registerInUi")}
 								</p>
-								<p className="text-caption text-accent-fg">
-									{t("inject.registerInUiHint")}
-									<code className="px-0.5">*.bak-locust</code>
-									).
+								<p id="inject-register-mode-hint" className="text-caption text-accent-fg">
+									{registrationHint ?? <>
+										{t("inject.registerInUiHint")}
+										<code className="px-0.5">*.bak-locust</code>
+										).
+									</>}
 								</p>
 								{selectedLangs.length === 1 && (
 									<div>
@@ -815,7 +829,8 @@ export default function InjectModal({
 								<button
 									type="button"
 									onClick={handleRegisterLang}
-									disabled={regLoading || selectedLangs.length === 0}
+									disabled={!canRegisterLang || regLoading || selectedLangs.length === 0}
+									aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
 									className="w-full py-1.5 text-body bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded font-medium"
 								>
 									{regLoading

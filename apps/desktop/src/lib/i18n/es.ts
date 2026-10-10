@@ -752,6 +752,8 @@ export const es: Record<keyof typeof en, string> = {
   "inject.injectAction": "Inyectar traducciones",
   "inject.rpgHint": "Para juegos de RPG Maker con un menú de idioma: añade los idiomas seleccionados a ese menú sin escribir traducciones.",
   "inject.autoRegister": "Tras inyectar, registrar también el idioma o idiomas en la interfaz del juego",
+  "inject.registerDirectHint": "Registrar un idioma modificaría archivos registrados por la inyección directa e impediría empaquetar o volver a inyectar. Use el modo Añadir para registrar un idioma seleccionable.",
+  "inject.registerAddOnlyHint": "Use el modo Añadir para registrar un idioma seleccionable en la interfaz del juego.",
   "inject.menuLabel": "Etiqueta del menú (opcional)",
   "inject.menuLabelHint": "Nombre mostrado en el menú de idioma del juego. Déjelo vacío para «{label}». Se recuerda entre sesiones.",
   "inject.menuLabelHintShort": "Nombre mostrado en el menú de idioma del juego. Déjelo vacío para «{label}».",
