@@ -71,6 +71,343 @@ fn interrupted(root: &Path, step: Step) {
     assert!(result.is_err());
 }
 
+fn initialization_remnant(root: &Path) -> PathBuf {
+    let root = root.canonicalize().unwrap();
+    let store = root.join(STORE_DIR);
+    fs::create_dir_all(store.join("operations")).unwrap();
+    fs::write(
+        store.join("store.json"),
+        serde_json::to_vec(&StoreMarker {
+            schema_version: SCHEMA,
+            kind: "locust-injection-store".into(),
+            game_root: root,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let directory = store
+        .join("operations")
+        .join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    directory
+}
+
+#[test]
+fn initialization_remnant_history_is_readable_without_applied_evidence() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let remnant = initialization_remnant(&root);
+    let status =
+        game_status(&root).expect("an empty initialization remnant is not corrupt history");
+    assert!(!status.injection_pending);
+    assert!(status.injections.is_empty());
+    assert!(remnant.is_dir(), "history inspection must remain read-only");
+}
+
+#[test]
+fn initialization_remnant_recovery_inspection_is_readable() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let remnant = initialization_remnant(&root);
+    let inspection = status(&root).expect("initialization must not block recovery inspection");
+    assert!(inspection.pending.is_none());
+    assert!(inspection.applied.is_empty());
+    assert!(remnant.is_dir());
+}
+
+#[test]
+fn initialization_remnant_backup_restore_succeeds_before_recovery() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let before = snapshot(&root);
+    let manager = BackupManager::new(outer.path().join("backups"));
+    let backup = manager.create_backup(&root).unwrap();
+    let remnant = initialization_remnant(&root);
+    fs::write(root.join("keep.bin"), b"changed after backup").unwrap();
+    manager.preview_restore(&backup.id).unwrap();
+    manager.restore(&backup.id).unwrap();
+    assert_eq!(snapshot(&root), before);
+    assert!(
+        remnant.is_dir(),
+        "restore must leave journal cleanup to recovery"
+    );
+}
+
+#[test]
+fn initialization_remnant_recovery_cleans_only_the_empty_directory() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let before = snapshot(&root);
+    let remnant = initialization_remnant(&root);
+    let report = recover(&root, Default::default()).unwrap();
+    assert!(
+        !remnant.exists(),
+        "recovery must remove the initialization remnant"
+    );
+    assert!(report.transaction_id.is_none());
+    assert_eq!((report.restored, report.removed), (0, 0));
+    assert_eq!(snapshot(&root), before);
+    assert_eq!(recover(&root, Default::default()).unwrap().restored, 0);
+}
+
+#[test]
+fn initialization_remnant_with_plan_fails_closed_before_restore_or_cleanup() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let manager = BackupManager::new(outer.path().join("backups"));
+    let backup = manager.create_backup(&root).unwrap();
+    let remnant = initialization_remnant(&root);
+    fs::write(remnant.join("plan.json"), b"{}").unwrap();
+    fs::write(root.join("keep.bin"), b"must survive refused restore").unwrap();
+    let before = snapshot(&root);
+    assert!(game_status(&root).is_err());
+    assert!(status(&root).is_err());
+    assert!(manager.preview_restore(&backup.id).is_err());
+    assert!(manager.restore(&backup.id).is_err());
+    assert!(recover(&root, Default::default()).is_err());
+    assert_eq!(snapshot(&root), before);
+    assert_eq!(fs::read(remnant.join("plan.json")).unwrap(), b"{}");
+}
+
+#[test]
+fn initialization_remnant_referenced_by_active_fails_closed() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let remnant = initialization_remnant(&root);
+    fs::write(
+        root.join(STORE_DIR).join("active.json"),
+        serde_json::to_vec(&Active {
+            mode: Some(InjectionMode::Direct),
+            schema_version: SCHEMA,
+            transaction_id: remnant.file_name().unwrap().to_str().unwrap().into(),
+            game_root: root.canonicalize().unwrap(),
+            format: "fixture".into(),
+            language: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(game_status(&root).is_err());
+    assert!(remnant.is_dir());
+}
+
+#[test]
+fn initialization_remnant_cleanup_is_idempotent_and_preserves_game_bytes() {
+    let outer = fixture();
+    let root = outer.path().join("game").canonicalize().unwrap();
+    let before = snapshot(&root);
+    let remnant = initialization_remnant(&root);
+    let mut messages = Vec::new();
+    cleanup_initialization_remnants(&root, &mut messages).unwrap();
+    assert!(!remnant.exists());
+    assert_eq!(snapshot(&root), before);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        format!(
+            "removed empty injection initialization remnant: {}",
+            display_path(&remnant).display()
+        )
+    );
+    messages.clear();
+    cleanup_initialization_remnants(&root, &mut messages).unwrap();
+    assert!(messages.is_empty());
+}
+
+#[test]
+fn initialization_remnant_malformed_history_is_never_ignored_or_cleaned() {
+    for kind in [
+        "plan",
+        "originals",
+        "unknown",
+        "phase",
+        "identity",
+        "file",
+        "name",
+    ] {
+        let outer = fixture();
+        let root = outer.path().join("game").canonicalize().unwrap();
+        let empty = initialization_remnant(&root);
+        let directory = initialization_remnant(&root);
+        match kind {
+            "plan" => fs::write(directory.join("plan.json"), b"{}"),
+            "originals" => fs::create_dir(directory.join("originals")),
+            "unknown" => fs::write(directory.join("unknown.bin"), b"preserve me"),
+            "phase" => fs::write(directory.join("phase.json"), b"broken JSON"),
+            "identity" => fs::write(directory.join("identity.json"), b"{}"),
+            "file" => {
+                fs::remove_dir(&directory).unwrap();
+                fs::write(&directory, b"not an operation directory")
+            }
+            "name" => fs::rename(&directory, directory.with_file_name("unknown-operation")),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        assert!(game_status(&root).is_err(), "{kind}");
+        let mut messages = Vec::new();
+        assert!(
+            cleanup_initialization_remnants(&root, &mut messages).is_err(),
+            "{kind}"
+        );
+        assert!(messages.is_empty(), "{kind}");
+        assert!(empty.is_dir(), "preflight must precede all cleanup: {kind}");
+        assert_eq!(
+            fs::read_dir(root.join(STORE_DIR).join("operations"))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn initialization_remnant_unpublished_metadata_is_reported_and_never_applied() {
+    let outer = fixture();
+    let root = outer.path().join("game").canonicalize().unwrap();
+    let empty = initialization_remnant(&root);
+    let staged = empty.with_file_name(format!(".locust-stage-{}", uuid::Uuid::new_v4()));
+    fs::rename(&empty, &staged).unwrap();
+    // Termination can leave either metadata file only partly written.
+    fs::write(staged.join("phase.json"), b"\"prepar").unwrap();
+    fs::write(staged.join("identity.json"), b"{").unwrap();
+    assert!(game_status(&root).unwrap().injections.is_empty());
+    let mut messages = Vec::new();
+    cleanup_initialization_remnants(&root, &mut messages).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        format!(
+            "kept removable injection initialization remnant: {}",
+            display_path(&staged).display()
+        )
+    );
+    assert!(
+        staged.is_dir(),
+        "nonempty remnants are reported for removal"
+    );
+    fs::write(staged.join("plan.json"), b"{}").unwrap();
+    assert!(game_status(&root).is_err());
+    assert!(cleanup_initialization_remnants(&root, &mut Vec::new()).is_err());
+}
+
+#[test]
+fn initialization_remnant_publication_during_history_scan_is_readable() {
+    let outer = fixture();
+    let root = outer.path().join("game").canonicalize().unwrap();
+    let directory = initialization_remnant(&root);
+    let staged = directory.with_file_name(format!(".locust-stage-{}", uuid::Uuid::new_v4()));
+    fs::rename(&directory, &staged).unwrap();
+    fs::write(staged.join("phase.json"), b"\"preparing\"").unwrap();
+    let entry = fs::read_dir(staged.parent().unwrap())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    // A metadata-only status reader may enumerate just before publication.
+    fs::rename(&staged, &directory).unwrap();
+    assert!(history_phase(&root, &entry).unwrap().is_none());
+    assert!(game_status(&root).unwrap().injections.is_empty());
+}
+
+#[test]
+fn initialization_remnant_publication_exposes_both_metadata_files_together() {
+    let outer = fixture();
+    let root = outer.path().join("game").canonicalize().unwrap();
+    let directory = initialization_remnant(&root);
+    fs::remove_dir(&directory).unwrap();
+    let active = Active {
+        mode: Some(InjectionMode::Direct),
+        schema_version: SCHEMA,
+        transaction_id: directory.file_name().unwrap().to_str().unwrap().into(),
+        game_root: root.clone(),
+        format: "fixture".into(),
+        language: Some("es".into()),
+    };
+    let mut reached = Vec::new();
+    let operation = initialize_operation(&root, active, &mut |step| {
+        reached.push(step);
+        assert!(game_status(&root)?.injections.is_empty());
+        if step == Step::OperationPublished {
+            assert_eq!(
+                read::<Phase>(&directory.join("phase.json"))?,
+                Phase::Preparing
+            );
+            assert_eq!(
+                read::<Active>(&directory.join("identity.json"))?.game_root,
+                root
+            );
+        } else {
+            assert!(
+                !directory.exists(),
+                "operation appeared before initialization: {step:?}"
+            );
+        }
+        assert!(!root.join(STORE_DIR).join("active.json").exists());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(operation.directory, directory);
+    assert_eq!(
+        reached,
+        [
+            Step::OperationCreated,
+            Step::OperationPrepared,
+            Step::OperationPublished
+        ]
+    );
+    assert_eq!(
+        fs::read_dir(directory.parent().unwrap()).unwrap().count(),
+        1
+    );
+}
+
+#[test]
+fn initialization_remnant_creation_hook_never_exposes_an_incomplete_operation() {
+    let outer = fixture();
+    let root = outer.path().join("game");
+    let before = snapshot(&root);
+    let mut reached = false;
+    let result = run_with_hook(
+        &root,
+        "fixture",
+        None,
+        || Ok(()),
+        plugin,
+        |_| Ok(()),
+        &mut |step| {
+            if step == Step::OperationCreated {
+                reached = true;
+                let status = game_status(&root)
+                    .expect("readers must work at the operation creation boundary");
+                assert!(status.injections.is_empty());
+                assert!(!status.injection_pending);
+                for entry in fs::read_dir(root.join(STORE_DIR).join("operations"))? {
+                    let entry = entry?;
+                    if uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
+                        assert!(entry.path().join("phase.json").is_file());
+                        assert!(entry.path().join("identity.json").is_file());
+                    }
+                }
+                return Err(error("interrupted at operation creation"));
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        reached,
+        "the operation creation hook must be reached: {result:?}"
+    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("interrupted at operation creation"));
+    assert_eq!(snapshot(&root), before);
+    assert!(status(&root).unwrap().pending.is_none());
+    recover(&root, Default::default()).unwrap();
+    run(&root, "fixture", None, || Ok(()), plugin, |_| Ok(())).unwrap();
+    assert_eq!(game_status(&root).unwrap().injections.len(), 1);
+}
+
 #[test]
 fn noop_retention_rejects_live_changes_hidden_by_an_empty_plan() {
     let outer = fixture();
@@ -742,6 +1079,9 @@ fn real_process_termination_at_transaction_boundaries_recovers_from_disk_only() 
     }
     for phase in [
         "store",
+        "operation-created",
+        "operation-prepared",
+        "operation-published",
         "preparing",
         "planned",
         "installed0",
@@ -797,6 +1137,22 @@ fn real_process_termination_at_transaction_boundaries_recovers_from_disk_only() 
             run(&root, "fixture", None, || Ok(()), plugin, |_| Ok(())).unwrap();
             continue;
         }
+        if phase.starts_with("operation-") {
+            assert!(status(&root).unwrap().pending.is_none(), "{phase}");
+            assert!(game_status(&root).unwrap().injections.is_empty(), "{phase}");
+            recover(&root, Default::default()).unwrap();
+            assert_eq!(snapshot(&root), before, "{phase}");
+            for entry in fs::read_dir(root.join(STORE_DIR).join("operations")).unwrap() {
+                let entry = entry.unwrap();
+                if uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
+                    assert!(entry.path().join("phase.json").is_file());
+                    assert!(entry.path().join("identity.json").is_file());
+                }
+            }
+            run(&root, "fixture", None, || Ok(()), plugin, |_| Ok(())).unwrap();
+            assert_eq!(game_status(&root).unwrap().injections.len(), 1);
+            continue;
+        }
         assert!(status(&root).unwrap().pending.is_some(), "{phase}");
         recover(&root, Default::default()).unwrap();
         assert_eq!(snapshot(&root), before, "{phase}");
@@ -833,6 +1189,9 @@ fn crash_child() {
     } else {
         let expected = match phase.as_str() {
             "store" => Step::StorePrepared,
+            "operation-created" => Step::OperationCreated,
+            "operation-prepared" => Step::OperationPrepared,
+            "operation-published" => Step::OperationPublished,
             "preparing" => Step::Preparing,
             "planned" => Step::PlanPublished,
             "installed0" => Step::Installed(0),

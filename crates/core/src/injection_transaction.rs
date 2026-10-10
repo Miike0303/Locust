@@ -271,7 +271,7 @@ pub fn validate_store(game_root: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn load(root: &Path) -> Result<Option<Operation>> {
+fn load_active(root: &Path) -> Result<Option<Active>> {
     if !validate_store(root)? {
         return Ok(None);
     }
@@ -290,6 +290,13 @@ fn load(root: &Path) -> Result<Option<Operation>> {
     {
         return Err(error("invalid active injection identity/root"));
     }
+    Ok(Some(active))
+}
+
+fn load(root: &Path) -> Result<Option<Operation>> {
+    let Some(active) = load_active(root)? else {
+        return Ok(None);
+    };
     let rel = Path::new(STORE_DIR)
         .join("operations")
         .join(&active.transaction_id);
@@ -302,6 +309,118 @@ fn load(root: &Path) -> Result<Option<Operation>> {
         active,
         phase,
     }))
+}
+
+/// Unpublished staging metadata is never a generation. Legacy UUID directories
+/// without a phase are remnants only when empty (or carrying a valid identity).
+/// No plan, originals, links, or unexpected children may be swept as preparation.
+fn history_phase(root: &Path, entry: &fs::DirEntry) -> Result<Option<Phase>> {
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let staged = name.starts_with(".locust-stage-");
+    let id = name.strip_prefix(".locust-stage-").unwrap_or(&name);
+    if uuid::Uuid::parse_str(id)
+        .map(|v| v.to_string())
+        .ok()
+        .as_deref()
+        != Some(id)
+    {
+        return Err(error("invalid injection history identity"));
+    }
+    let relative = Path::new(STORE_DIR).join("operations").join(&name);
+    ensure_no_links(root, &relative)?;
+    match inspect_history_phase(root, &entry.path(), id, staged) {
+        // Status is lock-free: publication or guard cleanup can remove a
+        // staging name after read_dir returned it. Published names stay strict.
+        Err(LocustError::IoError(e)) if staged && e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
+fn inspect_history_phase(
+    root: &Path,
+    directory: &Path,
+    id: &str,
+    staged: bool,
+) -> Result<Option<Phase>> {
+    if !fs::symlink_metadata(directory)?.is_dir() {
+        return Err(error("injection history entry is not a directory"));
+    }
+    if !staged {
+        match fs::symlink_metadata(directory.join("phase.json")) {
+            Ok(_) => return read(&directory.join("phase.json")).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if load_active(root)?.is_some_and(|active| active.transaction_id == id) {
+        return Err(error(
+            "active injection cannot be treated as an initialization remnant",
+        ));
+    }
+    for child in fs::read_dir(directory)? {
+        let child = child?;
+        let name = child.file_name();
+        ensure_no_links(directory, Path::new(&name))?;
+        let metadata = fs::symlink_metadata(child.path())?;
+        if !metadata.is_file()
+            || metadata.len() > MAX_METADATA_BYTES
+            || !(name == "identity.json" || staged && name == "phase.json")
+        {
+            return Err(error(
+                "injection initialization remnant contains unrecognized data",
+            ));
+        }
+        // Staged files can be partial writes: they were never published. A
+        // legacy operation identity, if present, must still bind to this game.
+        if !staged {
+            let identity: Active = read(&child.path())?;
+            if identity.schema_version != SCHEMA
+                || identity.transaction_id != id
+                || identity.game_root != root
+            {
+                return Err(error("invalid injection initialization identity"));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn cleanup_initialization_remnants(root: &Path, messages: &mut Vec<String>) -> Result<()> {
+    if !validate_store(root)? {
+        return Ok(());
+    }
+    let relative = Path::new(STORE_DIR).join("operations");
+    ensure_no_links(root, &relative)?;
+    let directory = root.join(relative);
+    if !directory.try_exists()? {
+        return Ok(());
+    }
+    // Validate the entire scan before removing even an empty remnant.
+    let mut remnants = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        if history_phase(root, &entry)?.is_none() {
+            remnants.push(entry.path());
+        }
+    }
+    for remnant in remnants {
+        if fs::read_dir(&remnant)?.next().transpose()?.is_some() {
+            messages.push(format!(
+                "kept removable injection initialization remnant: {}",
+                display_path(&remnant).display()
+            ));
+        } else {
+            // Nonrecursive deletion also refuses a child added after the scan.
+            fs::remove_dir(&remnant)?;
+            messages.push(format!(
+                "removed empty injection initialization remnant: {}",
+                display_path(&remnant).display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn ensure_no_pending(game_path: &Path) -> Result<()> {
@@ -357,19 +476,9 @@ pub(crate) fn created_outputs_since(
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let id = entry.file_name().to_string_lossy().into_owned();
-        if uuid::Uuid::parse_str(&id)
-            .map(|v| v.to_string())
-            .ok()
-            .as_ref()
-            != Some(&id)
-        {
-            return Err(error("invalid injection history identity"));
-        }
-        ensure_no_links(
-            lock.root(),
-            &Path::new(STORE_DIR).join("operations").join(&id),
-        )?;
-        let phase: Phase = read(&entry.path().join("phase.json"))?;
+        let Some(phase) = history_phase(lock.root(), &entry)? else {
+            continue;
+        };
         if phase != Phase::Completed {
             continue;
         }
@@ -468,16 +577,9 @@ fn committed_generations_with(
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let id = entry.file_name().to_string_lossy().into_owned();
-        if uuid::Uuid::parse_str(&id)
-            .map(|v| v.to_string())
-            .ok()
-            .as_ref()
-            != Some(&id)
-        {
-            return Err(error("invalid injection history identity"));
-        }
-        ensure_no_links(root, &Path::new(STORE_DIR).join("operations").join(&id))?;
-        let phase: Phase = read(&entry.path().join("phase.json"))?;
+        let Some(phase) = history_phase(root, &entry)? else {
+            continue;
+        };
         if refuse_pending && phase.pending().is_some() {
             return Err(error(
                 "unfinished injection history; recover before resuming this project",
@@ -1042,6 +1144,9 @@ fn cleanup_work(operation: &Operation) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     StorePrepared,
+    OperationCreated,
+    OperationPrepared,
+    OperationPublished,
     Preparing,
     OutputsPrepared,
     PlanPublished,
@@ -1192,8 +1297,6 @@ fn run_with_mode_hook<B, T>(
     ensure_no_links(root, &Path::new(STORE_DIR).join("operations"))?;
     fs::create_dir_all(store.join("operations"))?;
     let id = uuid::Uuid::new_v4().to_string();
-    let directory = store.join("operations").join(&id);
-    fs::create_dir(&directory)?;
     let active = Active {
         mode: Some(mode),
         schema_version: SCHEMA,
@@ -1202,18 +1305,7 @@ fn run_with_mode_hook<B, T>(
         format: format.into(),
         language: language.map(str::to_owned),
     };
-    let mut operation = Operation {
-        root: root.to_owned(),
-        directory,
-        active,
-        phase: Phase::Preparing,
-    };
-    operation.set_phase(Phase::Preparing)?;
-    publish(
-        root,
-        &operation.directory.join("identity.json"),
-        &operation.active,
-    )?;
+    let mut operation = initialize_operation(root, active, hook)?;
     publish(root, &store.join("active.json"), &operation.active)?;
     hook(Step::Preparing)?;
     let prepared = prepare(&operation, &selected, &before, |work, selected| {
@@ -1330,6 +1422,53 @@ fn run_with_mode_hook<B, T>(
         display_path(&operation.directory.join("originals")).display()
     ));
     Ok((backup, report, recorded))
+}
+
+fn initialize_operation(
+    root: &Path,
+    active: Active,
+    hook: &mut impl FnMut(Step) -> Result<()>,
+) -> Result<Operation> {
+    let parent = root.join(STORE_DIR).join("operations");
+    let directory = parent.join(&active.transaction_id);
+    let mut initial = crate::patch::stream::StagingDir::create_prepared(&parent)?;
+    hook(Step::OperationCreated)?;
+    for (name, bytes) in [
+        ("phase.json", serde_json::to_vec(&Phase::Preparing)?),
+        ("identity.json", serde_json::to_vec(&active)?),
+    ] {
+        use std::io::Write;
+        let mut file = initial.create_file(name)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    sync_directory_best_effort(initial.path());
+    hook(Step::OperationPrepared)?;
+    let temporary = initial.path().to_owned();
+    initial.disarm();
+    drop(initial); // release the directory's no-share-delete handle before rename
+    fs::rename(temporary, &directory)?;
+    sync_directory_best_effort(&parent);
+    hook(Step::OperationPublished)?;
+    Ok(Operation {
+        root: root.to_owned(),
+        directory,
+        active,
+        phase: Phase::Preparing,
+    })
+}
+
+// Match durable JSON publication: files are synced strictly; directory syncing
+// is best effort because not every supported filesystem permits it.
+fn sync_directory_best_effort(path: &Path) {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0200_0000); // FILE_FLAG_BACKUP_SEMANTICS
+    }
+    let _ = options.open(path).and_then(|file| file.sync_all());
 }
 
 /// User-facing spelling of a path. `canonicalize` yields `\\?\` verbatim
@@ -1561,6 +1700,7 @@ fn recover_with_hook(
             ));
         }
     }
+    cleanup_initialization_remnants(lock.root(), &mut report.messages)?;
     let Some(mut operation) = loaded else {
         report.messages.push("no unfinished injection".into());
         return Ok(report);
