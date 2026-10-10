@@ -378,8 +378,8 @@ fn ambiguous_saved_dbs_error(paths: &[PathBuf]) -> LocustError {
     ))
 }
 
-/// Detect, extract, reopen the per-project DB, and merge entries. Shared by
-/// the HTTP handler and the Tauri command.
+/// Detect, extract, and merge into the candidate DB before publishing it live.
+/// Shared by the HTTP handler and the Tauri command.
 pub fn open_project(
     db: &Database,
     registry: &FormatRegistry,
@@ -410,17 +410,17 @@ pub fn open_project(
     let extraction_warnings = extraction_warnings(&entries);
 
     let database_path = resolve_project_db_path(&path);
-    db.reopen(&database_path)?;
+    let candidate = Database::open(&database_path)?;
     let merge = if extraction_warnings.is_empty() {
-        db.merge_entries(&entries)?
+        candidate.merge_entries(&entries)?
     } else {
-        db.merge_entries_preserving_missing(&entries)?
+        candidate.merge_entries_preserving_missing(&entries)?
     };
-    db.set_project_metadata(
+    candidate.set_project_metadata(
         "extraction_warnings",
         &serde_json::json!(extraction_warnings),
     )?;
-    let total_strings = db.get_stats()?.total;
+    let total_strings = candidate.get_stats()?.total;
 
     let project_name = path
         .file_name()
@@ -428,7 +428,7 @@ pub fn open_project(
         .to_string_lossy()
         .to_string();
 
-    Ok(ProjectOpenOutcome {
+    let outcome = ProjectOpenOutcome {
         format_id,
         format_name,
         total_strings,
@@ -442,7 +442,9 @@ pub fn open_project(
         removed: merge.removed,
         preserved_translations: merge.preserved_translations,
         extraction_warnings,
-    })
+    };
+    db.replace_with(candidate);
+    Ok(outcome)
 }
 
 fn not_a_locust_db(path: &Path) -> LocustError {
@@ -537,7 +539,7 @@ fn open_project_db_under_lock(
     let plugin = registry
         .get(format_id)
         .ok_or_else(|| LocustError::UnsupportedFormat(format!("Unknown format: {format_id}")))?;
-    db.reopen(database_path)?;
+    let candidate = Database::open(database_path)?;
 
     let project_name = game_path
         .file_name()
@@ -545,7 +547,7 @@ fn open_project_db_under_lock(
         .to_string_lossy()
         .to_string();
 
-    Ok(ProjectOpenOutcome {
+    let outcome = ProjectOpenOutcome {
         format_id: plugin.id().to_string(),
         format_name: plugin.name().to_string(),
         total_strings,
@@ -560,9 +562,11 @@ fn open_project_db_under_lock(
         preserved_translations: 0,
         extraction_warnings: match verified_warnings {
             Some(warnings) => warnings,
-            None => saved_extraction_warnings(db)?,
+            None => saved_extraction_warnings(&candidate)?,
         },
-    })
+    };
+    db.replace_with(candidate);
+    Ok(outcome)
 }
 
 /// Reopen a legacy recent that has a game path but no saved `database_path`.
@@ -682,6 +686,181 @@ mod tests {
         let mut reg = FormatRegistry::new();
         reg.register(Box::new(TsvPlugin));
         reg
+    }
+
+    async fn assert_failed_saved_open_keeps_live_database(open_path: &str) {
+        let fixture = tempfile::tempdir().unwrap();
+        let game = fixture.path().join("candidate");
+        if open_path != "open-db" {
+            std::fs::create_dir(&game).unwrap();
+            std::fs::write(game.join("extract.tsv"), "hero\tCandidate").unwrap();
+        }
+        let path_a = fixture.path().join("previous.locust.db");
+        let path_b = fixture.path().join("candidate.locust.db");
+        let previous = Database::open(&path_a).unwrap();
+        previous
+            .save_entries(&[StringEntry::new("hero", "Previous", "extract.tsv".into())])
+            .unwrap();
+        drop(previous);
+        let candidate = Database::open(&path_b).unwrap();
+        candidate
+            .save_entries(&[StringEntry::new("hero", "Candidate", "extract.tsv".into())])
+            .unwrap();
+        candidate
+            .set_project_metadata("extraction_warnings", &serde_json::json!(42))
+            .unwrap();
+        let candidate_row = serde_json::to_value(candidate.get_entry("hero").unwrap()).unwrap();
+        drop(candidate);
+        let candidate_bytes = std::fs::read(&path_b).unwrap();
+
+        let live = Database::open_in_memory().unwrap();
+        let reg = registry();
+        open_project_db(
+            &live,
+            &reg,
+            &path_a,
+            &fixture.path().join("moved"),
+            "tsv-test",
+        )
+        .unwrap();
+        let error = match open_path {
+            "open-db" => open_project_db(&live, &reg, &path_b, &game, "tsv-test"),
+            "recent" => open_recent_project_with(
+                &live,
+                &reg,
+                &game,
+                Some("tsv-test"),
+                &fixture.path().join("config"),
+            ),
+            "resume" => open_verified_saved_project(&live, &reg, &path_b, &game, "tsv-test"),
+            _ => unreachable!(),
+        }
+        .unwrap_err();
+        assert!(error.to_string().contains("expected a sequence"), "{error}");
+        live.save_translation("hero", "Edited after failure", "manual")
+            .await
+            .unwrap();
+
+        let previous = Database::read_project_snapshot(&path_a).unwrap();
+        assert_eq!(
+            previous
+                .get_entry("hero")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Edited after failure"),
+            "a write after failed {open_path} must still reach the previous project"
+        );
+        assert_eq!(live.path(), path_a);
+        let candidate = Database::read_project_snapshot(&path_b).unwrap();
+        assert_eq!(
+            serde_json::to_value(candidate.get_entry("hero").unwrap()).unwrap(),
+            candidate_row
+        );
+        assert_eq!(std::fs::read(&path_b).unwrap(), candidate_bytes);
+    }
+
+    #[tokio::test]
+    async fn failed_open_db_keeps_live_database() {
+        assert_failed_saved_open_keeps_live_database("open-db").await;
+    }
+
+    #[tokio::test]
+    async fn failed_recent_open_keeps_live_database() {
+        assert_failed_saved_open_keeps_live_database("recent").await;
+    }
+
+    #[tokio::test]
+    async fn failed_resume_keeps_live_database() {
+        assert_failed_saved_open_keeps_live_database("resume").await;
+    }
+
+    #[test]
+    fn failed_first_open_db_keeps_empty_live_database() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("candidate.locust.db");
+        let candidate = Database::open(&path).unwrap();
+        candidate
+            .save_entries(&[StringEntry::new("hero", "Candidate", "extract.tsv".into())])
+            .unwrap();
+        candidate
+            .set_project_metadata("extraction_warnings", &serde_json::json!(42))
+            .unwrap();
+        drop(candidate);
+        let live = Database::open_in_memory().unwrap();
+        let error = open_project_db(
+            &live,
+            &registry(),
+            &path,
+            &fixture.path().join("moved"),
+            "tsv-test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expected a sequence"), "{error}");
+        assert_eq!(live.get_stats().unwrap().total, 0);
+        assert_eq!(live.path(), Path::new(":memory:"));
+    }
+
+    #[tokio::test]
+    async fn failed_folder_merge_keeps_live_database() {
+        // Exercise both complete and partial extraction merge paths.
+        for partial in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let game = fixture.path().join("candidate");
+            std::fs::create_dir(&game).unwrap();
+            std::fs::write(game.join("extract.tsv"), "hero\tCandidate\nnew\tNew").unwrap();
+            if partial {
+                std::fs::write(game.join("unread-container"), "").unwrap();
+            }
+            let path_a = fixture.path().join("previous.locust.db");
+            let path_b = resolve_project_db_path(&game);
+            let live = Database::open(&path_a).unwrap();
+            live.save_entries(&[StringEntry::new("hero", "Previous", "extract.tsv".into())])
+                .unwrap();
+            let candidate = Database::open(&path_b).unwrap();
+            candidate
+                .save_entries(&[StringEntry::new("hero", "Candidate", "extract.tsv".into())])
+                .unwrap();
+            let candidate_row = serde_json::to_value(candidate.get_entry("hero").unwrap()).unwrap();
+            drop(candidate);
+            Connection::open(&path_b)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER fail_merge BEFORE INSERT ON strings
+                     WHEN NEW.id = 'new'
+                     BEGIN SELECT RAISE(ABORT, 'forced merge failure'); END;",
+                )
+                .unwrap();
+            let candidate_bytes = std::fs::read(&path_b).unwrap();
+
+            let error = open_project(&live, &registry(), &game, None).unwrap_err();
+            assert!(
+                error.to_string().contains("forced merge failure"),
+                "{error}"
+            );
+            live.save_translation("hero", "Edited after failure", "manual")
+                .await
+                .unwrap();
+            let previous = Database::read_project_snapshot(&path_a).unwrap();
+            assert_eq!(
+                previous
+                    .get_entry("hero")
+                    .unwrap()
+                    .unwrap()
+                    .translation
+                    .as_deref(),
+                Some("Edited after failure")
+            );
+            assert_eq!(live.path(), path_a);
+            let candidate = Database::read_project_snapshot(&path_b).unwrap();
+            assert_eq!(
+                serde_json::to_value(candidate.get_entry("hero").unwrap()).unwrap(),
+                candidate_row
+            );
+            assert_eq!(candidate.get_stats().unwrap().total, 1);
+            assert_eq!(std::fs::read(&path_b).unwrap(), candidate_bytes);
+        }
     }
 
     #[test]

@@ -4051,6 +4051,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_open_db_keeps_current_project_and_patch_destination() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path_a = write_opendb_locust(
+            fixture.path(),
+            "previous.locust.db",
+            &[translated(
+                "hero",
+                "Previous",
+                "f.json",
+                "Previous translation",
+            )],
+        );
+        let path_b = write_opendb_locust(
+            fixture.path(),
+            "candidate.locust.db",
+            &[translated(
+                "hero",
+                "Candidate",
+                "f.json",
+                "Candidate translation",
+            )],
+        );
+        let candidate = Database::open(&path_b).unwrap();
+        candidate
+            .set_project_metadata("extraction_warnings", &serde_json::json!(42))
+            .unwrap();
+        let candidate_row = serde_json::to_value(candidate.get_entry("hero").unwrap()).unwrap();
+        drop(candidate);
+        let candidate_bytes = std::fs::read(&path_b).unwrap();
+        let (url, server, state) = setup_with_state().await;
+        let http = client();
+        let opened = http
+            .post(format!("{url}/api/project/open-db"))
+            .json(&serde_json::json!({
+                "database_path": path_a,
+                "game_path": fixture.path().join("moved-a"),
+                "format_id": "rpgmaker-mv"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opened.status(), 200, "{}", opened.text().await.unwrap());
+        let before: serde_json::Value = http
+            .get(format!("{url}/api/project/current"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let failed = http
+            .post(format!("{url}/api/project/open-db"))
+            .json(&serde_json::json!({
+                "database_path": path_b,
+                "game_path": fixture.path().join("moved-b"),
+                "format_id": "rpgmaker-mv"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(!failed.status().is_success());
+        let error = failed.text().await.unwrap();
+        assert!(error.contains("expected a sequence"), "{error}");
+        let current: serde_json::Value = http
+            .get(format!("{url}/api/project/current"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(current, before);
+        let patched = http
+            .patch(format!("{url}/api/strings/hero"))
+            .json(&serde_json::json!({"translation": "Edited after failure"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(patched.status(), 200, "{}", patched.text().await.unwrap());
+        let previous = Database::open(&path_a).unwrap();
+        assert_eq!(
+            previous
+                .get_entry("hero")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Edited after failure")
+        );
+        assert_eq!(state.db.path(), path_a);
+        let candidate = Database::open(&path_b).unwrap();
+        assert_eq!(
+            serde_json::to_value(candidate.get_entry("hero").unwrap()).unwrap(),
+            candidate_row
+        );
+        drop(candidate);
+        assert_eq!(std::fs::read(&path_b).unwrap(), candidate_bytes);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_first_open_db_keeps_edits_unavailable() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = write_opendb_locust(
+            fixture.path(),
+            "candidate.locust.db",
+            &[translated(
+                "hero",
+                "Candidate",
+                "f.json",
+                "Candidate translation",
+            )],
+        );
+        let candidate = Database::open(&path).unwrap();
+        candidate
+            .set_project_metadata("extraction_warnings", &serde_json::json!(42))
+            .unwrap();
+        drop(candidate);
+        let candidate_bytes = std::fs::read(&path).unwrap();
+        let (url, server, state) = setup_with_state().await;
+        let live_path = state.db.path();
+        let http = client();
+        let failed = http
+            .post(format!("{url}/api/project/open-db"))
+            .json(&serde_json::json!({
+                "database_path": path,
+                "game_path": fixture.path().join("moved"),
+                "format_id": "rpgmaker-mv"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(!failed.status().is_success());
+        let error = failed.text().await.unwrap();
+        assert!(error.contains("expected a sequence"), "{error}");
+        let current = http
+            .get(format!("{url}/api/project/current"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(current.status(), 404);
+        let patched = http
+            .patch(format!("{url}/api/strings/hero"))
+            .json(&serde_json::json!({"translation": "Wrong project"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(patched.status(), 400);
+        assert_eq!(patched.text().await.unwrap(), "no project open");
+        assert_eq!(state.db.path(), live_path);
+        assert_eq!(state.db.get_stats().unwrap().total, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), candidate_bytes);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn test_open_db_switches_without_extract_or_touching_source() {
         let dir = std::env::temp_dir().join(format!("locust_opendb_ok_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();

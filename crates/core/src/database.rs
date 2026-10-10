@@ -905,16 +905,18 @@ impl Database {
     /// Swap the live connection to `path` in place and run the same schema
     /// init as [`Database::open`]. Shared `Arc<Database>` handlers keep working.
     pub fn reopen(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let new_conn = Connection::open(path)?;
-        init_schema(&new_conn)?;
-        *lock_connection(&self.conn) = new_conn;
-        *self.path.lock().unwrap() = path.to_path_buf();
+        self.replace_with(Self::open(path)?);
         Ok(())
+    }
+
+    /// Publish a fully prepared candidate without reopening or other fallible I/O.
+    /// Callers must finish validation and merge work before replacing the live DB.
+    pub(crate) fn replace_with(&self, candidate: Self) {
+        let candidate_path = candidate.path();
+        let mut conn = lock_connection(&self.conn);
+        let mut path = self.path.lock().unwrap();
+        std::mem::swap(&mut *conn, &mut *lock_connection(&candidate.conn));
+        *path = candidate_path;
     }
 
     pub fn get_project_metadata(&self, key: &str) -> Result<Option<serde_json::Value>> {
