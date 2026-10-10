@@ -24,6 +24,17 @@ import {
   type ReviewQueueState,
 } from "../lib/reviewQueue";
 
+export function reviewApprovalPatch(
+  current: Pick<StringEntry, "translation" | "status">,
+  translation: string,
+): { translation?: string; status: "approved" } | null {
+  // Saving a translation can reset its status, including on a repeat approval.
+  if (translation !== (current.translation ?? "")) {
+    return { translation, status: "approved" };
+  }
+  return current.status === "approved" ? null : { status: "approved" };
+}
+
 export default function Review() {
   const t = useT();
   const navigate = useNavigate();
@@ -148,20 +159,20 @@ export default function Review() {
     const id = state.items[state.index]?.id;
     const current = id ? byId[id] : undefined;
     if (!current || state.complete) return;
-    if (!state.approvedIds.includes(current.id)) {
-      if (translation !== (current.translation || "")) {
-        await patchString(current.id, { translation } as any);
+    try {
+      const patch = reviewApprovalPatch(current, translation);
+      if (patch) {
+        const saved = await patchString(current.id, patch);
+        setById((prev) => ({ ...prev, [current.id]: saved }));
       }
-      await patchString(current.id, { status: "approved" } as any);
-      setById((prev) => ({
-        ...prev,
-        [current.id]: { ...current, translation, status: "approved" },
-      }));
+      setLoadError(null);
+      const next = approveCurrent(queueRef.current);
+      queueRef.current = next;
+      setQueue(next);
+      void qc.invalidateQueries({ queryKey: ["stats"], refetchType: "none" });
+    } catch (err: unknown) {
+      setLoadError(err instanceof Error ? err.message : String(err));
     }
-    const next = approveCurrent(queueRef.current);
-    queueRef.current = next;
-    setQueue(next);
-    void qc.invalidateQueries({ queryKey: ["stats"], refetchType: "none" });
   }, [byId, translation, qc]);
 
   const handleSkip = useCallback(() => {
@@ -287,6 +298,10 @@ export default function Review() {
           <div className="bg-accent h-2 rounded-full transition-all" style={{ width: `${bar}%` }} />
         </div>
       </div>
+
+      {loadError && (
+        <p role="alert" className="px-6 pt-4 text-body text-danger">{loadError}</p>
+      )}
 
       {/* Content */}
       {entry && (
