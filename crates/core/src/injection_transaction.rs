@@ -538,14 +538,14 @@ pub(crate) fn run_add<B, T>(
     language: Option<&str>,
     backup: impl FnOnce() -> Result<B>,
     inject: impl FnOnce(&Path, &Path) -> Result<InjectionReport>,
-    record: impl FnOnce(&InjectionReport) -> Result<T>,
+    record: impl FnOnce(&InjectionReport, &B) -> Result<T>,
 ) -> Result<(B, InjectionReport, T)> {
     run_with_mode_hook(
         selection,
         (format, language, InjectionMode::Add),
         backup,
         |work, selected, _| inject(work, selected),
-        (|report, _| record(report), |_, _, _| Ok(())),
+        (record, |_, _, _| Ok(())),
         &mut |_| Ok(()),
     )
 }
@@ -847,6 +847,61 @@ pub fn game_status(game_path: &Path) -> Result<GameInjectionStatus> {
         injections,
         injection_pending: active.is_some_and(|op| op.phase.pending().is_some()),
     })
+}
+
+/// Match a project recording to committed Add evidence for this exact root and
+/// language. A later Direct generation wins even if its union retains Add files.
+pub fn add_recording_under_lock(
+    lock: &GameLock,
+    db: &crate::database::Database,
+    language: &str,
+) -> Result<Option<crate::database::InjectionRecording>> {
+    ensure_no_pending_under_lock(lock)?;
+    matching_add_recording(lock.root(), db, language)
+}
+
+/// Internal transaction callers already hold the root lock before preparing a backup.
+pub(crate) fn matching_add_recording(
+    root: &Path,
+    db: &crate::database::Database,
+    language: &str,
+) -> Result<Option<crate::database::InjectionRecording>> {
+    let Some(recording) = db.get_injection(Some(language))? else {
+        return Ok(None);
+    };
+    if !crate::database::paths_identical(&recording.root, root) {
+        return Ok(None);
+    }
+    let active = load(root)?;
+    for generation in committed_generations(root)?.iter().rev() {
+        let Some(identity) = committed_identity(root, generation, active.as_ref())? else {
+            continue;
+        };
+        if identity.language.as_deref() != Some(language) {
+            continue;
+        }
+        if identity.mode != Some(InjectionMode::Add) {
+            return Ok(None);
+        }
+        let matches = generation.plan.files.iter().any(|change| {
+            !generation
+                .restored
+                .contains(&output_key(Path::new(&change.path)))
+                && recording.files.iter().any(|file| {
+                    file.rel == change.path
+                        && file.hash == change.result.sha256
+                        && file.size == change.result.size
+                })
+        });
+        if !matches {
+            continue;
+        }
+        for file in &recording.files {
+            crate::extraction::verify_recorded_injection_member(root, file)?;
+        }
+        return Ok(Some(recording));
+    }
+    Ok(None)
 }
 
 /// Record only paths actually restored/deleted by a successful backup restore.
@@ -1441,7 +1496,19 @@ pub fn write_files_under_lock(
     lock: &GameLock,
     files: &[(PathBuf, Vec<u8>)],
     operation_label: &str,
+    installed: impl FnMut(usize) -> Result<()>,
+) -> Result<()> {
+    write_files_and_record_under_lock(lock, files, operation_label, installed, || Ok(()))
+}
+
+/// Commit the recording after all writes verify, before closing the recovery
+/// operation. Recording errors roll back files under the same game lock.
+pub fn write_files_and_record_under_lock(
+    lock: &GameLock,
+    files: &[(PathBuf, Vec<u8>)],
+    operation_label: &str,
     mut installed: impl FnMut(usize) -> Result<()>,
+    record: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     ensure_no_pending_under_lock(lock)?;
     ensure_no_links(lock.root(), Path::new(".locust"))?;
@@ -1451,9 +1518,13 @@ pub fn write_files_under_lock(
     ) {
         return Err(error("an installed patch operation is unfinished; recover that patch before modifying this game"));
     }
+    let mut record = Some(record);
     let result = write_files_with_hook(lock.root(), files, operation_label, &mut |step| {
         if let Step::Installed(index) = step {
             installed(index)?;
+        }
+        if matches!(step, Step::FilesCommitted) {
+            record.take().expect("recording callback runs once")()?;
         }
         Ok(())
     });
@@ -2064,6 +2135,39 @@ mod tests;
 mod prepared_file_tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn registration_recording_failure_restores_files_and_preserves_database() {
+        let (_temp, root, files) = fixture();
+        let db = crate::database::Database::open_in_memory().unwrap();
+        let pack = root.join("data/lang_g_es.json");
+        fs::write(&pack, b"Spanish pack").unwrap();
+        db.record_injection(Some("es"), &root, &[pack]).unwrap();
+        let before = db.get_injection(Some("es")).unwrap().unwrap();
+        db.fail_registration_recording();
+        let backup = crate::database::RecordedBackup {
+            id: "registration-backup".into(),
+            source_path: root.clone(),
+            storage_root: None,
+        };
+        let written: Vec<_> = files.iter().map(|(rel, _)| root.join(rel)).collect();
+        let result = write_files_with_hook(&root, &files, "register-language", &mut |step| {
+            if step == Step::FilesCommitted {
+                db.extend_injection_with_registration_backup(&before, &written, &backup)?;
+            }
+            Ok(())
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("recording failure"));
+        recover_locked_root(&root, Default::default(), &mut |_| Ok(())).unwrap();
+        for (rel, _) in files {
+            assert_eq!(fs::read(root.join(rel)).unwrap(), b"original bytes");
+        }
+        assert_eq!(db.get_injection(Some("es")).unwrap().unwrap(), before);
+        assert!(db.registration_backups(Some("es")).unwrap().is_empty());
+    }
 
     // Private, exclusively owned fixtures exercise the transaction engine without
     // the per-user lock directory, which some CI sandboxes cannot write. Public

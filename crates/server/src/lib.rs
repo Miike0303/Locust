@@ -1606,6 +1606,7 @@ struct RegisterLangRequest {
 /// Patch Iavra/VisuMZ language lists + Map boot choices so a new lang is
 /// selectable in the game UI. Writes `*.bak-locust` siblings (same as CLI).
 async fn register_lang(
+    State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterLangRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let game_path = PathBuf::from(req.game_path.trim());
@@ -1620,8 +1621,22 @@ async fn register_lang(
     }
     let lang = req.lang;
     let label = req.label;
+    let guard =
+        try_project_operation(&state).map_err(|message| err(StatusCode::CONFLICT, message))?;
+    let db = state
+        .current_project
+        .read()
+        .await
+        .as_ref()
+        .map(|_| state.db.clone());
     let report = tokio::task::spawn_blocking(move || {
-        locust_formats::rpgmaker_lang::register_language(&game_path, &lang, &label)
+        let _guard = guard;
+        locust_formats::rpgmaker_lang::register_language_with_db(
+            &game_path,
+            &lang,
+            &label,
+            db.as_deref(),
+        )
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
@@ -3129,6 +3144,266 @@ mod download_guard_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registration_fixture(root: &Path) -> Vec<(&'static str, Vec<u8>)> {
+        let map = serde_json::json!({"events": [null, {"pages": [{"list": [
+            {"code":102,"indent":0,"parameters":[["日本語","ENGLISH","中文"],-1,0,1,0]},
+            {"code":402,"indent":0,"parameters":[1,"ENGLISH"]},
+            {"code":355,"indent":1,"parameters":["IAVRA.MasterLocalization.I18N.language = 'en';"]},
+            {"code":0,"indent":1,"parameters":[]},
+            {"code":404,"indent":0,"parameters":[]}
+        ]}]}]});
+        let plugins = r#"var $plugins = [{"name":"Iavra_MZ_Localization_byNeomaStudio","status":true,"parameters":{"Languages":"jp, en, zh","Language Labels":"en:English, jp:日本語, zh:中文"}},{"name":"VisuMZ_1_OptionsCore","status":true,"parameters":{"Language":"const langs = ['jp', 'en', 'zh']; IAVRA.MasterLocalization.I18N.language = langs[value];"}}];"#;
+        let files = vec![
+            ("js/rmmz_core.js", b"// MZ".to_vec()),
+            ("js/plugins.js", plugins.as_bytes().to_vec()),
+            (
+                "data/System.json",
+                br#"{"gameTitle":"Registration fixture"}"#.to_vec(),
+            ),
+            ("data/Map001.json", serde_json::to_vec(&map).unwrap()),
+            ("data/lang_g_en.json", br#"{"greeting":"Hello"}"#.to_vec()),
+        ];
+        for (rel, bytes) in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        files
+    }
+
+    fn registration_entries(state: &Arc<AppState>, game: &Path) -> String {
+        use locust_core::extraction::FormatPlugin;
+        let plugin = locust_formats::rpgmaker_mv::RpgMakerMvPlugin::new();
+        let mut entries = plugin.extract(game).unwrap();
+        entries.retain(|entry| entry.file_path.ends_with("lang_g_en.json"));
+        assert_eq!(entries.len(), 1);
+        entries[0].translation = Some("Hola".into());
+        entries[0].status = StringStatus::Translated;
+        state.db.save_entries(&entries).unwrap();
+        plugin.id().into()
+    }
+
+    async fn registration_add(state: &Arc<AppState>, game: &Path) {
+        let format = registration_entries(state, game);
+        let injector = MultiLangInjector::new(
+            state.format_registry.clone(),
+            state.db.clone(),
+            state.backup_manager.clone(),
+        );
+        let (tx, _rx) = mpsc::channel(32);
+        let report = injector
+            .inject(game, &format, OutputMode::Add, vec!["es".into()], None, tx)
+            .await
+            .unwrap();
+        assert!(
+            report.languages_failed.is_empty(),
+            "{:?}",
+            report.languages_failed
+        );
+        assert_eq!(report.languages_processed, ["es"]);
+        assert!(game.join("data/lang_g_es.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn pack_add_registration_roundtrip() {
+        use locust_core::patch::pack::{pack_with_pristine_backup, PackOptions};
+        use locust_core::patch::{apply, rollback, ApplyOptions, RollbackOptions};
+        let work = tempfile::tempdir().unwrap();
+        let author = work.path().join("author");
+        let player = work.path().join("player");
+        let originals = registration_fixture(&author);
+        registration_fixture(&player);
+        let (url, server, state) = setup_with_state().await;
+        registration_add(&state, &author).await;
+        *state.current_project.write().await = Some(ProjectInfo {
+            path: author.clone(),
+            ..ProjectInfo::default()
+        });
+        let response = client()
+            .post(format!("{url}/api/register-lang"))
+            .json(&serde_json::json!({"game_path":author,"lang":"es","label":"Español"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+        for rel in ["js/plugins.js", "data/Map001.json"] {
+            assert_ne!(
+                std::fs::read(author.join(rel)).unwrap(),
+                std::fs::read(player.join(rel)).unwrap()
+            );
+        }
+        let registered = state.db.get_injection(Some("es")).unwrap();
+        let registration_backups = state.db.registration_backups(Some("es")).unwrap();
+        let again = locust_formats::rpgmaker_lang::register_language_with_db(
+            &author,
+            "es",
+            "Español",
+            Some(&state.db),
+        )
+        .unwrap();
+        assert!(!again.plugins_js);
+        assert!(again.maps_patched.is_empty());
+        assert_eq!(state.db.get_injection(Some("es")).unwrap(), registered);
+        let mut entries = state.db.get_entries(&EntryFilter::default()).unwrap();
+        entries[0].translation = Some("Buenos días".into());
+        state.db.save_entries(&entries).unwrap();
+        let injector = MultiLangInjector::new(
+            state.format_registry.clone(),
+            state.db.clone(),
+            state.backup_manager.clone(),
+        );
+        let (tx, _rx) = mpsc::channel(32);
+        let format = state.format_registry.detect(&author).unwrap().id();
+        let revised = injector
+            .inject(
+                &author,
+                format,
+                OutputMode::Add,
+                vec!["es".into()],
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            revised.languages_failed.is_empty(),
+            "{:?}",
+            revised.languages_failed
+        );
+        assert_eq!(
+            state.db.registration_backups(Some("es")).unwrap(),
+            registration_backups
+        );
+        let zip = work.path().join("spanish.zip");
+        let packed = pack_with_pristine_backup(
+            &state.db,
+            PackOptions {
+                game_path: author.clone(),
+                lang: Some("es".into()),
+                output: zip.clone(),
+                pristine: None,
+                engine: Some("rpgmaker-mv".into()),
+                project: state.db.path(),
+                require_pristine: false,
+                game: None,
+            },
+            &state.backup_manager,
+            None,
+            true,
+        )
+        .unwrap();
+        let applied = apply(&player, &zip, ApplyOptions::default(), |_| {}).unwrap();
+        for rel in ["js/plugins.js", "data/Map001.json", "data/lang_g_es.json"] {
+            assert_eq!(
+                std::fs::read(player.join(rel)).unwrap(),
+                std::fs::read(author.join(rel)).unwrap(),
+                "distributed {rel} must match the registered author copy"
+            );
+        }
+        assert_eq!(packed.files_packed, 3);
+        assert_eq!(packed.tier, "strict");
+        assert_eq!((applied.replaced, applied.added), (2, 1));
+        let rolled_back = rollback(&player, RollbackOptions::default()).unwrap();
+        assert_eq!((rolled_back.restored, rolled_back.deleted), (2, 1));
+        for (rel, bytes) in originals {
+            assert_eq!(
+                std::fs::read(player.join(rel)).unwrap(),
+                bytes,
+                "rollback {rel}"
+            );
+        }
+        assert!(!player.join("data/lang_g_es.json").exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pack_add_registration_without_db_keeps_recording() {
+        let game = tempfile::tempdir().unwrap();
+        registration_fixture(game.path());
+        let state = create_test_state();
+        registration_add(&state, game.path()).await;
+        let before = state.db.get_injection(Some("es")).unwrap();
+        let report =
+            locust_formats::rpgmaker_lang::register_language(game.path(), "es", "Español").unwrap();
+        assert!(report.plugins_js);
+        assert_eq!(report.maps_patched.len(), 1);
+        assert_eq!(state.db.get_injection(Some("es")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn pack_add_registration_without_matching_recording_keeps_database() {
+        let author = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        registration_fixture(author.path());
+        registration_fixture(other.path());
+        let state = create_test_state();
+        let report = locust_formats::rpgmaker_lang::register_language_with_db(
+            other.path(),
+            "es",
+            "Español",
+            Some(&state.db),
+        )
+        .unwrap();
+        assert!(report.plugins_js);
+        assert!(state.db.list_recorded_langs().unwrap().is_empty());
+        registration_add(&state, author.path()).await;
+        let before = state.db.get_injection(Some("es")).unwrap();
+        // A different root, then a different language, must not change this recording.
+        registration_fixture(other.path());
+        for (game, lang, label) in [
+            (other.path(), "es", "Español"),
+            (author.path(), "fr", "Français"),
+        ] {
+            locust_formats::rpgmaker_lang::register_language_with_db(
+                game,
+                lang,
+                label,
+                Some(&state.db),
+            )
+            .unwrap();
+        }
+        assert_eq!(state.db.get_injection(Some("es")).unwrap(), before);
+        assert_eq!(
+            state.db.list_recorded_langs().unwrap(),
+            vec![Some("es".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_add_registration_leaves_direct_recording_untouched() {
+        let game = tempfile::tempdir().unwrap();
+        registration_fixture(game.path());
+        let (url, server, state) = setup_with_state().await;
+        let format = registration_entries(&state, game.path());
+        locust_core::extraction::inject_direct(
+            &state.format_registry,
+            &state.db,
+            &state.backup_manager,
+            game.path(),
+            &format,
+            &["es".into()],
+        )
+        .unwrap();
+        let before = state.db.get_injection(Some("es")).unwrap();
+        assert!(before.is_some());
+        *state.current_project.write().await = Some(ProjectInfo {
+            path: game.path().to_owned(),
+            ..ProjectInfo::default()
+        });
+        let response = client()
+            .post(format!("{url}/api/register-lang"))
+            .json(&serde_json::json!({"game_path":game.path(),"lang":"es","label":"Español"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+        assert!(std::fs::read_to_string(game.path().join("js/plugins.js"))
+            .unwrap()
+            .contains("Español"));
+        assert_eq!(state.db.get_injection(Some("es")).unwrap(), before);
+        server.abort();
+    }
 
     static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

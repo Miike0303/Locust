@@ -745,7 +745,10 @@ pub struct RegisterLangParams {
 /// Register a language in RM MZ multi-lang UI (Iavra / VisuMZ / Map choices).
 /// Same as CLI `locust register-lang`. Mutates game files; writes `*.bak-locust`.
 #[tauri::command]
-pub async fn register_lang(params: RegisterLangParams) -> Result<serde_json::Value, String> {
+pub async fn register_lang(
+    params: RegisterLangParams,
+    state: State<'_, AppStateWrapper>,
+) -> Result<serde_json::Value, String> {
     let game_path = PathBuf::from(params.game_path.trim());
     if params.game_path.trim().is_empty() || !game_path.is_dir() {
         return Err(format!(
@@ -755,8 +758,22 @@ pub async fn register_lang(params: RegisterLangParams) -> Result<serde_json::Val
     }
     let lang = params.lang;
     let label = params.label;
+    let guard = try_project_operation(&state.0)?;
+    let db = state
+        .0
+        .current_project
+        .read()
+        .await
+        .as_ref()
+        .map(|_| state.0.db.clone());
     let report = tokio::task::spawn_blocking(move || {
-        locust_formats::rpgmaker_lang::register_language(&game_path, &lang, &label)
+        let _guard = guard;
+        locust_formats::rpgmaker_lang::register_language_with_db(
+            &game_path,
+            &lang,
+            &label,
+            db.as_deref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?

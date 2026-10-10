@@ -429,6 +429,51 @@ fn select_pack_recording(db: &Database, opts: &PackOptions) -> Result<(Injection
     Ok((recording, translated))
 }
 
+fn load_registration_originals(
+    db: &Database,
+    recording: &InjectionRecording,
+    output: &Path,
+) -> Result<std::collections::HashMap<String, (String, u64)>> {
+    // Registration may follow Add after an author edits a menu/map. Its exact
+    // originals live in regular verified backups, separate from Add's baseline.
+    let mut registration_groups = std::collections::BTreeMap::new();
+    for (rel, backup) in db.registration_backups(recording.lang.as_deref())? {
+        let key = serde_json::to_string(&backup)?;
+        registration_groups
+            .entry(key)
+            .or_insert_with(|| (backup, Vec::new()))
+            .1
+            .push(rel);
+    }
+    let mut registration_originals = std::collections::HashMap::new();
+    for (_, (backup, rels)) in registration_groups {
+        if !paths_identical(&backup.source_path, &recording.root) {
+            return Err(pack_err("registration backup belongs to a different game"));
+        }
+        let storage = backup
+            .storage_root
+            .as_ref()
+            .filter(|root| root.is_absolute())
+            .ok_or_else(|| pack_err("registration backup store must be absolute"))?;
+        ensure_pack_output_outside(output, storage)?;
+        let manager = crate::backup::BackupManager::new(storage.clone());
+        manager.with_verified_pristine_tree(&backup.id, &backup.source_path, |tree| {
+            for rel in rels {
+                let path = super::zipsec::safe_stored_rel(&rel)?;
+                let original = hash_original_file(tree.root(), &path)?
+                    .ok_or_else(|| pack_err(format!("registration original is missing: {rel}")))?;
+                if tree.original_sha256(&path)? != Some(original.0.as_str()) {
+                    return Err(pack_err("registration backup changed after validation"));
+                }
+                registration_originals.insert(rel, original);
+            }
+            Ok(())
+        })?;
+    }
+
+    Ok(registration_originals)
+}
+
 fn pack_selected_recording(
     db: &Database,
     opts: PackOptions,
@@ -449,6 +494,8 @@ fn pack_selected_recording(
             "injection recording changed while selecting its backup; reopen Pack and retry",
         ));
     }
+
+    let registration_originals = load_registration_originals(db, recording, &opts.output)?;
 
     let out = opts.output;
     ensure_pack_output_outside(&out, &recording.root)?;
@@ -506,12 +553,12 @@ fn pack_selected_recording(
         }
     };
 
-    if opts.require_pristine && pristine_root.is_none() {
+    if opts.require_pristine && pristine_root.is_none() && registration_originals.is_empty() {
         return Err(pack_err(
             "pristine hashes required but no --pristine path and no valid .locust/backup found",
         ));
     }
-    if pristine_root.is_none() {
+    if pristine_root.is_none() && registration_originals.is_empty() {
         messages.push(
             "packing without original hashes (no pristine path, no .locust/backup); \
              apply will use structural verification"
@@ -557,13 +604,16 @@ fn pack_selected_recording(
             changed.push(f.rel.clone());
             continue;
         }
-        let original = match &pristine_root {
-            Some(root) => hash_original_file(root, rel)?,
-            None => None,
+        let original = match (registration_originals.get(&f.rel), &pristine_root) {
+            (Some(original), _) => Some(original.clone()),
+            (None, Some(root)) => hash_original_file(root, rel)?,
+            (None, None) => None,
         };
         let original_sha256 = original.as_ref().map(|(hash, _)| hash.clone());
         if let Some(pristine) = verified_pristine {
-            if original_sha256.as_deref() != pristine.original_sha256(rel)? {
+            if !registration_originals.contains_key(&f.rel)
+                && original_sha256.as_deref() != pristine.original_sha256(rel)?
+            {
                 return Err(pack_err(format!(
                     "injection backup changed after validation at {}; packing refused",
                     rel.display()
@@ -751,6 +801,46 @@ impl Drop for TempFileGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registration_originals_use_verified_pre_registration_bytes() {
+        use crate::database::{sha256_hex, Database, RecordedBackup};
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        std::fs::create_dir(&game).unwrap();
+        let pack = game.join("lang_es.json");
+        let menu = game.join("plugins.js");
+        std::fs::write(&pack, b"Spanish pack").unwrap();
+        std::fs::write(&menu, b"author menu before registration").unwrap();
+        let manager = crate::backup::BackupManager::new(temp.path().join("backups"));
+        let backup = manager.create_backup(&game).unwrap();
+        let provenance = RecordedBackup {
+            id: backup.id,
+            source_path: backup.source_path,
+            storage_root: Some(manager.root().to_owned()),
+        };
+        let db = Database::open_in_memory().unwrap();
+        db.record_injection(Some("es"), &game, &[pack]).unwrap();
+        let before = db.get_injection(Some("es")).unwrap().unwrap();
+        std::fs::write(&menu, b"Spanish registered menu").unwrap();
+        db.extend_injection_with_registration_backup(&before, &[menu], &provenance)
+            .unwrap();
+        let after = db.get_injection(Some("es")).unwrap().unwrap();
+        let output = temp.path().join("patch.zip");
+        let originals = super::load_registration_originals(&db, &after, &output).unwrap();
+        assert_eq!(originals.len(), 1, "the Add pack must remain an added file");
+        assert_eq!(
+            originals["plugins.js"],
+            (
+                sha256_hex(b"author menu before registration"),
+                b"author menu before registration".len() as u64
+            )
+        );
+        std::fs::write(backup.path.join("payload/plugins.js"), b"corrupted backup").unwrap();
+        assert!(super::load_registration_originals(&db, &after, &output)
+            .unwrap_err()
+            .to_string()
+            .contains("mismatch"));
+    }
     use super::*;
     use crate::models::{StringEntry, StringStatus};
     use std::fs;

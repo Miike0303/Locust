@@ -29,6 +29,105 @@ pub struct Database {
     path: Mutex<PathBuf>,
 }
 
+#[cfg(test)]
+mod registration_recording_tests {
+    use super::*;
+
+    #[test]
+    fn registration_extension_keeps_outputs_and_first_originals() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let pack = root.path().join("lang_es.json");
+        let menu = root.path().join("plugins.js");
+        std::fs::write(&pack, b"Spanish pack").unwrap();
+        std::fs::write(&menu, b"Spanish menu").unwrap();
+        db.record_injection(Some("es"), root.path(), std::slice::from_ref(&pack))
+            .unwrap();
+        let first = db.get_injection(Some("es")).unwrap().unwrap();
+        let backup = RecordedBackup {
+            id: "first".into(),
+            source_path: root.path().to_owned(),
+            storage_root: None,
+        };
+        db.extend_injection_with_registration_backup(&first, std::slice::from_ref(&menu), &backup)
+            .unwrap();
+        let registered = db.get_injection(Some("es")).unwrap().unwrap();
+        assert_eq!(registered.files.len(), 2);
+        assert_eq!(registered.files[0], first.files[0]);
+        let file = registered
+            .files
+            .iter()
+            .find(|f| f.rel == "plugins.js")
+            .unwrap();
+        assert_eq!((file.hash.clone(), file.size), sha256_file(&menu).unwrap());
+        std::fs::write(&menu, b"Updated Spanish menu").unwrap();
+        let later = RecordedBackup {
+            id: "later".into(),
+            ..backup.clone()
+        };
+        db.extend_injection_with_registration_backup(
+            &registered,
+            std::slice::from_ref(&menu),
+            &later,
+        )
+        .unwrap();
+        assert_eq!(
+            db.registration_backups(Some("es")).unwrap(),
+            vec![("plugins.js".into(), backup.clone())]
+        );
+        let updated = db.get_injection(Some("es")).unwrap().unwrap();
+        std::fs::write(&pack, b"Revised Spanish pack").unwrap();
+        db.extend_injection_recording(&updated, std::slice::from_ref(&pack), None)
+            .unwrap();
+        assert_eq!(
+            db.registration_backups(Some("es")).unwrap(),
+            vec![("plugins.js".into(), backup)]
+        );
+        assert_eq!(
+            db.get_injection(Some("es")).unwrap().unwrap().files.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn registration_extension_rejects_stale_generation_and_unrelated_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let pack = root.path().join("lang_es.json");
+        let menu = root.path().join("plugins.js");
+        std::fs::write(&pack, b"Spanish pack").unwrap();
+        std::fs::write(&menu, b"Spanish menu").unwrap();
+        db.record_injection(Some("es"), root.path(), std::slice::from_ref(&pack))
+            .unwrap();
+        let before = db.get_injection(Some("es")).unwrap().unwrap();
+        let backup = RecordedBackup {
+            id: "first".into(),
+            source_path: root.path().to_owned(),
+            storage_root: None,
+        };
+        std::fs::write(&pack, b"external edit").unwrap();
+        assert!(db
+            .extend_injection_with_registration_backup(
+                &before,
+                std::slice::from_ref(&menu),
+                &backup
+            )
+            .is_err());
+        assert_eq!(db.get_injection(Some("es")).unwrap().unwrap(), before);
+        std::fs::write(&pack, b"Spanish pack").unwrap();
+        db.record_injection(Some("es"), root.path(), std::slice::from_ref(&menu))
+            .unwrap();
+        let replacement = db.get_injection(Some("es")).unwrap();
+        assert!(db
+            .extend_injection_with_registration_backup(&before, &[menu], &backup)
+            .unwrap_err()
+            .to_string()
+            .contains("recording changed"));
+        assert_eq!(db.get_injection(Some("es")).unwrap(), replacement);
+        assert!(db.registration_backups(Some("es")).unwrap().is_empty());
+    }
+}
+
 pub const TRANSLATION_CONFLICT_MESSAGE: &str = "translation changed since it was loaded";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -676,6 +775,18 @@ fn init_schema(conn: &Connection) -> Result<()> {
     if !has_pristine_backup {
         conn.execute(
             "ALTER TABLE injected_files ADD COLUMN pristine_backup TEXT",
+            [],
+        )?;
+    }
+    let has_registration_backup = conn
+        .prepare("PRAGMA table_info(injected_files)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "registration_backup");
+    if !has_registration_backup {
+        conn.execute(
+            "ALTER TABLE injected_files ADD COLUMN registration_backup TEXT",
             [],
         )?;
     }
@@ -1680,6 +1791,65 @@ impl Database {
         written: &[PathBuf],
         pristine_backup: Option<&RecordedBackup>,
     ) -> Result<()> {
+        self.record_injection_generation(lang, root, written, pristine_backup, None)
+    }
+
+    /// Extend a checked generation atomically. Newly recorded registration files
+    /// retain their pre-registration backup; repeated registration retains the
+    /// first original. Ordinary injection recording clears these associations.
+    pub fn extend_injection_with_registration_backup(
+        &self,
+        expected: &InjectionRecording,
+        written: &[PathBuf],
+        backup: &RecordedBackup,
+    ) -> Result<()> {
+        self.extend_injection_recording(expected, written, Some(backup))
+    }
+
+    /// Merge another Add output into its checked generation without losing
+    /// registration originals. The caller holds the game lock throughout.
+    pub(crate) fn extend_injection_recording(
+        &self,
+        expected: &InjectionRecording,
+        written: &[PathBuf],
+        registration_backup: Option<&RecordedBackup>,
+    ) -> Result<()> {
+        if written.is_empty() {
+            return Ok(());
+        }
+        let changed: HashSet<_> = written
+            .iter()
+            .filter_map(|path| rel_under_root(path, &expected.root))
+            .map(|rel| fold_path_case(&rel))
+            .collect();
+        for file in &expected.files {
+            if !changed.contains(&fold_path_case(&file.rel)) {
+                crate::extraction::verify_recorded_injection_member(&expected.root, file)?;
+            }
+        }
+        let mut files: Vec<_> = expected
+            .files
+            .iter()
+            .map(|f| expected.root.join(&f.rel))
+            .collect();
+        files.extend_from_slice(written);
+        self.record_injection_generation(
+            expected.lang.as_deref(),
+            &expected.root,
+            &files,
+            expected.pristine_backup.as_ref(),
+            Some((expected, registration_backup)),
+        )
+    }
+
+    fn record_injection_generation(
+        &self,
+        lang: Option<&str>,
+        root: &Path,
+        written: &[PathBuf],
+        pristine_backup: Option<&RecordedBackup>,
+        extension: Option<(&InjectionRecording, Option<&RecordedBackup>)>,
+    ) -> Result<()> {
         if written.is_empty() {
             return Ok(());
         }
@@ -1735,13 +1905,36 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         let conn = lock_connection(&self.conn);
         let tx = conn.unchecked_transaction()?;
+        let mut registration_backups = HashMap::new();
+        if let Some((expected, backup)) = extension {
+            if Self::get_injection_from(&tx, lang)?.as_ref() != Some(expected) {
+                return Err(LocustError::InjectionError(
+                    "injection recording changed during language registration".into(),
+                ));
+            }
+            let mut stmt =
+                tx.prepare("SELECT rel, registration_backup FROM injected_files WHERE lang IS ?1")?;
+            let saved = stmt.query_map(params![lang], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in saved {
+                let (rel, backup) = row?;
+                registration_backups.insert(fold_path_case(&rel), backup);
+            }
+            let backup = backup.map(serde_json::to_string).transpose()?;
+            for (rel, _, _) in &rows {
+                registration_backups
+                    .entry(fold_path_case(rel))
+                    .or_insert_with(|| backup.clone());
+            }
+        }
         tx.execute("DELETE FROM injected_files WHERE lang IS ?1", params![lang])?;
         // Same class as save_entries/merge_entries: one plan for N file rows
         // (Unreal/Unity injects can record hundreds of written paths).
         {
             let mut insert = tx.prepare_cached(
-                "INSERT INTO injected_files (lang, root, rel, hash, size, recorded_at, pristine_backup)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO injected_files (lang, root, rel, hash, size, recorded_at, pristine_backup, registration_backup)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for (rel, hash, size) in &rows {
                 insert.execute(params![
@@ -1751,7 +1944,10 @@ impl Database {
                     hash,
                     *size as i64,
                     now,
-                    pristine_backup
+                    pristine_backup,
+                    registration_backups
+                        .get(&fold_path_case(rel))
+                        .and_then(Option::as_ref)
                 ])?;
             }
         }
@@ -1764,6 +1960,13 @@ impl Database {
     /// named one, and vice versa. `Ok(None)` when nothing is recorded for it.
     pub fn get_injection(&self, lang: Option<&str>) -> Result<Option<InjectionRecording>> {
         let conn = lock_connection(&self.conn);
+        Self::get_injection_from(&conn, lang)
+    }
+
+    fn get_injection_from(
+        conn: &Connection,
+        lang: Option<&str>,
+    ) -> Result<Option<InjectionRecording>> {
         let mut stmt = conn.prepare(
             "SELECT root, rel, hash, size, recorded_at, pristine_backup FROM injected_files
              WHERE lang IS ?1 ORDER BY id ASC",
@@ -1818,6 +2021,33 @@ impl Database {
         }
     }
 
+    /// Exact verified backup used for each registration-only replaced file.
+    pub fn registration_backups(
+        &self,
+        lang: Option<&str>,
+    ) -> Result<Vec<(String, RecordedBackup)>> {
+        let conn = lock_connection(&self.conn);
+        let mut stmt = conn.prepare("SELECT rel, registration_backup FROM injected_files WHERE lang IS ?1 AND registration_backup IS NOT NULL")?;
+        let rows = stmt.query_map(params![lang], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (rel, backup) = row?;
+            Ok((rel, serde_json::from_str(&backup)?))
+        })
+        .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_registration_recording(&self) {
+        lock_connection(&self.conn)
+            .execute_batch(
+                "CREATE TRIGGER fail_registration BEFORE INSERT ON injected_files
+             BEGIN SELECT RAISE(ABORT, 'recording failure'); END;",
+            )
+            .unwrap();
+    }
+
     /// The pristine backup for each recorded language that has one.
     /// Decode through `get_injection` so provenance and JSON errors are preserved.
     pub fn recorded_backup_refs(&self) -> Result<Vec<(Option<String>, RecordedBackup)>> {
@@ -1828,6 +2058,11 @@ impl Database {
                 .and_then(|recording| recording.pristine_backup)
             {
                 refs.push((lang, backup));
+            }
+        }
+        for lang in self.list_recorded_langs()? {
+            for (_, backup) in self.registration_backups(lang.as_deref())? {
+                refs.push((lang.clone(), backup));
             }
         }
         Ok(refs)

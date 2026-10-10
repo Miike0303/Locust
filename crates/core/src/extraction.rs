@@ -1034,26 +1034,49 @@ impl MultiLangInjector {
                 plugin.id(),
                 Some(lang),
                 || {
+                    let prior = crate::injection_transaction::matching_add_recording(
+                        recording_root,
+                        &self.db,
+                        lang,
+                    )?;
                     let backup = self.backup_manager.create_backup(&selected).map_err(|e| {
                         LocustError::BackupError(format!(
                             "{e} — injection is refused without a backup for recovery"
                         ))
                     })?;
                     created_backup = Some(backup.id.clone());
-                    Ok(backup)
+                    Ok((backup, prior))
                 },
                 |work, selected_copy| {
                     let entries = entries_for_copy(entries, &selected, work)?;
                     plugin.inject_add(selected_copy, lang, &entries)
                 },
-                |report| {
-                    record_injection_for_lang(
+                |report, (backup, prior)| {
+                    if let Some(prior) = prior {
+                        if !report.files_written.is_empty() {
+                            self.db.extend_injection_recording(
+                                prior,
+                                &report.files_written,
+                                None,
+                            )?;
+                            return Ok(RecordOutcome::Recorded {
+                                files: self.db.get_injection(Some(lang))?.unwrap().files.len(),
+                            });
+                        }
+                    }
+                    let provenance = RecordedBackup {
+                        id: backup.id.clone(),
+                        source_path: backup.source_path.clone(),
+                        storage_root: Some(std::path::absolute(self.backup_manager.root())?),
+                    };
+                    record_injection_for_lang_with_backup(
                         &self.db,
                         Some(lang),
                         recording_root,
                         &report.files_written,
                         "Inspect the injection transaction and recover before retrying.",
-                        None,
+                        Some(&backup.id),
+                        Some(&provenance),
                     )
                 },
             );

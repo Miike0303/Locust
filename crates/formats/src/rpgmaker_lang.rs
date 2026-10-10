@@ -7,9 +7,12 @@
 
 use std::path::{Path, PathBuf};
 
+use locust_core::database::{Database, RecordedBackup};
 use locust_core::encoding::EncodingDetector;
 use locust_core::error::{LocustError, Result};
-use locust_core::injection_transaction::{ensure_no_pending_under_lock, write_files_under_lock};
+use locust_core::injection_transaction::{
+    add_recording_under_lock, ensure_no_pending_under_lock, write_files_and_record_under_lock,
+};
 use locust_core::patch::GameLock;
 use serde::Serialize;
 
@@ -34,6 +37,18 @@ pub fn register_language(
     game_root: &Path,
     lang: &str,
     label: &str,
+) -> Result<RegisterLanguageReport> {
+    register_language_with_db(game_root, lang, label, None)
+}
+
+/// Register a language and extend only a matching Add recording, when supplied.
+/// Files and their recording commit under the same game lock. Games without a
+/// matching Add recording keep the standalone registration behavior.
+pub fn register_language_with_db(
+    game_root: &Path,
+    lang: &str,
+    label: &str,
+    db: Option<&Database>,
 ) -> Result<RegisterLanguageReport> {
     let lang = lang.trim();
     let label = label.trim();
@@ -98,7 +113,7 @@ pub fn register_language(
     }
 
     // Every read, decode and parse has succeeded before the first backup/write.
-    report.backups = write_planned_files(&lock, game_root, &planned)?;
+    report.backups = write_planned_files(&lock, game_root, &planned, db, lang)?;
     Ok(report)
 }
 
@@ -112,6 +127,8 @@ fn write_planned_files(
     lock: &GameLock,
     game_root: &Path,
     planned: &[PlannedFile],
+    db: Option<&Database>,
+    lang: &str,
 ) -> Result<Vec<PathBuf>> {
     let mut created_backups = Vec::new();
     let result = (|| {
@@ -132,14 +149,99 @@ fn write_planned_files(
                 files.push((relative.to_owned(), content.as_bytes().to_vec()));
             }
         }
+        let recording = if files.is_empty() {
+            None
+        } else {
+            db.map(|db| add_recording_under_lock(lock, db, lang))
+                .transpose()?
+                .flatten()
+        };
+        let registration_backup = if let Some(recording) = &recording {
+            // Capture these exact pre-registration bytes, even if a map was
+            // edited after Add. Keep the Add backup for its own original files.
+            let db_path = db.expect("recording requires a database").path();
+            let storage = recording
+                .pristine_backup
+                .as_ref()
+                .and_then(|backup| backup.storage_root.clone())
+                .unwrap_or_else(|| {
+                    db_path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or_else(|| lock.root().parent().unwrap())
+                        .join("locust-registration-backups")
+                });
+            let manager = locust_core::backup::BackupManager::new(std::path::absolute(storage)?);
+            let originals_match = |tree: &Path| -> Result<bool> {
+                for file in planned.iter().filter(|file| file.content.is_some()) {
+                    let relative = file.path.strip_prefix(game_root).map_err(|_| {
+                        LocustError::InjectionError(
+                            "language registration path escaped game root".into(),
+                        )
+                    })?;
+                    if std::fs::read(tree.join(relative)).ok().as_deref() != Some(&file.original) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            };
+            let reusable = recording.pristine_backup.as_ref().filter(|backup| {
+                backup.storage_root.as_deref() == Some(manager.root())
+                    && locust_core::database::paths_identical(&backup.source_path, lock.root())
+            });
+            let reusable = match reusable {
+                Some(backup)
+                    if manager.with_pristine_tree(
+                        &backup.id,
+                        &backup.source_path,
+                        originals_match,
+                    )? =>
+                {
+                    Some(backup)
+                }
+                _ => None,
+            };
+            if let Some(backup) = reusable {
+                Some(backup.clone())
+            } else {
+                let backup = manager.create_backup(lock.root())?;
+                if !manager.with_pristine_tree(&backup.id, &backup.source_path, originals_match)? {
+                    return Err(LocustError::InjectionError(
+                        "game changed while backing up language registration".into(),
+                    ));
+                }
+                Some(RecordedBackup {
+                    id: backup.id,
+                    source_path: backup.source_path,
+                    storage_root: Some(manager.root().to_owned()),
+                })
+            }
+        } else {
+            None
+        };
         for file in planned {
             backups.push(backup_file(&file.path, &mut created_backups)?);
         }
-        write_files_under_lock(lock, &files, "register-language", |_index| {
-            #[cfg(test)]
-            tests::after_install(_index);
-            Ok(())
-        })?;
+        write_files_and_record_under_lock(
+            lock,
+            &files,
+            "register-language",
+            |_index| {
+                #[cfg(test)]
+                tests::after_install(_index);
+                Ok(())
+            },
+            || {
+                if let (Some(db), Some(recording), Some(backup)) =
+                    (db, &recording, &registration_backup)
+                {
+                    let written: Vec<_> =
+                        files.iter().map(|(rel, _)| lock.root().join(rel)).collect();
+                    db.extend_injection_with_registration_backup(recording, &written, backup)?;
+                }
+                Ok(())
+            },
+        )?;
         Ok(backups)
     })();
     if result.is_err() {

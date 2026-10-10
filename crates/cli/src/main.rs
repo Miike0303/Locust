@@ -303,6 +303,9 @@ enum Commands {
     RegisterLang {
         /// Deployed game root (folder with js/ and data/)
         game_path: PathBuf,
+        /// Project database whose matching Add recording should include registration
+        #[arg(short = 'P', long)]
+        project: Option<PathBuf>,
         /// Language code written into packs/options (e.g. es)
         #[arg(short, long)]
         lang: String,
@@ -557,9 +560,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Formats => cmd_formats()?,
         Commands::RegisterLang {
             game_path,
+            project,
             lang,
             label,
-        } => cmd_register_lang(game_path, lang, label)?,
+        } => cmd_register_lang(game_path, project, lang, label)?,
         Commands::Glossary { action } => cmd_glossary(action)?,
         Commands::Export {
             project,
@@ -2249,8 +2253,19 @@ fn cmd_formats() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_register_lang(game_path: PathBuf, lang: String, label: String) -> anyhow::Result<()> {
-    let report = locust_formats::rpgmaker_lang::register_language(&game_path, &lang, &label)?;
+fn cmd_register_lang(
+    game_path: PathBuf,
+    project: Option<PathBuf>,
+    lang: String,
+    label: String,
+) -> anyhow::Result<()> {
+    let db = project.as_deref().map(Database::open).transpose()?;
+    let report = locust_formats::rpgmaker_lang::register_language_with_db(
+        &game_path,
+        &lang,
+        &label,
+        db.as_ref(),
+    )?;
     println!(
         "register-lang {} → {} ({})",
         game_path.display(),
