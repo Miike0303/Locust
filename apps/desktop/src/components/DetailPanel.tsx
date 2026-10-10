@@ -14,19 +14,19 @@ const statusButtons: { value: StringStatus; labelKey: MessageKey; color: string 
 	{
 		value: "pending",
 		labelKey: "detail.status.pending",
-		color: "bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200",
+		color: "bg-border text-text",
 	},
 	{
 		value: "reviewed",
 		labelKey: "detail.status.reviewed",
 		color:
-			"bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200",
+			"bg-warning-muted text-warning",
 	},
 	{
 		value: "approved",
 		labelKey: "detail.status.approved",
 		color:
-			"bg-green-100 text-green-800 dark:bg-green-900/60 dark:text-green-200",
+			"bg-success-muted text-success",
 	},
 ];
 
@@ -101,14 +101,14 @@ export default function DetailPanel({
 		srcSlotBytes != null && trSlotBytes != null && trSlotBytes > srcSlotBytes;
 
 	return (
-		<aside className="w-[340px] border-l border-gray-200 dark:border-gray-700 overflow-y-auto bg-white dark:bg-gray-900 flex flex-col">
-			<div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
-				<h3 className="text-xs font-semibold text-gray-700 dark:text-gray-200">
+		<aside className="w-[340px] border-l border-border overflow-y-auto bg-surface flex flex-col">
+			<div className="px-3 py-2 border-b border-border flex justify-between items-center">
+				<h3 className="text-caption font-semibold text-text">
 					{t("detail.title")}
 				</h3>
 				<button
 					onClick={onClose}
-					className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-lg"
+					className="text-text-muted hover:text-text text-section"
 					aria-label={t("detail.closeAria")}
 				>
 					&times;
@@ -117,33 +117,33 @@ export default function DetailPanel({
 
 			<div className="p-3 space-y-3 flex-1">
 				{Object.prototype.hasOwnProperty.call(entry.metadata ?? {}, "locust_stale_translation") && (
-					<p className="text-xs text-amber-800 dark:text-amber-200 bg-amber-50 dark:bg-amber-950/40 rounded p-2">
+					<p className="text-caption text-warning bg-warning-muted rounded p-2">
 						<strong>{t("validate.kind.staleLabel")}. </strong>{t("validate.kind.staleDetail")}
 					</p>
 				)}
-				{(actionError || draft?.error) && <p role="alert" className="text-xs text-red-700 dark:text-red-300 break-words">{actionError || draft?.error}</p>}
-                {persistenceIssue && <p role="alert" className="text-xs text-red-700 dark:text-red-300">{t("detail.draftStorageFailed")}</p>}
-                {alternatives.length > 0 && <div className="text-xs text-amber-800 dark:text-amber-200">
+				{(actionError || draft?.error) && <p role="alert" className="text-caption text-danger break-words">{actionError || draft?.error}</p>}
+                {persistenceIssue && <p role="alert" className="text-caption text-danger">{t("detail.draftStorageFailed")}</p>}
+                {alternatives.length > 0 && <div className="text-caption text-warning">
                     <p>{t("detail.draftConflict")}</p>
                     {alternatives.map(alternative => <button key={alternative.revision} type="button" disabled={saving || changingStatus}
-                        className="block w-full text-left border rounded p-1 mt-1 whitespace-pre-wrap break-words"
+                        className="block w-full text-left border border-warning rounded p-1 mt-1 whitespace-pre-wrap break-words"
                         onClick={() => selectDraftAlternative(draftKey, alternative.revision)}>
                         {t("detail.draftRestore")}: {alternative.text.length ? alternative.text.slice(0, 100) : t("detail.draftEmpty")}
                     </button>)}
                 </div>}
 				{/* Source */}
 				<div>
-					<label className="text-xs font-medium text-gray-500 dark:text-gray-400">
+					<label className="text-caption font-medium text-text-muted">
 						{t("detail.source")}
 					</label>
-					<div className="mt-1 p-2 bg-gray-50 dark:bg-gray-800 rounded font-mono text-xs text-gray-800 dark:text-gray-200 select-all whitespace-pre-wrap">
+					<div className="mt-1 p-2 bg-surface-muted rounded font-mono text-body text-text select-all whitespace-pre-wrap">
 						{entry.source}
 					</div>
 				</div>
 
 				{/* Translation */}
 				<div>
-					<label className="text-xs font-medium text-gray-500 dark:text-gray-400">
+					<label className="text-caption font-medium text-text-muted">
 						{t("detail.translation")}
 					</label>
 					<textarea
@@ -154,15 +154,15 @@ export default function DetailPanel({
 						onKeyDown={(e) => {
 							if (e.key === "Enter" && e.ctrlKey) handleSave();
 						}}
-						className="mt-1 w-full p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-xs text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-emerald-500 resize-y min-h-[72px]"
+						className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text focus:outline-none focus:ring-2 focus:ring-accent-fg resize-y min-h-[72px]"
 						rows={4}
 					/>
 					<div
 						className={clsx(
-							"text-[11px] mt-1",
+							"text-caption mt-1",
 							limitExceeded || binarySlotExceeded
-								? "text-red-500 font-semibold"
-								: "text-gray-400 dark:text-gray-500",
+								? "text-danger font-semibold"
+								: "text-text-muted",
 						)}
 					>
 						{t("detail.chars", { count: charCount })}
@@ -173,7 +173,7 @@ export default function DetailPanel({
 							</span>
 						)}
 						{binarySlot === "sjis" && (
-							<span className="ml-2 text-gray-400 font-normal">
+							<span className="ml-2 text-text-muted font-normal">
 								{t("detail.sjisNote")}
 							</span>
 						)}
@@ -184,7 +184,7 @@ export default function DetailPanel({
 
 				{/* Status */}
 				<div>
-					<label className="text-xs font-medium text-gray-500 dark:text-gray-400">
+					<label className="text-caption font-medium text-text-muted">
 						{t("detail.status")}
 					</label>
 					<div className="flex gap-1.5 mt-1">
@@ -194,10 +194,10 @@ export default function DetailPanel({
 								disabled={changingStatus}
 								onClick={() => handleStatusChange(value)}
 								className={clsx(
-									"px-2.5 py-0.5 rounded-full text-[11px] font-medium transition-colors",
+									"px-2.5 py-0.5 rounded-full text-caption font-medium transition-colors",
 									entry.status === value
 										? color
-										: "bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700",
+										: "bg-surface-muted text-text-muted hover:bg-border",
 								)}
 							>
 								{t(labelKey)}
@@ -208,13 +208,13 @@ export default function DetailPanel({
 
 				{/* Validation warnings */}
 				{limitExceeded && (
-					<div className="flex items-center gap-2 p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm text-red-700 dark:text-red-400">
+					<div className="flex items-center gap-2 p-2 bg-danger-muted border border-danger rounded text-body text-danger">
 						<AlertTriangle size={16} />
 						{t("detail.exceedsLimit")}
 					</div>
 				)}
 				{binarySlotExceeded && (
-					<div className="flex items-center gap-2 p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm text-red-700 dark:text-red-400">
+					<div className="flex items-center gap-2 p-2 bg-danger-muted border border-danger rounded text-body text-danger">
 						<AlertTriangle size={16} />
 						{t("detail.exceedsSlot", {
 							slot: binarySlot ?? "",
@@ -228,31 +228,31 @@ export default function DetailPanel({
 				<div>
 					<button
 						onClick={() => setShowMeta(!showMeta)}
-						className="flex items-center gap-1 text-xs font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+						className="flex items-center gap-1 text-caption font-medium text-text-muted hover:text-text"
 					>
 						{showMeta ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
 						{t("detail.metadata")}
 					</button>
 					{showMeta && (
-						<dl className="mt-2 space-y-1 text-[11px] text-gray-700 dark:text-gray-300">
+						<dl className="mt-2 space-y-1 text-caption text-text">
 							{entry.context && (
 								<>
-									<dt className="text-gray-500 dark:text-gray-400">{t("detail.context")}</dt>
+									<dt className="text-text-muted">{t("detail.context")}</dt>
 									<dd>{entry.context}</dd>
 								</>
 							)}
-							<dt className="text-gray-500 dark:text-gray-400">{t("detail.file")}</dt>
+							<dt className="text-text-muted">{t("detail.file")}</dt>
 							<dd className="break-all">{entry.file_path}</dd>
-							<dt className="text-gray-500 dark:text-gray-400">{t("detail.entryId")}</dt>
+							<dt className="text-text-muted">{t("detail.entryId")}</dt>
 							<dd className="font-mono break-all">{entry.id}</dd>
 							{entry.tags.length > 0 && (
 								<>
-									<dt className="text-gray-500 dark:text-gray-400">{t("detail.tags")}</dt>
+									<dt className="text-text-muted">{t("detail.tags")}</dt>
 									<dd className="flex gap-1 flex-wrap">
 										{entry.tags.map((t) => (
 											<span
 												key={t}
-												className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded"
+												className="px-1.5 py-0.5 bg-surface-muted rounded"
 											>
 												{t}
 											</span>
@@ -262,15 +262,15 @@ export default function DetailPanel({
 							)}
 							{entry.provider_used && (
 								<>
-									<dt className="text-gray-500 dark:text-gray-400">{t("detail.provider")}</dt>
+									<dt className="text-text-muted">{t("detail.provider")}</dt>
 									<dd>{entry.provider_used}</dd>
 								</>
 							)}
-							<dt className="text-gray-500 dark:text-gray-400">{t("detail.created")}</dt>
+							<dt className="text-text-muted">{t("detail.created")}</dt>
 							<dd>{new Date(entry.created_at).toLocaleString()}</dd>
 							{entry.translated_at && (
 								<>
-									<dt className="text-gray-500 dark:text-gray-400">
+									<dt className="text-text-muted">
 										{t("detail.translated")}
 									</dt>
 									<dd>{new Date(entry.translated_at).toLocaleString()}</dd>

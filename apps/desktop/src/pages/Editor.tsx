@@ -56,10 +56,10 @@ import { buildSettingsPath } from "../lib/settingsNav";
 import { useT } from "../lib/i18n";
 
 const BTN_BASE =
-	"inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-1 dark:focus-visible:ring-offset-gray-900 disabled:cursor-not-allowed disabled:opacity-50";
-const BTN_PRIMARY = `${BTN_BASE} bg-emerald-600 text-white shadow-sm hover:bg-emerald-700`;
-const BTN_SECONDARY = `${BTN_BASE} border border-gray-300 bg-white text-gray-800 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-100 dark:hover:bg-gray-800`;
-const BTN_GHOST = `${BTN_BASE} px-2.5 text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100`;
+	"inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-body font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-1 focus-visible:ring-offset-surface disabled:cursor-not-allowed disabled:opacity-50";
+const BTN_PRIMARY = `${BTN_BASE} bg-accent text-white shadow-sm hover:bg-accent-hover`;
+const BTN_SECONDARY = `${BTN_BASE} border border-border bg-surface text-text hover:bg-surface-muted`;
+const BTN_GHOST = `${BTN_BASE} px-2.5 text-text-muted hover:bg-surface-muted hover:text-text`;
 
 /** Slim stacked progress bar: approved / reviewed / translated over total. */
 function EditorProgress({ stats }: { stats: ProjectStats }) {
@@ -77,13 +77,13 @@ function EditorProgress({ stats }: { stats: ProjectStats }) {
 				aria-valuemin={0}
 				aria-valuemax={total}
 				aria-valuenow={done}
-				className="flex h-2 w-36 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700"
+				className="flex h-2 w-36 overflow-hidden rounded-full bg-border"
 			>
-				<span className="h-full bg-emerald-600 dark:bg-emerald-500" style={{ width: width(stats.approved) }} />
-				<span className="h-full bg-amber-500 dark:bg-amber-400" style={{ width: width(stats.reviewed) }} />
+				<span className="h-full bg-success" style={{ width: width(stats.approved) }} />
+				<span className="h-full bg-warning" style={{ width: width(stats.reviewed) }} />
 				<span className="h-full bg-blue-500 dark:bg-blue-400" style={{ width: width(stats.translated) }} />
 			</div>
-			<span className="text-xs font-semibold tabular-nums text-gray-700 dark:text-gray-200">
+			<span className="text-caption font-semibold tabular-nums text-text">
 				{t("editor.progressPercent", { percent })}
 			</span>
 		</div>
@@ -325,12 +325,12 @@ export default function Editor() {
 
 	return (
 		<div className="flex flex-col h-full">
-			{project?.persistence_warning && <div role="alert" className="border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
+			{project?.persistence_warning && <div role="alert" className="border-b border-warning bg-warning-muted px-4 py-2 text-body text-warning">
 				<p>{t("editor.recentSaveFailed")}</p>
 				<details><summary>{t("recovery.details")}</summary><p className="break-words">{project.persistence_warning}</p></details>
 			</div>}
 			{!!project?.extraction_warnings?.length && (
-				<details className="border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
+				<details className="border-b border-warning bg-warning-muted px-4 py-2 text-body text-warning">
 					<summary className="cursor-pointer font-medium">{t("editor.partialExtraction")}</summary>
 					<p className="mt-1">{t("editor.partialExtractionDetail")}</p>
 					<ul className="mt-1 max-h-32 overflow-y-auto list-disc pl-5 break-words">
@@ -339,15 +339,15 @@ export default function Editor() {
 				</details>
 			)}
 			{/* Top bar: project identity + progress, then grouped actions */}
-			<header className="flex flex-col gap-2 border-b border-gray-200 bg-white px-4 pb-2 pt-2.5 dark:border-gray-800 dark:bg-gray-900">
+			<header className="flex flex-col gap-2 border-b border-border bg-surface px-4 pb-2 pt-2.5">
 				<div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5">
 					<div className="flex min-w-0 flex-wrap items-center gap-2">
-						<h1 className="min-w-0 break-words text-base font-semibold text-gray-900 dark:text-gray-100">
+						<h1 className="min-w-0 break-words text-section font-semibold text-text">
 							{project?.name || t("editor.noProject")}
 						</h1>
 						{project && (
 							<span
-								className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[11px] text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+								className="rounded bg-surface-muted px-1.5 py-0.5 font-mono text-caption text-text-muted"
 								title={t("editor.formatTitle")}
 							>
 								{project.format_id}
@@ -363,7 +363,7 @@ export default function Editor() {
 								type="button"
 								onClick={handleGuidePrimaryAction}
 								title={t("editor.nextStepTitle")}
-								className="inline-flex items-center gap-0.5 rounded-full border border-emerald-300 px-2 py-0.5 text-[11px] font-medium text-emerald-700 transition-colors hover:bg-emerald-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:border-emerald-800 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
+								className="inline-flex items-center gap-0.5 rounded-full border border-accent-fg px-2 py-0.5 text-caption font-medium text-accent-fg transition-colors hover:bg-accent-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
 							>
 								{t("editor.next", { step: t(`workflow.${workflowStep}`) })}
 								<ChevronRight size={12} aria-hidden="true" />
@@ -374,7 +374,7 @@ export default function Editor() {
 					{statsData && (
 						<div className="ml-auto flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
 							<EditorProgress stats={statsData} />
-							<span className="text-xs text-gray-500 dark:text-gray-400">
+							<span className="text-caption text-text-muted">
 								{t(editorStatsKey(statsData.total_cost_usd), {
 									pending: statsData.pending,
 									translated: statsData.translated,
@@ -387,7 +387,7 @@ export default function Editor() {
 									type="button"
 									onClick={() => navigate(buildSettingsPath("history"))}
 									title={t("editor.viewHistoryTitle")}
-									className="rounded-sm text-xs font-medium text-emerald-700 underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:text-emerald-300"
+									className="rounded-sm text-caption font-medium text-accent-fg underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
 								>
 									{t("editor.viewHistory")}
 								</button>
@@ -481,8 +481,8 @@ export default function Editor() {
 			</header>
 
 			{validationWorklist && validationWorklist.length > 0 && (
-				<div className="flex items-center gap-3 px-4 py-1.5 border-b border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
-					<span className="text-xs font-medium">
+				<div className="flex items-center gap-3 px-4 py-1.5 border-b border-warning bg-warning-muted text-warning">
+					<span className="text-caption font-medium">
 						{t("validate.worklist", {
 							current: validationWorklistIndex + 1,
 							total: validationWorklist.length,
@@ -493,7 +493,7 @@ export default function Editor() {
 							type="button"
 							onClick={() => stepValidationWorklist(-1)}
 							disabled={validationWorklistIndex <= 0}
-							className="px-2 py-0.5 text-xs font-medium rounded border border-amber-300 disabled:opacity-40 dark:border-amber-800"
+							className="px-2 py-0.5 text-caption font-medium rounded border border-warning disabled:opacity-40"
 						>
 							{t("validate.worklistPrev")}
 						</button>
@@ -503,14 +503,14 @@ export default function Editor() {
 							disabled={
 								validationWorklistIndex >= validationWorklist.length - 1
 							}
-							className="px-2 py-0.5 text-xs font-medium rounded border border-amber-300 disabled:opacity-40 dark:border-amber-800"
+							className="px-2 py-0.5 text-caption font-medium rounded border border-warning disabled:opacity-40"
 						>
 							{t("validate.worklistNext")}
 						</button>
 						<button
 							type="button"
 							onClick={clearValidationWorklist}
-							className="px-2 py-0.5 text-xs font-medium rounded border border-amber-300 dark:border-amber-800"
+							className="px-2 py-0.5 text-caption font-medium rounded border border-warning"
 						>
 							{t("validate.worklistDone")}
 						</button>
@@ -545,13 +545,13 @@ export default function Editor() {
 						onAction={() => navigate("/")}
 					/>
 				) : stringsLoading ? (
-					<div className="flex flex-1 items-center justify-center text-gray-500">
+					<div className="flex flex-1 items-center justify-center text-text-muted">
 						{t("editor.loadingStrings")}
 					</div>
 				) : stringsError ? (
 					<div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
-						<p className="font-medium text-red-600">{t("editor.loadError")}</p>
-						<p className="text-sm text-gray-500">
+						<p className="font-medium text-danger">{t("editor.loadError")}</p>
+						<p className="text-body text-text-muted">
 							{stringsErrorDetail instanceof Error
 								? stringsErrorDetail.message
 								: t("common.tryAgain")}
@@ -560,7 +560,7 @@ export default function Editor() {
 							onClick={() => {
 								void refetch();
 							}}
-							className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+							className="rounded bg-accent px-4 py-2 text-body font-medium text-white hover:bg-accent-hover"
 						>
 							{t("common.retry")}
 						</button>

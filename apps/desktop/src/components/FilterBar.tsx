@@ -25,11 +25,11 @@ const STATUSES: { labelKey: MessageKey; value: StringStatus | undefined }[] = [
 ];
 
 const statusColors: Record<string, string> = {
-	pending: "bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300",
+	pending: "bg-border text-text",
 	translated: "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300",
-	reviewed: "bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300",
-	approved: "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300",
-	error: "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300",
+	reviewed: "bg-warning-muted text-warning",
+	approved: "bg-success-muted text-success",
+	error: "bg-danger-muted text-danger",
 };
 
 interface FilterBarProps {
@@ -91,19 +91,19 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 		filter.status || filter.search || filter.file_path || filter.tag;
 
 	return (
-		<div className="flex flex-wrap items-center gap-2 p-2 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+		<div className="flex flex-wrap items-center gap-2 p-2 border-b border-border bg-surface">
 			<div className="flex flex-wrap gap-0.5">
 				{STATUSES.map(({ labelKey, value }) => (
 					<button
 						key={labelKey}
 						onClick={() => setFilter({ status: value, offset: 0 })}
 						className={clsx(
-							"px-2.5 py-0.5 rounded-full text-[11px] font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500",
+							"px-2.5 py-0.5 rounded-full text-caption font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg",
 							filter.status === value
 								? value
 									? statusColors[value]
-									: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
-								: "text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100",
+									: "bg-accent-muted text-accent-fg"
+								: "text-text-muted hover:bg-surface-muted hover:text-text",
 						)}
 					>
 						{t(labelKey)}
@@ -114,7 +114,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 			<div className="flex-1 relative min-w-40 max-w-sm">
 				<Search
 					size={16}
-					className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
+					className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted"
 				/>
 				<input
 					data-search-input
@@ -122,14 +122,14 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 					value={searchInput}
 					onChange={(e) => setSearchInput(e.target.value)}
 					placeholder={t("filter.searchPlaceholder")}
-					className="w-full pl-9 pr-3 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+					className="w-full pl-9 pr-3 py-1 text-body border border-border rounded-md bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg"
 				/>
 			</div>
 
 			<div className="flex items-center gap-1">
 				<label
 					htmlFor="file-path-filter"
-					className="text-[11px] text-gray-500 dark:text-gray-400"
+					className="text-caption text-text-muted"
 				>
 					{t("filter.file")}
 				</label>
@@ -153,7 +153,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 						)
 					}
 					placeholder={t("filter.anyFile")}
-					className="w-32 rounded border border-gray-300 bg-white px-2 py-0.5 text-[11px] text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+					className="w-32 rounded border border-border bg-surface px-2 py-0.5 text-body text-text"
 				/>
 				<datalist id="file-path-filter-options">
 					{filePaths.map((path) => (
@@ -165,7 +165,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 			<div className="flex items-center gap-1">
 				<label
 					htmlFor="tag-filter"
-					className="text-[11px] text-gray-500 dark:text-gray-400"
+					className="text-caption text-text-muted"
 				>
 					{t("filter.tag")}
 				</label>
@@ -183,7 +183,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 						handleFacetKeyDown(event, filter.tag || "", setTagDraft, commitTag)
 					}
 					placeholder={t("filter.anyTag")}
-					className="w-24 rounded border border-gray-300 bg-white px-2 py-0.5 text-[11px] text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+					className="w-24 rounded border border-border bg-surface px-2 py-0.5 text-body text-text"
 				/>
 				<datalist id="tag-filter-options">
 					{tags.map((tag) => (
@@ -204,14 +204,14 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 						});
 						setSearchInput("");
 					}}
-					className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+					className="flex items-center gap-1 px-2 py-0.5 text-caption text-text-muted hover:text-text"
 				>
 					<X size={14} /> {t("common.clear")}
 				</button>
 			)}
 
 			<div className="flex items-center gap-2 ml-auto">
-				<span className="text-[11px] text-gray-500 dark:text-gray-400">
+				<span className="text-caption text-text-muted">
 					{total > 0
 						? t("filter.results", {
 								from: (filter.offset ?? 0) + 1,
@@ -232,7 +232,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 								})
 							}
 							disabled={(filter.offset ?? 0) === 0}
-							className="p-1 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded"
+							className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
 						>
 							<ChevronLeft size={14} />
 						</button>
@@ -243,7 +243,7 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 								})
 							}
 							disabled={(filter.offset ?? 0) + (filter.limit ?? 100) >= total}
-							className="p-1 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-emerald-500 rounded"
+							className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
 						>
 							<ChevronRight size={14} />
 						</button>

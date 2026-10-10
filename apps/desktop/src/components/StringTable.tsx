@@ -29,19 +29,19 @@ const statusLabel: Record<string, MessageKey> = {
 
 /** Calm status marker: a colored dot plus a sentence-case label (never color alone). */
 const statusDot: Record<string, string> = {
-	pending: "bg-transparent ring-1 ring-inset ring-gray-400 dark:ring-gray-500",
+	pending: "bg-transparent ring-1 ring-inset ring-text-muted",
 	translated: "bg-blue-500 dark:bg-blue-400",
-	reviewed: "bg-amber-500 dark:bg-amber-400",
-	approved: "bg-emerald-600 dark:bg-emerald-400",
-	error: "bg-red-600 dark:bg-red-400",
+	reviewed: "bg-warning",
+	approved: "bg-success",
+	error: "bg-danger",
 };
 
 const statusText: Record<string, string> = {
-	pending: "text-gray-500 dark:text-gray-400",
+	pending: "text-text-muted",
 	translated: "text-blue-700 dark:text-blue-300",
-	reviewed: "text-amber-800 dark:text-amber-300",
-	approved: "text-emerald-800 dark:text-emerald-300",
-	error: "text-red-700 dark:text-red-300",
+	reviewed: "text-warning",
+	approved: "text-success",
+	error: "text-danger",
 };
 
 function InlineEdit({
@@ -100,7 +100,7 @@ function InlineEdit({
 					}
 				}}
 				autoFocus
-				className="w-full p-1 text-xs border border-emerald-400 rounded bg-white dark:bg-gray-800 focus:outline-none resize-none"
+				className="w-full p-1 text-body border border-accent-fg rounded bg-surface text-text focus:outline-none resize-none"
 				rows={2}
 			/>
 		);
@@ -116,7 +116,7 @@ function InlineEdit({
 				initialValue.current = value;
 				setEditing(true);
 			}}
-			className="block w-full truncate rounded-sm text-left text-[13px] text-gray-900 dark:text-gray-100 cursor-text disabled:cursor-wait focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+			className="block w-full truncate rounded-sm text-left text-body text-text cursor-text disabled:cursor-wait focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
 		>
 			{value || (
 				<>
@@ -124,7 +124,7 @@ function InlineEdit({
 					<span
 						aria-hidden="true"
 						className={clsx(
-							"text-gray-300 dark:text-gray-600 group-hover:hidden group-focus-within:hidden",
+							"text-text-muted group-hover:hidden group-focus-within:hidden",
 							selected && "hidden",
 						)}
 					>
@@ -132,7 +132,7 @@ function InlineEdit({
 					</span>
 					<span
 						className={clsx(
-							"italic text-gray-500 dark:text-gray-400 group-hover:inline group-focus-within:inline",
+							"italic text-text-muted group-hover:inline group-focus-within:inline",
 							selected ? "inline" : "hidden",
 						)}
 					>
@@ -141,9 +141,9 @@ function InlineEdit({
 				</>
 			)}
 		</button>
-		{draft && <span role="status" className="block text-[11px] text-amber-800 dark:text-amber-200">{saving ? t("table.saving") : t("table.unsaved")}</span>}
-		{draft?.error && <div className="text-xs text-red-700 dark:text-red-300 break-words"><p role="alert">{draft.error}</p><button type="button" disabled={saving} onClick={() => void handleBlur()} className="underline">{t("common.retry")}</button></div>}
-		{persistenceIssue && <p role="alert" className="text-xs text-red-700 dark:text-red-300">{t("detail.draftStorageFailed")}</p>}
+		{draft && <span role="status" className="block text-caption text-warning">{saving ? t("table.saving") : t("table.unsaved")}</span>}
+		{draft?.error && <div className="text-caption text-danger break-words"><p role="alert">{draft.error}</p><button type="button" disabled={saving} onClick={() => void handleBlur()} className="underline">{t("common.retry")}</button></div>}
+		{persistenceIssue && <p role="alert" className="text-caption text-danger">{t("detail.draftStorageFailed")}</p>}
 		</div>
 	);
 }
@@ -181,15 +181,15 @@ export default function StringTable({
 					return (
 						<span
 							className={clsx(
-								"inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-medium",
-								statusText[status] || "text-gray-500 dark:text-gray-400",
+								"inline-flex items-center gap-1.5 whitespace-nowrap text-caption font-medium",
+								statusText[status] || "text-text-muted",
 							)}
 						>
 							<span
 								aria-hidden="true"
 								className={clsx(
 									"size-2 shrink-0 rounded-full",
-									statusDot[status] || "bg-gray-400",
+									statusDot[status] || "bg-text-muted",
 								)}
 							/>
 							{statusLabel[status] ? t(statusLabel[status]) : status}
@@ -203,7 +203,7 @@ export default function StringTable({
 				size: 300,
 				cell: ({ getValue }) => (
 					<div
-						className="text-[13px] line-clamp-2 text-gray-800 dark:text-gray-200"
+						className="text-body line-clamp-2 text-text"
 						title={getValue() as string}
 					>
 						{getValue() as string}
@@ -227,7 +227,7 @@ export default function StringTable({
 					const name = pathBasename(full);
 					return (
 						<span
-							className="text-[11px] text-gray-500 dark:text-gray-400"
+							className="text-caption text-text-muted"
 							title={full}
 						>
 							{name}
@@ -244,7 +244,7 @@ export default function StringTable({
 						{(getValue() as string[]).map((t) => (
 							<span
 								key={t}
-								className="px-1.5 py-px rounded border border-gray-200 text-gray-500 dark:border-gray-700 dark:text-gray-400 text-[10px]"
+								className="px-1.5 py-px rounded border border-border text-text-muted text-caption"
 							>
 								{t}
 							</span>
@@ -266,16 +266,16 @@ export default function StringTable({
 	});
 
 	return (
-		<div className="overflow-auto flex-1">
+		<div className="overflow-auto flex-1 bg-surface">
 			<table className="w-full text-left">
-				<thead className="sticky top-0 z-10 bg-white/95 dark:bg-gray-900/95 backdrop-blur border-b border-gray-200 dark:border-gray-800">
+				<thead className="sticky top-0 z-10 bg-surface/95 backdrop-blur border-b border-border">
 					{table.getHeaderGroups().map((hg) => (
 						<tr key={hg.id}>
 							{hg.headers.map((header) => (
 								<th
 									key={header.id}
 									onClick={header.column.getToggleSortingHandler()}
-									className="px-3 py-2 text-xs font-medium text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-800 dark:hover:text-gray-200 select-none"
+									className="px-3 py-2 text-caption font-medium text-text-muted cursor-pointer hover:text-text select-none"
 									style={{ width: header.getSize() }}
 								>
 									{flexRender(
@@ -297,10 +297,10 @@ export default function StringTable({
 							onClick={() => setSelected(row.original.id)}
 							style={{ height: rowHeight }}
 							className={clsx(
-								"group border-b border-gray-100 dark:border-gray-800/80 cursor-pointer transition-colors",
+								"group border-b border-border cursor-pointer transition-colors",
 								selectedEntryId === row.original.id
-									? "bg-emerald-50/70 dark:bg-emerald-950/40 shadow-[inset_2px_0_0_0_var(--color-emerald-500)]"
-									: "hover:bg-gray-50 dark:hover:bg-gray-800/50",
+									? "bg-accent-muted shadow-[inset_2px_0_0_0_var(--color-accent)]"
+									: "hover:bg-surface-muted",
 							)}
 						>
 							{row.getVisibleCells().map((cell) => (
@@ -317,14 +317,14 @@ export default function StringTable({
 				</tbody>
 			</table>
 			{data.length === 0 && (
-				<div className="flex flex-col items-center justify-center h-40 gap-1 text-sm text-gray-500 dark:text-gray-400">
-					<p className="font-medium text-gray-600 dark:text-gray-300">
+				<div className="flex flex-col items-center justify-center h-40 gap-1 text-body text-text-muted">
+					<p className="font-medium text-text-muted">
 						{hasActiveFilters
 							? t("table.noMatch")
 							: t("table.noStrings")}
 					</p>
 					{hasActiveFilters && (
-						<p className="text-xs">
+						<p className="text-caption">
 							{t("table.clearHint")}
 						</p>
 					)}
