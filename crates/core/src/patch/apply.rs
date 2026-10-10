@@ -101,11 +101,27 @@ where
             "run patch-rollback first".into(),
         ));
     }
+    let prior_receipt = store.read_receipt()?;
+    let mut archive = open_archive(zip_path)?;
+    // A legacy overlay cannot preserve the installed patch's rollback inventory.
+    // Check the same open archive before staging or probing game writability.
+    if prior_receipt.is_some() {
+        let mut has_manifest = false;
+        for name in archive.file_names() {
+            let normalized = super::zipsec::canonical_archive_name(name)?;
+            has_manifest |= normalized.to_lowercase() == PatchManifest::FILENAME;
+        }
+        if !has_manifest {
+            return Err(LocustError::PatchError(
+                "a Locust patch is already installed; roll it back before applying a patch without a manifest"
+                    .into(),
+            ));
+        }
+    }
     // Stage and validate once BEFORE rollback or any asset/receipt mutation.
     // The operation-owned directory is outside .locust so rollback cannot
     // erase incoming content, and replacing the source ZIP cannot alter it.
     let _staging = StagingDir::create_prepared(game_root)?;
-    let mut archive = open_archive(zip_path)?;
     let entries = scan_zip_entries(&mut archive, Some(&_staging))?;
     drop(archive);
     let report = verify_scanned(game_root, &entries)?;
@@ -141,7 +157,7 @@ where
         && matches!(report.tier, Some(VerificationTier::Strict));
 
     // R3 routing when a receipt is present.
-    if let Some(prior) = store.read_receipt()? {
+    if let Some(prior) = prior_receipt {
         if let Some(ref m) = report.manifest {
             if prior.patch_id == m.patch_id && prior.patch_version == m.patch_version && opts.force
             {

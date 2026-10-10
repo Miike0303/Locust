@@ -736,6 +736,109 @@ fn snapshot_patch_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Optio
         .collect()
 }
 
+fn build_legacy_zip(path: &Path, rel: &str, contents: &[u8]) {
+    let mut zip = ZipWriter::new(File::create(path).unwrap());
+    zip.start_file(rel, SimpleFileOptions::default()).unwrap();
+    zip.write_all(contents).unwrap();
+    zip.finish().unwrap();
+}
+
+fn patch_tree_hashes(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<String>> {
+    snapshot_patch_tree(root)
+        .into_iter()
+        .map(|(path, bytes)| (path, bytes.map(|bytes| sha256_hex(&bytes))))
+        .collect()
+}
+
+fn assert_manifestless_overlay_refused(dry_run: bool) {
+    for force in [false, true] {
+        let game = tmp_game("manifestless_overlay");
+        write_file(&game, "a.bin", b"ORIGINAL_A");
+        write_file(&game, "b.bin", b"ORIGINAL_B");
+        let patch_a = game.join("patch-a.zip");
+        build_patch_zip(
+            &patch_a,
+            &[("a.bin", b"PATCHED_A", Some(b"ORIGINAL_A"))],
+            "1.0.0",
+            "patch-a",
+        );
+        apply(&game, &patch_a, ApplyOptions::default(), |_| {}).unwrap();
+        let legacy = game.join("legacy.zip");
+        build_legacy_zip(&legacy, "b.bin", b"PATCHED_B");
+
+        let before = patch_tree_hashes(&game);
+        for path in [
+            "a.bin",
+            "b.bin",
+            ".locust/receipt.json",
+            ".locust/backup/manifest.json",
+            ".locust/backup/files/a.bin",
+        ] {
+            assert!(before.get(Path::new(path)).unwrap().is_some(), "{path}");
+        }
+        let mut progress = Vec::new();
+        let result = apply(
+            &game,
+            &legacy,
+            ApplyOptions {
+                confirm_legacy: true,
+                dry_run,
+                force,
+            },
+            |event| progress.push(event),
+        );
+        let err = result.expect_err("manifestless overlay must be refused");
+        assert!(matches!(err, LocustError::PatchError(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "patch error: a Locust patch is already installed; roll it back before applying a patch without a manifest"
+        );
+        assert!(progress.is_empty(), "refusal must precede file writes");
+        assert_eq!(patch_tree_hashes(&game), before);
+
+        rollback(&game, RollbackOptions::default()).unwrap();
+        assert_eq!(fs::read(game.join("a.bin")).unwrap(), b"ORIGINAL_A");
+        assert_eq!(fs::read(game.join("b.bin")).unwrap(), b"ORIGINAL_B");
+        fs::remove_dir_all(game).unwrap();
+    }
+}
+
+#[test]
+fn manifestless_overlay_refuses_before_mutating_game_or_recovery_files() {
+    assert_manifestless_overlay_refused(false);
+}
+
+#[test]
+fn manifestless_overlay_dry_run_also_refuses_without_mutation() {
+    assert_manifestless_overlay_refused(true);
+}
+
+#[test]
+fn manifestless_patch_on_clean_game_still_applies_with_confirmation() {
+    let game = tmp_game("manifestless_clean");
+    write_file(&game, "b.bin", b"ORIGINAL_B");
+    let legacy = game.join("legacy.zip");
+    build_legacy_zip(&legacy, "b.bin", b"PATCHED_B");
+    assert!(!PatchStore::new(&game).receipt_path().exists());
+
+    let report = apply(
+        &game,
+        &legacy,
+        ApplyOptions {
+            confirm_legacy: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.replaced, 1);
+    assert_eq!(report.added, 0);
+    assert_eq!(fs::read(game.join("b.bin")).unwrap(), b"PATCHED_B");
+    rollback(&game, RollbackOptions::default()).unwrap();
+    assert_eq!(fs::read(game.join("b.bin")).unwrap(), b"ORIGINAL_B");
+    fs::remove_dir_all(game).unwrap();
+}
+
 #[cfg(any(unix, windows))]
 fn link_directory(target: &Path, link: &Path) {
     #[cfg(unix)]

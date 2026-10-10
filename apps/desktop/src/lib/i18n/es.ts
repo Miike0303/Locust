@@ -1137,6 +1137,8 @@ export const es: Record<keyof typeof en, string> = {
     "La aplicación del parche se interrumpió. Revierta el parche antes de volver a aplicarlo.",
   "api.error.patchBackupMissing":
     "No se encontró ninguna copia de seguridad del parche. Locust no puede restaurar los archivos originales del juego.",
+  "api.error.patchManifestlessOverlay":
+    "Ya hay un parche de Locust instalado. Use Revertir en la ventana Parche antes de aplicar un parche sin manifiesto.",
   "api.error.providerNotFound":
     "No se encontró el proveedor. Seleccione otro proveedor o configure su clave API en Ajustes.",
   "api.error.injectSingleTargetLanguage":

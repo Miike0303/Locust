@@ -41,6 +41,8 @@ const EXACT: Record<string, MessageKey> = {
 	"provider not found": "api.error.providerNotFound",
 	"patch backup incomplete: no backup found — factory pristine is unrecoverable":
 		"api.error.patchBackupMissing",
+	"patch error: a Locust patch is already installed; roll it back before applying a patch without a manifest":
+		"api.error.patchManifestlessOverlay",
 	"One project database can inject only one target language. Use a separate pivot database for each target language.":
 		"api.error.injectSingleTargetLanguage",
 	cancelled: "api.error.cancelled",

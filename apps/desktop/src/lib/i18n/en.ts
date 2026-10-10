@@ -1166,6 +1166,8 @@ export const en = {
     "Patch application was interrupted. Roll back the patch before applying it again.",
   "api.error.patchBackupMissing":
     "No patch backup was found. Locust cannot restore the original game files.",
+  "api.error.patchManifestlessOverlay":
+    "A Locust patch is already installed. Use Rollback in the Patch window before applying a patch without a manifest.",
   "api.error.providerNotFound":
     "Provider not found. Choose another provider or configure its API key in Settings.",
   "api.error.injectSingleTargetLanguage":

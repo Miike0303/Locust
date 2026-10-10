@@ -12,6 +12,37 @@ import {
 } from "./apiError";
 import { setLocale } from "./i18n";
 
+const manifestlessOverlayError = "patch error: a Locust patch is already installed; roll it back before applying a patch without a manifest";
+for (const locale of ["en", "es"] as const) {
+	test(`manifestless overlay refusal gives Patch window rollback guidance in ${locale}`, () => {
+		setLocale(locale);
+		const expected = locale === "es"
+			? "Ya hay un parche de Locust instalado. Use Revertir en la ventana Parche antes de aplicar un parche sin manifiesto."
+			: "A Locust patch is already installed. Use Rollback in the Patch window before applying a patch without a manifest.";
+		for (const raw of [manifestlessOverlayError, `400: ${manifestlessOverlayError}`]) {
+			assert.equal(localizeApiError(raw), expected);
+			const error = new ApiError(raw);
+			assert.equal(error.message, expected);
+			assert.equal(error.key, "api.error.patchManifestlessOverlay");
+		}
+	});
+
+	test(`manifestless overlay mapping is exact in ${locale}`, () => {
+		setLocale(locale);
+		for (const raw of [
+			`${manifestlessOverlayError} extra`,
+			`extra: ${manifestlessOverlayError}`,
+			manifestlessOverlayError.replace("without a manifest", "with a manifest"),
+			"patch error: unrelated diagnostic",
+		]) {
+			assert.equal(localizeApiError(raw), raw);
+			assert.equal(localizeApiError(`400: ${raw}`),
+				`${locale === "es" ? "Error del servidor" : "Server error"} 400: ${raw}`);
+			assert.equal(new ApiError(raw).key, undefined);
+		}
+	});
+}
+
 // parseApiError
 assert.deepEqual(parseApiError("409: hello"), { status: 409, body: "hello" });
 assert.deepEqual(parseApiError("no project open"), {
