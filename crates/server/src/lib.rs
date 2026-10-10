@@ -2849,6 +2849,10 @@ async fn list_memory(
     State(state): State<Arc<AppState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     let search = params.get("search").map(|s| s.as_str());
     let lang_pair = params.get("lang_pair").map(|s| s.as_str());
     let limit: usize = params
@@ -2861,7 +2865,7 @@ async fn list_memory(
         .unwrap_or(0);
 
     let (entries, total) = state
-        .global_memory
+        .db
         .list_memory(search, lang_pair, limit, offset)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -2877,8 +2881,12 @@ async fn delete_memory_entry(
     State(state): State<Arc<AppState>>,
     AxumPath((hash, lang_pair)): AxumPath<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     state
-        .global_memory
+        .db
         .delete_memory(&hash, &lang_pair)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::json!({"ok": true})))
@@ -2894,13 +2902,16 @@ async fn clear_memory(
 }
 
 async fn clear_memory_owned(state: Arc<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
-    // Clear both global memory and project-level memory
-    state
-        .global_memory
-        .clear_memory()
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     state
         .db
+        .clear_memory()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Legacy global entries are cleared too, as before; nothing writes them now.
+    state
+        .global_memory
         .clear_memory()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::json!({"ok": true})))
@@ -2909,8 +2920,12 @@ async fn clear_memory_owned(state: Arc<AppState>) -> Result<Json<serde_json::Val
 async fn memory_lang_pairs(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<String>>, ApiError> {
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
     state
-        .global_memory
+        .db
         .memory_lang_pairs()
         .map(Json)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))

@@ -5352,6 +5352,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_memory_queries_filter_source_translation_and_paginate() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_memory_batch(
+            &[
+                ("hello".into(), "Hello".into(), "Hola".into()),
+                ("world".into(), "World".into(), "Mundo".into()),
+            ],
+            "en-es",
+        )
+        .await
+        .unwrap();
+        db.save_memory("hello", "Hello", "Bonjour", "en-fr")
+            .await
+            .unwrap();
+        for (search, pair, expected) in [
+            (None, None, 3),
+            (Some("Hello"), None, 2),
+            (Some("Mundo"), None, 1),
+            (None, Some("en-es"), 2),
+            (Some("Hello"), Some("en-es"), 1),
+            (Some("Mundo"), Some("en-fr"), 0),
+            (Some("' OR 1=1 --"), None, 0),
+        ] {
+            let (rows, total) = db.list_memory(search, pair, 50, 0).unwrap();
+            assert_eq!(total, expected);
+            assert_eq!(rows.len(), expected);
+        }
+        let (all, _) = db.list_memory(None, Some("en-es"), 50, 0).unwrap();
+        let (page, total) = db.list_memory(None, Some("en-es"), 1, 1).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].source_hash, all[1].source_hash);
+        let (past_end, total) = db.list_memory(None, None, 50, 3).unwrap();
+        assert!(past_end.is_empty());
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn project_memory_delete_removes_only_the_requested_engine_hit() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_memory("shared", "Hello", "Hola", "en-es")
+            .await
+            .unwrap();
+        db.save_memory("shared", "Hello", "Bonjour", "en-fr")
+            .await
+            .unwrap();
+        db.delete_memory("shared", "en-es").unwrap();
+        db.delete_memory("missing", "en-es").unwrap();
+        assert!(db
+            .lookup_memory_batch(&["shared".into()], "en-es")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.lookup_memory("shared", "en-fr").unwrap().as_deref(),
+            Some("Bonjour")
+        );
+        assert_eq!(db.list_memory(None, None, 50, 0).unwrap().1, 1);
+    }
+
+    #[tokio::test]
+    async fn project_memory_language_pairs_are_distinct_sorted_and_clear_with_rows() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.memory_lang_pairs().unwrap().is_empty());
+        for (hash, pair) in [("a", "en-fr"), ("b", "en-es"), ("c", "en-es")] {
+            db.save_memory(hash, "Source", "Translation", pair)
+                .await
+                .unwrap();
+        }
+        assert_eq!(db.memory_lang_pairs().unwrap(), ["en-es", "en-fr"]);
+        db.delete_memory("a", "en-fr").unwrap();
+        assert_eq!(db.memory_lang_pairs().unwrap(), ["en-es"]);
+        db.clear_memory().unwrap();
+        assert!(db.memory_lang_pairs().unwrap().is_empty());
+        assert_eq!(db.list_memory(None, None, 50, 0).unwrap().1, 0);
+        assert_eq!(db.memory_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn lookup_memory_batch_matches_single_lookups_across_chunk_sizes() {
         let db = Database::open_in_memory().unwrap();
         let mut hashes: Vec<_> = (0..501).map(|i| format!("hash'{i}")).collect();

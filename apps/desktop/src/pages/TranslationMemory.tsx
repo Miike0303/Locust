@@ -5,6 +5,8 @@ import { getTranslationMemory, getTranslationMemoryStats, getTranslationMemoryLa
 import ConfirmDialog from "../components/ConfirmDialog";
 import EmptyState from "../components/EmptyState";
 import { addToast } from "../stores/toastStore";
+import { useProjectStore } from "../stores/projectStore";
+import { ApiError } from "../lib/apiError";
 import { useT } from "../lib/i18n";
 
 const PAGE_SIZE = 50;
@@ -14,6 +16,13 @@ function errorMessage(err: unknown, fallback: string): string {
 }
 
 export default function TranslationMemory() {
+  const project = useProjectStore((s) => s.project);
+  const projectScope = project?.database_path ?? project?.path ?? null;
+  // Reset filters, pagination and pending confirmations when the project changes.
+  return <ProjectTranslationMemory key={projectScope} projectScope={projectScope} />;
+}
+
+function ProjectTranslationMemory({ projectScope }: { projectScope: string | null }) {
   const t = useT();
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
@@ -22,19 +31,23 @@ export default function TranslationMemory() {
   const [searchInput, setSearchInput] = useState("");
 
   const { data: stats } = useQuery({
-    queryKey: ["tm-stats"],
-    queryFn: getTranslationMemoryStats,
+    queryKey: ["tm-stats", projectScope],
+    queryFn: ({ signal }) => getTranslationMemoryStats(signal),
+    enabled: projectScope !== null,
   });
 
   const { data: langPairs } = useQuery({
-    queryKey: ["tm-lang-pairs"],
-    queryFn: getTranslationMemoryLangPairs,
+    queryKey: ["tm-lang-pairs", projectScope],
+    queryFn: ({ signal }) => getTranslationMemoryLangPairs(signal),
+    enabled: projectScope !== null,
   });
 
   const { data, refetch, isLoading, isError, error } = useQuery({
-    queryKey: ["tm-entries", search, langPair, offset],
-    queryFn: () => getTranslationMemory({ search: search || undefined, lang_pair: langPair, limit: PAGE_SIZE, offset }),
+    queryKey: ["tm-entries", projectScope, search, langPair, offset],
+    queryFn: ({ signal }) => getTranslationMemory({ search: search || undefined, lang_pair: langPair, limit: PAGE_SIZE, offset }, signal),
+    enabled: projectScope !== null,
     staleTime: 10_000,
+    refetchOnMount: "always",
   });
 
   const entries = data?.entries ?? [];
@@ -58,6 +71,13 @@ export default function TranslationMemory() {
   const [entryToDelete, setEntryToDelete] = useState<{ hash: string; lp: string } | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
 
+  const invalidateMemory = () => {
+    // Invalidate only this project; an old mutation may finish after a switch.
+    for (const key of ["tm-entries", "tm-stats", "tm-lang-pairs"]) {
+      void qc.invalidateQueries({ queryKey: [key, projectScope] });
+    }
+  };
+
   const handleDeleteConfirmed = async () => {
     if (!entryToDelete) return;
     const { hash, lp } = entryToDelete;
@@ -65,8 +85,7 @@ export default function TranslationMemory() {
     try {
       await deleteTranslationMemoryEntry(hash, lp);
       addToast("success", t("memory.toast.deleted"));
-      refetch();
-      qc.invalidateQueries({ queryKey: ["tm-stats"] });
+      invalidateMemory();
     } catch (err) {
       addToast("error", t("memory.toast.deleteFailed", { error: errorMessage(err, t("common.tryAgain")) }));
     }
@@ -77,13 +96,21 @@ export default function TranslationMemory() {
     try {
       await clearTranslationMemory();
       addToast("success", t("memory.toast.cleared"));
-      refetch();
-      qc.invalidateQueries({ queryKey: ["tm-stats"] });
-      qc.invalidateQueries({ queryKey: ["tm-lang-pairs"] });
+      setOffset(0);
+      invalidateMemory();
     } catch (err) {
       addToast("error", t("memory.toast.clearFailed", { error: errorMessage(err, t("common.tryAgain")) }));
     }
   };
+
+  if (projectScope === null || (error instanceof ApiError && error.key === "api.error.noProjectOpen")) {
+    return (
+      <div className="flex flex-col h-full bg-surface text-text">
+        <h1 className="px-6 py-4 border-b border-border text-page font-bold">{t("memory.title")}</h1>
+        <EmptyState title={t("memory.noProject.title")} description={t("memory.noProject.description")} />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full bg-surface text-text">

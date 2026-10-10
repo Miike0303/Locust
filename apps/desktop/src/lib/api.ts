@@ -60,7 +60,8 @@ async function request<T>(path: string, options?: RequestInit, quietStatus?: num
   let res: Response;
   try {
     res = await fetch(`${base}${path}`, mergeRequestInit(options));
-  } catch {
+  } catch (error) {
+    if (options?.signal?.aborted) throw error;
     throw unreachableBackend(base, path);
   }
   // An expected status (for example 404 = no project open) is a signal, not an error.
@@ -910,19 +911,20 @@ export interface MemoryFilter {
   offset?: number;
 }
 
-export const getTranslationMemoryStats = (): Promise<{ project_entries: number; global_entries: number }> =>
-  request("/memory/stats");
+export const getTranslationMemoryStats = (signal?: AbortSignal): Promise<{ project_entries: number; global_entries: number }> =>
+  request("/memory/stats", { signal });
 
-export const getTranslationMemoryLangPairs = (): Promise<string[]> =>
-  request("/memory/lang-pairs");
+export const getTranslationMemoryLangPairs = (signal?: AbortSignal): Promise<string[]> =>
+  request("/memory/lang-pairs", { signal });
 
-export const getTranslationMemory = (filter: MemoryFilter): Promise<MemoryListResponse> => {
+/** Entries and mutations belong to the open project, like the engine's cache. */
+export const getTranslationMemory = (filter: MemoryFilter, signal?: AbortSignal): Promise<MemoryListResponse> => {
   const params = new URLSearchParams();
   if (filter.search) params.set("search", filter.search);
   if (filter.lang_pair) params.set("lang_pair", filter.lang_pair);
   if (filter.limit) params.set("limit", String(filter.limit));
   if (filter.offset) params.set("offset", String(filter.offset));
-  return request(`/memory?${params}`);
+  return request(`/memory?${params}`, { signal });
 };
 
 export const deleteTranslationMemoryEntry = (hash: string, langPair: string): Promise<void> =>
