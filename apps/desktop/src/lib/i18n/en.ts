@@ -1148,6 +1148,22 @@ export const en = {
     "Provider not found. Choose another provider or configure its API key in Settings.",
   "api.error.injectSingleTargetLanguage":
     "One project database can inject only one target language. Use a separate pivot database for each target language.",
+  "api.error.patchVerificationFailed":
+    "The selected game files do not match what the patch expects. The game or version may be different, or the files may already be modified. Check the game folder, or use Force only if you are sure.",
+  "api.error.gameDirNotWritable":
+    "Locust cannot write to the game folder. Close the game, check folder permissions, or move the game out of protected folders such as Program Files.",
+  "api.error.backupManifestUnreadable":
+    "Backup {id} is damaged and cannot be restored. It is listed in Settings → Data.",
+  "api.error.exportDestinationProtected":
+    "The chosen export file is the project database or one of its companion files. Choose a different file name.",
+  "api.error.directFormatIncompatible":
+    "The saved Direct project format is incompatible. Locust cannot resume this project with the selected format.",
+  "api.error.patchAlreadyApplied":
+    "This patch is already installed. Roll it back before reinstalling it, or use Force.",
+  "api.error.patchDowngradeBlocked":
+    "A newer patch version is installed. Roll back the installed patch before installing an older version.",
+  "api.error.patchDowngradeVersions":
+    "A newer patch version is installed ({installed}); the selected version is {incoming}. Roll back the installed patch before installing an older version.",
   "api.error.noTranslatedToPivot":
     "No translations to pivot from. Translate or import first.",
   "api.error.unknownExportFormat":

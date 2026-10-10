@@ -58,9 +58,12 @@ const EXACT: Record<string, MessageKey> = {
 	"no translated, reviewed, or approved strings — nothing to pack yet. Run translate first.":
 		"api.error.nothingToPack",
 	"handle not found": "api.error.xaiHandleNotFound",
+	// project.rs returns InjectionError; also recognize the exact inner reason.
+	"injection error: saved Direct project format is incompatible": "api.error.directFormatIncompatible",
+	"saved Direct project format is incompatible": "api.error.directFormatIncompatible",
 };
 
-type PrefixRule = { prefix: string; key: MessageKey; detail?: boolean };
+type PrefixRule = { prefix: string; key: MessageKey; detail?: boolean; singleLine?: boolean };
 
 const PREFIXES: PrefixRule[] = [
 	// Recovery guidance replaces opaque paths and CLI instructions; do not interpolate detail.
@@ -72,6 +75,12 @@ const PREFIXES: PrefixRule[] = [
 		prefix: "patch apply interrupted — run rollback first: ",
 		key: "api.error.patchInterrupted",
 	},
+	// These Display families own only a single original line, before legacy trimming.
+	// Verification suffixes can contain long hash/file lists; retain them only in logs.
+	{ prefix: "patch verification failed: ", key: "api.error.patchVerificationFailed", singleLine: true },
+	{ prefix: "game directory not writable: ", key: "api.error.gameDirNotWritable", singleLine: true },
+	{ prefix: "patch already applied: ", key: "api.error.patchAlreadyApplied", singleLine: true },
+	{ prefix: "patch downgrade blocked: ", key: "api.error.patchDowngradeBlocked", singleLine: true },
 	{ prefix: "format not found: ", key: "api.error.formatNotFound", detail: true },
 	{ prefix: "zip_path not found: ", key: "api.error.zipPathNotFound", detail: true },
 	{ prefix: "invalid zip_url: ", key: "api.error.invalidZipUrl", detail: true },
@@ -128,14 +137,39 @@ export function isMalformedPoStringError(raw: string): boolean {
 	return malformedPoStringLine(raw) !== undefined;
 }
 
-function mapBody(body: string): string | null {
+// verify.rs compares SemVer strings; expose only bounded, unambiguous version tokens.
+const VERSION_TOKEN = String.raw`[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?`;
+const DOWNGRADE_VERSIONS = new RegExp(`^patch downgrade blocked: installed (${VERSION_TOKEN}), incoming (${VERSION_TOKEN})$`);
+
+/** Narrow owned families; IDs/versions are useful, nested diagnostics are not. */
+function mapRecoveryDetails(body: string): string | null {
+	if (/[\r\n]/.test(body)) return null;
+	const backup = /^backup error: backup (\S+) has no readable manifest\.json: [^\r\n]+$/.exec(body);
+	if (backup?.[0] === body) return t("api.error.backupManifestUnreadable", { id: backup[1] });
+
+	const destination = /^the export destination is [^\r\n]+; choose a different file$/.exec(body);
+	if (destination?.[0] === body) return t("api.error.exportDestinationProtected");
+
+	const versions = DOWNGRADE_VERSIONS.exec(body);
+	if (versions?.[0] === body && versions[1].length <= 64 && versions[2].length <= 64) {
+		return t("api.error.patchDowngradeVersions", { installed: versions[1], incoming: versions[2] });
+	}
+	return null;
+}
+
+function mapBody(body: string, originalBody: string): string | null {
 	const exact = EXACT[body];
 	if (exact) return t(exact);
 
+	const recovery = mapRecoveryDetails(originalBody);
+	if (recovery) return recovery;
+
 	for (const rule of PREFIXES) {
-		if (body.startsWith(rule.prefix)) {
+		const candidate = rule.singleLine ? originalBody : body;
+		if (rule.singleLine && /[\r\n]/.test(candidate)) continue;
+		if (candidate.startsWith(rule.prefix)) {
 			if (rule.detail) {
-				const detail = body.slice(rule.prefix.length);
+				const detail = candidate.slice(rule.prefix.length);
 				return t(rule.key, { detail });
 			}
 			return t(rule.key);
@@ -150,7 +184,8 @@ function mapBody(body: string): string | null {
  */
 export function localizeApiError(raw: string): string {
 	// Strip only request()'s frame, before legacy trimming can hide extra text/newlines.
-	const poLine = malformedPoStringLine(raw.replace(/^\d{3}: /, ""));
+	const originalBody = raw.replace(/^\d{3}: /, "");
+	const poLine = malformedPoStringLine(originalBody);
 	// English retains its existing bare diagnostic or HTTP frame byte-for-byte.
 	if (poLine !== undefined && getLocale() === "es") {
 		return t("api.error.poMalformedString", { line: poLine });
@@ -160,7 +195,7 @@ export function localizeApiError(raw: string): string {
 	if (!trimmed) return trimmed;
 
 	const { status, body } = parseApiError(trimmed);
-	const mapped = mapBody(body);
+	const mapped = mapBody(body, originalBody);
 	if (mapped) return mapped;
 
 	if (status != null) {

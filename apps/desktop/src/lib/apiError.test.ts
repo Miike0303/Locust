@@ -195,6 +195,201 @@ test("near-miss recovery messages retain unknown-error fallback in both locales"
 	}
 });
 
+// Verified against core error.rs and the corresponding construction sites.
+const secondBatchErrors = [
+	{
+		name: "patch verification mismatch",
+		body: `patch verification failed: data/Actors.json: expected ${"a".repeat(64)}, found ${"b".repeat(64)}`,
+		en: "The selected game files do not match what the patch expects. The game or version may be different, or the files may already be modified. Check the game folder, or use Force only if you are sure.",
+		es: "Los archivos del juego seleccionado no coinciden con los que espera el parche. Puede tratarse de otro juego o versión, o de archivos ya modificados. Compruebe la carpeta del juego o use Forzar solo si está seguro.",
+	},
+	{
+		name: "unwritable game directory",
+		body: String.raw`game directory not writable: C:\Program Files\Game (IO error: Access is denied. (os error 5))`,
+		en: "Locust cannot write to the game folder. Close the game, check folder permissions, or move the game out of protected folders such as Program Files.",
+		es: "Locust no puede escribir en la carpeta del juego. Cierre el juego, compruebe los permisos de la carpeta o mueva el juego fuera de carpetas protegidas como Program Files.",
+	},
+	{
+		name: "damaged backup manifest",
+		body: "backup error: backup 20261009_120000_fixture has no readable manifest.json: JSON error: EOF while parsing a value at line 1 column 0",
+		en: "Backup 20261009_120000_fixture is damaged and cannot be restored. It is listed in Settings → Data.",
+		es: "La copia de seguridad 20261009_120000_fixture está dañada y no se puede restaurar. Figura en Ajustes → Datos.",
+	},
+	{
+		name: "protected export destination",
+		body: "the export destination is the project database itself; choose a different file",
+		en: "The chosen export file is the project database or one of its companion files. Choose a different file name.",
+		es: "El archivo elegido para exportar es la base de datos del proyecto o uno de sus archivos auxiliares. Elija otro nombre de archivo.",
+	},
+	{
+		name: "incompatible saved Direct project format",
+		body: "injection error: saved Direct project format is incompatible",
+		en: "The saved Direct project format is incompatible. Locust cannot resume this project with the selected format.",
+		es: "El formato del proyecto guardado con inyección directa es incompatible. Locust no puede reanudar este proyecto con el formato seleccionado.",
+	},
+	{
+		name: "patch already installed",
+		body: "patch already applied: fixture@1.0.0",
+		en: "This patch is already installed. Roll it back before reinstalling it, or use Force.",
+		es: "Este parche ya está instalado. Reviértalo antes de volver a instalarlo o use Forzar.",
+	},
+	{
+		name: "patch downgrade",
+		body: "patch downgrade blocked: installed 2.0.0, incoming 1.0.0",
+		en: "A newer patch version is installed (2.0.0); the selected version is 1.0.0. Roll back the installed patch before installing an older version.",
+		es: "Hay una versión más reciente del parche instalada (2.0.0); la versión seleccionada es 1.0.0. Revierta el parche instalado antes de instalar una versión anterior.",
+	},
+] as const;
+
+for (const recovery of secondBatchErrors) {
+	for (const locale of ["es", "en"] as const) {
+		test(`${recovery.name} shows second-batch guidance for bare and HTTP errors in ${locale}`, () => {
+			setLocale(locale);
+			assert.equal(localizeApiError(recovery.body), recovery[locale]);
+			for (const status of [400, 409, 500]) {
+				assert.equal(localizeApiError(`${status}: ${recovery.body}`), recovery[locale]);
+			}
+		});
+	}
+}
+
+const secondBatchPrefixes = [
+	{ prefix: "patch verification failed: ", recovery: secondBatchErrors[0] },
+	{ prefix: "game directory not writable: ", recovery: secondBatchErrors[1] },
+	{ prefix: "patch already applied: ", recovery: secondBatchErrors[5] },
+];
+
+const downgradeGuidance = {
+	en: "A newer patch version is installed. Roll back the installed patch before installing an older version.",
+	es: "Hay una versión más reciente del parche instalada. Revierta el parche instalado antes de instalar una versión anterior.",
+};
+
+test("second-batch prefixes hide opaque and long diagnostic suffixes in both locales", () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const { prefix, recovery } of secondBatchPrefixes) {
+			for (const suffix of [String.raw`C:\fixtures\日本語\$&\{detail}`, "opaque; ".repeat(200), "$' $$ $`"]) {
+				assert.equal(localizeApiError(`${prefix}${suffix}`), recovery[locale]);
+				assert.equal(localizeApiError(`500: ${prefix}${suffix}`), recovery[locale]);
+			}
+		}
+	}
+});
+
+test("damaged backup guidance preserves non-space IDs literally but hides manifest diagnostics", () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const id of ["fixture", "20261009_120000_abc-def", "$&$$$`$'{id}", "日本語"]) {
+			const expected = locale === "es"
+				? `La copia de seguridad ${id} está dañada y no se puede restaurar. Figura en Ajustes → Datos.`
+				: `Backup ${id} is damaged and cannot be restored. It is listed in Settings → Data.`;
+			for (const detail of [String.raw`IO error: C:\fixtures\$&\manifest.json`, "opaque".repeat(200)]) {
+				const raw = `backup error: backup ${id} has no readable manifest.json: ${detail}`;
+				assert.equal(localizeApiError(raw), expected);
+				assert.equal(localizeApiError(`500: ${raw}`), expected);
+			}
+		}
+	}
+});
+
+test("export database and all SQLite companion-file destinations show the same guidance", () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const target of ["the project database itself", ...["-wal", "-shm", "-journal"].map(suffix =>
+			`the project database's SQLite ${suffix} sidecar`)]) {
+			const raw = `the export destination is ${target}; choose a different file`;
+			assert.equal(localizeApiError(raw), secondBatchErrors[3][locale]);
+			assert.equal(localizeApiError(`400: ${raw}`), secondBatchErrors[3][locale]);
+		}
+		assert.equal(localizeApiError("saved Direct project format is incompatible"), secondBatchErrors[4][locale]);
+		assert.equal(localizeApiError("409: saved Direct project format is incompatible"), secondBatchErrors[4][locale]);
+	}
+});
+
+test("Direct-format exact rules retain error identity and reject added prefixes, suffixes or line breaks", () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const body of [secondBatchErrors[4].body, "saved Direct project format is incompatible"]) {
+			for (const frame of ["", "409: "]) {
+				const error = new ApiError(`${frame}${body}`);
+				assert.equal(error.key, "api.error.directFormatIncompatible");
+				assert.equal(error.message, secondBatchErrors[4][locale]);
+				// Like every exact rule, surrounding whitespace is trimmed; other additions are not.
+				for (const nearMiss of [`extra prefix: ${body}`, `${body}: opaque`, `${body}\nsecond line`]) {
+					assert.equal(new ApiError(`${frame}${nearMiss}`).key, undefined);
+				}
+			}
+		}
+	}
+});
+
+test("downgrade guidance shows only reliably extracted short versions, including prerelease and build tokens", () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const [installed, incoming] of [["2.0.0", "1.0.0"], ["2.1.0-beta.2+build.7", "2.1.0-alpha.1+build.3"]]) {
+			const raw = `patch downgrade blocked: installed ${installed}, incoming ${incoming}`;
+			const expected = locale === "es"
+				? `Hay una versión más reciente del parche instalada (${installed}); la versión seleccionada es ${incoming}. Revierta el parche instalado antes de instalar una versión anterior.`
+				: `A newer patch version is installed (${installed}); the selected version is ${incoming}. Roll back the installed patch before installing an older version.`;
+			assert.equal(localizeApiError(raw), expected);
+			assert.equal(localizeApiError(`409: ${raw}`), expected);
+		}
+		for (const suffix of [
+			"installed unknown, incoming opaque",
+			"installed 2.0.0, incoming 1.0.0; opaque extra detail",
+			"installed 2.0.0, incoming 1.0.0, incoming 0.9.0",
+			"installed , incoming 1.0.0",
+			String.raw`installed C:\fixtures\$&, incoming {incoming}`,
+			`installed 2.0.0+${"a".repeat(100)}, incoming 1.0.0`,
+			`installed 2.0.0, incoming 1.0.0+${"a".repeat(100)}`,
+		]) {
+			const raw = `patch downgrade blocked: ${suffix}`;
+			assert.equal(localizeApiError(raw), downgradeGuidance[locale]);
+			assert.equal(localizeApiError(`409: ${raw}`), downgradeGuidance[locale]);
+		}
+	}
+});
+
+test("second-batch extra prefixes, incomplete shapes and multiline diagnostics stay unmatched", () => {
+	const nearMisses = [
+		...secondBatchErrors.map(({ body }) => `extra prefix: ${body}`),
+		// Exact rules trim surrounding whitespace (legacy behavior); only the line-owned families reject it.
+		...secondBatchErrors.filter(({ body }) => body !== secondBatchErrors[4].body).map(({ body }) => ` ${body}`),
+		...secondBatchPrefixes.flatMap(({ prefix }) => [prefix.trimEnd(), prefix.replace(": ", " - ") + "opaque"]),
+		"patch downgrade blocked:installed 2.0.0, incoming 1.0.0",
+		"patch downgrade blocked:",
+		"backup error: backup fixture has no readable manifest.json",
+		"backup error: backup fixture has no readable manifest.json:opaque",
+		"backup error: backup fixture with spaces has no readable manifest.json: opaque",
+		"backup error: backup  has no readable manifest.json: opaque",
+		"backup error: backup fixture has no readable manifest.txt: opaque",
+		"backup error: backup fixture has no readable manifest.json: ",
+		"the export destination is the project database itself",
+		"the export destination is ; choose a different file",
+		"the export destination is the project database itself; choose another file",
+		`${secondBatchErrors[3].body} extra detail`,
+		`${secondBatchErrors[4].body}: extra detail`,
+		"saved Direct project format is incompatible: extra detail",
+		...secondBatchErrors.flatMap(({ body }) => [
+			`${body}\nsecond line`, `${body}\rsecond line`,
+			...(body === secondBatchErrors[4].body ? [] : [`${body}\n`, `${body}\r\n`]),
+		]),
+		"backup error: backup fixture has no readable manifest.json: first\nsecond",
+		"the export destination is first\nsecond; choose a different file",
+	];
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const raw of nearMisses) {
+			assert.equal(localizeApiError(raw), raw.trim(), `${locale} bare: ${JSON.stringify(raw)}`);
+			assert.equal(localizeApiError(`400: ${raw}`),
+				`${locale === "es" ? "Error del servidor" : "Server error"} 400: ${raw.trim()}`,
+				`${locale} HTTP: ${JSON.stringify(raw)}`);
+			assert.equal(new ApiError(raw).key, undefined);
+			assert.equal(new ApiError(`400: ${raw}`).key, undefined);
+		}
+	}
+});
+
 const excerpts = ['"unterminated', String.raw`"$& C:\games\日本語\dialog.po`, '"café" extra', ""];
 const poError = (line: string, excerpt: string) =>
 	`parse error in po: line ${line}: malformed PO string: ${excerpt}`;
@@ -348,6 +543,55 @@ test("HTTP recovery failures localize guidance and preserve the complete raw act
 			assert.equal(entries.length, 1);
 			assert.deepEqual([entries[0].level, entries[0].message, entries[0].detail, entries[0].source],
 				["error", "API 400: /patch/pack", rawFailure, "api"]);
+		}
+	}
+});
+
+test("Tauri second-batch string/Error rejections keep existing logging behavior", async () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const asError of [false, true]) {
+			rejectWithError = asError;
+			for (const recovery of secondBatchErrors) {
+				rawFailure = recovery.body;
+				useLogStore.getState().clear();
+				await assert.rejects(api.importTranslations("po", "fixture.po"), (error: unknown) => {
+					assert.ok(error instanceof ApiError);
+					assert.equal(error.message, recovery[locale]);
+					return true;
+				});
+				assert.equal(useLogStore.getState().entries.length, 0);
+			}
+		}
+	}
+});
+
+test("HTTP second-batch guidance preserves raw diagnostic activity-log details without duplicate logs", async () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const recovery of secondBatchErrors) {
+			rawFailure = recovery.body;
+			useLogStore.getState().clear();
+			await assert.rejects(api.patchPack({ game_path: "fixture", output_path: "fixture.zip" }), (error: unknown) => {
+				assert.ok(error instanceof ApiError);
+				assert.equal(error.message, recovery[locale]);
+				return true;
+			});
+			const entries = useLogStore.getState().entries;
+			assert.equal(entries.length, 1);
+			assert.deepEqual([entries[0].level, entries[0].message, entries[0].detail, entries[0].source],
+				["error", "API 400: /patch/pack", rawFailure, "api"]);
+		}
+		// Opaque long/multiline bodies must still reach the log verbatim, even when unmatched.
+		for (const raw of [
+			`patch verification failed: ${"opaque; ".repeat(200)}`,
+			`patch verification failed: first\nsecond\r\n  `,
+		]) {
+			rawFailure = raw;
+			useLogStore.getState().clear();
+			await assert.rejects(api.patchPack({ game_path: "fixture", output_path: "fixture.zip" }), ApiError);
+			assert.equal(useLogStore.getState().entries.length, 1);
+			assert.equal(useLogStore.getState().entries[0].detail, raw);
 		}
 	}
 });

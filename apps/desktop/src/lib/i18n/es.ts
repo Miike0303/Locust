@@ -1119,6 +1119,22 @@ export const es: Record<keyof typeof en, string> = {
     "No se encontró el proveedor. Seleccione otro proveedor o configure su clave API en Ajustes.",
   "api.error.injectSingleTargetLanguage":
     "Una base de datos de proyecto solo puede inyectar un idioma de destino. Use un proyecto intermedio con su propia base de datos para cada idioma de destino.",
+  "api.error.patchVerificationFailed":
+    "Los archivos del juego seleccionado no coinciden con los que espera el parche. Puede tratarse de otro juego o versión, o de archivos ya modificados. Compruebe la carpeta del juego o use Forzar solo si está seguro.",
+  "api.error.gameDirNotWritable":
+    "Locust no puede escribir en la carpeta del juego. Cierre el juego, compruebe los permisos de la carpeta o mueva el juego fuera de carpetas protegidas como Program Files.",
+  "api.error.backupManifestUnreadable":
+    "La copia de seguridad {id} está dañada y no se puede restaurar. Figura en Ajustes → Datos.",
+  "api.error.exportDestinationProtected":
+    "El archivo elegido para exportar es la base de datos del proyecto o uno de sus archivos auxiliares. Elija otro nombre de archivo.",
+  "api.error.directFormatIncompatible":
+    "El formato del proyecto guardado con inyección directa es incompatible. Locust no puede reanudar este proyecto con el formato seleccionado.",
+  "api.error.patchAlreadyApplied":
+    "Este parche ya está instalado. Reviértalo antes de volver a instalarlo o use Forzar.",
+  "api.error.patchDowngradeBlocked":
+    "Hay una versión más reciente del parche instalada. Revierta el parche instalado antes de instalar una versión anterior.",
+  "api.error.patchDowngradeVersions":
+    "Hay una versión más reciente del parche instalada ({installed}); la versión seleccionada es {incoming}. Revierta el parche instalado antes de instalar una versión anterior.",
   "api.error.noTranslatedToPivot":
     "No hay traducciones para pivotar. Traduzca o importe primero.",
   "api.error.unknownExportFormat":
