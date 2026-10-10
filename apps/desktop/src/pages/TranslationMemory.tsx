@@ -86,45 +86,45 @@ export default function TranslationMemory() {
   };
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full bg-surface text-text">
       {/* Header */}
-      <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+      <div className="px-6 py-4 border-b border-border bg-surface">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-3">
-            <Database size={20} className="text-emerald-600" />
-            <h1 className="text-xl font-bold">{t("memory.title")}</h1>
+            <Database size={20} className="text-accent-fg" />
+            <h1 className="text-page font-bold">{t("memory.title")}</h1>
           </div>
           <button
             onClick={() => setConfirmClearAll(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 dark:bg-red-900/30 dark:hover:bg-red-900/50 dark:text-red-400 rounded text-sm font-medium"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-danger-muted hover:bg-danger-muted/80 text-danger rounded text-body font-medium"
           >
             <Trash2 size={14} /> {t("memory.clearAll")}
           </button>
         </div>
 
         {/* Stats */}
-        <div className="flex gap-6 text-sm text-gray-500 mb-4">
-          <span className="text-gray-800 dark:text-gray-200">{t("memory.globalEntries", { count: stats?.global_entries ?? 0 })}</span>
-          <span className="text-gray-800 dark:text-gray-200">{t("memory.projectEntries", { count: stats?.project_entries ?? 0 })}</span>
-          <span className="text-gray-800 dark:text-gray-200">{t("memory.languagePairs", { count: langPairs?.length ?? 0 })}</span>
+        <div className="flex gap-6 text-body text-text-muted mb-4">
+          <span className="text-text">{t("memory.globalEntries", { count: stats?.global_entries ?? 0 })}</span>
+          <span className="text-text">{t("memory.projectEntries", { count: stats?.project_entries ?? 0 })}</span>
+          <span className="text-text">{t("memory.languagePairs", { count: langPairs?.length ?? 0 })}</span>
         </div>
 
         {/* Search & Filter */}
         <div className="flex gap-3">
           <div className="flex-1 relative">
-            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted" />
             <input
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleSearch()}
               placeholder={t("memory.searchPlaceholder")}
-              className="w-full pl-9 pr-3 py-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              className="w-full pl-9 pr-3 py-2 border border-border rounded bg-surface text-body focus:outline-none focus:ring-2 focus:ring-accent-fg"
             />
           </div>
           <select
             value={langPair ?? ""}
             onChange={(e) => { setLangPair(e.target.value || undefined); setOffset(0); }}
-            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-sm"
+            className="px-3 py-2 border border-border rounded bg-surface text-body"
           >
             <option value="">{t("memory.allLanguages")}</option>
             {langPairs?.map((lp) => (
@@ -133,7 +133,7 @@ export default function TranslationMemory() {
           </select>
           <button
             onClick={handleSearch}
-            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium"
+            className="px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium"
           >
             {t("common.search")}
           </button>
@@ -143,19 +143,19 @@ export default function TranslationMemory() {
       {/* Table / page states */}
       <div className="flex-1 overflow-auto">
         {isLoading ? (
-          <div className="flex h-full items-center justify-center text-gray-500">
+          <div className="flex h-full items-center justify-center text-text-muted">
             {t("memory.loading")}
           </div>
         ) : isError ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-            <p className="font-medium text-red-600 dark:text-red-400">{t("memory.loadError")}</p>
-            <p className="text-sm text-gray-500">
+            <p className="font-medium text-danger">{t("memory.loadError")}</p>
+            <p className="text-body text-text-muted">
               {errorMessage(error, t("common.tryAgain"))}
             </p>
             <button
               type="button"
               onClick={() => { void refetch(); }}
-              className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+              className="rounded bg-accent px-4 py-2 text-body font-medium text-white hover:bg-accent-hover"
             >
               {t("common.retry")}
             </button>
@@ -175,9 +175,9 @@ export default function TranslationMemory() {
             />
           )
         ) : (
-          <table className="w-full text-sm">
-            <thead className="sticky top-0 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
-              <tr className="text-left text-gray-500 text-xs uppercase">
+          <table className="w-full text-body">
+            <thead className="sticky top-0 bg-surface-muted border-b border-border">
+              <tr className="text-left text-text-muted text-caption uppercase">
                 <th className="px-4 py-2">{t("memory.col.source")}</th>
                 <th className="px-4 py-2">{t("memory.col.translation")}</th>
                 <th className="px-4 py-2 w-24">{t("memory.col.language")}</th>
@@ -190,7 +190,7 @@ export default function TranslationMemory() {
               {entries.map((entry, i) => (
                 <tr
                   key={`${entry.source_hash}-${entry.lang_pair}-${i}`}
-                  className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50"
+                  className="border-b border-border hover:bg-surface-muted"
                 >
                   <td className="px-4 py-2 max-w-xs truncate" title={entry.source}>
                     {entry.source}
@@ -199,12 +199,12 @@ export default function TranslationMemory() {
                     {entry.translation}
                   </td>
                   <td className="px-4 py-2">
-                    <span className="px-2 py-0.5 bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 rounded text-xs">
+                    <span className="px-2 py-0.5 bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 rounded text-caption">
                       {entry.lang_pair}
                     </span>
                   </td>
-                  <td className="px-4 py-2 text-center text-gray-500">{entry.uses}</td>
-                  <td className="px-4 py-2 text-gray-500 text-xs">
+                  <td className="px-4 py-2 text-center text-text-muted">{entry.uses}</td>
+                  <td className="px-4 py-2 text-text-muted text-caption">
                     {new Date(entry.last_used).toLocaleString()}
                   </td>
                   <td className="px-4 py-2">
@@ -212,7 +212,7 @@ export default function TranslationMemory() {
                       type="button"
                       aria-label={t("memory.deleteAria", { name: entry.source.trim() || entry.source_hash })}
                       onClick={() => setEntryToDelete({ hash: entry.source_hash, lp: entry.lang_pair })}
-                      className="text-red-400 hover:text-red-600"
+                      className="text-danger hover:bg-danger-muted"
                     >
                       <Trash2 size={14} />
                     </button>
@@ -226,25 +226,25 @@ export default function TranslationMemory() {
 
       {/* Pagination */}
       {!isLoading && !isError && totalPages > 1 && (
-        <div className="flex items-center justify-between px-6 py-3 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
-          <span className="text-sm text-gray-500">
+        <div className="flex items-center justify-between px-6 py-3 border-t border-border bg-surface">
+          <span className="text-body text-text-muted">
             {t("memory.showing", { from: offset + 1, to: Math.min(offset + PAGE_SIZE, total), total })}
           </span>
           <div className="flex gap-2">
             <button
               onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
               disabled={offset === 0}
-              className="flex items-center gap-1 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm disabled:opacity-50"
+              className="flex items-center gap-1 px-3 py-1.5 bg-surface-muted hover:bg-surface rounded text-body disabled:opacity-50"
             >
               <ChevronLeft size={14} /> {t("common.prev")}
             </button>
-            <span className="px-3 py-1.5 text-sm text-gray-600 dark:text-gray-400">
+            <span className="px-3 py-1.5 text-body text-text-muted">
               {currentPage} / {totalPages}
             </span>
             <button
               onClick={() => setOffset(offset + PAGE_SIZE)}
               disabled={offset + PAGE_SIZE >= total}
-              className="flex items-center gap-1 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 rounded text-sm disabled:opacity-50"
+              className="flex items-center gap-1 px-3 py-1.5 bg-surface-muted hover:bg-surface rounded text-body disabled:opacity-50"
             >
               {t("common.next")} <ChevronRight size={14} />
             </button>

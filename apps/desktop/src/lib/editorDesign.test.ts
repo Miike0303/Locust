@@ -5,6 +5,8 @@ import { test } from "node:test";
 // Inspect every authored branch, including inline editing and conditional detail states.
 const files = [
   "../pages/Editor.tsx",
+  "../pages/Review.tsx",
+  "../pages/TranslationMemory.tsx",
   "../components/StringTable.tsx",
   "../components/DetailPanel.tsx",
   "../components/FilterBar.tsx",
