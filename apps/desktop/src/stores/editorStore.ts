@@ -14,6 +14,7 @@ export interface TranslationJobSnapshot {
   done: boolean;
   cancelled: boolean;
   cancelling: boolean;
+  disconnected?: boolean;
 }
 
 interface EditorStore {

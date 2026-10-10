@@ -9,6 +9,7 @@ const h = {
   snapshot: null as any, jobId: null as string | null, translating: false,
   handlers: null as any, toasts: [] as any[], logs: [] as any[], unsubscribed: 0,
   cancellations: [] as string[],
+  subscriptions: [] as { jobId: string; handlers: any }[],
 };
 (globalThis as any).__sessionHarness = h;
 registerHooks({
@@ -20,7 +21,7 @@ registerHooks({
         export async function getProviders(){return [];}
         export async function getConfig(){return {};}
         export async function checkProviderHealth(){return {ok:true};}`,
-      "/src/lib/ws.ts": `export const JOB_STREAM_LOST_MESSAGE='stream lost'; export function subscribeToJob(id,handlers){globalThis.__sessionHarness.handlers=handlers;return()=>{globalThis.__sessionHarness.unsubscribed++;};}`,
+      "/src/lib/ws.ts": `export const JOB_STREAM_LOST_MESSAGE='stream lost'; export function subscribeToJob(id,handlers){const h=globalThis.__sessionHarness;h.handlers=handlers;h.subscriptions.push({jobId:id,handlers});return()=>{h.unsubscribed++;};}`,
       "/src/stores/editorStore.ts": `const h=globalThis.__sessionHarness; export const useEditorStore=Object.assign(()=>({isTranslating:h.translating,jobSnapshot:h.snapshot}),{getState:()=>({jobId:h.jobId,isTranslating:h.translating,jobSnapshot:h.snapshot,setJob:id=>{h.jobId=id;},setTranslating:v=>{h.translating=v;},setJobSnapshot:v=>{h.snapshot=v;},patchJobSnapshot:v=>{h.snapshot={...h.snapshot,...v};}})});`,
       "/src/stores/queueStore.ts": `export const useQueueStore={getState:()=>({setGlobalProgress:()=>{},globalProgress:null})};`,
       "/src/stores/logStore.ts": `export function addLog(...args){globalThis.__sessionHarness.logs.push(args);}`,
@@ -272,5 +273,218 @@ test("unknown and multiline batch failures keep the diagnostic only in raw detai
   }
   h.handlers.onCompleted({ type: "completed", total_translated: 0, total_cost: 0, cost_is_complete: true });
   setLocale("en");
+});
+function enabledButton(markup: string, label: string): void {
+  const button = [...markup.matchAll(/<button\b([^>]*)>(.*?)<\/button>/gs)]
+    .find(([, , text]) => text === label);
+  assert.ok(button, `expected a ${label} button`);
+  assert.ok(!button[1].includes("disabled="), `${label} must stay enabled`);
+}
+
+for (const locale of ["en", "es"] as const) {
+  test(`unexpected close preserves the cancellable job and connection status in ${locale}`, async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    setLocale(locale);
+    attach(`disconnected-cancel-${locale}`);
+    h.logs = []; h.toasts = []; h.cancellations = [];
+    h.handlers.onClosed();
+    assert.equal(h.jobId, `disconnected-cancel-${locale}`);
+    assert.equal(session.subscribedTranslationJobId(), h.jobId);
+    assert.equal(h.translating, true);
+    assert.equal(h.snapshot.disconnected, true);
+    assert.equal(h.snapshot.error, null);
+    const modal = renderModal();
+    assert.ok(modal.includes(locale === "es" ? "Conexión perdida" : "Connection lost"));
+    enabledButton(modal, t("translate.cancel"));
+    assert.deepEqual(h.toasts, [], "a transport failure is not a failed translation");
+    await session.requestTranslationCancel();
+    assert.deepEqual(h.cancellations, [`disconnected-cancel-${locale}`]);
+    assert.equal(h.snapshot.cancelling, true);
+    // A disconnected cancellation must also subscribe for its terminal replay.
+    h.handlers.onFailed({ type: "failed", error: "cancelled" });
+    assert.equal(h.snapshot.cancelled, true);
+    assert.equal(h.snapshot.disconnected, false);
+    assert.equal(h.jobId, null);
+  });
+
+  test(`exhausted backoff keeps Cancel and Reconnect available in ${locale}`, async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    setLocale(locale);
+    h.subscriptions = [];
+    attach(`retry-exhausted-${locale}`);
+    h.handlers.onClosed();
+    assert.equal(h.snapshot.disconnected, true);
+    for (const [index, delay] of [1000, 2000, 4000].entries()) {
+      ctx.mock.timers.tick(delay - 1);
+      assert.equal(h.subscriptions.length, index + 1);
+      ctx.mock.timers.tick(1);
+      assert.equal(h.subscriptions.length, index + 2);
+      h.handlers.onClosed();
+      h.handlers.onClosed(); // Error followed by close must not consume two retries.
+    }
+    ctx.mock.timers.tick(60_000);
+    assert.equal(h.subscriptions.length, 4, "initial subscription plus three retries");
+    assert.ok(h.subscriptions.every(({ jobId }) => jobId === `retry-exhausted-${locale}`));
+    assert.equal(h.snapshot.disconnected, true);
+    assert.equal(h.snapshot.error, null);
+    assert.equal(h.translating, true);
+    session.setTranslationModalOpen(false);
+    session.clearTranslationSnapshotIfIdle();
+    attach(`retry-exhausted-${locale}`);
+    session.setTranslationModalOpen(true);
+    assert.equal(h.subscriptions.length, 4, "reopening must preserve the disconnected session");
+    const modal = renderModal();
+    enabledButton(modal, t("translate.cancel"));
+    enabledButton(modal, locale === "es" ? "Reconectar" : "Reconnect");
+    session.reconnectTranslationJob();
+    assert.equal(h.subscriptions.length, 5);
+    session.reconnectTranslationJob();
+    assert.equal(h.subscriptions.length, 5, "manual reconnect must not overlap subscriptions");
+    h.handlers.onOpen();
+    assert.equal(h.snapshot.disconnected, false);
+    h.handlers.onFailed({ type: "failed", error: "cancelled" });
+    const subscriptions = h.subscriptions.length;
+    ctx.mock.timers.tick(60_000);
+    assert.equal(h.subscriptions.length, subscriptions);
+  });
+}
+
+test("replay preserves progress and counts repeated batch failures once per occurrence", (ctx) => {
+  ctx.mock.timers.enable({ apis: ["setTimeout"] });
+  setLocale("en");
+  h.subscriptions = []; h.logs = []; h.toasts = [];
+  attach("replay-counts");
+  const started = { type: "started", total: 5 };
+  const failure = { type: "batch_failed", error: "provider unavailable" };
+  const string = { type: "string_translated", entry_id: "entry-1", translation: "First" };
+  const progress = { type: "batch_completed", completed: 1, total: 5, cost_so_far: 0.01 };
+  const original = h.handlers;
+  original.onStarted(started);
+  original.onStringTranslated(string);
+  original.onBatchFailed(failure);
+  original.onBatchFailed(failure); // Two distinct failures can have identical payloads.
+  original.onBatchCompleted(progress);
+  original.onClosed();
+  ctx.mock.timers.tick(1000);
+  assert.equal(h.subscriptions.length, 2);
+  const replay = h.handlers;
+  replay.onStarted(started);
+  replay.onStringTranslated(string);
+  replay.onBatchFailed(failure);
+  replay.onBatchFailed(failure);
+  replay.onBatchCompleted(progress);
+  assert.equal(h.snapshot.disconnected, false);
+  assert.equal(h.snapshot.completed, 1);
+  assert.equal(h.snapshot.batchFailures.count, 2);
+  assert.equal(h.logs.filter(([, , detail]) => detail === failure.error).length, 2);
+  original.onFailed({ type: "failed", error: "stale socket" });
+  original.onClosed();
+  assert.equal(h.jobId, "replay-counts");
+  replay.onBatchFailed(failure);
+  replay.onStringTranslated({ ...string, entry_id: "entry-2", translation: "Second" });
+  replay.onBatchCompleted({ ...progress, completed: 2, cost_so_far: 0.02 });
+  const completed = { type: "completed", total_translated: 2, total_cost: 0.02, cost_is_complete: true };
+  replay.onCompleted(completed);
+  replay.onCompleted(completed);
+  replay.onStringTranslated(string);
+  replay.onBatchFailed(failure);
+  replay.onClosed();
+  ctx.mock.timers.tick(60_000);
+  assert.equal(h.snapshot.completed, 2);
+  assert.equal(h.snapshot.lastTranslated, "Second");
+  assert.equal(h.snapshot.batchFailures.count, 3);
+  assert.equal(h.snapshot.costSoFar, 0.02);
+  assert.equal(h.snapshot.done, true);
+  assert.equal(h.snapshot.disconnected, false);
+  assert.equal(h.jobId, null);
+  assert.equal(h.translating, false);
+  assert.deepEqual(h.toasts, [["warning", t("translate.completedWithErrorsSummary", { translated: 2, count: 3 })]]);
+  assert.equal(h.subscriptions.length, 2);
+});
+
+test("job not found on resubscribe is terminal and stops retries", (ctx) => {
+  ctx.mock.timers.enable({ apis: ["setTimeout"] });
+  h.subscriptions = []; h.toasts = [];
+  attach("expired-job");
+  h.handlers.onClosed();
+  ctx.mock.timers.tick(1000);
+  assert.equal(h.subscriptions.length, 2);
+  h.handlers.onFailed({ type: "failed", error: "job not found" });
+  h.handlers.onClosed();
+  ctx.mock.timers.tick(60_000);
+  assert.equal(h.snapshot.error, t("api.error.jobNotFound"));
+  assert.equal(h.snapshot.disconnected, false);
+  assert.equal(h.jobId, null);
+  assert.equal(session.subscribedTranslationJobId(), null);
+  assert.equal(h.translating, false);
+  assert.equal(h.toasts.length, 1);
+  assert.equal(h.toasts[0][0], "error");
+  assert.equal(h.subscriptions.length, 2);
+});
+
+test("replacing a disconnected job cancels its retry and ignores its late events", (ctx) => {
+  ctx.mock.timers.enable({ apis: ["setTimeout"] });
+  h.subscriptions = [];
+  attach("old-disconnected");
+  const old = h.handlers;
+  old.onClosed();
+  assert.equal(h.snapshot.disconnected, true);
+  attach("replacement");
+  old.onCompleted({ type: "completed", total_translated: 99, total_cost: 1 });
+  old.onStarted({ type: "started", total: 99 });
+  old.onClosed();
+  ctx.mock.timers.tick(60_000);
+  assert.equal(h.subscriptions.length, 2);
+  assert.equal(h.jobId, "replacement");
+  assert.equal(h.snapshot.completed, 0);
+  h.handlers.onFailed({ type: "failed", error: "cancelled" });
+});
+
+test("replaying old events does not replenish automatic retries; new progress does", (ctx) => {
+  ctx.mock.timers.enable({ apis: ["setTimeout"] });
+  h.subscriptions = [];
+  attach("interrupted-replay");
+  const started = { type: "started", total: 5 };
+  h.handlers.onStarted(started);
+  h.handlers.onClosed();
+  for (const delay of [1000, 2000, 4000]) {
+    ctx.mock.timers.tick(delay);
+    h.handlers.onOpen();
+    h.handlers.onStarted(started);
+    h.handlers.onClosed();
+  }
+  ctx.mock.timers.tick(60_000);
+  assert.equal(h.subscriptions.length, 4);
+  assert.equal(h.snapshot.disconnected, true);
+  session.reconnectTranslationJob();
+  h.handlers.onStarted(started);
+  h.handlers.onClosed();
+  ctx.mock.timers.tick(1000);
+  h.handlers.onStarted(started);
+  h.handlers.onBatchCompleted({ type: "batch_completed", completed: 1, total: 5, cost_so_far: 0 });
+  h.handlers.onClosed();
+  const count = h.subscriptions.length;
+  ctx.mock.timers.tick(999);
+  assert.equal(h.subscriptions.length, count);
+  ctx.mock.timers.tick(1);
+  assert.equal(h.subscriptions.length, count + 1, "fresh progress restarts backoff at one second");
+  h.handlers.onFailed({ type: "failed", error: "cancelled" });
+});
+
+test("a terminal event arriving during backoff ends the job and clears the pending retry", (ctx) => {
+  ctx.mock.timers.enable({ apis: ["setTimeout"] });
+  h.subscriptions = []; h.toasts = [];
+  attach("terminal-during-backoff");
+  h.handlers.onStarted({ type: "started", total: 2 });
+  h.handlers.onClosed();
+  h.handlers.onStringTranslated({ type: "string_translated", translation: "late progress" });
+  assert.equal(h.snapshot.lastTranslated, "");
+  h.handlers.onCompleted({ type: "completed", total_translated: 2, total_cost: 0, cost_is_complete: true });
+  assert.equal(h.snapshot.done, true);
+  assert.equal(h.snapshot.disconnected, false);
+  assert.equal(h.jobId, null);
+  ctx.mock.timers.tick(60_000);
+  assert.equal(h.subscriptions.length, 1);
+  assert.equal(h.toasts.length, 1);
 });
 console.log("translationJobSession.test.ts: ok");

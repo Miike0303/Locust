@@ -12,7 +12,8 @@ import type {
   PatchErrorEvent,
 } from "./api";
 
-interface JobHandlers {
+export interface JobHandlers {
+  onOpen?: () => void;
   onStarted?: (e: ProgressEventStarted) => void;
   onBatchCompleted?: (e: ProgressEventBatchCompleted) => void;
   onStringTranslated?: (e: ProgressEventStringTranslated) => void;
@@ -76,6 +77,10 @@ export function subscribeToJob(
         ws.close();
         return;
       }
+
+      ws.onopen = () => {
+        if (!cancelled) handlers.onOpen?.();
+      };
 
       ws.onmessage = (event) => {
         if (cancelled) return;

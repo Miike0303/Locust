@@ -13,6 +13,7 @@ import { translationModalStep } from "../lib/translationJob";
 import { startSingleTranslation } from "../lib/translationStart";
 import {
 	clearTranslationSnapshotIfIdle,
+	reconnectTranslationJob,
 	requestTranslationCancel,
 	setTranslationModalOpen,
 } from "../lib/translationJobSession";
@@ -288,6 +289,7 @@ export default function TranslationModal({
 	const completedWithErrors = done && (batchFailures?.count ?? 0) > 0;
 	const cancelled = jobSnapshot?.cancelled ?? false;
 	const cancelling = jobSnapshot?.cancelling ?? false;
+	const disconnected = jobSnapshot?.disconnected ?? false;
 	const error = jobSnapshot?.error ?? null;
 	const completed = jobSnapshot?.completed ?? 0;
 	const total = jobSnapshot?.total ?? 0;
@@ -598,6 +600,18 @@ export default function TranslationModal({
 						{lastTranslated && !done && !cancelled && !error && (
 							<div className="text-caption text-text-muted truncate">
 								{t("translate.last", { text: lastTranslated })}
+							</div>
+						)}
+						{disconnected && (
+							<div role="status" className="p-2 bg-warning-muted border border-warning rounded text-body text-warning space-y-2">
+								<p>{t("translate.connectionLost")}</p>
+								<p>{t("translate.connectionLostHint")}</p>
+								<button
+									onClick={reconnectTranslationJob}
+									className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
+								>
+									{t("translate.reconnect")}
+								</button>
 							</div>
 						)}
 						{error && (
