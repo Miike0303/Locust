@@ -341,6 +341,11 @@ pub async fn run_pivot(
 pub struct PatchStringReq {
     pub translation: Option<String>,
     pub status: Option<StringStatus>,
+    #[serde(
+        default,
+        deserialize_with = "locust_core::database::deserialize_expected_translation"
+    )]
+    pub expected_translation: Option<Option<String>>,
 }
 
 #[tauri::command]
@@ -355,22 +360,34 @@ pub async fn patch_string(
         if s.current_project.read().await.is_none() {
             return Err("no project open".into());
         }
-        if let Some(ref translation) = data.translation {
-            s.db.save_translation(&id, translation, "manual")
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        if let Some(ref status) = data.status {
-            s.db.update_entry_status(&id, status.clone())
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        s.db.get_entry(&id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "Entry not found".to_string())
+        apply_string_patch(&s.db, &id, data).await
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+async fn apply_string_patch(
+    db: &locust_core::database::Database,
+    id: &str,
+    data: PatchStringReq,
+) -> Result<StringEntry, String> {
+    if let Some(ref translation) = data.translation {
+        let outcome = db
+            .save_translation_if_unchanged(id, translation, "manual", data.expected_translation)
+            .await
+            .map_err(|e| e.to_string())?;
+        if outcome == locust_core::database::TranslationSaveOutcome::Conflict {
+            return Err(locust_core::database::TRANSLATION_CONFLICT_MESSAGE.into());
+        }
+    }
+    if let Some(ref status) = data.status {
+        db.update_entry_status(id, status.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    db.get_entry(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Entry not found".to_string())
 }
 
 #[derive(Deserialize)]
@@ -863,6 +880,40 @@ async fn apply_add_glossary_entry(s: &AppState, entry: &GlossaryEntry) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn manual_save_conflict_preserves_row_and_maps_the_stable_message() {
+        let db = locust_core::database::Database::open_in_memory().unwrap();
+        let mut row = StringEntry::new("row", "Source", PathBuf::from("story.html"));
+        row.translation = Some("V1".into());
+        row.status = StringStatus::Approved;
+        db.save_entries(&[row]).unwrap();
+        for expected in [serde_json::json!("V0"), serde_json::Value::Null] {
+            let data = serde_json::from_value(serde_json::json!({
+                "translation": "A draft", "expected_translation": expected, "status": "pending"
+            }))
+            .unwrap();
+            assert_eq!(
+                apply_string_patch(&db, "row", data).await.unwrap_err(),
+                "translation changed since it was loaded"
+            );
+            let saved = db.get_entry("row").unwrap().unwrap();
+            assert_eq!(saved.translation.as_deref(), Some("V1"));
+            assert_eq!(saved.status, StringStatus::Approved);
+        }
+        for body in [
+            serde_json::json!({"translation":"V2", "expected_translation":"V1"}),
+            serde_json::json!({"translation":"legacy"}),
+            serde_json::json!({"status":"reviewed"}),
+        ] {
+            apply_string_patch(&db, "row", serde_json::from_value(body).unwrap())
+                .await
+                .unwrap();
+        }
+        let saved = db.get_entry("row").unwrap().unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("legacy"));
+        assert_eq!(saved.status, StringStatus::Reviewed);
+    }
 
     #[test]
     fn backup_response_supports_report_and_legacy_modes() {

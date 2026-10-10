@@ -12,12 +12,12 @@ import {
 } from "@tanstack/react-table";
 import clsx from "clsx";
 import type { StringEntry } from "../lib/api";
-import { getConfig, patchString } from "../lib/api";
+import { getConfig, getString, patchString } from "../lib/api";
 import { clampTableRowHeight, showSourceColumnEnabled } from "../lib/appearance";
 import { useEditorStore } from "../stores/editorStore";
 import { useT, type MessageKey } from "../lib/i18n";
 import { useProjectStore } from "../stores/projectStore";
-import { acknowledgeDraft, draftEntryKey, draftProjectKey, editDraft, saveDraft, useDraftStore } from "../stores/draftStore";
+import { acknowledgeDraft, draftEntryKey, draftProjectKey, editDraft, loadLatestDraft, saveDraft, useDraftStore } from "../stores/draftStore";
 
 const statusLabel: Record<string, MessageKey> = {
 	pending: "detail.status.pending",
@@ -69,16 +69,24 @@ function InlineEdit({
 		return !!current && draftProjectKey(current) === projectKey;
 	};
 
-	const handleBlur = async () => {
-		if (cancelled.current) return;
+	const handleBlur = async (overwrite = false) => {
+		if (cancelled.current && !overwrite) return;
 		setEditing(false);
 		if (!isCurrentProject()) return;
-		await saveDraft(draftKey, entry.translation || "", async text => {
+		await saveDraft(draftKey, entry.translation || "", async (text, expectedTranslation) => {
 			if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
-			await patchString(entry.id, { translation: text });
+			await patchString(entry.id, { translation: text, ...(expectedTranslation === undefined ? {} : { expected_translation: expectedTranslation }) });
 			if (isCurrentProject()) onSave();
-		});
+		}, overwrite);
 	};
+
+	const handleLoadLatest = () => loadLatestDraft(draftKey, async () => {
+		if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
+		const latest = await getString(entry.id);
+		if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
+		onSave();
+		return latest.translation;
+	});
 
 	if (editing) {
 		return (
@@ -86,8 +94,8 @@ function InlineEdit({
 				aria-label={t("table.editTranslation")}
 				value={value}
 				disabled={saving}
-				onChange={(e) => editDraft(draftKey, e.target.value)}
-				onBlur={handleBlur}
+				onChange={(e) => editDraft(draftKey, e.target.value, entry.translation)}
+				onBlur={() => handleBlur()}
 				onClick={e => e.stopPropagation()}
 				onKeyDown={(e) => {
 					if (e.key === "Enter" && e.ctrlKey) { e.preventDefault(); void handleBlur(); }
@@ -114,6 +122,7 @@ function InlineEdit({
 				e.stopPropagation();
 				cancelled.current = false;
 				initialValue.current = value;
+				if (!useDraftStore.getState().drafts[draftKey]) editDraft(draftKey, value, entry.translation);
 				setEditing(true);
 			}}
 			className="block w-full truncate rounded-sm text-left text-body text-text cursor-text disabled:cursor-wait focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
@@ -142,7 +151,14 @@ function InlineEdit({
 			)}
 		</button>
 		{draft && <span role="status" className="block text-caption text-warning">{saving ? t("table.saving") : t("table.unsaved")}</span>}
-		{draft?.error && <div className="text-caption text-danger break-words"><p role="alert">{draft.error}</p><button type="button" disabled={saving} onClick={() => void handleBlur()} className="underline">{t("common.retry")}</button></div>}
+		{draft?.conflict && <div className="text-caption text-danger break-words">
+			<p role="alert">{t("api.error.translationConflict")}</p>
+			<div className="flex gap-3">
+				<button type="button" disabled={saving} onClick={handleLoadLatest} className="underline">{t("detail.loadLatest")}</button>
+				<button type="button" disabled={saving} onClick={() => handleBlur(true)} className="underline">{t("detail.overwrite")}</button>
+			</div>
+		</div>}
+		{draft?.error && <div className="text-caption text-danger break-words"><p role="alert">{draft.error}</p>{!draft.conflict && <button type="button" disabled={saving} onClick={() => void handleBlur()} className="underline">{t("common.retry")}</button>}</div>}
 		{persistenceIssue && <p role="alert" className="text-caption text-danger">{t("detail.draftStorageFailed")}</p>}
 		</div>
 	);

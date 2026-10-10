@@ -571,6 +571,9 @@ export const es: Record<keyof typeof en, string> = {
 
   "detail.draftStorageFailed": "No se pudo leer o actualizar todo el almacenamiento de borradores. Mantén esta ventana abierta y guarda tu texto en el proyecto antes de cerrar.",
   "detail.draftConflict": "Se recuperaron otras versiones del borrador. Selecciona una para revisarla; las demás seguirán disponibles.",
+  "detail.loadLatest": "Cargar versión actual",
+  "detail.overwrite": "Sobrescribir",
+  "api.error.translationConflict": "La traducción cambió desde que se cargó. Su borrador se ha conservado. Cargue la versión actual o sobrescríbala con su borrador.",
   "detail.draftRestore": "Recuperar versión",
   "detail.draftEmpty": "(texto vacío)",
   "detail.title": "Detalle de la entrada",

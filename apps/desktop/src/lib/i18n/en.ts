@@ -586,6 +586,9 @@ export const en = {
   // ── detail ──────────────────────────────────────────────────────────────
   "detail.draftStorageFailed": "Draft storage could not be read or updated completely. Keep this window open and save your text to the project before closing.",
   "detail.draftConflict": "Other draft versions were recovered. Select a version to review it; the other versions remain available.",
+  "detail.loadLatest": "Load latest",
+  "detail.overwrite": "Overwrite",
+  "api.error.translationConflict": "This translation changed since it was loaded. Your draft has been kept. Load the latest version or overwrite it with your draft.",
   "detail.draftRestore": "Recover version",
   "detail.draftEmpty": "(empty text)",
   "detail.title": "Entry Detail",

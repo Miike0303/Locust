@@ -1001,6 +1001,11 @@ async fn get_string(
 struct PatchStringRequest {
     translation: Option<String>,
     status: Option<StringStatus>,
+    #[serde(
+        default,
+        deserialize_with = "locust_core::database::deserialize_expected_translation"
+    )]
+    expected_translation: Option<Option<String>>,
 }
 
 async fn patch_string(
@@ -1026,11 +1031,17 @@ async fn patch_string_owned(
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
     if let Some(ref translation) = req.translation {
-        state
+        let outcome = state
             .db
-            .save_translation(&id, translation, "manual")
+            .save_translation_if_unchanged(&id, translation, "manual", req.expected_translation)
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if outcome == locust_core::database::TranslationSaveOutcome::Conflict {
+            return Err(err(
+                StatusCode::CONFLICT,
+                locust_core::database::TRANSLATION_CONFLICT_MESSAGE,
+            ));
+        }
     }
     if let Some(ref status) = req.status {
         state

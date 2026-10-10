@@ -2,10 +2,10 @@ import { useState, useEffect, useRef } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import clsx from "clsx";
 import type { StringEntry, StringStatus } from "../lib/api";
-import { encodedByteLen, patchString } from "../lib/api";
+import { encodedByteLen, getString, patchString } from "../lib/api";
 import { binaryBudgetHint } from "../lib/binaryBudget";
 import { useT } from "../lib/i18n";
-import { acknowledgeDraft, draftAlternatives, selectDraftAlternative, draftEntryKey, draftProjectKey, editDraft, saveDraft, useDraftStore } from "../stores/draftStore";
+import { acknowledgeDraft, draftAlternatives, selectDraftAlternative, draftEntryKey, draftProjectKey, editDraft, loadLatestDraft, saveDraft, useDraftStore } from "../stores/draftStore";
 import { useProjectStore } from "../stores/projectStore";
 
 import type { MessageKey } from "../lib/i18n";
@@ -66,16 +66,24 @@ export default function DetailPanel({
 	}, [draftKey, entry.translation, saving]);
 	useEffect(() => { setActionError(null); }, [entry.id]);
 
-	const handleSave = (): Promise<boolean> => {
+	const handleSave = (overwrite = false): Promise<boolean> => {
 		if (!isCurrentProject()) return Promise.resolve(false);
 		const id = entry.id;
 		setActionError(null);
-		return saveDraft(draftKey, entry.translation || "", async (text) => {
+		return saveDraft(draftKey, entry.translation || "", async (text, expectedTranslation) => {
 			if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
-			await patchString(id, { translation: text });
+			await patchString(id, { translation: text, ...(expectedTranslation === undefined ? {} : { expected_translation: expectedTranslation }) });
 			if (isCurrentProject()) onRefetch();
-		});
+		}, overwrite);
 	};
+
+	const handleLoadLatest = () => loadLatestDraft(draftKey, async () => {
+		if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
+		const latest = await getString(entry.id);
+		if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
+		onRefetch();
+		return latest.translation;
+	});
 
 	const handleStatusChange = async (status: StringStatus) => {
 		const id = entry.id;
@@ -122,6 +130,13 @@ export default function DetailPanel({
 					</p>
 				)}
 				{(actionError || draft?.error) && <p role="alert" className="text-caption text-danger break-words">{actionError || draft?.error}</p>}
+				{draft?.conflict && <div className="text-caption">
+					<p role="alert" className="text-danger">{t("api.error.translationConflict")}</p>
+					<div className="flex gap-3">
+					<button type="button" disabled={saving || changingStatus} onClick={handleLoadLatest} className="underline">{t("detail.loadLatest")}</button>
+					<button type="button" disabled={saving || changingStatus} onClick={() => handleSave(true)} className="underline">{t("detail.overwrite")}</button>
+					</div>
+				</div>}
                 {persistenceIssue && <p role="alert" className="text-caption text-danger">{t("detail.draftStorageFailed")}</p>}
                 {alternatives.length > 0 && <div className="text-caption text-warning">
                     <p>{t("detail.draftConflict")}</p>
@@ -149,8 +164,11 @@ export default function DetailPanel({
 					<textarea
 						disabled={saving || changingStatus}
 						value={translation}
-						onChange={(e) => editDraft(draftKey, e.target.value)}
-						onBlur={handleSave}
+						onFocus={() => {
+							if (!useDraftStore.getState().drafts[draftKey]) editDraft(draftKey, translation, entry.translation);
+						}}
+						onChange={(e) => editDraft(draftKey, e.target.value, entry.translation)}
+						onBlur={() => handleSave()}
 						onKeyDown={(e) => {
 							if (e.key === "Enter" && e.ctrlKey) handleSave();
 						}}

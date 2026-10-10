@@ -26,6 +26,7 @@ export const INJECT_EMPTY_LANGUAGES_EN =
 	"inject requires at least one language (e.g. [\"es\"])";
 
 const EXACT: Record<string, MessageKey> = {
+  "translation changed since it was loaded": "api.error.translationConflict",
   "Configuration could not be loaded. The existing file is protected. Repair the configuration and restart Locust before saving settings.": "settings.configLoadFailed",
   "cost limit must be finite and non-negative": "api.error.invalidCostLimit",
   "provider error: cost limit must be finite and non-negative": "api.error.invalidCostLimit",

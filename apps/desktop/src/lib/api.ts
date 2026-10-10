@@ -499,7 +499,7 @@ export const runPivot = (outputPath: string): Promise<PivotResult> =>
 export const getString = (id: string) =>
   request<StringEntry>(`/strings/${encodeURIComponent(id)}`);
 
-export const patchString = (id: string, data: Partial<Pick<StringEntry, "translation" | "status">>): Promise<StringEntry> =>
+export const patchString = (id: string, data: Partial<Pick<StringEntry, "translation" | "status">> & { expected_translation?: string | null }): Promise<StringEntry> =>
   IS_TAURI
     ? tauriInvoke("patch_string", { id, data })
     : request(`/strings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });

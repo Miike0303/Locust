@@ -3,7 +3,7 @@
 export const DRAFT_PREFIX = "locust.editor.draft.v1.";
 export const MAX_DRAFT_TEXT = 256 * 1024;
 export const MAX_DRAFT_RECORDS = 1024;
-const MAX_RECORD_SIZE = MAX_DRAFT_TEXT * 2 + 16384;
+const MAX_RECORD_SIZE = MAX_DRAFT_TEXT * 4 + 16384;
 export type DraftStorageIssue = "unavailable" | "invalid" | "tooLarge" | "full";
 export interface DurableDraft {
   version: 1;
@@ -11,6 +11,9 @@ export interface DurableDraft {
   parent: string | null;
   entryKey: string;
   text: string;
+  /** Absent only on drafts created before guarded saves were supported. */
+  baseline?: string | null;
+  conflict?: boolean;
   error: string | null;
   updatedAt: number;
 }
@@ -54,6 +57,9 @@ export function createDraftPersistence(getStorage: () => DraftStorage = browserD
             !(value.parent === null || typeof value.parent === "string") ||
             typeof value.entryKey !== "string" || value.entryKey.length > 8192 ||
             typeof value.text !== "string" || value.text.length > MAX_DRAFT_TEXT ||
+            !(value.baseline === undefined || value.baseline === null ||
+              (typeof value.baseline === "string" && value.baseline.length <= MAX_DRAFT_TEXT)) ||
+            !(value.conflict === undefined || typeof value.conflict === "boolean") ||
             !(value.error === null || (typeof value.error === "string" && value.error.length <= 4096)) ||
             !Number.isFinite(value.updatedAt)) throw new Error("Invalid draft");
           serialized.set(value, raw);
@@ -63,8 +69,8 @@ export function createDraftPersistence(getStorage: () => DraftStorage = browserD
     } catch { issue = "unavailable"; }
     return { records, issue };
   }
-  function write(entryKey: string, text: string, error: string | null, parent: string | null) {
-    if (text.length > MAX_DRAFT_TEXT || entryKey.length > 8192) {
+  function write(entryKey: string, text: string, error: string | null, parent: string | null, baseline?: string | null, conflict?: boolean) {
+    if (text.length > MAX_DRAFT_TEXT || (baseline?.length ?? 0) > MAX_DRAFT_TEXT || entryKey.length > 8192) {
       return { record: null, issue: "tooLarge" as DraftStorageIssue };
     }
     const before = read();
@@ -76,7 +82,7 @@ export function createDraftPersistence(getStorage: () => DraftStorage = browserD
       const revision = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
         : Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16).padStart(8, "0")).join("");
       const record: DurableDraft = { version: 1, revision, parent,
-        entryKey, text, error: error?.slice(0, 4096) ?? null, updatedAt: Date.now() };
+        entryKey, text, baseline, conflict, error: error?.slice(0, 4096) ?? null, updatedAt: Date.now() };
       const storage = getStorage();
       const raw = JSON.stringify(record);
       if (raw.length > MAX_RECORD_SIZE) return { record: null, issue: "tooLarge" as DraftStorageIssue };

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { ProjectInfo } from "../lib/api";
+import { ApiError } from "../lib/apiError";
 import { createDraftPersistence, DRAFT_PREFIX, type DraftStorageIssue, type DurableDraft } from "../lib/draftPersistence";
 
 export function draftProjectKey(project: ProjectInfo): string {
@@ -10,9 +11,15 @@ export function draftEntryKey(projectKey: string, id: string): string {
 }
 export interface EntryDraft {
   text: string;
+  baseline?: string | null;
+  conflict?: boolean;
   error: string | null;
   saving: boolean;
   revision?: string;
+}
+function restoredDraft(record: DurableDraft): EntryDraft {
+  return { text: record.text, baseline: record.baseline, conflict: record.conflict,
+    error: record.error, saving: false, revision: record.revision };
 }
 const persistence = createDraftPersistence();
 const loaded = persistence.read();
@@ -22,7 +29,7 @@ function branches(records: DurableDraft[]): DurableDraft[] {
 }
 const initialDrafts: Record<string, EntryDraft> = {};
 for (const record of branches(loaded.records)) {
-  initialDrafts[record.entryKey] ??= { text: record.text, error: record.error, saving: false, revision: record.revision };
+  initialDrafts[record.entryKey] ??= restoredDraft(record);
 }
 export const useDraftStore = create<{
   drafts: Record<string, EntryDraft>;
@@ -35,7 +42,7 @@ const pending = new Map<string, Promise<boolean>>();
 function persistDraft(key: string): void {
   const draft = useDraftStore.getState().drafts[key];
   if (!draft) return;
-  const result = persistence.write(key, draft.text, draft.error, draft.revision ?? null);
+  const result = persistence.write(key, draft.text, draft.error, draft.revision ?? null, draft.baseline, draft.conflict);
   const fresh = persistence.read();
   useDraftStore.setState(({ drafts, persistenceIssues }) => {
     const issues = { ...persistenceIssues };
@@ -53,7 +60,7 @@ export function refreshDurableDrafts(): void {
     const next = { ...drafts };
     for (const record of branches(fresh.records)) {
       // Never replace the active text or an in-flight write from another tab.
-      next[record.entryKey] ??= { text: record.text, error: record.error, saving: false, revision: record.revision };
+      next[record.entryKey] ??= restoredDraft(record);
     }
     return { drafts: next, records: fresh.records, persistenceIssue: fresh.issue ?? useDraftStore.getState().persistenceIssue };
   });
@@ -78,19 +85,19 @@ export function selectDraftAlternative(key: string, revision: string): void {
   if (!record) return;
   // Keep the previously selected branch available. Selecting is not deletion.
   useDraftStore.setState(({ drafts }) => ({ drafts: { ...drafts,
-    [key]: { text: record.text, error: record.error, saving: false, revision: record.revision },
+    [key]: restoredDraft(record),
   } }));
 }
-export function editDraft(key: string, text: string): void {
+export function editDraft(key: string, text: string, baseline?: string | null): void {
   useDraftStore.setState(({ drafts }) => ({ drafts: {
-    ...drafts, [key]: { ...drafts[key], text, error: null, saving: drafts[key]?.saving ?? false },
+    ...drafts, [key]: { baseline, ...drafts[key], text, error: null, saving: drafts[key]?.saving ?? false },
   } }));
   // Synchronous persistence covers abrupt reload/exit without an unload handler.
   persistDraft(key);
 }
 export function acknowledgeDraft(key: string, serverText: string): void {
   const draft = useDraftStore.getState().drafts[key];
-  if (!draft || draft.saving || draft.text !== serverText) return;
+  if (!draft || draft.saving || draft.conflict || draft.text !== serverText) return;
   const fresh = persistence.read();
   let issue = fresh.issue;
   for (const record of fresh.records) {
@@ -105,7 +112,7 @@ export function acknowledgeDraft(key: string, serverText: string): void {
     delete next[key];
     const alternative = branches(remaining.records.filter(r => r.entryKey === key))
       .find(r => r.revision !== draft.revision && r.text !== serverText);
-    if (alternative && alternative.text !== serverText) next[key] = { text: alternative.text, error: alternative.error, saving: false, revision: alternative.revision };
+    if (alternative && alternative.text !== serverText) next[key] = restoredDraft(alternative);
     const issues = { ...useDraftStore.getState().persistenceIssues };
     if (issue) issues[key] = issue;
     else delete issues[key];
@@ -115,22 +122,54 @@ export function acknowledgeDraft(key: string, serverText: string): void {
 export function saveDraft(
   key: string,
   serverText: string,
-  write: (text: string) => Promise<unknown>,
+  write: (text: string, expectedTranslation?: string | null) => Promise<unknown>,
+  overwrite = false,
 ): Promise<boolean> {
   const active = pending.get(key);
   if (active) return active;
   const draft = useDraftStore.getState().drafts[key];
-  if (!draft || draft.text === serverText) {
+  if (draft?.conflict && !overwrite) return Promise.resolve(false);
+  if (!draft || (!overwrite && draft.text === serverText)) {
     acknowledgeDraft(key, serverText);
     return Promise.resolve(true);
   }
   const submitted = draft.text;
-  useDraftStore.setState(({ drafts }) => ({ drafts: {
-    ...drafts, [key]: { ...draft, error: null, saving: true },
-  } }));
-  const operation = Promise.resolve().then(() => write(submitted)).then(() => true, (error: unknown) => {
+  return runDraftOperation(key, async () => {
+    await write(submitted, overwrite ? undefined : draft.baseline);
     useDraftStore.setState(({ drafts }) => ({ drafts: {
-      ...drafts, [key]: { ...drafts[key], error: error instanceof Error ? error.message : String(error) },
+      ...drafts, [key]: { ...drafts[key], baseline: submitted, conflict: false, error: null },
+    } }));
+  });
+}
+
+/** Explicitly replace a conflicted draft, using the same pending/error lifecycle. */
+export function loadLatestDraft(key: string, read: () => Promise<string | null>): Promise<boolean> {
+  const active = pending.get(key);
+  if (active) return active;
+  const draft = useDraftStore.getState().drafts[key];
+  if (!draft) return Promise.resolve(true);
+  return runDraftOperation(key, async () => {
+    const latest = await read();
+    useDraftStore.setState(({ drafts }) => ({ drafts: {
+      ...drafts, [key]: { ...drafts[key],
+        // A late read must not erase text entered while it was pending.
+        text: drafts[key].text === draft.text ? latest ?? "" : drafts[key].text,
+        baseline: latest, conflict: false, error: null },
+    } }));
+  });
+}
+
+function runDraftOperation(key: string, action: () => Promise<void>): Promise<boolean> {
+  useDraftStore.setState(({ drafts }) => ({ drafts: {
+    ...drafts, [key]: { ...drafts[key], error: null, saving: true },
+  } }));
+  const operation = Promise.resolve().then(action).then(() => true, (error: unknown) => {
+    const conflict = error instanceof ApiError && error.key === "api.error.translationConflict";
+    useDraftStore.setState(({ drafts }) => ({ drafts: {
+      ...drafts, [key]: { ...drafts[key],
+        // Conflict guidance is rendered from the current locale, including after reload.
+        error: conflict ? null : error instanceof Error ? error.message : String(error),
+        conflict: drafts[key].conflict || conflict },
     } }));
     return false;
   }).finally(() => {

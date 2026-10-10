@@ -29,6 +29,26 @@ pub struct Database {
     path: Mutex<PathBuf>,
 }
 
+pub const TRANSLATION_CONFLICT_MESSAGE: &str = "translation changed since it was loaded";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationSaveOutcome {
+    Updated,
+    Missing,
+    Conflict,
+}
+
+/// With `serde(default)`, absent is None, JSON null is Some(None), and text is
+/// Some(Some(text)). Plain nested Options would collapse absent and null.
+pub fn deserialize_expected_translation<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 fn lock_connection(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
     conn.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1118,6 +1138,21 @@ impl Database {
         translation: &str,
         provider: &str,
     ) -> Result<bool> {
+        Ok(self
+            .save_translation_if_unchanged(entry_id, translation, provider, None)
+            .await?
+            == TranslationSaveOutcome::Updated)
+    }
+
+    /// Atomically compare the original translation and write. None preserves
+    /// legacy unconditional saves; Some(None) requires SQL NULL (not "").
+    pub async fn save_translation_if_unchanged(
+        &self,
+        entry_id: &str,
+        translation: &str,
+        provider: &str,
+        expected_translation: Option<Option<String>>,
+    ) -> Result<TranslationSaveOutcome> {
         let conn = self.conn.clone();
         let entry_id = entry_id.to_string();
         let translation = translation.to_string();
@@ -1125,11 +1160,24 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = lock_connection(&conn);
             let now = Utc::now().to_rfc3339();
-            let n = conn.execute(
-                "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4",
-                params![translation, provider, now, entry_id, !translation.trim().is_empty()],
+            let tx = conn.unchecked_transaction()?;
+            let n = tx.execute(
+                "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4 AND (?6 = 0 OR translation IS ?7)",
+                params![translation, provider, now, entry_id, !translation.trim().is_empty(), expected_translation.is_some(), expected_translation.flatten()],
             )?;
-            Ok(n > 0)
+            let outcome = if n > 0 {
+                TranslationSaveOutcome::Updated
+            } else if tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM strings WHERE id = ?1)",
+                [&entry_id],
+                |row| row.get::<_, bool>(0),
+            )? {
+                TranslationSaveOutcome::Conflict
+            } else {
+                TranslationSaveOutcome::Missing
+            };
+            tx.commit()?;
+            Ok(outcome)
         })
         .await
         .unwrap()
