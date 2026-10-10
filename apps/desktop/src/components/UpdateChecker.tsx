@@ -87,42 +87,42 @@ export default function UpdateChecker() {
   return (
     <div className="fixed bottom-4 right-4 z-50 max-w-md">
       {state.kind === "checking" && (
-        <div className="bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-lg shadow-lg p-3 flex items-center gap-2 text-sm">
-          <div className="animate-spin h-4 w-4 border-2 border-blue-500 border-t-transparent rounded-full" />
+        <div className="bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-lg shadow-lg p-3 flex items-center gap-2 text-body">
+          <div className="animate-spin h-4 w-4 border-2 border-blue-500 dark:border-blue-400 border-t-transparent dark:border-t-transparent rounded-full" />
           <span>{t("update.checking")}</span>
         </div>
       )}
 
       {state.kind === "upToDate" && (
-        <div className="bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-800 rounded-lg shadow-lg p-3 flex items-center gap-2 text-sm">
-          <CheckCircle size={16} className="text-green-600" />
+        <div className="bg-success-muted text-success border border-success rounded-lg shadow-lg p-3 flex items-center gap-2 text-body">
+          <CheckCircle size={16} className="text-success" />
           <span>{t("update.upToDate")}</span>
         </div>
       )}
 
       {state.kind === "available" && (
-        <div className="bg-white dark:bg-gray-800 border border-emerald-500 rounded-lg shadow-xl p-4">
+        <div className="bg-surface text-text border border-accent-fg rounded-lg shadow-xl p-4">
           <div className="flex items-start gap-2">
-            <Download className="text-emerald-500 flex-shrink-0 mt-0.5" size={20} />
+            <Download className="text-accent-fg flex-shrink-0 mt-0.5" size={20} />
             <div className="flex-1">
-              <div className="font-semibold text-sm">
+              <div className="font-semibold text-body">
                 {t("update.available", { version: state.version })}
               </div>
               {state.notes && (
-                <div className="text-xs text-gray-600 dark:text-gray-400 mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap">
+                <div className="text-caption text-text-muted mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap">
                   {state.notes}
                 </div>
               )}
               <div className="flex gap-2 mt-3">
                 <button
                   onClick={downloadAndInstall}
-                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-medium"
+                  className="px-3 py-1.5 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium"
                 >
                   {t("update.download")}
                 </button>
                 <button
                   onClick={() => setState({ kind: "idle" })}
-                  className="px-3 py-1.5 bg-gray-200 dark:bg-gray-700 rounded text-sm"
+                  className="px-3 py-1.5 bg-surface-muted text-text rounded text-body"
                 >
                   {t("common.later")}
                 </button>
@@ -133,37 +133,37 @@ export default function UpdateChecker() {
       )}
 
       {state.kind === "downloading" && (
-        <div className="bg-white dark:bg-gray-800 border rounded-lg shadow-xl p-4">
-          <div className="text-sm font-semibold mb-2">{t("update.downloading")}</div>
-          <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+        <div className="bg-surface text-text border border-border rounded-lg shadow-xl p-4">
+          <div className="text-body font-semibold mb-2">{t("update.downloading")}</div>
+          <div className="w-full bg-border rounded-full h-2">
             <div
-              className="bg-emerald-500 h-2 rounded-full transition-all"
+              className="bg-accent h-2 rounded-full transition-all"
               style={{ width: `${state.progress}%` }}
             />
           </div>
-          <div className="text-xs text-gray-500 mt-1">
+          <div className="text-caption text-text-muted mt-1">
             {state.progress.toFixed(0)}%
           </div>
         </div>
       )}
 
       {state.kind === "ready" && (
-        <div className="bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-500 rounded-lg shadow-lg p-3 flex items-center gap-2 text-sm">
-          <CheckCircle size={16} className="text-emerald-600" />
+        <div className="bg-success-muted text-success border border-success rounded-lg shadow-lg p-3 flex items-center gap-2 text-body">
+          <CheckCircle size={16} className="text-success" />
           <span>{t("update.installed")}</span>
         </div>
       )}
 
       {state.kind === "error" && (
-        <div className="bg-red-50 dark:bg-red-900/30 border border-red-300 rounded-lg shadow-lg p-3 flex items-center gap-2 text-sm">
-          <AlertCircle size={16} className="text-red-600 flex-shrink-0" />
+        <div className="bg-danger-muted text-danger border border-danger rounded-lg shadow-lg p-3 flex items-center gap-2 text-body">
+          <AlertCircle size={16} className="text-danger flex-shrink-0" />
           <div className="flex-1">
             <div className="font-semibold">{t("update.checkFailed")}</div>
-            <div className="text-xs text-gray-600 dark:text-gray-400">{state.message}</div>
+            <div className="text-caption text-text-muted">{state.message}</div>
           </div>
           <button
             onClick={() => setState({ kind: "idle" })}
-            className="text-gray-500 hover:text-gray-700"
+            className="text-text-muted hover:text-text"
           >
             ✕
           </button>

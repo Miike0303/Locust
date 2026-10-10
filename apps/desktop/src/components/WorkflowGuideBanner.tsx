@@ -28,11 +28,11 @@ export default function WorkflowGuideBanner({
   return (
     <section
       aria-label={t("workflow.guideAria")}
-      className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-gray-200 bg-emerald-50/40 px-4 py-1.5 dark:border-gray-800 dark:bg-emerald-950/15"
+      className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-border bg-accent-muted/40 px-4 py-1.5"
     >
       <ol
         aria-label={t("workflow.stepsAria")}
-        className="flex shrink-0 items-center gap-1.5 text-xs"
+        className="flex shrink-0 items-center gap-1.5 text-caption"
       >
         {STEPS.map((item, index) => {
           const done = index < currentIndex;
@@ -45,8 +45,8 @@ export default function WorkflowGuideBanner({
                   className={clsx(
                     "h-px w-4",
                     done || current
-                      ? "bg-emerald-400 dark:bg-emerald-700"
-                      : "bg-gray-300 dark:bg-gray-700",
+                      ? "bg-accent"
+                      : "bg-border",
                   )}
                 />
               )}
@@ -55,21 +55,21 @@ export default function WorkflowGuideBanner({
                 className={clsx(
                   "flex items-center gap-1.5",
                   current
-                    ? "font-semibold text-emerald-800 dark:text-emerald-200"
+                    ? "font-semibold text-accent-fg"
                     : done
-                      ? "text-gray-700 dark:text-gray-300"
-                      : "text-gray-500 dark:text-gray-400",
+                      ? "text-text"
+                      : "text-text-muted",
                 )}
               >
                 <span
                   aria-hidden="true"
                   className={clsx(
-                    "flex size-4 items-center justify-center rounded-full text-[10px] font-semibold",
+                    "flex size-4 items-center justify-center rounded-full text-caption font-semibold",
                     current
-                      ? "bg-emerald-600 text-white"
+                      ? "bg-accent text-white"
                       : done
-                        ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/60 dark:text-emerald-300"
-                        : "ring-1 ring-inset ring-gray-300 text-gray-500 dark:ring-gray-600 dark:text-gray-400",
+                        ? "bg-accent-muted text-accent-fg"
+                        : "ring-1 ring-inset ring-border text-text-muted",
                   )}
                 >
                   {done ? <Check size={10} strokeWidth={3} /> : index + 1}
@@ -82,7 +82,7 @@ export default function WorkflowGuideBanner({
         })}
       </ol>
 
-      <p className="min-w-0 flex-1 truncate text-xs text-gray-600 dark:text-gray-400" title={content.description}>
+      <p className="min-w-0 flex-1 truncate text-caption text-text-muted" title={content.description}>
         {content.description}
       </p>
 
@@ -91,7 +91,7 @@ export default function WorkflowGuideBanner({
           <button
             type="button"
             onClick={onSkipReview}
-            className="rounded px-2 py-1 text-xs font-medium text-gray-600 hover:bg-gray-100 hover:text-gray-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-white"
+            className="rounded px-2 py-1 text-caption font-medium text-text-muted hover:bg-surface-muted hover:text-text focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
           >
             {t("workflow.skipReview")}
           </button>
@@ -99,7 +99,7 @@ export default function WorkflowGuideBanner({
         <button
           type="button"
           onClick={onPrimaryAction}
-          className="rounded bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-emerald-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-1 dark:focus-visible:ring-offset-gray-900"
+          className="rounded bg-accent px-2.5 py-1 text-caption font-medium text-white transition-colors hover:bg-accent-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
         >
           {content.action}
         </button>
@@ -108,7 +108,7 @@ export default function WorkflowGuideBanner({
           onClick={onDismiss}
           aria-label={t("workflow.dismiss")}
           title={t("workflow.dismiss")}
-          className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:text-gray-500 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+          className="rounded p-1 text-text-muted hover:bg-surface-muted hover:text-text focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
         >
           <X aria-hidden="true" size={14} />
         </button>

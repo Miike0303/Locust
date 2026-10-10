@@ -39,17 +39,17 @@ export default class RouteErrorBoundary extends Component<Props, State> {
 			<div className="flex min-h-full items-center justify-center p-6">
 				<div
 					role="alert"
-					className="w-full max-w-md rounded-xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-700 dark:bg-gray-900"
+					className="w-full max-w-md rounded-xl border border-border bg-surface p-6 shadow-sm"
 				>
 					<div className="flex items-start gap-3">
-						<span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-amber-50 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400">
+						<span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-warning-muted text-warning">
 							<AlertTriangle size={20} aria-hidden="true" />
 						</span>
 						<div className="min-w-0">
-							<h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">
+							<h2 className="text-section font-semibold text-text">
 								{t("route.crash.title")}
 							</h2>
-							<p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
+							<p className="mt-1 text-body text-text-muted">
 								{t("route.crash.body")}
 							</p>
 						</div>
@@ -58,20 +58,20 @@ export default class RouteErrorBoundary extends Component<Props, State> {
 						<button
 							type="button"
 							onClick={this.handleReload}
-							className="inline-flex items-center gap-2 rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-gray-900"
+							className="inline-flex items-center gap-2 rounded-md bg-accent px-4 py-2 text-body font-medium text-white transition-colors hover:bg-accent-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
 						>
 							<RotateCw size={16} aria-hidden="true" />
 							{t("route.crash.reload")}
 						</button>
-						<span className="text-xs text-gray-500 dark:text-gray-400">
+						<span className="text-caption text-text-muted">
 							{t("route.crash.sidebarHint")}
 						</span>
 					</div>
-					<details className="mt-5 text-xs text-gray-500 dark:text-gray-400">
-						<summary className="cursor-pointer select-none rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500">
+					<details className="mt-5 text-caption text-text-muted">
+						<summary className="cursor-pointer select-none rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg">
 							{t("route.crash.details")}
 						</summary>
-						<pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md bg-gray-50 p-3 font-mono text-[11px] text-gray-700 dark:bg-gray-800 dark:text-gray-300">
+						<pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md bg-surface-muted p-3 font-mono text-caption text-text">
 							{error.message || error.name}
 						</pre>
 					</details>

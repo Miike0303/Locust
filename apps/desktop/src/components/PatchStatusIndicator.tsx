@@ -29,7 +29,7 @@ function statusPresentation(
 		if (data.injection_pending) {
 			return {
 				label: t("patch.status.injectionPending"),
-				className: "bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100 border-amber-200 dark:border-amber-800",
+				className: "bg-warning-muted text-warning border-warning/40",
 				Icon: AlertCircle,
 			};
 		}
@@ -39,7 +39,7 @@ function statusPresentation(
 			if (data.status === "patched") labels.push(t("patch.status.patched"));
 			return {
 				label: labels.join(" · "),
-				className: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200 border-emerald-200 dark:border-emerald-800",
+				className: "bg-success-muted text-success border-success/40",
 				Icon: Package,
 			};
 		}
@@ -49,28 +49,28 @@ function statusPresentation(
 			return {
 				label: t("patch.status.pristine"),
 				className:
-					"bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300 border-gray-200 dark:border-gray-700",
+					"bg-surface-muted text-text-muted border-border",
 				Icon: CheckCircle2,
 			};
 		case "patched":
 			return {
 				label: t("patch.status.patched"),
 				className:
-					"bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200 border-emerald-200 dark:border-emerald-800",
+					"bg-success-muted text-success border-success/40",
 				Icon: Package,
 			};
 		case "interrupted":
 			return {
 				label: t("patch.status.interrupted"),
 				className:
-					"bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100 border-amber-200 dark:border-amber-800",
+					"bg-warning-muted text-warning border-warning/40",
 				Icon: AlertCircle,
 			};
 		default:
 			return {
 				label: t("patch.status.unknown"),
 				className:
-					"bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-100 border-amber-200 dark:border-amber-900",
+					"bg-warning-muted text-warning border-warning/40",
 				Icon: HelpCircle,
 			};
 	}
@@ -99,7 +99,7 @@ export default function PatchStatusIndicator({
 			<button
 				type="button"
 				onClick={onOpenPatch}
-				className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] font-medium transition-colors hover:brightness-95 dark:hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 bg-gray-50 text-gray-600 dark:bg-gray-800 dark:text-gray-300 border-gray-200 dark:border-gray-700"
+				className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-caption font-medium transition-colors hover:brightness-95 dark:hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg bg-surface-muted text-text-muted border-border"
 				title={t("patch.status.checking")}
 			>
 				<Loader2 size={12} className="animate-spin" />
@@ -113,7 +113,7 @@ export default function PatchStatusIndicator({
 			<button
 				type="button"
 				onClick={onOpenPatch}
-				className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] font-medium transition-colors hover:brightness-95 dark:hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 bg-amber-50 text-amber-900 dark:bg-amber-950/40 dark:text-amber-100 border-amber-200 dark:border-amber-900"
+				className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-caption font-medium transition-colors hover:brightness-95 dark:hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg bg-warning-muted text-warning border-warning/40"
 				title={t("patch.status.unknownTitle")}
 			>
 				<HelpCircle size={12} />
@@ -138,7 +138,7 @@ export default function PatchStatusIndicator({
 		<button
 			type="button"
 			onClick={onOpenPatch}
-			className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] font-medium transition-colors hover:brightness-95 dark:hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${className}`}
+			className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-caption font-medium transition-colors hover:brightness-95 dark:hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg ${className}`}
 			title={title}
 		>
 			<Icon size={12} />

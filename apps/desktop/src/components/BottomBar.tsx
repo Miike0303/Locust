@@ -31,38 +31,38 @@ export default function BottomBar() {
 	const eta = formatEta(progress.startedAt, progress.completed, progress.total, t);
 
 	return (
-		<div className="h-9 flex items-center gap-3 px-4 bg-gray-50 dark:bg-gray-900 border-t border-gray-200 dark:border-gray-700 text-xs shrink-0">
+		<div className="h-9 flex items-center gap-3 px-4 bg-surface-muted dark:bg-surface border-t border-border text-caption shrink-0">
 			<Loader2
 				size={14}
-				className="animate-spin text-emerald-500 dark:text-emerald-400 shrink-0"
+				className="animate-spin text-accent-fg shrink-0"
 			/>
-			<span className="font-medium truncate max-w-40 text-gray-800 dark:text-gray-200">
+			<span className="font-medium truncate max-w-40 text-text">
 				{progress.projectName}
 			</span>
 
-			<div className="flex-1 max-w-64 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+			<div className="flex-1 max-w-64 h-2 bg-border rounded-full overflow-hidden">
 				<div
-					className="h-full bg-emerald-500 dark:bg-emerald-400 rounded-full transition-all duration-300"
+					className="h-full bg-accent rounded-full transition-all duration-300"
 					style={{ width: `${percent}%` }}
 				/>
 			</div>
 
-			<span className="text-gray-600 dark:text-gray-300 tabular-nums shrink-0">
+			<span className="text-text-muted tabular-nums shrink-0">
 				{progress.completed}/{progress.total} · {percent}%
 			</span>
 
 			{(
-				<span className="text-gray-500 dark:text-gray-400 tabular-nums">
+				<span className="text-text-muted tabular-nums">
 					{formatObservedCost(progress.costSoFar, progress.costIsComplete, t)}
 				</span>
 			)}
 
-			{eta && <span className="text-gray-500 dark:text-gray-400">{eta}</span>}
+			{eta && <span className="text-text-muted">{eta}</span>}
 
 			{progress.queuePosition != null &&
 				progress.queueTotal != null &&
 				progress.queueTotal > 1 && (
-					<span className="text-gray-500 dark:text-gray-400 ml-auto">
+					<span className="text-text-muted ml-auto">
 						{t("bottom.project", {
 							position: progress.queuePosition,
 							total: progress.queueTotal,
