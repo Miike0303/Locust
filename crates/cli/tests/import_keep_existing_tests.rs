@@ -49,9 +49,19 @@ fn import(
 }
 
 fn write_catalog(input: &Path, format: &str, entries: &[StringEntry]) {
+    // A translator's catalog carries no project metadata; stale markers on the
+    // fixtures describe DB state and would otherwise export as fuzzy entries.
+    let entries: Vec<StringEntry> = entries
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            entry.metadata.clear();
+            entry
+        })
+        .collect();
     let content = match format {
-        "po" => export::export_po(entries, "en", "es"),
-        "xliff" => export::export_xliff(entries, "en", "es"),
+        "po" => export::export_po(&entries, "en", "es"),
+        "xliff" => export::export_xliff(&entries, "en", "es"),
         _ => unreachable!(),
     };
     std::fs::write(input, content).unwrap();

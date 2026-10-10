@@ -1,5 +1,5 @@
 use crate::error::{LocustError, Result};
-use crate::models::StringEntry;
+use crate::models::{StringEntry, STALE_TRANSLATION_METADATA_KEY};
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -82,6 +82,9 @@ pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) 
         // File location only — Locust ids often contain `#` (e.g. file#idx#key).
         // Putting the id after path# and re-importing with rfind broke multi-# ids.
         lines.push(format!("#: {}", entry.file_path.display()));
+        if entry.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY) {
+            lines.push("#, fuzzy".to_string());
+        }
         // Full entry id for lossless import (preferred over legacy path#id).
         lines.push(format!("msgctxt \"{}\"", escape_po(&entry.id)));
         lines.push(format!("msgid \"{}\"", escape_po(&entry.source)));
@@ -318,6 +321,11 @@ pub fn export_xliff(entries: &[StringEntry], source_lang: &str, target_lang: &st
 
     for entry in entries {
         let translation = entry.translation.as_deref().unwrap_or("");
+        let target_state = if entry.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY) {
+            " state=\"needs-review-translation\""
+        } else {
+            ""
+        };
         xml.push_str(&format!(
             "      <trans-unit id=\"{}\">\n",
             escape_xml(&entry.id)
@@ -327,7 +335,7 @@ pub fn export_xliff(entries: &[StringEntry], source_lang: &str, target_lang: &st
             escape_xml(&entry.source)
         ));
         xml.push_str(&format!(
-            "        <target>{}</target>\n",
+            "        <target{target_state}>{}</target>\n",
             escape_xml(translation)
         ));
         xml.push_str("      </trans-unit>\n");
@@ -367,6 +375,7 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
         id: String,
         source: String,
         target: String,
+        target_state: Option<String>,
         has_source: bool,
         has_target: bool,
     }
@@ -398,12 +407,14 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                 // ignoring duplicate attributes or broken entity references.
                 let mut id = None;
                 let mut version = None;
+                let mut state = None;
                 for attribute in element.attributes() {
                     let attribute = attribute.map_err(invalid)?;
                     let value = attribute.unescape_value().map_err(invalid)?.into_owned();
                     match attribute.key.as_ref() {
                         b"id" => id = Some(value),
                         b"version" => version = Some(value),
+                        b"state" => state = Some(value),
                         _ => {}
                     }
                 }
@@ -433,6 +444,7 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                                 id,
                                 source: String::new(),
                                 target: String::new(),
+                                target_state: None,
                                 has_source: false,
                                 has_target: false,
                             });
@@ -456,6 +468,7 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                                 return Err(invalid("duplicate target in translation unit"));
                             }
                             unit.has_target = true;
+                            unit.target_state = state;
                             Element::Target
                         }
                         // Translation elements in a wrong position are not
@@ -505,6 +518,7 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                         id: unit.id,
                         source: unit.source,
                         target: unit.target,
+                        target_state: unit.target_state,
                     });
                 }
             }
@@ -526,6 +540,9 @@ pub struct XliffUnit {
     pub id: String,
     pub source: String,
     pub target: String,
+    /// XLIFF 1.2 target state; absent in older serialized units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_state: Option<String>,
 }
 
 /// Collect `(id, translation)` pairs for [`crate::database::Database::save_translations_batch`].
@@ -559,12 +576,17 @@ pub fn po_entries_for_batch(entries: &[PoEntry]) -> (Vec<ImportedTranslation>, u
     (updates, skipped)
 }
 
-/// Same as [`po_entries_for_batch`] for XLIFF units (empty target → skipped).
+/// Same as [`po_entries_for_batch`]: empty or needs-review targets are skipped.
 pub fn xliff_units_for_batch(units: &[XliffUnit]) -> (Vec<ImportedTranslation>, usize) {
     let mut skipped = 0usize;
     let mut updates = Vec::with_capacity(units.len());
     for unit in units {
-        if unit.target.is_empty() {
+        if unit.target.is_empty()
+            || matches!(
+                unit.target_state.as_deref(),
+                Some("needs-review-translation" | "needs-review-adaptation" | "needs-review-l10n")
+            )
+        {
             skipped += 1;
             continue;
         }
@@ -1259,11 +1281,13 @@ msgstr "Hola"
                 id: "a".into(),
                 source: "A".into(),
                 target: "Á".into(),
+                target_state: None,
             },
             XliffUnit {
                 id: "b".into(),
                 source: "B".into(),
                 target: String::new(),
+                target_state: None,
             },
         ];
         let (updates, pre_skipped) = xliff_units_for_batch(&units);
