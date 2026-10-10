@@ -3,6 +3,7 @@
  * (run: npx --yes tsx src/lib/reviewQueue.test.ts).
  */
 import assert from "node:assert/strict";
+import { test } from "node:test";
 import {
   applyBootstrap,
   applyFetchedPage,
@@ -302,3 +303,20 @@ function currentId(state: ReturnType<typeof createReviewQueue>): string | undefi
 }
 
 console.log("reviewQueue.test.ts: ok");
+
+test("a delayed acknowledgement counts its captured row without advancing another row", () => {
+  const initial = applyBootstrap(createReviewQueue(), page(["A", "B", "C"], 3), page([], 0), 4);
+  const onB = skipCurrent(initial);
+  const acknowledged = approveCurrent(onB, "A");
+  assert.deepEqual(acknowledged.approvedIds, ["A"]);
+  assert.equal(acknowledged.approvedCount, 1);
+  assert.equal(currentId(acknowledged), "B");
+  const repeated = approveCurrent(acknowledged, "A");
+  assert.equal(repeated.approvedCount, 1);
+  assert.equal(currentId(repeated), "B");
+});
+
+test("acknowledging an unknown row cannot approve or advance the current row", () => {
+  const queue = applyBootstrap(createReviewQueue(), page(["A", "B"], 2), page([], 0), PAGE);
+  assert.deepEqual(approveCurrent(queue, "old-project-row"), queue);
+});

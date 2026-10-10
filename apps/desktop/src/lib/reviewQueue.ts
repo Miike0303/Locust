@@ -237,19 +237,21 @@ function advanceFromCurrent(state: ReviewQueueState): ReviewQueueState {
   return { ...state, pendingAdvance: true };
 }
 
-export function approveCurrent(state: ReviewQueueState): ReviewQueueState {
+export function approveCurrent(
+  state: ReviewQueueState,
+  approvedId = state.items[state.index]?.id,
+): ReviewQueueState {
   if (state.complete) return state;
-  const current = state.items[state.index];
-  if (!current) return state;
-  const already = state.approvedIds.includes(current.id);
+  if (!approvedId || !state.items.some(item => item.id === approvedId)) return state;
+  const already = state.approvedIds.includes(approvedId);
   const next: ReviewQueueState = {
     ...state,
     approvedIds: already
       ? state.approvedIds
-      : [...state.approvedIds, current.id],
+      : [...state.approvedIds, approvedId],
     approvedCount: already ? state.approvedCount : state.approvedCount + 1,
   };
-  return advanceFromCurrent(next);
+  return state.items[state.index]?.id === approvedId ? advanceFromCurrent(next) : next;
 }
 
 export function skipCurrent(state: ReviewQueueState): ReviewQueueState {

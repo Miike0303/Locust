@@ -19,6 +19,7 @@ const h = {
   effects: [] as (() => void)[], pending: [] as Promise<void>[], errors: [] as unknown[],
   rows: {} as Record<string, StringEntry>, writes: [] as { id: string; patch: Patch }[],
   failure: null as unknown, waitForSave: null as Promise<void> | null, invalidations: 0,
+  keydown: null as ((event: any) => void) | null, navigations: [] as string[],
   t,
   state(initial: any) {
     const index = this.cursor++;
@@ -71,7 +72,7 @@ const hooks = registerHooks({
     if (context.parentURL?.endsWith("/pages/Review.tsx")) {
       const stubs: Record<string, string> = {
         react: `const h=globalThis.__reviewTest;export const useState=x=>h.state(x);export const useRef=x=>h.ref(x);export const useEffect=(fn,deps)=>h.effect(fn,deps);export const useCallback=(fn,deps)=>h.callback(fn,deps);`,
-        "react-router-dom": `export const useNavigate=()=>()=>{};`,
+        "react-router-dom": `export const useNavigate=()=>path=>globalThis.__reviewTest.navigations.push(path);`,
         "@tanstack/react-query": `export const useQueryClient=()=>({invalidateQueries:async()=>{globalThis.__reviewTest.invalidations++;}});`,
         "../stores/projectStore": `export const useProjectStore=select=>select({project:{path:'/game'}});`,
         "../lib/i18n": `export const useT=()=>globalThis.__reviewTest.t;`,
@@ -83,14 +84,23 @@ const hooks = registerHooks({
   },
 });
 const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
 Object.defineProperty(globalThis, "window", {
-  configurable: true, value: { addEventListener() {}, removeEventListener() {} },
+  configurable: true, value: {
+    addEventListener(_type: string, handler: typeof h.keydown) { h.keydown = handler; },
+    removeEventListener() { h.keydown = null; },
+  },
+});
+Object.defineProperty(globalThis, "document", {
+  configurable: true, value: { documentElement: { lang: "en" }, querySelector() { return null; } },
 });
 const { default: Review, reviewApprovalPatch } = await import("./Review.tsx");
 after(() => {
   hooks.deregister();
   if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
   else Reflect.deleteProperty(globalThis, "window");
+  if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument);
+  else Reflect.deleteProperty(globalThis, "document");
   Reflect.deleteProperty(globalThis, "__reviewTest");
   setLocale("en");
 });
@@ -122,8 +132,8 @@ function button(label: string) {
 }
 function textarea() { return nodes(render()).find(node => node.type === "textarea"); }
 function edit(value: string) { textarea().props.onChange({ target: { value } }); }
-function progress(current: number, approved: number) {
-  assert.ok(text(render()).includes(t("review.progress", { current, total: 2, approved })));
+function progress(current: number, approved: number, total = 2) {
+  assert.ok(text(render()).includes(t("review.progress", { current, total, approved })), text(render()));
 }
 async function settle() {
   do { await Promise.all(h.pending.splice(0)); render(); } while (h.pending.length);
@@ -137,6 +147,7 @@ beforeEach(async () => {
   h.values = []; h.effects = []; h.pending = []; h.errors = [];
   h.rows = { A: row("A"), B: row("B") }; h.writes = [];
   h.failure = null; h.waitForSave = null; h.invalidations = 0;
+  h.keydown = null; h.navigations = [];
   render();
   await settle();
   assert.equal(textarea().props.value, "Translation A");
@@ -215,5 +226,69 @@ test("a revised approval waits for persistence before advancing", async () => {
     await settle();
   }
   assert.equal(h.rows.A.translation, "Delayed A");
+  progress(2, 1);
+});
+
+async function threeRows() {
+  h.values = []; h.effects = []; h.pending = [];
+  h.rows = { A: row("A"), B: row("B"), C: row("C") };
+  render();
+  await settle();
+}
+
+test("two approvals in the same render submit A once and land on B with one approval", async () => {
+  await threeRows();
+  let finish!: () => void;
+  h.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+  const click = button(t("review.approve")).props.onClick;
+  click();
+  click();
+  finish();
+  await settle();
+  assert.deepEqual(h.writes.map(write => write.id), ["A"]);
+  assert.equal(textarea().props.value, "Translation B");
+  progress(2, 1, 3);
+  assert.equal(h.rows.B.status, "translated");
+});
+
+test("pending approval disables actions and synchronously blocks stale clicks and hotkeys", async () => {
+  await threeRows();
+  button(t("review.skip")).props.onClick(); // B lets Previous exercise a real move.
+  const actions = ["review.approve", "review.skip", "review.previous", "common.exit"] as const;
+  const staleClicks = actions.map(key => button(t(key)).props.onClick);
+  let finish!: () => void;
+  h.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+  staleClicks[0]();
+  try {
+    for (const click of staleClicks) click();
+    for (const key of ["a", "s", "p", "e", "Escape", "Enter"]) {
+      h.keydown?.({ key, ctrlKey: key === "Enter", target: null, preventDefault() {} });
+    }
+    for (const key of actions) assert.equal(button(t(key)).props.disabled, true, key);
+    assert.equal(textarea().props.disabled, true, "pending edits must not be lost on advance");
+    assert.equal(textarea().props.value, "Translation B");
+    assert.deepEqual(h.navigations, []);
+    assert.deepEqual(h.writes.map(write => write.id), ["B"]);
+    progress(2, 0, 3);
+  } finally {
+    finish();
+    await settle();
+  }
+  assert.equal(textarea().props.value, "Translation C");
+  progress(3, 1, 3);
+  for (const key of actions) assert.equal(button(t(key)).props.disabled, false, key);
+});
+
+test("a failed delayed approval releases the guard and retries the same row", async () => {
+  let finish!: () => void;
+  h.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+  h.failure = new Error("Delayed failure");
+  button(t("review.approve")).props.onClick();
+  finish();
+  await settle();
+  progress(1, 0);
+  assert.equal(button(t("review.approve")).props.disabled, false);
+  h.failure = null;
+  await approve();
   progress(2, 1);
 });
