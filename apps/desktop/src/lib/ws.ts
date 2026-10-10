@@ -31,6 +31,8 @@ interface JobHandlers {
 
 interface WaitOptions {
   onProgress?: (completed: number, total: number, costSoFar: number, costIsComplete: boolean) => void;
+  onBatchFailed?: (e: ProgressEventBatchFailed) => void;
+  onCompleted?: (e: ProgressEventCompleted) => void;
 }
 
 /** Catalog key — UI renders via `t()`, tests assert on the code. */
@@ -41,7 +43,11 @@ export function waitForJob(jobId: string, opts?: WaitOptions): Promise<void> {
     let settled = false;
     const unsub = subscribeToJob(jobId, {
       onBatchCompleted: (e) => opts?.onProgress?.(e.completed, e.total, e.cost_so_far, e.cost_is_complete === true),
-      onCompleted: () => settle(() => resolve()),
+      onBatchFailed: (e) => opts?.onBatchFailed?.(e),
+      onCompleted: (e) => settle(() => {
+        opts?.onCompleted?.(e);
+        resolve();
+      }),
       onFailed: (e) => settle(() => reject(new Error(e.error))),
       onClosed: () =>
         settle(() => reject(new Error(JOB_STREAM_LOST_MESSAGE))),

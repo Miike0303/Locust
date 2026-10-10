@@ -10,6 +10,7 @@ import type { ProjectOpenPreflight, TranslationStartParams } from "../lib/api.ts
 const h = {
   calls: [] as string[], toasts: [] as unknown[][],
   logs: [] as unknown[][], jobError: null as string | null,
+  batchErrors: [] as string[], translated: 1, progressTotal: 100, onJob: () => {},
   preflight: { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" } as ProjectOpenPreflight,
 };
 (globalThis as any).__resumeQueue = h;
@@ -23,8 +24,8 @@ registerHooks({
         export async function resumeProject(){h.calls.push('resume');return result;}
         export async function startTranslation(){h.calls.push('translate');return {job_id:'job'};}
         export async function cancelTranslation(){h.calls.push('cancelTranslation');}
+        export async function getWsUrl(){return 'ws://fixture/translation';}
         export async function validate(){h.calls.push('validate');return {validation:{issues_found:0}};}`,
-      "/src/lib/ws.ts": `export const JOB_STREAM_LOST_MESSAGE='ws.jobStreamLost';export async function waitForJob(){const error=globalThis.__resumeQueue.jobError;if(error!==null)throw new Error(error);}`,
       "/src/stores/logStore.ts": `export function addLog(...args){globalThis.__resumeQueue.logs.push(args);}`,
       "/src/stores/toastStore.ts": `export function addToast(...args){globalThis.__resumeQueue.toasts.push(args);}`,
     };
@@ -33,6 +34,26 @@ registerHooks({
     return key ? { format: "module", source: stubs[key], shortCircuit: true } : nextLoad(url, context);
   },
 });
+// Exercise real waitForJob and WS dispatch so dropped batch events cannot hide
+// behind a mock that already knows the expected queue result.
+class JobSocket {
+  closed = false;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  onclose: (() => void) | null = null;
+  constructor() {
+    queueMicrotask(() => {
+      for (const error of h.batchErrors) this.emit({ type: "batch_failed", error });
+      this.emit({ type: "batch_completed", completed: 99, total: h.progressTotal, cost_so_far: 1 });
+      h.onJob();
+      this.emit(h.jobError !== null
+        ? { type: "failed", error: h.jobError }
+        : { type: "completed", total_translated: h.translated, total_cost: 0.25, cost_is_complete: true, duration_secs: 1 });
+    });
+  }
+  emit(data: unknown) { this.onmessage?.({ data: JSON.stringify(data) }); }
+  close() { this.closed = true; this.onclose?.(); }
+}
+(globalThis as any).WebSocket = JobSocket;
 const { useQueueStore: queue } = await import("./queueStore.ts");
 const { useProjectStore: project } = await import("./projectStore.ts");
 const { useEditorStore: editor } = await import("./editorStore.ts");
@@ -51,6 +72,7 @@ beforeEach(() => {
   editor.setState({ isTranslating: false });
   project.setState({ project: originalProject });
   h.calls = []; h.toasts = []; h.logs = []; h.jobError = null;
+  h.batchErrors = []; h.translated = 1; h.progressTotal = 100; h.onJob = () => {};
   h.preflight = { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" };
   setLocale("en");
 });
@@ -160,4 +182,124 @@ test("queue keeps unknown diagnostics and stream-loss localization", async () =>
     assert.equal(queue.getState().items[0].error, raw === "ws.jobStreamLost" ? t("ws.jobStreamLost") : raw);
     assert.equal(h.logs.filter(([, , detail]) => detail === raw).length, 1);
   }
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`queue fallback recovery reaching the progress total validates and completes in ${locale}`, async () => {
+    setLocale(locale);
+    h.preflight = { kind: "extract" };
+    h.batchErrors = ["provider error: OpenAI returned status 401 Unauthorized"];
+    for (const translated of [100, 101]) {
+      h.translated = translated;
+      h.calls = []; h.toasts = []; h.logs = [];
+      queue.getState().addItem("/fixture/game");
+      await queue.getState().startQueue();
+      const item = queue.getState().items[0];
+      assert.equal(item.status, "done");
+      assert.equal(item.error, null);
+      assert.equal(item.progress.completed, translated);
+      assert.equal(item.progress.total, 100);
+      assert.equal(item.validationIssues, 0);
+      assert.ok(h.calls.includes("validate"));
+      assert.deepEqual(h.toasts, [
+        ["success", t("queue.toast.itemDone", { name: "Fixture" })],
+        ["success", t("queue.toast.allDone")],
+      ]);
+      assert.equal(h.logs.filter(([, , detail]) => detail === h.batchErrors[0]).length, 1);
+      assert.equal(queue.getState().isRunning, false);
+      assert.equal(queue.getState().globalProgress, null);
+      queue.getState().clearCompleted();
+      assert.equal(queue.getState().items.length, 0);
+    }
+  });
+
+  test(`queue batch failures with an unknown total retain warning or failure outcomes in ${locale}`, async () => {
+    setLocale(locale);
+    h.preflight = { kind: "extract" };
+    h.batchErrors = ["provider unavailable"];
+    h.progressTotal = 0;
+    for (const translated of [2, 0]) {
+      h.translated = translated;
+      h.calls = []; h.toasts = [];
+      queue.getState().addItem("/fixture/game");
+      await queue.getState().startQueue();
+      const item = queue.getState().items[0];
+      assert.equal(item.status, "error");
+      assert.equal(item.progress.total, 0);
+      assert.equal(item.progress.completed, translated);
+      assert.ok(!h.calls.includes("validate"));
+      assert.equal(h.toasts[h.toasts.length - 1][0], translated > 0 ? "warning" : "error");
+      queue.getState().removeItem(item.id);
+    }
+  });
+
+  for (const translated of [2, 0]) {
+    test(`queue ${translated ? "partial" : "total"} batch failure has a non-success row and notices in ${locale}`, async () => {
+      setLocale(locale);
+      h.preflight = { kind: "extract" };
+      h.translated = translated;
+      h.batchErrors = [
+        "provider error: OpenAI returned status 401 Unauthorized: first opaque body",
+        "provider error: Claude returned status 403 Forbidden: last opaque body  ",
+      ];
+      queue.getState().addItem("/fixture/game");
+      await queue.getState().startQueue();
+      const item = queue.getState().items[0];
+      const reason = locale === "es"
+        ? "Claude rechazó la clave API. Revísela en Ajustes → Proveedores."
+        : "Claude rejected the API key. Check it in Settings → Providers.";
+      const message = translated > 0
+        ? t("queue.completedWithErrors", { name: "Fixture", translated, count: 2 })
+        : t("queue.translationFailed", { name: "Fixture", count: 2 });
+      const level = translated > 0 ? "warning" : "error";
+      assert.equal(item.status, "error", "reuse the existing non-success row");
+      assert.ok(item.error?.includes(message));
+      assert.ok(item.error?.includes(reason));
+      assert.ok(item.error?.includes(t("translate.pendingRetryHint")));
+      assert.equal(item.progress.completed, translated, "terminal count overrides interim progress");
+      assert.equal(item.progress.costSoFar, 0.25);
+      assert.ok(h.toasts.some(([severity, text]) => severity === level && text === message));
+      assert.ok(h.logs.some(([severity, text]) => severity === level && text === message));
+      assert.ok(!h.toasts.some(([severity]) => severity === "success"));
+      assert.equal(h.toasts[h.toasts.length - 1][0], level);
+      for (const raw of h.batchErrors) {
+        assert.equal(h.logs.filter(([, , detail]) => detail === raw).length, 1);
+        assert.ok(!h.logs.some(([, summary]) => String(summary).includes(raw)));
+      }
+      assert.ok(!h.calls.includes("validate"), "validation must not overwrite the translation outcome");
+      assert.equal(queue.getState().isRunning, false);
+      assert.equal(queue.getState().globalProgress, null);
+      queue.getState().clearCompleted();
+      assert.equal(queue.getState().items.length, 1, "incomplete work stays visible");
+    });
+  }
+}
+
+test("queue batch failures do not leak into the next item or next run", async () => {
+  h.preflight = { kind: "extract" };
+  h.batchErrors = ["provider error: OpenAI returned status 401 Unauthorized"];
+  h.onJob = () => { h.batchErrors = []; };
+  queue.getState().addItem("/fixture/game");
+  queue.getState().addItem("/fixture/next");
+  await queue.getState().startQueue();
+  assert.deepEqual(queue.getState().items.map(i => i.status), ["error", "done"]);
+  assert.equal(h.toasts[h.toasts.length - 1][0], "warning");
+  queue.getState().addItem("/fixture/last");
+  await queue.getState().startQueue();
+  assert.equal(queue.getState().items[2].status, "done");
+  assert.equal(h.toasts[h.toasts.length - 1][0], "success");
+});
+
+test("queue cancellation after batch failure keeps the item cancelled and the next item pending", async () => {
+  h.preflight = { kind: "extract" };
+  h.batchErrors = ["provider error: OpenAI returned status 401 Unauthorized"];
+  h.onJob = () => queue.getState().cancelQueue();
+  queue.getState().addItem("/fixture/game");
+  queue.getState().addItem("/fixture/next");
+  await queue.getState().startQueue();
+  assert.deepEqual(queue.getState().items.map(i => i.status), ["cancelled", "pending"]);
+  assert.equal(queue.getState().items[0].error, null);
+  assert.equal(h.calls.filter(c => c === "translate").length, 1);
+  assert.ok(!h.calls.includes("validate"));
+  assert.ok(h.toasts.every(([level]) => level === "info"));
 });

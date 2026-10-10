@@ -284,6 +284,8 @@ export default function TranslationModal({
 		snapshot: jobSnapshot,
 	});
 	const done = jobSnapshot?.done ?? false;
+	const batchFailures = jobSnapshot?.batchFailures;
+	const completedWithErrors = done && (batchFailures?.count ?? 0) > 0;
 	const cancelled = jobSnapshot?.cancelled ?? false;
 	const cancelling = jobSnapshot?.cancelling ?? false;
 	const error = jobSnapshot?.error ?? null;
@@ -572,16 +574,20 @@ export default function TranslationModal({
 					<div className="space-y-4">
 						<div className="w-full bg-border rounded-full h-3">
 							<div
-								className="bg-accent h-3 rounded-full transition-all"
+								className={`h-3 rounded-full transition-all ${error ? "bg-danger" : completedWithErrors ? "bg-warning" : "bg-accent"}`}
 								style={{ width: `${progressPercent}%` }}
 							/>
 						</div>
-						<div className="text-center text-body">
-							{done
-								? t("translate.complete")
-								: cancelled
-									? t("translate.cancelled")
-									: `${completed} / ${total}`}
+						<div className={`text-center text-body ${error ? "text-danger" : completedWithErrors ? "text-warning" : ""}`}>
+							{error
+								? t("translate.failed")
+								: completedWithErrors
+									? t("translate.completedWithErrors")
+									: done
+										? t("translate.complete")
+										: cancelled
+											? t("translate.cancelled")
+											: `${completed} / ${total}`}
 							{` · ${formatObservedCost(costSoFar, jobSnapshot?.costIsComplete, t)}`}
 						</div>
 						{activeProviderLabel && !done && !cancelled && !error && (
@@ -597,6 +603,13 @@ export default function TranslationModal({
 						{error && (
 							<div className="p-2 bg-danger-muted border border-danger rounded text-body text-danger">
 								{error}
+							</div>
+						)}
+						{completedWithErrors && batchFailures && (
+							<div role="status" className="p-2 bg-warning-muted border border-warning rounded text-body text-warning space-y-1">
+								<p>{t("translate.completedWithErrorsSummary", { translated: completed, count: batchFailures.count })}</p>
+								<p className="whitespace-pre-wrap break-words">{batchFailures.lastReason}</p>
+								<p>{t("translate.pendingRetryHint")}</p>
 							</div>
 						)}
 						{!done && !cancelled && !error && (

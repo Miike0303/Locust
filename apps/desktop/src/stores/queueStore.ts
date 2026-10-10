@@ -6,6 +6,7 @@ import { waitForJob } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
 import { useEditorStore } from "./editorStore";
 import { canStartQueue } from "../lib/translationJob";
+import { hasUnresolvedBatchFailures } from "../lib/translationJobSession";
 import { addLog } from "./logStore";
 import { addToast } from "./toastStore";
 import { t } from "../lib/i18n";
@@ -133,6 +134,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     set({ isRunning: true, cancelRequested: false });
     activeJobId = null;
     const pending = items.filter((i) => i.status === "pending");
+    const partialItemIds = new Set<string>();
     addLog("info", t("activity.queue.started", { count: pending.length }), undefined, "queue");
 
     for (let idx = 0; idx < pending.length; idx++) {
@@ -204,17 +206,35 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
         const job = await startTranslation(translationParams);
         activeJobId = job.job_id;
+        let failedBatches = 0;
+        let lastBatchReason = "";
+        let translated = 0;
+        const updateProgress = (completed: number, total: number, costSoFar: number, costIsComplete: boolean) => {
+          updateItem({ progress: { completed, total, costSoFar, costIsComplete, startedAt: get().items.find((i) => i.id === item.id)?.progress.startedAt ?? null } });
+          set((s) => ({
+            globalProgress: s.globalProgress
+              ? { ...s.globalProgress, completed, total, costSoFar, costIsComplete }
+              : null,
+          }));
+        };
         try {
           if (get().cancelRequested) get().cancelQueue();
           // Step 3: Wait for completion
           await waitForJob(job.job_id, {
-            onProgress: (completed, total, costSoFar, costIsComplete) => {
-              updateItem({ progress: { completed, total, costSoFar, costIsComplete, startedAt: get().items.find((i) => i.id === item.id)?.progress.startedAt ?? null } });
-              set((s) => ({
-                globalProgress: s.globalProgress
-                  ? { ...s.globalProgress, completed, total, costSoFar, costIsComplete }
-                  : null,
-              }));
+            onProgress: updateProgress,
+            onBatchFailed: (e) => {
+              failedBatches++;
+              lastBatchReason = localizeApiError(e.error) || t("activity.translation.failed");
+              const summary = lastBatchReason === e.error.trim()
+                ? t("activity.translation.batchFailed")
+                : t("activity.translation.batchFailedReason", { error: lastBatchReason });
+              addLog("warning", summary, e.error, "queue");
+            },
+            onCompleted: (e) => {
+              translated = e.total_translated;
+              updateProgress(translated,
+                get().items.find((i) => i.id === item.id)?.progress.total ?? result.total_strings,
+                e.total_cost, e.cost_is_complete === true);
             },
           });
         } finally {
@@ -224,6 +244,22 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         if (get().cancelRequested) {
           markCancelled();
           break;
+        }
+
+        const total = get().items.find((i) => i.id === item.id)?.progress.total ?? 0;
+        if (hasUnresolvedBatchFailures(failedBatches, translated, total)) {
+          // Use the terminal translated count, not interim fallback progress.
+          const partial = translated > 0;
+          if (partial) partialItemIds.add(item.id);
+          const summary = t(partial ? "queue.completedWithErrors" : "queue.translationFailed", {
+            name: result.project_name, translated, count: failedBatches,
+          });
+          // Reuse the existing error row so incomplete jobs stay visible and
+          // validation cannot overwrite their translation outcome with "done".
+          updateItem({ status: "error", error: `${summary}. ${lastBatchReason} ${t("translate.pendingRetryHint")}` });
+          addLog(partial ? "warning" : "error", summary, undefined, "queue");
+          addToast(partial ? "warning" : "error", summary);
+          continue;
         }
 
         updateItem({ status: "validating" });
@@ -284,14 +320,21 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       const runIds = new Set(pending.map((i) => i.id));
       let finished = 0;
       let failed = 0;
+      let partial = 0;
       let cancelled = 0;
       for (const i of get().items) {
         if (!runIds.has(i.id)) continue;
         if (i.status === "done") finished++;
-        else if (i.status === "error") failed++;
-        else if (i.status === "cancelled") cancelled++;
+        else if (i.status === "error") {
+          if (partialItemIds.has(i.id)) partial++;
+          else failed++;
+        } else if (i.status === "cancelled") cancelled++;
       }
-      if (failed === 0 && cancelled > 0) {
+      if (partial > 0) {
+        const summary = t("queue.completedWithErrorsSummary", { finished, partial, failed, cancelled });
+        addLog(failed > 0 ? "error" : "warning", summary, undefined, "queue");
+        addToast(failed > 0 ? "error" : "warning", summary);
+      } else if (failed === 0 && cancelled > 0) {
         addLog("info", t("activity.queue.finishedWithCancelled", { finished, cancelled }), undefined, "queue");
         addToast("info", t("queue.toast.finishedWithCancelled", { finished, cancelled }));
       } else if (failed === 0) {

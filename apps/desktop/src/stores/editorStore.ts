@@ -7,6 +7,7 @@ export interface TranslationJobSnapshot {
   total: number;
   costSoFar: number;
   costIsComplete?: boolean;
+  batchFailures?: { count: number; lastReason: string };
   lastTranslated: string;
   activeProviderLabel: string;
   error: string | null;

@@ -21,6 +21,11 @@ let finished = false;
 let cancelRequested = false;
 let modalOpen = false;
 
+export function hasUnresolvedBatchFailures(failedBatches: number, translated: number, total: number): boolean {
+  // Fallback providers can recover failed batches; an unknown total cannot prove recovery.
+  return failedBatches > 0 && !(total > 0 && translated >= total);
+}
+
 export function setTranslationModalOpen(open: boolean): void {
   modalOpen = open;
 }
@@ -73,6 +78,7 @@ export function attachTranslationJob(opts: {
   subscribedJobId = opts.jobId;
   finished = false;
   cancelRequested = false;
+  let batchFailures = { count: 0, lastReason: "" };
 
   const editor = useEditorStore.getState();
   editor.setJob(opts.jobId);
@@ -143,33 +149,54 @@ export function attachTranslationJob(opts: {
     onCompleted: (e) => {
       if (finished) return;
       finished = true;
+      // Completed.total_translated is authoritative across provider fallbacks;
+      // batch progress and failure counts do not measure translated strings.
+      const unresolvedFailures = hasUnresolvedBatchFailures(
+        batchFailures.count, e.total_translated, useEditorStore.getState().jobSnapshot?.total ?? 0,
+      );
+      const totalFailure = unresolvedFailures && e.total_translated === 0;
       patchSnapshot({
-        done: true,
+        done: !totalFailure,
+        error: totalFailure ? batchFailures.lastReason : null,
+        batchFailures: unresolvedFailures ? batchFailures : undefined,
         cancelling: false,
         completed: e.total_translated,
         costSoFar: e.total_cost,
         costIsComplete: e.cost_is_complete === true,
       });
-      addLog(
-        "info",
-        t("activity.translation.completed", { count: e.total_translated, cost: formatObservedCost(e.total_cost, e.cost_is_complete, t) }),
-        undefined,
-        "translation",
-      );
-      const cost = e.total_cost ?? 0;
-      addToast(
-        "success",
-        t("translate.toast.completeObservedCost", {
-          count: e.total_translated,
-          cost: formatObservedCost(cost, e.cost_is_complete, t),
-        }),
-      );
+      if (unresolvedFailures) {
+        const summary = t("translate.completedWithErrorsSummary", {
+          translated: e.total_translated, count: batchFailures.count,
+        });
+        // Each original diagnostic already has its own batch log entry.
+        addLog(totalFailure ? "error" : "warning", totalFailure ? t("activity.translation.failed") : summary, undefined, "translation");
+        addToast(totalFailure ? "error" : "warning", totalFailure
+          ? t("translate.toast.failed", { error: batchFailures.lastReason })
+          : summary);
+      } else {
+        addLog(
+          "info",
+          t("activity.translation.completed", { count: e.total_translated, cost: formatObservedCost(e.total_cost, e.cost_is_complete, t) }),
+          undefined,
+          "translation",
+        );
+        const cost = e.total_cost ?? 0;
+        addToast(
+          "success",
+          t("translate.toast.completeObservedCost", {
+            count: e.total_translated,
+            cost: formatObservedCost(cost, e.cost_is_complete, t),
+          }),
+        );
+      }
       endJob();
       discardSnapshotIfModalClosed();
     },
     onBatchFailed: (e) => {
       if (finished) return;
-      const reason = localizeApiError(e.error);
+      const reason = localizeApiError(e.error) || t("activity.translation.failed");
+      batchFailures = { count: batchFailures.count + 1, lastReason: reason };
+      patchSnapshot({ batchFailures });
       // Unknown diagnostics stay in detail, without repeating them in the summary.
       const summary = reason === e.error.trim()
         ? t("activity.translation.batchFailed")
