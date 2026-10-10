@@ -76,6 +76,11 @@ enum Commands {
         /// Preview only — do not write the database
         #[arg(long)]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Merge into a project database that records a different game"
+        )]
+        force: bool,
     },
     /// Translate extracted strings using a provider
     Translate {
@@ -405,7 +410,8 @@ async fn main() -> anyhow::Result<()> {
             format,
             output,
             dry_run,
-        } => cmd_extract(path, format, output, dry_run)?,
+            force,
+        } => cmd_extract(path, format, output, dry_run, force)?,
         Commands::Translate {
             project,
             provider,
@@ -1414,14 +1420,35 @@ fn load_config(path: &Option<PathBuf>) -> AppConfig {
 
 fn merge_extracted(
     db: &Database,
+    game_root: &Path,
     entries: &[StringEntry],
     preserve_missing: bool,
+    force: bool,
 ) -> anyhow::Result<MergeStats> {
-    Ok(if preserve_missing {
+    // Both real extracts and scratch previews must check before merging: a
+    // complete merge removes entries absent from the selected game's sources.
+    if !force {
+        if let Some(value) = db.get_project_metadata("game_root")? {
+            let recorded_root: PathBuf = serde_json::from_value(value)?;
+            if !locust_core::database::paths_identical(&recorded_root, game_root) {
+                anyhow::bail!(
+                    "The project database belongs to the game at \"{}\", but \"{}\" is being extracted. \
+                     Pass `-o <other.db>` to use another database, or `--force` to merge anyway.",
+                    recorded_root.display(),
+                    game_root.display()
+                );
+            }
+        }
+    }
+    let merge = if preserve_missing {
         db.merge_entries_preserving_missing(entries)?
     } else {
         db.merge_entries(entries)?
-    })
+    };
+    // The caller supplies the canonical selected path. For dry runs this only
+    // updates the disposable snapshot, including when adopting a legacy DB.
+    db.set_project_metadata("game_root", &serde_json::json!(game_root))?;
+    Ok(merge)
 }
 
 fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -1440,26 +1467,37 @@ fn remove_sqlite_files(path: &Path) {
 fn preview_extract_merge_in(
     scratch_path: &Path,
     db_path: &Path,
+    game_root: &Path,
     entries: &[StringEntry],
     preserve_missing: bool,
+    force: bool,
 ) -> anyhow::Result<MergeStats> {
     if db_path.try_exists()? {
         Database::snapshot_existing(db_path, scratch_path)?;
     }
     let scratch = Database::open(scratch_path)?;
-    merge_extracted(&scratch, entries, preserve_missing)
+    merge_extracted(&scratch, game_root, entries, preserve_missing, force)
 }
 
 /// Run the same merge a real extract would, against a scratch database.
 /// The output path, its parent, and any existing database sidecars are not created or modified.
 fn preview_extract_merge(
     db_path: &Path,
+    game_root: &Path,
     entries: &[StringEntry],
     preserve_missing: bool,
+    force: bool,
 ) -> anyhow::Result<MergeStats> {
     let scratch_dir = tempfile::tempdir()?;
     let scratch_path = scratch_dir.path().join("extract-preview.locust.db");
-    let result = preview_extract_merge_in(&scratch_path, db_path, entries, preserve_missing);
+    let result = preview_extract_merge_in(
+        &scratch_path,
+        db_path,
+        game_root,
+        entries,
+        preserve_missing,
+        force,
+    );
     remove_sqlite_files(&scratch_path);
     result
 }
@@ -1469,7 +1507,9 @@ fn cmd_extract(
     format: Option<String>,
     output: Option<PathBuf>,
     dry_run: bool,
+    force: bool,
 ) -> anyhow::Result<()> {
+    let game_root = path.canonicalize()?;
     let _source_lock = locust_core::project::lock_game_source(&path)?;
     let registry = locust_formats::default_registry();
 
@@ -1504,10 +1544,10 @@ fn cmd_extract(
 
     let preserve_missing = !extraction_warnings.is_empty();
     let merge = if dry_run {
-        preview_extract_merge(&db_path, &entries, preserve_missing)?
+        preview_extract_merge(&db_path, &game_root, &entries, preserve_missing, force)?
     } else {
         let db = Database::open(&db_path)?;
-        let merge = merge_extracted(&db, &entries, preserve_missing)?;
+        let merge = merge_extracted(&db, &game_root, &entries, preserve_missing, force)?;
         db.set_project_metadata(
             "extraction_warnings",
             &serde_json::json!(extraction_warnings),
@@ -2476,6 +2516,96 @@ mod tests {
     use super::*;
     use locust_core::models::StringStatus;
     use std::fs;
+
+    fn extract_root_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("A");
+        let b = dir.path().join("B");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let db = Database::open(&dir.path().join("project.db")).unwrap();
+        let mut entry = StringEntry::new("a", "Hello!", "a.rpy".into());
+        entry.translation = Some("¡Hola!".into());
+        entry.status = StringStatus::Translated;
+        db.save_entries(&[entry]).unwrap();
+        (dir, a, b, db)
+    }
+
+    #[test]
+    fn extract_merge_refuses_foreign_root_before_changing_translations() {
+        for preserve_missing in [false, true] {
+            let (_dir, a, b, db) = extract_root_fixture();
+            let a = a.canonicalize().unwrap();
+            let b = b.canonicalize().unwrap();
+            db.set_project_metadata("game_root", &serde_json::json!(a))
+                .unwrap();
+            let before = serde_json::to_value(db.get_entry("a").unwrap()).unwrap();
+            let entries = [StringEntry::new("b", "Welcome!", "b.rpy".into())];
+            let result = merge_extracted(&db, &b, &entries, preserve_missing, false);
+            assert!(result.is_err(), "foreign extraction unexpectedly merged");
+            let error = result.unwrap_err().to_string();
+            for root in [&a, &b] {
+                assert!(error.contains(&root.display().to_string()), "{error}");
+            }
+            assert!(error.contains("-o <other.db>"), "{error}");
+            assert!(error.contains("--force"), "{error}");
+            assert_eq!(
+                serde_json::to_value(db.get_entry("a").unwrap()).unwrap(),
+                before
+            );
+            assert!(db.get_entry("b").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn extract_preview_checks_foreign_root_and_force_without_writing() {
+        let (_dir, a, b, db) = extract_root_fixture();
+        db.set_project_metadata("game_root", &serde_json::json!(a.canonicalize().unwrap()))
+            .unwrap();
+        let saved = db.path();
+        drop(db);
+        let before = fs::read(&saved).unwrap();
+        let entries = [StringEntry::new("b", "Welcome!", "b.rpy".into())];
+        let root = b.canonicalize().unwrap();
+        assert!(preview_extract_merge(&saved, &root, &entries, false, false).is_err());
+        assert_eq!(fs::read(&saved).unwrap(), before);
+        let preview = preview_extract_merge(&saved, &root, &entries, false, true).unwrap();
+        assert_eq!(preview.added, 1);
+        assert_eq!(preview.removed, 1);
+        assert_eq!(preview.lost_translations, 1);
+        assert_eq!(fs::read(&saved).unwrap(), before);
+    }
+
+    #[test]
+    fn extract_merge_records_root_for_legacy_same_root_and_forced_merges() {
+        for kind in ["legacy", "same", "force", "case"] {
+            let (_dir, a, b, db) = extract_root_fixture();
+            let saved_root = match kind {
+                "legacy" => None,
+                "force" => Some(b),
+                "case" if cfg!(windows) => Some(PathBuf::from(a.to_str().unwrap().to_uppercase())),
+                _ => Some(a.clone()),
+            };
+            if let Some(root) = saved_root {
+                db.set_project_metadata("game_root", &serde_json::json!(root))
+                    .unwrap();
+            }
+            let before = db.get_entries(&EntryFilter::default()).unwrap();
+            let root = a.canonicalize().unwrap();
+            let merge = merge_extracted(&db, &root, &before, false, kind == "force").unwrap();
+            assert_eq!(merge.preserved_translations, 1, "{kind}");
+            assert_eq!(
+                serde_json::to_value(db.get_entries(&EntryFilter::default()).unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap(),
+                "{kind}"
+            );
+            assert_eq!(
+                db.get_project_metadata("game_root").unwrap(),
+                Some(serde_json::json!(root)),
+                "{kind}"
+            );
+        }
+    }
 
     /// Process-global env vars — serialize tests that select backup/data roots.
     static BACKUP_ROOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
