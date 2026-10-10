@@ -46,6 +46,8 @@ export default function Review() {
   const [translation, setTranslation] = useState("");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
+  const [approving, setApproving] = useState(false);
+  const approvingRef = useRef(false);
   const fetchingRef = useRef(false);
   const queueRef = useRef(queue);
   const loadGenRef = useRef(0);
@@ -155,40 +157,58 @@ export default function Review() {
   }, [entry?.id]);
 
   const handleApprove = useCallback(async () => {
+    if (approvingRef.current) return;
     const state = queueRef.current;
     const id = state.items[state.index]?.id;
     const current = id ? byId[id] : undefined;
     if (!current || state.complete) return;
+    approvingRef.current = true;
+    setApproving(true);
+    const gen = loadGenRef.current;
     try {
       const patch = reviewApprovalPatch(current, translation);
       if (patch) {
         const saved = await patchString(current.id, patch);
+        if (gen !== loadGenRef.current) return;
         setById((prev) => ({ ...prev, [current.id]: saved }));
       }
       setLoadError(null);
-      const next = approveCurrent(queueRef.current);
+      const next = approveCurrent(queueRef.current, current.id);
       queueRef.current = next;
       setQueue(next);
       void qc.invalidateQueries({ queryKey: ["stats"], refetchType: "none" });
     } catch (err: unknown) {
-      setLoadError(err instanceof Error ? err.message : String(err));
+      if (gen === loadGenRef.current) {
+        setLoadError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      approvingRef.current = false;
+      setApproving(false);
     }
   }, [byId, translation, qc]);
 
   const handleSkip = useCallback(() => {
+    if (approvingRef.current) return;
     const next = skipCurrent(queueRef.current);
     queueRef.current = next;
     setQueue(next);
   }, []);
 
   const handlePrev = useCallback(() => {
+    if (approvingRef.current) return;
     const next = prevCurrent(queueRef.current);
     queueRef.current = next;
     setQueue(next);
   }, []);
 
+  const handleExit = useCallback(() => {
+    if (approvingRef.current) return;
+    navigate("/editor");
+  }, [navigate]);
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (approvingRef.current) return;
       if (e.key === "Escape") {
         if (shouldHandleEscape({ overlayOpen: false, target: e.target as HTMLElement | null })) {
           navigate("/editor");
@@ -290,7 +310,7 @@ export default function Review() {
               approved: progress.approved,
             })}
           </span>
-          <button onClick={() => navigate("/editor")} className="text-body text-text-muted hover:text-text flex items-center gap-1">
+          <button onClick={handleExit} disabled={approving} className="text-body text-text-muted hover:text-text flex items-center gap-1 disabled:opacity-50">
             <X size={14} /> {t("common.exit")}
           </button>
         </div>
@@ -331,6 +351,7 @@ export default function Review() {
             <textarea
               id="review-textarea"
               value={translation}
+              disabled={approving}
               onChange={(e) => setTranslation(e.target.value)}
               className="w-full p-3 border border-border rounded bg-surface text-body focus:outline-none focus:ring-2 focus:ring-accent-fg resize-y min-h-[100px] font-mono"
               rows={4}
@@ -350,16 +371,16 @@ export default function Review() {
 
       {/* Bottom bar */}
       <div className="p-4 border-t border-border flex justify-center gap-3">
-        <button onClick={handlePrev} disabled={queue.index === 0}
+        <button onClick={handlePrev} disabled={approving || queue.index === 0}
           className="flex items-center gap-1.5 px-4 py-2 bg-surface-muted hover:bg-surface rounded text-body font-medium disabled:opacity-50">
           <ArrowLeft size={16} /> {t("review.previous")} <kbd className="text-caption text-text-muted ml-1">P</kbd>
         </button>
-        <button onClick={handleSkip}
-          className="flex items-center gap-1.5 px-4 py-2 bg-surface-muted hover:bg-surface rounded text-body font-medium">
+        <button onClick={handleSkip} disabled={approving}
+          className="flex items-center gap-1.5 px-4 py-2 bg-surface-muted hover:bg-surface rounded text-body font-medium disabled:opacity-50">
           <SkipForward size={16} /> {t("review.skip")} <kbd className="text-caption text-text-muted ml-1">S</kbd>
         </button>
-        <button onClick={() => { void handleApprove(); }}
-          className="flex items-center gap-1.5 px-6 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium">
+        <button onClick={() => { void handleApprove(); }} disabled={approving}
+          className="flex items-center gap-1.5 px-6 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50">
           <Check size={16} /> {t("review.approve")} <kbd className="text-caption text-white/70 ml-1">A</kbd>
         </button>
       </div>

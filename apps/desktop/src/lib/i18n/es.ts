@@ -500,6 +500,7 @@ export const es: Record<keyof typeof en, string> = {
   "settings.glossary.toast.pairRequired": "El par de idiomas es obligatorio (p. ej. ja-en).",
   "settings.glossary.toast.addFailed": "No se pudo añadir la entrada: {error}",
   "settings.glossary.toast.deleteFailed": "No se pudo eliminar: {error}",
+  "settings.glossary.toast.projectChanged": "El proyecto abierto cambió. Intente de nuevo en el glosario del proyecto actual.",
 
   "settings.history.title": "Historial de traducción",
   "settings.history.description": "Cada ejecución de traducción registrada para este proyecto: proveedor, coste, tokens y duración.",

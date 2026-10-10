@@ -510,6 +510,7 @@ export const en = {
   "settings.glossary.toast.pairRequired": "Language pair is required (e.g. ja-en).",
   "settings.glossary.toast.addFailed": "Failed to add entry: {error}",
   "settings.glossary.toast.deleteFailed": "Failed to delete: {error}",
+  "settings.glossary.toast.projectChanged": "The open project changed. Try again in the current project's glossary.",
 
   // ── settings.history ────────────────────────────────────────────────────
   "settings.history.title": "Translation history",

@@ -33,6 +33,7 @@ import { useT, useLocale, type Locale, type TranslateFn } from "../lib/i18n";
 import ConfirmDialog from "../components/ConfirmDialog";
 import BufferedSetting, { SETTINGS_INPUT_CLASS } from "../components/BufferedSetting";
 import { addToast } from "../stores/toastStore";
+import { useProjectStore } from "../stores/projectStore";
 
 export default function Settings() {
   const location = useLocation();
@@ -761,6 +762,8 @@ function AppearanceSection() {
 
 function GlossarySection() {
   const t = useT();
+  const project = useProjectStore((s) => s.project);
+  const projectScope = project?.database_path ?? project?.path ?? null;
   const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
   const qc = useQueryClient();
   const configPair = config
@@ -769,18 +772,47 @@ function GlossarySection() {
   const [langPairOverride, setLangPairOverride] = useState<string | null>(null);
   const activePair = (langPairOverride ?? configPair).trim() || "ja-en";
 
-  const { data: entries, refetch, isLoading, isError, error } = useQuery({
-    queryKey: ["glossary", activePair],
+  const { data: entries, isLoading, isError, error } = useQuery({
+    queryKey: ["glossary", projectScope, activePair],
     queryFn: () => getGlossary(activePair),
-    enabled: !!activePair,
+    enabled: projectScope !== null && !!activePair,
   });
-  const queryState = isError ? settingsQueryState(error) : null;
+  const queryState = projectScope === null ? "no_project" : isError ? settingsQueryState(error) : null;
 
   const [filter, setFilter] = useState("");
   const [term, setTerm] = useState("");
   const [translation, setTranslation] = useState("");
   const [saving, setSaving] = useState(false);
-  const [entryToDelete, setEntryToDelete] = useState<GlossaryEntry | null>(null);
+  const [entryToDelete, setEntryToDelete] = useState<{
+    entry: GlossaryEntry;
+    projectScope: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    setEntryToDelete(null);
+    setTerm("");
+    setTranslation("");
+    setSaving(false);
+  }, [projectScope]);
+
+  const isCurrentProject = (scope: string | null) => {
+    const current = useProjectStore.getState().project;
+    return scope !== null && scope === (current?.database_path ?? current?.path ?? null);
+  };
+
+  const canSubmit = (scope: string | null) => {
+    if (isCurrentProject(scope)) return true;
+    addToast("error", t("settings.glossary.toast.projectChanged"));
+    return false;
+  };
+
+  const invalidateGlossary = (scope: string | null) => {
+    // A completed mutation must never refetch another project's backend into this cache.
+    void qc.invalidateQueries({
+      queryKey: ["glossary", scope],
+      refetchType: isCurrentProject(scope) ? "active" : "none",
+    });
+  };
 
   const filtered = useMemo(() => {
     const list = entries ?? [];
@@ -795,6 +827,7 @@ function GlossarySection() {
   }, [entries, filter]);
 
   const handleAdd = async () => {
+    if (!canSubmit(projectScope)) return;
     const termText = term.trim();
     const tr = translation.trim();
     if (!termText || !tr) {
@@ -815,23 +848,25 @@ function GlossarySection() {
         case_sensitive: false,
       };
       await addGlossaryEntry(entry);
-      setTerm("");
-      setTranslation("");
-      refetch();
-      qc.invalidateQueries({ queryKey: ["glossary"] });
+      if (isCurrentProject(projectScope)) {
+        setTerm("");
+        setTranslation("");
+      }
+      invalidateGlossary(projectScope);
     } catch (e: any) {
       addToast("error", t("settings.glossary.toast.addFailed", { error: e.message }));
     } finally {
-      setSaving(false);
+      if (isCurrentProject(projectScope)) setSaving(false);
     }
   };
 
-  const handleDeleteConfirmed = async (entry: GlossaryEntry) => {
+  const handleDeleteConfirmed = async (pending: NonNullable<typeof entryToDelete>) => {
     setEntryToDelete(null);
+    if (!canSubmit(pending.projectScope)) return;
     try {
+      const { entry } = pending;
       await deleteGlossaryEntry(entry.term, entry.lang_pair);
-      refetch();
-      qc.invalidateQueries({ queryKey: ["glossary"] });
+      invalidateGlossary(pending.projectScope);
     } catch (e: any) {
       addToast("error", t("settings.glossary.toast.deleteFailed", { error: e.message }));
     }
@@ -894,7 +929,7 @@ function GlossarySection() {
         </div>
         <button
           onClick={handleAdd}
-          disabled={saving}
+          disabled={saving || projectScope === null}
           className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded-md text-body font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
         >
           <Plus size={14} /> {saving ? t("settings.glossary.adding") : t("settings.glossary.addEntry")}
@@ -949,7 +984,7 @@ function GlossarySection() {
                   </td>
                   <td className="px-3 py-2">
                     <button
-                      onClick={() => setEntryToDelete(e)}
+                      onClick={() => setEntryToDelete({ entry: e, projectScope })}
                       className="inline-flex items-center justify-center rounded-md p-2 text-danger hover:bg-danger-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
                       title={t("settings.glossary.deleteTitle")}
                     >
@@ -965,9 +1000,9 @@ function GlossarySection() {
       </div>
 
       <ConfirmDialog
-        open={entryToDelete !== null}
+        open={entryToDelete !== null && entryToDelete.projectScope === projectScope}
         title={t("settings.glossary.confirm.title")}
-        message={entryToDelete ? t("settings.glossary.confirm.message", { term: entryToDelete.term }) : ""}
+        message={entryToDelete ? t("settings.glossary.confirm.message", { term: entryToDelete.entry.term }) : ""}
         confirmLabel={t("common.delete")}
         destructive
         onConfirm={() => entryToDelete && handleDeleteConfirmed(entryToDelete)}

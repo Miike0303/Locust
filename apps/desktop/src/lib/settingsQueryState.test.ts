@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 import { after, before, test } from "node:test";
+import * as React from "react";
+import * as ReactQuery from "@tanstack/react-query";
+import * as Router from "react-router-dom";
+import * as i18n from "./i18n/index.ts";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -8,7 +13,69 @@ import { setLocale, translate } from "./i18n/index.ts";
 import { en } from "./i18n/en.ts";
 import { es } from "./i18n/es.ts";
 import { SETTINGS_SECTIONS, type SettingsSectionId } from "./settingsNav.ts";
-import type { AppConfig, ProviderInfo, TranslationRun } from "./api.ts";
+import type { AppConfig, GlossaryEntry, ProjectInfo, ProviderInfo, TranslationRun } from "./api.ts";
+
+// SSR keeps the real hooks and QueryClient. Interactive regressions use the
+// same dependency-aware hook seam as Review.test.tsx, with real query storage.
+const glossary = {
+  active: false, project: null as ProjectInfo | null,
+  React, ReactQuery, Router, i18n,
+  values: [] as any[], cursor: 0, dirty: false, effects: [] as (() => void)[],
+  client: new QueryClient({ defaultOptions: { queries: { gcTime: Infinity, staleTime: 30_000 } } }),
+  writes: [] as unknown[][], invalidations: [] as readonly unknown[][],
+  toasts: [] as string[], refetches: 0, waitForSave: null as Promise<void> | null,
+  state(initial: any) {
+    const index = this.cursor++;
+    if (!(index in this.values)) this.values[index] = typeof initial === "function" ? initial() : initial;
+    return [this.values[index], (value: any) => {
+      const next = typeof value === "function" ? value(this.values[index]) : value;
+      if (!Object.is(next, this.values[index])) this.dirty = true;
+      this.values[index] = next;
+    }];
+  },
+  effect(callback: () => void, deps: unknown[]) {
+    const index = this.cursor++;
+    const previous = this.values[index];
+    if (previous && deps.every((dep, i) => Object.is(dep, previous[i]))) return;
+    this.values[index] = deps;
+    this.effects.push(callback);
+  },
+  query(options: any) {
+    const query = this.client.getQueryCache().build(this.client, options);
+    return { data: query.state.data, isLoading: false, isError: false,
+      refetch: async () => { this.refetches++; } };
+  },
+};
+(globalThis as any).__glossaryTest = glossary;
+const hooks = registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (context.parentURL?.endsWith("/pages/Settings.tsx")) {
+      const stubs: Record<string, string> = {
+        react: `const h=globalThis.__glossaryTest;
+          export const useState=x=>h.active?h.state(x):h.React.useState(x);
+          export const useEffect=(fn,deps)=>h.active?h.effect(fn,deps):h.React.useEffect(fn,deps);
+          export const useMemo=(fn,deps)=>h.active?fn():h.React.useMemo(fn,deps);`,
+        "@tanstack/react-query": `const h=globalThis.__glossaryTest;
+          export const useQuery=o=>h.active?h.query(o):h.ReactQuery.useQuery(o);
+          export const useQueryClient=()=>h.active?{invalidateQueries:async o=>{h.invalidations.push(o.queryKey);await h.client.invalidateQueries(o);}}:h.ReactQuery.useQueryClient();`,
+        "react-router-dom": `const h=globalThis.__glossaryTest;
+          export const useLocation=()=>h.active?{search:'?section=glossary'}:h.Router.useLocation();
+          export const useNavigate=()=>h.active?()=>{}:h.Router.useNavigate();`,
+        "../lib/i18n": `const h=globalThis.__glossaryTest;
+          export const useT=()=>h.active?h.i18n.t:h.i18n.useT();export const useLocale=()=>h.i18n.useLocale();`,
+        "../stores/projectStore": `const h=globalThis.__glossaryTest;
+          export const useProjectStore=select=>select(h);useProjectStore.getState=()=>h;`,
+        "../stores/toastStore": `export const addToast=(_type,message)=>globalThis.__glossaryTest.toasts.push(message);`,
+        "../lib/api": `export * from ${JSON.stringify(new URL("./api.ts", import.meta.url).href)};
+          const h=globalThis.__glossaryTest;
+          export const addGlossaryEntry=async entry=>{h.writes.push(['add',entry]);if(h.waitForSave)await h.waitForSave;};
+          export const deleteGlossaryEntry=async (...args)=>{h.writes.push(['delete',...args]);if(h.waitForSave)await h.waitForSave;};`,
+      };
+      if (stubs[specifier]) return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent(stubs[specifier])}` };
+    }
+    return nextResolve(specifier, context);
+  },
+});
 
 let Settings: typeof import("../pages/Settings.tsx").default;
 let api: typeof import("./api.ts");
@@ -33,6 +100,9 @@ before(async () => {
 });
 
 after(() => {
+  hooks.deregister();
+  glossary.client.clear();
+  Reflect.deleteProperty(globalThis, "__glossaryTest");
   if (windowDescriptor) Object.defineProperty(globalThis, "window", windowDescriptor);
   else Reflect.deleteProperty(globalThis, "window");
   globalThis.fetch = originalFetch;
@@ -62,6 +132,7 @@ test("query failures retain their stable identity across localization and locale
 
 async function renderQueryFailure(section: "glossary" | "history", raw: string): Promise<string> {
   backendError = raw;
+  glossary.project = glossaryProject("/projects/fixture.locust.db");
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, retryOnMount: false, gcTime: Infinity } },
   });
@@ -69,7 +140,7 @@ async function renderQueryFailure(section: "glossary" | "history", raw: string):
     client.setQueryData(["config"], { default_source_lang: "ja", default_target_lang: "en" });
     if (section === "glossary") {
       await assert.rejects(client.fetchQuery({
-        queryKey: ["glossary", "ja-en"], queryFn: () => api.getGlossary("ja-en"),
+        queryKey: ["glossary", glossary.project.database_path, "ja-en"], queryFn: () => api.getGlossary("ja-en"),
       }));
     } else {
       await assert.rejects(client.fetchQuery({
@@ -80,6 +151,7 @@ async function renderQueryFailure(section: "glossary" | "history", raw: string):
       createElement(MemoryRouter, { initialEntries: [`/settings?section=${section}`] },
         createElement(Settings))));
   } finally {
+    glossary.project = null;
     client.clear();
   }
 }
@@ -179,7 +251,122 @@ function assertSemanticPalette(html: string): void {
   assert.equal(looseGrays.length, 0, `Settings still renders loose grays: ${looseGrays.slice(0, 5).join(", ")}`);
 }
 
+function glossaryProject(database: string | undefined, path = "/games/shared"): ProjectInfo {
+  return { path, database_path: database, format_id: "html", name: "Fixture" };
+}
+function glossaryNodes(node: any): any[] {
+  if (!node || typeof node !== "object") return [];
+  if (Array.isArray(node)) return node.flatMap(glossaryNodes);
+  return [node, ...glossaryNodes(node.props?.children)];
+}
+function renderGlossary() {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    glossary.cursor = 0; glossary.dirty = false;
+    const section = glossaryNodes(Settings()).find(node => node.type?.name === "GlossarySection");
+    assert.ok(section);
+    const tree = section.type(section.props);
+    for (const effect of glossary.effects.splice(0)) effect();
+    if (!glossary.dirty) return tree;
+  }
+  throw new Error("Glossary did not settle");
+}
+function glossaryNode(predicate: (node: any) => boolean) {
+  const node = glossaryNodes(renderGlossary()).find(predicate);
+  assert.ok(node, "missing glossary control");
+  return node;
+}
+function confirmation() { return glossaryNode(node => node.props?.confirmLabel === i18n.t("common.delete")); }
+function seedGlossary(translation: string) {
+  renderGlossary();
+  const query = glossary.client.getQueryCache().getAll().filter(q => q.queryKey[0] === "glossary").slice(-1)[0];
+  const entry: GlossaryEntry = { term: "HP", translation, lang_pair: "ja-en", context: null, case_sensitive: false };
+  glossary.client.setQueryData(query.queryKey, [entry]);
+  return query.queryKey;
+}
+function startDelete() {
+  glossaryNode(node => node.props?.title === i18n.t("settings.glossary.deleteTitle")).props.onClick();
+  return confirmation();
+}
+function prepareAdd() {
+  for (const [key, value] of [["settings.glossary.sourceTerm", "HP"], ["settings.glossary.preferredTranslation", "Health Points"]] as const) {
+    glossaryNode(node => node.props?.placeholder === i18n.t(key)).props.onChange({ target: { value } });
+  }
+  return glossaryNode(node => node.type === "button" && node.props?.onClick?.name === "handleAdd").props.onClick;
+}
+function glossaryTest(name: string, run: () => void | Promise<void>) {
+  test(name, async () => {
+    setLocale("en"); glossary.active = true;
+    glossary.project = glossaryProject("/projects/A.locust.db");
+    glossary.values = []; glossary.effects = []; glossary.writes = [];
+    glossary.invalidations = []; glossary.toasts = []; glossary.refetches = 0;
+    glossary.waitForSave = null; glossary.client.clear();
+    try { await run(); } finally { glossary.active = false; glossary.project = null; }
+  });
+}
+
+glossaryTest("glossary cache separates databases sharing a game path within the freshness window", () => {
+  const firstKey = seedGlossary("Health Points");
+  assert.ok(JSON.stringify(renderGlossary()).includes("Health Points"));
+  glossary.project = glossaryProject("/projects/B.locust.db");
+  assert.ok(!JSON.stringify(renderGlossary()).includes("Health Points"), "B must not show A's cached row");
+  const secondKey = seedGlossary("Hit Points");
+  assert.ok(firstKey.includes("/projects/A.locust.db"));
+  assert.ok(secondKey.includes("/projects/B.locust.db"));
+  assert.ok(JSON.stringify(renderGlossary()).includes("Hit Points"));
+});
+
+glossaryTest("glossary falls back to the game path when no database path is available", () => {
+  glossary.project = glossaryProject(undefined, "/games/A");
+  const firstKey = seedGlossary("Health Points");
+  glossary.project = glossaryProject(undefined, "/games/B");
+  assert.ok(!JSON.stringify(renderGlossary()).includes("Health Points"));
+  assert.ok(firstKey.includes("/games/A"));
+  assert.ok(seedGlossary("Hit Points").includes("/games/B"));
+});
+
+glossaryTest("switching databases resets a pending glossary delete confirmation", () => {
+  seedGlossary("Health Points");
+  assert.equal(startDelete().props.open, true);
+  glossary.project = glossaryProject("/projects/B.locust.db");
+  assert.equal(confirmation().props.open, false);
+  assert.deepEqual(glossary.writes, []);
+});
+
+for (const locale of ["en", "es"] as const) {
+  for (const action of ["add", "delete"] as const) {
+    glossaryTest(`${locale}: stale glossary ${action} refuses a changed project before rerender with a visible message`, async () => {
+      setLocale(locale);
+      seedGlossary("Health Points");
+      const submit = action === "delete" ? startDelete().props.onConfirm : prepareAdd();
+      glossary.project = glossaryProject("/projects/B.locust.db");
+      await submit();
+      assert.deepEqual(glossary.writes, [], "an A callback must not mutate the current B database");
+      assert.ok(glossary.toasts.includes(locale === "en"
+        ? "The open project changed. Try again in the current project's glossary."
+        : "El proyecto abierto cambió. Intente de nuevo en el glosario del proyecto actual."));
+    });
+  }
+}
+
+for (const action of ["add", "delete"] as const) {
+  glossaryTest(`a completed glossary ${action} invalidates only its captured project without refetching after a switch`, async () => {
+    seedGlossary("Health Points");
+    const submit = action === "delete" ? startDelete().props.onConfirm : prepareAdd();
+    let finish!: () => void;
+    glossary.waitForSave = new Promise<void>(resolve => { finish = resolve; });
+    const saving = submit();
+    assert.equal(glossary.writes.length, 1);
+    glossary.project = glossaryProject("/projects/B.locust.db");
+    const secondKey = seedGlossary("Hit Points");
+    finish(); await saving;
+    assert.equal(glossary.refetches, 0, "an old query must not read the current project's backend");
+    assert.deepEqual(glossary.invalidations, [["glossary", "/projects/A.locust.db"]]);
+    assert.equal(glossary.client.getQueryState(secondKey)?.isInvalidated, false);
+  });
+}
+
 async function renderPopulatedSection(section: SettingsSectionId): Promise<string> {
+  glossary.project = glossaryProject("/projects/fixture.locust.db");
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, retryOnMount: false, gcTime: Infinity } },
   });
@@ -206,7 +393,7 @@ async function renderPopulatedSection(section: SettingsSectionId): Promise<strin
     };
     client.setQueryData(["config"], config);
     client.setQueryData(["providers"], providers);
-    client.setQueryData(["glossary", "ja-en"], [
+    client.setQueryData(["glossary", glossary.project.database_path, "ja-en"], [
       { term: "Greeting", translation: "Hello", lang_pair: "ja-en", context: null, case_sensitive: false },
     ]);
     client.setQueryData(["translation-runs"], [run]);
@@ -214,7 +401,7 @@ async function renderPopulatedSection(section: SettingsSectionId): Promise<strin
     return renderToStaticMarkup(createElement(QueryClientProvider, { client },
       createElement(MemoryRouter, { initialEntries: [`/settings?section=${section}`] },
         createElement(Settings))));
-  } finally { client.clear(); }
+  } finally { client.clear(); glossary.project = null; }
 }
 
 for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
