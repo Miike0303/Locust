@@ -259,10 +259,14 @@ fn short_path_hash(game_root: &Path) -> String {
 /// Preferred: `<parent>/<game_name>.locust.db`. Fallback when that directory
 /// is not writable: `config_dir/projects/<sanitized>-<hash>.locust.db`.
 pub fn resolve_project_db_path(game_root: &Path) -> PathBuf {
-    resolve_project_db_path_with(game_root, dir_is_writable)
+    resolve_project_db_path_with(game_root, &AppConfig::config_dir(), dir_is_writable)
 }
 
-fn resolve_project_db_path_with(game_root: &Path, writable: impl Fn(&Path) -> bool) -> PathBuf {
+fn resolve_project_db_path_with(
+    game_root: &Path,
+    config_dir: &Path,
+    writable: impl Fn(&Path) -> bool,
+) -> PathBuf {
     let raw_name = game_root
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -274,7 +278,7 @@ fn resolve_project_db_path_with(game_root: &Path, writable: impl Fn(&Path) -> bo
         }
     }
     let hash = short_path_hash(game_root);
-    AppConfig::config_dir()
+    config_dir
         .join("projects")
         .join(format!("{stem}-{hash}.locust.db"))
 }
@@ -378,6 +382,24 @@ fn ambiguous_saved_dbs_error(paths: &[PathBuf]) -> LocustError {
     ))
 }
 
+fn folder_open_db_path_with(
+    game_root: &Path,
+    config_dir: &Path,
+    writable: impl Fn(&Path) -> bool,
+) -> Result<PathBuf> {
+    let existing = unique_existing_saved_dbs_with(
+        &saved_project_db_candidates(game_root, config_dir),
+        |candidate| std::fs::metadata(candidate),
+    )?;
+    match existing.as_slice() {
+        [] => Ok(resolve_project_db_path_with(
+            game_root, config_dir, writable,
+        )),
+        [database_path] => Ok(database_path.clone()),
+        _ => Err(ambiguous_saved_dbs_error(&existing)),
+    }
+}
+
 /// Detect, extract, and merge into the candidate DB before publishing it live.
 /// Shared by the HTTP handler and the Tauri command.
 pub fn open_project(
@@ -386,11 +408,32 @@ pub fn open_project(
     raw_path: &Path,
     format_id: Option<&str>,
 ) -> Result<ProjectOpenOutcome> {
+    open_project_with(
+        db,
+        registry,
+        raw_path,
+        format_id,
+        &AppConfig::config_dir(),
+        dir_is_writable,
+    )
+}
+
+fn open_project_with(
+    db: &Database,
+    registry: &FormatRegistry,
+    raw_path: &Path,
+    format_id: Option<&str>,
+    config_dir: &Path,
+    writable: impl Fn(&Path) -> bool,
+) -> Result<ProjectOpenOutcome> {
     if !raw_path.exists() {
         return Err(LocustError::ProjectNotFound(raw_path.display().to_string()));
     }
 
     let path = resolve_game_root(raw_path, registry);
+    // Reuse saved work regardless of current writability, and reject ambiguity
+    // before extraction or opening either candidate database for writing.
+    let database_path = folder_open_db_path_with(&path, config_dir, writable)?;
     let _source_lock = lock_game_source(&path)?;
 
     let plugin = if let Some(fid) = format_id {
@@ -409,7 +452,6 @@ pub fn open_project(
     let entries = plugin.extract(&path)?;
     let extraction_warnings = extraction_warnings(&entries);
 
-    let database_path = resolve_project_db_path(&path);
     let candidate = Database::open(&database_path)?;
     let merge = if extraction_warnings.is_empty() {
         candidate.merge_entries(&entries)?
@@ -957,11 +999,183 @@ mod tests {
     #[test]
     fn resolve_project_db_path_falls_back_when_parent_not_writable() {
         let game = Path::new("locked-parent").join("My Game");
-        let db_path = resolve_project_db_path_with(&game, |_| false);
+        let db_path = resolve_project_db_path_with(&game, &AppConfig::config_dir(), |_| false);
         let name = db_path.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("My Game-") || name.starts_with("My_Game-"));
         assert!(name.ends_with(".locust.db"));
         assert!(db_path.components().any(|c| c.as_os_str() == "projects"));
+    }
+
+    fn saved_folder_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<PathBuf>) {
+        let fixture = tempfile::tempdir().unwrap();
+        let game = fixture.path().join("game");
+        let config = fixture.path().join("config");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("extract.tsv"), "hero\tHello\nnew\tNew").unwrap();
+        let candidates = saved_project_db_candidates(&game, &config);
+        (fixture, game, config, candidates)
+    }
+
+    fn save_folder_translation(database_path: &Path, game: &Path) {
+        let saved = Database::open(database_path).unwrap();
+        let mut hero = StringEntry::new("hero", "Hello", game.join("extract.tsv"));
+        hero.translation = Some("Hola".into());
+        hero.status = StringStatus::Approved;
+        saved.save_entries(&[hero]).unwrap();
+    }
+
+    #[test]
+    fn folder_db_selection_reuses_fallback_when_parent_is_writable() {
+        let (_fixture, game, config, candidates) = saved_folder_fixture();
+        save_folder_translation(&candidates[1], &game);
+        assert!(dir_is_writable(game.parent().unwrap()));
+        assert_eq!(
+            folder_open_db_path_with(&game, &config, |_| true).unwrap(),
+            candidates[1]
+        );
+        assert!(!candidates[0].exists());
+    }
+
+    #[test]
+    fn folder_db_selection_reuses_adjacent_when_parent_is_unwritable() {
+        let (_fixture, game, config, candidates) = saved_folder_fixture();
+        save_folder_translation(&candidates[0], &game);
+        assert_eq!(
+            folder_open_db_path_with(&game, &config, |_| false).unwrap(),
+            candidates[0]
+        );
+        assert!(!candidates[1].exists());
+    }
+
+    #[test]
+    fn folder_db_selection_rejects_distinct_saved_dbs() {
+        let (_fixture, game, config, candidates) = saved_folder_fixture();
+        for path in &candidates {
+            save_folder_translation(path, &game);
+        }
+        assert!(!same_saved_db(&candidates[0], &candidates[1]));
+        let before: Vec<_> = candidates.iter().map(|p| snapshot_db_sidecars(p)).collect();
+        let error = folder_open_db_path_with(&game, &config, |_| true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            ambiguous_saved_dbs_error(&candidates).to_string()
+        );
+        for (path, snapshot) in candidates.iter().zip(before) {
+            assert_eq!(snapshot_db_sidecars(path), snapshot);
+        }
+    }
+
+    #[test]
+    fn folder_db_selection_without_saved_db_keeps_writability_choice() {
+        let (_fixture, game, config, candidates) = saved_folder_fixture();
+        for writable in [true, false] {
+            assert_eq!(
+                folder_open_db_path_with(&game, &config, |_| writable).unwrap(),
+                candidates[usize::from(!writable)]
+            );
+        }
+        assert!(candidates.iter().all(|p| !p.exists()));
+    }
+
+    fn assert_folder_open_reuses_saved_db(parent_writable: bool) {
+        let (_fixture, game, config, candidates) = saved_folder_fixture();
+        let saved_index = usize::from(parent_writable);
+        let saved_path = &candidates[saved_index];
+        save_folder_translation(saved_path, &game);
+        let live = Database::open_in_memory().unwrap();
+        let outcome = open_project_with(&live, &registry(), &game, None, &config, |_| {
+            parent_writable
+        })
+        .unwrap();
+        assert_eq!(&outcome.database_path, saved_path);
+        assert_eq!(&live.path(), saved_path);
+        assert_eq!(outcome.added, 1, "folder open must merge new source rows");
+        assert_eq!(outcome.preserved_translations, 1);
+        assert_eq!(outcome.total_strings, 2);
+        let hero = live.get_entry("hero").unwrap().unwrap();
+        assert_eq!(hero.translation.as_deref(), Some("Hola"));
+        assert_eq!(hero.status, StringStatus::Approved);
+        assert_eq!(live.get_entry("new").unwrap().unwrap().source, "New");
+        assert!(!candidates[1 - saved_index].exists());
+        drop(live);
+        let saved = Database::read_project_snapshot(saved_path).unwrap();
+        assert_eq!(saved.get_stats().unwrap().total, 2);
+        assert_eq!(
+            saved
+                .get_entry("hero")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("Hola")
+        );
+    }
+
+    #[test]
+    fn folder_open_merges_fallback_when_parent_is_writable() {
+        assert_folder_open_reuses_saved_db(true);
+    }
+
+    #[test]
+    fn folder_open_merges_adjacent_when_parent_is_unwritable() {
+        assert_folder_open_reuses_saved_db(false);
+    }
+
+    #[test]
+    fn folder_open_ambiguous_dbs_keeps_files_and_live_database_unchanged() {
+        let (fixture, game, config, candidates) = saved_folder_fixture();
+        for path in &candidates {
+            save_folder_translation(path, &game);
+        }
+        let before: Vec<_> = candidates.iter().map(|p| snapshot_db_sidecars(p)).collect();
+        let live_path = fixture.path().join("previous.locust.db");
+        let live = Database::open(&live_path).unwrap();
+        let keep = StringEntry::new("keep", "Previous", "previous.tsv".into());
+        live.save_entries(&[keep]).unwrap();
+        let row_before = serde_json::to_value(live.get_entry("keep").unwrap()).unwrap();
+        // Snapshot between SQL reads, which can update SQLite WAL read marks.
+        let live_before = snapshot_db_sidecars(&live_path);
+        let error = open_project_with(
+            &live,
+            &panic_extract_registry(),
+            &game,
+            Some("tsv-no-extract"),
+            &config,
+            |_| true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            ambiguous_saved_dbs_error(&candidates).to_string()
+        );
+        assert!(
+            snapshot_db_sidecars(&live_path) == live_before,
+            "ambiguous folder open must not change the live database or its sidecars"
+        );
+        assert_eq!(live.path(), live_path);
+        assert_eq!(
+            serde_json::to_value(live.get_entry("keep").unwrap()).unwrap(),
+            row_before
+        );
+        assert_eq!(live.get_stats().unwrap().total, 1);
+        for (path, snapshot) in candidates.iter().zip(before) {
+            assert_eq!(snapshot_db_sidecars(path), snapshot);
+        }
+    }
+
+    #[test]
+    fn folder_open_without_saved_db_keeps_writability_choice() {
+        for writable in [true, false] {
+            let (_fixture, game, config, candidates) = saved_folder_fixture();
+            let live = Database::open_in_memory().unwrap();
+            let outcome =
+                open_project_with(&live, &registry(), &game, None, &config, |_| writable).unwrap();
+            assert_eq!(outcome.database_path, candidates[usize::from(!writable)]);
+            assert_eq!(live.path(), outcome.database_path);
+            assert_eq!(outcome.added, 2);
+            assert_eq!(outcome.total_strings, 2);
+            assert!(!candidates[usize::from(writable)].exists());
+        }
     }
 
     #[tokio::test]
