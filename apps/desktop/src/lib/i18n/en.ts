@@ -1010,7 +1010,9 @@ export const en = {
   "replace.toast.noMatches": "No translation matches",
   "replace.toast.nothing": "Nothing to replace",
   "replace.toast.replaced": "Replaced in {applied} string(s) ({occurrences} occurrence(s))",
-  "replace.toast.replacedSkipped": "Replaced in {applied} string(s) ({occurrences} occurrence(s)) — {skipped} skipped",
+  "replace.toast.replacedSkipped": "Applied {applied} of {requested} translation(s); {skipped} skipped. Run the preview again before retrying.",
+  "replace.toast.conflicts": "Applied {applied} of {requested} translation(s). {conflicts} row(s) changed meanwhile and were left untouched. Run the preview again before retrying.",
+  "replace.toast.incomplete": "Loaded {loaded} of {total} matching rows. No changes were made. Narrow the search and run the preview again.",
   "replace.toast.previewFailed": "Preview failed: {error}",
   "replace.toast.replaceFailed": "Replace failed: {error}",
 

@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 
 use locust_core::backup::BackupManager;
 use locust_core::config::AppConfig;
-use locust_core::database::{Database, EntryFilter, MergeStats};
+use locust_core::database::{
+    Database, EntryFilter, MergeStats, TranslationBatchItem, TRANSLATION_CONFLICT_MESSAGE,
+};
 use locust_core::export;
 use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry};
@@ -2122,7 +2124,7 @@ async fn cmd_replace(
         );
     }
 
-    let mut updates: Vec<(String, String)> = Vec::new();
+    let mut updates = Vec::new();
     let mut occurrences = 0usize;
     for e in &entries {
         let Some(ref t) = e.translation else {
@@ -2133,7 +2135,11 @@ async fn cmd_replace(
             continue;
         }
         occurrences += n;
-        updates.push((e.id.clone(), next));
+        updates.push(TranslationBatchItem {
+            id: e.id.clone(),
+            translation: next,
+            expected_translation: Some(e.translation.clone()),
+        });
     }
 
     if updates.is_empty() {
@@ -2147,8 +2153,12 @@ async fn cmd_replace(
             updates.len(),
             occurrences
         );
-        for (id, next) in updates.iter().take(10) {
-            println!("  {id} → {}", truncate_preview(next, 80));
+        for update in updates.iter().take(10) {
+            println!(
+                "  {} → {}",
+                update.id,
+                truncate_preview(&update.translation, 80)
+            );
         }
         if updates.len() > 10 {
             println!("  … and {} more", updates.len() - 10);
@@ -2156,11 +2166,22 @@ async fn cmd_replace(
         return Ok(());
     }
 
-    let applied = db.save_translations_batch(updates, "cli-replace").await?;
+    let report = db
+        .save_translations_batch_if_unchanged(updates, "cli-replace")
+        .await?;
     println!(
-        "Updated {applied} string(s), {occurrences} occurrence(s) in {}.",
-        project.display()
+        "Updated {} string(s) in {}. {} skipped; {} conflict(s).",
+        report.applied,
+        project.display(),
+        report.skipped,
+        report.conflicts.len()
     );
+    if report.skipped == 0 {
+        println!("Replaced {occurrences} occurrence(s).");
+    }
+    if !report.conflicts.is_empty() {
+        println!("Conflicting rows left untouched ({TRANSLATION_CONFLICT_MESSAGE}). Run replace --dry-run again before retrying.");
+    }
     Ok(())
 }
 

@@ -987,7 +987,9 @@ export const es: Record<keyof typeof en, string> = {
   "replace.toast.noMatches": "No hay coincidencias en las traducciones",
   "replace.toast.nothing": "Nada que reemplazar",
   "replace.toast.replaced": "Reemplazado en {applied} cadena(s) ({occurrences} aparición(es))",
-  "replace.toast.replacedSkipped": "Reemplazado en {applied} cadena(s) ({occurrences} aparición(es)) — {skipped} omitidas",
+  "replace.toast.replacedSkipped": "Se aplicaron {applied} de {requested} traducción(es); se omitieron {skipped}. Ejecute de nuevo la vista previa antes de reintentar.",
+  "replace.toast.conflicts": "Se aplicaron {applied} de {requested} traducción(es). {conflicts} fila(s) cambiaron mientras tanto y se dejaron intactas. Ejecute de nuevo la vista previa antes de reintentar.",
+  "replace.toast.incomplete": "Se cargaron {loaded} de {total} filas coincidentes. No se realizaron cambios. Acote la búsqueda y ejecute de nuevo la vista previa.",
   "replace.toast.previewFailed": "La vista previa falló: {error}",
   "replace.toast.replaceFailed": "El reemplazo falló: {error}",
 

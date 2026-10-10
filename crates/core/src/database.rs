@@ -49,6 +49,23 @@ where
     Option::<String>::deserialize(deserializer).map(Some)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TranslationBatchItem {
+    pub id: String,
+    pub translation: String,
+    #[serde(default, deserialize_with = "deserialize_expected_translation")]
+    pub expected_translation: Option<Option<String>>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct TranslationBatchReport {
+    pub requested: usize,
+    pub applied: usize,
+    /// Includes conflicts and unknown ids, preserving the existing count.
+    pub skipped: usize,
+    pub conflicts: Vec<String>,
+}
+
 fn lock_connection(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
     conn.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1191,8 +1208,30 @@ impl Database {
         updates: Vec<(String, String)>,
         provider: &str,
     ) -> Result<usize> {
+        let updates = updates
+            .into_iter()
+            .map(|(id, translation)| TranslationBatchItem {
+                id,
+                translation,
+                expected_translation: None,
+            })
+            .collect();
+        Ok(self
+            .save_translations_batch_if_unchanged(updates, provider)
+            .await?
+            .applied)
+    }
+
+    /// Compare and write each item in one transaction. Conflicts are left
+    /// untouched and included in `skipped`; unknown ids are only skipped.
+    /// Absent expectations retain unconditional legacy behavior.
+    pub async fn save_translations_batch_if_unchanged(
+        &self,
+        updates: Vec<TranslationBatchItem>,
+        provider: &str,
+    ) -> Result<TranslationBatchReport> {
         if updates.is_empty() {
-            return Ok(0);
+            return Ok(TranslationBatchReport::default());
         }
         let conn = self.conn.clone();
         let provider = provider.to_string();
@@ -1200,20 +1239,31 @@ impl Database {
             let conn = lock_connection(&conn);
             let now = Utc::now().to_rfc3339();
             let tx = conn.unchecked_transaction()?;
-            let mut applied = 0usize;
+            let mut report = TranslationBatchReport {
+                requested: updates.len(),
+                ..Default::default()
+            };
             {
                 let mut stmt = tx.prepare_cached(
-                    "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4",
+                    "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4 AND (?6 = 0 OR translation IS ?7)",
                 )?;
-                for (id, translation) in &updates {
-                    let n = stmt.execute(params![translation, provider, now, id, !translation.trim().is_empty()])?;
+                let mut exists = tx.prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM strings WHERE id = ?1)",
+                )?;
+                for update in &updates {
+                    let guarded = update.expected_translation.is_some();
+                    let expected = update.expected_translation.as_ref().and_then(|v| v.as_deref());
+                    let n = stmt.execute(params![update.translation, provider, now, update.id, !update.translation.trim().is_empty(), guarded, expected])?;
                     if n > 0 {
-                        applied += 1;
+                        report.applied += 1;
+                    } else if guarded && exists.query_row([&update.id], |row| row.get::<_, bool>(0))? {
+                        report.conflicts.push(update.id.clone());
                     }
                 }
             }
             tx.commit()?;
-            Ok(applied)
+            report.skipped = report.requested - report.applied;
+            Ok(report)
         })
         .await
         .unwrap()
@@ -4454,6 +4504,134 @@ mod tests {
             Some("Mundo")
         );
         assert!(db.get_entry("missing").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn guarded_batch_preserves_intervening_edits_and_applies_other_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("project.db");
+        let db = Database::open(&path).unwrap();
+        let desktop = Database::open(&path).unwrap();
+        db.save_entries(&[make_entry("a", "A"), make_entry("b", "B")])
+            .unwrap();
+        db.save_translation("a", "old", "initial").await.unwrap();
+        let expected = db.get_entry("a").unwrap().unwrap().translation;
+        desktop
+            .save_translation("a", "desktop edit", "manual")
+            .await
+            .unwrap();
+        desktop
+            .update_entry_status("a", StringStatus::Approved)
+            .await
+            .unwrap();
+        let before = serde_json::to_value(db.get_entry("a").unwrap().unwrap()).unwrap();
+        let report = db
+            .save_translations_batch_if_unchanged(
+                vec![
+                    TranslationBatchItem {
+                        id: "a".into(),
+                        translation: "stale replacement".into(),
+                        expected_translation: Some(expected),
+                    },
+                    TranslationBatchItem {
+                        id: "b".into(),
+                        translation: "filled".into(),
+                        expected_translation: Some(None),
+                    },
+                    TranslationBatchItem {
+                        id: "missing".into(),
+                        translation: "unknown".into(),
+                        expected_translation: Some(None),
+                    },
+                ],
+                "batch",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(db.get_entry("a").unwrap().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "requested":3, "applied":1, "skipped":2, "conflicts":["a"]
+            })
+        );
+        let saved = db.get_entry("b").unwrap().unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("filled"));
+        assert_eq!(saved.provider_used.as_deref(), Some("batch"));
+        assert_eq!(saved.status, StringStatus::Translated);
+    }
+
+    #[tokio::test]
+    async fn guarded_batch_distinguishes_absent_null_and_empty_guards() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[
+            make_entry("null", "A"),
+            make_entry("empty", "B"),
+            make_entry("legacy", "C"),
+        ])
+        .unwrap();
+        db.save_translation("empty", "", "manual").await.unwrap();
+        db.save_translation("legacy", "desktop edit", "manual")
+            .await
+            .unwrap();
+        let updates = serde_json::from_value(serde_json::json!([
+            {"id":"empty", "translation":"stale", "expected_translation":null},
+            {"id":"null", "translation":"stale", "expected_translation":""},
+            {"id":"legacy", "translation":"unconditional"},
+            {"id":"empty", "translation":"filled empty", "expected_translation":""},
+            {"id":"null", "translation":"filled null", "expected_translation":null}
+        ]))
+        .unwrap();
+        let report = db
+            .save_translations_batch_if_unchanged(updates, "batch")
+            .await
+            .unwrap();
+        assert_eq!(report.conflicts, ["empty", "null"]);
+        assert_eq!(
+            (report.requested, report.applied, report.skipped),
+            (5, 3, 2)
+        );
+        for (id, expected) in [
+            ("legacy", "unconditional"),
+            ("empty", "filled empty"),
+            ("null", "filled null"),
+        ] {
+            assert_eq!(
+                db.get_entry(id).unwrap().unwrap().translation.as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_batch_rolls_back_on_error() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[make_entry("a", "A"), make_entry("b", "B")])
+            .unwrap();
+        lock_connection(&db.conn)
+            .execute_batch(
+                "CREATE TRIGGER reject_second BEFORE UPDATE ON strings
+            WHEN NEW.id = 'b' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+            )
+            .unwrap();
+        let updates = ["a", "b"]
+            .into_iter()
+            .map(|id| TranslationBatchItem {
+                id: id.into(),
+                translation: "filled".into(),
+                expected_translation: Some(None),
+            })
+            .collect();
+        assert!(db
+            .save_translations_batch_if_unchanged(updates, "batch")
+            .await
+            .is_err());
+        for id in ["a", "b"] {
+            assert!(db.get_entry(id).unwrap().unwrap().translation.is_none());
+        }
     }
 
     #[tokio::test]

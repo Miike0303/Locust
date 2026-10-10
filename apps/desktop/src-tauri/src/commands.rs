@@ -390,11 +390,7 @@ async fn apply_string_patch(
         .ok_or_else(|| "Entry not found".to_string())
 }
 
-#[derive(Deserialize)]
-pub struct BatchPatchItem {
-    pub id: String,
-    pub translation: String,
-}
+pub type BatchPatchItem = locust_core::database::TranslationBatchItem;
 
 #[derive(Deserialize)]
 pub struct BatchPatchReq {
@@ -416,27 +412,17 @@ pub async fn batch_patch_strings(
     if data.updates.len() > 50_000 {
         return Err("batch too large (max 50000 updates)".into());
     }
-    let pairs: Vec<(String, String)> = data
-        .updates
-        .into_iter()
-        .map(|u| (u.id, u.translation))
-        .collect();
-    let requested = pairs.len();
     let s = state.0.clone();
     let exclusive = try_project_operation(&s)?;
     run_owned_project_operation(exclusive, async move {
         if s.current_project.read().await.is_none() {
             return Err("no project open".into());
         }
-        let applied =
-            s.db.save_translations_batch(pairs, &data.provider)
+        let report =
+            s.db.save_translations_batch_if_unchanged(data.updates, &data.provider)
                 .await
                 .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({
-            "requested": requested,
-            "applied": applied,
-            "skipped": requested.saturating_sub(applied),
-        }))
+        Ok(serde_json::json!(report))
     })
     .await
     .map_err(|e| e.to_string())?

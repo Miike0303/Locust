@@ -1058,11 +1058,7 @@ async fn patch_string_owned(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "entry not found"))
 }
 
-#[derive(Deserialize)]
-struct BatchPatchItem {
-    id: String,
-    translation: String,
-}
+type BatchPatchItem = locust_core::database::TranslationBatchItem;
 
 #[derive(Deserialize)]
 struct BatchPatchRequest {
@@ -1101,22 +1097,12 @@ async fn batch_patch_strings_owned(
             "batch too large (max 50000 updates)",
         ));
     }
-    let pairs: Vec<(String, String)> = req
-        .updates
-        .into_iter()
-        .map(|u| (u.id, u.translation))
-        .collect();
-    let requested = pairs.len();
-    let applied = state
+    let report = state
         .db
-        .save_translations_batch(pairs, &req.provider)
+        .save_translations_batch_if_unchanged(req.updates, &req.provider)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(serde_json::json!({
-        "requested": requested,
-        "applied": applied,
-        "skipped": requested.saturating_sub(applied),
-    })))
+    Ok(Json(serde_json::json!(report)))
 }
 
 async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<ProjectStats>, ApiError> {

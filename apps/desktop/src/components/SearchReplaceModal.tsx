@@ -1,7 +1,7 @@
 import { useState } from "react";
 import clsx from "clsx";
 import { X, Replace, AlertCircle } from "lucide-react";
-import { batchPatchStrings, getStrings, type StringEntry } from "../lib/api";
+import { batchPatchStrings, getStrings } from "../lib/api";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 import {
@@ -82,6 +82,20 @@ export default function SearchReplaceModal({
 
 	if (!open) return null;
 
+	const loadMatches = async () => {
+		const res = await getStrings({ search: find, limit: 50_000, offset: 0 });
+		// Keep the backend's single-transaction batch limit. Refuse an incomplete
+		// search instead of presenting a partial preview or silently replacing it.
+		if (res.total > res.entries.length) {
+			addToast("warning", t("replace.toast.incomplete", {
+				loaded: res.entries.length,
+				total: res.total,
+			}));
+			return null;
+		}
+		return res.entries;
+	};
+
 	const runPreview = async () => {
 		if (!find) {
 			addToast("error", t("replace.toast.enterFind"));
@@ -90,11 +104,12 @@ export default function SearchReplaceModal({
 		setLoading(true);
 		setPreview(null);
 		try {
-			const res = await getStrings({ search: find, limit: 50_000, offset: 0 });
+			const entries = await loadMatches();
+			if (!entries) return;
 			let entriesHit = 0;
 			let occurrences = 0;
 			const samples: { id: string; before: string; after: string }[] = [];
-			for (const e of res.entries) {
+			for (const e of entries) {
 				const target = e.translation;
 				if (!target) continue;
 				const nTr = countMatches(target, find, caseSensitive);
@@ -130,17 +145,19 @@ export default function SearchReplaceModal({
 			return;
 		}
 		setLoading(true);
+		setPreview(null);
 		try {
-			const res = await getStrings({ search: find, limit: 50_000, offset: 0 });
+			const entries = await loadMatches();
+			if (!entries) return;
 			let occurrences = 0;
-			const updates: { id: string; translation: string }[] = [];
-			for (const e of res.entries as StringEntry[]) {
+			const updates: { id: string; translation: string; expected_translation: string }[] = [];
+			for (const e of entries) {
 				if (!e.translation) continue;
 				const n = countMatches(e.translation, find, caseSensitive);
 				if (n === 0) continue;
 				const next = replaceAll(e.translation, find, replace, caseSensitive);
 				if (next === e.translation) continue;
-				updates.push({ id: e.id, translation: next });
+				updates.push({ id: e.id, translation: next, expected_translation: e.translation });
 				occurrences += n;
 			}
 			if (updates.length === 0) {
@@ -148,22 +165,24 @@ export default function SearchReplaceModal({
 				return;
 			}
 			const result = await batchPatchStrings(updates, "search-replace");
-			addToast(
-				result.skipped ? "warning" : "success",
-				result.skipped
+			const partial = result.applied !== updates.length || result.conflicts.length > 0;
+			const summary = result.conflicts.length
+				? t("replace.toast.conflicts", {
+					applied: result.applied,
+					requested: result.requested,
+					conflicts: result.conflicts.length,
+				})
+				: partial
 					? t("replace.toast.replacedSkipped", {
-							applied: result.applied,
-							occurrences,
-							skipped: result.skipped,
-						})
-					: t("replace.toast.replaced", {
-							applied: result.applied,
-							occurrences,
-						}),
-			);
+						applied: result.applied,
+						requested: result.requested,
+						skipped: result.skipped,
+					})
+					: t("replace.toast.replaced", { applied: result.applied, occurrences });
+			addToast(partial ? "warning" : "success", summary);
 			addLog(
-				"info",
-				t("activity.replace.completed", {
+				partial ? "warning" : "info",
+				partial ? summary : t("activity.replace.completed", {
 					applied: t("activity.replace.applied", { count: result.applied, requested: result.requested }),
 					count: occurrences,
 				}),
@@ -171,7 +190,7 @@ export default function SearchReplaceModal({
 				"replace",
 			);
 			onDone?.();
-			onClose();
+			if (!partial) onClose();
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
 			addToast("error", t("replace.toast.replaceFailed", { error: msg }));

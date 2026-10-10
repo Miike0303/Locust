@@ -508,11 +508,12 @@ export interface BatchPatchResult {
   requested: number;
   applied: number;
   skipped: number;
+  conflicts: string[];
 }
 
 /** Bulk update translations in one transaction (search-replace). */
 export const batchPatchStrings = (
-  updates: { id: string; translation: string }[],
+  updates: { id: string; translation: string; expected_translation?: string | null }[],
   provider = "manual"
 ): Promise<BatchPatchResult> =>
   IS_TAURI
