@@ -143,6 +143,8 @@ enum Phase {
     CommittedUnrecorded,
     RollingBack,
     Completed,
+    // Auxiliary file operations use recovery, but are not Direct/Add evidence.
+    FilesCompleted,
     Aborted,
     RolledBack,
 }
@@ -1275,27 +1277,7 @@ fn run_with_mode_hook<B, T>(
     }
     let mut backup = backup()?;
     let before = inventory(root, &selected, true)?;
-    let store = root.join(STORE_DIR);
-    if !validate_store(root)? {
-        use std::io::Write;
-        let mut initial = crate::patch::stream::StagingDir::create_prepared(root)?;
-        let mut file = initial.create_file("store.json")?;
-        let marker = StoreMarker {
-            schema_version: SCHEMA,
-            kind: "locust-injection-store".into(),
-            game_root: root.to_owned(),
-        };
-        file.write_all(&serde_json::to_vec(&marker)?)?;
-        file.sync_all()?;
-        drop(file);
-        hook(Step::StorePrepared)?;
-        let temporary = initial.path().to_owned();
-        initial.disarm();
-        drop(initial); // release the directory's no-share-delete handle
-        fs::rename(temporary, &store)?;
-    }
-    ensure_no_links(root, &Path::new(STORE_DIR).join("operations"))?;
-    fs::create_dir_all(store.join("operations"))?;
+    let store = initialize_store(root, hook)?;
     let id = uuid::Uuid::new_v4().to_string();
     let active = Active {
         mode: Some(mode),
@@ -1422,6 +1404,207 @@ fn run_with_mode_hook<B, T>(
         display_path(&operation.directory.join("originals")).display()
     ));
     Ok((backup, report, recorded))
+}
+
+fn initialize_store(root: &Path, hook: &mut impl FnMut(Step) -> Result<()>) -> Result<PathBuf> {
+    let store = root.join(STORE_DIR);
+    if !validate_store(root)? {
+        use std::io::Write;
+        let mut initial = crate::patch::stream::StagingDir::create_prepared(root)?;
+        let mut file = initial.create_file("store.json")?;
+        let marker = StoreMarker {
+            schema_version: SCHEMA,
+            kind: "locust-injection-store".into(),
+            game_root: root.to_owned(),
+        };
+        file.write_all(&serde_json::to_vec(&marker)?)?;
+        file.sync_all()?;
+        drop(file);
+        hook(Step::StorePrepared)?;
+        let temporary = initial.path().to_owned();
+        initial.disarm();
+        drop(initial); // release the directory's no-share-delete handle
+        fs::rename(temporary, &store)?;
+    }
+    ensure_no_links(root, &Path::new(STORE_DIR).join("operations"))?;
+    fs::create_dir_all(store.join("operations"))?;
+    Ok(store)
+}
+
+/// Replace prepared contents of existing game files as one recoverable operation.
+/// The caller must hold this lock across source reads, preparation, and this call.
+/// Paths are relative to `lock.root()`; duplicates, links and reserved paths are
+/// refused before publication. `installed` is a progress callback under the lock;
+/// a returned error rolls back, while process termination leaves public recovery
+/// responsible for restoring the entire plan. This never records Direct/Add outputs.
+pub fn write_files_under_lock(
+    lock: &GameLock,
+    files: &[(PathBuf, Vec<u8>)],
+    operation_label: &str,
+    mut installed: impl FnMut(usize) -> Result<()>,
+) -> Result<()> {
+    ensure_no_pending_under_lock(lock)?;
+    ensure_no_links(lock.root(), Path::new(".locust"))?;
+    if matches!(
+        PatchStore::new(lock.root()).status()?,
+        crate::patch::PatchStatus::Interrupted(_)
+    ) {
+        return Err(error("an installed patch operation is unfinished; recover that patch before modifying this game"));
+    }
+    let result = write_files_with_hook(lock.root(), files, operation_label, &mut |step| {
+        if let Step::Installed(index) = step {
+            installed(index)?;
+        }
+        Ok(())
+    });
+    if let Err(cause) = result {
+        if let Err(rollback) = recover_locked_root(
+            lock.root(),
+            InjectionRecoveryOptions::default(),
+            &mut |_| Ok(()),
+        ) {
+            return Err(error(format!("{cause}; rollback failed: {rollback}; inspect injection status and recover before retry")));
+        }
+        return Err(cause);
+    }
+    Ok(())
+}
+
+fn write_files_with_hook(
+    root: &Path,
+    files: &[(PathBuf, Vec<u8>)],
+    operation_label: &str,
+    hook: &mut impl FnMut(Step) -> Result<()>,
+) -> Result<()> {
+    use std::io::Write;
+
+    if files.is_empty() {
+        return Ok(());
+    }
+    if files.len() > MAX_FILES {
+        return Err(error("too many prepared game files"));
+    }
+    let mut paths = BTreeSet::new();
+    let mut changes = Vec::new();
+    for (path, _) in files {
+        let raw = path
+            .to_str()
+            .ok_or_else(|| error("non-UTF-8 game path"))?
+            .replace('\\', "/");
+        let relative = safe_game_rel(&raw)?;
+        if !paths.insert(raw.to_lowercase()) {
+            return Err(error("duplicate prepared game file"));
+        }
+        let original = inspect_target(root, &raw)?
+            .ok_or_else(|| error(format!("missing prepared game file: {raw}")))?;
+        if original.readonly {
+            return Err(error(format!("read-only prepared game file: {raw}")));
+        }
+        // Check access without truncating. On Windows also check DELETE sharing,
+        // so a reader denying replacement fails before journal/backup publication.
+        let mut options = fs::OpenOptions::new();
+        options.write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.access_mode(0x4000_0000 | 0x0001_0000); // GENERIC_WRITE | DELETE
+        }
+        drop(options.open(root.join(relative))?);
+        changes.push(Change {
+            path: raw,
+            original: Some(original.clone()),
+            result: original,
+        });
+    }
+    let store = initialize_store(root, hook)?;
+    let active = Active {
+        mode: None,
+        schema_version: SCHEMA,
+        transaction_id: uuid::Uuid::new_v4().to_string(),
+        game_root: root.to_owned(),
+        format: operation_label.into(),
+        language: None,
+    };
+    let mut operation = initialize_operation(root, active, hook)?;
+    publish(root, &store.join("active.json"), &operation.active)?;
+    hook(Step::Preparing)?;
+    fs::create_dir(operation.directory.join("originals"))?;
+    fs::create_dir(operation.directory.join("results"))?;
+    for (index, (change, (_, bytes))) in changes.iter_mut().zip(files).enumerate() {
+        let source = root.join(safe_game_rel(&change.path)?);
+        copy_verified(
+            &source,
+            &operation
+                .directory
+                .join("originals")
+                .join(index.to_string()),
+            change.original.as_ref().unwrap(),
+        )?;
+        let result = operation.directory.join("results").join(index.to_string());
+        let mut output = File::create_new(&result)?;
+        output.write_all(bytes)?;
+        output.set_permissions(fs::metadata(&source)?.permissions())?;
+        output.sync_all()?;
+        drop(output);
+        change.result = fingerprint(&result)?;
+    }
+    sync_directory_best_effort(&operation.directory.join("originals"));
+    sync_directory_best_effort(&operation.directory.join("results"));
+    let plan = Plan {
+        schema_version: SCHEMA,
+        transaction_id: operation.active.transaction_id.clone(),
+        game_root: root.to_owned(),
+        prepared_at: Some(chrono::Utc::now()),
+        files: changes,
+        created_dirs: Vec::new(),
+    };
+    publish(root, &operation.directory.join("plan.json"), &plan)?;
+    operation.plan()?;
+    hook(Step::OutputsPrepared)?;
+    for change in &plan.files {
+        if inspect_target(root, &change.path)? != change.original {
+            return Err(error(format!(
+                "game changed while preparing {}",
+                change.path
+            )));
+        }
+    }
+    operation.set_phase(Phase::Applying)?;
+    hook(Step::PlanPublished)?;
+    for (index, change) in plan.files.iter().enumerate() {
+        let destination = root.join(safe_game_rel(&change.path)?);
+        let parent = destination.parent().unwrap();
+        // Reuse the owned staging guard used by durable JSON publication,
+        // staging beside this destination to guarantee a same-volume rename.
+        let stage = crate::patch::stream::StagingDir::create_prepared(parent)?;
+        let temp = stage.child("prepared");
+        let mut output = stage.create_file("prepared")?;
+        let source = operation.directory.join("results").join(index.to_string());
+        std::io::copy(&mut File::open(&source)?, &mut output)?;
+        output.set_permissions(fs::metadata(&source)?.permissions())?;
+        output.sync_all()?;
+        drop(output);
+        if fingerprint(&temp)? != change.result {
+            return Err(error(format!("prepared output changed: {}", change.path)));
+        }
+        if inspect_target(root, &change.path)? != change.original {
+            return Err(error(format!(
+                "game changed before install: {}",
+                change.path
+            )));
+        }
+        fs::rename(&temp, &destination)?;
+        sync_directory_best_effort(parent);
+        hook(Step::Installed(index))?;
+    }
+    for change in &plan.files {
+        if inspect_target(root, &change.path)?.as_ref() != Some(&change.result) {
+            return Err(error(format!("committed output changed: {}", change.path)));
+        }
+    }
+    hook(Step::FilesCommitted)?;
+    operation.set_phase(Phase::FilesCompleted)?;
+    Ok(())
 }
 
 fn initialize_operation(
@@ -1679,6 +1862,14 @@ fn recover_with_hook(
     hook: &mut impl FnMut(Step) -> Result<()>,
 ) -> Result<InjectionRecoveryReport> {
     let lock = GameLock::acquire(&root_for(game_path)?)?;
+    recover_locked_root(lock.root(), options, hook)
+}
+
+fn recover_locked_root(
+    root: &Path,
+    options: InjectionRecoveryOptions,
+    hook: &mut impl FnMut(Step) -> Result<()>,
+) -> Result<InjectionRecoveryReport> {
     let mut report = InjectionRecoveryReport {
         transaction_id: None,
         restored: 0,
@@ -1686,7 +1877,7 @@ fn recover_with_hook(
         preserved_conflicts: Vec::new(),
         messages: Vec::new(),
     };
-    let loaded = load(lock.root())?;
+    let loaded = load(root)?;
     if let Some(expected) = &options.expected_transaction_id {
         let actual = loaded.as_ref().and_then(|operation| {
             operation
@@ -1700,7 +1891,7 @@ fn recover_with_hook(
             ));
         }
     }
-    cleanup_initialization_remnants(lock.root(), &mut report.messages)?;
+    cleanup_initialization_remnants(root, &mut report.messages)?;
     let Some(mut operation) = loaded else {
         report.messages.push("no unfinished injection".into());
         return Ok(report);
@@ -1726,7 +1917,7 @@ fn recover_with_hook(
     let current: Vec<_> = plan
         .files
         .iter()
-        .map(|c| inspect_target(lock.root(), &c.path))
+        .map(|c| inspect_target(root, &c.path))
         .collect::<Result<_>>()?;
     hook(Step::RecoverySnapshot)?;
     for (change, value) in plan.files.iter().zip(&current) {
@@ -1758,7 +1949,7 @@ fn recover_with_hook(
             if conflicts.iter().any(|c| c.path == change.path) {
                 let destination = preserved.join(index.to_string());
                 copy_verified(
-                    &lock.root().join(safe_game_rel(&change.path)?),
+                    &root.join(safe_game_rel(&change.path)?),
                     &destination,
                     current[index].as_ref().unwrap(),
                 )?;
@@ -1769,14 +1960,10 @@ fn recover_with_hook(
                 report.preserved_conflicts.push(destination);
             }
         }
-        publish(
-            lock.root(),
-            &preserved.join("manifest.json"),
-            &preserved_manifest,
-        )?;
+        publish(root, &preserved.join("manifest.json"), &preserved_manifest)?;
     }
     for (change, expected) in plan.files.iter().zip(&current) {
-        if inspect_target(lock.root(), &change.path)? != *expected {
+        if inspect_target(root, &change.path)? != *expected {
             return Err(error(format!(
                 "file changed during recovery preflight: {}; no game files restored",
                 change.path
@@ -1785,7 +1972,7 @@ fn recover_with_hook(
     }
     operation.set_phase(Phase::RollingBack)?;
     for (index, change) in plan.files.iter().enumerate() {
-        let now = inspect_target(lock.root(), &change.path)?;
+        let now = inspect_target(root, &change.path)?;
         if now != current[index] {
             return Err(error(format!(
                 "file changed during recovery: {}; retry after inspection",
@@ -1795,7 +1982,7 @@ fn recover_with_hook(
         if now == change.original {
             continue;
         }
-        let destination = lock.root().join(safe_game_rel(&change.path)?);
+        let destination = root.join(safe_game_rel(&change.path)?);
         if let Some(original) = &change.original {
             let stage = crate::patch::stream::StagingDir::create_prepared(&operation.directory)?;
             let temp = stage.child("restore");
@@ -1827,11 +2014,11 @@ fn recover_with_hook(
                     change.path
                 )));
             }
-            ensure_no_links(lock.root(), &safe_game_rel(&change.path)?)?;
+            ensure_no_links(root, &safe_game_rel(&change.path)?)?;
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
-            if inspect_target(lock.root(), &change.path)? != now {
+            if inspect_target(root, &change.path)? != now {
                 return Err(error(format!(
                     "file changed while preparing recovery: {}",
                     change.path
@@ -1848,11 +2035,11 @@ fn recover_with_hook(
     let mut dirs: Vec<_> = plan.created_dirs.iter().collect();
     dirs.sort_by_key(|s| std::cmp::Reverse(s.matches('/').count()));
     for raw in dirs {
-        ensure_no_links(lock.root(), &safe_game_rel(raw)?)?;
-        let _ = fs::remove_dir(lock.root().join(raw));
+        ensure_no_links(root, &safe_game_rel(raw)?)?;
+        let _ = fs::remove_dir(root.join(raw));
     }
     for change in &plan.files {
-        if inspect_target(lock.root(), &change.path)? != change.original {
+        if inspect_target(root, &change.path)? != change.original {
             return Err(error(format!(
                 "file changed before recovery completion: {}",
                 change.path
@@ -1872,3 +2059,227 @@ fn recover_with_hook(
 #[cfg(test)]
 #[path = "injection_transaction_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod prepared_file_tests {
+    use super::*;
+    use std::io::Read;
+
+    // Private, exclusively owned fixtures exercise the transaction engine without
+    // the per-user lock directory, which some CI sandboxes cannot write. Public
+    // locking and process-death recovery are also tested by locust-formats.
+    fn fixture() -> (tempfile::TempDir, PathBuf, Vec<(PathBuf, Vec<u8>)>) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("js")).unwrap();
+        fs::create_dir(root.join("data")).unwrap();
+        let files = vec![
+            (
+                PathBuf::from("js/plugins.js"),
+                b"var languages = ['en', 'es'];".to_vec(),
+            ),
+            (
+                PathBuf::from("data/Map001.json"),
+                br#"{"languages":["en","es"]}"#.to_vec(),
+            ),
+        ];
+        for (path, _) in &files {
+            fs::write(root.join(path), b"original bytes").unwrap();
+        }
+        (temp, root, files)
+    }
+
+    #[test]
+    fn recovery_restores_the_whole_prepared_plan_after_each_interruption() {
+        for stop in [
+            Step::Preparing,
+            Step::OutputsPrepared,
+            Step::PlanPublished,
+            Step::Installed(0),
+            Step::Installed(1),
+            Step::FilesCommitted,
+        ] {
+            let (_temp, root, files) = fixture();
+            let result = write_files_with_hook(&root, &files, "register-language", &mut |step| {
+                if step == stop {
+                    Err(error("interrupted"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err(), "{stop:?}");
+            let operation = load(&root).unwrap().unwrap();
+            assert!(operation.phase.pending().is_some());
+            if operation.phase != Phase::Preparing {
+                let plan = operation.plan().unwrap();
+                assert_eq!(plan.files.len(), files.len());
+                assert!(conflicts(&root, &plan).unwrap().is_empty());
+            }
+            recover_locked_root(&root, Default::default(), &mut |_| Ok(())).unwrap();
+            for (path, _) in &files {
+                assert_eq!(fs::read(root.join(path)).unwrap(), b"original bytes");
+            }
+            assert!(load(&root).unwrap().unwrap().phase.pending().is_none());
+            assert!(game_status(&root).unwrap().injections.is_empty());
+            assert_eq!(
+                recover_locked_root(&root, Default::default(), &mut |_| Ok(()))
+                    .unwrap()
+                    .restored,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_crash_child() {
+        let Some(root) = std::env::var_os("LOCUST_PREPARED_CRASH_GAME") else {
+            return;
+        };
+        let files = vec![
+            (
+                PathBuf::from("js/plugins.js"),
+                b"complete new plugins".to_vec(),
+            ),
+            (
+                PathBuf::from("data/Map001.json"),
+                b"complete new map".to_vec(),
+            ),
+        ];
+        write_files_with_hook(Path::new(&root), &files, "register-language", &mut |step| {
+            if step == Step::Installed(0) {
+                std::process::exit(86);
+            }
+            Ok(())
+        })
+        .unwrap();
+        panic!("crash hook was not reached");
+    }
+
+    #[test]
+    fn prepared_process_death_leaves_a_recoverable_unit() {
+        let (_temp, root, files) = fixture();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "injection_transaction::prepared_file_tests::prepared_crash_child",
+                "--nocapture",
+            ])
+            .env("LOCUST_PREPARED_CRASH_GAME", &root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(86),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            fs::read(root.join(&files[0].0)).unwrap(),
+            b"complete new plugins"
+        );
+        assert_eq!(fs::read(root.join(&files[1].0)).unwrap(), b"original bytes");
+        let operation = load(&root).unwrap().unwrap();
+        assert_eq!(operation.phase, Phase::Applying);
+        assert_eq!(operation.plan().unwrap().files.len(), 2);
+        let recovered = recover_locked_root(&root, Default::default(), &mut |_| Ok(())).unwrap();
+        assert_eq!(recovered.restored, 1);
+        for (path, _) in files {
+            assert_eq!(fs::read(root.join(path)).unwrap(), b"original bytes");
+        }
+    }
+
+    #[test]
+    fn prepared_files_replace_open_readers_and_preserve_injection_recordings() {
+        let (_temp, root, files) = fixture();
+        let mut readers: Vec<_> = files
+            .iter()
+            .map(|(path, _)| File::open(root.join(path)).unwrap())
+            .collect();
+        // Seed real Direct transaction evidence without touching a project DB.
+        write_files_with_hook(&root, &files[..1], "rpgmaker_mv", &mut |_| Ok(())).unwrap();
+        let mut prior = load(&root).unwrap().unwrap();
+        prior.active.mode = Some(InjectionMode::Direct);
+        publish(&root, &prior.directory.join("identity.json"), &prior.active).unwrap();
+        publish(
+            &root,
+            &root.join(STORE_DIR).join("active.json"),
+            &prior.active,
+        )
+        .unwrap();
+        prior.set_phase(Phase::Completed).unwrap();
+        let before = serde_json::to_value(game_status(&root).unwrap()).unwrap();
+        let recorded_plan = fs::read(prior.directory.join("plan.json")).unwrap();
+        write_files_with_hook(&root, &files, "register-language", &mut |_| Ok(())).unwrap();
+        for ((path, expected), reader) in files.iter().zip(&mut readers) {
+            let mut observed = Vec::new();
+            reader.read_to_end(&mut observed).unwrap();
+            assert_eq!(observed, b"original bytes");
+            assert_eq!(&fs::read(root.join(path)).unwrap(), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(game_status(&root).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read(prior.directory.join("plan.json")).unwrap(),
+            recorded_plan
+        );
+        assert_eq!(load(&root).unwrap().unwrap().phase, Phase::FilesCompleted);
+    }
+
+    #[test]
+    fn prepared_plan_refuses_unsafe_or_duplicate_paths_before_publication() {
+        for invalid in [
+            "../escape",
+            ".locust/state",
+            ".locust-injections/active.json",
+            "js/plugins.js",
+        ] {
+            let (_temp, root, mut files) = fixture();
+            files.push((invalid.into(), b"bad".to_vec()));
+            assert!(
+                write_files_with_hook(&root, &files, "register-language", &mut |_| Ok(())).is_err()
+            );
+            assert!(!root.join(STORE_DIR).exists());
+            assert_eq!(
+                fs::read(root.join("js/plugins.js")).unwrap(),
+                b"original bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_external_edits_until_explicit_force() {
+        let (_temp, root, files) = fixture();
+        assert!(
+            write_files_with_hook(&root, &files, "register-language", &mut |step| {
+                if step == Step::Installed(0) {
+                    Err(error("interrupted"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        );
+        fs::write(root.join(&files[0].0), b"external edit").unwrap();
+        assert!(recover_locked_root(&root, Default::default(), &mut |_| Ok(())).is_err());
+        assert_eq!(fs::read(root.join(&files[0].0)).unwrap(), b"external edit");
+        let recovered = recover_locked_root(
+            &root,
+            InjectionRecoveryOptions {
+                force: true,
+                ..Default::default()
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(recovered.preserved_conflicts.len(), 1);
+        assert_eq!(
+            fs::read(&recovered.preserved_conflicts[0]).unwrap(),
+            b"external edit"
+        );
+        for (path, _) in files {
+            assert_eq!(fs::read(root.join(path)).unwrap(), b"original bytes");
+        }
+    }
+}

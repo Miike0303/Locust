@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use locust_core::encoding::EncodingDetector;
 use locust_core::error::{LocustError, Result};
-use locust_core::injection_transaction::ensure_no_pending_under_lock;
+use locust_core::injection_transaction::{ensure_no_pending_under_lock, write_files_under_lock};
 use locust_core::patch::GameLock;
 use serde::Serialize;
 
@@ -98,7 +98,7 @@ pub fn register_language(
     }
 
     // Every read, decode and parse has succeeded before the first backup/write.
-    report.backups = write_planned_files(&planned)?;
+    report.backups = write_planned_files(&lock, game_root, &planned)?;
     Ok(report)
 }
 
@@ -108,35 +108,48 @@ struct PlannedFile {
     content: Option<String>,
 }
 
-fn write_planned_files(planned: &[PlannedFile]) -> Result<Vec<PathBuf>> {
+fn write_planned_files(
+    lock: &GameLock,
+    game_root: &Path,
+    planned: &[PlannedFile],
+) -> Result<Vec<PathBuf>> {
     let mut created_backups = Vec::new();
-    let mut written: Vec<&PlannedFile> = Vec::new();
     let result = (|| {
         let mut backups = Vec::new();
+        let mut files = Vec::new();
         for file in planned {
-            backups.push(backup_file(&file.path, &mut created_backups)?);
+            let relative = file.path.strip_prefix(game_root).map_err(|_| {
+                LocustError::InjectionError("language registration path escaped game root".into())
+            })?;
+            locust_core::patch::zipsec::ensure_no_links(lock.root(), relative)?;
+            if std::fs::read(&file.path)? != file.original {
+                return Err(LocustError::InjectionError(format!(
+                    "game changed while preparing language registration: {}",
+                    file.path.display()
+                )));
+            }
             if let Some(content) = &file.content {
-                // Include the failing file: write may truncate before returning Err.
-                written.push(file);
-                std::fs::write(&file.path, content)?;
+                files.push((relative.to_owned(), content.as_bytes().to_vec()));
             }
         }
+        for file in planned {
+            backups.push(backup_file(&file.path, &mut created_backups)?);
+        }
+        write_files_under_lock(lock, &files, "register-language", |_index| {
+            #[cfg(test)]
+            tests::after_install(_index);
+            Ok(())
+        })?;
         Ok(backups)
     })();
     if result.is_err() {
-        let mut restored = true;
-        for file in written.into_iter().rev() {
-            if std::fs::read(&file.path).is_ok_and(|bytes| bytes == file.original) {
-                continue;
-            }
-            // A .bak-locust may predate this call, so restore the in-memory bytes.
-            if let Err(error) = std::fs::write(&file.path, &file.original) {
-                restored = false;
-                tracing::error!(path = %file.path.display(), %error, "language registration rollback failed");
-            }
-        }
-        // Keep recovery copies if restoration itself failed; return the first error.
-        if restored {
+        // The adapter has rolled back under this same lock. Retain compatibility
+        // backups if rollback failed or an external editor changed an original.
+        if ensure_no_pending_under_lock(lock).is_ok()
+            && planned
+                .iter()
+                .all(|file| std::fs::read(&file.path).is_ok_and(|bytes| bytes == file.original))
+        {
             for backup in created_backups.into_iter().rev() {
                 if let Err(error) = std::fs::remove_file(&backup) {
                     if error.kind() != std::io::ErrorKind::NotFound {
@@ -155,9 +168,16 @@ fn backup_file(path: &Path, created_backups: &mut Vec<PathBuf>) -> Result<PathBu
         path.file_name().unwrap().to_string_lossy()
     ));
     if !bak.exists() {
-        // Track even a failed copy so a partially created backup is removed.
+        let parent = path.parent().unwrap();
+        locust_core::patch::zipsec::ensure_no_links(parent, Path::new(bak.file_name().unwrap()))?;
+        let stage = locust_core::patch::stream::StagingDir::create_prepared(parent)?;
+        let temp = stage.child("backup");
+        let mut output = stage.create_file("backup")?;
+        std::io::copy(&mut std::fs::File::open(path)?, &mut output)?;
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(temp, &bak)?;
         created_backups.push(bak.clone());
-        std::fs::copy(path, &bak)?;
     }
     Ok(bak)
 }
@@ -1062,6 +1082,147 @@ fn rewrite_lang_script(script: &str, lang: &str, index: i32) -> LangScriptRewrit
 mod tests {
     use super::*;
     use std::fs;
+
+    thread_local! {
+        static STOP_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn after_install(index: usize) {
+        if STOP_AFTER.get() == Some(index) {
+            // Exit without unwinding, so neither rollback nor guard destructors run.
+            std::process::exit(86);
+        }
+    }
+
+    fn crash_fixture(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fs::create_dir_all(root.join("js")).unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(root.join("data/System.json"), br#"{"gameTitle":"T"}"#).unwrap();
+        let plugins = br#"var $plugins = [{"parameters":{"Languages":"jp, en, zh"}}];"#;
+        let map = serde_json::json!({"events": [null, {"pages": [{"list": [
+            {"code":102,"indent":0,"parameters":[["日本語","ENGLISH","中文"],-1,0,1,0]},
+            {"code":402,"indent":0,"parameters":[1,"ENGLISH"]},
+            {"code":355,"indent":1,"parameters":["I18N.language = 'en';"]},
+            {"code":0,"indent":1,"parameters":[]},
+            {"code":404,"indent":0,"parameters":[]}
+        ]}]}]});
+        let files = vec![
+            (root.join("js/plugins.js"), plugins.to_vec()),
+            (root.join("data/Map001.json"), map.to_string().into_bytes()),
+            (
+                root.join("data/Map002.jsono"),
+                lz_str::compress_to_base64(&map.to_string()).into_bytes(),
+            ),
+        ];
+        for (path, bytes) in &files {
+            fs::write(path, bytes).unwrap();
+        }
+        files
+    }
+
+    #[test]
+    fn register_lang_crash_child() {
+        let Some(root) = std::env::var_os("LOCUST_REGISTER_LANG_CRASH_GAME") else {
+            return;
+        };
+        STOP_AFTER.set(Some(
+            std::env::var("LOCUST_REGISTER_LANG_CRASH_AFTER")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        ));
+        register_language(Path::new(&root), "es", "Español").unwrap();
+        panic!("crash hook was not reached");
+    }
+
+    #[test]
+    fn register_lang_crash_recovers_all_originals() {
+        for stop_after in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let originals = crash_fixture(dir.path());
+            let stale_backup = dir.path().join("js/plugins.js.bak-locust");
+            fs::write(&stale_backup, b"older user backup").unwrap();
+            let expected_plugins = patch_plugins_js(&originals[0].0, "es", "Español")
+                .unwrap()
+                .0
+                .content
+                .unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rpgmaker_lang::tests::register_lang_crash_child",
+                    "--nocapture",
+                ])
+                .env("LOCUST_REGISTER_LANG_CRASH_GAME", dir.path())
+                .env("LOCUST_REGISTER_LANG_CRASH_AFTER", stop_after.to_string())
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.code(),
+                Some(86),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert_eq!(
+                fs::read(&originals[0].0).unwrap(),
+                expected_plugins.as_bytes()
+            );
+            if stop_after == 0 {
+                for (path, bytes) in &originals[1..] {
+                    assert_eq!(&fs::read(path).unwrap(), bytes);
+                }
+            }
+            let pending = locust_core::injection_transaction::status(dir.path())
+                .unwrap()
+                .pending
+                .expect("an interrupted registration must be visible to Injection Recovery");
+            assert_eq!(pending.changed_files, originals.len());
+            assert!(pending.conflicts.is_empty());
+            assert!(register_language(dir.path(), "fr", "Français").is_err());
+            let recovered =
+                locust_core::injection_transaction::recover(dir.path(), Default::default())
+                    .unwrap();
+            assert_eq!(recovered.restored, stop_after + 1);
+            for (path, bytes) in &originals {
+                assert_eq!(&fs::read(path).unwrap(), bytes);
+            }
+            assert_eq!(fs::read(&stale_backup).unwrap(), b"older user backup");
+            assert!(locust_core::injection_transaction::status(dir.path())
+                .unwrap()
+                .pending
+                .is_none());
+            register_language(dir.path(), "es", "Español").unwrap();
+        }
+    }
+
+    #[test]
+    fn register_lang_replaces_live_files_without_truncating_open_handles() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let originals = crash_fixture(dir.path());
+        let mut handles: Vec<_> = originals
+            .iter()
+            .map(|(path, _)| fs::File::open(path).unwrap())
+            .collect();
+        let report = register_language(dir.path(), "es", "Español").unwrap();
+        assert!(report.plugins_js);
+        assert_eq!(report.maps_patched.len(), 2);
+        for ((path, original), handle) in originals.iter().zip(&mut handles) {
+            let mut observed = Vec::new();
+            handle.read_to_end(&mut observed).unwrap();
+            assert_eq!(
+                &observed,
+                original,
+                "an open reader must retain the complete old file: {}",
+                path.display()
+            );
+            assert_ne!(&fs::read(path).unwrap(), original);
+        }
+        assert!(locust_core::injection_transaction::game_status(dir.path())
+            .unwrap()
+            .injections
+            .is_empty());
+    }
 
     fn write_jsono(path: &Path, json: &str) {
         fs::write(path, lz_str::compress_to_base64(json)).unwrap();
