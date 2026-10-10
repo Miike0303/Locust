@@ -9,6 +9,7 @@ import type { ProjectOpenPreflight, TranslationStartParams } from "../lib/api.ts
 
 const h = {
   calls: [] as string[], toasts: [] as unknown[][],
+  logs: [] as unknown[][], jobError: null as string | null,
   preflight: { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" } as ProjectOpenPreflight,
 };
 (globalThis as any).__resumeQueue = h;
@@ -23,8 +24,8 @@ registerHooks({
         export async function startTranslation(){h.calls.push('translate');return {job_id:'job'};}
         export async function cancelTranslation(){h.calls.push('cancelTranslation');}
         export async function validate(){h.calls.push('validate');return {validation:{issues_found:0}};}`,
-      "/src/lib/ws.ts": `export const JOB_STREAM_LOST_MESSAGE='lost';export async function waitForJob(){}`,
-      "/src/stores/logStore.ts": `export function addLog(){}`,
+      "/src/lib/ws.ts": `export const JOB_STREAM_LOST_MESSAGE='ws.jobStreamLost';export async function waitForJob(){const error=globalThis.__resumeQueue.jobError;if(error!==null)throw new Error(error);}`,
+      "/src/stores/logStore.ts": `export function addLog(...args){globalThis.__resumeQueue.logs.push(args);}`,
       "/src/stores/toastStore.ts": `export function addToast(...args){globalThis.__resumeQueue.toasts.push(args);}`,
     };
     const path = url.replace(/\\/g, "/");
@@ -49,7 +50,7 @@ beforeEach(() => {
   queue.setState({ items: [], isRunning: false, cancelRequested: false, globalProgress: null, translationParams: params });
   editor.setState({ isTranslating: false });
   project.setState({ project: originalProject });
-  h.calls = []; h.toasts = [];
+  h.calls = []; h.toasts = []; h.logs = []; h.jobError = null;
   h.preflight = { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" };
   setLocale("en");
 });
@@ -123,4 +124,40 @@ test("plain queued folder still extracts and translates without a choice", async
   assert.equal(getProjectOpenChoice(), null);
   assert.deepEqual(h.calls, ["preflight", "extract", "translate", "validate"]);
   assert.equal(queue.getState().items[0].status, "done");
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`queue row localizes terminal provider failure and logs raw detail once in ${locale}`, async () => {
+    setLocale(locale);
+    h.preflight = { kind: "extract" };
+    const raw = "provider error: Claude returned status 403 Forbidden: opaque response  ";
+    h.jobError = raw;
+    queue.getState().addItem("/fixture/game");
+    await queue.getState().startQueue();
+    const item = queue.getState().items[0];
+    assert.equal(item.status, "error");
+    assert.equal(item.error, locale === "es"
+      ? "Claude rechazó la clave API. Revísela en Ajustes → Proveedores."
+      : "Claude rejected the API key. Check it in Settings → Providers.");
+    assert.deepEqual(h.logs.filter(([, , detail]) => detail === raw), [
+      ["error", t("activity.queue.itemFailed", { name: "game" }), raw, "queue"],
+    ]);
+    assert.ok(!h.logs.some(([, message]) => String(message).includes(raw)));
+    assert.ok(!h.calls.includes("validate"));
+    assert.equal(queue.getState().isRunning, false);
+    assert.equal(queue.getState().globalProgress, null);
+  });
+}
+
+test("queue keeps unknown diagnostics and stream-loss localization", async () => {
+  setLocale("es");
+  h.preflight = { kind: "extract" };
+  for (const raw of ["unknown provider failure", "provider error: OpenAI malformed response: first\nsecond", "ws.jobStreamLost"]) {
+    queue.setState({ items: [] });
+    h.logs = []; h.jobError = raw;
+    queue.getState().addItem("/fixture/game");
+    await queue.getState().startQueue();
+    assert.equal(queue.getState().items[0].error, raw === "ws.jobStreamLost" ? t("ws.jobStreamLost") : raw);
+    assert.equal(h.logs.filter(([, , detail]) => detail === raw).length, 1);
+  }
 });

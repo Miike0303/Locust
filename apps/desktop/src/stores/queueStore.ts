@@ -9,6 +9,7 @@ import { canStartQueue } from "../lib/translationJob";
 import { addLog } from "./logStore";
 import { addToast } from "./toastStore";
 import { t } from "../lib/i18n";
+import { localizeApiError } from "../lib/apiError";
 import { JOB_STREAM_LOST_MESSAGE } from "../lib/ws";
 import {
   queueItemPatchAfterValidation,
@@ -267,7 +268,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           const raw = err.message ?? String(err);
           updateItem({
             status: "error",
-            error: raw === JOB_STREAM_LOST_MESSAGE ? t(JOB_STREAM_LOST_MESSAGE) : raw,
+            error: raw === JOB_STREAM_LOST_MESSAGE ? t(JOB_STREAM_LOST_MESSAGE) : localizeApiError(raw),
           });
           addLog("error", t("activity.queue.itemFailed", { name: item.projectName }), raw, "queue");
           addToast("error", t("queue.toast.itemFailed", { name: item.projectName }));

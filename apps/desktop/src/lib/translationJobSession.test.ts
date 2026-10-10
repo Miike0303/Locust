@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { test } from "node:test";
 import { setLocale, t } from "./i18n/index.ts";
 
 // Exercise the real persistent session across terminal/cancel races. Only its
@@ -78,4 +79,61 @@ setLocale("es");
 h.handlers.onFailed({type:"failed",entry_id:null,error:"raw backend failure"});
 assert.deepEqual(h.logs[h.logs.length - 1], ["error", "La traducción falló", "raw backend failure", "translation"]);
 setLocale("en");
+for (const locale of ["en", "es"] as const) {
+  test(`terminal provider failure localizes snapshot and toast, logging raw detail once in ${locale}`, () => {
+    setLocale(locale === "en" ? "es" : "en");
+    attach(`provider-failed-${locale}`);
+    setLocale(locale);
+    h.logs = []; h.toasts = [];
+    const raw = String.raw`provider error: OpenAI returned status 401 Unauthorized: <html>opaque $& {error}</html>  `;
+    const reason = locale === "es"
+      ? "OpenAI rechazó la clave API. Revísela en Ajustes → Proveedores."
+      : "OpenAI rejected the API key. Check it in Settings → Providers.";
+    h.handlers.onFailed({ type: "failed", error: raw });
+    assert.equal(h.snapshot.error, reason);
+    assert.equal(h.snapshot.cancelling, false);
+    assert.equal(h.snapshot.cancelled, false);
+    assert.equal(h.translating, false);
+    assert.equal(h.jobId, null);
+    assert.deepEqual(h.toasts, [["error", `${locale === "es" ? "La traducción falló" : "Translation failed"}: ${reason}`]]);
+    assert.deepEqual(h.logs, [["error", t("activity.translation.failed"), raw, "translation"]]);
+    h.handlers.onFailed({ type: "failed", error: raw });
+    h.handlers.onBatchFailed({ type: "batch_failed", error: raw });
+    h.handlers.onClosed();
+    assert.equal(h.logs.length, 1);
+    assert.equal(h.toasts.length, 1);
+    setLocale("en");
+  });
+
+  test(`batch provider failure adds localized guidance, keeps raw detail once and continues in ${locale}`, () => {
+    attach(`provider-batch-${locale}`);
+    setLocale(locale);
+    h.logs = []; h.toasts = [];
+    const raw = "provider error: DeepL returned status 429 Too Many Requests: opaque response  ";
+    const reason = locale === "es"
+      ? "El proveedor está limitando las solicitudes. Espere y vuelva a intentarlo, o reduzca el tamaño del lote en Ajustes → Valores predeterminados de traducción."
+      : "The provider is limiting requests. Wait and retry, or lower the batch size in Settings → Translation Defaults.";
+    h.handlers.onBatchFailed({ type: "batch_failed", error: raw });
+    assert.deepEqual(h.logs, [["warning", `${t("activity.translation.batchFailed")}: ${reason}`, raw, "translation"]]);
+    assert.equal(h.snapshot.error, null);
+    assert.equal(h.translating, true);
+    assert.equal(h.toasts.length, 0);
+    h.handlers.onCompleted({ type: "completed", total_translated: 1, total_cost: 0, cost_is_complete: true });
+    assert.equal(h.snapshot.done, true);
+    assert.equal(h.logs.filter(([, , detail]) => detail === raw).length, 1);
+    setLocale("en");
+  });
+}
+
+test("unknown and multiline batch failures keep the diagnostic only in raw detail", () => {
+  setLocale("es");
+  attach("unknown-batches");
+  for (const raw of ["unknown provider failure", "provider error: OpenAI malformed response: first\nsecond\r\n  "]) {
+    h.logs = [];
+    h.handlers.onBatchFailed({ type: "batch_failed", error: raw });
+    assert.deepEqual(h.logs, [["warning", t("activity.translation.batchFailed"), raw, "translation"]]);
+  }
+  h.handlers.onCompleted({ type: "completed", total_translated: 0, total_cost: 0, cost_is_complete: true });
+  setLocale("en");
+});
 console.log("translationJobSession.test.ts: ok");

@@ -390,6 +390,169 @@ test("second-batch extra prefixes, incomplete shapes and multiline diagnostics s
 	}
 });
 
+// Verified Display templates: providers/{openai,claude,deepl,ollama,google,argos}.rs,
+// xai_oauth.rs:346, core/error.rs:20 and core/translation.rs:527,1394-1419,1562,2333.
+const providerGuidance = {
+	credentials: {
+		en: (name: string) => `${name} rejected the API key. Check it in Settings → Providers.`,
+		es: (name: string) => `${name} rechazó la clave API. Revísela en Ajustes → Proveedores.`,
+	},
+	rate: {
+		en: "The provider is limiting requests. Wait and retry, or lower the batch size in Settings → Translation Defaults.",
+		es: "El proveedor está limitando las solicitudes. Espere y vuelva a intentarlo, o reduzca el tamaño del lote en Ajustes → Valores predeterminados de traducción.",
+	},
+	network: {
+		en: "Could not reach the provider. Check your connection. For Ollama, Argos or LM Studio, make sure the local server is running.",
+		es: "No se pudo conectar con el proveedor. Compruebe su conexión. Si usa Ollama, Argos o LM Studio, compruebe que el servidor local esté en funcionamiento.",
+	},
+	malformed: {
+		en: "The provider returned an unusable answer. Retry, lower the batch size, or try another model or provider.",
+		es: "El proveedor devolvió una respuesta que no se puede utilizar. Vuelva a intentarlo, reduzca el tamaño del lote o pruebe otro modelo o proveedor.",
+	},
+	budget: {
+		en: "The cost limit cannot be enforced because cost information is unavailable. Remove the cost limit or choose a provider with cost estimates.",
+		es: "No se puede aplicar el límite de coste porque falta información sobre los costes. Quite el límite de coste o elija un proveedor con estimaciones de coste.",
+	},
+};
+const opaqueProviderDetails = ["", "opaque diagnostic", String.raw`<html>C:\日本語\$& {error} $' $$</html>`, "opaque; ".repeat(200)];
+const malformedProviderPrefixes = [
+	...["OpenAI", "Claude", "Ollama"].map(name => `provider error: ${name} malformed response: `),
+	...["DeepL", "Argos"].map(name => `provider error: ${name} returned malformed response: `),
+	"provider error: Google Translate returned invalid JSON: ",
+	"provider error: could not parse JSON array from response: ",
+];
+const connectionProviderPrefixes = [
+	...["OpenAI", "Claude", "DeepL", "Ollama", "Argos"].map(name => `provider error: ${name} connection failed: `),
+	"provider error: Google Translate request failed: ",
+];
+const grokExpired = "provider error: xAI session expired — run `locust auth grok` to log in again";
+const providerTimeout = "provider error: provider request timeout: retry deadline exceeded";
+const costReasons = [
+	"preceding calls have unknown cost", "this provider has no valid cost estimate",
+	"this provider has no cost estimate", "observed calls have unknown cost",
+];
+const mismatchedIds = "provider returned mismatched or duplicate entry IDs";
+
+for (const locale of ["en", "es"] as const) {
+	const check = (raw: string, expected: string) => {
+		assert.equal(localizeApiError(raw), expected, `${locale} bare: ${JSON.stringify(raw)}`);
+		assert.equal(localizeApiError(`500: ${raw}`), expected, `${locale} HTTP: ${JSON.stringify(raw)}`);
+	};
+	test(`provider credentials reject only owned 401/403 forms and hide bodies in ${locale}`, () => {
+		setLocale(locale);
+		for (const name of ["OpenAI", "Claude", "DeepL"]) {
+			for (const status of ["401", "403", "401 Unauthorized", "403 Forbidden"]) {
+				for (const suffix of ["", ...opaqueProviderDetails.map(detail => `: ${detail}`)]) {
+					check(`provider error: ${name} returned status ${status}${suffix}`, providerGuidance.credentials[locale](name));
+				}
+			}
+		}
+	});
+	test(`Grok session expiry gives desktop sign-in guidance in ${locale}`, () => {
+		setLocale(locale);
+		check(grokExpired, locale === "es"
+			? "La sesión de Grok caducó. Vuelva a iniciar sesión en Ajustes → Proveedores."
+			: "Your Grok session expired. Sign in again in Settings → Providers.");
+	});
+	test(`provider rate limits hide bodies and suggest smaller batches in ${locale}`, () => {
+		setLocale(locale);
+		for (const name of ["OpenAI", "Claude", "DeepL", "Ollama", "Google Translate", "Argos"]) {
+			for (const status of ["429", "429 Too Many Requests"]) {
+				for (const suffix of ["", ...opaqueProviderDetails.map(detail => `: ${detail}`)]) {
+					check(`provider error: ${name} returned status ${status}${suffix}`, providerGuidance.rate[locale]);
+				}
+			}
+		}
+	});
+	test(`provider timeout and connections give local-server guidance in ${locale}`, () => {
+		setLocale(locale);
+		check(providerTimeout, providerGuidance.network[locale]);
+		for (const prefix of connectionProviderPrefixes) {
+			for (const detail of opaqueProviderDetails) check(prefix + detail, providerGuidance.network[locale]);
+		}
+	});
+	test(`cost limits preserve amounts and recognize all four enforcement reasons in ${locale}`, () => {
+		setLocale(locale);
+		for (const [estimated, limit] of [["1.2345", "0.5000"], ["9007199254740993.2500", "0.0000"]]) {
+			check(`cost limit exceeded: estimated $${estimated} exceeds limit $${limit}`, locale === "es"
+				? `El coste estimado ($${estimated}) supera el límite de coste ($${limit}). Aumente o quite el límite de coste, o elija un proveedor con estimaciones de coste.`
+				: `Estimated cost ($${estimated}) exceeds the cost limit ($${limit}). Raise or remove the cost limit, or choose a provider with cost estimates.`);
+		}
+		for (const reason of costReasons) {
+			const expected = reason === "this provider has no cost estimate"
+				? (locale === "es"
+					? "Este proveedor no puede estimar el coste. Quite el límite de presupuesto para continuar o elija un proveedor con estimaciones de coste."
+					: "This provider cannot estimate cost. Remove the budget limit to continue, or choose a provider with cost estimates.")
+				: providerGuidance.budget[locale];
+			check(`provider error: cannot enforce a cost limit: ${reason}`, expected);
+		}
+		assert.equal(new ApiError("provider error: cannot enforce a cost limit: this provider has no cost estimate").key, "api.error.unknownProviderCost");
+	});
+	test(`malformed provider output hides diagnostic bodies in ${locale}`, () => {
+		setLocale(locale);
+		for (const prefix of malformedProviderPrefixes) {
+			for (const detail of opaqueProviderDetails) check(prefix + detail, providerGuidance.malformed[locale]);
+		}
+		check("provider error: translation count mismatch: sent 12 strings, got 0 back", providerGuidance.malformed[locale]);
+		check(mismatchedIds, providerGuidance.malformed[locale]);
+	});
+}
+
+const providerSamples = [
+	"provider error: OpenAI returned status 401", "provider error: Claude returned status 403 Forbidden: opaque",
+	"provider error: Argos returned status 429 Too Many Requests", grokExpired, providerTimeout,
+	...connectionProviderPrefixes.map(prefix => prefix + "opaque"),
+	...malformedProviderPrefixes.map(prefix => prefix + "opaque"),
+	...costReasons.map(reason => `provider error: cannot enforce a cost limit: ${reason}`),
+	"cost limit exceeded: estimated $1.2345 exceeds limit $0.5000",
+	"provider error: translation count mismatch: sent 12 strings, got 0 back", mismatchedIds,
+];
+test("provider near misses and unknown diagnostics retain fallback in both locales", () => {
+	const nearMisses = [
+		...providerSamples.map(raw => `extra prefix: ${raw}`),
+		...providerSamples.map(raw => ` ${raw}`),
+		"provider error: Other returned status 401", "provider error: openai returned status 401",
+		"provider error: Ollama returned status 401", "provider error: Google Translate returned status 403",
+		"provider error: OpenAI returned status 4010", "provider error: Claude returned status 4030: opaque",
+		"provider error: OpenAI returned status 401 Forbidden", "provider error: Claude returned status 401 Unauthorized extra",
+		"provider error: OpenAI returned status 4290", "provider error: Other returned status 429",
+		"provider error: OpenAI returned status 500: opaque", "provider error: OpenAI health check returned status 401",
+		"provider error: OpenAI returned status 401:opaque", "provider error: OpenAI returned status 429 Nope",
+		grokExpired + " extra", grokExpired.replace("—", "-"), providerTimeout + ": opaque",
+		"provider error: Other connection failed: opaque", "provider error: OpenAI connection failed:opaque",
+		"provider error: Google Translate request failed", "provider error: Other malformed response: opaque",
+		"provider error: OpenAI malformed response:opaque", "provider error: Google returned invalid JSON: opaque",
+		"provider error: cannot enforce a cost limit: unknown reason",
+		...costReasons.map(reason => `provider error: cannot enforce a cost limit: ${reason} extra`),
+		"cost limit exceeded: estimated $NaN exceeds limit $1.0000", "cost limit exceeded: estimated $-1.0000 exceeds limit $1.0000",
+		"cost limit exceeded: estimated $1.0000 exceeds limit $0.0000 extra",
+		"provider error: translation count mismatch: sent -1 strings, got 2 back",
+		"provider error: translation count mismatch: sent N strings, got M back",
+		"provider error: translation count mismatch: sent 1 strings, got 2 back extra", mismatchedIds + " extra",
+		"provider error: something new", "unrelated diagnostic",
+	];
+	for (const locale of ["en", "es"] as const) {
+		setLocale(locale);
+		for (const raw of nearMisses) {
+			assert.equal(localizeApiError(raw), raw.trim(), JSON.stringify(raw));
+			assert.equal(localizeApiError(`500: ${raw}`), `${locale === "es" ? "Error del servidor" : "Server error"} 500: ${raw.trim()}`, JSON.stringify(raw));
+		}
+	}
+});
+test("provider rules reject embedded and final line breaks before legacy trimming", () => {
+	for (const locale of ["en", "es"] as const) {
+		setLocale(locale);
+		for (const sample of providerSamples) {
+			for (const newline of ["\n", "\r", "\r\n", "\u2028", "\u2029"]) {
+				for (const raw of [sample + newline, sample + newline + "opaque", newline + sample]) {
+					assert.equal(localizeApiError(raw), raw.trim(), JSON.stringify(raw));
+					assert.equal(localizeApiError(`500: ${raw}`), `${locale === "es" ? "Error del servidor" : "Server error"} 500: ${raw.trim()}`, JSON.stringify(raw));
+				}
+			}
+		}
+	}
+});
+
 const excerpts = ['"unterminated', String.raw`"$& C:\games\日本語\dialog.po`, '"café" extra', ""];
 const poError = (line: string, excerpt: string) =>
 	`parse error in po: line ${line}: malformed PO string: ${excerpt}`;

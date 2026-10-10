@@ -29,7 +29,6 @@ const EXACT: Record<string, MessageKey> = {
   "Configuration could not be loaded. The existing file is protected. Repair the configuration and restart Locust before saving settings.": "settings.configLoadFailed",
   "cost limit must be finite and non-negative": "api.error.invalidCostLimit",
   "provider error: cost limit must be finite and non-negative": "api.error.invalidCostLimit",
-    "provider error: cannot enforce a cost limit: this provider has no cost estimate": "api.error.unknownProviderCost",
 	[TRANSLATION_IN_FLIGHT_EN]: "api.error.translationInFlight",
 	[PATCH_APPLY_IN_FLIGHT_EN]: "api.error.patchApplyInFlight",
 	[PROJECT_BUSY_EN]: "api.error.projectBusy",
@@ -63,9 +62,39 @@ const EXACT: Record<string, MessageKey> = {
 	"saved Direct project format is incompatible": "api.error.directFormatIncompatible",
 };
 
+// Match the original line so trimming cannot turn a multiline diagnostic into guidance.
+// ProviderError adds its prefix in core/error.rs:14; batch entry-ID errors are bare.
+const SINGLE_LINE_EXACT: Record<string, MessageKey> = {
+	"provider error: xAI session expired — run `locust auth grok` to log in again": "api.error.grokSessionExpired",
+	"provider error: provider request timeout: retry deadline exceeded": "api.error.providerConnection",
+	"provider error: cannot enforce a cost limit: this provider has no cost estimate": "api.error.unknownProviderCost",
+	"provider error: cannot enforce a cost limit: this provider has no valid cost estimate": "api.error.costLimitUnavailable",
+	"provider error: cannot enforce a cost limit: preceding calls have unknown cost": "api.error.costLimitUnavailable",
+	"provider error: cannot enforce a cost limit: observed calls have unknown cost": "api.error.costLimitUnavailable",
+	"provider returned mismatched or duplicate entry IDs": "api.error.providerMalformedResponse",
+};
+
 type PrefixRule = { prefix: string; key: MessageKey; detail?: boolean; singleLine?: boolean };
 
 const PREFIXES: PrefixRule[] = [
+	// Verified provider Display prefixes. Opaque response bodies belong only in logs.
+	...[
+		"provider error: OpenAI connection failed: ",
+		"provider error: Claude connection failed: ",
+		"provider error: DeepL connection failed: ",
+		"provider error: Ollama connection failed: ",
+		"provider error: Argos connection failed: ",
+		"provider error: Google Translate request failed: ",
+	].map(prefix => ({ prefix, key: "api.error.providerConnection" as const, singleLine: true })),
+	...[
+		"provider error: OpenAI malformed response: ",
+		"provider error: Claude malformed response: ",
+		"provider error: Ollama malformed response: ",
+		"provider error: DeepL returned malformed response: ",
+		"provider error: Argos returned malformed response: ",
+		"provider error: Google Translate returned invalid JSON: ",
+		"provider error: could not parse JSON array from response: ",
+	].map(prefix => ({ prefix, key: "api.error.providerMalformedResponse" as const, singleLine: true })),
 	// Recovery guidance replaces opaque paths and CLI instructions; do not interpolate detail.
 	{
 		prefix: 'patch error: no injection has been recorded in "',
@@ -157,7 +186,31 @@ function mapRecoveryDetails(body: string): string | null {
 	return null;
 }
 
+/** Owned provider status/amount/count shapes; never interpolate opaque diagnostics. */
+function mapProviderFailure(body: string): string | null {
+	if (/[\r\n\u2028\u2029]/.test(body)) return null;
+	const exact = SINGLE_LINE_EXACT[body];
+	if (exact) return t(exact);
+
+	// Rust http::StatusCode Display includes the canonical reason phrase.
+	const credentials = /^provider error: (OpenAI|Claude|DeepL) returned status (?:401(?: Unauthorized)?|403(?: Forbidden)?)(?:: .*)?$/.exec(body);
+	if (credentials) return t("api.error.providerCredentialsRejected", { name: credentials[1] });
+	if (/^provider error: (?:OpenAI|Claude|DeepL|Ollama|Google Translate|Argos) returned status 429(?: Too Many Requests)?(?:: .*)?$/.test(body)) {
+		return t("api.error.providerRateLimited");
+	}
+
+	const budget = /^cost limit exceeded: estimated \$([0-9]+(?:\.[0-9]+)?) exceeds limit \$([0-9]+(?:\.[0-9]+)?)$/.exec(body);
+	if (budget) return t("api.error.costLimitExceeded", { estimated: budget[1], limit: budget[2] });
+	if (/^provider error: translation count mismatch: sent [0-9]+ strings, got [0-9]+ back$/.test(body)) {
+		return t("api.error.providerMalformedResponse");
+	}
+	return null;
+}
+
 function mapBody(body: string, originalBody: string): string | null {
+	const provider = mapProviderFailure(originalBody);
+	if (provider) return provider;
+
 	const exact = EXACT[body];
 	if (exact) return t(exact);
 
@@ -166,7 +219,7 @@ function mapBody(body: string, originalBody: string): string | null {
 
 	for (const rule of PREFIXES) {
 		const candidate = rule.singleLine ? originalBody : body;
-		if (rule.singleLine && /[\r\n]/.test(candidate)) continue;
+		if (rule.singleLine && /[\r\n\u2028\u2029]/.test(candidate)) continue;
 		if (candidate.startsWith(rule.prefix)) {
 			if (rule.detail) {
 				const detail = candidate.slice(rule.prefix.length);
@@ -211,6 +264,6 @@ export class ApiError extends Error {
 	constructor(raw: string) {
 		super(localizeApiError(raw));
 		this.name = "ApiError";
-		this.key = EXACT[parseApiError(raw.trim()).body];
+		this.key = SINGLE_LINE_EXACT[raw.replace(/^\d{3}: /, "")] ?? EXACT[parseApiError(raw.trim()).body];
 	}
 }

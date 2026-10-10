@@ -3,6 +3,7 @@
  * progress, toasts, and BottomBar stay live. Reopen must not double-subscribe.
  */
 import { cancelTranslation } from "./api";
+import { localizeApiError } from "./apiError";
 import { t } from "./i18n";
 import {
   formatObservedCost,
@@ -168,7 +169,12 @@ export function attachTranslationJob(opts: {
     },
     onBatchFailed: (e) => {
       if (finished) return;
-      addLog("warning", t("activity.translation.batchFailed"), e.error, "translation");
+      const reason = localizeApiError(e.error);
+      // Unknown diagnostics stay in detail, without repeating them in the summary.
+      const summary = reason === e.error.trim()
+        ? t("activity.translation.batchFailed")
+        : t("activity.translation.batchFailedReason", { error: reason });
+      addLog("warning", summary, e.error, "translation");
     },
     onFailed: (e) => {
       if (finished) return;
@@ -179,9 +185,10 @@ export function attachTranslationJob(opts: {
         finishCancelledJob();
         return;
       }
-      patchSnapshot({ error: e.error, cancelling: false });
+      const reason = localizeApiError(e.error);
+      patchSnapshot({ error: reason, cancelling: false });
       addLog("error", t("activity.translation.failed"), e.error, "translation");
-      addToast("error", t("translate.toast.failed", { error: e.error }));
+      addToast("error", t("translate.toast.failed", { error: reason }));
       endJob();
       discardSnapshotIfModalClosed();
     },
