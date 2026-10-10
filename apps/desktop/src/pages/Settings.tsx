@@ -12,7 +12,7 @@ import {
   getTranslationRuns,
   xaiAuthStart, xaiAuthPoll,
 } from "../lib/api";
-import type { GlossaryEntry, TranslationRun, ProviderInfo, ConfigUpdate } from "../lib/api";
+import type { GlossaryEntry, TranslationRun, ProviderInfo, ConfigUpdate, BackupRestoreReport } from "../lib/api";
 import { applyAppearance, clampTableRowHeight, TABLE_ROW_HEIGHT_MAX, TABLE_ROW_HEIGHT_MIN } from "../lib/appearance";
 import { resolveProviderReadiness } from "../lib/providerReadiness";
 import { settingsQueryState } from "../lib/settingsQueryState";
@@ -987,6 +987,9 @@ function DataSection() {
   const [pendingAction, setPendingAction] = useState<
     { kind: "restore" | "delete"; id: string; game: string; sourcePath: string } | null
   >(null);
+  const [restoreResult, setRestoreResult] = useState<{
+    id: string; restored: number; kept: BackupRestoreReport["kept"];
+  } | null>(null);
 
   const gameLabel = (sourcePath: string) =>
     gameFolderName(sourcePath) || t("settings.data.unknownGame");
@@ -996,9 +999,16 @@ function DataSection() {
     const { kind, id } = pendingAction;
     setPendingAction(null);
     if (kind === "restore") {
+      setRestoreResult(null);
       try {
-        await restoreBackup(id);
-        addToast("success", t("settings.data.toast.restored", { id }));
+        const report = await restoreBackup(id);
+        // Core writes every inventoried file, including those already identical.
+        const restored = report.replaced.length + report.recreated.length + report.identical.length;
+        if (report.kept.length > 0) {
+          setRestoreResult({ id, restored, kept: report.kept });
+        } else {
+          addToast("success", t("settings.data.toast.restored", { id, count: restored }));
+        }
       } catch (e: any) {
         addToast("error", t("settings.data.toast.restoreFailed", { error: e.message }));
       }
@@ -1015,6 +1025,25 @@ function DataSection() {
   return (
     <div className="space-y-6">
       <h2 className="text-page font-bold">{t("settings.data.title")}</h2>
+      {restoreResult && (
+        <div role="alert" className="p-4 border border-warning bg-warning-muted text-warning rounded-xl space-y-2">
+          <p className="font-semibold">
+            {t("settings.data.toast.restored", { id: restoreResult.id, count: restoreResult.restored })}
+          </p>
+          <p>{t("settings.data.restoreKept")}</p>
+          <ul className="space-y-2 text-body">
+            {restoreResult.kept.slice(0, 10).map(({ path, reason }) => (
+              <li key={path}>
+                <div className="font-mono text-caption break-all">{path}</div>
+                <div className="text-caption break-words">{reason}</div>
+              </li>
+            ))}
+          </ul>
+          {restoreResult.kept.length > 10 && (
+            <p className="text-caption">{t("settings.data.restoreKeptMore", { count: restoreResult.kept.length - 10 })}</p>
+          )}
+        </div>
+      )}
       <div>
         <h3 className="text-section font-semibold mb-3">{t("settings.data.backups")}</h3>
         {isPending ? (

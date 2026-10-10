@@ -183,6 +183,17 @@ export interface BackupListing {
   unreadable: { id: string; error: string }[];
 }
 
+/** Serialized core RestorePreview returned after a completed restore. */
+export interface BackupRestoreReport {
+  destination: string;
+  replaced: string[];
+  recreated: string[];
+  identical: string[];
+  removed: string[];
+  removed_directories: string[];
+  kept: { path: string; reason: string }[];
+}
+
 export interface AppConfig {
   /** Protected startup fallback: original configuration could not be read. */
   load_warning?: string;
@@ -703,8 +714,9 @@ export const getBackups = (): Promise<BackupEntry[]> =>
 export const getBackupsReport = (): Promise<BackupListing> =>
   IS_TAURI ? tauriInvoke("get_backups", { report: true }) : request("/backups?report=true");
 
-export const restoreBackup = (id: string) =>
-  request<void>(`/backups/${encodeURIComponent(id)}/restore`, { method: "POST" }).finally(refreshGameState);
+/** Both browser and desktop restore through the HTTP server. */
+export const restoreBackup = (id: string): Promise<BackupRestoreReport> =>
+  request<BackupRestoreReport>(`/backups/${encodeURIComponent(id)}/restore`, { method: "POST" }).finally(refreshGameState);
 
 /** Delete a backup by id (HTTP DELETE — uses baseUrl for Tauri port). */
 export const deleteBackup = (id: string): Promise<void> =>

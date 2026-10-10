@@ -551,7 +551,9 @@ export const en = {
   "settings.data.unknownGame": "Unknown game",
   "settings.data.confirm.deleteTitle": "Delete backup",
   "settings.data.confirm.deleteMessage": "Delete backup {id}?",
-  "settings.data.toast.restored": "Backup {id} restored",
+  "settings.data.toast.restored": "Backup {id} restored. Restored files: {count}.",
+  "settings.data.restoreKept": "Some paths were kept in the game. See the reasons below.",
+  "settings.data.restoreKeptMore": "and {count} more",
   "settings.data.toast.restoreFailed": "Restore failed: {error}",
   "settings.data.toast.deleteFailed": "Delete failed: {error}",
 

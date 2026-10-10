@@ -539,7 +539,9 @@ export const es: Record<keyof typeof en, string> = {
   "settings.data.unknownGame": "Juego desconocido",
   "settings.data.confirm.deleteTitle": "Eliminar copia de seguridad",
   "settings.data.confirm.deleteMessage": "¿Eliminar la copia de seguridad {id}?",
-  "settings.data.toast.restored": "Copia de seguridad {id} restaurada",
+  "settings.data.toast.restored": "Copia de seguridad {id} restaurada. Archivos restaurados: {count}.",
+  "settings.data.restoreKept": "Se conservaron algunas rutas en el juego. Consulte los motivos a continuación.",
+  "settings.data.restoreKeptMore": "y {count} más",
   "settings.data.toast.restoreFailed": "La restauración falló: {error}",
   "settings.data.toast.deleteFailed": "La eliminación falló: {error}",
 
