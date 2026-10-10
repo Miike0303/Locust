@@ -566,6 +566,61 @@ fn committed_owners(
     Ok(owners)
 }
 
+/// Reconcile only completed Direct outputs explicitly retired by backup restore.
+/// A restored marker alone is insufficient: bind it to the saved output and
+/// verify the live pre-injection bytes (or absence for a generated file). Called
+/// under GameLock before Direct creates its backup or recovery metadata.
+pub(crate) fn verified_reverted_direct_files(
+    root: &Path,
+    recording: &crate::database::InjectionRecording,
+) -> Result<BTreeSet<PathBuf>> {
+    let root = root.canonicalize()?;
+    let generations = committed_generations_with(&root, true)?;
+    let owners = committed_owners(&generations)?;
+    let mut latest = BTreeMap::new();
+    for (index, generation) in generations.iter().enumerate() {
+        for change in &generation.plan.files {
+            latest.insert(output_key(&safe_game_rel(&change.path)?), (index, change));
+        }
+    }
+    let mut reverted = BTreeSet::new();
+    for file in &recording.files {
+        let relative = safe_game_rel(&file.rel)?;
+        let key = output_key(&relative);
+        let Some((index, change)) = latest.get(&key) else {
+            continue;
+        };
+        let generation = &generations[*index];
+        if owners.contains_key(&key)
+            || !generation.restored.contains(&key)
+            || change.result.sha256 != file.hash
+            || change.result.size != file.size
+        {
+            continue;
+        }
+        let Some(identity) = committed_identity(&root, generation, None)? else {
+            continue;
+        };
+        if identity.mode != Some(InjectionMode::Direct) || identity.language != recording.lang {
+            continue;
+        }
+        ensure_no_links(&root, &relative)?;
+        let current = root.join(&relative);
+        let matches_original = match &change.original {
+            Some(original) => sha256_file(&current)
+                .is_ok_and(|(hash, size)| hash == original.sha256 && size == original.size),
+            None => matches!(
+                fs::symlink_metadata(&current),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+        };
+        if matches_original {
+            reverted.insert(key);
+        }
+    }
+    Ok(reverted)
+}
+
 /// Prove the entire recording union against current committed ownership, not
 /// status labels. No pristine-backup bytes are needed to resume saved DB rows.
 /// Read-only and lock-free here: advisory callers may race; confirmation must

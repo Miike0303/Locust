@@ -477,9 +477,9 @@ fn prepare_direct_backup(
 ) -> Result<DirectBackupRun> {
     let prior = db.get_injection(languages.first().map(String::as_str))?;
     let merge = match prior {
-        Some(record) if crate::database::paths_identical(&record.root, recording_root) => Some(
-            prepare_same_root_direct_merge(backup_manager, selection, recording_root, &record)?,
-        ),
+        Some(record) if crate::database::paths_identical(&record.root, recording_root) => {
+            prepare_same_root_direct_merge(backup_manager, selection, recording_root, &record)?
+        }
         _ => None,
     };
     // Other projects and no-op recordings can still require older originals.
@@ -501,19 +501,31 @@ fn prepare_same_root_direct_merge(
     selection: &Path,
     recording_root: &Path,
     prior: &crate::database::InjectionRecording,
-) -> Result<DirectPriorMerge> {
+) -> Result<Option<DirectPriorMerge>> {
     refuse_incompatible_direct_scope(selection, prior)?;
+    let reverted =
+        crate::injection_transaction::verified_reverted_direct_files(recording_root, prior)?;
     let mut files = Vec::with_capacity(prior.files.len());
     for recorded in &prior.files {
+        if reverted.contains(&crate::injection_transaction::output_key(Path::new(
+            &recorded.rel,
+        ))) {
+            continue;
+        }
         files.push(verify_recorded_injection_member(recording_root, recorded)?);
+    }
+    // Every saved output was restored. This run's backup becomes the pristine
+    // baseline; do not merge originals into the next output recording.
+    if files.is_empty() {
+        return Ok(None);
     }
     if let Some(provenance) = &prior.pristine_backup {
         validate_recorded_pristine_backup(backup_manager, provenance)?;
     }
-    Ok(DirectPriorMerge {
+    Ok(Some(DirectPriorMerge {
         files,
         provenance: prior.pristine_backup.clone(),
-    })
+    }))
 }
 
 /// A selected file and a leftover folder inventory share the parent
@@ -1560,6 +1572,227 @@ fn copy_dir_for_inject_under_lock(
 
 #[cfg(test)]
 mod tests {
+    // Exercise the locked preparation body without acquiring the OS lock. The
+    // full public injection/restore workflow is covered in direct_after_restore.
+    fn restored_direct_fixture() -> (tempfile::TempDir, Database, BackupManager, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let game = game.canonicalize().unwrap();
+        let file = game.join("one.html");
+        fs::write(&file, b"ONE").unwrap();
+        let manager = BackupManager::new(temp.path().join("backups"));
+        let backup = manager.create_backup(&game).unwrap();
+        let db = Database::open(&temp.path().join("project.db")).unwrap();
+        fs::write(&file, b"Uno").unwrap();
+        db.record_injection_with_backup(
+            Some("es"),
+            &game,
+            std::slice::from_ref(&file),
+            Some(&RecordedBackup {
+                id: backup.id,
+                source_path: backup.source_path,
+                storage_root: Some(manager.root().to_path_buf()),
+            }),
+        )
+        .unwrap();
+        let store = game.join(crate::injection_transaction::STORE_DIR);
+        let id = uuid::Uuid::new_v4().to_string();
+        let operation = store.join("operations").join(&id);
+        fs::create_dir_all(&operation).unwrap();
+        let write = |path: PathBuf, value: serde_json::Value| {
+            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        };
+        write(
+            store.join("store.json"),
+            serde_json::json!({
+                "schema_version": 1, "kind": "locust-injection-store", "game_root": game,
+            }),
+        );
+        write(operation.join("phase.json"), serde_json::json!("completed"));
+        write(
+            operation.join("identity.json"),
+            serde_json::json!({
+                "schema_version": 1, "transaction_id": id, "game_root": game,
+                "mode": "direct", "format": "source-match", "language": "es",
+            }),
+        );
+        let fingerprint = |bytes: &[u8]| {
+            serde_json::json!({
+                "sha256": crate::database::sha256_hex(bytes), "size": bytes.len(),
+                "readonly": false, "unix_mode": null,
+            })
+        };
+        write(
+            operation.join("plan.json"),
+            serde_json::json!({
+                "schema_version": 1, "transaction_id": id, "game_root": game,
+                "prepared_at": chrono::Utc::now(), "created_dirs": [],
+                "files": [{"path": "one.html", "original": fingerprint(b"ONE"),
+                           "result": fingerprint(b"Uno")}],
+            }),
+        );
+        // State produced by BackupManager::restore: originals on disk, a
+        // per-path restored marker, and the old project recording untouched.
+        fs::write(&file, b"ONE").unwrap();
+        write(
+            operation.join("restored.json"),
+            serde_json::json!(["one.html"]),
+        );
+        (temp, db, manager, game)
+    }
+
+    #[test]
+    fn direct_restore_preparation_accepts_verified_original_as_new_baseline() {
+        let (_temp, db, manager, game) = restored_direct_fixture();
+        let before = db.get_injection(Some("es")).unwrap();
+        let run = prepare_direct_backup(&db, &manager, &game, &game, &["es".into()])
+            .unwrap_or_else(|error| panic!("verified restored original must be accepted: {error}"));
+        assert!(
+            run.prior.is_none(),
+            "fully reverted inventory starts a new baseline"
+        );
+        assert_eq!(
+            fs::read(run.entry.path.join("payload/one.html")).unwrap(),
+            b"ONE"
+        );
+        assert_eq!(db.get_injection(Some("es")).unwrap(), before);
+    }
+
+    #[test]
+    fn direct_restore_preparation_still_rejects_drift() {
+        let (_temp, db, manager, game) = restored_direct_fixture();
+        fs::write(game.join("one.html"), b"drift").unwrap();
+        let error = match prepare_direct_backup(&db, &manager, &game, &game, &["es".into()]) {
+            Ok(_) => panic!("restore history must not authorize new drift"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("no longer matches its recorded hash/size"),
+            "{error}"
+        );
+        assert_eq!(manager.list_backups().unwrap().len(), 1);
+    }
+
+    fn restored_operation(game: &Path) -> PathBuf {
+        fs::read_dir(
+            game.join(crate::injection_transaction::STORE_DIR)
+                .join("operations"),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+    }
+
+    #[test]
+    fn direct_restore_preparation_requires_matching_completed_direct_history() {
+        for variant in [
+            "no-restore",
+            "wrong-output",
+            "wrong-language",
+            "add",
+            "aborted",
+            "unknown",
+        ] {
+            let (_temp, db, manager, game) = restored_direct_fixture();
+            let operation = restored_operation(&game);
+            match variant {
+                "no-restore" => fs::remove_file(operation.join("restored.json")).unwrap(),
+                "aborted" => fs::write(operation.join("phase.json"), b"\"aborted\"").unwrap(),
+                "unknown" => fs::remove_file(operation.join("identity.json")).unwrap(),
+                "wrong-output" => {
+                    let path = operation.join("plan.json");
+                    let mut plan: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    plan["files"][0]["result"]["size"] = 99.into();
+                    fs::write(path, serde_json::to_vec(&plan).unwrap()).unwrap();
+                }
+                _ => {
+                    let path = operation.join("identity.json");
+                    let mut identity: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    if variant == "add" {
+                        identity["mode"] = "add".into();
+                    } else {
+                        identity["language"] = "fr".into();
+                    }
+                    fs::write(path, serde_json::to_vec(&identity).unwrap()).unwrap();
+                }
+            }
+            let error = match prepare_direct_backup(&db, &manager, &game, &game, &["es".into()]) {
+                Ok(_) => panic!("{variant} must not authorize restored bytes"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("no longer matches its recorded hash/size"),
+                "{variant}: {error}"
+            );
+            assert_eq!(manager.list_backups().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn direct_restore_preparation_checks_remaining_members_after_partial_restore() {
+        for drift in [false, true] {
+            let (_temp, db, manager, game) = restored_direct_fixture();
+            let prior = db.get_injection(Some("es")).unwrap().unwrap();
+            let second = game.join("two.html");
+            fs::write(&second, b"Dos").unwrap();
+            // Record both injected outputs, then put the verified first original
+            // back. Only the first member appears in restored.json.
+            fs::write(game.join("one.html"), b"Uno").unwrap();
+            db.record_injection_with_backup(
+                Some("es"),
+                &game,
+                &[game.join("one.html"), second.clone()],
+                prior.pristine_backup.as_ref(),
+            )
+            .unwrap();
+            fs::write(game.join("one.html"), b"ONE").unwrap();
+            if drift {
+                fs::write(&second, b"drift").unwrap();
+            }
+            let result = prepare_direct_backup(&db, &manager, &game, &game, &["es".into()]);
+            if drift {
+                let error = match result {
+                    Ok(_) => panic!("unrestored drift must still refuse"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    error.contains("previously injected file \"two.html\" no longer matches"),
+                    "{error}"
+                );
+                assert_eq!(manager.list_backups().unwrap().len(), 1);
+            } else {
+                let run = result.unwrap();
+                let merge = run
+                    .prior
+                    .expect("still-applied member retains the original baseline");
+                assert_eq!(merge.files, vec![second]);
+                assert_eq!(merge.provenance, prior.pristine_backup);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_restore_preparation_accepts_only_verified_removal_of_created_output() {
+        let (_temp, db, manager, game) = restored_direct_fixture();
+        let path = restored_operation(&game).join("plan.json");
+        let mut plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        plan["files"][0]["original"] = serde_json::Value::Null;
+        fs::write(path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        // The path was created by injection, so restore must have removed it.
+        // An unrelated file occupying that path is still drift.
+        let result = prepare_direct_backup(&db, &manager, &game, &game, &["es".into()]);
+        assert!(result.is_err());
+        fs::remove_file(game.join("one.html")).unwrap();
+        let run = prepare_direct_backup(&db, &manager, &game, &game, &["es".into()]).unwrap();
+        assert!(run.prior.is_none());
+    }
+
     fn reference_path_union(written: &[PathBuf], prior: &[PathBuf]) -> Vec<PathBuf> {
         let mut files = written.to_vec();
         for path in prior {
