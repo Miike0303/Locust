@@ -1589,6 +1589,24 @@ fn cmd_extract(
     Ok(())
 }
 
+fn cli_translation_options(
+    provider_id: &str,
+    configured_batch_size: Option<usize>,
+    batch_size: Option<usize>,
+    concurrency: Option<usize>,
+    max_batch_tokens: Option<usize>,
+) -> TranslationOptions {
+    let defaults = TranslationOptions::defaults_for_provider(provider_id);
+    TranslationOptions {
+        batch_size: batch_size
+            .or(configured_batch_size)
+            .unwrap_or(defaults.batch_size),
+        max_concurrent: concurrency.unwrap_or(defaults.max_concurrent),
+        max_batch_tokens: max_batch_tokens.or(defaults.max_batch_tokens),
+        ..defaults
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_translate(
     config: AppConfig,
@@ -1609,40 +1627,20 @@ async fn cmd_translate(
     let provider_reg = locust_providers::default_registry(&config);
     let glossary = Arc::new(Glossary::new(db.clone()));
 
-    // Measured with Grok 4.6: smaller batches avoid long reasoning deadlines.
-    // Explicit flags always take precedence; other providers retain their defaults.
-    let grok = matches!(provider_id.as_str(), "grok" | "grok-sub");
-    // Antigravity measured ~19s for 5 strings vs ~22s for 100: amortize each call.
-    let antigravity = provider_id == "antigravity";
     let opts = TranslationOptions {
         source_lang: source,
         target_lang: target,
-        batch_size: batch_size.unwrap_or(if antigravity {
-            100
-        } else if grok {
-            10
-        } else {
-            40
-        }),
-        max_concurrent: concurrency.unwrap_or(if grok {
-            10
-        } else if antigravity {
-            4
-        } else {
-            TranslationOptions::default().max_concurrent
-        }),
-        // The generic 6k token estimate would split a 100-line batch near 40
-        // entries; Antigravity also enforces its own exact prompt/argument cap.
-        max_batch_tokens: max_batch_tokens.or(if antigravity {
-            Some(20_000)
-        } else {
-            TranslationOptions::default().max_batch_tokens
-        }),
         use_memory: !no_memory,
         allow_lossy_binary_fit,
         cost_limit_usd: cost_limit,
         game_context: context,
-        ..Default::default()
+        ..cli_translation_options(
+            &provider_id,
+            config.default_batch_size,
+            batch_size,
+            concurrency,
+            max_batch_tokens,
+        )
     };
 
     // Primary then fallbacks — shared chain in locust_core (same as HTTP server).
@@ -2601,6 +2599,90 @@ mod tests {
     use super::*;
     use locust_core::models::StringStatus;
     use std::fs;
+
+    #[test]
+    fn provider_translation_defaults_cli_settings_and_partial_flags() {
+        let configured = cli_translation_options("google", Some(40), None, None, None);
+        assert_eq!(
+            (
+                configured.batch_size,
+                configured.max_concurrent,
+                configured.max_batch_tokens
+            ),
+            (40, 4, Some(40_000))
+        );
+        let explicit = cli_translation_options("google", Some(40), Some(7), None, None);
+        assert_eq!(
+            (
+                explicit.batch_size,
+                explicit.max_concurrent,
+                explicit.max_batch_tokens
+            ),
+            (7, 4, Some(40_000))
+        );
+        let tokens = cli_translation_options("google", None, None, None, Some(900));
+        assert_eq!(
+            (
+                tokens.batch_size,
+                tokens.max_concurrent,
+                tokens.max_batch_tokens
+            ),
+            (200, 4, Some(900))
+        );
+    }
+
+    #[test]
+    fn provider_translation_defaults_cli_flags() {
+        for (provider, expected) in [
+            ("google", (200, 4, Some(40_000))),
+            ("antigravity", (100, 4, Some(20_000))),
+            ("grok", (10, 10, Some(6000))),
+            ("grok-sub", (10, 10, Some(6000))),
+            ("ollama", (40, 1, Some(6000))),
+        ] {
+            for flags in [
+                vec![],
+                vec![
+                    "--batch-size",
+                    "7",
+                    "--concurrency",
+                    "2",
+                    "--max-batch-tokens",
+                    "900",
+                ],
+            ] {
+                let mut args = vec!["locust", "translate", "project.db", "--provider", provider];
+                args.extend(&flags);
+                let cli = Cli::try_parse_from(args).unwrap();
+                let Commands::Translate {
+                    provider,
+                    batch_size,
+                    concurrency,
+                    max_batch_tokens,
+                    ..
+                } = cli.command
+                else {
+                    panic!("expected translate")
+                };
+                let opts = cli_translation_options(
+                    &provider,
+                    None,
+                    batch_size,
+                    concurrency,
+                    max_batch_tokens,
+                );
+                assert_eq!(
+                    (opts.batch_size, opts.max_concurrent, opts.max_batch_tokens),
+                    if flags.is_empty() {
+                        expected
+                    } else {
+                        (7, 2, Some(900))
+                    },
+                    "{provider}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn translation_error_summary_ranks_counts_and_limits_to_five() {

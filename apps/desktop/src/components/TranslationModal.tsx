@@ -92,8 +92,8 @@ export default function TranslationModal({
 		readTranslationFallbacks(),
 	);
 	const [fallbackPick, setFallbackPick] = useState("");
-	const [batchSize, setBatchSize] = useState(40);
-	const [maxConcurrent, setMaxConcurrent] = useState(1);
+	const [batchSize, setBatchSize] = useState<number | undefined>(undefined);
+	const [maxConcurrent, setMaxConcurrent] = useState<number | undefined>(undefined);
 	const [costLimit, setCostLimit] = useState("");
 	const [gameContext, setGameContext] = useState("");
 	const [useGlossary, setUseGlossary] = useState(true);
@@ -189,7 +189,9 @@ export default function TranslationModal({
 		const chainLabel = [providerId, ...fallbackIds].join(" → ");
 		addLog(
 			"info",
-			t("activity.translation.starting", { chain: chainLabel, source: sourceLang, target: targetLang, count: batchSize }),
+			batchSize === undefined
+				? t("activity.translation.startingDefault", { chain: chainLabel, source: sourceLang, target: targetLang })
+				: t("activity.translation.starting", { chain: chainLabel, source: sourceLang, target: targetLang, count: batchSize }),
 			undefined,
 			"translation",
 		);
@@ -519,10 +521,10 @@ export default function TranslationModal({
 								<label className="text-body font-medium">{t("translate.batchSize")}</label>
 								<input
 									type="number"
-									value={batchSize}
-									onChange={(e) => setBatchSize(+e.target.value)}
+									value={batchSize ?? ""}
+									placeholder={t("common.providerDefault")}
+									onChange={(e) => setBatchSize(e.target.value ? +e.target.value : undefined)}
 									min={1}
-									max={100}
 									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								/>
 							</div>
@@ -534,10 +536,11 @@ export default function TranslationModal({
 									{t("translate.parallelRequests")}
 								</label>
 								<select
-									value={maxConcurrent}
-									onChange={(e) => setMaxConcurrent(+e.target.value)}
+									value={maxConcurrent ?? ""}
+									onChange={(e) => setMaxConcurrent(e.target.value ? +e.target.value : undefined)}
 									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								>
+									<option value="">{t("common.providerDefault")}</option>
 									{Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
 										<option key={n} value={n}>
 											{n}

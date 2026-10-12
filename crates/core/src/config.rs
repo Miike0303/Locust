@@ -16,8 +16,9 @@ pub struct AppConfig {
     pub default_source_lang: String,
     #[serde(default = "default_target_lang")]
     pub default_target_lang: String,
-    #[serde(default = "default_batch_size")]
-    pub default_batch_size: usize,
+    /// None selects provider tuning; non-legacy numeric settings remain explicit.
+    #[serde(default, deserialize_with = "deserialize_default_batch_size")]
+    pub default_batch_size: Option<usize>,
     #[serde(default)]
     pub default_cost_limit: Option<f64>,
     #[serde(default)]
@@ -32,8 +33,15 @@ fn default_source_lang() -> String {
 fn default_target_lang() -> String {
     "en".to_string()
 }
-fn default_batch_size() -> usize {
-    40
+
+fn deserialize_default_batch_size<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Older configs always saved the factory default 40, even without a user choice.
+    Ok(Option::<usize>::deserialize(deserializer)?.filter(|&batch| batch != 40))
 }
 
 impl Default for AppConfig {
@@ -43,7 +51,7 @@ impl Default for AppConfig {
             default_provider: None,
             default_source_lang: "ja".to_string(),
             default_target_lang: "en".to_string(),
-            default_batch_size: 40,
+            default_batch_size: None,
             default_cost_limit: None,
             ui: UiConfig::default(),
             recent_projects: Vec::new(),
@@ -326,6 +334,46 @@ impl PartialEq for AppConfig {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_translation_defaults_migrate_legacy_batch_size() {
+        let directory = tempdir();
+        let path = directory.path().join("config.json");
+        for saved in [
+            serde_json::json!({}),
+            serde_json::json!({"default_batch_size": null}),
+            serde_json::json!({"default_batch_size": 40}),
+        ] {
+            let deserialized: AppConfig = serde_json::from_value(saved.clone()).unwrap();
+            assert_eq!(deserialized.default_batch_size, None);
+            std::fs::write(&path, saved.to_string()).unwrap();
+            let loaded = AppConfig::load(&path).unwrap();
+            assert_eq!(loaded.default_batch_size, None);
+            loaded.save(&path).unwrap();
+            let resaved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(resaved["default_batch_size"].is_null());
+            assert_eq!(AppConfig::load(&path).unwrap().default_batch_size, None);
+        }
+    }
+
+    #[test]
+    fn provider_translation_defaults_preserve_explicit_batch_settings() {
+        let directory = tempdir();
+        let path = directory.path().join("config.json");
+        for batch in [10, 39, 41, 200] {
+            let config: AppConfig =
+                serde_json::from_value(serde_json::json!({"default_batch_size": batch})).unwrap();
+            assert_eq!(config.default_batch_size, Some(batch));
+            config.save(&path).unwrap();
+            let loaded = AppConfig::load(&path).unwrap();
+            assert_eq!(loaded.default_batch_size, Some(batch));
+            assert_eq!(
+                serde_json::to_value(loaded).unwrap()["default_batch_size"],
+                batch
+            );
+        }
+    }
+
     fn tempdir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("locust_cfg_")
@@ -404,7 +452,7 @@ mod tests {
             });
             for count in 1..20 {
                 AppConfig {
-                    default_batch_size: count,
+                    default_batch_size: Some(count),
                     ..Default::default()
                 }
                 .save(&path)
@@ -420,7 +468,7 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.default_source_lang, "ja");
         assert_eq!(cfg.default_target_lang, "en");
-        assert_eq!(cfg.default_batch_size, 40);
+        assert_eq!(cfg.default_batch_size, None);
         assert!(cfg.default_provider.is_none());
         assert_eq!(cfg.ui.theme, "system");
         assert_eq!(cfg.ui.font_size, 14);
@@ -433,13 +481,13 @@ mod tests {
         let path = tmp.join("config.json");
         let cfg = AppConfig {
             default_source_lang: "ko".to_string(),
-            default_batch_size: 20,
+            default_batch_size: Some(20),
             ..Default::default()
         };
         cfg.save(&path).unwrap();
         let loaded = AppConfig::load(&path).unwrap();
         assert_eq!(loaded.default_source_lang, "ko");
-        assert_eq!(loaded.default_batch_size, 20);
+        assert_eq!(loaded.default_batch_size, Some(20));
         assert_eq!(cfg, loaded);
     }
 

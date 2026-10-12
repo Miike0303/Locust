@@ -20,12 +20,14 @@ export interface TranslationDefaultsConfig {
   default_provider?: string | null;
   default_source_lang?: string;
   default_target_lang?: string;
-  default_batch_size?: number;
+  default_batch_size?: number | null;
   default_cost_limit?: number | null;
 }
 
 /** Last-used values persisted in localStorage (all optional; legacy entries only carry source/target). */
 export interface LastUsedTranslationPrefs {
+  /** New saves distinguish deliberate 40/3 choices from legacy factory defaults. */
+  tuningVersion?: 1;
   provider?: string;
   source?: string;
   target?: string;
@@ -41,8 +43,8 @@ export interface TranslationDefaults {
   providerId: string;
   sourceLang: string;
   targetLang: string;
-  batchSize: number;
-  maxConcurrent: number;
+  batchSize: number | undefined;
+  maxConcurrent: number | undefined;
   /** Raw input value; "" = no limit. */
   costLimit: string;
 }
@@ -54,6 +56,17 @@ function nonEmpty(value: unknown): string | null {
 function validBatch(value: unknown): number | null {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return null;
   return Math.floor(value);
+}
+
+function migrateLegacyTuning(prefs: LastUsedTranslationPrefs): LastUsedTranslationPrefs {
+  if (prefs.tuningVersion === 1) return prefs;
+  // Both dialogs saved factory batch 40 / concurrency 3 on every start, even untouched.
+  return {
+    ...prefs,
+    batchSize: prefs.batchSize === 40 ? undefined : prefs.batchSize,
+    maxConcurrent: prefs.maxConcurrent === 3 ? undefined : prefs.maxConcurrent,
+    tuningVersion: 1,
+  };
 }
 
 /** What the open project says about its languages. */
@@ -110,6 +123,7 @@ export function resolveTranslationDefaults(
   lastUsed?: LastUsedTranslationPrefs | null,
   project?: ProjectLanguageContext | null,
 ): TranslationDefaults {
+  const tuning = migrateLegacyTuning(lastUsed ?? {});
   const costLimit =
     typeof lastUsed?.costLimit === "string"
       ? lastUsed.costLimit
@@ -130,10 +144,11 @@ export function resolveTranslationDefaults(
     targetLang: detected
       ? targetDifferentFrom(sourceLang, preferredTarget, project?.uiLocale)
       : preferredTarget,
-    batchSize: validBatch(lastUsed?.batchSize) ?? validBatch(config?.default_batch_size) ?? 40,
-    // Translate dialog historically defaulted to 1; queue used 3. Prefer last-used, else 3
-    // so batch runs keep the documented escape hatch for large projects.
-    maxConcurrent: validBatch(lastUsed?.maxConcurrent) ?? 3,
+    batchSize: validBatch(tuning.batchSize)
+      ?? validBatch(config?.default_batch_size === 40 ? undefined : config?.default_batch_size)
+      ?? undefined,
+    // Leave automatic tuning to core so changing providers uses its defaults.
+    maxConcurrent: validBatch(tuning.maxConcurrent) ?? undefined,
     costLimit,
   };
 }
@@ -144,8 +159,8 @@ export type TranslationStartForm = {
   fallbackIds: string[];
   sourceLang: string;
   targetLang: string;
-  batchSize: number;
-  maxConcurrent: number;
+  batchSize: number | undefined;
+  maxConcurrent: number | undefined;
   /** Raw; empty string → null cost limit. */
   costLimit: string;
   gameContext: string;
@@ -157,8 +172,8 @@ export function buildTranslationStartParams(form: TranslationStartForm): {
   options: {
     source_lang: string;
     target_lang: string;
-    batch_size: number;
-    max_concurrent: number;
+    batch_size?: number;
+    max_concurrent?: number;
     cost_limit_usd: number | null;
     game_context: string | null;
     use_glossary: boolean;
@@ -171,8 +186,8 @@ export function buildTranslationStartParams(form: TranslationStartForm): {
   if (cost_limit_usd !== null && (!Number.isFinite(cost_limit_usd) || cost_limit_usd < 0)) {
     throw new Error("cost limit must be finite and non-negative");
   }
-  const max_concurrent = Math.max(1, validBatch(form.maxConcurrent) ?? 1);
-  const batch_size = Math.max(1, validBatch(form.batchSize) ?? 40);
+  const max_concurrent = validBatch(form.maxConcurrent);
+  const batch_size = validBatch(form.batchSize);
   const fallbacks = form.fallbackIds.filter(
     (id) => typeof id === "string" && id.length > 0 && id !== form.providerId,
   );
@@ -182,8 +197,8 @@ export function buildTranslationStartParams(form: TranslationStartForm): {
     options: {
       source_lang: form.sourceLang,
       target_lang: form.targetLang,
-      batch_size,
-      max_concurrent,
+      ...(batch_size !== null ? { batch_size } : {}),
+      ...(max_concurrent !== null ? { max_concurrent } : {}),
       cost_limit_usd,
       game_context: form.gameContext.trim() || null,
       use_glossary: true,
@@ -250,7 +265,7 @@ export function saveTranslationFallbacks(ids: string[]): void {
 export function readLastUsedTranslationPrefs(): LastUsedTranslationPrefs {
   try {
     const v = JSON.parse(localStorage.getItem(TRANSLATION_PREFS_KEY) || "{}");
-    return v && typeof v === "object" ? (v as LastUsedTranslationPrefs) : {};
+    return v && typeof v === "object" ? migrateLegacyTuning(v as LastUsedTranslationPrefs) : {};
   } catch {
     return {};
   }
@@ -260,7 +275,7 @@ export function saveLastUsedTranslationPrefs(prefs: LastUsedTranslationPrefs): v
   try {
     localStorage.setItem(
       TRANSLATION_PREFS_KEY,
-      JSON.stringify({ ...readLastUsedTranslationPrefs(), ...prefs })
+      JSON.stringify({ ...readLastUsedTranslationPrefs(), ...prefs, tuningVersion: 1 })
     );
   } catch {
     /* best effort */

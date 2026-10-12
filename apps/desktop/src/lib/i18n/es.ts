@@ -2,6 +2,8 @@ import type { en } from "./en";
 
 /** Spanish UI catalog. Missing keys are a compile error. Neutral professional Spanish. */
 export const es: Record<keyof typeof en, string> = {
+  "common.providerDefault": "Predeterminado del proveedor",
+  "activity.translation.startingDefault": "Iniciando traducción con la cadena de proveedores: {chain}, origen: {source}, destino: {target}, lote: predeterminado",
   // Activity-log messages. Raw detail and source remain diagnostic data.
   "activity.project.detectFailed": "No se pudo detectar automáticamente el motor del juego",
   "activity.project.openFailed": "No se pudo abrir el proyecto",

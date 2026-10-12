@@ -671,7 +671,7 @@ function DefaultsSection() {
         <BufferedSetting label={t("settings.defaults.targetLang")} value={config.default_target_lang} required normalize={value => value.trim()} onSave={value => save("default_target_lang", value)} />
       </div>
       <p className="text-caption text-text-muted -mt-2">{t("settings.defaults.langHint")}</p>
-      <BufferedSetting label={value => t("settings.defaults.batchSize", { size: value })} type="range" min={10} max={100} value={config.default_batch_size} onSave={value => save("default_batch_size", Number(value))} />
+      <BufferedSetting label={value => t("settings.defaults.batchSize", { size: value || t("common.providerDefault") })} type="number" min={1} value={config.default_batch_size ?? ""} placeholder={t("common.providerDefault")} onSave={value => save("default_batch_size", value ? Number(value) : null)} />
       <BufferedSetting label={t("settings.defaults.costLimit")} type="number" min={0} step={0.01} value={config.default_cost_limit ?? ""} placeholder={t("settings.defaults.noLimit")} onSave={value => save("default_cost_limit", value ? Number(value) : null)} />
     </div>
   );

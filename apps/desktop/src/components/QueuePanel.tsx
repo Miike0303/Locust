@@ -426,10 +426,10 @@ export default function QueuePanel() {
 									<label className={settingsLabelClass}>{t("queue.batchSize")}</label>
 									<input
 										type="number"
-										value={batchSize}
-										onChange={(e) => setBatchSize(+e.target.value)}
+										value={batchSize ?? ""}
+										placeholder={t("common.providerDefault")}
+										onChange={(e) => setBatchSize(e.target.value ? +e.target.value : undefined)}
 										min={1}
-										max={100}
 										className={settingsInputClass}
 									/>
 								</div>
@@ -437,8 +437,9 @@ export default function QueuePanel() {
 									<label className={settingsLabelClass}>{t("queue.maxConcurrent")}</label>
 									<input
 										type="number"
-										value={maxConcurrent}
-										onChange={(e) => setMaxConcurrent(+e.target.value)}
+										value={maxConcurrent ?? ""}
+										placeholder={t("common.providerDefault")}
+										onChange={(e) => setMaxConcurrent(e.target.value ? +e.target.value : undefined)}
 										min={1}
 										max={16}
 										className={settingsInputClass}

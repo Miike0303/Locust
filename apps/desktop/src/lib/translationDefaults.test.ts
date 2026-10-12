@@ -5,7 +5,10 @@ import assert from "node:assert/strict";
 import {
   buildTranslationStartParams,
   coerceProviderId,
+  readLastUsedTranslationPrefs,
   resolveTranslationDefaults,
+  saveLastUsedTranslationPrefs,
+  TRANSLATION_PREFS_KEY,
 } from "./translationDefaults.ts";
 
 // No config, no last-used → sane fallbacks
@@ -13,16 +16,16 @@ assert.deepEqual(resolveTranslationDefaults(undefined, undefined), {
   providerId: "",
   sourceLang: "auto",
   targetLang: "es",
-  batchSize: 40,
-  maxConcurrent: 3,
+  batchSize: undefined,
+  maxConcurrent: undefined,
   costLimit: "",
 });
 assert.deepEqual(resolveTranslationDefaults(null, null), {
   providerId: "",
   sourceLang: "auto",
   targetLang: "es",
-  batchSize: 40,
-  maxConcurrent: 3,
+  batchSize: undefined,
+  maxConcurrent: undefined,
   costLimit: "",
 });
 
@@ -43,7 +46,7 @@ assert.deepEqual(
     sourceLang: "ja",
     targetLang: "en",
     batchSize: 25,
-    maxConcurrent: 3,
+    maxConcurrent: undefined,
     costLimit: "1.5",
   }
 );
@@ -65,7 +68,7 @@ assert.deepEqual(
     sourceLang: "auto",
     targetLang: "es",
     batchSize: 25,
-    maxConcurrent: 3,
+    maxConcurrent: undefined,
     costLimit: "",
   }
 );
@@ -116,7 +119,7 @@ assert.deepEqual(
     sourceLang: "ja",
     targetLang: "pt-BR",
     batchSize: 25,
-    maxConcurrent: 3,
+    maxConcurrent: undefined,
     costLimit: "1.5",
   }
 );
@@ -143,7 +146,7 @@ assert.equal(
 );
 assert.equal(
   resolveTranslationDefaults({ default_batch_size: Number.NaN }, { batchSize: Number.NaN }).batchSize,
-  40
+  undefined
 );
 assert.equal(
   resolveTranslationDefaults(undefined, { batchSize: 12.9 }).batchSize,
@@ -160,8 +163,8 @@ assert.deepEqual(
     providerId: "deepl",
     sourceLang: "ja",
     targetLang: "en",
-    batchSize: 40,
-    maxConcurrent: 3,
+    batchSize: undefined,
+    maxConcurrent: undefined,
     costLimit: "",
   }
 );
@@ -185,7 +188,7 @@ assert.deepEqual(
   assert.equal(p.options.game_context, "VN");
   assert.equal(p.options.batch_size, 20);
 }
-// empty cost / zero concurrency clamps
+// Empty cost stays unlimited; invalid tuning falls back to provider defaults.
 {
   const p = buildTranslationStartParams({
     providerId: "mock",
@@ -198,9 +201,9 @@ assert.deepEqual(
     gameContext: "",
   });
   assert.equal(p.fallback_provider_ids, undefined);
-  assert.equal(p.options.max_concurrent, 1);
+  assert.equal(p.options.max_concurrent, undefined);
   assert.equal(p.options.cost_limit_usd, null);
-  assert.equal(p.options.batch_size, 40);
+  assert.equal(p.options.batch_size, undefined);
   assert.equal(p.options.game_context, null);
 }
 // Negative: hardcoding max_concurrent:3 with null cost must not be the only path
@@ -276,3 +279,73 @@ assert.equal(resolveTranslationDefaults(factory, { target: "fr" }, { detectedSou
 // Without detection nothing changes.
 assert.deepEqual(resolveTranslationDefaults(factory, undefined, { detectedSource: null, uiLocale: "es" }),
   resolveTranslationDefaults(factory, undefined));
+
+// Automatic tuning is resolved in core, including after changing providers.
+for (const providerId of ["google", "antigravity", "grok", "grok-sub", "ollama"]) {
+  const defaults = resolveTranslationDefaults({ default_batch_size: null });
+  const p = buildTranslationStartParams({ ...defaults, providerId, fallbackIds: [], gameContext: "" });
+  assert.equal(Object.prototype.hasOwnProperty.call(p.options, "batch_size"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(p.options, "max_concurrent"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(p.options, "max_batch_tokens"), false);
+  const saved = resolveTranslationDefaults({ default_batch_size: 41 }, { maxConcurrent: 1 });
+  const explicit = buildTranslationStartParams({ ...saved, providerId, fallbackIds: [], gameContext: "" });
+  assert.equal(explicit.options.batch_size, 41);
+  assert.equal(explicit.options.max_concurrent, 1);
+}
+
+// Old config and last-used defaults were persisted even without editing the inputs.
+assert.equal(resolveTranslationDefaults({ default_batch_size: 40 }).batchSize, undefined);
+assert.equal(resolveTranslationDefaults(undefined, { batchSize: 40 }).batchSize, undefined);
+assert.equal(resolveTranslationDefaults(undefined, { maxConcurrent: 3 }).maxConcurrent, undefined);
+assert.equal(resolveTranslationDefaults({ default_batch_size: 200 }, { batchSize: 40 }).batchSize, 200);
+for (const batchSize of [39, 41, 200]) {
+  assert.equal(resolveTranslationDefaults({ default_batch_size: batchSize }).batchSize, batchSize);
+  assert.equal(resolveTranslationDefaults(undefined, { batchSize }).batchSize, batchSize);
+}
+for (const maxConcurrent of [1, 2, 4, 10]) {
+  assert.equal(resolveTranslationDefaults(undefined, { maxConcurrent }).maxConcurrent, maxConcurrent);
+}
+
+// Both dialogs share this storage key. Re-saving migrates old tuning but keeps
+// unrelated preferences, and newly chosen 40/3 remain explicit on the next run.
+const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+const storedPrefs = new Map<string, string>();
+Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
+  getItem: (key: string) => storedPrefs.get(key) ?? null,
+  setItem: (key: string, value: string) => { storedPrefs.set(key, value); },
+} });
+try {
+  const selection = { provider: "google", source: "ja", target: "es", costLimit: "2" };
+  storedPrefs.set(TRANSLATION_PREFS_KEY, JSON.stringify({ ...selection, batchSize: 40, maxConcurrent: 3 }));
+  const migrated = readLastUsedTranslationPrefs();
+  assert.equal(migrated.batchSize, undefined);
+  assert.equal(migrated.maxConcurrent, undefined);
+  const defaults = resolveTranslationDefaults({ default_batch_size: 40 }, migrated);
+  const params = buildTranslationStartParams({ ...defaults, fallbackIds: [], gameContext: "" });
+  assert.equal(Object.prototype.hasOwnProperty.call(params.options, "batch_size"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(params.options, "max_concurrent"), false);
+  saveLastUsedTranslationPrefs({ target: "fr" });
+  const resaved = JSON.parse(storedPrefs.get(TRANSLATION_PREFS_KEY)!);
+  assert.equal(Object.prototype.hasOwnProperty.call(resaved, "batchSize"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(resaved, "maxConcurrent"), false);
+  for (const [key, value] of Object.entries({ ...selection, target: "fr" })) {
+    assert.equal(resaved[key], value);
+  }
+  saveLastUsedTranslationPrefs({ batchSize: 40, maxConcurrent: 3 });
+  const explicit = resolveTranslationDefaults(undefined, readLastUsedTranslationPrefs());
+  assert.equal(explicit.batchSize, 40);
+  assert.equal(explicit.maxConcurrent, 3);
+  const explicitParams = buildTranslationStartParams({ ...explicit, fallbackIds: [], gameContext: "" });
+  assert.equal(explicitParams.options.batch_size, 40);
+  assert.equal(explicitParams.options.max_concurrent, 3);
+  for (const batchSize of [39, 41, 200]) {
+    storedPrefs.set(TRANSLATION_PREFS_KEY, JSON.stringify({ batchSize, maxConcurrent: 2 }));
+    saveLastUsedTranslationPrefs({ target: "es" });
+    const kept = readLastUsedTranslationPrefs();
+    assert.equal(kept.batchSize, batchSize);
+    assert.equal(kept.maxConcurrent, 2);
+  }
+} finally {
+  if (storageDescriptor) Object.defineProperty(globalThis, "localStorage", storageDescriptor);
+  else Reflect.deleteProperty(globalThis, "localStorage");
+}

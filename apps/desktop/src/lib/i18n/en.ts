@@ -1,5 +1,7 @@
 /** English UI catalog. Keys are dotted namespaces. Keep in sync with es.ts. */
 export const en = {
+  "common.providerDefault": "Provider default",
+  "activity.translation.startingDefault": "Starting translation with chain: {chain}, source: {source}, target: {target}, batch: default",
   // Activity-log messages. Raw detail and source remain diagnostic data.
   "activity.project.detectFailed": "Could not auto-detect game engine",
   "activity.project.openFailed": "Failed to open project",

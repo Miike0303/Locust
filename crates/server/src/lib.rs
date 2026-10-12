@@ -36,7 +36,7 @@ use locust_core::glossary::Glossary;
 use locust_core::models::{OutputMode, ProgressEvent, StringEntry, StringStatus};
 use locust_core::project::{self, ProjectOpenOutcome};
 use locust_core::translation::{
-    run_fallback_chain, unique_provider_chain, ProviderRegistry, TranslationOptions,
+    run_fallback_chain, unique_provider_chain, ProviderRegistry, TranslationOptionsRequest,
 };
 use locust_core::validation::Validator;
 
@@ -1153,7 +1153,7 @@ struct TranslateStartRequest {
     /// Optional ordered fallbacks after the primary (same chain rules as CLI `--fallback`).
     #[serde(default)]
     fallback_provider_ids: Option<Vec<String>>,
-    options: TranslationOptions,
+    options: TranslationOptionsRequest,
 }
 
 #[derive(Serialize)]
@@ -1166,12 +1166,15 @@ pub async fn spawn_translation_job(
     state: &AppState,
     provider_id: String,
     fallback_provider_ids: Option<Vec<String>>,
-    options: TranslationOptions,
+    options: impl Into<TranslationOptionsRequest>,
 ) -> std::result::Result<String, String> {
     let exclusive = try_project_operation(state)?;
     if state.current_project.read().await.is_none() {
         return Err("no project open".into());
     }
+    let options = options
+        .into()
+        .resolve(&provider_id, state.config.read().await.default_batch_size);
     let reg = state.provider_registry.read().await;
     if reg.get(&provider_id).is_none() {
         return Err("provider not found".into());
@@ -3145,6 +3148,7 @@ mod test_server;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use locust_core::translation::TranslationOptions;
 
     fn registration_fixture(root: &Path) -> Vec<(&'static str, Vec<u8>)> {
         let map = serde_json::json!({"events": [null, {"pages": [{"list": [
@@ -5389,6 +5393,65 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body.get("job_id").is_some());
+    }
+
+    #[test]
+    fn provider_translation_defaults_wire_options() {
+        for (provider, expected) in [
+            ("google", (200, 4, Some(40_000))),
+            ("antigravity", (100, 4, Some(20_000))),
+            ("grok", (10, 10, Some(6000))),
+            ("grok-sub", (10, 10, Some(6000))),
+            ("mock", (40, 1, Some(6000))),
+        ] {
+            for explicit in [false, true] {
+                let mut options = serde_json::json!({
+                    "source_lang": "ja", "target_lang": "en",
+                    "use_glossary": false, "use_memory": false, "skip_approved": true
+                });
+                if explicit {
+                    options["batch_size"] = 7.into();
+                    options["max_concurrent"] = 2.into();
+                    options["max_batch_tokens"] = 900.into();
+                }
+                let params: TranslateStartRequest = serde_json::from_value(
+                    serde_json::json!({"provider_id": provider, "options": options}),
+                )
+                .unwrap();
+                let resolved = params.options.resolve(&params.provider_id, None);
+                assert_eq!(
+                    (
+                        resolved.batch_size,
+                        resolved.max_concurrent,
+                        resolved.max_batch_tokens
+                    ),
+                    if explicit {
+                        (7, 2, Some(900))
+                    } else {
+                        expected
+                    },
+                    "{provider}"
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn provider_translation_defaults_accept_omitted_request_fields() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let response = client()
+            .post(format!("{url}/api/translate/start"))
+            .json(&serde_json::json!({
+                "provider_id": "mock",
+                "options": {
+                    "source_lang": "ja", "target_lang": "en",
+                    "use_glossary": true, "use_memory": true, "skip_approved": true
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
     }
 
     #[tokio::test]

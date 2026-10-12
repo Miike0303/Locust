@@ -8,7 +8,7 @@ use locust_core::database::{EntryFilter, GlossaryEntry, PivotResult, ProjectStat
 use locust_core::extraction::PluginInfo;
 use locust_core::models::{OutputMode, StringEntry, StringStatus};
 use locust_core::project;
-use locust_core::translation::TranslationOptions;
+use locust_core::translation::TranslationOptionsRequest;
 use locust_core::validation::Validator;
 use locust_server::{
     cancel_translation_job, poll_xai_device_login, remember_open_project,
@@ -435,7 +435,7 @@ pub struct TranslateParams {
     pub provider_id: String,
     #[serde(default)]
     pub fallback_provider_ids: Option<Vec<String>>,
-    pub options: TranslationOptions,
+    pub options: TranslationOptionsRequest,
 }
 
 #[tauri::command]
@@ -1135,6 +1135,58 @@ mod tests {
         .unwrap();
         assert_eq!(params.provider_id, "always-error");
         assert_eq!(params.fallback_provider_ids, Some(vec!["mock".to_string()]));
+    }
+
+    #[test]
+    fn provider_translation_defaults_wire_options() {
+        for (provider, expected) in [
+            ("google", (200, 4, Some(40_000))),
+            ("antigravity", (100, 4, Some(20_000))),
+            ("grok", (10, 10, Some(6000))),
+            ("grok-sub", (10, 10, Some(6000))),
+            ("mock", (40, 1, Some(6000))),
+        ] {
+            for explicit in [false, true] {
+                let mut options = serde_json::json!({
+                    "source_lang": "ja", "target_lang": "en",
+                    "use_glossary": false, "use_memory": false, "skip_approved": true
+                });
+                if explicit {
+                    options["batch_size"] = 7.into();
+                    options["max_concurrent"] = 2.into();
+                    options["max_batch_tokens"] = 900.into();
+                }
+                let params: TranslateParams = serde_json::from_value(
+                    serde_json::json!({"provider_id": provider, "options": options}),
+                )
+                .unwrap();
+                let resolved = params.options.resolve(&params.provider_id, None);
+                assert_eq!(
+                    (
+                        resolved.batch_size,
+                        resolved.max_concurrent,
+                        resolved.max_batch_tokens
+                    ),
+                    if explicit {
+                        (7, 2, Some(900))
+                    } else {
+                        expected
+                    },
+                    "{provider}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn provider_translation_defaults_accept_omitted_command_fields() {
+        let params = serde_json::from_value::<TranslateParams>(serde_json::json!({
+            "provider_id": "google",
+            "options": {
+                "source_lang": "ja", "target_lang": "en",
+                "use_glossary": true, "use_memory": true, "skip_approved": true
+            }
+        }));
+        assert!(params.is_ok(), "{}", params.err().unwrap());
     }
 
     #[tokio::test]

@@ -202,7 +202,7 @@ export interface AppConfig {
   default_provider: string | null;
   default_source_lang: string;
   default_target_lang: string;
-  default_batch_size: number;
+  default_batch_size: number | null;
   default_cost_limit: number | null;
   ui: { theme: string; font_size: number; show_source_column: boolean; table_row_height: number };
   recent_projects: {
@@ -220,8 +220,8 @@ export interface TranslationStartParams {
   /** Ordered fallbacks after the primary (optional; same chain rules as CLI --fallback). */
   fallback_provider_ids?: string[];
   options: {
-    source_lang: string; target_lang: string; batch_size: number;
-    max_concurrent: number; cost_limit_usd: number | null;
+    source_lang: string; target_lang: string; batch_size?: number;
+    max_concurrent?: number; max_batch_tokens?: number | null; cost_limit_usd: number | null;
     game_context: string | null; use_glossary: boolean;
     use_memory: boolean; skip_approved: boolean;
   };
