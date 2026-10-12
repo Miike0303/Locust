@@ -790,13 +790,11 @@ fn renpy_replace_records_the_copy_and_preserves_the_original() {
 
 #[test]
 fn legacy_database_on_an_already_injected_entry_tree_game_gets_a_restore_first_remedy() {
-    // The shipped pipeline reaches this state: an older Locust injected the
-    // tree (byte-patching the ORIGINAL .wolf files) and kept only the legacy
-    // recording table, which the migration drops on the next open. `patch`
-    // then advises `--direct` — but the byte-scan injector needs the ORIGINAL
-    // source bytes, finds nothing in the already-translated tree, writes 0
-    // files, and records nothing: the identical error forever unless the
-    // advice carries the restore-first note.
+    // Losing a recording (including legacy-table migration) used to make
+    // Direct scan already-translated bytes and report success with no writes.
+    // When transaction history survives, refuse before dispatch and explain
+    // how to restore the original tree. Patch's advice must also cover older
+    // games without transaction history, where that scan cannot be prevented.
     let base_guard = base_dir();
     let base = base_guard.path().to_path_buf();
     let (game, db_path) = wolf_game_project(&base);
@@ -852,9 +850,12 @@ fn legacy_database_on_an_already_injected_entry_tree_game_gets_a_restore_first_r
         "the advice must explain the already-injected dead end and its way out: {stderr}"
     );
 
-    // Prove the loop the note breaks: the bare --direct re-run writes 0
-    // files and records nothing, and patch stays blocked.
+    // Surviving Direct history must prevent the zero-write success loop.
+    let before = fs::read(game.join("Data/BasicData.wolf")).unwrap();
+    let active = fs::read(game.join(".locust-injections/active.json")).unwrap();
+    let refused_backups = base.join("refused-backups");
     let rerun = locust()
+        .env("LOCUST_BACKUP_ROOT", &refused_backups)
         .arg("inject")
         .arg(&game)
         .arg("-P")
@@ -862,12 +863,21 @@ fn legacy_database_on_an_already_injected_entry_tree_game_gets_a_restore_first_r
         .arg("--direct")
         .args(["-l", "es"])
         .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&rerun.get_output().stdout).into_owned();
+        .failure();
+    let stderr = stderr_of(rerun);
     assert!(
-        stdout.contains("0 files written") && stdout.contains("nothing was recorded"),
-        "the zero-write run must say nothing was recorded: {stdout}"
+        stderr.contains("Direct re-injection refused")
+            && stderr.contains("recording")
+            && stderr.contains("restore-backup")
+            && stderr.contains("pristine game copy"),
+        "{stderr}"
     );
+    assert_eq!(fs::read(game.join("Data/BasicData.wolf")).unwrap(), before);
+    assert_eq!(
+        fs::read(game.join(".locust-injections/active.json")).unwrap(),
+        active
+    );
+    assert_eq!(fs::read_dir(refused_backups).unwrap().count(), 0);
     locust()
         .arg("patch")
         .arg(&game)

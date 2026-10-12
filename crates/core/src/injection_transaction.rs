@@ -670,6 +670,64 @@ fn committed_owners(
     Ok(owners)
 }
 
+/// Called under GameLock after validating the project's same-root recording,
+/// before any new backup or transaction. A fresh/replaced DB cannot authorize
+/// replay just because its row IDs or physical sources match: recovery plans
+/// retain each run's pre-write bytes, not the pristine-backup provenance needed
+/// by inject_revision. Never adopt an already translated tree as a new baseline.
+pub(crate) fn refuse_unrecorded_direct_outputs(
+    selection: &Path,
+    recording: Option<&crate::database::InjectionRecording>,
+) -> Result<()> {
+    let root = root_for(selection)?;
+    let generations = committed_generations_with(&root, true)?;
+    let owners = committed_owners(&generations)?;
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let active = load(&root)?;
+    let identities = generations
+        .iter()
+        .map(|generation| committed_identity(&root, generation, active.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+    let recorded: BTreeMap<_, _> = recording
+        .filter(|record| {
+            crate::database::paths_identical(&record.root, &root)
+                && record.pristine_backup.is_some()
+        })
+        .into_iter()
+        .flat_map(|record| &record.files)
+        .map(|file| Ok((output_key(&safe_game_rel(&file.rel)?), file)))
+        .collect::<Result<_>>()?;
+    let selected_file = selection
+        .is_file()
+        .then(|| output_key(Path::new(selection.file_name().unwrap())));
+    for (key, (index, change)) in owners {
+        if selected_file.as_ref().is_some_and(|file| file != &key) {
+            continue;
+        }
+        // Known Add outputs retain their existing flow. Legacy unknown-mode
+        // evidence cannot prove that the selected tree is safe for a fresh DB.
+        if identities[index].as_ref().and_then(|id| id.mode) == Some(InjectionMode::Add) {
+            continue;
+        }
+        if recorded.get(&key).is_some_and(|file| {
+            file.hash == change.result.sha256 && file.size == change.result.size
+        }) {
+            continue;
+        }
+        return Err(error(format!(
+            "Direct re-injection refused: previously injected file {:?} has no matching \
+             recording with pristine-backup provenance in this project. To revise in place, \
+             use the project DB that recorded this injection; otherwise restore the original \
+             backup first (locust backups, then locust restore-backup <id>), or inject into a \
+             fresh pristine game copy. No new output has been installed.",
+            change.path,
+        )));
+    }
+    Ok(())
+}
+
 /// Reconcile only completed Direct outputs explicitly retired by backup restore.
 /// A restored marker alone is insufficient: bind it to the saved output and
 /// verify the live pre-injection bytes (or absence for a generated file). Called

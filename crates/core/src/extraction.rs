@@ -475,13 +475,16 @@ fn prepare_direct_backup(
     recording_root: &Path,
     languages: &[String],
 ) -> Result<DirectBackupRun> {
-    let prior = db.get_injection(languages.first().map(String::as_str))?;
-    let merge = match prior {
-        Some(record) if crate::database::paths_identical(&record.root, recording_root) => {
-            prepare_same_root_direct_merge(backup_manager, selection, recording_root, &record)?
+    let prior = db
+        .get_injection(languages.first().map(String::as_str))?
+        .filter(|record| crate::database::paths_identical(&record.root, recording_root));
+    let merge = match &prior {
+        Some(record) => {
+            prepare_same_root_direct_merge(backup_manager, selection, recording_root, record)?
         }
-        _ => None,
+        None => None,
     };
+    crate::injection_transaction::refuse_unrecorded_direct_outputs(selection, prior.as_ref())?;
     // Other projects and no-op recordings can still require older originals.
     // Automatic global pruning cannot establish that they are unreferenced.
     let entry = backup_manager.create_backup(selection).map_err(|e| {
