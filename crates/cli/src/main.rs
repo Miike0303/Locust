@@ -1612,16 +1612,32 @@ async fn cmd_translate(
     // Measured with Grok 4.6: smaller batches avoid long reasoning deadlines.
     // Explicit flags always take precedence; other providers retain their defaults.
     let grok = matches!(provider_id.as_str(), "grok" | "grok-sub");
+    // Antigravity measured ~19s for 5 strings vs ~22s for 100: amortize each call.
+    let antigravity = provider_id == "antigravity";
     let opts = TranslationOptions {
         source_lang: source,
         target_lang: target,
-        batch_size: batch_size.unwrap_or(if grok { 10 } else { 40 }),
+        batch_size: batch_size.unwrap_or(if antigravity {
+            100
+        } else if grok {
+            10
+        } else {
+            40
+        }),
         max_concurrent: concurrency.unwrap_or(if grok {
             10
+        } else if antigravity {
+            4
         } else {
             TranslationOptions::default().max_concurrent
         }),
-        max_batch_tokens: max_batch_tokens.or(TranslationOptions::default().max_batch_tokens),
+        // The generic 6k token estimate would split a 100-line batch near 40
+        // entries; Antigravity also enforces its own exact prompt/argument cap.
+        max_batch_tokens: max_batch_tokens.or(if antigravity {
+            Some(20_000)
+        } else {
+            TranslationOptions::default().max_batch_tokens
+        }),
         use_memory: !no_memory,
         allow_lossy_binary_fit,
         cost_limit_usd: cost_limit,

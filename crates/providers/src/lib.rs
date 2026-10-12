@@ -1,3 +1,4 @@
+pub mod antigravity;
 pub mod argos;
 pub mod claude;
 pub mod deepl;
@@ -189,11 +190,29 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
         reg.register(Arc::new(xai_oauth::GrokSubscriptionProvider::new(model)));
     }
 
+    // The CLI owns subscription login; discovery never spawns it or reads tokens.
+    let antigravity_config = config.get_provider_config("antigravity");
+    if antigravity::find_executable(antigravity_config).is_some() {
+        reg.register(Arc::new(antigravity::AntigravityProvider::new(
+            antigravity_config,
+        )));
+    }
+
     // Any other config entry with a base_url is treated as a custom
     // OpenAI-compatible endpoint (vLLM, OpenRouter, self-hosted, ...).
-    const KNOWN_IDS: [&str; 11] = [
-        "google", "argos", "deepl", "openai", "claude", "lmstudio", "ollama", "deepseek", "grok",
-        "gemini", "grok-sub",
+    const KNOWN_IDS: [&str; 12] = [
+        "google",
+        "argos",
+        "deepl",
+        "openai",
+        "claude",
+        "lmstudio",
+        "ollama",
+        "deepseek",
+        "grok",
+        "gemini",
+        "grok-sub",
+        "antigravity",
     ];
     for (id, pc) in &config.providers {
         if KNOWN_IDS.contains(&id.as_str()) {

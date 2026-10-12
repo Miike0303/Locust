@@ -686,6 +686,7 @@ pub fn default_requests_per_minute(provider_id: &str) -> u32 {
         // Free translate.googleapis.com endpoint — conservative to avoid blocks.
         "google" => 8,
         "deepl" => 120,
+        "antigravity" => 60,
         "openai" | "claude" | "grok" | "grok-sub" | "deepseek" | "gemini" => 90,
         _ => 60,
     }
@@ -805,6 +806,11 @@ impl TranslationManager {
         // game-dialogue batches. Cancellation remains immediate and bounded.
         if matches!(provider.id(), "grok" | "grok-sub") {
             retry.overall_deadline = Some(Duration::from_secs(180));
+        }
+        // Antigravity bounds each subprocess itself (300s by default) and may
+        // split malformed batches. Keep cancellation, without a shorter outer cap.
+        if provider.id() == "antigravity" {
+            retry.overall_deadline = None;
         }
         Self {
             provider,
@@ -2425,6 +2431,39 @@ mod tests {
             requests_per_minute_for("google", Some(&extra)),
             default_requests_per_minute("google")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn antigravity_allows_slow_cli_calls_but_remains_cancellable() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let provider = Arc::new(LimitProvider::new("antigravity", "Antigravity", 1));
+        let mut manager =
+            TranslationManager::new(provider, db.clone(), Arc::new(Glossary::new(db)));
+        assert_eq!(default_requests_per_minute("antigravity"), 60);
+        let start = Instant::now();
+        with_retry(&manager.retry, || async {
+            tokio::time::sleep(Duration::from_secs(75)).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(start.elapsed(), Duration::from_secs(75));
+
+        let cancel = CancellationToken::new();
+        manager.retry.cancel = Some(cancel.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            cancel.cancel();
+        });
+        let start = Instant::now();
+        let error = with_retry(&manager.retry, || async {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
     }
 
     #[tokio::test(start_paused = true)]
