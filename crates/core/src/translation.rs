@@ -1425,6 +1425,8 @@ impl TranslationManager {
             let mut memory_events = Vec::new();
             for (entry, hash) in translatable.drain(..).zip(hashes) {
                 if let Some(cached) = memory.get(&hash) {
+                    // Memory written before the cap existed may hold stretched text.
+                    let cached = &collapse_runaway_letters(&entry.source, cached);
                     if !translation_fits_entry(&entry, cached) {
                         remaining.push(entry);
                         continue;
@@ -4399,6 +4401,49 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(saved.translation.as_deref(), Some("\\n<Old man>¡Haaaaa!"));
+    }
+
+    #[tokio::test]
+    async fn stretched_memory_hits_are_saved_capped() {
+        let (db, glossary) = setup();
+        let entry = StringEntry::new("m1", "あぁぁぁぁ！", PathBuf::from("data/Map001.json"));
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        // A memory row written by an older build, before the cap existed.
+        db.save_memory(
+            &entry.source_hash(),
+            &entry.source,
+            &format!("A{}h!", "a".repeat(30)),
+            "ja-en",
+        )
+        .await
+        .unwrap();
+        let manager = TranslationManager::new(Arc::new(StretchingProvider), db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            source_lang: "ja".into(),
+            target_lang: "en".into(),
+            use_memory: true,
+            use_glossary: false,
+            ..Default::default()
+        };
+        manager
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-mem".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(saved.provider_used.as_deref(), Some("memory"));
+        assert_eq!(saved.translation.as_deref(), Some("Aaaaah!"));
     }
 
     /// Captures request context keyed by entry id (for binary-slot budget tests).
