@@ -2403,10 +2403,11 @@ for(var i = 2; ; i++) {
     use super::*;
     use std::fs;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_krkr_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_krkr_")
+            .tempdir()
+            .unwrap()
     }
 
     fn sample_script() -> &'static str {
@@ -2448,7 +2449,8 @@ This is narration.\r\n\
 
     #[test]
     fn vn01_lossless_encodings_and_separators() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("story.ks");
         let original = "Hello.\n;comment\rGoodbye.\r\nAnother.\r";
         let expected = format!("AUDIT {original}");
@@ -2546,7 +2548,8 @@ This is narration.\r\n\
             .unwrap();
         assert_eq!(written, 1);
         assert_eq!(after, [b"AUDIT ".as_slice(), &bytes].concat());
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("story.ks");
         write_mode2_ks(&path, "Hello.\rGoodbye.\n");
         let mut bytes = fs::read(&path).unwrap();
@@ -2630,7 +2633,8 @@ This is narration.\r\n\
 
     #[test]
     fn vn01_existing_xp3_retention_and_precedence() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data =
             kirikiri_xp3::write_xp3(&[("story.ks".into(), b"Old base.\n".to_vec())]).unwrap();
         let patch = kirikiri_xp3::write_xp3(&[
@@ -2692,7 +2696,8 @@ This is narration.\r\n\
 
     #[test]
     fn vn01_encrypted_existing_patch_preserved_with_new_overlay() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(
             dir.join("data.xp3"),
             kirikiri_xp3::write_xp3(&[("story.ks".into(), b"Hello.\n".to_vec())]).unwrap(),
@@ -2765,21 +2770,24 @@ This is narration.\r\n\
 
     #[test]
     fn test_detect_ks_dir() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_utf16le_ks(&dir.join("scenario.ks"), sample_script());
         assert!(KirikiriPlugin::new().detect(&dir));
     }
 
     #[test]
     fn test_detect_xp3_only_still_true() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("data.xp3"), b"XP3\r\n").unwrap();
         assert!(KirikiriPlugin::new().detect(&dir));
     }
 
     #[test]
     fn test_detect_non_krkr() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("readme.txt"), b"nope").unwrap();
         assert!(!KirikiriPlugin::new().detect(&dir));
     }
@@ -2851,7 +2859,8 @@ This is narration.\r\n\
 
     #[test]
     fn test_extract_utf16le_filters_and_ids() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_utf16le_ks(&dir.join("scenario.ks"), sample_script());
         let plugin = KirikiriPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -2883,14 +2892,16 @@ This is narration.\r\n\
 
     #[test]
     fn test_inject_roundtrip_utf16le() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_utf16le_ks(&dir.join("scenario.ks"), sample_script());
         roundtrip_translate(&dir, "Hola, mundo!");
     }
 
     #[test]
     fn test_inject_roundtrip_sjis() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         // ASCII-only SJIS is fine and avoids unmappable glyphs in the fixture.
         write_sjis_ks(&dir.join("scenario.ks"), sample_script());
         roundtrip_translate(&dir, "Hola, mundo!");
@@ -2898,7 +2909,8 @@ This is narration.\r\n\
 
     #[test]
     fn test_inject_roundtrip_mode1() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_mode1_ks(&dir.join("scenario.ks"), sample_script());
         // Confirm cipher still present after inject
         roundtrip_translate(&dir, "Hola, mundo!");
@@ -2908,7 +2920,8 @@ This is narration.\r\n\
 
     #[test]
     fn test_inject_roundtrip_mode2() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_mode2_ks(&dir.join("scenario.ks"), sample_script());
         roundtrip_translate(&dir, "Hola, mundo!");
         let bytes = fs::read(dir.join("scenario.ks")).unwrap();
@@ -2946,7 +2959,8 @@ This is narration.\r\n\
 
     #[test]
     fn test_mode2_extract_dialogue() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_mode2_ks(&dir.join("scenario.ks"), sample_script());
         let plugin = KirikiriPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -2969,7 +2983,8 @@ This is narration.\r\n\
 
     #[test]
     fn test_mode2_bad_zlib_errors_naming_file() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("bad.ks");
         // Valid header + sizes claiming a short zlib blob of garbage
         let mut bytes = vec![0xFE, 0xFE, 0x02, 0xFF, 0xFE];
@@ -2991,7 +3006,8 @@ This is narration.\r\n\
 
     #[test]
     fn test_xp3_malformed_extract_errors_naming_file() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("data.xp3"), b"XP3\r\n").unwrap();
         let err = KirikiriPlugin::new().extract(&dir).unwrap_err().to_string();
         assert!(
@@ -3056,7 +3072,8 @@ This is narration.\r\n\
         // A cxdec archive outranks the plaintext dump but decodes to control
         // soup. Ranking before decoding used to pick it and drop the only
         // readable copy, leaving the game with almost nothing extracted.
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let cipher: String = (0..400)
             .map(|i| if i % 3 == 0 { '\u{3}' } else { 'j' })
             .collect();
@@ -3083,7 +3100,8 @@ This is narration.\r\n\
 
     #[test]
     fn test_extract_prefers_patch_over_data_and_unencrypted() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let script = "; comment\n*start\nHello from DATA\n";
         let script_patch = "; comment\n*start\nHello from PATCH2\n";
         let mut ks_data = vec![0xFF, 0xFE];
@@ -3123,7 +3141,8 @@ This is narration.\r\n\
 
     #[test]
     fn test_xp3_e2e_extract_and_patch_inject() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         // Build UTF-16LE .ks payload and pack into data.xp3
         let mut ks = vec![0xFF, 0xFE];
         ks.extend_from_slice(&utf16le_bytes_from_str(sample_script()));
@@ -3177,7 +3196,8 @@ This is narration.\r\n\
 
     #[test]
     fn test_xp3_garbage_ks_skipped_not_crash() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         // Mode-2 cipher header: existing decoder rejects (not plausible text / unsupported).
         let garbage = vec![0xFE, 0xFE, 0x02, 0xFF, 0xFE, 0x00, 0x00];
         let arch = crate::kirikiri_xp3::write_xp3(&[("foo.ks".into(), garbage)]).unwrap();
@@ -3204,7 +3224,8 @@ This is narration.\r\n\
     fn xp3_lookup_is_linear() {
         const FILLER: usize = 400;
         const SCRIPTS: usize = 100;
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(FILLER + SCRIPTS);
         for i in 0..FILLER {
             files.push((format!("img/{i:04}.png"), vec![0, 1, 2, 3]));
@@ -3290,7 +3311,8 @@ This is narration.\r\n\
 
     #[test]
     fn detect_xp3_skips_ks_walk() {
-        let xp3_dir = tempdir();
+        let xp3_dir_guard = tempdir();
+        let xp3_dir = xp3_dir_guard.path().to_path_buf();
         fs::write(xp3_dir.join("game.xp3"), b"XP3\r\n").unwrap();
         fs::create_dir_all(xp3_dir.join("nested").join("deeper")).unwrap();
         fs::write(xp3_dir.join("nested").join("deeper").join("note.txt"), b"x").unwrap();
@@ -3304,7 +3326,8 @@ This is narration.\r\n\
             "a top-level xp3 must not walk the tree for .ks files"
         );
 
-        let ks_dir = tempdir();
+        let ks_dir_guard = tempdir();
+        let ks_dir = ks_dir_guard.path().to_path_buf();
         write_utf16le_ks(&ks_dir.join("scenario.ks"), sample_script());
         FIND_KS_FILES_CALLS.with(|c| c.set(Some(0)));
         assert!(KirikiriPlugin::new().detect(&ks_dir));

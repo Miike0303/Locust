@@ -1209,15 +1209,16 @@ mod tests {
         assert_eq!(resp.status, XaiAuthStatus::Pending);
     }
 
-    fn write_tauri_locust_db(rows: &[StringEntry]) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "locust_opendb_tauri_{}.locust.db",
-            uuid::Uuid::new_v4()
-        ));
+    fn write_tauri_locust_db(rows: &[StringEntry]) -> (tempfile::TempDir, PathBuf) {
+        let path_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_tauri_")
+            .tempdir()
+            .unwrap();
+        let path = path_guard.path().join("fixture.locust.db");
         let db = locust_core::database::Database::open(&path).unwrap();
         db.save_entries(rows).unwrap();
         drop(db);
-        path
+        (path_guard, path)
     }
 
     fn translated_entry(id: &str, source: &str, translation: &str) -> StringEntry {
@@ -1285,8 +1286,11 @@ mod tests {
 
     #[tokio::test]
     async fn export_preserves_database_and_sidecars() {
-        let dir = std::env::temp_dir().join(format!("locust_export_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_export_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let project = dir.join("project.locust.db");
         let state = locust_server::create_test_state_with_db(&project);
         *state.current_project.write().await = Some(ProjectInfo::default());
@@ -1331,8 +1335,11 @@ mod tests {
 
     #[tokio::test]
     async fn export_allows_confirmed_catalog_replacement() {
-        let dir = std::env::temp_dir().join(format!("locust_export_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_export_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let project = dir.join("project.locust.db");
         let state = locust_server::create_test_state_with_db(&project);
         *state.current_project.write().await = Some(ProjectInfo::default());
@@ -1370,7 +1377,11 @@ mod tests {
             .save_entries(&[translated_entry("leftover", "Hello", "Hola")])
             .unwrap();
         let before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
-        let input = std::env::temp_dir().join(format!("locust_import_{}", uuid::Uuid::new_v4()));
+        let input_guard = tempfile::Builder::new()
+            .prefix("locust_import_")
+            .tempdir()
+            .unwrap();
+        let input = input_guard.path().join("catalog");
         let po = "msgctxt \"leftover\"\nmsgid \"Hello\"\nmsgstr \"Wrong\"\n";
         let xliff = r#"<xliff version="1.2"><file><body><trans-unit id="leftover"><source>Hello</source><target>Wrong</target></trans-unit></body></file></xliff>"#;
 
@@ -1403,8 +1414,11 @@ mod tests {
             .unwrap();
         let before = serde_json::to_value(state.db.get_entry("leftover").unwrap()).unwrap();
         let recordings_before = state.db.list_recorded_langs().unwrap();
-        let game = std::env::temp_dir().join(format!("locust_inject_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&game).unwrap();
+        let game_guard = tempfile::Builder::new()
+            .prefix("locust_inject_")
+            .tempdir()
+            .unwrap();
+        let game = game_guard.path().to_path_buf();
         let file = game.join("story.html");
         let original = b"<p>Hello</p>";
         std::fs::write(&file, original).unwrap();
@@ -1472,8 +1486,11 @@ mod tests {
 
     #[tokio::test]
     async fn open_project_db_switches_without_extract_or_touching_source() {
-        let dir = std::env::temp_dir().join(format!("locust_opendb_t_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_t_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let source_path = dir.join("source.locust.db");
         {
             let src = locust_core::database::Database::open(&source_path).unwrap();
@@ -1561,10 +1578,11 @@ mod tests {
             .save_entries(&[translated_entry("keep", "Hello", "Hola")])
             .unwrap();
 
-        let other = std::env::temp_dir().join(format!(
-            "locust_opendb_tauri_bad_{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let other_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_tauri_bad_")
+            .tempdir()
+            .unwrap();
+        let other = other_guard.path().join("fixture.db");
         std::fs::write(&other, b"not-a-sqlite-database").unwrap();
 
         let err = apply_open_project_db(
@@ -1659,7 +1677,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_project_db_rejects_unknown_format() {
-        let db_path = write_tauri_locust_db(&[translated_entry("a", "Hello", "Hola")]);
+        let (_db_path_guard, db_path) =
+            write_tauri_locust_db(&[translated_entry("a", "Hello", "Hola")]);
         let state = locust_server::create_test_state();
         *state.current_project.write().await = Some(ProjectInfo {
             path: PathBuf::from("/tmp/original-game"),
@@ -1686,9 +1705,12 @@ mod tests {
 
     #[tokio::test]
     async fn prefer_saved_open_skips_extract_after_source_change() {
-        let game =
-            std::env::temp_dir().join(format!("locust_prefer_saved_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&game).unwrap();
+        let game_guard = tempfile::Builder::new()
+            .prefix("locust_prefer_saved_")
+            .tempdir()
+            .unwrap();
+        let game = game_guard.path().join("game");
+        std::fs::create_dir(&game).unwrap();
         std::fs::write(game.join("story.html"), "<p>Hello</p>").unwrap();
         let state = locust_server::create_test_state();
         let first = apply_open_project(

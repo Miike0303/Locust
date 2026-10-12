@@ -547,8 +547,11 @@ mod tests {
 
     #[test]
     fn stream_to_file_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("locust_stream_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_stream_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let dest = dir.join("out.bin");
         let data = vec![0xABu8; 100_000];
         let mut cur = Cursor::new(data.as_slice());

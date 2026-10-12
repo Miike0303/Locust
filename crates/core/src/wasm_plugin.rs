@@ -305,16 +305,18 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_wasm_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_wasm_")
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
     fn test_scan_plugin_dir_finds_wasm() {
         // Without actual WASM files, this just tests the scanning logic
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         // Create a dummy .wasm file (invalid, but tests the scanning)
         fs::write(dir.join("test.wasm"), b"not a real wasm").unwrap();
 
@@ -335,7 +337,8 @@ mod tests {
 
     #[test]
     fn test_scan_plugin_dir_skips_invalid() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         // Create files with wrong extensions
         fs::write(dir.join("readme.txt"), "not a plugin").unwrap();
         fs::write(dir.join("data.json"), "{}").unwrap();
@@ -357,7 +360,8 @@ mod tests {
 
     #[test]
     fn test_scan_empty_dir() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         #[cfg(feature = "wasm-plugins")]
         {
             let result = scan_plugin_dir(&dir).unwrap();

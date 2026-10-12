@@ -141,7 +141,11 @@ fn build_rpa(files: &[(&str, &[u8])]) -> Vec<u8> {
 
 #[test]
 fn test_loose_rpy_translation_survives_inject_alongside_rpa() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_mixed_{}", uuid::Uuid::new_v4()));
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_mixed_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
     let game_dir = dir.join("game");
     fs::create_dir_all(&game_dir).unwrap();
 
@@ -233,7 +237,11 @@ fn test_loose_rpy_translation_survives_inject_alongside_rpa() {
 /// written.
 #[test]
 fn test_colliding_filename_loose_translation_survives_and_report_reconciles() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_collide_{}", uuid::Uuid::new_v4()));
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_collide_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
     let game_dir = dir.join("game");
     fs::create_dir_all(&game_dir).unwrap();
 
@@ -324,7 +332,11 @@ fn test_colliding_filename_loose_translation_survives_and_report_reconciles() {
 /// translation never reaches disk.
 #[test]
 fn test_archive_member_in_subdirectory_does_not_collide_with_same_basename_loose_file() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_subdir_{}", uuid::Uuid::new_v4()));
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_subdir_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
     let game_dir = dir.join("game");
     fs::create_dir_all(&game_dir).unwrap();
 
@@ -394,7 +406,11 @@ fn test_archive_member_in_subdirectory_does_not_collide_with_same_basename_loose
 /// found.
 #[test]
 fn test_stale_line_number_counted_as_skipped_not_written() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_stale_{}", uuid::Uuid::new_v4()));
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_stale_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
     let game_dir = dir.join("game");
     fs::create_dir_all(&game_dir).unwrap();
 
@@ -441,7 +457,11 @@ fn test_stale_line_number_counted_as_skipped_not_written() {
 /// rpyc-filter and RPA partitions, so all three agree.
 #[test]
 fn test_loose_identity_translation_is_skipped_and_file_untouched() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_ident_{}", uuid::Uuid::new_v4()));
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_ident_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
     let game_dir = dir.join("game");
     fs::create_dir_all(&game_dir).unwrap();
 
@@ -498,7 +518,11 @@ fn test_loose_identity_translation_is_skipped_and_file_untouched() {
 /// `exists()` is true but `remove_file` cannot delete it, on every platform.
 #[test]
 fn test_stale_filter_removal_warning_reaches_caller_in_mixed_batch() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_warn_{}", uuid::Uuid::new_v4()));
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_warn_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
     let game_dir = dir.join("game");
     fs::create_dir_all(&game_dir).unwrap();
 
@@ -643,7 +667,11 @@ fn test_fixture_index_opcode_set_matches_real_archive() {
 /// carrying the .rpa as its file_path.
 #[test]
 fn test_real_shape_152_member_archive_extracts_every_member() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_scale_{}", uuid::Uuid::new_v4()));
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_scale_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
     let game_dir = dir.join("game");
     fs::create_dir_all(&game_dir).unwrap();
 
@@ -711,8 +739,11 @@ fn wrap_index_pickle(pickle: &[u8], body: &[u8]) -> Vec<u8> {
 /// hard error of its own that names the offending opcode.
 #[test]
 fn test_index_with_zero_members_is_a_loud_error_not_empty_success() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_empty_{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(&dir).unwrap();
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_empty_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
 
     let pickle: Vec<u8> = vec![0x80, 0x02, 0x7d, 0x2e]; // PROTO 2 · EMPTY_DICT · STOP
     let rpa_path = dir.join("scripts.rpa");
@@ -746,8 +777,11 @@ fn test_index_with_zero_members_is_a_loud_error_not_empty_success() {
 /// opcode, missing arm) that caused the original field failure.
 #[test]
 fn test_unknown_argumented_opcode_after_harvested_members_is_a_hard_error() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_derail_{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(&dir).unwrap();
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_derail_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
 
     let header_len = format!("RPA-3.0 {:016x} {:08x}\n", 0u64, 0u32).len();
     let member_a = b"label a:\n    e \"From member a.\"\n";
@@ -833,8 +867,11 @@ fn test_unknown_argumented_opcode_after_harvested_members_is_a_hard_error() {
 /// every exit path.
 #[test]
 fn test_failing_archive_extraction_leaks_no_temp_directory() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_leak_{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(&dir).unwrap();
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_leak_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
 
     // Memberless index: parses cleanly to zero members, so extraction errors
     // AFTER the temp dir has been created — the exact leaking path.
@@ -912,8 +949,11 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
 /// because it is also the symptom of a harvester regression.
 #[test]
 fn test_script_members_without_harvestable_strings_warn_instead_of_silence() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_nostr_{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(&dir).unwrap();
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_nostr_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
 
     let script = b"# configuration only, nothing translatable\n$ flag = True\n";
     let rpa_path = dir.join("scripts.rpa");
@@ -949,8 +989,11 @@ fn test_script_members_without_harvestable_strings_warn_instead_of_silence() {
 /// considers may arm the warning.
 #[test]
 fn test_translations_only_archive_does_not_warn_about_no_strings() {
-    let dir = std::env::temp_dir().join(format!("locust_renpy_tlonly_{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(&dir).unwrap();
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_renpy_tlonly_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
 
     let tl_script = b"translate spanish start_x1:\n    e \"Hola desde tl!\"\n";
     let rpa_path = dir.join("scripts.rpa");

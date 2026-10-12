@@ -62,6 +62,13 @@ Desktop and HTTP `POST /api/project/open` use `resolve_project_db_path`: `<game-
 
 CLI `extract` without `-o` writes `{game-folder-name}.locust.db` in the **current working directory**. Pass `-o <game-parent>/<game-name>.locust.db` to share the desktop file.
 
+## Verification worktrees
+
+Agents creating throwaway worktrees for verification must build with
+`CARGO_TARGET_DIR` set to `<main checkout>/target-verify` (covered by `/target-*`)
+instead of a fresh per-worktree target directory. Remove the worktree with
+`git worktree remove` when verification is done.
+
 ## Build
 
 ```bash

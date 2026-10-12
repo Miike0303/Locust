@@ -335,15 +335,17 @@ mod tests {
         assert_eq!(output[2]["message"], "Translated");
     }
 
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("locust_vntp_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&d).unwrap();
-        d
+    fn tmp() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_vntp_")
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
     fn test_extract_and_inject_roundtrip() {
-        let dir = tmp();
+        let dir_guard = tmp();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(
             dir.join("yst00001.json"),
             r#"[{"name":"太郎","message":"こんにちは。"},{"message":"…"},{"message":"元気ですか？"}]"#,
@@ -390,7 +392,8 @@ mod tests {
 
     #[test]
     fn test_detect_rejects_plain_json() {
-        let dir = tmp();
+        let dir_guard = tmp();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("config.json"), r#"{"width":800,"height":600}"#).unwrap();
         assert!(!VnTextPatchPlugin::new().detect(&dir));
     }

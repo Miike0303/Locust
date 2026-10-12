@@ -2554,10 +2554,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_tyrano_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_tyrano_")
+            .tempdir()
+            .unwrap()
     }
 
     /// Minimal TyranoScript-ish scenario (grammar shapes from kag.parser.js).
@@ -2646,14 +2647,16 @@ block comment body\r\n\
 
     #[test]
     fn test_detect_scenario_layout() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_tyrano_layout(&dir, "scene1.ks", sample_scenario(), false);
         assert!(TyranoPlugin::new().detect(&dir));
     }
 
     #[test]
     fn test_detect_tyrano_dir_without_ks_still_true() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::create_dir_all(dir.join("tyrano")).unwrap();
         fs::create_dir_all(dir.join("data").join("scenario")).unwrap();
         assert!(TyranoPlugin::new().detect(&dir));
@@ -2662,14 +2665,16 @@ block comment body\r\n\
     #[test]
     fn test_detect_bare_ks_dir_is_not_tyrano() {
         // Loose .ks without tyrano/ or data/scenario/ → KiriKiri territory.
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("scenario.ks"), sample_scenario().as_bytes()).unwrap();
         assert!(!TyranoPlugin::new().detect(&dir));
     }
 
     #[test]
     fn test_detect_non_tyrano() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("readme.md"), b"nope").unwrap();
         assert!(!TyranoPlugin::new().detect(&dir));
     }
@@ -2680,10 +2685,12 @@ block comment body\r\n\
         use locust_core::extraction::FormatRegistry;
 
         // Tyrano layout with .ks must not be claimed by KiriKiri.
-        let tyrano_dir = tempdir();
+        let tyrano_dir_guard = tempdir();
+        let tyrano_dir = tyrano_dir_guard.path().to_path_buf();
         write_tyrano_layout(&tyrano_dir, "scene1.ks", sample_scenario(), false);
 
-        let bare_ks = tempdir();
+        let bare_ks_guard = tempdir();
+        let bare_ks = bare_ks_guard.path().to_path_buf();
         fs::write(bare_ks.join("scenario.ks"), sample_scenario().as_bytes()).unwrap();
 
         // Mimic default_registry order: tyrano then kirikiri.
@@ -2705,7 +2712,8 @@ block comment body\r\n\
 
     #[test]
     fn test_extract_known_lines_and_ids() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_tyrano_layout(&dir, "scene1.ks", sample_scenario(), false);
         let plugin = TyranoPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -2770,14 +2778,16 @@ block comment body\r\n\
 
     #[test]
     fn test_inject_roundtrip_no_bom() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_tyrano_layout(&dir, "scene1.ks", sample_scenario(), false);
         roundtrip_translate(&dir, "Hola, mundo!", false);
     }
 
     #[test]
     fn test_inject_roundtrip_with_bom() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_tyrano_layout(&dir, "scene1.ks", sample_scenario(), true);
         roundtrip_translate(&dir, "Hola, mundo!", true);
         let bytes = fs::read(dir.join("data/scenario/scene1.ks")).unwrap();
@@ -2789,7 +2799,8 @@ block comment body\r\n\
 
     #[test]
     fn test_inject_speaker_display_name() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_tyrano_layout(&dir, "scene1.ks", sample_scenario(), false);
         let plugin = TyranoPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -2850,7 +2861,8 @@ block comment body\r\n\
 
     #[test]
     fn test_tyrano_layout_without_scenario_errors_loudly() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::create_dir_all(dir.join("tyrano")).unwrap();
         fs::create_dir_all(dir.join("data").join("scenario")).unwrap();
         // No .ks files
@@ -2868,7 +2880,8 @@ block comment body\r\n\
 
     #[test]
     fn test_asar_e2e_extract_inject_with_locust_old() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let resources = dir.join("resources");
         fs::create_dir_all(&resources).unwrap();
         // Optional tyrano marker for detect fallback
@@ -2942,7 +2955,8 @@ block comment body\r\n\
 
     #[test]
     fn test_package_nw_e2e_extract_inject_locust_old() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let nw_path = dir.join("package.nw");
         fs::write(&nw_path, build_nw_zip_bytes(sample_scenario())).unwrap();
 
@@ -2981,7 +2995,8 @@ block comment body\r\n\
 
     #[test]
     fn test_data_exe_e2e_extract_inject() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let mut exe = b"MZ\x90\x00FAKE_NW_STUB!!!!".to_vec();
         let prefix = exe.clone();
         exe.extend_from_slice(&build_nw_zip_bytes(sample_scenario()));
@@ -3017,7 +3032,8 @@ block comment body\r\n\
 
     #[test]
     fn repeated_injection_keeps_every_prior_backup() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("package.nw");
         let original = build_nw_zip_bytes(sample_scenario());
         fs::write(&path, &original).unwrap();

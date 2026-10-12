@@ -602,10 +602,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_asar_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_asar_")
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
@@ -646,7 +647,8 @@ mod tests {
 
     #[test]
     fn test_unpacked_entry_from_sibling_dir() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let asar_path = dir.join("app.asar");
         // Manual header with one unpacked file
         let json = r#"{"files":{"data":{"files":{"loose.ks":{"size":5,"unpacked":true}}}}}"#;

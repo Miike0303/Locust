@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use locust_core::extraction::FormatPlugin;
 use locust_core::models::StringEntry;
@@ -50,11 +50,14 @@ fn build_rpa(name: &str, content: &[u8]) -> Vec<u8> {
     archive
 }
 
-fn game_fixture(kind: &str) -> PathBuf {
-    let root =
-        std::env::temp_dir().join(format!("locust_renpy_ui_{kind}_{}", uuid::Uuid::new_v4()));
+fn game_fixture(kind: &str) -> tempfile::TempDir {
+    let root_guard = tempfile::Builder::new()
+        .prefix(&format!("locust_renpy_ui_{kind}_"))
+        .tempdir()
+        .unwrap();
+    let root = root_guard.path().to_path_buf();
     fs::create_dir_all(root.join("game")).unwrap();
-    root
+    root_guard
 }
 
 fn select_ui_translations(entries: &mut [StringEntry]) {
@@ -93,14 +96,16 @@ fn rpa_ui_injection_matches_loose_and_replaces_only_the_selected_literal() {
         "    textbutton \"Save\" action FileSave(1)\n",
     );
 
-    let rpa_root = game_fixture("rpa");
+    let rpa_root_guard = game_fixture("rpa");
+    let rpa_root = rpa_root_guard.path().to_path_buf();
     fs::write(
         rpa_root.join("game/scripts.rpa"),
         build_rpa("screens.rpy", script.as_bytes()),
     )
     .unwrap();
 
-    let loose_root = game_fixture("loose");
+    let loose_root_guard = game_fixture("loose");
+    let loose_root = loose_root_guard.path().to_path_buf();
     fs::write(loose_root.join("game/screens.rpy"), script).unwrap();
 
     let (rpa_report, rpa_output) = inject_selected(&rpa_root);
@@ -123,7 +128,8 @@ fn rpa_ui_injection_matches_loose_and_replaces_only_the_selected_literal() {
 #[test]
 fn rpa_ui_injection_rejects_a_stale_physical_source() {
     let script = "screen navigation():\n    textbutton \"Back\" action Return(\"Back\")\n";
-    let root = game_fixture("stale");
+    let root_guard = game_fixture("stale");
+    let root = root_guard.path().to_path_buf();
     fs::write(
         root.join("game/scripts.rpa"),
         build_rpa("screens.rpy", script.as_bytes()),

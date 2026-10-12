@@ -3907,7 +3907,11 @@ mod tests {
 
     #[test]
     fn test_inject_rpyc_filter_writes_file() {
-        let dir = std::env::temp_dir().join(format!("locust_rpycf_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_rpycf_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         fs::create_dir_all(dir.join("game")).unwrap();
 
         let mut e = StringEntry::new(
@@ -3930,7 +3934,11 @@ mod tests {
 
     #[test]
     fn test_inject_rpyc_filter_chains_previous_filter() {
-        let dir = std::env::temp_dir().join(format!("locust_rpycf_chain_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_rpycf_chain_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         fs::create_dir_all(dir.join("game")).unwrap();
 
         let mut e = StringEntry::new("scripts.rpa#a.rpyc#s0", "Hello!", dir.join("scripts.rpa"));
@@ -3953,7 +3961,11 @@ mod tests {
 
     #[test]
     fn test_inject_rpyc_filter_zero_translations_does_not_write_file() {
-        let dir = std::env::temp_dir().join(format!("locust_rpycf_empty_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_rpycf_empty_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         fs::create_dir_all(dir.join("game")).unwrap();
 
         let mut e = StringEntry::new("scripts.rpa#a.rpyc#s0", "Hello!", dir.join("scripts.rpa"));
@@ -3973,7 +3985,11 @@ mod tests {
 
     #[test]
     fn test_inject_rpyc_filter_zero_translations_removes_stale_filter() {
-        let dir = std::env::temp_dir().join(format!("locust_rpycf_stale_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_rpycf_stale_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let game_dir = dir.join("game");
         fs::create_dir_all(&game_dir).unwrap();
 
@@ -4014,8 +4030,11 @@ mod tests {
 
     #[test]
     fn test_inject_rpyc_filter_reconciles_written_and_skipped() {
-        let dir =
-            std::env::temp_dir().join(format!("locust_rpycf_reconcile_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_rpycf_reconcile_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         fs::create_dir_all(dir.join("game")).unwrap();
 
         let mut translated =
@@ -4053,10 +4072,14 @@ mod tests {
             .join("renpy")
     }
 
-    fn temp_renpy_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_renpy_{}", uuid::Uuid::new_v4()));
+    fn temp_renpy_dir() -> tempfile::TempDir {
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_renpy_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         copy_dir(&fixture_dir(), &dir);
-        dir
+        dir_guard
     }
 
     fn copy_dir(src: &Path, dst: &Path) {
@@ -4089,8 +4112,11 @@ mod tests {
 
     #[test]
     fn test_detect_non_renpy() {
-        let dir = std::env::temp_dir().join(format!("locust_notrenpy_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_notrenpy_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RenPyPlugin::new();
         assert!(!plugin.detect(&dir));
     }
@@ -4678,7 +4704,8 @@ label start:
 
     #[test]
     fn test_inject_replace_roundtrip() {
-        let dir = temp_renpy_dir();
+        let dir_guard = temp_renpy_dir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RenPyPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
 
@@ -4702,7 +4729,8 @@ label start:
         // entries: extraction skips `zzz_locust*` and rewrites entry paths to
         // the .rpa. Both the in-place loose edit and the generated runtime
         // filter must therefore be reported.
-        let dir = temp_renpy_dir();
+        let dir_guard = temp_renpy_dir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RenPyPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
         for entry in &mut entries {
@@ -4737,7 +4765,8 @@ label start:
 
     #[test]
     fn test_inject_add_creates_tl_dir() {
-        let dir = temp_renpy_dir();
+        let dir_guard = temp_renpy_dir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RenPyPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
         for entry in &mut entries {
@@ -4754,7 +4783,8 @@ label start:
     fn test_reextract_after_inject_add_ignores_generated_language_picker() {
         // Add mode writes game/locust_languages.rpy (an in-game language menu).
         // Reopening the project must not import its labels as game strings.
-        let dir = temp_renpy_dir();
+        let dir_guard = temp_renpy_dir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RenPyPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
         let before: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
@@ -4781,7 +4811,8 @@ label start:
 
     #[test]
     fn test_inject_add_format() {
-        let dir = temp_renpy_dir();
+        let dir_guard = temp_renpy_dir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RenPyPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
         for entry in &mut entries {

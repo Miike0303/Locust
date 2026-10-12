@@ -537,13 +537,11 @@ mod tests {
     #[tokio::test]
     async fn poll_for_token_denied_and_expired_and_complete() {
         let _lock = token_store_test_lock();
-        let token_file = std::env::temp_dir().join(format!(
-            "locust_xai_oauth_test_{}.json",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let token_file_guard = tempfile::Builder::new()
+            .prefix("locust_xai_oauth_test_")
+            .tempdir()
+            .unwrap();
+        let token_file = token_file_guard.path().join("fixture.json");
         set_token_path_override(Some(token_file.clone()));
 
         let server = MockServer::start();

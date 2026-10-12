@@ -3290,7 +3290,8 @@ mod tests {
             &serde_json::json!(["Unread encrypted TOC"]),
         )
         .unwrap();
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("partial-pivot.db");
         db.pivot_to(&path).unwrap();
         let pivot = Database::open(&path).unwrap();
@@ -3310,7 +3311,8 @@ mod tests {
 
     #[test]
     fn project_metadata_roundtrips_reopen_and_update() {
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("metadata.db");
         let db = Database::open(&path).unwrap();
         assert_eq!(db.get_project_metadata("missing").unwrap(), None);
@@ -3426,7 +3428,8 @@ mod tests {
 
     #[test]
     fn shared_textasset_database_large_roundtrip_has_one_blob_and_shared_memory() {
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("shared.db");
         let (original, entries) = shared_textasset_rows(512);
         assert!(original.len() > 32_768);
@@ -3559,7 +3562,8 @@ mod tests {
 
     #[test]
     fn shared_textasset_partial_pivot_and_merge_preserve_physical_blob_without_leader() {
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let (original, mut entries) = shared_textasset_rows(256);
         // Only the final row is translated: the group's first row never enters
         // either pivot, so blob ownership cannot depend on a leader row.
@@ -3712,7 +3716,8 @@ mod tests {
     #[test]
     fn sha256_file_matches_in_memory_across_chunk_boundary() {
         // FILE_HASH_CHUNK is 1 MiB — force at least two reads.
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("big.bin");
         let mut data = vec![0u8; FILE_HASH_CHUNK + 50_000];
         for (i, b) in data.iter_mut().enumerate() {
@@ -3730,7 +3735,8 @@ mod tests {
 
     #[test]
     fn copy_path_chunked_roundtrip_multi_chunk() {
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let src = dir.join("src.bin");
         let dst = dir.join("dst.bin");
         let data = vec![0x5Au8; FILE_HASH_CHUNK + 12];
@@ -3745,10 +3751,11 @@ mod tests {
 
     // ─── injection recording (root + rel + hash per language) ──────────────
 
-    fn recording_tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_db_rec_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn recording_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_db_rec_")
+            .tempdir()
+            .unwrap()
     }
 
     /// A minimal injected tree: `<base>/root/game/script.rpy` with known bytes.
@@ -3822,7 +3829,8 @@ mod tests {
 
     #[test]
     fn test_record_injection_roundtrip_stores_rel_hash_and_size() {
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, file, bytes) = make_recorded_tree(&base);
         let db = Database::open_in_memory().unwrap();
 
@@ -3855,7 +3863,8 @@ mod tests {
     fn test_record_injection_many_files_all_persist() {
         // Pins the prepare_cached INSERT path: N rows in one transaction must
         // all round-trip (guards against accidentally emptying the insert loop).
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let root = base.join("root");
         let sub = root.join("game");
         std::fs::create_dir_all(&sub).unwrap();
@@ -3876,7 +3885,8 @@ mod tests {
     fn test_record_injection_null_key_is_its_own_recording() {
         // `--direct` without -l records under the reserved NULL key, matched
         // only by `patch` without -l — never silently by a named language.
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, file, _) = make_recorded_tree(&base);
         let db = Database::open_in_memory().unwrap();
 
@@ -3892,7 +3902,8 @@ mod tests {
 
     #[test]
     fn test_record_injection_replaces_only_its_own_key() {
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let root = base.join("root");
         std::fs::create_dir_all(root.join("game")).unwrap();
         let a = root.join("game").join("a.rpy");
@@ -3925,7 +3936,8 @@ mod tests {
     fn test_record_injection_empty_report_keeps_previous_recording() {
         // An inject run that wrote nothing must not clobber the last good
         // recording — the files it previously wrote are still on disk.
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, file, _) = make_recorded_tree(&base);
         let db = Database::open_in_memory().unwrap();
         db.record_injection(Some("es"), &root, &[file]).unwrap();
@@ -3942,7 +3954,8 @@ mod tests {
         // different tree (Unity/Unreal/Wolf/Ren'Py-loose in Replace mode) must
         // produce a hard error and record NOTHING — recording the paths would
         // silently re-create the packs-the-wrong-tree corruption.
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, file, _) = make_recorded_tree(&base);
         let outside = base.join("elsewhere.rpy");
         std::fs::write(&outside, b"y").unwrap();
@@ -3971,7 +3984,8 @@ mod tests {
         // way the refusal must come from the recording guards (shared
         // "cannot record injection output" contract), never from an
         // incidental read failure later on.
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, _file, _) = make_recorded_tree(&base);
         let sneaky = root.join("game").join("..").join("..").join("evil.txt");
         let db = Database::open_in_memory().unwrap();
@@ -3992,7 +4006,8 @@ mod tests {
         // ONE physical file reached under two case spellings is a duplicate,
         // not a collision — NTFS/APFS fold case, so both spellings name the
         // same bytes and the file must be recorded exactly once.
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, file, _) = make_recorded_tree(&base);
         let respelled = root.join("game").join("SCRIPT.RPY");
         let db = Database::open_in_memory().unwrap();
@@ -4013,7 +4028,8 @@ mod tests {
         // The pre-recording table (file_path/lang, no root) cannot say which
         // tree injection targeted, so it is dropped on open; `locust patch`
         // then gives the exact inject command that rebuilds the recording.
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let db_path = base.join("legacy.locust.db");
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -4047,7 +4063,8 @@ mod tests {
         // table WITH `root` but WITHOUT hash/size (an intermediate schema)
         // survives and then fails at runtime with a raw SQL error the first
         // time a recording is read or written.
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let db_path = base.join("intermediate.locust.db");
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -4082,7 +4099,8 @@ mod tests {
 
     #[test]
     fn test_rel_under_root_uses_forward_slashes() {
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, file, _) = make_recorded_tree(&base);
         assert_eq!(
             rel_under_root(&file, &root),
@@ -4120,7 +4138,8 @@ mod tests {
     fn test_rel_under_root_resolves_verbatim_prefix_spelling() {
         // `canonicalize()` yields `\\?\C:\...` verbatim paths on Windows. A
         // plainly spelled file must still match a verbatim-spelled root.
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, file, _) = make_recorded_tree(&base);
         let verbatim_root = root.canonicalize().unwrap();
         assert_eq!(
@@ -4131,7 +4150,8 @@ mod tests {
 
     #[test]
     fn test_rel_under_root_is_none_outside_the_root_and_for_the_root_itself() {
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, _file, _) = make_recorded_tree(&base);
         assert_eq!(rel_under_root(&base.join("elsewhere.txt"), &root), None);
         assert_eq!(
@@ -4143,7 +4163,8 @@ mod tests {
 
     #[test]
     fn test_paths_identical_across_spellings() {
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (root, _file, _) = make_recorded_tree(&base);
         let canonical = root.canonicalize().unwrap();
         assert!(paths_identical(&root, &canonical));
@@ -4165,7 +4186,8 @@ mod tests {
 
     #[test]
     fn test_reopen_swaps_connection_and_preserves_original() {
-        let base = recording_tempdir();
+        let base_guard = recording_tempdir();
+        let base = base_guard.path().to_path_buf();
         let path_a = base.join("a.locust.db");
         let path_b = base.join("b.locust.db");
 
@@ -6394,7 +6416,8 @@ mod tests {
         let whitespace = translated_entry("c", "Skip me", "data/Actors.json", "   ");
         src.save_entries(&[done, pending, whitespace]).unwrap();
 
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let out = dir.join("pivoted.locust.db");
         let result = src.pivot_to(&out).unwrap();
         assert_eq!(result.entries, 1);
@@ -6432,7 +6455,8 @@ mod tests {
             .insert("binary_slot".into(), serde_json::json!("utf8"));
         src.save_entries(&[japanese]).unwrap();
 
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let first_path = dir.join("en.locust.db");
         src.pivot_to(&first_path).unwrap();
         let first = Database::open(&first_path).unwrap();
@@ -6491,7 +6515,8 @@ mod tests {
         );
         src.save_entries(&members).unwrap();
 
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let out = dir.join("pivot-group.locust.db");
         src.pivot_to(&out).unwrap();
         let pivoted = Database::open(&out).unwrap();
@@ -6521,7 +6546,8 @@ mod tests {
             translated_entry("b", "日本語B", "old-b", "English B"),
         ])
         .unwrap();
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let pivot_path = dir.join("merge.locust.db");
         src.pivot_to(&pivot_path).unwrap();
         let pivot = Database::open(&pivot_path).unwrap();
@@ -6610,7 +6636,8 @@ mod tests {
         src.save_entries(&[translated_entry("a", "Hello", "f.json", "Hola")])
             .unwrap();
 
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let out = dir.join("exists.locust.db");
         std::fs::write(&out, b"nope").unwrap();
         let err = src.pivot_to(&out).expect_err("must refuse overwrite");
@@ -6624,7 +6651,8 @@ mod tests {
         let src = Database::open_in_memory().unwrap();
         src.save_entries(&[StringEntry::new("b", "World", PathBuf::from("f.json"))])
             .unwrap();
-        let dir = recording_tempdir();
+        let dir_guard = recording_tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let out = dir.join("empty-pivot.locust.db");
         let err = src.pivot_to(&out).expect_err("must refuse empty pivot");
         assert!(

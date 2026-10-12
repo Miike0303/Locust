@@ -746,10 +746,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_nscr_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_nscr_")
+            .tempdir()
+            .unwrap()
     }
 
     /// Minimal NScripter-ish script with code + JP dialogue + English backtick + waits.
@@ -830,35 +831,40 @@ click"
 
     #[test]
     fn test_detect_0_txt_dir() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_0_txt(&dir, sample_script());
         assert!(NScripterPlugin::new().detect(&dir));
     }
 
     #[test]
     fn test_detect_nscript_dat_dir() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_nscript_dat(&dir, sample_script());
         assert!(NScripterPlugin::new().detect(&dir));
     }
 
     #[test]
     fn test_detect_arc_nsa_only_still_true() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("arc.nsa"), b"NSA\0fake").unwrap();
         assert!(NScripterPlugin::new().detect(&dir));
     }
 
     #[test]
     fn test_detect_non_nscripter() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("readme.md"), b"nope").unwrap();
         assert!(!NScripterPlugin::new().detect(&dir));
     }
 
     #[test]
     fn test_extract_0_txt_filters_and_ids() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_0_txt(&dir, sample_script());
         let plugin = NScripterPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -911,7 +917,8 @@ click"
 
     #[test]
     fn test_extract_nscript_dat() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_nscript_dat(&dir, sample_script());
         let entries = NScripterPlugin::new().extract(&dir).unwrap();
         assert!(
@@ -924,7 +931,8 @@ click"
 
     #[test]
     fn test_priority_prefers_0_txt_over_nscript_dat() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_0_txt(&dir, "`from zero`\r\n");
         write_nscript_dat(&dir, "`from dat`\r\n");
         let entries = NScripterPlugin::new().extract(&dir).unwrap();
@@ -938,7 +946,8 @@ click"
 
     #[test]
     fn test_inject_roundtrip_0_txt() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_0_txt(&dir, sample_script());
         roundtrip_translate(&dir, "`Hola, mundo!`");
     }
@@ -963,7 +972,8 @@ click"
 
     #[test]
     fn japanese_to_ascii_stays_dialogue() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_0_txt(&dir, "こんにちは。@\n");
         assert_japanese_to_ascii_stays_dialogue(&dir);
         assert_eq!(fs::read(dir.join("0.txt")).unwrap(), b"`Hello.@\n");
@@ -971,7 +981,8 @@ click"
 
     #[test]
     fn japanese_to_ascii_stays_dialogue_nscr_sec() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_nscr_sec(&dir, "こんにちは。@\n");
         assert_japanese_to_ascii_stays_dialogue(&dir);
         assert_eq!(
@@ -982,7 +993,8 @@ click"
 
     #[test]
     fn japanese_to_ascii_stays_dialogue_nscript_dat() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_nscript_dat(&dir, "こんにちは。@\n");
         assert_japanese_to_ascii_stays_dialogue(&dir);
         assert_eq!(
@@ -1003,7 +1015,8 @@ click"
             ("123", "`123"),
             (";Hi", "`;Hi"),
         ] {
-            let dir = tempdir();
+            let dir_guard = tempdir();
+            let dir = dir_guard.path().to_path_buf();
             write_0_txt(&dir, "こんにちは。@\n");
             let plugin = NScripterPlugin::new();
             let mut entries = plugin.extract(&dir).unwrap();
@@ -1027,7 +1040,8 @@ click"
     #[test]
     fn test_inject_keeps_empty_and_whitespace_translations() {
         for translation in ["", "   ", "\t", " \t ", " \t\n"] {
-            let dir = tempdir();
+            let dir_guard = tempdir();
+            let dir = dir_guard.path().to_path_buf();
             write_0_txt(&dir, "こんにちは。@\n");
             let plugin = NScripterPlugin::new();
             let mut entries = plugin.extract(&dir).unwrap();
@@ -1047,7 +1061,8 @@ click"
 
     #[test]
     fn test_inject_normalized_translation_is_skipped() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let original = " \t `Hello.@\n";
         write_0_txt(&dir, original);
         let plugin = NScripterPlugin::new();
@@ -1065,7 +1080,8 @@ click"
 
     #[test]
     fn test_inject_normalized_translation_is_skipped_in_changed_file() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_0_txt(&dir, "`Hello.@\nこんにちは。@\n");
         let plugin = NScripterPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -1083,7 +1099,8 @@ click"
 
     #[test]
     fn test_inject_roundtrip_nscript_dat() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_nscript_dat(&dir, sample_script());
         roundtrip_translate(&dir, "`Hola, mundo!`");
         // Cipher still applied after inject
@@ -1097,7 +1114,8 @@ click"
 
     #[test]
     fn test_extract_nscr_sec() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_nscr_sec(&dir, sample_script());
         let entries = NScripterPlugin::new().extract(&dir).unwrap();
         assert!(
@@ -1110,7 +1128,8 @@ click"
 
     #[test]
     fn test_inject_roundtrip_nscr_sec() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_nscr_sec(&dir, sample_script());
         roundtrip_translate(&dir, "`Hola, mundo!`");
         let bytes = fs::read(dir.join("nscr_sec.dat")).unwrap();
@@ -1122,7 +1141,8 @@ click"
 
     #[test]
     fn test_priority_prefers_0_txt_over_nscr_sec() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_0_txt(&dir, "`from zero`\r\n");
         write_nscr_sec(&dir, "`from sec`\r\n");
         let entries = NScripterPlugin::new().extract(&dir).unwrap();
@@ -1137,7 +1157,8 @@ click"
 
     #[test]
     fn test_priority_prefers_nscr_sec_over_nscript_dat() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_nscr_sec(&dir, "`from sec`\r\n");
         write_nscript_dat(&dir, "`from dat`\r\n");
         let entries = NScripterPlugin::new().extract(&dir).unwrap();
@@ -1174,7 +1195,8 @@ click"
 
     #[test]
     fn test_unsupported_only_nscript_underscore_errors_loudly() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("nscript.___"), b"\0\0\0").unwrap();
         let err = NScripterPlugin::new()
             .extract(&dir)
@@ -1190,7 +1212,8 @@ click"
     fn test_nscript_underscore_outranks_nscript_dat_errors_loudly() {
         // Engine readScript order: nscript.___ (mode 3) beats nscript.dat (mode 1).
         // Extracting nscript.dat here would translate a file the game never loads.
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("nscript.___"), b"\0\0\0").unwrap();
         write_nscript_dat(&dir, "`ignored by engine\n");
         let err = NScripterPlugin::new()
@@ -1209,7 +1232,8 @@ click"
 
     #[test]
     fn test_nsa_only_extract_reports_loudly() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("arc.nsa"), b"NSA\0fake").unwrap();
         let err = NScripterPlugin::new()
             .extract(&dir)
@@ -1223,7 +1247,8 @@ click"
 
     #[test]
     fn test_sjis_unencodable_translation_warns_and_skips() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_0_txt(&dir, sample_script());
         let plugin = NScripterPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -1258,7 +1283,8 @@ click"
 
     #[test]
     fn test_00_txt_supported() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("00.txt"), encode_sjis_fixture("`from 00`\r\n")).unwrap();
         let plugin = NScripterPlugin::new();
         assert!(plugin.detect(&dir));
@@ -1270,7 +1296,8 @@ click"
     fn c120_rmenu_fields_all_containers_and_newlines() {
         for name in SUPPORTED_CONTAINERS {
             for newline in ["\n", "\r\n"] {
-                let dir = tempdir();
+                let dir_guard = tempdir();
+                let dir = dir_guard.path().to_path_buf();
                 let path = dir.join(name);
                 let kind = ContainerKind::from_name(name).unwrap();
                 let text = format!("; untouched{newline}caption \"題名\"{newline}rmenu \"Skip\",skip,\"Hide\",windowerase,\"Restart\",reset{newline}こんにちは。@{newline}bg \"image.bmp\",0{newline}");
@@ -1343,7 +1370,8 @@ click"
             "bad\0nul",
             "bad😀",
         ] {
-            let dir = tempdir();
+            let dir_guard = tempdir();
+            let dir = dir_guard.path().to_path_buf();
             let original = " \tCaPtIoN \"Title\" ; comment\r\n";
             write_0_txt(&dir, original);
             let plugin = NScripterPlugin::new();
@@ -1381,7 +1409,8 @@ click"
 
     #[test]
     fn c120_duplicate_labels_keep_physical_positions() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let original = "caption\t\"First\"\n\trmenu\t\"Same\" , skip , \"Same\" , reset\r\ncaption \"Last\"\n rmenu \"Other\",windowerase";
         write_0_txt(&dir, original);
         let plugin = NScripterPlugin::new();
@@ -1401,7 +1430,8 @@ click"
 
     #[test]
     fn c120_token_scanner_excludes_technical_and_expression_arguments() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_0_txt(
             &dir,
             concat!(
@@ -1427,7 +1457,8 @@ click"
     #[test]
     fn c120_inject_rejects_stale_or_ambiguous_fields() {
         for change in ["source", "dispatch", "command", "locator", "duplicate"] {
-            let dir = tempdir();
+            let dir_guard = tempdir();
+            let dir = dir_guard.path().to_path_buf();
             write_0_txt(&dir, "rmenu \"Old\",skip,\"Other\",reset\n");
             let plugin = NScripterPlugin::new();
             let mut entries = plugin.extract(&dir).unwrap();
@@ -1458,7 +1489,8 @@ click"
 
     #[test]
     fn c120_preserves_unmodified_sjis_bytes_and_mixed_newlines() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         // ED40 is a valid non-canonical encoding of a CP932 character. Re-encoding
         // the whole script would change it to FA5C, even in an untouched comment.
         let original = [
@@ -1487,7 +1519,8 @@ click"
     #[test]
     fn c120_verified_revision_retargets_changed_length_fields() {
         for name in SUPPORTED_CONTAINERS {
-            let dir = tempdir();
+            let dir_guard = tempdir();
+            let dir = dir_guard.path().to_path_buf();
             let path = dir.join(name);
             let kind = ContainerKind::from_name(name).unwrap();
             let text = "caption \"題名\"\nrmenu \"同じ\",skip,\"同じ\",reset\nこんにちは。@\n";

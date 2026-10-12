@@ -1696,25 +1696,29 @@ mod tests {
             .unwrap();
     }
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_bak_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_bak_")
+            .tempdir()
+            .unwrap()
     }
 
-    fn create_game_dir() -> PathBuf {
-        let dir = tempdir();
+    fn create_game_dir() -> tempfile::TempDir {
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("data.json"), r#"{"hp": 100}"#).unwrap();
         fs::write(dir.join("strings.txt"), "Hello\nWorld").unwrap();
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("sub").join("nested.txt"), "nested content").unwrap();
-        dir
+        dir_guard
     }
 
     #[test]
     fn test_create_backup_copies_files() {
-        let game_dir = create_game_dir();
-        let backup_root = tempdir();
+        let game_dir_guard = create_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
         let entry = mgr.create_backup(&game_dir).unwrap();
 
@@ -1731,8 +1735,10 @@ mod tests {
 
     #[test]
     fn test_create_backup_writes_manifest() {
-        let game_dir = create_game_dir();
-        let backup_root = tempdir();
+        let game_dir_guard = create_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
         let entry = mgr.create_backup(&game_dir).unwrap();
 
@@ -1745,8 +1751,10 @@ mod tests {
 
     #[test]
     fn test_list_backups_sorted() {
-        let game_dir = create_game_dir();
-        let backup_root = tempdir();
+        let game_dir_guard = create_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
         let _b1 = mgr.create_backup(&game_dir).unwrap();
         let _b2 = mgr.create_backup(&game_dir).unwrap();
@@ -1869,12 +1877,13 @@ mod tests {
         // Ids arrive from HTTP (`POST /api/backups/:id/restore` and delete),
         // so a traversal must not reach outside the backup root — delete in
         // particular would remove the directory tree it lands on.
-        let backup_root = tempdir();
-        let outsider = backup_root
-            .parent()
-            .unwrap()
-            .join(format!("locust_outsider_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&outsider).unwrap();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
+        let outsider_guard = tempfile::Builder::new()
+            .prefix("locust_outsider_")
+            .tempdir_in(backup_root.parent().unwrap())
+            .unwrap();
+        let outsider = outsider_guard.path().to_path_buf();
         fs::write(outsider.join("keep.txt"), "important").unwrap();
 
         let mgr = BackupManager::new(backup_root);
@@ -1899,7 +1908,8 @@ mod tests {
         );
 
         // A real id still works.
-        let game_dir = create_game_dir();
+        let game_dir_guard = create_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         let entry = mgr.create_backup(&game_dir).unwrap();
         mgr.restore(&entry.id).unwrap();
         mgr.delete_backup(&entry.id).unwrap();
@@ -1910,11 +1920,15 @@ mod tests {
         // Backup ids are second-resolution timestamps. Two injects within the
         // same second must not land in one directory, or each overwrites the
         // other's manifest and restore hands back a mix of both games.
-        let backup_root = tempdir();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
 
-        let game_a = create_game_dir();
-        let game_b = tempdir();
+        let game_a_guard = create_game_dir();
+
+        let game_a = game_a_guard.path().to_path_buf();
+        let game_b_guard = tempdir();
+        let game_b = game_b_guard.path().to_path_buf();
         fs::write(game_b.join("only_in_b.txt"), "b").unwrap();
 
         let a = mgr.create_backup(&game_a).unwrap();
@@ -2040,8 +2054,10 @@ mod tests {
 
     #[test]
     fn test_restore_overwrites_target() {
-        let game_dir = create_game_dir();
-        let backup_root = tempdir();
+        let game_dir_guard = create_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
         let entry = mgr.create_backup(&game_dir).unwrap();
 
@@ -2064,11 +2080,14 @@ mod tests {
     fn test_restore_writes_to_backup_origin_not_another_game() {
         // Inject game A (a backup is taken), then another game exists as if it
         // were the open project. Restore must land in A; B must stay untouched.
-        let game_a = create_game_dir();
-        let game_b = tempdir();
+        let game_a_guard = create_game_dir();
+        let game_a = game_a_guard.path().to_path_buf();
+        let game_b_guard = tempdir();
+        let game_b = game_b_guard.path().to_path_buf();
         fs::write(game_b.join("b_only.txt"), "keep-b").unwrap();
 
-        let backup_root = tempdir();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
         let entry = mgr.create_backup(&game_a).unwrap();
 
@@ -2092,8 +2111,10 @@ mod tests {
 
     #[test]
     fn test_restore_refuses_deleted_source_directory() {
-        let game_dir = create_game_dir();
-        let backup_root = tempdir();
+        let game_dir_guard = create_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
         let entry = mgr.create_backup(&game_dir).unwrap();
 
@@ -2117,8 +2138,10 @@ mod tests {
 
     #[test]
     fn test_restore_refuses_missing_or_corrupt_manifest() {
-        let game_dir = create_game_dir();
-        let backup_root = tempdir();
+        let game_dir_guard = create_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
 
         let missing = mgr.create_backup(&game_dir).unwrap();
@@ -2162,8 +2185,10 @@ mod tests {
 
     #[test]
     fn test_delete_backup() {
-        let game_dir = create_game_dir();
-        let backup_root = tempdir();
+        let game_dir_guard = create_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
         let entry = mgr.create_backup(&game_dir).unwrap();
         mgr.delete_backup(&entry.id).unwrap();
@@ -2173,8 +2198,10 @@ mod tests {
 
     #[test]
     fn test_delete_old_keeps_recent() {
-        let game_dir = create_game_dir();
-        let backup_root = tempdir();
+        let game_dir_guard = create_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().to_path_buf();
         let mgr = BackupManager::new(backup_root);
         for _ in 0..5 {
             mgr.create_backup(&game_dir).unwrap();

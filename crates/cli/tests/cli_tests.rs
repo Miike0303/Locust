@@ -5,6 +5,41 @@ mod common;
 use common::locust;
 
 #[test]
+fn command_roots_survive_commands_and_are_cleaned_up_at_thread_exit() {
+    let roots = std::thread::spawn(|| {
+        let mut roots = Vec::new();
+        for _ in 0..2 {
+            let command = locust();
+            let paths: Vec<_> = command
+                .get_envs()
+                .filter(|(name, _)| *name == "LOCUST_DATA_DIR" || *name == "LOCUST_BACKUP_ROOT")
+                .map(|(_, value)| std::path::PathBuf::from(value.unwrap()))
+                .collect();
+            assert_eq!(paths.len(), 2);
+            for path in &paths {
+                std::fs::create_dir_all(path).unwrap();
+                std::fs::write(path.join("keep.txt"), b"earlier command").unwrap();
+            }
+            drop(command);
+            roots.push(paths);
+        }
+        assert_ne!(roots[0], roots[1], "each command needs a fresh root");
+        for path in roots.iter().flatten() {
+            assert_eq!(
+                std::fs::read(path.join("keep.txt")).unwrap(),
+                b"earlier command"
+            );
+        }
+        roots
+    })
+    .join()
+    .unwrap();
+    for path in roots.iter().flatten() {
+        assert!(!path.parent().unwrap().exists(), "root leaked: {path:?}");
+    }
+}
+
+#[test]
 fn test_cli_help_exits_0() {
     locust().arg("--help").assert().success();
 }
@@ -42,8 +77,11 @@ fn test_cli_extract_missing_path() {
 
 #[test]
 fn test_cli_extract_unknown_format() {
-    let dir = std::env::temp_dir().join(format!("locust_cli_test_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_cli_test_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
     locust()
         .args(["extract", &dir.to_string_lossy()])
         .assert()
@@ -53,8 +91,11 @@ fn test_cli_extract_unknown_format() {
 
 #[test]
 fn test_cli_glossary_add_and_list() {
-    let dir = std::env::temp_dir().join(format!("locust_cli_gloss_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = tempfile::Builder::new()
+        .prefix("locust_cli_gloss_")
+        .tempdir()
+        .unwrap();
+    let dir = dir_guard.path().to_path_buf();
     let db_path = dir.join("test.locust.db");
 
     // Create the db first with an extract-like operation (or just open it)

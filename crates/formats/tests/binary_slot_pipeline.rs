@@ -7,17 +7,18 @@ use locust_core::validation::{count_binary_slot_oversize, Validator};
 use locust_formats::unreal::UnrealPlugin;
 use locust_formats::wolf_rpg::{build_test_fixture, WolfRpgPlugin};
 use std::fs;
-use std::path::PathBuf;
 
-fn tmp(prefix: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("locust_{prefix}_{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(&d).unwrap();
-    d
+fn tmp(prefix: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("locust_{prefix}_"))
+        .tempdir()
+        .unwrap()
 }
 
 #[test]
 fn wolf_extract_tags_sjis_binary_slot_and_validate_catches_oversize() {
-    let dir = tmp("wolf_slot");
+    let dir_guard = tmp("wolf_slot");
+    let dir = dir_guard.path().to_path_buf();
     let data = dir.join("Data");
     fs::create_dir_all(&data).unwrap();
     fs::write(data.join("BasicData.wolf"), build_test_fixture()).unwrap();
@@ -49,7 +50,8 @@ fn wolf_extract_tags_sjis_binary_slot_and_validate_catches_oversize() {
 
 #[test]
 fn unreal_extract_tags_utf16le_binary_slot() {
-    let dir = tmp("ue_slot");
+    let dir_guard = tmp("ue_slot");
+    let dir = dir_guard.path().to_path_buf();
     let paks = dir.join("TestGame").join("Content").join("Paks");
     fs::create_dir_all(&paks).unwrap();
 

@@ -1350,7 +1350,11 @@ mod tests {
 
     #[test]
     fn test_register_language_map_choice() {
-        let dir = std::env::temp_dir().join(format!("locust_reglang_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_reglang_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let data = dir.join("data");
         fs::create_dir_all(dir.join("js")).unwrap();
         fs::create_dir_all(&data).unwrap();

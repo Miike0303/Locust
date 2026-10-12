@@ -1213,10 +1213,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_sc_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_sc_")
+            .tempdir()
+            .unwrap()
     }
 
     fn create_fixture(dir: &Path) -> PathBuf {
@@ -1244,7 +1245,8 @@ The adventure awaits!</tw-passagedata>
 
     #[test]
     fn test_detect_sugarcube() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_fixture(&dir);
         let plugin = SugarCubePlugin::new();
         assert!(plugin.detect(&dir));
@@ -1252,7 +1254,8 @@ The adventure awaits!</tw-passagedata>
 
     #[test]
     fn test_detect_non_sugarcube() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("index.html"), "<html><body>normal</body></html>").unwrap();
         let plugin = SugarCubePlugin::new();
         assert!(!plugin.detect(&dir));
@@ -1260,7 +1263,8 @@ The adventure awaits!</tw-passagedata>
 
     #[test]
     fn generic_html_file_is_rejected_and_registry_selects_html_game() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("story.html");
         fs::write(&html, "<p>Original one</p>").unwrap();
 
@@ -1279,7 +1283,8 @@ The adventure awaits!</tw-passagedata>
 
     #[test]
     fn sugarcube_file_and_directory_are_detected_by_plugin_and_registry() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("story.htm");
         fs::write(
             &html,
@@ -1310,7 +1315,8 @@ The adventure awaits!</tw-passagedata>
 
     #[test]
     fn test_extract_passages() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_fixture(&dir);
         let plugin = SugarCubePlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -1328,7 +1334,8 @@ The adventure awaits!</tw-passagedata>
 
     #[test]
     fn test_extract_strips_macros() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_fixture(&dir);
         let plugin = SugarCubePlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -1343,7 +1350,8 @@ The adventure awaits!</tw-passagedata>
 
     #[test]
     fn test_inject_replace() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_fixture(&dir);
         let plugin = SugarCubePlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -1363,7 +1371,8 @@ The adventure awaits!</tw-passagedata>
 
     #[test]
     fn test_context_is_passage_name() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_fixture(&dir);
         let plugin = SugarCubePlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -1404,7 +1413,8 @@ The adventure awaits!</tw-passagedata>
 
     #[test]
     fn test_inject_changes_only_selected_duplicate_row() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("game.html");
         fs::write(
             &html,
@@ -1432,7 +1442,8 @@ Repeat me</tw-passagedata>
 
     #[test]
     fn test_stale_source_is_skipped_without_rewrite() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("game.html");
         fs::write(
             &html,
@@ -1456,7 +1467,8 @@ Repeat me</tw-passagedata>
 
     #[test]
     fn joined_inline_link_row_is_not_flattened_or_emptied() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("game.html");
         let original = r#"<tw-passagedata pid="1" name="Start" tags="">Please [[continue|Next]] now.</tw-passagedata>"#;
         fs::write(&html, original).unwrap();
@@ -1497,7 +1509,8 @@ Repeat me</tw-passagedata>
 
     #[test]
     fn quoted_gt_in_passage_name_does_not_split_header() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("game.html");
         fs::write(
             &html,
@@ -1535,7 +1548,8 @@ Repeat me</tw-passagedata>
 
     #[test]
     fn malformed_fragment_metadata_is_rejected() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("game.html");
         let original = r#"<tw-passagedata pid="1" name="Start" tags="">Please [[continue|Next]] now.</tw-passagedata>"#;
         fs::write(&html, original).unwrap();
@@ -1579,7 +1593,8 @@ Repeat me</tw-passagedata>
 
     #[test]
     fn quoted_delimiters_do_not_expose_macro_or_attribute_text() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("game.html");
         let original = r#"<tw-passagedata pid="1" name="Start" tags="">&lt;&lt;set $value = &quot;Secret &gt;&gt; word&quot;&gt;&gt;&lt;span title=&quot;Secret &gt; attribute&quot;&gt;Visible text&lt;/span&gt;</tw-passagedata>"#;
         fs::write(&html, original).unwrap();
@@ -1598,7 +1613,8 @@ Repeat me</tw-passagedata>
 
     #[test]
     fn test_inject_protects_encoded_markup_macro_and_link_target() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("game.html");
         let original = r#"<tw-passagedata pid="7" name="Start" tags="">&lt;span data-label=&quot;Open&quot;&gt;&lt;/span&gt;&lt;&lt;set $next = &quot;Secret&quot;&gt;&gt;[[Open|Secret]]</tw-passagedata>"#;
         fs::write(&html, original).unwrap();
@@ -1617,7 +1633,8 @@ Repeat me</tw-passagedata>
 
     #[test]
     fn test_extract_inject_extract_roundtrip() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let html = dir.join("game.html");
         fs::write(
             &html,

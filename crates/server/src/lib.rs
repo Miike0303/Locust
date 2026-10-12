@@ -263,22 +263,15 @@ pub struct AppState {
     pub current_project: Arc<RwLock<Option<ProjectInfo>>>,
     /// Atomic live-project admission shared by HTTP and desktop operations.
     pub project_exclusive: Arc<AtomicUsize>,
-    /// Temp directory to clean up on drop (only set for test states)
-    temp_backup_dir: Option<PathBuf>,
+    /// Test fixture owners drop after the database and other state fields.
+    #[allow(dead_code)] // Read by unit tests; production states keep this empty.
+    test_temp_dirs: std::sync::Mutex<Vec<tempfile::TempDir>>,
 }
 
 /// One in-flight xAI device login. The map key is never the raw `device_code`.
 pub struct XaiPendingAuth {
     pub device: Arc<locust_providers::xai_oauth::DeviceCode>,
     pub last_poll: Option<Instant>,
-}
-
-impl Drop for AppState {
-    fn drop(&mut self) {
-        if let Some(ref dir) = self.temp_backup_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
 }
 
 /// Create production AppState with persistent storage in the user data directory.
@@ -318,7 +311,7 @@ pub fn create_app_state() -> Arc<AppState> {
         xai_token_url: Arc::new(RwLock::new(None)),
         current_project: Arc::new(RwLock::new(None)),
         project_exclusive: Arc::new(AtomicUsize::new(0)),
-        temp_backup_dir: None,
+        test_temp_dirs: std::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -336,7 +329,11 @@ pub fn create_test_state_with_db(db_path: &std::path::Path) -> Arc<AppState> {
 
 fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
     let glossary = Arc::new(Glossary::new(db.clone()));
-    let backup_root = std::env::temp_dir().join(format!("locust_srv_{}", uuid::Uuid::new_v4()));
+    let backup_root_guard = tempfile::Builder::new()
+        .prefix("locust_srv_")
+        .tempdir()
+        .unwrap();
+    let backup_root = backup_root_guard.path().to_path_buf();
     let format_registry = locust_formats::default_registry();
     let config = AppConfig::default();
     let provider_registry = locust_providers::default_registry(&config);
@@ -357,7 +354,7 @@ fn create_test_state_inner(db: Arc<Database>) -> Arc<AppState> {
         xai_token_url: Arc::new(RwLock::new(None)),
         current_project: Arc::new(RwLock::new(None)),
         project_exclusive: Arc::new(AtomicUsize::new(0)),
-        temp_backup_dir: Some(backup_root),
+        test_temp_dirs: std::sync::Mutex::new(vec![backup_root_guard]),
     })
 }
 
@@ -3604,9 +3601,11 @@ mod tests {
     #[tokio::test]
     async fn test_open_unknown_format_returns_422() {
         let (url, _h) = setup().await;
-        let dir =
-            std::env::temp_dir().join(format!("locust_test_noformat_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_test_noformat_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let resp = client()
             .post(format!("{}/api/project/open", url))
             .json(&serde_json::json!({"path": dir.to_string_lossy()}))
@@ -3771,7 +3770,12 @@ mod tests {
     #[tokio::test]
     async fn patch_recordings_lists_langs_and_hides_them_without_a_project() {
         let (url, _h, state) = setup_with_state().await;
-        let dir = std::env::temp_dir().join(format!("locust_rec_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_rec_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let root = dir.join("game");
         let file = root.join("a.txt");
         std::fs::create_dir_all(&root).unwrap();
@@ -3972,8 +3976,12 @@ mod tests {
             ])
             .unwrap();
 
-        let dir = std::env::temp_dir().join(format!("locust_pivot_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_pivot_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let out = dir.join("new.locust.db");
 
         let resp = client()
@@ -4020,8 +4028,12 @@ mod tests {
             .save_entries(&[translated("a", "Hello", "f.json", "Hola")])
             .unwrap();
 
-        let dir = std::env::temp_dir().join(format!("locust_pivot_ex_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_pivot_ex_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let out = dir.join("exists.locust.db");
         std::fs::write(&out, b"keep-me").unwrap();
 
@@ -4208,8 +4220,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_db_switches_without_extract_or_touching_source() {
-        let dir = std::env::temp_dir().join(format!("locust_opendb_ok_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_ok_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let source_path = write_opendb_locust(
             &dir,
             "source.locust.db",
@@ -4219,6 +4234,7 @@ mod tests {
             ],
         );
         let state = create_test_state_with_db(&source_path);
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         mark_project_open(&state).await;
         let (url, _h) = start_test_server(state.clone()).await;
 
@@ -4310,8 +4326,12 @@ mod tests {
             .save_entries(&[translated("keep", "Hello", "f.json", "Hola")])
             .unwrap();
 
-        let dir = std::env::temp_dir().join(format!("locust_opendb_bad_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_bad_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let other = dir.join("not-locust.db");
         std::fs::write(&other, b"not-a-sqlite-database").unwrap();
 
@@ -4390,8 +4410,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_db_rejects_unknown_format() {
-        let dir = std::env::temp_dir().join(format!("locust_opendb_fmt_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_fmt_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let db_path = write_opendb_locust(
             &dir,
             "ok.locust.db",
@@ -4399,6 +4422,7 @@ mod tests {
         );
 
         let (url, _h, state) = setup_with_state().await;
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         mark_project_open(&state).await;
         state
             .db
@@ -4467,8 +4491,16 @@ mod tests {
     #[tokio::test]
     async fn active_patch_job_for_game_ignores_finished_and_other_folders() {
         let state = create_test_state();
-        let game_a = std::env::temp_dir().join(format!("locust_patch_a_{}", uuid::Uuid::new_v4()));
-        let game_b = std::env::temp_dir().join(format!("locust_patch_b_{}", uuid::Uuid::new_v4()));
+        let game_a_guard = tempfile::Builder::new()
+            .prefix("locust_patch_a_")
+            .tempdir()
+            .unwrap();
+        let game_a = game_a_guard.path().to_path_buf();
+        let game_b_guard = tempfile::Builder::new()
+            .prefix("locust_patch_b_")
+            .tempdir()
+            .unwrap();
+        let game_b = game_b_guard.path().to_path_buf();
         std::fs::create_dir_all(&game_a).unwrap();
         std::fs::create_dir_all(&game_b).unwrap();
         let key_a = super::patch_game_key(&game_a.to_string_lossy());
@@ -4767,7 +4799,12 @@ mod tests {
             .unwrap();
         park_job(&state, "job-translate", JobKind::Translate, None);
 
-        let dir = std::env::temp_dir().join(format!("locust_open_busy_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_open_busy_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let game = dir.join("OtherGame");
         write_rpgmaker_game(&game);
 
@@ -4824,7 +4861,12 @@ mod tests {
             .unwrap();
         let _hold = ProjectExclusiveGuard::enter(&state.project_exclusive);
 
-        let dir = std::env::temp_dir().join(format!("locust_open_excl_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_open_excl_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let game = dir.join("OtherGame");
         write_rpgmaker_game(&game);
 
@@ -4884,7 +4926,12 @@ mod tests {
             "validate must drop ProjectExclusiveGuard on completion"
         );
 
-        let dir = std::env::temp_dir().join(format!("locust_val_excl_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_val_excl_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let game = dir.join("OtherGame");
         write_rpgmaker_game(&game);
 
@@ -4917,8 +4964,12 @@ mod tests {
             .unwrap();
         park_job(&state, "job-translate", JobKind::Translate, None);
 
-        let dir = std::env::temp_dir().join(format!("locust_opendb_busy_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_busy_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let other = write_opendb_locust(
             &dir,
             "other.locust.db",
@@ -4969,7 +5020,12 @@ mod tests {
         mark_project_open(&state).await;
         park_job(&state, "job-done", JobKind::Translate, Some("completed"));
 
-        let dir = std::env::temp_dir().join(format!("locust_open_done_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_open_done_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let game = dir.join("OtherGame");
         write_rpgmaker_game(&game);
 
@@ -4999,7 +5055,12 @@ mod tests {
         mark_project_open(&state).await;
         park_job(&state, "job-patch", JobKind::Patch, None);
 
-        let dir = std::env::temp_dir().join(format!("locust_open_patch_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_open_patch_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
+        state.test_temp_dirs.lock().unwrap().push(dir_guard);
         let game = dir.join("OtherGame");
         write_rpgmaker_game(&game);
 
@@ -6027,13 +6088,11 @@ mod xai_auth_tests {
     #[tokio::test]
     async fn complete_rebuilds_registry_with_grok_sub() {
         let _lock = token_store_test_lock();
-        let token_file = std::env::temp_dir().join(format!(
-            "locust_xai_http_test_{}.json",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let token_file_guard = tempfile::Builder::new()
+            .prefix("locust_xai_http_test_")
+            .tempdir()
+            .unwrap();
+        let token_file = token_file_guard.path().join("fixture.json");
         struct TokenPathGuard(std::path::PathBuf);
         impl Drop for TokenPathGuard {
             fn drop(&mut self) {
@@ -6108,17 +6167,20 @@ mod xai_auth_tests {
         );
     }
 
-    fn game_temp(prefix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_{prefix}_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn game_temp(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("locust_{prefix}_"))
+            .tempdir()
+            .unwrap()
     }
 
     #[tokio::test]
     async fn restore_writes_to_backup_origin_not_the_open_project() {
         let state = create_test_state();
-        let game_a = game_temp("restore_a");
-        let game_b = game_temp("restore_b");
+        let game_a_guard = game_temp("restore_a");
+        let game_a = game_a_guard.path().to_path_buf();
+        let game_b_guard = game_temp("restore_b");
+        let game_b = game_b_guard.path().to_path_buf();
         std::fs::write(game_a.join("data.json"), r#"{"hp": 100}"#).unwrap();
         std::fs::write(game_b.join("b_only.txt"), "keep-b").unwrap();
 
@@ -6161,7 +6223,8 @@ mod xai_auth_tests {
     #[tokio::test]
     async fn restore_does_not_require_an_open_project() {
         let state = create_test_state();
-        let game = game_temp("restore_no_proj");
+        let game_guard = game_temp("restore_no_proj");
+        let game = game_guard.path().to_path_buf();
         std::fs::write(game.join("data.json"), r#"{"hp": 100}"#).unwrap();
         let entry = state.backup_manager.create_backup(&game).unwrap();
         std::fs::write(game.join("data.json"), "MUTATED").unwrap();
@@ -6182,7 +6245,8 @@ mod xai_auth_tests {
     #[tokio::test]
     async fn restore_missing_source_directory_is_4xx() {
         let state = create_test_state();
-        let game = game_temp("restore_gone");
+        let game_guard = game_temp("restore_gone");
+        let game = game_guard.path().to_path_buf();
         std::fs::write(game.join("data.json"), r#"{"hp": 100}"#).unwrap();
         let entry = state.backup_manager.create_backup(&game).unwrap();
         std::fs::remove_dir_all(&game).unwrap();
@@ -6206,7 +6270,8 @@ mod xai_auth_tests {
     #[tokio::test]
     async fn restore_missing_or_corrupt_manifest_is_4xx() {
         let state = create_test_state();
-        let game = game_temp("restore_manifest");
+        let game_guard = game_temp("restore_manifest");
+        let game = game_guard.path().to_path_buf();
         std::fs::write(game.join("data.json"), r#"{"hp": 100}"#).unwrap();
 
         let missing = state.backup_manager.create_backup(&game).unwrap();

@@ -1775,19 +1775,21 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_vxa_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_vxa_")
+            .tempdir()
+            .unwrap()
     }
 
-    fn create_vxa_fixture() -> PathBuf {
-        let dir = tempdir();
+    fn create_vxa_fixture() -> tempfile::TempDir {
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("Data");
         fs::create_dir_all(&data_dir).unwrap();
         let bytes = build_test_fixture();
         fs::write(data_dir.join("Actors.rvdata2"), &bytes).unwrap();
-        dir
+        dir_guard
     }
 
     fn make_cmd(code: i64, params: Vec<MarshalValue>) -> MarshalValue {
@@ -1804,8 +1806,9 @@ mod tests {
     }
 
     /// XP-style map: Show Text (101) carries the first line, 401s continue it.
-    fn create_xp_map_fixture() -> PathBuf {
-        let dir = tempdir();
+    fn create_xp_map_fixture() -> tempfile::TempDir {
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("Data");
         fs::create_dir_all(&data_dir).unwrap();
 
@@ -1848,12 +1851,13 @@ mod tests {
             },
         };
         fs::write(data_dir.join("Map001.rxdata"), map.serialize()).unwrap();
-        dir
+        dir_guard
     }
 
     #[test]
     fn test_xp_message_block_extract_and_rewrap() {
-        let dir = create_xp_map_fixture();
+        let dir_guard = create_xp_map_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RpgMakerVxaPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
 
@@ -1932,14 +1936,16 @@ mod tests {
 
     #[test]
     fn test_detect_vxa_directory() {
-        let dir = create_vxa_fixture();
+        let dir_guard = create_vxa_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RpgMakerVxaPlugin::new();
         assert!(plugin.detect(&dir));
     }
 
     #[test]
     fn test_detect_ignores_mv() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("data"); // lowercase = MV style
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(data_dir.join("Actors.json"), "[]").unwrap();
@@ -1949,7 +1955,8 @@ mod tests {
 
     #[test]
     fn test_extract_strings_from_fixture() {
-        let dir = create_vxa_fixture();
+        let dir_guard = create_vxa_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RpgMakerVxaPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
 
@@ -1968,7 +1975,8 @@ mod tests {
 
     #[test]
     fn test_inject_roundtrip() {
-        let dir = create_vxa_fixture();
+        let dir_guard = create_vxa_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RpgMakerVxaPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
 
@@ -1991,7 +1999,8 @@ mod tests {
 
     #[test]
     fn test_inject_rewraps_flattened_multiline_description() {
-        let dir = create_vxa_fixture();
+        let dir_guard = create_vxa_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RpgMakerVxaPlugin::new();
         const ID: &str = "Actors.rvdata2#1#@description";
 
@@ -2044,7 +2053,8 @@ mod tests {
 
     #[test]
     fn test_inject_preserves_binary_structure() {
-        let dir = create_vxa_fixture();
+        let dir_guard = create_vxa_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let file_path = dir.join("Data").join("Actors.rvdata2");
         let original_len = fs::metadata(&file_path).unwrap().len();
 
