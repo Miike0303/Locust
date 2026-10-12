@@ -2248,7 +2248,11 @@ mod tests {
 
     #[test]
     fn copy_entries_relocate_before_a_path_based_plugin_can_write() {
-        let base = std::env::temp_dir().join(format!("locust_copy_paths_{}", uuid::Uuid::new_v4()));
+        let base_guard = tempfile::Builder::new()
+            .prefix("locust_copy_paths_")
+            .tempdir()
+            .unwrap();
+        let base = base_guard.path().to_path_buf();
         let original = base.join("original");
         let copy = base.join("copy");
         fs::create_dir_all(&original).unwrap();
@@ -2436,7 +2440,8 @@ mod tests {
 
     #[test]
     fn test_mock_extract_returns_3_entries() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let file = tmp.join("game.mock");
         fs::write(&file, "").unwrap();
         let plugin = MockFormatPlugin;
@@ -2448,7 +2453,8 @@ mod tests {
 
     #[test]
     fn test_inject_replace_roundtrip() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let file = tmp.join("game.mock");
         fs::write(&file, "").unwrap();
         let plugin = MockFormatPlugin;
@@ -2465,7 +2471,8 @@ mod tests {
 
     #[test]
     fn test_inject_add_creates_lang_dir() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let plugin = MockFormatPlugin;
         let mut entries = plugin.extract(&tmp).unwrap();
         entries[0].translation = Some("Hola".to_string());
@@ -2476,7 +2483,8 @@ mod tests {
 
     #[test]
     fn test_inject_report_counts() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let file = tmp.join("game.mock");
         fs::write(&file, "").unwrap();
         let plugin = MockFormatPlugin;
@@ -2498,10 +2506,11 @@ mod tests {
         assert_eq!(detected.id(), "mock");
     }
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_test_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_test_")
+            .tempdir()
+            .unwrap()
     }
 
     // ─── MultiLangInjector tests ────────────────────────────
@@ -2511,18 +2520,21 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn make_game_dir() -> PathBuf {
-        let dir = tempdir().join("mygame");
+    fn make_game_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().join("mygame");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("game.mock"), "").unwrap();
         fs::write(dir.join("image.png"), "fake png data").unwrap();
-        dir
+        (dir_guard, dir)
     }
 
-    fn setup_injector() -> (MultiLangInjector, PathBuf, PathBuf) {
-        let game_dir = make_game_dir();
-        let backup_root = tempdir().join("backups");
-        let output_dir = tempdir().join("output");
+    fn setup_injector() -> (Vec<tempfile::TempDir>, MultiLangInjector, PathBuf, PathBuf) {
+        let (_game_guard, game_dir) = make_game_dir();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().join("backups");
+        let output_dir_guard = tempdir();
+        let output_dir = output_dir_guard.path().join("output");
         fs::create_dir_all(&output_dir).unwrap();
 
         let db = Arc::new(Database::open_in_memory().unwrap());
@@ -2545,7 +2557,12 @@ mod tests {
         registry.register(Box::new(MockFormatPlugin));
 
         let injector = MultiLangInjector::new(Arc::new(registry), db, backup);
-        (injector, game_dir, output_dir)
+        (
+            vec![_game_guard, backup_root_guard, output_dir_guard],
+            injector,
+            game_dir,
+            output_dir,
+        )
     }
 
     async fn assert_inject_materializes_entries_once(mode: OutputMode) {
@@ -2611,7 +2628,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_replace_single_language() {
-        let (injector, game_dir, output_dir) = setup_contained_injector();
+        let (_injector_guards, injector, game_dir, output_dir) = setup_contained_injector();
         let (tx, mut rx) = mpsc::channel(100);
 
         let report = injector
@@ -2644,7 +2661,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_replace_rejects_multiple_languages_for_one_database() {
-        let (injector, game_dir, output_dir) = setup_injector();
+        let (_injector_guards, injector, game_dir, output_dir) = setup_injector();
         let (tx, _rx) = mpsc::channel(100);
 
         let error = injector
@@ -2665,7 +2682,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn test_replace_copies_on_windows() {
-        let (injector, game_dir, output_dir) = setup_contained_injector();
+        let (_injector_guards, injector, game_dir, output_dir) = setup_contained_injector();
         let (tx, mut rx) = mpsc::channel(100);
 
         let report = injector
@@ -2691,7 +2708,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_replace_output_does_not_share_inodes_with_original_on_unix() {
-        let (injector, game_dir, output_dir) = setup_contained_injector();
+        let (_injector_guards, injector, game_dir, output_dir) = setup_contained_injector();
         let (tx, mut rx) = mpsc::channel(100);
 
         injector
@@ -2719,7 +2736,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_single_language() {
-        let (injector, game_dir, _output_dir) = setup_injector();
+        let (_injector_guards, injector, game_dir, _output_dir) = setup_injector();
         let (tx, mut rx) = mpsc::channel(100);
 
         let report = injector
@@ -2748,8 +2765,8 @@ mod tests {
 
     #[tokio::test]
     async fn separate_language_databases_keep_separate_values() {
-        let (es, es_game, _) = setup_injector();
-        let (fr, fr_game, _) = setup_injector();
+        let (_es_guards, es, es_game, _) = setup_injector();
+        let (_fr_guards, fr, fr_game, _) = setup_injector();
         es.db
             .save_translation("mock#0", "Español", "manual")
             .await
@@ -2792,7 +2809,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_rejects_multiple_languages_for_one_database() {
-        let (injector, game_dir, _output_dir) = setup_injector();
+        let (_injector_guards, injector, game_dir, _output_dir) = setup_injector();
         let (tx, _rx) = mpsc::channel(100);
 
         let error = injector
@@ -2812,7 +2829,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backup_created_before_inject() {
-        let (injector, game_dir, output_dir) = setup_contained_injector();
+        let (_injector_guards, injector, game_dir, output_dir) = setup_contained_injector();
         let (tx, mut rx) = mpsc::channel(100);
 
         // Replace mode with output_dir skips backup (original untouched)
@@ -2847,12 +2864,14 @@ mod tests {
     async fn test_backup_failure_is_fatal_and_nothing_is_injected() {
         // An unsuccessful backup must refuse the operation before any copy or
         // injection, keeping the promised recovery path available.
-        let game_dir = make_game_dir();
-        let output_dir = tempdir().join("output");
+        let (_game_guard, game_dir) = make_game_dir();
+        let output_dir_guard = tempdir();
+        let output_dir = output_dir_guard.path().join("output");
         fs::create_dir_all(&output_dir).unwrap();
         // A backup root that is a FILE: create_backup cannot create its
         // timestamp directory under it, on any platform.
-        let bad_backup_root = tempdir().join("not_a_dir");
+        let bad_backup_root_guard = tempdir();
+        let bad_backup_root = bad_backup_root_guard.path().join("not_a_dir");
         fs::write(&bad_backup_root, b"occupied").unwrap();
 
         let db = Arc::new(Database::open_in_memory().unwrap());
@@ -2898,7 +2917,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backup_created_for_add_mode() {
-        let (injector, game_dir, _output_dir) = setup_injector();
+        let (_injector_guards, injector, game_dir, _output_dir) = setup_injector();
         let (tx, mut rx) = mpsc::channel(100);
 
         // Add mode should create a real backup
@@ -2923,8 +2942,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_language_plugin_failure_is_reported() {
-        let game_dir = make_game_dir();
-        let backup_root = tempdir().join("backups");
+        let (_game_guard, game_dir) = make_game_dir();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().join("backups");
 
         let db = Arc::new(Database::open_in_memory().unwrap());
         let backup = Arc::new(BackupManager::new(backup_root));
@@ -3052,10 +3072,12 @@ mod tests {
         }
     }
 
-    fn setup_contained_injector() -> (MultiLangInjector, PathBuf, PathBuf) {
-        let game_dir = make_game_dir();
-        let backup_root = tempdir().join("backups");
-        let output_dir = tempdir().join("output");
+    fn setup_contained_injector() -> (Vec<tempfile::TempDir>, MultiLangInjector, PathBuf, PathBuf) {
+        let (_game_guard, game_dir) = make_game_dir();
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().join("backups");
+        let output_dir_guard = tempdir();
+        let output_dir = output_dir_guard.path().join("output");
         fs::create_dir_all(&output_dir).unwrap();
 
         let db = Arc::new(Database::open_in_memory().unwrap());
@@ -3071,12 +3093,17 @@ mod tests {
         let mut registry = FormatRegistry::new();
         registry.register(Box::new(ContainedMock));
         let injector = MultiLangInjector::new(Arc::new(registry), db, backup);
-        (injector, game_dir, output_dir)
+        (
+            vec![_game_guard, backup_root_guard, output_dir_guard],
+            injector,
+            game_dir,
+            output_dir,
+        )
     }
 
     #[tokio::test]
     async fn replace_after_direct_does_not_copy_game_bound_history() {
-        let (injector, game, output) = setup_contained_injector();
+        let (_injector_guards, injector, game, output) = setup_contained_injector();
         fs::create_dir(game.join(".locust-injections-notes")).unwrap();
         fs::write(game.join(".locust-injections-notes/user.txt"), b"user").unwrap();
         fs::create_dir_all(game.join("assets/.locust-injections")).unwrap();
@@ -3153,7 +3180,7 @@ mod tests {
     #[tokio::test]
     async fn replace_rejects_unknown_and_pending_before_backup_or_output() {
         for pending in [false, true] {
-            let (injector, game, output) = setup_contained_injector();
+            let (_injector_guards, injector, game, output) = setup_contained_injector();
             let metadata = game.join(crate::injection_transaction::STORE_DIR);
             if pending {
                 let result = crate::injection_transaction::run(
@@ -3226,7 +3253,7 @@ mod tests {
                 ContainedMock.inject(path, entries)
             }
         }
-        let (mut injector, game, output) = setup_contained_injector();
+        let (_injector_guards, mut injector, game, output) = setup_contained_injector();
         let mut registry = FormatRegistry::new();
         registry.register(Box::new(CheckLock(game.clone())));
         injector.registry = Arc::new(registry);
@@ -3329,7 +3356,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_multilang_injection_records_every_processed_language() {
-        let (injector, game_dir, output_dir) = setup_contained_injector();
+        let (_injector_guards, injector, game_dir, output_dir) = setup_contained_injector();
         let decoy = injector.backup_manager.create_backup(&game_dir).unwrap();
         let (tx, mut rx) = mpsc::channel(100);
         let langs = vec!["es".to_string()];
@@ -3405,7 +3432,7 @@ mod tests {
         // MockFormatPlugin writes `<dest>.injected` — a SIBLING of the
         // per-language copy, outside its root. Recording must hard-fail inside
         // the injector and persist nothing for that language.
-        let (injector, game_dir, output_dir) = setup_injector();
+        let (_injector_guards, injector, game_dir, output_dir) = setup_injector();
         let (tx, mut rx) = mpsc::channel(100);
         let langs = vec!["es".to_string()];
         let err = injector
@@ -3488,7 +3515,7 @@ mod tests {
     #[tokio::test]
     async fn replace_holds_destination_lock_through_copy_inject_and_record() {
         let _seam = DestLockSeam;
-        let (injector, game, output) = setup_contained_injector();
+        let (_injector_guards, injector, game, output) = setup_contained_injector();
         REPLACE_AFTER_DEST_LOCK.with(|hook| hook.set(Some(observe_dest_locked)));
         let (tx, _rx) = mpsc::channel(10);
         let report = injector
@@ -3533,7 +3560,7 @@ mod tests {
                 Err(LocustError::InjectionError("plugin refused".into()))
             }
         }
-        let (mut injector, game, output) = setup_contained_injector();
+        let (_injector_guards, mut injector, game, output) = setup_contained_injector();
         let mut registry = FormatRegistry::new();
         registry.register(Box::new(FailInject));
         injector.registry = Arc::new(registry);
@@ -3582,7 +3609,7 @@ mod tests {
                 })
             }
         }
-        let (injector, game, output) = setup_contained_injector();
+        let (_injector_guards, injector, game, output) = setup_contained_injector();
         let (tx, _rx) = mpsc::channel(10);
         let first = injector
             .inject(
@@ -3608,7 +3635,8 @@ mod tests {
             injector.db.clone(),
             injector.backup_manager.clone(),
         );
-        let empty_out = tempdir().join("output-zero");
+        let empty_out_guard = tempdir();
+        let empty_out = empty_out_guard.path().join("output-zero");
         fs::create_dir_all(&empty_out).unwrap();
         let (tx, _rx) = mpsc::channel(10);
         let second = zero
@@ -3638,11 +3666,14 @@ mod tests {
 
     #[tokio::test]
     async fn replace_records_file_source_with_destination_root() {
-        let parent = tempdir();
+        let parent_guard = tempdir();
+        let parent = parent_guard.path().to_path_buf();
         let file = parent.join("game.mock");
         fs::write(&file, b"Hello").unwrap();
-        let backup_root = tempdir().join("backups");
-        let output_dir = tempdir().join("output");
+        let backup_root_guard = tempdir();
+        let backup_root = backup_root_guard.path().join("backups");
+        let output_dir_guard = tempdir();
+        let output_dir = output_dir_guard.path().join("output");
         fs::create_dir_all(&output_dir).unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
         let mut entries = vec![StringEntry::new("mock#0", "Hello", file.clone())];
@@ -3728,7 +3759,8 @@ mod tests {
     #[test]
     fn test_record_injection_for_lang_zero_write_outcomes() {
         let db = Database::open_in_memory().unwrap();
-        let root = tempdir();
+        let root_guard = tempdir();
+        let root = root_guard.path().to_path_buf();
         let file = root.join("data.bin");
         fs::write(&file, b"translated bytes").unwrap();
 
@@ -3761,7 +3793,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multilang_report_structure() {
-        let (injector, game_dir, output_dir) = setup_contained_injector();
+        let (_injector_guards, injector, game_dir, output_dir) = setup_contained_injector();
         let (tx, mut rx) = mpsc::channel(100);
 
         let report = injector
@@ -4090,7 +4122,8 @@ mod tests {
             fixture.display()
         );
 
-        let game_dir = tempdir().join("rpg");
+        let game_dir_guard = tempdir();
+        let game_dir = game_dir_guard.path().join("rpg");
         copy_tree(&fixture, &game_dir);
         let actors = game_dir.join(&actors_rel);
         let original = fs::read(&actors).unwrap();
@@ -4105,7 +4138,8 @@ mod tests {
             id: "rpgmaker-mv",
             target_rel: "data/Actors.json",
         }));
-        let mgr = BackupManager::new(tempdir().join("bak"));
+        let mgr_guard = tempdir();
+        let mgr = BackupManager::new(mgr_guard.path().join("bak"));
 
         let report = inject_direct(
             &registry,
@@ -4141,7 +4175,8 @@ mod tests {
     #[test]
     fn test_inject_direct_backs_up_kirikiri_before_write() {
         // Same stale-list miss as RPG Maker — KiriKiri inject overwrites .ks.
-        let game_dir = tempdir().join("krkr");
+        let game_dir_guard = tempdir();
+        let game_dir = game_dir_guard.path().join("krkr");
         fs::create_dir_all(&game_dir).unwrap();
         let ks = game_dir.join("scenario.ks");
         let original = b"; comment\n*start\nHello, world!\nThis is narration.\n";
@@ -4157,7 +4192,8 @@ mod tests {
             id: "kirikiri",
             target_rel: "scenario.ks",
         }));
-        let mgr = BackupManager::new(tempdir().join("bak"));
+        let mgr_guard = tempdir();
+        let mgr = BackupManager::new(mgr_guard.path().join("bak"));
 
         let report =
             inject_direct(&registry, &db, &mgr, &game_dir, "kirikiri", &["es".into()]).unwrap();
@@ -4179,7 +4215,8 @@ mod tests {
     fn test_inject_direct_backup_failure_refuses_and_does_not_write() {
         // A previously excluded format used to skip backup entirely, so a
         // broken backup root still let inject overwrite the game.
-        let game_dir = tempdir().join("rpg");
+        let game_dir_guard = tempdir();
+        let game_dir = game_dir_guard.path().join("rpg");
         let data = game_dir.join("data");
         fs::create_dir_all(&data).unwrap();
         let actors = data.join("Actors.json");
@@ -4195,7 +4232,8 @@ mod tests {
             id: "rpgmaker-mv",
             target_rel: "data/Actors.json",
         }));
-        let bad_root = tempdir().join("not_a_dir");
+        let bad_root_guard = tempdir();
+        let bad_root = bad_root_guard.path().join("not_a_dir");
         fs::write(&bad_root, b"occupied").unwrap();
         let mgr = BackupManager::new(bad_root);
 
@@ -4251,11 +4289,12 @@ mod tests {
     }
 
     fn direct_revision_mutation_refused(mutate: fn(&Path), single_file: bool) {
-        let (game, one, _) = two_html_game();
+        let (_game_guard, game, one, _) = two_html_game();
         let selection = if single_file { &one } else { &game };
         let db = Database::open_in_memory().unwrap();
         save_translated(&db, "one", "ONE", PathBuf::from("one.html"), "Uno");
-        let mgr = BackupManager::new(tempdir().join("backups"));
+        let mgr_guard = tempdir();
+        let mgr = BackupManager::new(mgr_guard.path().join("backups"));
         let first = inject_direct(
             &direct_html_registry(),
             &db,
@@ -4367,14 +4406,15 @@ mod tests {
         }
     }
 
-    fn two_html_game() -> (PathBuf, PathBuf, PathBuf) {
-        let game = tempdir().join("game");
+    fn two_html_game() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let game_guard = tempdir();
+        let game = game_guard.path().join("game");
         fs::create_dir_all(&game).unwrap();
         let one = game.join("one.html");
         let two = game.join("two.html");
         fs::write(&one, b"ONE").unwrap();
         fs::write(&two, b"TWO").unwrap();
-        (game, one, two)
+        (game_guard, game, one, two)
     }
 
     fn direct_html_registry() -> FormatRegistry {
@@ -4405,12 +4445,13 @@ mod tests {
 
     #[test]
     fn direct_first_injection_records_written_files_and_new_backup_as_pristine() {
-        let (game, one, two) = two_html_game();
+        let (_game_guard, game, one, two) = two_html_game();
         let original_one = fs::read(&one).unwrap();
         let original_two = fs::read(&two).unwrap();
         let db = Database::open_in_memory().unwrap();
         save_translated(&db, "one", "ONE", PathBuf::from("one.html"), "Uno");
-        let mgr = BackupManager::new(tempdir().join("bak"));
+        let mgr_guard = tempdir();
+        let mgr = BackupManager::new(mgr_guard.path().join("bak"));
         let report = inject_direct(
             &direct_html_registry(),
             &db,
@@ -4448,10 +4489,11 @@ mod tests {
 
     #[test]
     fn direct_partial_injections_keep_union_and_original_provenance() {
-        let (game, one, two) = two_html_game();
+        let (_game_guard, game, one, two) = two_html_game();
         let original_one = fs::read(&one).unwrap();
         let original_two = fs::read(&two).unwrap();
-        let first_store = tempdir().join("store1");
+        let first_store_guard = tempdir();
+        let first_store = first_store_guard.path().join("store1");
         let db = Database::open_in_memory().unwrap();
         save_translated(&db, "one", "ONE", PathBuf::from("one.html"), "Uno");
         let first_mgr = BackupManager::new(first_store.clone());
@@ -4468,7 +4510,8 @@ mod tests {
         let original_path = first.backup_path.clone().unwrap();
 
         save_translated(&db, "two", "TWO", PathBuf::from("two.html"), "Dos");
-        let second_mgr = BackupManager::new(tempdir().join("store2"));
+        let second_mgr_guard = tempdir();
+        let second_mgr = BackupManager::new(second_mgr_guard.path().join("store2"));
         let decoy = second_mgr.create_backup(&game).unwrap();
         let second = inject_direct(
             &direct_html_registry(),
@@ -4532,11 +4575,12 @@ mod tests {
 
     #[test]
     fn direct_drifted_prior_file_refuses_before_new_write() {
-        let (game, one, two) = two_html_game();
+        let (_game_guard, game, one, two) = two_html_game();
         let original_two = fs::read(&two).unwrap();
         let db = Database::open_in_memory().unwrap();
         save_translated(&db, "one", "ONE", PathBuf::from("one.html"), "Uno");
-        let mgr = BackupManager::new(tempdir().join("bak"));
+        let mgr_guard = tempdir();
+        let mgr = BackupManager::new(mgr_guard.path().join("bak"));
         inject_direct(
             &direct_html_registry(),
             &db,
@@ -4570,11 +4614,12 @@ mod tests {
     #[test]
     fn direct_invalid_original_backup_refuses_before_writes() {
         for kind in ["missing", "corrupt", "wrong"] {
-            let (game, one, two) = two_html_game();
+            let (_game_guard, game, one, two) = two_html_game();
             let original_two = fs::read(&two).unwrap();
             let db = Database::open_in_memory().unwrap();
             save_translated(&db, "one", "ONE", PathBuf::from("one.html"), "Uno");
-            let mgr = BackupManager::new(tempdir().join("bak"));
+            let mgr_guard = tempdir();
+            let mgr = BackupManager::new(mgr_guard.path().join("bak"));
             let first = inject_direct(
                 &direct_html_registry(),
                 &db,
@@ -4585,13 +4630,15 @@ mod tests {
             )
             .unwrap();
             let original_path = PathBuf::from(first.backup_path.as_ref().unwrap());
+            // The copied manifest names this game; validation still needs it below.
+            let other_guard = (kind == "wrong").then(tempdir);
             match kind {
                 "missing" => fs::remove_dir_all(&original_path).unwrap(),
                 "corrupt" => {
                     fs::write(original_path.join("payload").join("one.html"), b"CORRUPT").unwrap();
                 }
                 "wrong" => {
-                    let other = tempdir().join("other");
+                    let other = other_guard.as_ref().unwrap().path().join("other");
                     fs::create_dir(&other).unwrap();
                     fs::write(other.join("n.txt"), b"nope").unwrap();
                     let wrong = mgr.create_backup(&other).unwrap();
@@ -4611,6 +4658,9 @@ mod tests {
             )
             .expect_err(kind);
             let message = err.to_string();
+            if kind == "wrong" {
+                assert!(message.contains("different game"), "{kind}: {message}");
+            }
             assert!(
                 message.contains("backup")
                     || message.contains("manifest")
@@ -4634,12 +4684,13 @@ mod tests {
 
     #[test]
     fn direct_root_mismatch_starts_new_generation() {
-        let (game_a, one_a, two_a) = two_html_game();
-        let (game_b, one_b, two_b) = two_html_game();
+        let (_game_a_guard, game_a, one_a, two_a) = two_html_game();
+        let (_game_b_guard, game_b, one_b, two_b) = two_html_game();
         let db = Database::open_in_memory().unwrap();
         save_translated(&db, "one", "ONE", PathBuf::from("one.html"), "Uno");
         save_translated(&db, "two", "TWO", PathBuf::from("two.html"), "Dos");
-        let mgr = BackupManager::new(tempdir().join("bak"));
+        let mgr_guard = tempdir();
+        let mgr = BackupManager::new(mgr_guard.path().join("bak"));
         let first = inject_direct(
             &direct_html_registry(),
             &db,
@@ -4685,11 +4736,12 @@ mod tests {
 
     #[test]
     fn direct_noop_keeps_full_prior_recording() {
-        let (game, one, two) = two_html_game();
+        let (_game_guard, game, one, two) = two_html_game();
         let db = Database::open_in_memory().unwrap();
         save_translated(&db, "one", "ONE", PathBuf::from("one.html"), "Uno");
         save_translated(&db, "two", "TWO", PathBuf::from("two.html"), "Dos");
-        let mgr = BackupManager::new(tempdir().join("bak"));
+        let mgr_guard = tempdir();
+        let mgr = BackupManager::new(mgr_guard.path().join("bak"));
         let first = inject_direct(
             &direct_html_registry(),
             &db,
@@ -4740,11 +4792,12 @@ mod tests {
 
     #[test]
     fn direct_selected_file_refuses_sibling_folder_inventory() {
-        let (game, one, two) = two_html_game();
+        let (_game_guard, game, one, two) = two_html_game();
         let original_two = fs::read(&two).unwrap();
         let db = Database::open_in_memory().unwrap();
         save_translated(&db, "one", "ONE", PathBuf::from("one.html"), "Uno");
-        let mgr = BackupManager::new(tempdir().join("bak"));
+        let mgr_guard = tempdir();
+        let mgr = BackupManager::new(mgr_guard.path().join("bak"));
         inject_direct(
             &direct_html_registry(),
             &db,

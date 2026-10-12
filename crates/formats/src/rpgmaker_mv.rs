@@ -2271,11 +2271,15 @@ mod tests {
             .join("rpgmaker_mv")
     }
 
-    fn temp_game_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_rpg_{}", uuid::Uuid::new_v4()));
+    fn temp_game_dir() -> tempfile::TempDir {
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_rpg_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let src = fixture_dir();
         copy_dir(&src, &dir);
-        dir
+        dir_guard
     }
 
     fn copy_dir(src: &Path, dst: &Path) {
@@ -2977,15 +2981,22 @@ mod tests {
 
     #[test]
     fn test_detect_non_rpgmaker() {
-        let dir = std::env::temp_dir().join(format!("locust_notrpg_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_notrpg_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = RpgMakerMvPlugin::new();
         assert!(!plugin.detect(&dir));
     }
 
     #[test]
     fn test_encrypted_game_errors_clearly() {
-        let dir = std::env::temp_dir().join(format!("locust_enc_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_enc_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let data = dir.join("data");
         fs::create_dir_all(&data).unwrap();
         // Encryption-plugin wrapper, not a real System.json
@@ -3085,7 +3096,8 @@ mod tests {
 
     #[test]
     fn test_inject_block_preserves_name_tag() {
-        let game_dir = temp_game_dir();
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         let plugin = RpgMakerMvPlugin::new();
         let mut entries = plugin.extract(&game_dir).unwrap();
 
@@ -3331,7 +3343,8 @@ mod tests {
     fn test_replace_inject_rewraps_multiline_description() {
         // Replace mode writes database fields verbatim, so a flat provider
         // reply used to ship a single overlong line into a wrapped field.
-        let game_dir = temp_game_dir();
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         let actors = game_dir.join("data").join("Actors.json");
         let src_profile = "A brave hero from the\nnorthern mountain village.";
         let mut json: serde_json::Value =
@@ -3370,7 +3383,8 @@ mod tests {
 
     #[test]
     fn test_inject_message_block_rewraps_lines() {
-        let game_dir = temp_game_dir();
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         let plugin = RpgMakerMvPlugin::new();
         let mut entries = plugin.extract(&game_dir).unwrap();
 
@@ -3438,7 +3452,8 @@ mod tests {
 
     #[test]
     fn test_inject_replace_roundtrip() {
-        let game_dir = temp_game_dir();
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         let plugin = RpgMakerMvPlugin::new();
         let mut entries = plugin.extract(&game_dir).unwrap();
 
@@ -3458,7 +3473,8 @@ mod tests {
 
     #[test]
     fn test_inject_replace_rejects_stale_id_without_rewriting_file() {
-        let game_dir = temp_game_dir();
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         let plugin = RpgMakerMvPlugin::new();
         let mut entries = plugin.extract(&game_dir).unwrap();
         let selected = entries
@@ -3483,7 +3499,8 @@ mod tests {
 
     #[test]
     fn test_inject_replace_identity_is_not_counted_as_write() {
-        let game_dir = temp_game_dir();
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         let plugin = RpgMakerMvPlugin::new();
         let mut entries = plugin.extract(&game_dir).unwrap();
         let selected = entries
@@ -3499,7 +3516,8 @@ mod tests {
 
     #[test]
     fn test_inject_preserves_other_fields() {
-        let game_dir = temp_game_dir();
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         let plugin = RpgMakerMvPlugin::new();
         let mut entries = plugin.extract(&game_dir).unwrap();
 
@@ -3608,7 +3626,8 @@ mod tests {
 
     #[test]
     fn test_inject_add_mz_creates_file() {
-        let game_dir = temp_game_dir();
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         let plugin = RpgMakerMvPlugin::new();
         let mut entries = plugin.extract(&game_dir).unwrap();
         for entry in &mut entries {
@@ -3626,7 +3645,8 @@ mod tests {
 
     #[test]
     fn test_inject_add_mv_creates_file() {
-        let game_dir = temp_game_dir();
+        let game_dir_guard = temp_game_dir();
+        let game_dir = game_dir_guard.path().to_path_buf();
         // Create MV marker
         fs::create_dir_all(game_dir.join("js")).unwrap();
         fs::write(game_dir.join("js").join("rpg_core.js"), "").unwrap();
@@ -3669,7 +3689,11 @@ mod tests {
 
     #[test]
     fn test_detect_por_jsono_only_deploy() {
-        let dir = std::env::temp_dir().join(format!("locust_por_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_por_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let data = dir.join("data");
         fs::create_dir_all(&data).unwrap();
         fs::create_dir_all(dir.join("js")).unwrap();
@@ -3690,7 +3714,11 @@ mod tests {
 
     #[test]
     fn test_extract_system_jsono() {
-        let dir = std::env::temp_dir().join(format!("locust_por_ex_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_por_ex_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let data = dir.join("data");
         fs::create_dir_all(&data).unwrap();
         write_jsono(
@@ -3741,7 +3769,11 @@ mod tests {
 
     #[test]
     fn test_extract_iavra_packs_prefer_en() {
-        let dir = std::env::temp_dir().join(format!("locust_iavra_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_iavra_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let data = dir.join("data");
         fs::create_dir_all(&data).unwrap();
         fs::create_dir_all(dir.join("js")).unwrap();
@@ -3812,7 +3844,11 @@ mod tests {
 
     #[test]
     fn test_inject_add_iavra_writes_target_jsono() {
-        let dir = std::env::temp_dir().join(format!("locust_iavra_inj_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_iavra_inj_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let data = dir.join("data");
         fs::create_dir_all(&data).unwrap();
         fs::create_dir_all(dir.join("js")).unwrap();
@@ -3865,7 +3901,11 @@ mod tests {
 
     #[test]
     fn test_inject_replace_jsono_in_place() {
-        let dir = std::env::temp_dir().join(format!("locust_por_inj_{}", uuid::Uuid::new_v4()));
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_por_inj_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let data = dir.join("data");
         fs::create_dir_all(&data).unwrap();
         write_jsono(

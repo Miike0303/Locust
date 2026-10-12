@@ -484,17 +484,21 @@ mod tests {
     /// parallel, so one test could read the `.wolf` file while another was
     /// mid-write, intermittently failing on missing strings. It also meant the
     /// suite overwrote a tracked repo file on every run.
-    fn setup_fixture() -> PathBuf {
+    fn setup_fixture() -> tempfile::TempDir {
         temp_wolf_dir()
     }
 
-    fn temp_wolf_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_wolf_{}", uuid::Uuid::new_v4()));
+    fn temp_wolf_dir() -> tempfile::TempDir {
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_wolf_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("Data");
         fs::create_dir_all(&data_dir).unwrap();
         let bytes = build_test_fixture();
         fs::write(data_dir.join("BasicData.wolf"), &bytes).unwrap();
-        dir
+        dir_guard
     }
 
     #[test]
@@ -508,14 +512,16 @@ mod tests {
 
     #[test]
     fn test_detect_wolf_dir() {
-        let dir = setup_fixture();
+        let dir_guard = setup_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = WolfRpgPlugin::new();
         assert!(plugin.detect(&dir));
     }
 
     #[test]
     fn test_detect_wolf_file() {
-        let dir = setup_fixture();
+        let dir_guard = setup_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let file = dir.join("Data").join("BasicData.wolf");
         let plugin = WolfRpgPlugin::new();
         assert!(plugin.detect(&file));
@@ -523,15 +529,19 @@ mod tests {
 
     #[test]
     fn test_detect_non_wolf() {
-        let dir = std::env::temp_dir().join(format!("locust_notwolf_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_notwolf_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = WolfRpgPlugin::new();
         assert!(!plugin.detect(&dir));
     }
 
     #[test]
     fn test_extract_heuristic_finds_strings() {
-        let dir = setup_fixture();
+        let dir_guard = setup_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = WolfRpgPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
 
@@ -551,7 +561,8 @@ mod tests {
 
     #[test]
     fn test_inject_shorter_string() {
-        let dir = temp_wolf_dir();
+        let dir_guard = temp_wolf_dir();
+        let dir = dir_guard.path().to_path_buf();
         let file_path = dir.join("Data").join("BasicData.wolf");
         let original_len = fs::metadata(&file_path).unwrap().len();
 
@@ -575,7 +586,8 @@ mod tests {
 
     #[test]
     fn test_inject_longer_string_skips_not_hard_fail() {
-        let dir = temp_wolf_dir();
+        let dir_guard = temp_wolf_dir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = WolfRpgPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
 
@@ -601,7 +613,8 @@ mod tests {
 
     #[test]
     fn test_inject_identity_skips_write() {
-        let dir = temp_wolf_dir();
+        let dir_guard = temp_wolf_dir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = WolfRpgPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
         for entry in &mut entries {
@@ -615,7 +628,8 @@ mod tests {
 
     #[test]
     fn test_inject_report_has_warning_on_truncation() {
-        let dir = temp_wolf_dir();
+        let dir_guard = temp_wolf_dir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = WolfRpgPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
 
@@ -635,7 +649,8 @@ mod tests {
 
     #[test]
     fn test_heuristic_metadata() {
-        let dir = setup_fixture();
+        let dir_guard = setup_fixture();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = WolfRpgPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
 

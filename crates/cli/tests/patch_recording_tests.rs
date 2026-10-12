@@ -19,10 +19,11 @@ use std::path::{Path, PathBuf};
 mod common;
 use common::locust;
 
-fn base_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("locust_patchrec_{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn base_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("locust_patchrec_")
+        .tempdir()
+        .unwrap()
 }
 
 const HTML_BODY: &str = "<html><head><title>demo</title></head><body>\n\
@@ -144,7 +145,8 @@ fn replace_and_add_without_a_language_bail_loudly() {
     // These runs used to iterate zero languages: nothing copied, nothing
     // injected, nothing recorded — exit 0. Two commands later the user
     // shipped an untranslated "patch".
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = html_game_project(&base);
     let original = fs::read_to_string(game.join("index.html")).unwrap();
     let out = base.join("out");
@@ -181,7 +183,8 @@ fn replace_and_add_without_a_language_bail_loudly() {
 
 #[test]
 fn direct_inject_rejects_mislabelling_one_translation_as_multiple_languages() {
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = html_game_project(&base);
     let before = fs::read(game.join("index.html")).unwrap();
     let result = locust()
@@ -214,7 +217,8 @@ fn direct_inject_rejects_mislabelling_one_translation_as_multiple_languages() {
 
 #[test]
 fn patch_pointed_at_the_original_after_a_copy_inject_names_the_recorded_root() {
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = html_game_project(&base);
     let out = base.join("out");
     locust()
@@ -275,7 +279,8 @@ fn patch_pointed_at_the_original_after_a_copy_inject_names_the_recorded_root() {
 #[test]
 fn unsupported_add_mode_fails_loudly_and_the_advice_unblocks() {
     // E4 flavor (HTML): Add is unsupported, but Replace and direct both work.
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = html_game_project(&base);
     let assert = locust()
         .arg("inject")
@@ -328,7 +333,8 @@ fn unsupported_add_advice_is_direct_only_for_entry_tree_writers() {
     // E5 flavor (Wolf RPG): the Replace branch hits the containment
     // hard-error for this engine class, so the advice must NOT send the user
     // there — per-engine advice, like the containment error's.
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = wolf_game_project(&base);
     let assert = locust()
         .arg("inject")
@@ -386,7 +392,8 @@ fn patch_without_lang_over_es_and_unspecified_keys_requires_a_choice() {
     // re-injects a second pristine copy forgetting -l (which records the
     // reserved language-unspecified key). Both rules claim this cell; the
     // multiple-keys error wins — never a silent match of either key.
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game1, db) = html_game_project(&base);
     let game2 = base.join("htmlgame2");
     fs::create_dir_all(&game2).unwrap();
@@ -545,7 +552,8 @@ fn patch_without_lang_over_es_and_unspecified_keys_requires_a_choice() {
 
 #[test]
 fn a_database_with_no_recording_names_a_command_that_provably_unblocks() {
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = html_game_project(&base);
     let zip = base.join("es.zip");
     // The exact command the error must print — executed verbatim below.
@@ -695,7 +703,8 @@ fn assert_copy_recording_and_patch_roundtrip(
 
 #[test]
 fn wolf_replace_records_the_copy_and_preserves_the_original() {
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = wolf_game_project(&base);
     let original = fs::read(game.join("Data/BasicData.wolf")).unwrap();
     let out = base.join("out");
@@ -727,7 +736,8 @@ fn wolf_replace_records_the_copy_and_preserves_the_original() {
 
 #[test]
 fn renpy_replace_records_the_copy_and_preserves_the_original() {
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let game = base.join("renpygame");
     let game_sub = game.join("game");
     fs::create_dir_all(&game_sub).unwrap();
@@ -787,7 +797,8 @@ fn legacy_database_on_an_already_injected_entry_tree_game_gets_a_restore_first_r
     // source bytes, finds nothing in the already-translated tree, writes 0
     // files, and records nothing: the identical error forever unless the
     // advice carries the restore-first note.
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db_path) = wolf_game_project(&base);
     let pristine = base.join("pristine");
     copy_dir(&game, &pristine);
@@ -906,7 +917,8 @@ fn a_first_direct_inject_that_writes_zero_files_explains_why_nothing_was_recorde
     // not in the code page) — a state `locust import` can hand it. The old
     // behavior recorded nothing and exited 0 silently; `patch` then advised
     // the exact command that had just written zero files.
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let game = base.join("wolfgame");
     let data = game.join("Data");
     fs::create_dir_all(&data).unwrap();
@@ -990,7 +1002,8 @@ fn a_first_direct_inject_that_writes_zero_files_explains_why_nothing_was_recorde
 
 #[test]
 fn a_changed_recording_refuses_pack_and_reinject_until_recorded_bytes_are_restored() {
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = html_game_project(&base);
     locust()
         .arg("inject")
@@ -1080,7 +1093,8 @@ fn a_rerun_that_writes_nothing_keeps_the_previous_recording_visibly() {
     // the keep must be SAID, not silent — silent keeps were the
     // stale-recording hazard. (HTML cannot reach this state: the mock
     // translation contains the source substring, so a re-run replaces again.)
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = wolf_game_project(&base);
     locust()
         .arg("inject")
@@ -1131,7 +1145,8 @@ fn a_recording_made_with_relative_paths_packs_from_any_cwd() {
     // later absolutized against PATCH's cwd, breaking every recorded path
     // when patch ran from anywhere else. Roots are absolutized at record
     // time now.
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let (game, db) = html_game_project(&base);
 
     locust()
@@ -1161,7 +1176,8 @@ fn a_recording_made_with_relative_paths_packs_from_any_cwd() {
 
 #[test]
 fn replacing_another_project_never_prunes_a_recorded_direct_backup() {
-    let base = base_dir();
+    let base_guard = base_dir();
+    let base = base_guard.path().to_path_buf();
     let backups = base.join("isolated-backups");
     let first_base = base.join("first");
     fs::create_dir(&first_base).unwrap();

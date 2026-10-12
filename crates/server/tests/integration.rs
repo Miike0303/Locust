@@ -253,9 +253,11 @@ async fn test_full_rpgmaker_mv_flow() {
     assert_eq!(stats.pending, 0);
 
     // 10. Inject Replace mode — use short path to avoid Windows path length limit
-    let output_dir = std::env::temp_dir().join("locust_out");
-    let _ = std::fs::remove_dir_all(&output_dir);
-    std::fs::create_dir_all(&output_dir).unwrap();
+    let output_guard = tempfile::Builder::new()
+        .prefix("locust_out")
+        .tempdir()
+        .unwrap();
+    let output_dir = output_guard.path().to_path_buf();
     let resp = client()
         .post(format!("{}/api/inject", base_url))
         .json(&serde_json::json!({

@@ -2772,8 +2772,11 @@ mod tests {
 
     #[test]
     fn cmd_pivot_skips_pending_and_refuses_overwrite() {
-        let dir = std::env::temp_dir().join(format!("locust_cli_pivot_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_cli_pivot_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let src_path = dir.join("src.locust.db");
         let src = Database::open(&src_path).unwrap();
         let mut done = StringEntry::new("a", "Hello", PathBuf::from("f.json"));
@@ -2828,8 +2831,11 @@ mod tests {
 
     #[test]
     fn astro_stub_guides_players_to_rule95_patcher() {
-        let dir = std::env::temp_dir().join(format!("locust_astro_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_astro_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let stub = dir.join("release.md");
         let game = dir.join("MyGame");
         fs::create_dir_all(&game).unwrap();
@@ -2930,10 +2936,11 @@ mod tests {
     use locust_core::database::sha256_hex;
     use locust_core::models::StringEntry;
 
-    fn patch_test_tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_patch_test_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn patch_test_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_patch_test_")
+            .tempdir()
+            .unwrap()
     }
 
     /// One translated entry, in the exact shape `locust extract` +
@@ -3124,7 +3131,8 @@ mod tests {
             "note",
             "pristine",
         ] {
-            let base = patch_test_tempdir();
+            let base_guard = patch_test_tempdir();
+            let base = base_guard.path().to_path_buf();
             let (game, script, db_path, contents) = make_renpy_game(&base);
             let db = Database::open(&db_path).unwrap();
             db.record_injection(Some("es"), &game, std::slice::from_ref(&script))
@@ -3174,7 +3182,8 @@ mod tests {
     #[test]
     fn astro_stub_uses_the_auto_selected_recording_language() {
         let _profile = TestProfile::new();
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("fr"), &game, &[script]).unwrap();
@@ -3213,7 +3222,8 @@ mod tests {
         // A recording exists for one key ("es", from a direct inject on the
         // game root); `patch` without -l resolves the single key and packs
         // exactly the recorded rels, byte-for-byte.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, script, db_path, contents) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("es"), &game_dir, &[script])
@@ -3250,7 +3260,8 @@ mod tests {
         // The recorded root and the patch-time game path are the same on-disk
         // directory spelled with different case. The identity check must fold
         // case where the filesystem does, not refuse a spelling difference.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("es"), &game_dir, &[script])
@@ -3282,7 +3293,8 @@ mod tests {
         // was READ from, while injection wrote loose .rpy files that
         // extraction deliberately never re-ingests (it skips `zzz_locust*`).
         // The patch must come from what injection RECORDED, not from entries.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let game_dir = base.join("renpygame");
         let game_sub = game_dir.join("game");
         fs::create_dir_all(&game_sub).unwrap();
@@ -3340,7 +3352,8 @@ mod tests {
         // recorded. There is deliberately NO entry-derived fallback — the
         // fallback was the mechanism of every silently-wrong patch — so this
         // must hard-error naming the exact command that records an injection.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, _script, db_path, _) = make_renpy_game(&base);
 
         let out_zip = base.join("out-patch.zip");
@@ -3384,7 +3397,8 @@ mod tests {
         // back to the entry-derived list silently; now the mismatch is loud,
         // lists what IS recorded, and offers only remedies that work from
         // this state ( `-l fr` is offered because fr's root IS this tree).
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("fr"), &game_dir, &[script])
@@ -3427,7 +3441,8 @@ mod tests {
         // `--direct` without -l records under the reserved language-unspecified
         // key: `patch` without -l packs it, `patch -l es` must NOT silently
         // match it.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(None, &game_dir, &[script]).unwrap();
@@ -3474,7 +3489,8 @@ mod tests {
         // claimed by two rules: "NULL key is matched by patch without -l" and
         // "multiple keys without -l is an error". The error wins — packing a
         // silent guess (or the union) is how mixed-language zips shipped.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script))
@@ -3586,7 +3602,8 @@ mod tests {
         // identical error forever. The advice must carry the restore-first
         // note. `patch` cannot know whether a prior inject ran, so every
         // engine that writes in place carries the restore-first note.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, _wolf_file, db_path) = make_wolf_game(&base);
 
         let err = cmd_patch(
@@ -3609,7 +3626,8 @@ mod tests {
 
         // Every registered format writes in place, so the restore note is
         // no longer gated on the stale four-engine list.
-        let base2 = patch_test_tempdir();
+        let base2_guard = patch_test_tempdir();
+        let base2 = base2_guard.path().to_path_buf();
         let (game2, _script, db2, _) = make_renpy_game(&base2);
         let err2 = cmd_patch(
             game2,
@@ -3623,7 +3641,8 @@ mod tests {
         .unwrap_err();
         assert!(err2.to_string().contains("restore the original"), "{err2}");
 
-        let base3 = patch_test_tempdir();
+        let base3_guard = patch_test_tempdir();
+        let base3 = base3_guard.path().to_path_buf();
         let game3 = base3.join("htmlgame");
         fs::create_dir_all(&game3).unwrap();
         fs::write(
@@ -3665,7 +3684,8 @@ mod tests {
         // A recording exists for another language on an entry-tree game: its
         // originals were provably byte-patched by that inject, so the advised
         // `--direct -l <missing>` re-run needs the same restore-first note.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, wolf_file, db_path) = make_wolf_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("fr"), &game_dir, &[wolf_file])
@@ -3703,7 +3723,8 @@ mod tests {
         // `recording.root.join(abs)` REPLACES the root — the patch would read
         // a file outside the game tree and ship it, hash-verified from the
         // same row.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("es"), &game_dir, &[script])
@@ -3765,7 +3786,8 @@ mod tests {
         // pre-check must not send a fully reviewed/approved project back to
         // `locust translate` — that advice would re-translate finished work.
         for status in [StringStatus::Approved, StringStatus::Reviewed] {
-            let base = patch_test_tempdir();
+            let base_guard = patch_test_tempdir();
+            let base = base_guard.path().to_path_buf();
             let game_dir = base.join("mygame");
             let game_sub = game_dir.join("game");
             fs::create_dir_all(&game_sub).unwrap();
@@ -3801,7 +3823,8 @@ mod tests {
         }
 
         // Triangulate: a project with nothing translated still gets the gate.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let game_dir = base.join("mygame");
         fs::create_dir_all(game_dir.join("game")).unwrap();
         let script = game_dir.join("game").join("script.rpy");
@@ -3834,7 +3857,8 @@ mod tests {
         // the user points patch at the ORIGINAL. The old content-root anchor
         // silently re-read the rels out of the original — an untranslated zip
         // claiming "translated text only". Now: hard error naming the root.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, _script, db_path, _) = make_renpy_game(&base);
         // The Replace copy, injected and recorded.
         let copy_dir = base.join("out").join("mygame-es");
@@ -3886,7 +3910,8 @@ mod tests {
         // no longer matches must fail loudly instead of shipping bytes nobody
         // verified (F8: nothing ever checked a packed file was the file
         // injection reported writing).
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script))
@@ -3928,7 +3953,8 @@ mod tests {
         // A recording names every file the patch promised to carry. A missing
         // one must be a hard error naming the path — the old flow listed it
         // under "Files not found on disk" and shipped the zip anyway.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script))
@@ -3963,7 +3989,8 @@ mod tests {
     #[tokio::test]
     async fn test_inject_direct_rejects_multiple_languages_for_one_database() {
         let _profile = TestProfile::new_async().await;
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let bak = base.join("bak");
         let game_dir = base.join("renpygame");
         let game_sub = game_dir.join("game");
@@ -4012,7 +4039,8 @@ mod tests {
         let _profile = TestProfile::new_async().await;
         // Task #14: --direct is the universally recommended recovery path, but
         // for engines that write the original tree it used to take no backup.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let bak = base.join("bak");
         let game_dir = base.join("renpygame");
         let game_sub = game_dir.join("game");
@@ -4073,7 +4101,8 @@ mod tests {
     #[tokio::test]
     async fn pivoted_html_inject_uses_original_slot_and_leaves_duplicate_untouched() {
         let _profile = TestProfile::new_async().await;
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let bak = base.join("bak");
         let game = base.join("htmlgame");
         fs::create_dir_all(&game).unwrap();
@@ -4115,7 +4144,8 @@ mod tests {
     #[tokio::test]
     async fn test_inject_direct_without_lang_records_the_unspecified_key() {
         let _profile = TestProfile::new_async().await;
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let bak = base.join("bak");
         let game_dir = base.join("renpygame");
         let game_sub = game_dir.join("game");
@@ -4159,7 +4189,8 @@ mod tests {
         // recording verification (file missing since) must not truncate or
         // delete it: the archive is built in a temp file and renamed over the
         // destination only on success; the drop guard removes the temp.
-        let base = patch_test_tempdir();
+        let base_guard = patch_test_tempdir();
+        let base = base_guard.path().to_path_buf();
         let (game_dir, script, db_path, _) = make_renpy_game(&base);
         let db = Database::open(&db_path).unwrap();
         db.record_injection(Some("es"), &game_dir, std::slice::from_ref(&script))

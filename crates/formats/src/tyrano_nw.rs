@@ -523,10 +523,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_tyrano_nw_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_tyrano_nw_")
+            .tempdir()
+            .unwrap()
     }
 
     fn sample_ks() -> &'static str {
@@ -555,7 +556,8 @@ Hello NW world.\n\
 
     #[test]
     fn open_package_nw_lists_scenario() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let zip = build_package_zip(sample_ks());
         let path = dir.join("package.nw");
         fs::write(&path, &zip).unwrap();
@@ -577,7 +579,8 @@ Hello NW world.\n\
 
     #[test]
     fn open_data_exe_preserves_prefix() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let zip = build_package_zip(sample_ks());
         // Fake MZ header + padding + zip
         let mut exe = b"MZ\x90\x00FAKE_PE_STUB".to_vec();
@@ -595,7 +598,8 @@ Hello NW world.\n\
 
     #[test]
     fn rebuild_keeps_untouched_entry_bytes() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let zip = build_package_zip(sample_ks());
         let path = dir.join("package.nw");
         fs::write(&path, &zip).unwrap();
@@ -629,7 +633,8 @@ Hello NW world.\n\
 
     #[test]
     fn rebuild_data_exe_keeps_prefix() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let zip = build_package_zip(sample_ks());
         let mut exe = b"MZ_PREFIX_12345".to_vec();
         let prefix = exe.clone();
@@ -651,7 +656,8 @@ Hello NW world.\n\
 
     #[test]
     fn malformed_zip_returns_err() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("package.nw");
         fs::write(&path, b"not a zip at all!!!!").unwrap();
         let e = NwArchive::open(&path).unwrap_err();
@@ -661,7 +667,8 @@ Hello NW world.\n\
 
     #[test]
     fn probe_detects_package_and_exe() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let zip = build_package_zip(sample_ks());
         let pn = dir.join("package.nw");
         fs::write(&pn, &zip).unwrap();

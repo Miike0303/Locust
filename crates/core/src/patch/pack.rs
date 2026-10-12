@@ -846,10 +846,11 @@ mod tests {
     use std::fs;
     use std::io::Read;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_pack_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_pack_")
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
@@ -1223,7 +1224,8 @@ mod tests {
 
     #[test]
     fn temp_file_guard_removes_on_drop_and_survives_disarm() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         // Dropped while armed: the half-written temp must not be left behind.
         // This covers every `?` between creating the temp archive and renaming.
         let armed = dir.join("armed.tmp-1");
@@ -1332,7 +1334,8 @@ mod tests {
 
     #[test]
     fn pack_from_recording_writes_zip_with_bytes() {
-        let base = tempdir();
+        let base_guard = tempdir();
+        let base = base_guard.path().to_path_buf();
         let game = base.join("game");
         let game_sub = game.join("game");
         fs::create_dir_all(&game_sub).unwrap();
@@ -1418,7 +1421,8 @@ mod tests {
         // The scratch name used to be PID-derived, so two packs inside one
         // process (the server packs on a blocking task) targeted the same file
         // and clobbered each other's zip mid-write.
-        let base = tempdir();
+        let base_guard = tempdir();
+        let base = base_guard.path().to_path_buf();
         let out = base.join("shared-out.zip");
 
         let handles: Vec<_> = (0..2)
@@ -1483,7 +1487,8 @@ mod tests {
 
     #[test]
     fn pack_without_recording_errors() {
-        let base = tempdir();
+        let base_guard = tempdir();
+        let base = base_guard.path().to_path_buf();
         let game = base.join("g");
         fs::create_dir_all(&game).unwrap();
         let db = Database::open_in_memory().unwrap();
@@ -1515,7 +1520,8 @@ mod tests {
 
     #[test]
     fn pack_require_pristine_without_backup_errors() {
-        let base = tempdir();
+        let base_guard = tempdir();
+        let base = base_guard.path().to_path_buf();
         let game = base.join("game");
         let game_sub = game.join("game");
         fs::create_dir_all(&game_sub).unwrap();

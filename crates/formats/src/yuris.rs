@@ -2953,10 +2953,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_yuris_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_yuris_")
+            .tempdir()
+            .unwrap()
     }
 
     /// Ground-truth key from real yst00042.ybn audit: bytes B4 62 6A D8 (LE u32).
@@ -3065,7 +3066,8 @@ mod tests {
 
     #[test]
     fn test_detect_ybn_dir_recursive() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_fixture(&dir);
         let plugin = YurisPlugin::new();
         assert!(plugin.detect(&dir));
@@ -3073,7 +3075,8 @@ mod tests {
 
     #[test]
     fn test_detect_ypf_only_still_true() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("ysbin.ypf"), b"YPF\0fake").unwrap();
         let plugin = YurisPlugin::new();
         assert!(plugin.detect(&dir));
@@ -3081,7 +3084,8 @@ mod tests {
 
     #[test]
     fn test_detect_non_yuris() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("readme.txt"), b"nope").unwrap();
         let plugin = YurisPlugin::new();
         assert!(!plugin.detect(&dir));
@@ -3108,7 +3112,8 @@ mod tests {
     /// extract must Err with the filename, never emit garbage strings.
     #[test]
     fn test_bad_first_descriptor_errors_not_garbage() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let mut bytes = build_minimal_ystb(TRUE_KEY_B4626AD8, "Hello, traveler!", "Welcome home.");
         let hdr = parse_header(&bytes, "t").unwrap();
         let (_, attr_off, _, _) = section_offsets(&hdr);
@@ -3199,7 +3204,8 @@ mod tests {
 
     #[test]
     fn test_ybn_discovery_skips_tool_trees_and_dedupes() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let pac = dir.join("pac").join("ysbin").join("ysbin");
         let tools = dir.join("VNTranslationTools").join("ysbin");
         let res = dir.join("res");
@@ -3249,7 +3255,8 @@ mod tests {
 
     #[test]
     fn test_extract_known_strings_and_stable_ids() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_fixture(&dir);
         let plugin = YurisPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -3386,7 +3393,8 @@ mod tests {
 
     #[test]
     fn test_inject_roundtrip() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_fixture(&dir);
         let plugin = YurisPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -3415,7 +3423,8 @@ mod tests {
         // YU-RIS messages carry the author's own hard wraps (confirmed on a
         // real title: mid-sentence breaks). A provider returns one flat line,
         // which used to be written back as-is and overflow the textbox.
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_fixture(&dir);
         let plugin = YurisPlugin::new();
 
@@ -3484,7 +3493,8 @@ mod tests {
 
     #[test]
     fn test_ypf_malformed_extract_errors_naming_file() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("ysbin.ypf"), b"YPF\0fake").unwrap();
         let plugin = YurisPlugin::new();
         let err = plugin.extract(&dir).unwrap_err().to_string();
@@ -3500,7 +3510,8 @@ mod tests {
 
     #[test]
     fn test_ypf_e2e_extract_inject_with_locust_old() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let ysbin = dir.join("ysbin");
         fs::create_dir_all(&ysbin).unwrap();
 
@@ -3559,7 +3570,8 @@ mod tests {
 
     #[test]
     fn test_ystd_stub_skipped() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         // 16-byte YSTD stub (real games ship pac/ysbin/ysbin/yst.ybn like this)
         let mut stub = Vec::new();
         stub.extend_from_slice(b"YSTD");

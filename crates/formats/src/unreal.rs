@@ -2012,10 +2012,11 @@ mod tests {
     use std::fs;
     use std::io::{Cursor, Read, Seek, SeekFrom};
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_ue_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_ue_")
+            .tempdir()
+            .unwrap()
     }
 
     fn create_pak_fixture(dir: &Path) -> PathBuf {
@@ -2156,7 +2157,8 @@ mod tests {
 
     #[test]
     fn test_detect_unreal() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_pak_fixture(&dir);
         let plugin = UnrealPlugin::new();
         assert!(plugin.detect(&dir));
@@ -2165,7 +2167,8 @@ mod tests {
     #[test]
     fn test_detect_skips_pak_walk_when_engine_present() {
         // Negative-tested: restoring the old always-walk detect makes this fail.
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::create_dir_all(dir.join("Engine")).unwrap();
         // A real Unreal-looking pak that would be opened if detect walked.
         let paks = dir.join("Content").join("Paks");
@@ -2187,7 +2190,8 @@ mod tests {
 
     #[test]
     fn test_detect_skips_pak_walk_when_content_game_present() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_pak_fixture(&dir);
 
         FIND_PAK_FILES_CALLS.with(|c| c.set(Some(0)));
@@ -2203,7 +2207,8 @@ mod tests {
 
     #[test]
     fn test_detect_pak_only_tree_still_walks() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let mut data = vec![0u8; 64];
         data[60..64].copy_from_slice(&pak_magic());
         fs::write(dir.join("orphan.pak"), &data).unwrap();
@@ -2220,7 +2225,8 @@ mod tests {
 
     #[test]
     fn test_detect_pak_only_tree_stops_after_first_valid_pak() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let mut data = vec![0u8; 64];
         data[60..64].copy_from_slice(&pak_magic());
         for n in 0..20 {
@@ -2236,7 +2242,8 @@ mod tests {
 
     #[test]
     fn test_detect_non_unreal() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = UnrealPlugin::new();
         assert!(!plugin.detect(&dir));
     }
@@ -2245,7 +2252,8 @@ mod tests {
     fn test_detect_ignores_nwjs_chromium_paks() {
         // RPG Maker MZ NW.js deploys ship Chromium packs (resources.pak, nw_*.pak,
         // locales/*.pak) that must not classify as Unreal Engine.
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("resources.pak"), b"not-an-unreal-pak").unwrap();
         fs::write(dir.join("nw_100_percent.pak"), b"also-not-unreal").unwrap();
         fs::create_dir_all(dir.join("locales")).unwrap();
@@ -2264,7 +2272,8 @@ mod tests {
 
     #[test]
     fn test_extract_utf16le_strings() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_pak_fixture(&dir);
         let plugin = UnrealPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -2449,7 +2458,8 @@ mod tests {
 
     #[test]
     fn test_inject_shorter_succeeds() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_pak_fixture(&dir);
         let plugin = UnrealPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -2466,7 +2476,8 @@ mod tests {
 
     #[test]
     fn test_inject_longer_skips_not_hard_fail() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_pak_fixture(&dir);
         let plugin = UnrealPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -2493,7 +2504,8 @@ mod tests {
 
     #[test]
     fn test_inject_identity_skips_write() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_pak_fixture(&dir);
         let plugin = UnrealPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -2510,7 +2522,8 @@ mod tests {
     /// Entries planted manually (no extract filter dependency).
     #[test]
     fn test_inject_multi_pattern_semantics() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let game_dir = dir.join("TestGame").join("Content").join("Paks");
         fs::create_dir_all(&game_dir).unwrap();
 
@@ -2625,7 +2638,8 @@ mod tests {
     #[test]
     fn test_locres_loose_extract_inject_e2e_compact() {
         use crate::unreal_locres::LocresVersion;
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let loc_path = write_loose_locres(&dir, LocresVersion::Compact);
         // Minimal Unreal tree marker so detect is happy without a pak.
         fs::create_dir_all(dir.join("TestGame").join("Content")).unwrap();
@@ -2666,7 +2680,8 @@ mod tests {
     #[test]
     fn test_locres_rejects_stale_value_and_preserves_other_entries() {
         use crate::unreal_locres::LocresVersion;
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let loc_path = write_loose_locres(&dir, LocresVersion::Compact);
         let plugin = UnrealPlugin::new();
         let mut entries = plugin.extract(&loc_path).unwrap();
@@ -2694,7 +2709,8 @@ mod tests {
     #[test]
     fn test_locres_loose_extract_inject_e2e_optimized() {
         use crate::unreal_locres::LocresVersion;
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         write_loose_locres(&dir, LocresVersion::Optimized);
         fs::create_dir_all(dir.join("TestGame").join("Content")).unwrap();
         let plugin = UnrealPlugin::new();
@@ -2713,7 +2729,8 @@ mod tests {
 
     #[test]
     fn test_locres_malformed_errors_loudly() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let loc = dir.join("broken.locres");
         let mut bad = crate::unreal_locres::LOCRES_MAGIC.to_vec();
         bad.push(1); // Compact
@@ -2731,7 +2748,8 @@ mod tests {
     #[test]
     fn test_pak_heuristic_skips_values_also_in_loose_locres() {
         use crate::unreal_locres::LocresVersion;
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_pak_fixture(&dir); // contains "Hello World"
                                   // Locres with the same string — extract should prefer locres for that value
                                   // when both exist; at least not double-count as two independent heuristics.
@@ -2798,7 +2816,8 @@ mod tests {
         };
         use crate::unreal_pak::{read_index, write_pak, PakWriteFile, DEFAULT_MOUNT_POINT};
 
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let paks = dir.join("TestGame").join("Content").join("Paks");
         fs::create_dir_all(&paks).unwrap();
 

@@ -619,23 +619,25 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_font_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_font_")
+            .tempdir()
+            .unwrap()
     }
 
-    fn create_test_font() -> PathBuf {
-        let dir = tempdir();
+    fn create_test_font() -> (tempfile::TempDir, PathBuf) {
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let font_path = dir.join("test_font.ttf");
         let font_data = build_minimal_ascii_font();
         fs::write(&font_path, &font_data).unwrap();
-        font_path
+        (dir_guard, font_path)
     }
 
     #[test]
     fn test_check_coverage_all_present() {
-        let font_path = create_test_font();
+        let (_font_guard, font_path) = create_test_font();
         let translations = &["Hello world", "Test 123"];
         let report = FontValidator::check_coverage(&font_path, translations).unwrap();
         assert_eq!(report.missing_count, 0);
@@ -645,7 +647,7 @@ mod tests {
 
     #[test]
     fn test_check_coverage_missing_chars() {
-        let font_path = create_test_font();
+        let (_font_guard, font_path) = create_test_font();
         let translations = &["Hello ñ world"];
         let report = FontValidator::check_coverage(&font_path, translations).unwrap();
         assert!(report.missing_chars.contains(&'ñ'));
@@ -654,14 +656,16 @@ mod tests {
 
     #[test]
     fn test_find_game_fonts_empty_dir() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let fonts = FontValidator::find_game_fonts(&dir);
         assert!(fonts.is_empty());
     }
 
     #[test]
     fn test_find_game_fonts_finds_ttf() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let fonts_dir = dir.join("fonts");
         fs::create_dir_all(&fonts_dir).unwrap();
         fs::write(fonts_dir.join("test.ttf"), build_minimal_ascii_font()).unwrap();
@@ -671,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_coverage_report_percent() {
-        let font_path = create_test_font();
+        let (_font_guard, font_path) = create_test_font();
         // Create a string with 10 ASCII + 1 non-ASCII char (ñ)
         // The font covers ASCII, so 10 covered, 1 missing = ~90.9%
         let text = "abcdefghijñ";

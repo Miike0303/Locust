@@ -924,12 +924,15 @@ mod tests {
         assert!(saved_extraction_warnings(&db).unwrap().is_empty());
     }
 
-    fn game_dir(label: &str, tsv: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("locust_proj_{label}_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn game_dir(label: &str, tsv: &str) -> tempfile::TempDir {
+        let dir_guard = tempfile::Builder::new()
+            .prefix(&format!("locust_proj_{label}_"))
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().join("game");
+        std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("extract.tsv"), tsv).unwrap();
-        dir
+        dir_guard
     }
 
     #[test]
@@ -941,7 +944,8 @@ mod tests {
 
     #[test]
     fn resolve_project_db_path_prefers_sibling_when_parent_writable() {
-        let game = game_dir("sib", "a\tA");
+        let game_guard = game_dir("sib", "a\tA");
+        let game = game_guard.path().join("game");
         let db_path = resolve_project_db_path(&game);
         let parent = game.parent().unwrap();
         let stem = sanitize_project_stem(game.file_name().unwrap().to_str().unwrap());
@@ -962,7 +966,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_same_game_preserves_translations() {
-        let game = game_dir("same", "hero\tHello\nnpc\tWelcome");
+        let game_guard = game_dir("same", "hero\tHello\nnpc\tWelcome");
+        let game = game_guard.path().join("game");
         let db = Database::open_in_memory().unwrap();
         let reg = registry();
 
@@ -990,8 +995,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_game_b_does_not_destroy_game_a() {
-        let game_a = game_dir("A", "hero\tHello");
-        let game_b = game_dir("B", "villain\tEvil");
+        let game_a_guard = game_dir("A", "hero\tHello");
+        let game_a = game_a_guard.path().join("game");
+        let game_b_guard = game_dir("B", "villain\tEvil");
+        let game_b = game_b_guard.path().join("game");
         let db = Database::open_in_memory().unwrap();
         let reg = registry();
 
@@ -1018,7 +1025,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_stale_source_resets_status() {
-        let game = game_dir("stale", "npc\tWelcome");
+        let game_guard = game_dir("stale", "npc\tWelcome");
+        let game = game_guard.path().join("game");
         let db = Database::open_in_memory().unwrap();
         let reg = registry();
         open_project(&db, &reg, &game, None).unwrap();
@@ -1046,7 +1054,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_removes_entries_gone_from_game() {
-        let game = game_dir("gone", "keep\tStay\ndrop\tLeave");
+        let game_guard = game_dir("gone", "keep\tStay\ndrop\tLeave");
+        let game = game_guard.path().join("game");
         let db = Database::open_in_memory().unwrap();
         let reg = registry();
         open_project(&db, &reg, &game, None).unwrap();
@@ -1068,7 +1077,8 @@ mod tests {
     fn test_http_and_tauri_share_open_project() {
         // Both HTTP POST /api/project/open and the Tauri command call
         // `open_project` below. Same inputs → same merge result.
-        let game = game_dir("share", "a\tA");
+        let game_guard = game_dir("share", "a\tA");
+        let game = game_guard.path().join("game");
         let db_http = Database::open_in_memory().unwrap();
         let db_tauri = Database::open_in_memory().unwrap();
         let reg = registry();
@@ -1135,11 +1145,15 @@ mod tests {
         reg
     }
 
-    fn write_locust_db(label: &str, rows: &[(&str, &str, Option<&str>)]) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "locust_opendb_{label}_{}.locust.db",
-            uuid::Uuid::new_v4()
-        ));
+    fn write_locust_db(
+        label: &str,
+        rows: &[(&str, &str, Option<&str>)],
+    ) -> (tempfile::TempDir, PathBuf) {
+        let path_guard = tempfile::Builder::new()
+            .prefix(&format!("locust_opendb_{label}_"))
+            .tempdir()
+            .unwrap();
+        let path = path_guard.path().join("fixture.locust.db");
         let db = Database::open(&path).unwrap();
         let entries: Vec<StringEntry> = rows
             .iter()
@@ -1154,7 +1168,7 @@ mod tests {
             .collect();
         db.save_entries(&entries).unwrap();
         drop(db);
-        path
+        (path_guard, path)
     }
 
     fn snapshot_db_sidecars(path: &Path) -> Vec<(String, Vec<u8>)> {
@@ -1178,7 +1192,7 @@ mod tests {
     fn open_project_db_opens_pivoted_db_without_extract_or_row_change() {
         use crate::database::EntryFilter;
 
-        let source_path = write_locust_db(
+        let (_source_path_guard, source_path) = write_locust_db(
             "src",
             &[
                 ("a", "Hello", Some("Hola")),
@@ -1187,10 +1201,11 @@ mod tests {
             ],
         );
         let source_db = Database::open(&source_path).unwrap();
-        let pivot_path = std::env::temp_dir().join(format!(
-            "locust_opendb_pivot_{}.locust.db",
-            uuid::Uuid::new_v4()
-        ));
+        let pivot_path_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_pivot_")
+            .tempdir()
+            .unwrap();
+        let pivot_path = pivot_path_guard.path().join("fixture.locust.db");
         let pivoted = source_db.pivot_to(&pivot_path).unwrap();
         assert_eq!(pivoted.entries, 2);
         drop(source_db);
@@ -1201,9 +1216,12 @@ mod tests {
         drop(snap);
 
         let live = Database::open_in_memory().unwrap();
-        let game =
-            std::env::temp_dir().join(format!("locust_opendb_game_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&game).unwrap();
+        let game_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_game_")
+            .tempdir()
+            .unwrap();
+        let game = game_guard.path().join("game");
+        std::fs::create_dir(&game).unwrap();
         std::fs::write(game.join("extract.tsv"), "hero\tEXTRACTED").unwrap();
 
         let reg = panic_extract_registry();
@@ -1246,11 +1264,15 @@ mod tests {
 
     #[test]
     fn open_project_db_rejects_unrelated_db_and_leaves_live_connection() {
-        let live_path = write_locust_db("live", &[("keep", "Stay", Some("Queda"))]);
+        let (_live_path_guard, live_path) =
+            write_locust_db("live", &[("keep", "Stay", Some("Queda"))]);
         let live = Database::open(&live_path).unwrap();
 
-        let other =
-            std::env::temp_dir().join(format!("locust_opendb_other_{}.db", uuid::Uuid::new_v4()));
+        let other_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_other_")
+            .tempdir()
+            .unwrap();
+        let other = other_guard.path().join("fixture.db");
         {
             let conn = rusqlite::Connection::open(&other).unwrap();
             conn.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY)", [])
@@ -1259,8 +1281,12 @@ mod tests {
         }
         let other_bytes = std::fs::read(&other).unwrap();
 
-        let game = std::env::temp_dir().join(format!("locust_opendb_g_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&game).unwrap();
+        let game_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_g_")
+            .tempdir()
+            .unwrap();
+        let game = game_guard.path().join("game");
+        std::fs::create_dir(&game).unwrap();
 
         let err = open_project_db(&live, &registry(), &other, &game, "tsv-test").unwrap_err();
         let msg = err.to_string().to_lowercase();
@@ -1302,8 +1328,11 @@ mod tests {
     #[test]
     fn open_project_db_rejects_directory() {
         let live = Database::open_in_memory().unwrap();
-        let dir = std::env::temp_dir().join(format!("locust_opendb_dir_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_opendb_dir_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let err = open_project_db(&live, &registry(), &dir, &dir, "tsv-test").unwrap_err();
         let msg = err.to_string().to_lowercase();
         assert!(
@@ -1316,7 +1345,7 @@ mod tests {
 
     #[test]
     fn open_project_db_rejects_unknown_format() {
-        let db_path = write_locust_db("fmt", &[("a", "A", None)]);
+        let (_db_path_guard, db_path) = write_locust_db("fmt", &[("a", "A", None)]);
         let live = Database::open_in_memory().unwrap();
         let err = open_project_db(
             &live,
@@ -1352,7 +1381,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_recent_preserves_translations_when_game_bytes_change() {
-        let game = game_dir("legacy_saved", "hero\tHello\nnpc\tWelcome");
+        let game_guard = game_dir("legacy_saved", "hero\tHello\nnpc\tWelcome");
+        let game = game_guard.path().join("game");
         let db = Database::open_in_memory().unwrap();
         let reg = registry();
         let first = open_project(&db, &reg, &game, None).unwrap();
@@ -1392,7 +1422,8 @@ mod tests {
 
     #[test]
     fn open_recent_missing_saved_db_extracts() {
-        let game = game_dir("legacy_missing", "hero\tHello");
+        let game_guard = game_dir("legacy_missing", "hero\tHello");
+        let game = game_guard.path().join("game");
         let live = Database::open_in_memory().unwrap();
         let data = tempfile::tempdir().unwrap();
         let out = open_recent_project_with(&live, &registry(), &game, None, data.path()).unwrap();
@@ -1405,7 +1436,8 @@ mod tests {
 
     #[test]
     fn open_recent_invalid_saved_db_does_not_extract() {
-        let game = game_dir("legacy_invalid", "hero\tEXTRACTED");
+        let game_guard = game_dir("legacy_invalid", "hero\tEXTRACTED");
+        let game = game_guard.path().join("game");
         let adjacent = saved_project_db_candidates(&game, Path::new("/unused"))[0].clone();
         std::fs::write(&adjacent, b"not-a-sqlite-database").unwrap();
         let live = Database::open_in_memory().unwrap();
@@ -1431,7 +1463,8 @@ mod tests {
 
     #[test]
     fn open_recent_metadata_error_does_not_extract() {
-        let game = game_dir("legacy_meta_err", "hero\tEXTRACTED");
+        let game_guard = game_dir("legacy_meta_err", "hero\tEXTRACTED");
+        let game = game_guard.path().join("game");
         let data = tempfile::tempdir().unwrap();
         let candidates = saved_project_db_candidates(&game, data.path());
         let adjacent = candidates[0].clone();
@@ -1483,7 +1516,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_recent_uses_profile_fallback_without_writability_probe() {
-        let game = game_dir("legacy_fallback", "hero\tHello");
+        let game_guard = game_dir("legacy_fallback", "hero\tHello");
+        let game = game_guard.path().join("game");
         let db = Database::open_in_memory().unwrap();
         let first = open_project(&db, &registry(), &game, None).unwrap();
         assert!(db.save_translation("hero", "Hola", "mock").await.unwrap());
@@ -1512,7 +1546,8 @@ mod tests {
 
     #[test]
     fn open_recent_rejects_ambiguous_distinct_saved_dbs() {
-        let game = game_dir("legacy_ambiguous", "hero\tHello");
+        let game_guard = game_dir("legacy_ambiguous", "hero\tHello");
+        let game = game_guard.path().join("game");
         let db = Database::open_in_memory().unwrap();
         let first = open_project(&db, &registry(), &game, None).unwrap();
         let original = first.database_path.clone();
@@ -1543,7 +1578,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_recent_same_file_aliases_are_one_candidate() {
-        let game = game_dir("legacy_alias", "hero\tHello");
+        let game_guard = game_dir("legacy_alias", "hero\tHello");
+        let game = game_guard.path().join("game");
         let db = Database::open_in_memory().unwrap();
         let first = open_project(&db, &registry(), &game, None).unwrap();
         assert!(db.save_translation("hero", "Hola", "mock").await.unwrap());
@@ -1671,8 +1707,11 @@ mod tests {
 
     #[tokio::test]
     async fn open_recent_single_file_root_uses_sibling_db() {
-        let dir = std::env::temp_dir().join(format!("locust_proj_file_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_guard = tempfile::Builder::new()
+            .prefix("locust_proj_file_")
+            .tempdir()
+            .unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let game = dir.join("story.txt");
         std::fs::write(&game, "hero\tHello").unwrap();
         let mut reg = FormatRegistry::new();

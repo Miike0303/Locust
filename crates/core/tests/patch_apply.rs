@@ -15,14 +15,11 @@ use locust_core::patch::{
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-fn tmp_game(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "locust_patch_test_{}_{}",
-        name,
-        uuid::Uuid::new_v4()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmp_game(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("locust_patch_test_{name}_"))
+        .tempdir()
+        .unwrap()
 }
 
 fn write_file(root: &Path, rel: &str, contents: &[u8]) {
@@ -72,7 +69,8 @@ fn build_patch_zip(path: &Path, files: &[PatchZipFile<'_>], version: &str, patch
 
 #[test]
 fn apply_then_rollback_is_byte_identical_including_added_file() {
-    let game = tmp_game("roundtrip");
+    let game_guard = tmp_game("roundtrip");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/Map001.json", b"ORIGINAL_MAP");
     let zip = game.join("patch.zip");
     build_patch_zip(
@@ -112,7 +110,8 @@ fn apply_then_rollback_is_byte_identical_including_added_file() {
 
 #[test]
 fn cancelled_apply_after_one_write_can_be_rolled_back() {
-    let game = tmp_game("cancel_after_write");
+    let game_guard = tmp_game("cancel_after_write");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"ORIGINAL_A");
     write_file(&game, "data/b.json", b"ORIGINAL_B");
     let zip = game.join("patch.zip");
@@ -150,7 +149,8 @@ fn cancelled_apply_after_one_write_can_be_rolled_back() {
 
 #[test]
 fn already_applied_blocks_without_force() {
-    let game = tmp_game("already");
+    let game_guard = tmp_game("already");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"ORIG");
     let zip = game.join("p.zip");
     build_patch_zip(
@@ -169,7 +169,8 @@ fn already_applied_blocks_without_force() {
 fn critical_a_forced_reapply_after_reclassified_conflict_still_restores_user_original() {
     // User file at an "added" path → force reclassifies to replaced and backs it up.
     // Forced same-version reapply must keep that original in the backup (R1).
-    let game = tmp_game("crit_a");
+    let game_guard = tmp_game("crit_a");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/base.json", b"BASE_ORIG");
     write_file(&game, "data/extra.json", b"USER_FILE"); // conflict for intended-add
     let zip = game.join("p.zip");
@@ -233,7 +234,8 @@ fn critical_a_forced_reapply_after_reclassified_conflict_still_restores_user_ori
 
 #[test]
 fn critical_b_receipt_present_manifest_less_backup_hard_errors() {
-    let game = tmp_game("crit_b");
+    let game_guard = tmp_game("crit_b");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"ORIG");
     let zip = game.join("p.zip");
     build_patch_zip(
@@ -294,7 +296,8 @@ fn critical_b_receipt_present_manifest_less_backup_hard_errors() {
 fn critical_c_structural_manifest_less_backup_not_discarded() {
     // Pure-replacement structural patch (no original hashes). Manifest-less
     // backup/ with surviving files and no receipt/journal → R2 hard error.
-    let game = tmp_game("crit_c");
+    let game_guard = tmp_game("crit_c");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "www/data/Map001.json", b"ORIG");
     // Fake a leftover backup without commit marker (externally lost).
     let backup_file = game
@@ -337,7 +340,8 @@ fn critical_c_structural_manifest_less_backup_not_discarded() {
 
 #[test]
 fn verify_clean_on_pristine_game() {
-    let game = tmp_game("verify_clean");
+    let game_guard = tmp_game("verify_clean");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"ORIG");
     let zip = game.join("p.zip");
     build_patch_zip(
@@ -353,8 +357,8 @@ fn verify_clean_on_pristine_game() {
 
 #[test]
 fn unsafe_zip_entry_rejected() {
-    let game = tmp_game("unsafe");
-    fs::create_dir_all(&game).unwrap();
+    let game_guard = tmp_game("unsafe");
+    let game = game_guard.path().to_path_buf();
     let zip_path = game.join("bad.zip");
     let f = File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(f);
@@ -372,7 +376,8 @@ fn unsafe_zip_entry_rejected() {
 fn r1_deletion_set_never_includes_backup_manifest_paths() {
     // Even if a (corrupt) receipt lists a path as added that is also in the
     // backup manifest, rollback restores it and does not delete it.
-    let game = tmp_game("r1_veto");
+    let game_guard = tmp_game("r1_veto");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"ORIG");
     let zip = game.join("p.zip");
     build_patch_zip(
@@ -445,7 +450,8 @@ fn understate_uncompressed_sizes(zip_path: &Path, new_declared: u32) {
 #[test]
 fn streaming_apply_multi_entry_byte_identical() {
     // A few MB across multiple files — streaming path must not depend on size.
-    let game = tmp_game("stream_multi");
+    let game_guard = tmp_game("stream_multi");
+    let game = game_guard.path().to_path_buf();
     let chunk_a: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
     let chunk_b: Vec<u8> = (0..750_000u32).map(|i| (i % 241) as u8).collect();
     let orig_a: Vec<u8> = vec![0x11; chunk_a.len()];
@@ -496,7 +502,8 @@ fn streaming_apply_multi_entry_byte_identical() {
 
 #[test]
 fn actual_exceeds_declared_aborts_nothing_replaced() {
-    let game = tmp_game("bomb_declared");
+    let game_guard = tmp_game("bomb_declared");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"ORIGINAL_KEEP");
     let zip = game.join("bomb.zip");
     // Build a normal stored zip with a real content file + manifest, then
@@ -557,7 +564,8 @@ fn declared_over_total_ceiling_rejected_before_stream() {
 
 #[test]
 fn dry_run_does_not_leave_locust_dir_on_clean_game() {
-    let game = tmp_game("dry_run_clean");
+    let game_guard = tmp_game("dry_run_clean");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"ORIG");
     let zip = game.join("p.zip");
     build_patch_zip(
@@ -588,7 +596,8 @@ fn dry_run_does_not_leave_locust_dir_on_clean_game() {
 #[test]
 fn upgrade_aborts_when_rollback_soft_fails_on_edited_added_file() {
     // CRITICAL: apply must not continue after a soft-abort rollback.
-    let game = tmp_game("upgrade_abort");
+    let game_guard = tmp_game("upgrade_abort");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/base.json", b"BASE_ORIG");
     let zip_v1 = game.join("v1.zip");
     build_patch_zip(
@@ -633,7 +642,8 @@ fn upgrade_aborts_when_rollback_soft_fails_on_edited_added_file() {
 fn r2_discards_manifest_less_backup_when_strict_clean() {
     // W1: leftover backup/ without receipt made status Unknown and blocked
     // discard even when game content was Clean at strict tier.
-    let game = tmp_game("r2_discard");
+    let game_guard = tmp_game("r2_discard");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"ORIG");
     let junk = game.join(".locust").join("backup").join("files");
     fs::create_dir_all(&junk).unwrap();
@@ -662,7 +672,8 @@ fn r2_discards_manifest_less_backup_when_strict_clean() {
 
 #[test]
 fn restore_rejects_path_escape_in_backup_manifest() {
-    let game = tmp_game("w5_escape");
+    let game_guard = tmp_game("w5_escape");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"ORIG");
     let zip = game.join("p.zip");
     build_patch_zip(
@@ -699,7 +710,8 @@ fn identity_patch_on_pristine_game_is_clean_not_unknown() {
     // When translation == source, original_sha256 == patched_sha256. A pristine
     // game matching that hash must verify Clean so apply can proceed (Unity
     // equal-length inject case), not Unknown.
-    let game = tmp_game("identity_clean");
+    let game_guard = tmp_game("identity_clean");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "data/a.json", b"SAME_BYTES");
     let zip = game.join("p.zip");
     build_patch_zip(
@@ -752,7 +764,8 @@ fn patch_tree_hashes(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<
 
 fn assert_manifestless_overlay_refused(dry_run: bool) {
     for force in [false, true] {
-        let game = tmp_game("manifestless_overlay");
+        let game_guard = tmp_game("manifestless_overlay");
+        let game = game_guard.path().to_path_buf();
         write_file(&game, "a.bin", b"ORIGINAL_A");
         write_file(&game, "b.bin", b"ORIGINAL_B");
         let patch_a = game.join("patch-a.zip");
@@ -815,7 +828,8 @@ fn manifestless_overlay_dry_run_also_refuses_without_mutation() {
 
 #[test]
 fn manifestless_patch_on_clean_game_still_applies_with_confirmation() {
-    let game = tmp_game("manifestless_clean");
+    let game_guard = tmp_game("manifestless_clean");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "b.bin", b"ORIGINAL_B");
     let legacy = game.join("legacy.zip");
     build_legacy_zip(&legacy, "b.bin", b"PATCHED_B");
@@ -861,8 +875,10 @@ fn link_directory(target: &Path, link: &Path) {
 #[test]
 #[cfg(any(unix, windows))]
 fn apply_and_rollback_reject_linked_game_directories() {
-    let game = tmp_game("linked_game");
-    let outside = tmp_game("linked_external");
+    let game_guard = tmp_game("linked_game");
+    let game = game_guard.path().to_path_buf();
+    let outside_guard = tmp_game("linked_external");
+    let outside = outside_guard.path().to_path_buf();
     write_file(&outside, "base.json", b"ORIGINAL");
     link_directory(&outside, &game.join("data"));
     let zip = game.join("patch.zip");
@@ -911,8 +927,10 @@ fn apply_and_rollback_reject_linked_game_directories() {
 #[test]
 #[cfg(any(unix, windows))]
 fn selected_game_root_can_be_a_directory_link() {
-    let parent = tmp_game("linked_root_parent");
-    let game = tmp_game("linked_root_target");
+    let parent_guard = tmp_game("linked_root_parent");
+    let parent = parent_guard.path().to_path_buf();
+    let game_guard = tmp_game("linked_root_target");
+    let game = game_guard.path().to_path_buf();
     write_file(&game, "base.json", b"ORIGINAL");
     let link = parent.join("game");
     link_directory(&game, &link);
@@ -948,7 +966,8 @@ fn selected_game_root_can_be_a_directory_link() {
 
 #[test]
 fn patch_cannot_overwrite_its_own_recovery_files() {
-    let game = tmp_game("reserved_store");
+    let game_guard = tmp_game("reserved_store");
+    let game = game_guard.path().to_path_buf();
     let zip = game.join("patch.zip");
     build_patch_zip(
         &zip,
@@ -982,7 +1001,8 @@ fn dry_run_patch_transitions_preserve_installed_files_and_recovery_metadata() {
         ("different_id", "1.0.0", "id2", true, false),
         ("file_set_drift", "1.0.0", "id1", true, true),
     ] {
-        let game = tmp_game(name);
+        let game_guard = tmp_game(name);
+        let game = game_guard.path().to_path_buf();
         write_file(&game, "data/base.json", b"ORIGINAL");
         let old_zip = game.join("old.zip");
         build_patch_zip(

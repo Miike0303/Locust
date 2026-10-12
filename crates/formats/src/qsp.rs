@@ -784,10 +784,11 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), original);
     }
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_qsp_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_qsp_")
+            .tempdir()
+            .unwrap()
     }
 
     /// Minimal valid UTF-16LE QSPGAME matching converters `writeQsp` layout.
@@ -923,7 +924,8 @@ mod tests {
 
     #[test]
     fn test_detect_qsp_dir() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_qsp_fixture(&dir);
         let plugin = QspPlugin::new();
         assert!(plugin.detect(&dir));
@@ -931,7 +933,8 @@ mod tests {
 
     #[test]
     fn test_detect_non_qsp() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("readme.txt"), b"nope").unwrap();
         let plugin = QspPlugin::new();
         assert!(!plugin.detect(&dir));
@@ -939,7 +942,8 @@ mod tests {
 
     #[test]
     fn test_extract_known_strings_and_stable_ids() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_qsp_fixture(&dir);
         let plugin = QspPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -973,7 +977,8 @@ mod tests {
 
     #[test]
     fn test_inject_roundtrip() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_qsp_fixture(&dir);
         let plugin = QspPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -1009,7 +1014,8 @@ mod tests {
 
     #[test]
     fn test_legacy_header_is_reported_not_silent() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         // Fake single-byte / non-QSPGAME content with .qsp extension
         let path = dir.join("old.qsp");
         // High byte nonzero → CP1251 path error

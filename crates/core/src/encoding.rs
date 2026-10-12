@@ -129,12 +129,12 @@ impl EncodingDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_enc_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_enc_")
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
@@ -224,7 +224,8 @@ mod tests {
 
     #[test]
     fn test_read_file_auto_utf8() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let path = tmp.join("test.txt");
         std::fs::write(&path, "Hello UTF-8 file").unwrap();
         let (text, enc) = EncodingDetector::read_file_auto(&path).unwrap();
@@ -234,7 +235,8 @@ mod tests {
 
     #[test]
     fn test_write_file_encoded_creates_dirs() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let path = tmp.join("deep").join("nested").join("file.txt");
         EncodingDetector::write_file_encoded(&path, "hello", "UTF-8").unwrap();
         assert!(path.exists());

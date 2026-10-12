@@ -326,10 +326,11 @@ impl PartialEq for AppConfig {
 mod tests {
     use super::*;
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_cfg_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_cfg_")
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
@@ -427,7 +428,8 @@ mod tests {
 
     #[test]
     fn test_save_and_load_roundtrip() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let path = tmp.join("config.json");
         let cfg = AppConfig {
             default_source_lang: "ko".to_string(),
@@ -449,7 +451,8 @@ mod tests {
 
     #[test]
     fn test_load_invalid_json_returns_error() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let path = tmp.join("bad.json");
         std::fs::write(&path, "not json at all!!!").unwrap();
         assert!(AppConfig::load(&path).is_err());
@@ -475,7 +478,8 @@ mod tests {
 
     #[test]
     fn test_provider_config_roundtrip() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let path = tmp.join("config.json");
         let mut cfg = AppConfig::default();
         cfg.providers.insert(
@@ -567,7 +571,8 @@ mod tests {
 
     #[test]
     fn test_save_creates_parent_dirs() {
-        let tmp = tempdir();
+        let tmp_guard = tempdir();
+        let tmp = tmp_guard.path().to_path_buf();
         let path = tmp
             .join("deep")
             .join("nested")

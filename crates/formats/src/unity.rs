@@ -3885,10 +3885,11 @@ mod tests {
         );
     }
 
-    fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("locust_unity_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("locust_unity_")
+            .tempdir()
+            .unwrap()
     }
 
     fn assert_inplace_char_limit(entry: &StringEntry) {
@@ -3978,7 +3979,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_detect_unity() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_unity_fixture(&dir);
         let plugin = UnityPlugin::new();
         assert!(plugin.detect(&dir));
@@ -3986,7 +3988,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_detect_non_unity() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let plugin = UnityPlugin::new();
         assert!(!plugin.detect(&dir));
     }
@@ -4031,7 +4034,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_extract_finds_extensionless_globalgamemanagers() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -4062,7 +4066,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_unityfs_data_unity3d_extract_and_inject() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -4150,7 +4155,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_find_assets_nested_depth3_level() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         let nested = data_dir.join("Scenes").join("Act1");
         fs::create_dir_all(&nested).unwrap();
@@ -4179,7 +4185,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_extract_assets_strings() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_unity_fixture(&dir);
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -4194,7 +4201,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_extract_assets_binary_slot_metadata() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_unity_fixture(&dir);
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -4228,7 +4236,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_vn_single_visible_character_extract_inject() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let scripts = dir.join("TestGame_Data/SCRIPTS~");
         fs::create_dir_all(&scripts).unwrap();
         let path = scripts.join("Short.txt");
@@ -4323,7 +4332,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_extract_vn_scripts() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_vn_script_fixture(&dir);
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -4350,7 +4360,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_vn_script_dialogue_has_context() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_vn_script_fixture(&dir);
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -4371,7 +4382,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_inject_vn_scripts() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_vn_script_fixture(&dir);
         let plugin = UnityPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -4401,7 +4413,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_inject_assets_shorter_succeeds() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_unity_fixture(&dir);
         let plugin = UnityPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -4432,7 +4445,8 @@ script Chapter_1_script chapter 1 {
         ];
 
         for endian in [LengthEndian::Little, LengthEndian::Big] {
-            let dir = tempdir();
+            let dir_guard = tempdir();
+            let dir = dir_guard.path().to_path_buf();
             let data_dir = dir.join("TestGame_Data");
             fs::create_dir_all(&data_dir).unwrap();
             fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -4525,7 +4539,8 @@ script Chapter_1_script chapter 1 {
     /// BE shadows.
     #[test]
     fn test_heuristic_be_extract_and_inject() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -4624,7 +4639,8 @@ script Chapter_1_script chapter 1 {
     /// do not filter the fixture.
     #[test]
     fn test_inject_assets_multi_pattern_semantics() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -4701,7 +4717,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_heuristic_offsets_and_legacy_targets_are_safe() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -4893,7 +4910,8 @@ script Chapter_1_script chapter 1 {
                 r#"{"MeasurementCount":12}"#,
             ),
         ] {
-            let dir = tempdir();
+            let dir_guard = tempdir();
+            let dir = dir_guard.path().to_path_buf();
             let path = dir.join("resources.assets");
             let before = crate::unity_serialized::write_v17_fixture_ex(name, source, None);
             fs::write(&path, &before).unwrap();
@@ -4936,7 +4954,8 @@ script Chapter_1_script chapter 1 {
     fn test_runtime_configuration_old_heuristic_translations_cannot_write() {
         for class_id in [13, 78, 94] {
             for pinned in [false, true] {
-                let dir = tempdir();
+                let dir_guard = tempdir();
+                let dir = dir_guard.path().to_path_buf();
                 let data_dir = dir.join("TestGame_Data");
                 fs::create_dir_all(&data_dir).unwrap();
                 fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -5082,7 +5101,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_structural_textasset_and_mono_extract_cjk_fields() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -5139,7 +5159,8 @@ script Chapter_1_script chapter 1 {
 
     #[test]
     fn test_textasset_skips_linebreak_charset_tables() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -5192,7 +5213,8 @@ script Chapter_1_script chapter 1 {
             "TitleMenu.START: NEW GAME\r\nTitleMenu.CREDITS: CREDITS"
         ));
 
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -5244,7 +5266,8 @@ Confirmation.Yes: YES\r\n";
     /// MonoScript bodies must not leak type names into heuristic extract.
     #[test]
     fn test_monoscript_range_skipped_by_heuristic() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -5283,7 +5306,8 @@ Confirmation.Yes: YES\r\n";
 
     #[test]
     fn test_textasset_extract_structural() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_textasset_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -5344,7 +5368,8 @@ Electronics,video games,13\r\n";
 
     #[test]
     fn test_textasset_csv_extract_and_inject() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -5500,7 +5525,8 @@ Confirmation.Yes: YES\r\n";
         assert!(!lines.iter().any(|l| l.value.contains("Afrikaans")));
 
         // Full extract skips Naninovel Locales catalog asset.
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -5521,7 +5547,8 @@ Confirmation.Yes: YES\r\n";
 
     #[test]
     fn test_textasset_loc_line_extract_and_inject() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -5616,7 +5643,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_textasset_inject_same_and_shorter() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let assets = create_textasset_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -5719,7 +5747,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_mono_extract_structural() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_mono_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -5753,7 +5782,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_mono_inject_shorter() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let assets = create_mono_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -5807,7 +5837,8 @@ Confirmation.Yes: YES\r\n\
     /// so multi-pattern inject can rewrite all occurrences.
     #[test]
     fn test_heuristic_keeps_duplicate_text_offsets() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
@@ -5864,7 +5895,8 @@ Confirmation.Yes: YES\r\n\
     /// so inject can rewrite every instance of a repeated UI label.
     #[test]
     fn test_structural_keeps_duplicate_text_instances() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_dual_textmesh_same_text_fixture(&dir);
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -5889,7 +5921,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_structural_inject_both_duplicate_instances() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let assets = create_dual_textmesh_same_text_fixture(&dir);
         let plugin = UnityPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -5923,7 +5956,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_textmesh_extract_structural() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_textmesh_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -5956,7 +5990,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_textmesh_inject_shorter() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let assets = create_textmesh_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -5998,7 +6033,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_guitext_extract_structural() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_guitext_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let entries = plugin.extract(&dir).unwrap();
@@ -6031,7 +6067,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_guitext_inject_shorter() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let assets = create_guitext_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -6063,7 +6100,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_legacy_textasset_inject_oversize_skips() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         create_textasset_assets_fixture(&dir);
         let plugin = UnityPlugin::new();
         let mut entries = plugin.extract(&dir).unwrap();
@@ -6092,7 +6130,8 @@ Confirmation.Yes: YES\r\n\
 
     #[test]
     fn test_garbage_assets_falls_back_to_heuristic() {
-        let dir = tempdir();
+        let dir_guard = tempdir();
+        let dir = dir_guard.path().to_path_buf();
         let data_dir = dir.join("TestGame_Data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(dir.join("UnityPlayer.dll"), b"fake").unwrap();
