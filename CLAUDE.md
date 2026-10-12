@@ -4,12 +4,12 @@
 
 Leer primero [docs/IMPROVEMENT-GOAL.md](docs/IMPROVEMENT-GOAL.md), especialmente la ultima entrada **Done** y el backlog; el mapa tecnico esta en [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Los HANDOFF y checkpoints fechados de abajo son historia, no la cola actual ni el estado de publicacion. Sus preferencias y restricciones explicitas del usuario siguen vigentes salvo autorizacion posterior.
 
-Checkpoint observado por el padre (2026-10-12): `main` remoto y local con el codigo del candidato probado `bab56c9` (el commit siguiente es solo documental). [GitHub Actions run 38278034213](https://github.com/Miike0303/Locust/actions/runs/38278034213):
+Checkpoint observado por el padre (2026-10-12): `main` remoto y local con el codigo del candidato probado `97ed01d` (el commit siguiente es solo documental). [GitHub Actions run 38298450166](https://github.com/Miike0303/Locust/actions/runs/38298450166):
 
 | Plataforma | Rust (pasan / fallan / ignorados) | Frontend (pasan / fallan / ignorados) |
 |---|---|---|
-| Ubuntu | 2159 / 0 / 19 | 439 / 0 / 0 |
-| Windows | 2170 / 0 / 19 | 439 / 0 / 0 |
+| Ubuntu | 2212 / 0 / 21 | 439 / 0 / 0 |
+| Windows | 2223 / 0 / 21 | 439 / 0 / 0 |
 
 Ambas plataformas pasaron `npm ci`, build frontend, fmt, Clippy estricto y tests del workspace, incluido el crate Tauri. Los tests ignorados no se ejecutaron. No verifica la UI Tauri nativa ni juegos reales; las capturas headless usaron el build de produccion con un backend real aislado y fixtures sinteticos. El 2026-10-09 se entregaron 30 unidades de codigo (ver las entradas Done del 2026-10-09 en el ledger). Los temporales de los tests van a `.test-tmp/` (ver Build); al final de cada sesion correr `tools/cleanup-scratch.ps1 -Apply`.
 
@@ -51,7 +51,7 @@ Use Grok concurrency for independent translation batches. The user recalls rough
 Cargo workspace with 6 crates:
 - `crates/core` — error types, models, database (SQLite), extraction traits, translation engine, config, encoding, placeholders, validation, backup, glossary, font validation, export (PO/XLIFF). WASM plugins exist but are gated behind the non-default `wasm-plugins` Cargo feature; no shipped build enables it, so plugin loading is inert by default.
 - `crates/formats` — 14 plugins, all with real inject. Stable (inherit `FormatPlugin::stability` default, not an explicit declaration): `rpgmaker-mv`, `rpgmaker-vxa`, `renpy`. Experimental (explicit): Wolf RPG, SugarCube, HTML, Unity, Unreal, QSP, TyranoBuilder, KiriKiri, YU-RIS, NScripter, VNTextPatch. No registered plugin is `ComingSoon`.
-- `crates/providers` — always registered: Google (free, no key), Mock, Argos, LM Studio, Ollama. Key-gated (registered when `api_key` is set): DeepL, OpenAI, Claude, DeepSeek, Grok, Gemini. `grok-sub` when an OAuth token exists (`locust auth grok`). Retry + per-provider rate limiting are wired at the single call site in `locust-core::translation` (not dead code): retries transient failures only (429/5xx/timeout/network), never auth errors; exponential backoff with jitter; overall deadline; cancellation wins during backoff; per-provider-id RPM defaults.
+- `crates/providers` — always registered: Google (free, no key), Mock, Argos, LM Studio, Ollama. Key-gated (registered when `api_key` is set): DeepL, OpenAI, Claude, DeepSeek, Grok, Gemini. `grok-sub` when an OAuth token exists (`locust auth grok`). `antigravity` (Gemini through the user's logged-in Antigravity CLI `agy`, subscription, no key) when `agy` is on PATH or `extra.agy_path` is set. Retry + per-provider rate limiting are wired at the single call site in `locust-core::translation` (not dead code): retries transient failures only (429/5xx/timeout/network), never auth errors; exponential backoff with jitter; overall deadline; cancellation wins during backoff; per-provider-id RPM defaults.
 - `crates/server` — Axum, loopback (`127.0.0.1`) by default; local-origin CORS plus a guard refuse non-loopback Host and foreign Origin before handlers run (`crates/server/src/lib.rs:460-486`, `:541-545`). JSON REST + two WebSockets (`/api/translate/ws/:job_id`, `/api/patch/ws/:job_id`). Does **not** serve a static UI.
 - `crates/cli` — clap CLI (see `locust --help` for current subcommands). `locust server` default port is **7842** (matches the browser UI; was 3000 before cycle 42); the desktop app reserves an available loopback socket and reports the actual port to its frontend. Standalone production HTTP UI defaults to **7842**.
 - `apps/desktop/src-tauri` — Tauri desktop app (React + Vite + TypeScript in `apps/desktop/`). UI chrome is English/Spanish via Settings → Appearance → Interface language (`localStorage` `locust.ui.language`); that is not the translation target language.
