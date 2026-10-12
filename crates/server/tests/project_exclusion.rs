@@ -1,4 +1,6 @@
 //! Real HTTP admission/cancellation tests with local deterministic providers.
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -219,7 +221,8 @@ async fn cancelled_job_keeps_project_until_actual_worker_exit() {
         .write()
         .await
         .register(Arc::new(BlockingEstimate(gate.clone())));
-    let (base, server) = start_test_server(state.clone()).await;
+    let (base, server) =
+        common::start_test_server(locust_server::create_router(state.clone())).await;
     let started = start(&base, "blocking-estimate").await;
     assert_eq!(started.status(), 200);
     let body: serde_json::Value = started.json().await.unwrap();
@@ -355,7 +358,10 @@ async fn cancelled_job_keeps_project_until_actual_worker_exit() {
         200,
         "project must unlock after actual task cleanup"
     );
-    server.abort();
+    drop(websocket);
+    server.shutdown().await;
+    drop(state);
+    other.close().unwrap();
 }
 
 #[tokio::test]

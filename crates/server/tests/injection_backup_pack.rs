@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::{json, Value};
 
 #[tokio::test]
@@ -11,7 +13,8 @@ async fn injection_backup_packs_strictly_for_directory_and_single_file_projects(
         std::fs::write(&source, original).unwrap();
         let selected = if single_file { &source } else { &game };
         let state = locust_server::create_test_state();
-        let (url, handle) = locust_server::start_test_server(state.clone()).await;
+        let (url, handle) =
+            common::start_test_server(locust_server::create_router(state.clone())).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("{url}/api/project/open"))
@@ -138,7 +141,7 @@ async fn injection_backup_packs_strictly_for_directory_and_single_file_projects(
         assert!(std::fs::read_to_string(&source)
             .unwrap()
             .contains("Traducción"));
-        handle.abort();
+        handle.shutdown().await;
     }
 }
 
@@ -177,7 +180,7 @@ async fn backup_deletion_respects_recorded_store_and_default_language() {
                 }),
             )
             .unwrap();
-        let (url, handle) = locust_server::start_test_server(state).await;
+        let (url, handle) = common::start_test_server(locust_server::create_router(state)).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .delete(format!("{url}/api/backups/{}", backup.id))
@@ -196,7 +199,7 @@ async fn backup_deletion_respects_recorded_store_and_default_language() {
                 .contains("recorded for default"));
             assert!(backup_path.is_dir());
         }
-        handle.abort();
+        handle.shutdown().await;
     }
 }
 
@@ -211,7 +214,8 @@ async fn repeated_injection_keeps_the_original_pack_baseline() {
         std::fs::write(&source, original).unwrap();
         let selected = if single_file { &source } else { &game };
         let state = locust_server::create_test_state();
-        let (url, handle) = locust_server::start_test_server(state.clone()).await;
+        let (url, handle) =
+            common::start_test_server(locust_server::create_router(state.clone())).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let opened = client
             .post(format!("{url}/api/project/open"))
@@ -293,11 +297,12 @@ async fn repeated_injection_keeps_the_original_pack_baseline() {
             json!([]),
             "must still apply to the original after a no-op injection: {verified}"
         );
-        handle.abort();
+        handle.shutdown().await;
         let database_path = state.db.path();
         // A different profile/store must recover the original backup from the recording.
         let restarted = locust_server::create_test_state();
-        let (restart_url, restart_handle) = locust_server::start_test_server(restarted).await;
+        let (restart_url, restart_handle) =
+            common::start_test_server(locust_server::create_router(restarted)).await;
         let opened = client.post(format!("{restart_url}/api/project/open-db"))
             .json(&json!({"database_path":database_path,"game_path":selected,"format_id":"html-game"}))
             .send().await.unwrap();
@@ -346,7 +351,7 @@ async fn repeated_injection_keeps_the_original_pack_baseline() {
             .unwrap();
         assert_eq!(refused.status(), 400);
         assert_eq!(std::fs::read(&output).unwrap(), saved_zip);
-        restart_handle.abort();
+        restart_handle.shutdown().await;
     }
 }
 
@@ -361,7 +366,8 @@ async fn first_identity_injection_reports_no_retained_backup_or_recording() {
         std::fs::write(&source, original).unwrap();
         let selected = if single_file { &source } else { &game };
         let state = locust_server::create_test_state();
-        let (url, handle) = locust_server::start_test_server(state.clone()).await;
+        let (url, handle) =
+            common::start_test_server(locust_server::create_router(state.clone())).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let opened = client
             .post(format!("{url}/api/project/open"))
@@ -386,6 +392,6 @@ async fn first_identity_injection_reports_no_retained_backup_or_recording() {
         assert!(state.backup_manager.list_backups().unwrap().is_empty());
         assert!(state.db.get_injection(Some("es")).unwrap().is_none());
         assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
-        handle.abort();
+        handle.shutdown().await;
     }
 }

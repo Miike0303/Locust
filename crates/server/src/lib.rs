@@ -3139,6 +3139,10 @@ mod download_guard_tests {
 }
 
 #[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_server;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3621,9 +3625,11 @@ mod tests {
 
     #[tokio::test]
     async fn prefer_saved_open_skips_extract_after_source_change() {
-        let game = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let game = tempfile::tempdir_in(fixture.path()).unwrap();
         write_html_game(game.path(), "Hello");
-        let (url, _h, state) = setup_with_state().await;
+        let state = create_test_state();
+        let (url, server) = test_server::start_test_server(create_router(state.clone())).await;
         let first = client()
             .post(format!("{url}/api/project/open"))
             .json(&serde_json::json!({
@@ -3691,14 +3697,16 @@ mod tests {
         assert_eq!(reset.source, "Hello, traveler");
         assert_eq!(reset.translation.as_deref(), Some("Hola"));
         assert_eq!(reset.status, StringStatus::Pending);
-        let _ = std::fs::remove_file(&db_path);
+        server.shutdown().await;
     }
 
     #[tokio::test]
     async fn prefer_saved_missing_db_extracts() {
-        let missing = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = tempfile::tempdir_in(fixture.path()).unwrap();
         write_html_game(missing.path(), "Only extract");
-        let (url, _h) = setup().await;
+        let state = create_test_state();
+        let (url, server) = test_server::start_test_server(create_router(state.clone())).await;
         let extracted = client()
             .post(format!("{url}/api/project/open"))
             .json(&serde_json::json!({
@@ -3712,11 +3720,7 @@ mod tests {
         assert_eq!(extracted.status(), 200);
         let extracted_body: serde_json::Value = extracted.json().await.unwrap();
         assert!(extracted_body["added"].as_u64().unwrap() >= 1);
-        let extracted_db = extracted_body["database_path"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let _ = std::fs::remove_file(&extracted_db);
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -4092,7 +4096,8 @@ mod tests {
         let candidate_row = serde_json::to_value(candidate.get_entry("hero").unwrap()).unwrap();
         drop(candidate);
         let candidate_bytes = std::fs::read(&path_b).unwrap();
-        let (url, server, state) = setup_with_state().await;
+        let state = create_test_state();
+        let (url, server) = test_server::start_test_server(create_router(state.clone())).await;
         let http = client();
         let opened = http
             .post(format!("{url}/api/project/open-db"))
@@ -4160,7 +4165,7 @@ mod tests {
         );
         drop(candidate);
         assert_eq!(std::fs::read(&path_b).unwrap(), candidate_bytes);
-        server.abort();
+        server.shutdown().await;
     }
 
     #[tokio::test]

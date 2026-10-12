@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::{json, Value};
 
 #[tokio::test]
@@ -7,7 +9,8 @@ async fn c139_patch_status_exposes_injections_and_preserves_patch_fields() {
     std::fs::create_dir(&game).unwrap();
     std::fs::write(game.join("story.html"), "<p>Original</p>").unwrap();
     let state = locust_server::create_test_state();
-    let (url, server) = locust_server::start_test_server(state.clone()).await;
+    let (url, server) =
+        common::start_test_server(locust_server::create_router(state.clone())).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let get_status = || async {
         let response = client
@@ -89,5 +92,5 @@ async fn c139_patch_status_exposes_injections_and_preserves_patch_fields() {
         .unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(get_status().await["injections"], json!([]));
-    server.abort();
+    server.shutdown().await;
 }

@@ -1,4 +1,6 @@
 //! Deterministic HTTP adapters: saved-data resume never extracts injected sources.
+mod common;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -14,7 +16,7 @@ use locust_core::{
     models::{StringEntry, StringStatus},
     project::open_project,
 };
-use locust_server::{create_test_state, start_test_server, AppState, ProjectInfo};
+use locust_server::{create_test_state, AppState, ProjectInfo};
 use serde_json::{json, Value};
 
 struct TextPlugin(Arc<AtomicUsize>);
@@ -59,11 +61,12 @@ impl FormatPlugin for TextPlugin {
 }
 
 struct Fixture {
-    _temp: tempfile::TempDir,
     game: PathBuf,
     database: PathBuf,
     state: Arc<AppState>,
     calls: Arc<AtomicUsize>,
+    // Fields drop in declaration order, after the database state.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -134,7 +137,8 @@ async fn post(base: &str, path: &str, body: Value) -> reqwest::Response {
 #[tokio::test]
 async fn preflight_shape_and_resume_preserve_approved_rows_without_extraction() {
     let f = Fixture::new().await;
-    let (base, server) = start_test_server(f.state.clone()).await;
+    let (base, server) =
+        common::start_test_server(locust_server::create_router(f.state.clone())).await;
     let before_live = f.state.db.path();
     let preflight = post(&base, "preflight", json!({"game_path": f.game})).await;
     assert_eq!(preflight.status(), 200);
@@ -186,13 +190,14 @@ async fn preflight_shape_and_resume_preserve_approved_rows_without_extraction() 
     );
     assert!(f.state.config_path.is_file());
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-    server.abort();
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn drift_after_preflight_refuses_without_changing_live_or_saved_project() {
     let f = Fixture::new().await;
-    let (base, server) = start_test_server(f.state.clone()).await;
+    let (base, server) =
+        common::start_test_server(locust_server::create_router(f.state.clone())).await;
     let preflight = post(
         &base,
         "preflight",
@@ -233,7 +238,7 @@ async fn drift_after_preflight_refuses_without_changing_live_or_saved_project() 
     let attention = attention.json::<Value>().await.unwrap();
     assert_eq!(attention["kind"], "needs_attention");
     assert!(!attention["reason"].as_str().unwrap().is_empty());
-    server.abort();
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -242,7 +247,8 @@ async fn plain_preflight_keeps_backward_compatible_folder_extraction() {
     let plain = f._temp.path().join("plain");
     fs::create_dir(&plain).unwrap();
     fs::write(plain.join("story.txt"), "Plain source").unwrap();
-    let (base, server) = start_test_server(f.state.clone()).await;
+    let (base, server) =
+        common::start_test_server(locust_server::create_router(f.state.clone())).await;
     let preflight = post(&base, "preflight", json!({"game_path": plain})).await;
     assert_eq!(preflight.status(), 200);
     assert_eq!(
@@ -258,13 +264,14 @@ async fn plain_preflight_keeps_backward_compatible_folder_extraction() {
         "Plain source"
     );
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
-    server.abort();
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn resume_refuses_project_admission_conflicts_and_explicit_refresh_remains_available() {
     let f = Fixture::new().await;
-    let (base, server) = start_test_server(f.state.clone()).await;
+    let (base, server) =
+        common::start_test_server(locust_server::create_router(f.state.clone())).await;
     let guard = locust_server::try_project_operation(&f.state).unwrap();
     let response = post(&base, "resume", f.resume_body()).await;
     assert_eq!(response.status(), 409);
@@ -299,5 +306,5 @@ async fn resume_refuses_project_admission_conflicts_and_explicit_refresh_remains
         f.state.db.get_entry("hero").unwrap().unwrap().status,
         StringStatus::Pending
     );
-    server.abort();
+    server.shutdown().await;
 }

@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 
 use serde::Deserialize;
@@ -93,11 +95,13 @@ struct MultiLangReport {
 
 #[tokio::test]
 async fn test_full_rpgmaker_mv_flow() {
-    let tmpdir = TempDir::new().unwrap();
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     create_rpgmaker_mv_fixture(tmpdir.path());
 
     let state = locust_server::create_test_state();
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
 
     // 1. Open project
     let resp: ProjectOpenResponse = client()
@@ -308,24 +312,27 @@ async fn test_full_rpgmaker_mv_flow() {
         report.backup_id, "skip-replace-mode",
         "Replace mode with an output_dir must not skip the backup"
     );
+    server.shutdown().await;
 }
 
 // ─── Injection recording through the HTTP seam ──────────────────────────────
 
 #[tokio::test]
 async fn test_inject_records_the_injection_for_patch() {
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
     // `locust patch` packs EXCLUSIVELY from the recording an injection
     // persisted. The HTTP seam used to call MultiLangInjector::inject with
     // no record_injection at all, so every project injected through the
     // server (or the desktop app, which shares the core seam) hard-errored
     // at patch time with "no injection has been recorded".
-    let tmpdir = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     create_rpgmaker_mv_fixture(tmpdir.path());
     let db_dir = TempDir::new().unwrap();
     let db_path = db_dir.path().join("project.locust.db");
 
     let state = locust_server::create_test_state_with_db(&db_path);
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
 
     let resp: ProjectOpenResponse = client()
         .post(format!("{}/api/project/open", base_url))
@@ -400,21 +407,24 @@ async fn test_inject_records_the_injection_for_patch() {
         "the injected data files must be recorded, got: {:?}",
         rec.files.iter().map(|f| &f.rel).collect::<Vec<_>>()
     );
+    server.shutdown().await;
 }
 
 // ─── Direct inject records for patch packing ────────────────────────────────
 
 #[tokio::test]
 async fn test_inject_direct_records_on_game_root() {
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
     // `direct: true` must write into the game tree and record under that root
     // (not a per-lang copy), matching CLI --direct — so Patch → Pack can use it.
-    let tmpdir = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     create_rpgmaker_mv_fixture(tmpdir.path());
     let db_dir = TempDir::new().unwrap();
     let db_path = db_dir.path().join("project.locust.db");
 
     let state = locust_server::create_test_state_with_db(&db_path);
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
 
     let _open: ProjectOpenResponse = client()
         .post(format!("{}/api/project/open", base_url))
@@ -484,22 +494,25 @@ async fn test_inject_direct_records_on_game_root() {
     );
     // Non-direct default path unchanged: without direct, recording is under *-lang copy
     // (covered by test_inject_records_the_injection_for_patch).
+    server.shutdown().await;
 }
 
 // ─── Pack patch zip via HTTP ────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_patch_pack_from_injection_recording() {
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
     // End-to-end: open → translate → inject (records files) → POST /api/patch/pack
     // packs a zip from that recording. game_path must be the recorded root
     // (per-language copy when inject uses output_dir).
-    let tmpdir = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     create_rpgmaker_mv_fixture(tmpdir.path());
     let db_dir = TempDir::new().unwrap();
     let db_path = db_dir.path().join("project.locust.db");
 
     let state = locust_server::create_test_state_with_db(&db_path);
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
 
     let _open: ProjectOpenResponse = client()
         .post(format!("{}/api/project/open", base_url))
@@ -664,17 +677,20 @@ async fn test_patch_pack_from_injection_recording() {
         .send().await.unwrap();
     assert_eq!(wrong.status(), 400);
     assert_eq!(std::fs::read(strict_zip).unwrap(), saved);
+    server.shutdown().await;
 }
 
 // ─── Ren'Py Add mode flow ──────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_renpy_add_mode_flow() {
-    let tmpdir = TempDir::new().unwrap();
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     create_renpy_fixture(tmpdir.path());
 
     let state = locust_server::create_test_state();
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
 
     // Open project
     let resp: ProjectOpenResponse = client()
@@ -762,13 +778,16 @@ async fn test_renpy_add_mode_flow() {
         content.contains("translate es"),
         "should have translate es blocks"
     );
+    server.shutdown().await;
 }
 
 // ─── Validation catches placeholder issues ─────────────────────────────────
 
 #[tokio::test]
 async fn test_validation_catches_placeholder_issues() {
-    let tmpdir = TempDir::new().unwrap();
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     let data = tmpdir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
 
@@ -784,7 +803,7 @@ async fn test_validation_catches_placeholder_issues() {
     .unwrap();
 
     let state = locust_server::create_test_state();
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
 
     // Open project
     client()
@@ -832,17 +851,20 @@ async fn test_validation_catches_placeholder_issues() {
         let issues_found = resp["validation"]["issues_found"].as_u64().unwrap_or(0);
         assert!(issues_found > 0, "should have validation issues");
     }
+    server.shutdown().await;
 }
 
 // ─── Batch string patch (search-replace) ───────────────────────────────────
 
 #[tokio::test]
 async fn test_batch_patch_strings_applies_known_skips_unknown() {
-    let tmpdir = TempDir::new().unwrap();
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     create_rpgmaker_mv_fixture(tmpdir.path());
 
     let state = locust_server::create_test_state();
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
 
     client()
         .post(format!("{}/api/project/open", base_url))
@@ -899,6 +921,7 @@ async fn test_batch_patch_strings_applies_known_skips_unknown() {
         .await
         .unwrap();
     assert_eq!(e0["translation"].as_str(), Some("BATCH_A"));
+    server.shutdown().await;
 }
 
 fn urlencoding(s: &str) -> String {
@@ -1047,11 +1070,13 @@ async fn backup_report_distinguishes_empty_and_fatal_listing_failure() {
 
 #[tokio::test]
 async fn test_backup_restore() {
-    let tmpdir = TempDir::new().unwrap();
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     create_rpgmaker_mv_fixture(tmpdir.path());
 
     let state = locust_server::create_test_state();
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
 
     // Open project
     client()
@@ -1123,6 +1148,7 @@ async fn test_backup_restore() {
         restored.contains("Hero"),
         "original content should be restored"
     );
+    server.shutdown().await;
 }
 
 // ─── Register language (RM multi-lang UI) ───────────────────────────────────
@@ -1566,13 +1592,15 @@ async fn patch_status_detects_receipt_drift() {
 /// come back byte-identical, which is the whole promise of the transaction.
 #[tokio::test]
 async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
-    let tmpdir = TempDir::new().unwrap();
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     create_rpgmaker_mv_fixture(tmpdir.path());
     let db_dir = TempDir::new().unwrap();
     let db_path = db_dir.path().join("project.locust.db");
 
     let state = locust_server::create_test_state_with_db(&db_path);
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
 
     let _open: ProjectOpenResponse = client()
         .post(format!("{}/api/project/open", base_url))
@@ -1808,6 +1836,7 @@ async fn test_patch_lifecycle_over_http_restores_game_byte_identical() {
         before,
         "a refused apply must leave the game untouched"
     );
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -2052,11 +2081,14 @@ struct ProjectOpenMergeResponse {
 
 #[tokio::test]
 async fn test_http_reopen_same_game_preserves_translations() {
-    let tmpdir = TempDir::new().unwrap();
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
+    let tmpdir = TempDir::new_in(fixture.path()).unwrap();
     create_rpgmaker_mv_fixture(tmpdir.path());
 
     let state = locust_server::create_test_state();
-    let (base_url, _handle) = locust_server::start_test_server(state.clone()).await;
+    let (base_url, server) =
+        common::start_test_server(locust_server::create_router(state.clone())).await;
 
     let first: ProjectOpenMergeResponse = client()
         .post(format!("{}/api/project/open", base_url))
@@ -2124,17 +2156,20 @@ async fn test_http_reopen_same_game_preserves_translations() {
         .expect("translated id still present");
     assert_eq!(kept["translation"], "Hola");
     assert_eq!(kept["status"], "approved");
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_http_and_core_open_produce_the_same_merge() {
-    let http_game = TempDir::new().unwrap();
-    let core_game = TempDir::new().unwrap();
+    // Include the sibling project database in the fixture lifetime.
+    let fixture = TempDir::new().unwrap();
+    let http_game = TempDir::new_in(fixture.path()).unwrap();
+    let core_game = TempDir::new_in(fixture.path()).unwrap();
     create_rpgmaker_mv_fixture(http_game.path());
     create_rpgmaker_mv_fixture(core_game.path());
 
     let state = locust_server::create_test_state();
-    let (base_url, _handle) = locust_server::start_test_server(state).await;
+    let (base_url, server) = common::start_test_server(locust_server::create_router(state)).await;
     let http: ProjectOpenMergeResponse = client()
         .post(format!("{}/api/project/open", base_url))
         .json(&serde_json::json!({"path": http_game.path().to_string_lossy()}))
@@ -2156,6 +2191,7 @@ async fn test_http_and_core_open_produce_the_same_merge() {
     assert_eq!(http.removed, core.removed);
     assert_eq!(http.preserved_translations, core.preserved_translations);
     assert_eq!(http.total_strings, core.total_strings);
+    server.shutdown().await;
 }
 
 #[tokio::test]

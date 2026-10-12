@@ -84,6 +84,10 @@ npm run build
 
 See the checkpoint above and the ledger's latest **Done** entry for observed results. Frontend unit command: `npm run test:unit` in `apps/desktop`.
 
+Cargo routes `TMP`, `TEMP`, and `TMPDIR` to the checkout's `.test-tmp/`; its tracked `.gitignore` keeps the directory present and test output ignored.
+Tests must release file handles before their temp guards; a full run should leave only `.gitignore`.
+Run `powershell -NoProfile -File tools/cleanup-scratch.ps1` to preview aged test/scratch cleanup; add `-Apply` to remove it (`-MinAgeHours` defaults to 2).
+
 ## Key Commands
 
 Selected commands (see `locust --help` for the full list, including font-check, font-patch, inject-status and inject-recover):

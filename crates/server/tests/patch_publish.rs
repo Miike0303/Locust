@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -5,13 +7,14 @@ use locust_core::patch::{identity::normalize_dlsite_code, PatchManifest};
 use serde_json::{json, Value};
 
 struct Fixture {
-    directory: tempfile::TempDir,
     game: PathBuf,
     pristine: PathBuf,
     state: Arc<locust_server::AppState>,
     url: String,
-    handle: tokio::task::JoinHandle<()>,
+    handle: common::TestServer,
     client: reqwest::Client,
+    // Fields drop in declaration order, after the database state.
+    directory: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -25,7 +28,8 @@ impl Fixture {
         std::fs::write(&script, "<p>Hello</p>").unwrap();
         std::fs::write(pristine.join("story.html"), "<p>Hello</p>").unwrap();
         let state = locust_server::create_test_state_with_db(&directory.path().join("project.db"));
-        let (url, handle) = locust_server::start_test_server(state.clone()).await;
+        let (url, handle) =
+            common::start_test_server(locust_server::create_router(state.clone())).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("{url}/api/project/open"))
@@ -70,12 +74,6 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
 #[tokio::test]
 async fn pack_identity_is_written_to_manifest_and_response() {
     let fixture = Fixture::new().await;
@@ -108,6 +106,7 @@ async fn pack_identity_is_written_to_manifest_and_response() {
         json!({"store_ids":game.store_ids,"game_version":"1.2","fingerprint_count":1})
     );
     assert!(report.get("entry_path").is_none());
+    fixture.handle.shutdown().await;
 }
 
 #[tokio::test]
@@ -134,6 +133,7 @@ async fn pack_invalid_identity_returns_400_without_zip() {
         }
         assert!(!fixture.directory.path().join("patch.zip").exists());
     }
+    fixture.handle.shutdown().await;
 }
 
 #[tokio::test]
@@ -154,6 +154,7 @@ async fn pack_entry_contains_detected_rj_and_written_zip_hash() {
     assert!(md.contains("gameTitle: \"Demo Game\"\n"), "{md}");
     assert!(md.contains("rjCode: \"RJ01234567\"\n"));
     assert!(md.contains(&format!("  size: {size}\n  sha256: {hash:?}\n")));
+    fixture.handle.shutdown().await;
 }
 
 #[tokio::test]
@@ -178,6 +179,7 @@ async fn pack_rejects_protected_and_existing_entry_paths_before_zip() {
     }
     assert!(!fixture.game.join("new").exists());
     assert_eq!(std::fs::read_to_string(existing).unwrap(), "keep");
+    fixture.handle.shutdown().await;
 }
 
 #[tokio::test]
@@ -190,12 +192,14 @@ async fn pack_detection_can_be_disabled() {
     let report: Value = response.json().await.unwrap();
     assert_eq!(report["game"]["store_ids"], json!({}));
     assert_eq!(report["game"]["fingerprint_count"], 1);
+    fixture.handle.shutdown().await;
 }
 
 #[tokio::test]
 async fn identity_endpoint_detects_paths_without_project_or_filesystem_access() {
     let state = locust_server::create_test_state();
-    let (url, handle) = locust_server::start_test_server(state.clone()).await;
+    let (url, handle) =
+        common::start_test_server(locust_server::create_router(state.clone())).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     for (path, expected) in [
         ("Z:/missing/[rj01234567] Game", Some("RJ01234567")),
@@ -222,7 +226,7 @@ async fn identity_endpoint_detects_paths_without_project_or_filesystem_access() 
         .unwrap();
     assert_eq!(response.status(), 400);
     assert!(state.current_project.read().await.is_none());
-    handle.abort();
+    handle.shutdown().await;
 }
 
 #[tokio::test]
@@ -269,4 +273,5 @@ async fn pack_entry_uses_recorded_root_when_game_path_is_the_project_db() {
     let response = fixture.pack(&unrelated).await;
     assert_eq!(response.status(), 400);
     assert!(!out.join("third.zip").exists());
+    fixture.handle.shutdown().await;
 }

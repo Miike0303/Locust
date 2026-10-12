@@ -1,0 +1,4 @@
+[env]
+TMP = { value = ".test-tmp", relative = true, force = true }
+TEMP = { value = ".test-tmp", relative = true, force = true }
+TMPDIR = { value = ".test-tmp", relative = true, force = true }

@@ -160,7 +160,8 @@ mod tests {
 
     #[tokio::test]
     async fn project_open_persists_recents_and_reports_failed_save_without_failing_open() {
-        let game = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let game = tempfile::tempdir_in(fixture.path()).unwrap();
         std::fs::write(
             game.path().join("story.html"),
             "<p>Test Japanese 日本語</p>",
