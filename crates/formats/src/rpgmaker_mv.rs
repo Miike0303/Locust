@@ -453,7 +453,8 @@ impl RpgMakerMvPlugin {
                         continue;
                     }
                     let id = format!("{}#{}#{}", filename, idx, field);
-                    let mut entry = StringEntry::new(id, val, file_path.to_path_buf());
+                    let mut entry = StringEntry::new(id, val, file_path.to_path_buf())
+                        .with_format_id("rpgmaker-mv");
                     entry.tags = vec![tag.to_string()];
                     entries.push(entry);
                 }
@@ -512,7 +513,8 @@ impl RpgMakerMvPlugin {
                         .map(|s| s.to_string());
                     if let Some(name) = speaker.as_deref().filter(|s| has_speaker_text(s)) {
                         let id = format!("{}#cmd_{}#speaker", id_prefix, cmd_idx);
-                        let mut entry = StringEntry::new(id, name, file_path.to_path_buf());
+                        let mut entry = StringEntry::new(id, name, file_path.to_path_buf())
+                            .with_format_id("rpgmaker-mv");
                         entry.tags = vec!["actor_name".to_string(), "speaker".to_string()];
                         entries.push(entry);
                     }
@@ -546,7 +548,8 @@ impl RpgMakerMvPlugin {
                         } else {
                             "dialogue"
                         };
-                        let mut entry = StringEntry::new(id, &text, file_path.to_path_buf());
+                        let mut entry = StringEntry::new(id, &text, file_path.to_path_buf())
+                            .with_format_id("rpgmaker-mv");
                         entry.tags = vec![tag.to_string()];
                         if code == 401 {
                             entry.context = speaker.clone();
@@ -562,7 +565,8 @@ impl RpgMakerMvPlugin {
                                 if !text.trim().is_empty() {
                                     let id = format!("{}#cmd_{}#choice_{}", id_prefix, cmd_idx, ci);
                                     let mut entry =
-                                        StringEntry::new(id, text, file_path.to_path_buf());
+                                        StringEntry::new(id, text, file_path.to_path_buf())
+                                            .with_format_id("rpgmaker-mv");
                                     entry.tags = vec!["menu".to_string()];
                                     entries.push(entry);
                                 }
@@ -575,7 +579,8 @@ impl RpgMakerMvPlugin {
                     if let Some(text) = params.get(1).and_then(|v| v.as_str()) {
                         if !text.trim().is_empty() {
                             let id = format!("{}#cmd_{}", id_prefix, cmd_idx);
-                            let mut entry = StringEntry::new(id, text, file_path.to_path_buf());
+                            let mut entry = StringEntry::new(id, text, file_path.to_path_buf())
+                                .with_format_id("rpgmaker-mv");
                             entry.tags = vec!["actor_name".to_string()];
                             entries.push(entry);
                         }
@@ -587,7 +592,8 @@ impl RpgMakerMvPlugin {
                         if let Some(extracted) = extract_plugin_command_text(text) {
                             let id = format!("{}#cmd_{}", id_prefix, cmd_idx);
                             let mut entry =
-                                StringEntry::new(id, &extracted, file_path.to_path_buf());
+                                StringEntry::new(id, &extracted, file_path.to_path_buf())
+                                    .with_format_id("rpgmaker-mv");
                             entry.tags = vec!["plugin_cmd".to_string()];
                             if parse_d_text_command(text).is_some() {
                                 entry.tags.push("d_text".to_string());
@@ -600,7 +606,8 @@ impl RpgMakerMvPlugin {
                 357 => {
                     for (arg_key, text) in extract_mz_plugin_command(params) {
                         let id = format!("{}#cmd_{}#arg_{}", id_prefix, cmd_idx, arg_key);
-                        let mut entry = StringEntry::new(id, &text, file_path.to_path_buf());
+                        let mut entry = StringEntry::new(id, &text, file_path.to_path_buf())
+                            .with_format_id("rpgmaker-mv");
                         entry.tags = vec!["plugin_cmd".to_string()];
                         entries.push(entry);
                     }
@@ -624,7 +631,8 @@ impl RpgMakerMvPlugin {
                     format!("{}#gameTitle", filename),
                     title,
                     file_path.to_path_buf(),
-                );
+                )
+                .with_format_id("rpgmaker-mv");
                 entry.tags = vec!["system".to_string()];
                 entries.push(entry);
             }
@@ -640,7 +648,8 @@ impl RpgMakerMvPlugin {
                                 format!("{}#terms#basic#{}", filename, i),
                                 s,
                                 file_path.to_path_buf(),
-                            );
+                            )
+                            .with_format_id("rpgmaker-mv");
                             entry.tags = vec!["ui_label".to_string()];
                             entries.push(entry);
                         }
@@ -657,7 +666,8 @@ impl RpgMakerMvPlugin {
                                 format!("{}#terms#commands#{}", filename, i),
                                 s,
                                 file_path.to_path_buf(),
-                            );
+                            )
+                            .with_format_id("rpgmaker-mv");
                             entry.tags = vec!["menu".to_string()];
                             entries.push(entry);
                         }
@@ -674,7 +684,8 @@ impl RpgMakerMvPlugin {
                                 format!("{}#terms#params#{}", filename, i),
                                 s,
                                 file_path.to_path_buf(),
-                            );
+                            )
+                            .with_format_id("rpgmaker-mv");
                             entry.tags = vec!["ui_label".to_string()];
                             entries.push(entry);
                         }
@@ -691,7 +702,8 @@ impl RpgMakerMvPlugin {
                                 format!("{}#terms#messages#{}", filename, key),
                                 s,
                                 file_path.to_path_buf(),
-                            );
+                            )
+                            .with_format_id("rpgmaker-mv");
                             entry.tags = vec!["dialogue".to_string()];
                             entries.push(entry);
                         }
@@ -710,7 +722,8 @@ impl RpgMakerMvPlugin {
                                 format!("{}#{}#{}", filename, arr_name, i),
                                 s,
                                 file_path.to_path_buf(),
-                            );
+                            )
+                            .with_format_id("rpgmaker-mv");
                             entry.tags = vec![tag.to_string()];
                             entries.push(entry);
                         }
@@ -741,7 +754,8 @@ impl RpgMakerMvPlugin {
                                 continue;
                             }
                             let id = format!("{}#plugins#{}#{}#{}", filename, pi, plugin_name, key);
-                            let mut entry = StringEntry::new(id, s, file_path.to_path_buf());
+                            let mut entry = StringEntry::new(id, s, file_path.to_path_buf())
+                                .with_format_id("rpgmaker-mv");
                             entry.tags = vec!["plugin_param".to_string()];
                             entries.push(entry);
                         }
@@ -767,7 +781,8 @@ impl RpgMakerMvPlugin {
                     format!("{}#displayName", filename),
                     dn,
                     file_path.to_path_buf(),
-                );
+                )
+                .with_format_id("rpgmaker-mv");
                 entry.tags = vec!["location".to_string()];
                 entries.push(entry);
             }
@@ -1486,7 +1501,8 @@ impl RpgMakerMvPlugin {
                 continue;
             }
             let id = format!("{filename}#{key}");
-            let mut entry = StringEntry::new(id, text.to_string(), file_path.to_path_buf());
+            let mut entry = StringEntry::new(id, text.to_string(), file_path.to_path_buf())
+                .with_format_id("rpgmaker-mv");
             entry = entry.with_tags(vec![
                 "iavra".to_string(),
                 format!("pack:{pack}"),

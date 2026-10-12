@@ -47,7 +47,8 @@ impl WolfRpgPlugin {
             }
 
             let id = format!("{}#offset_{}#{}", filename, offset, idx);
-            let mut entry = StringEntry::new(id, &text, file_path.to_path_buf());
+            let mut entry =
+                StringEntry::new(id, &text, file_path.to_path_buf()).with_format_id("wolf-rpg");
             entry.tags = vec!["unknown".to_string()];
             entry.metadata.insert(
                 "extraction_method".to_string(),

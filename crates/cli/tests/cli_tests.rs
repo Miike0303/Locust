@@ -167,3 +167,75 @@ fn validate_json_reports_issues_and_clean_projects() {
     assert_eq!(report["count"], 0);
     assert_eq!(report["issues"], serde_json::json!([]));
 }
+
+#[test]
+fn format_profile_validate_uses_extracted_and_legacy_rpgmaker_provenance() {
+    use locust_core::database::{Database, EntryFilter};
+    use locust_core::models::{StringStatus, FORMAT_ID_METADATA_KEY};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Actors.json");
+    std::fs::write(&source, serde_json::to_vec(&serde_json::json!([
+        null,
+        {"name": r"\n<【貴族】リディア視点>　■解放条件　\n　・好感度１４以上\n　・「精力を集める」を選択"},
+        {"name": r"\n<【冒険者】ルイ視点>　■解放条件　\n　・好感度６以上 /「精力を集める」を選択"}
+    ])).unwrap()).unwrap();
+    let project = dir.path().join("format.locust.db");
+    locust()
+        .arg("extract")
+        .arg(&source)
+        .args(["--format", "rpgmaker-mv", "--output"])
+        .arg(&project)
+        .assert()
+        .success();
+    let db = Database::open(&project).unwrap();
+    let mut entries = db.get_entries(&EntryFilter::default()).unwrap();
+    assert_eq!(entries.len(), 2);
+    let translations = [
+        r"\n<[Noble] Lidia> Unlock conditions\n Affection 14 or higher\n Select Gather energy",
+        r"\n<[Adventurer] Louis> Unlock conditions\n Affection 6 or higher / Select Gather energy",
+    ];
+    for (entry, translation) in entries.iter_mut().zip(translations) {
+        assert_eq!(entry.metadata[FORMAT_ID_METADATA_KEY], "rpgmaker-mv");
+        entry.translation = Some(translation.into());
+        entry.status = StringStatus::Translated;
+    }
+    // Validation of an archived project must not require the game files.
+    std::fs::remove_file(&source).unwrap();
+    for legacy in [false, true] {
+        if legacy {
+            for entry in &mut entries {
+                entry.metadata.remove(FORMAT_ID_METADATA_KEY);
+            }
+        }
+        db.save_entries(&entries).unwrap();
+        let output = locust()
+            .arg("validate")
+            .arg(&project)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["count"], 0);
+    }
+    for entry in &mut entries {
+        entry
+            .metadata
+            .insert(FORMAT_ID_METADATA_KEY.into(), serde_json::json!("renpy"));
+    }
+    db.save_entries(&entries).unwrap();
+    let output = locust()
+        .arg("validate")
+        .arg(&project)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["count"], 2);
+}

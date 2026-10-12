@@ -4,6 +4,27 @@ use crate::error::{LocustError, Result};
 
 pub struct PlaceholderProcessor;
 
+/// Unknown formats retain every scanner. Only engines whose square brackets
+/// are plain text opt out; their backslash controls use the RPG Maker scanner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PlaceholderProfile {
+    #[default]
+    Full,
+    RpgMaker,
+}
+
+impl PlaceholderProfile {
+    pub fn for_format(format_id: &str) -> Self {
+        match format_id {
+            // The MV plugin also handles MZ; the VXA plugin includes VX and XP.
+            "rpgmaker-mv" | "rpgmaker-mz" | "rpgmaker-vxa" | "wolf-rpg" => Self::RpgMaker,
+            // Ren'Py interpolation, KAG/Tyrano commands, HTML and SugarCube
+            // retain the existing protections, as do all unknown formats.
+            _ => Self::Full,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Placeholder {
     pub index: usize,
@@ -44,6 +65,13 @@ struct PatternMatch {
 
 impl PlaceholderProcessor {
     pub fn extract(source: &str) -> (String, Vec<Placeholder>) {
+        Self::extract_with_profile(source, PlaceholderProfile::default())
+    }
+
+    pub fn extract_with_profile(
+        source: &str,
+        profile: PlaceholderProfile,
+    ) -> (String, Vec<Placeholder>) {
         let mut matches = Vec::new();
 
         // Collect all pattern matches
@@ -52,7 +80,9 @@ impl PlaceholderProcessor {
         Self::find_python_format(source, &mut matches);
         Self::find_rust_format(source, &mut matches);
         Self::find_c_format(source, &mut matches);
-        Self::find_custom_brackets(source, &mut matches);
+        if profile != PlaceholderProfile::RpgMaker {
+            Self::find_custom_brackets(source, &mut matches);
+        }
 
         // Sort by start position and remove overlaps
         matches.sort_by_key(|m| m.start);
@@ -126,8 +156,16 @@ impl PlaceholderProcessor {
     }
 
     pub fn validate(original: &str, translated: &str) -> Vec<PlaceholderMismatch> {
-        let (_, orig_phs) = Self::extract(original);
-        let (_, trans_phs) = Self::extract(translated);
+        Self::validate_with_profile(original, translated, PlaceholderProfile::default())
+    }
+
+    pub fn validate_with_profile(
+        original: &str,
+        translated: &str,
+        profile: PlaceholderProfile,
+    ) -> Vec<PlaceholderMismatch> {
+        let (_, orig_phs) = Self::extract_with_profile(original, profile);
+        let (_, trans_phs) = Self::extract_with_profile(translated, profile);
 
         let orig_texts: Vec<&str> = orig_phs.iter().map(|p| p.original.as_str()).collect();
         let trans_texts: Vec<&str> = trans_phs.iter().map(|p| p.original.as_str()).collect();
@@ -675,6 +713,95 @@ fn is_renpy_interpolation(inner: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_profile_rpgmaker_brackets_are_text_but_controls_are_protected() {
+        for format in ["rpgmaker-mv", "rpgmaker-mz", "rpgmaker-vxa", "wolf-rpg"] {
+            let profile = PlaceholderProfile::for_format(format);
+            let source = r"[Noble] \V[1] \N[1] \C[1]";
+            let (safe, placeholders) = PlaceholderProcessor::extract_with_profile(source, profile);
+            assert_eq!(safe, "[Noble] {PL_0} {PL_1} {PL_2}", "{format}");
+            assert_eq!(
+                PlaceholderProcessor::restore(&safe, &placeholders).unwrap(),
+                source
+            );
+            assert!(PlaceholderProcessor::validate_with_profile(
+                source,
+                r"[Adventurer] \V[1] \N[1] \C[1]",
+                profile
+            )
+            .is_empty());
+            for control in [r"\V[1]", r"\N[1]", r"\C[1]"] {
+                let missing = source.replace(control, "");
+                let changed = source.replace(control, &control.replace('1', "2"));
+                assert!(
+                    !PlaceholderProcessor::validate_with_profile(source, &missing, profile)
+                        .is_empty(),
+                    "{format}: {control}"
+                );
+                assert!(
+                    !PlaceholderProcessor::validate_with_profile(source, &changed, profile)
+                        .is_empty(),
+                    "{format}: {control}"
+                );
+                assert!(
+                    !PlaceholderProcessor::validate_with_profile("Hello", control, profile)
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn format_profile_keeps_renpy_kag_and_tyrano_brackets() {
+        for format in ["renpy", "kirikiri", "tyrano"] {
+            let profile = PlaceholderProfile::for_format(format);
+            assert_eq!(
+                PlaceholderProcessor::validate_with_profile("Hello", "Hello [Noble]", profile),
+                vec![PlaceholderMismatch {
+                    kind: MismatchKind::Extra,
+                    placeholder: "[Noble]".into(),
+                }]
+            );
+            let (safe, placeholders) =
+                PlaceholderProcessor::extract_with_profile("Hello[tag]", profile);
+            assert_eq!(safe, "Hello{PL_0}");
+            assert_eq!(
+                PlaceholderProcessor::restore(&safe, &placeholders).unwrap(),
+                "Hello[tag]"
+            );
+            assert!(
+                !PlaceholderProcessor::validate_with_profile("Hello[tag]", "Hola", profile)
+                    .is_empty()
+            );
+        }
+        let profile = PlaceholderProfile::for_format("renpy");
+        assert!(
+            !PlaceholderProcessor::validate_with_profile("{i}Hello{/i}", "{i}Hola", profile)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn format_profile_unknown_html_and_sugarcube_keep_full_behavior() {
+        let source = r"[name] {i}Hello{/i} <b>%1</b> \V[1] <<print $name>>";
+        let (old_safe, old_placeholders) = PlaceholderProcessor::extract(source);
+        for format in ["", "future-engine", "html-game", "sugarcube"] {
+            let profile = PlaceholderProfile::for_format(format);
+            let (safe, placeholders) = PlaceholderProcessor::extract_with_profile(source, profile);
+            assert_eq!(safe, old_safe);
+            assert_eq!(
+                serde_json::to_value(placeholders).unwrap(),
+                serde_json::to_value(&old_placeholders).unwrap()
+            );
+            for target in ["Hola", "Hola [Noble]", source] {
+                assert_eq!(
+                    PlaceholderProcessor::validate_with_profile(source, target, profile),
+                    PlaceholderProcessor::validate(source, target)
+                );
+            }
+        }
+    }
 
     #[test]
     fn namebox_translated_japanese_names_validate() {

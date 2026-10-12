@@ -13,7 +13,7 @@ use crate::glossary::Glossary;
 use crate::models::{
     ProgressEvent, StringEntry, StringStatus, TranslationRequest, TranslationResult,
 };
-use crate::placeholder::{Placeholder, PlaceholderProcessor};
+use crate::placeholder::{Placeholder, PlaceholderProcessor, PlaceholderProfile};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LangPair {
@@ -76,7 +76,12 @@ impl Default for TranslationOptions {
 
 fn translation_fits_entry(entry: &StringEntry, translation: &str) -> bool {
     if translation.trim().is_empty()
-        || !PlaceholderProcessor::validate(&entry.source, translation).is_empty()
+        || !PlaceholderProcessor::validate_with_profile(
+            &entry.source,
+            translation,
+            entry.placeholder_profile(),
+        )
+        .is_empty()
     {
         return false;
     }
@@ -104,6 +109,7 @@ fn default_max_batch_tokens() -> Option<usize> {
 #[derive(Hash, PartialEq, Eq)]
 struct RepeatedSourceKey {
     source: String,
+    placeholder_profile: PlaceholderProfile,
     context: Option<String>,
     tags: Vec<String>,
     char_limit: Option<usize>,
@@ -126,6 +132,7 @@ impl RepeatedSources {
         for entry in entries {
             let key = RepeatedSourceKey {
                 source: entry.source.clone(),
+                placeholder_profile: entry.placeholder_profile(),
                 context: entry.context.clone(),
                 tags: entry.tags.clone(),
                 char_limit: entry.char_limit,
@@ -1097,11 +1104,12 @@ impl TranslationManager {
                                     }
                                     for result in &mut results {
                                         restore_placeholders_in_result(result, &acc.placeholders);
-                                        if let Some(source) = sources_by_id.get(&result.entry_id) {
+                                        if let Some(entry) = entries_by_id.get(&result.entry_id) {
                                             if result.translation.trim().is_empty()
-                                                || !PlaceholderProcessor::validate(
-                                                    source,
+                                                || !PlaceholderProcessor::validate_with_profile(
+                                                    &entry.source,
                                                     &result.translation,
+                                                    entry.placeholder_profile(),
                                                 )
                                                 .is_empty()
                                             {
@@ -1474,7 +1482,10 @@ impl TranslationManager {
                             // glossary unbudgeted so a long term can still share the blob.
                             slot_budget = None;
                         }
-                        let (sanitized, phs) = PlaceholderProcessor::extract(&entry.source);
+                        let (sanitized, phs) = PlaceholderProcessor::extract_with_profile(
+                            &entry.source,
+                            entry.placeholder_profile(),
+                        );
                         placeholders_by_id.insert(entry.id.clone(), phs);
                         // Per-entry glossary: terms present in source; for binary
                         // slots also drop translations that cannot fit the budget.
@@ -1708,11 +1719,12 @@ impl TranslationManager {
                                         &placeholders_by_id,
                                     );
                                     if retry_result.translation.trim().is_empty()
-                                        || sources_by_id.get(&result.entry_id).is_some_and(
-                                            |source| {
-                                                !PlaceholderProcessor::validate(
-                                                    source,
+                                        || entries_by_id.get(&result.entry_id).is_some_and(
+                                            |entry| {
+                                                !PlaceholderProcessor::validate_with_profile(
+                                                    &entry.source,
                                                     &retry_result.translation,
+                                                    entry.placeholder_profile(),
                                                 )
                                                 .is_empty()
                                             },
@@ -1856,9 +1868,13 @@ impl TranslationManager {
                             }
                             continue;
                         }
-                        if let Some(source) = sources_by_id.get(&result.entry_id) {
-                            if !PlaceholderProcessor::validate(source, &result.translation)
-                                .is_empty()
+                        if let Some(entry) = entries_by_id.get(&result.entry_id) {
+                            if !PlaceholderProcessor::validate_with_profile(
+                                &entry.source,
+                                &result.translation,
+                                entry.placeholder_profile(),
+                            )
+                            .is_empty()
                             {
                                 let _ = tx.send(ProgressEvent::BatchFailed {
                                     entry_id: Some(result.entry_id.clone()),
@@ -2798,6 +2814,55 @@ mod tests {
             events.push(event);
         }
         (db, events)
+    }
+
+    #[tokio::test]
+    async fn format_profile_controls_masking_and_repeated_source_grouping() {
+        let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+        let entries = ["rpgmaker-mv", "renpy"]
+            .into_iter()
+            .map(|format| {
+                StringEntry::new(format, r"[Noble] Hello \V[1]", PathBuf::from("test.json"))
+                    .with_format_id(format)
+            })
+            .collect();
+        let (db, _) = run_repeated_job(entries, provider.clone(), Default::default()).await;
+        assert_eq!(provider.sent(), 2);
+        let calls = provider.calls.lock().unwrap();
+        let requests: HashMap<_, _> = calls
+            .iter()
+            .flatten()
+            .map(|r| (r.entry_id.as_str(), r.source.as_str()))
+            .collect();
+        assert_eq!(requests["rpgmaker-mv"], "[Noble] Hello {PL_0}");
+        assert_eq!(requests["renpy"], "{PL_0} Hello {PL_1}");
+        for format in ["rpgmaker-mv", "renpy"] {
+            let entry = db.get_entry(format).unwrap().unwrap();
+            assert_eq!(
+                entry.translation.as_deref(),
+                Some(r"en: [Noble] Hello \V[1]")
+            );
+            assert!(entry.require_preserved_translation_controls().is_ok());
+        }
+    }
+
+    #[test]
+    fn format_profile_applies_to_memory_and_glossary_acceptance() {
+        for (format, accepted) in [
+            ("rpgmaker-mv", true),
+            ("wolf-rpg", true),
+            ("renpy", false),
+            ("unknown", false),
+        ] {
+            let entry = StringEntry::new("id", r"Hello \V[1]", PathBuf::from("test.json"))
+                .with_format_id(format);
+            assert_eq!(
+                translation_fits_entry(&entry, r"[Noble] Hola \V[1]"),
+                accepted,
+                "{format}"
+            );
+            assert!(!translation_fits_entry(&entry, "[Noble] Hola"));
+        }
     }
 
     #[tokio::test]
@@ -4508,6 +4573,82 @@ mod tests {
             assert_eq!(saved.status, StringStatus::Translated);
             assert_eq!(saved.translation.as_deref(), Some(r"\n<Luis>Eh..."));
         }
+    }
+
+    #[tokio::test]
+    async fn format_profile_accepts_provider_brackets_only_for_rpgmaker() {
+        for (format, accepted) in [("rpgmaker-mv", true), ("renpy", false), ("unknown", false)] {
+            let (db, _) = setup();
+            let entry = StringEntry::new(
+                "namebox",
+                r"\n<【貴族】リディア視点>Hello",
+                PathBuf::from("data.json"),
+            )
+            .with_format_id(format);
+            db.save_entries(std::slice::from_ref(&entry)).unwrap();
+            let provider = Arc::new(ScriptedLengthProvider::new(&["{PL_0}<[Noble] Lidia>Hola"]));
+            run_group_job(
+                db.clone(),
+                provider,
+                vec![entry],
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+            )
+            .await;
+            let saved = db.get_entry("namebox").unwrap().unwrap();
+            assert_eq!(
+                saved.translation.as_deref(),
+                accepted.then_some(r"\n<[Noble] Lidia>Hola"),
+                "{format}"
+            );
+            assert_eq!(
+                saved.placeholder_profile(),
+                PlaceholderProfile::for_format(format)
+            );
+            assert!(crate::validation::Validator::validate_entry(&saved).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn format_profile_accepts_brackets_in_wolf_length_retry() {
+        let (db, _) = setup();
+        let mut entry = StringEntry::new(
+            "wolf",
+            "A sufficiently long source",
+            PathBuf::from("Map.wolf"),
+        )
+        .with_format_id("wolf-rpg");
+        entry
+            .metadata
+            .insert("binary_slot".into(), serde_json::json!("sjis"));
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let provider = Arc::new(ScriptedLengthProvider::new(&[
+            "A first translation that is much too long for this binary slot",
+            "[Noble]",
+        ]));
+        run_group_job(
+            db.clone(),
+            provider.clone(),
+            vec![entry],
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            db.get_entry("wolf")
+                .unwrap()
+                .unwrap()
+                .translation
+                .as_deref(),
+            Some("[Noble]")
+        );
     }
 
     #[tokio::test]

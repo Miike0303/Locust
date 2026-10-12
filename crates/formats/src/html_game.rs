@@ -355,9 +355,10 @@ impl FormatPlugin for HtmlGamePlugin {
                     report.skip("unchanged", 1);
                     continue;
                 }
-                if !locust_core::placeholder::PlaceholderProcessor::validate(
+                if !locust_core::placeholder::PlaceholderProcessor::validate_with_profile(
                     &entry.source,
                     translation,
+                    locust_core::placeholder::PlaceholderProfile::for_format(self.id()),
                 )
                 .is_empty()
                 {

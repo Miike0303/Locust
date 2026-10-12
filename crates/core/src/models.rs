@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 pub const INJECTION_SOURCE_METADATA_KEY: &str = "locust_injection_source";
 pub const INJECTION_CAPACITY_METADATA_KEY: &str = "locust_injection_capacity";
 pub const STALE_TRANSLATION_METADATA_KEY: &str = "locust_stale_translation";
+pub const FORMAT_ID_METADATA_KEY: &str = "format_id";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StringEntry {
@@ -68,6 +69,115 @@ impl StringEntry {
         self
     }
 
+    pub fn with_format_id(mut self, format_id: &str) -> Self {
+        self.metadata
+            .insert(FORMAT_ID_METADATA_KEY.into(), serde_json::json!(format_id));
+        self
+    }
+
+    pub fn placeholder_profile(&self) -> crate::placeholder::PlaceholderProfile {
+        use crate::placeholder::PlaceholderProfile;
+
+        // Explicit provenance wins, including unknown or malformed IDs. It is
+        // persisted with the row and survives exports, pivots and DB reloads.
+        if let Some(format_id) = self.metadata.get(FORMAT_ID_METADATA_KEY) {
+            return PlaceholderProfile::for_format(format_id.as_str().unwrap_or_default());
+        }
+        let extension = self
+            .file_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        match extension.to_ascii_lowercase().as_str() {
+            "rvdata2" | "rvdata" | "rxdata" | "wolf" => PlaceholderProfile::RpgMaker,
+            "json" | "jsono" | "js" if self.has_legacy_rpgmaker_locator() => {
+                PlaceholderProfile::RpgMaker
+            }
+            _ => PlaceholderProfile::Full,
+        }
+    }
+
+    /// Older MV/MZ rows have no format metadata. Recognize the extractor's
+    /// filename + locator convention, never the ambiguous .json/.js extension
+    /// alone. No game files need to exist for validation of an archived DB.
+    fn has_legacy_rpgmaker_locator(&self) -> bool {
+        let Some(filename) = self.file_path.file_name().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        let Some(locator) = self
+            .id
+            .strip_prefix(filename)
+            .and_then(|s| s.strip_prefix('#'))
+        else {
+            return false;
+        };
+        let stem = self
+            .file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if filename.eq_ignore_ascii_case("plugins.js") {
+            return locator.starts_with("plugins#");
+        }
+        if !matches!(
+            self.file_path.extension().and_then(|s| s.to_str()),
+            Some("json" | "jsono")
+        ) {
+            return false;
+        }
+        let numbered_map = stem
+            .strip_prefix("map")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if numbered_map && locator == "displayName" {
+            return true;
+        }
+        if numbered_map
+            || matches!(
+                stem.as_str(),
+                "actors"
+                    | "classes"
+                    | "skills"
+                    | "items"
+                    | "weapons"
+                    | "armors"
+                    | "enemies"
+                    | "states"
+                    | "troops"
+                    | "commonevents"
+            )
+        {
+            return locator.split_once('#').is_some_and(|(index, field)| {
+                !index.is_empty()
+                    && index.bytes().all(|b| b.is_ascii_digit())
+                    && (matches!(field, "description" | "profile" | "message1" | "message2" | "message3" | "message4")
+                        // VNTextPatch can also have Actors.json#1#name, but
+                        // uses the tag "name", not RPG Maker's "actor_name".
+                        || (field == "name" && self.tags.iter().any(|tag| tag == "actor_name"))
+                        || field.starts_with("cmd_")
+                        || field.starts_with("page_")
+                        || field.starts_with("event_"))
+            });
+        }
+        if stem == "system" {
+            return locator == "gameTitle"
+                || [
+                    "terms#",
+                    "armorTypes#",
+                    "elements#",
+                    "equipTypes#",
+                    "skillTypes#",
+                    "weaponTypes#",
+                    "plugins#",
+                ]
+                .iter()
+                .any(|prefix| locator.starts_with(prefix));
+        }
+        stem.starts_with("lang_")
+            && !locator.is_empty()
+            && self.tags.iter().any(|tag| tag == "iavra")
+    }
+
     pub fn source_hash(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.source.as_bytes());
@@ -117,12 +227,18 @@ impl StringEntry {
             return Ok(Vec::new());
         };
         let physical = self.injection_source()?;
-        let mut mismatches =
-            crate::placeholder::PlaceholderProcessor::validate(&self.source, translation);
+        let profile = self.placeholder_profile();
+        let mut mismatches = crate::placeholder::PlaceholderProcessor::validate_with_profile(
+            &self.source,
+            translation,
+            profile,
+        );
         if physical != self.source {
-            for mismatch in
-                crate::placeholder::PlaceholderProcessor::validate(physical, translation)
-            {
+            for mismatch in crate::placeholder::PlaceholderProcessor::validate_with_profile(
+                physical,
+                translation,
+                profile,
+            ) {
                 if !mismatches.contains(&mismatch) {
                     mismatches.push(mismatch);
                 }
@@ -558,6 +674,110 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
+    fn check_rpgmaker_namebox_translation(source: &str, translation: &str) {
+        let mut entry = StringEntry::new(
+            "Map001.json#0#event_1#page_0#cmd_0#msg",
+            source,
+            PathBuf::from("data/Map001.json"),
+        );
+        entry
+            .metadata
+            .insert("format_id".into(), serde_json::json!("rpgmaker-mv"));
+        entry.translation = Some(translation.into());
+        assert!(entry.translation_control_mismatches().unwrap().is_empty());
+        assert!(crate::validation::Validator::validate_entry(&entry).is_empty());
+        assert!(!entry
+            .with_format_id("renpy")
+            .translation_control_mismatches()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn format_profile_allows_noble_namebox_translation() {
+        check_rpgmaker_namebox_translation(
+            r"\n<【貴族】リディア視点>　■解放条件　\n　・好感度１４以上\n　・「精力を集める」を選択",
+            r"\n<[Noble] Lidia's perspective> Unlock conditions\n Affection 14 or higher\n Select Gather energy",
+        );
+    }
+
+    #[test]
+    fn format_profile_allows_adventurer_namebox_translation() {
+        check_rpgmaker_namebox_translation(
+            r"\n<【冒険者】ルイ視点>　■解放条件　\n　・好感度６以上 /「精力を集める」を選択",
+            r"\n<[Adventurer] Louis's perspective> Unlock conditions\n Affection 6 or higher / Select Gather energy",
+        );
+    }
+
+    #[test]
+    fn format_profile_recognizes_legacy_engine_locators_conservatively() {
+        use crate::placeholder::PlaceholderProfile;
+        for (id, path) in [
+            ("Map001.json#0#event_1#page_0#cmd_0#msg", "data/Map001.json"),
+            ("Map001.jsono#displayName", "data/Map001.jsono"),
+            ("Actors.json#1#name", "data/Actors.json"),
+            ("System.json#gameTitle", "data/System.json"),
+            ("plugins.js#plugins#0#Plugin#text", "js/plugins.js"),
+            ("legacy", "Data/Actors.rvdata2"),
+            ("legacy", "Data/Actors.rvdata"),
+            ("legacy", "Data/Actors.rxdata"),
+            ("legacy", "Data/Map.wolf"),
+        ] {
+            let mut entry = StringEntry::new(id, "Hello", PathBuf::from(path));
+            if id == "Actors.json#1#name" {
+                entry.tags.push("actor_name".into());
+            }
+            assert_eq!(
+                entry.placeholder_profile(),
+                PlaceholderProfile::RpgMaker,
+                "{path}"
+            );
+            for explicit in ["renpy", "future-engine"] {
+                assert_eq!(
+                    entry.clone().with_format_id(explicit).placeholder_profile(),
+                    PlaceholderProfile::Full
+                );
+            }
+        }
+        for (id, path) in [
+            ("plain", "data/Map001.json"),
+            ("Actors.json#custom", "data/Actors.json"),
+            ("Actors.json#1#name", "data/Actors.json"),
+            ("Actors.json#1#message", "data/Actors.json"),
+            ("data.json#1#name", "data/data.json"),
+            ("plugins.js#custom", "js/plugins.js"),
+            ("id", "scenario.ks"),
+            ("id", "script.rpy"),
+        ] {
+            assert_eq!(
+                StringEntry::new(id, "Hello", PathBuf::from(path)).placeholder_profile(),
+                PlaceholderProfile::Full
+            );
+        }
+        let mut entry = StringEntry::new("id", "Hello", PathBuf::from("Actors.rvdata2"));
+        entry
+            .metadata
+            .insert(FORMAT_ID_METADATA_KEY.into(), serde_json::json!(42));
+        assert_eq!(entry.placeholder_profile(), PlaceholderProfile::Full);
+    }
+
+    #[test]
+    fn format_profile_applies_to_pivot_physical_baseline() {
+        let mut entry = StringEntry::new("id", "Hello", PathBuf::from("data.json"))
+            .with_format_id("rpgmaker-mv");
+        entry.metadata.insert(
+            INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!(r"[Noble] Hello \V[1]"),
+        );
+        entry.translation = Some("Hola [Adventurer]".into());
+        let mismatches = entry.translation_control_mismatches().unwrap();
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].placeholder, r"\V[1]");
+        entry.source = r"Hello \V[1]".into();
+        entry.translation = Some(r"Hola [Adventurer] \V[1]".into());
+        assert!(entry.require_preserved_translation_controls().is_ok());
+    }
+
     #[test]
     fn control_gate_distinguishes_pending_empty_and_physical_baseline() {
         let mut entry = StringEntry::new("id", "Hello", PathBuf::from("script.rpy"));

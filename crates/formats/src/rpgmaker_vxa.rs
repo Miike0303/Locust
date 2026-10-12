@@ -1023,7 +1023,8 @@ impl RpgMakerVxaPlugin {
                         if let Some(s) = val.as_str() {
                             if !s.trim().is_empty() {
                                 let id = format!("{}#{}#{}", filename, idx, field);
-                                let mut entry = StringEntry::new(id, s, file_path.to_path_buf());
+                                let mut entry = StringEntry::new(id, s, file_path.to_path_buf())
+                                    .with_format_id("rpgmaker-vxa");
                                 entry.tags = vec![tag.to_string()];
                                 entries.push(entry);
                             }
@@ -1107,7 +1108,8 @@ impl RpgMakerVxaPlugin {
                                     filename, ev_id, page_idx, cmd_idx
                                 );
                                 let mut entry =
-                                    StringEntry::new(id, &text, file_path.to_path_buf());
+                                    StringEntry::new(id, &text, file_path.to_path_buf())
+                                        .with_format_id("rpgmaker-vxa");
                                 entry.tags = vec!["dialogue".to_string()];
                                 entries.push(entry);
                             }
@@ -1124,7 +1126,8 @@ impl RpgMakerVxaPlugin {
                                                 filename, ev_id, page_idx, cmd_idx, ci
                                             );
                                             let mut entry =
-                                                StringEntry::new(id, text, file_path.to_path_buf());
+                                                StringEntry::new(id, text, file_path.to_path_buf())
+                                                    .with_format_id("rpgmaker-vxa");
                                             entry.tags = vec!["menu".to_string()];
                                             entries.push(entry);
                                         }
@@ -1192,7 +1195,8 @@ impl RpgMakerVxaPlugin {
                     let text = lines.join("\n");
                     if !text.trim().is_empty() {
                         let id = format!("{}#{}#cmd_{}#msg", filename, ev_idx, cmd_idx);
-                        let mut entry = StringEntry::new(id, &text, file_path.to_path_buf());
+                        let mut entry = StringEntry::new(id, &text, file_path.to_path_buf())
+                            .with_format_id("rpgmaker-vxa");
                         entry.tags = vec!["dialogue".to_string()];
                         entries.push(entry);
                     }
