@@ -362,6 +362,48 @@ fn group_retry_batches<'a>(
     Ok(batches)
 }
 
+/// Longest run of one letter a translation may contain unless its source has
+/// a longer run of that letter.
+const MAX_LETTER_RUN: usize = 5;
+
+/// Machine translators stretch moans and screams (`はぁぁ～～～～`) into
+/// hundreds of repeated letters; one unbreakable word then overflows the
+/// game's text window. Cap runs of the same letter at `MAX_LETTER_RUN`,
+/// keeping any longer run the source itself spells out.
+pub fn collapse_runaway_letters(source: &str, translation: &str) -> String {
+    fn letter_runs(text: &str) -> Vec<(char, Vec<char>)> {
+        let mut runs: Vec<(char, Vec<char>)> = Vec::new();
+        for c in text.chars() {
+            let key = c.to_lowercase().next().unwrap_or(c);
+            match runs.last_mut() {
+                Some((last, run)) if c.is_alphabetic() && *last == key => run.push(c),
+                _ => runs.push((key, vec![c])),
+            }
+        }
+        runs
+    }
+
+    let runs = letter_runs(translation);
+    if runs.iter().all(|(_, run)| run.len() <= MAX_LETTER_RUN) {
+        return translation.to_string();
+    }
+    let mut source_max: HashMap<char, usize> = HashMap::new();
+    for (key, run) in letter_runs(source) {
+        let longest = source_max.entry(key).or_default();
+        *longest = (*longest).max(run.len());
+    }
+    runs.into_iter()
+        .flat_map(|(key, run)| {
+            let keep = if run[0].is_alphabetic() {
+                MAX_LETTER_RUN.max(source_max.get(&key).copied().unwrap_or(0))
+            } else {
+                run.len()
+            };
+            run.into_iter().take(keep)
+        })
+        .collect()
+}
+
 /// Restore placeholder tokens in a provider result (best-effort on failure).
 fn restore_placeholders_in_result(
     result: &mut TranslationResult,
@@ -1208,6 +1250,10 @@ impl TranslationManager {
                                     for result in &mut results {
                                         restore_placeholders_in_result(result, &acc.placeholders);
                                         if let Some(entry) = entries_by_id.get(&result.entry_id) {
+                                            result.translation = collapse_runaway_letters(
+                                                &entry.source,
+                                                &result.translation,
+                                            );
                                             if result.translation.trim().is_empty()
                                                 || !PlaceholderProcessor::validate_with_profile(
                                                     &entry.source,
@@ -1695,6 +1741,10 @@ impl TranslationManager {
                     // Restore placeholders in translations before saving
                     for result in &mut results {
                         restore_placeholders_in_result(result, &placeholders_by_id);
+                        if let Some(source) = sources_by_id.get(&result.entry_id) {
+                            result.translation =
+                                collapse_runaway_letters(source, &result.translation);
+                        }
                     }
 
                     // Length-aware retries: up to MAX_BINARY_SLOT_LENGTH_RETRIES
@@ -2505,6 +2555,64 @@ pub struct ProviderInfo {
     pub name: String,
     pub is_free: bool,
     pub requires_api_key: bool,
+}
+
+#[cfg(test)]
+mod runaway_letter_tests {
+    use super::collapse_runaway_letters;
+
+    #[test]
+    fn stretched_moans_are_capped_at_five_letters() {
+        let long = format!("¡H{}!", "a".repeat(80));
+        assert_eq!(
+            collapse_runaway_letters("はぁぁ～～～～！？", &long),
+            "¡Haaaaa!"
+        );
+        assert_eq!(
+            collapse_runaway_letters("んぁ～", &format!("\\n<Lydia>M{}...", "m".repeat(300))),
+            "\\n<Lydia>Mmmmm..."
+        );
+    }
+
+    #[test]
+    fn ordinary_text_and_short_runs_are_unchanged() {
+        for text in [
+            "Hola, ¿cómo estás?",
+            "Aaaah... ¡Nooooo!",
+            "\\C[27]♥\\C[0] Hmmmmm",
+            "!!!!!!!!!!!! ??????? ........",
+            "――――――――",
+            "",
+        ] {
+            assert_eq!(collapse_runaway_letters("そのまま", text), text);
+        }
+    }
+
+    #[test]
+    fn runs_the_source_already_spells_out_are_kept() {
+        let source = "AAAAAAAAAH! The dragon!";
+        let translation = "¡AAAAAAAAAH! ¡El dragón!";
+        assert_eq!(collapse_runaway_letters(source, translation), translation);
+        // Only up to the source's own length, and case-insensitively.
+        assert_eq!(
+            collapse_runaway_letters("aaaaaaa!", &format!("¡A{}!", "a".repeat(20))),
+            "¡Aaaaaaa!"
+        );
+    }
+
+    #[test]
+    fn every_letter_run_is_capped_independently() {
+        let translation = format!(
+            "U{}hi{}... Aa{}",
+            "u".repeat(9),
+            "i".repeat(12),
+            "a".repeat(40)
+        );
+        assert_eq!(
+            collapse_runaway_letters("うひぃ……あぁ", &translation),
+            "Uuuuuhiiiii... Aaaaa"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4214,6 +4322,85 @@ mod tests {
         assert_eq!(saved.translation.as_deref(), Some("Opcns"));
     }
 
+    /// Answers every request with a scream stretched to 200 letters.
+    struct StretchingProvider;
+
+    #[async_trait]
+    impl TranslationProvider for StretchingProvider {
+        fn id(&self) -> &str {
+            "stretching"
+        }
+        fn name(&self) -> &str {
+            "Stretching"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            requests: &[TranslationRequest],
+        ) -> Result<Vec<TranslationResult>> {
+            Ok(requests
+                .iter()
+                .map(|r| TranslationResult {
+                    entry_id: r.entry_id.clone(),
+                    translation: format!("{{PL_0}}<Old man>¡H{}!", "a".repeat(200)),
+                    detected_source_lang: None,
+                    provider: "stretching".to_string(),
+                    tokens_used: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_usd: None,
+                })
+                .collect())
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stretched_provider_letters_are_saved_capped() {
+        let (db, glossary) = setup();
+        let entry = StringEntry::new(
+            "Map001.json#0#event_1#page_0#cmd_1#msg",
+            "\\n<老人>はぁぁ～～～～！",
+            PathBuf::from("data/Map001.json"),
+        )
+        .with_format_id("rpgmaker-mv");
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let manager = TranslationManager::new(Arc::new(StretchingProvider), db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let opts = TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        };
+        manager
+            .translate_entries(
+                vec![entry],
+                opts,
+                tx,
+                "job-stretch".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rx.close();
+        while rx.recv().await.is_some() {}
+        let saved = db
+            .get_entries(&crate::database::EntryFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(saved.translation.as_deref(), Some("\\n<Old man>¡Haaaaa!"));
+    }
+
     /// Captures request context keyed by entry id (for binary-slot budget tests).
     struct ContextById {
         by_id: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
@@ -4528,7 +4715,7 @@ mod tests {
         db.save_entries(std::slice::from_ref(&entry)).unwrap();
 
         let provider = Arc::new(ScriptedLengthProvider::new(&[
-            "XXXXXXXXXXXXXXXX", // 16 > 5
+            "ABCDEFGHIJKLMNOP", // 16 > 5
             "Hola!",            // 5 == 5 fits on first retry
         ]));
         let capture = provider.clone();
@@ -4577,7 +4764,7 @@ mod tests {
             "retry must include correction: {retry_ctx}"
         );
         assert!(
-            retry_ctx.contains("Previous text: «XXXXXXXXXXXXXXXX»"),
+            retry_ctx.contains("Previous text: «ABCDEFGHIJKLMNOP»"),
             "retry must quote the failed attempt so the model can edit: {retry_ctx}"
         );
         assert!(
@@ -4593,7 +4780,7 @@ mod tests {
         db.save_entries(std::slice::from_ref(&entry)).unwrap();
 
         let provider = Arc::new(ScriptedLengthProvider::new(&[
-            "XXXXXXXXXXXXXXXX", // 16
+            "ABCDEFGHIJKLMNOP", // 16
             "YYYYYYYY",         // 8 shorter but still over
             "ZZZZ",             // 4 still over budget 2 → mechanical truncates to "ZZ"
         ]));
@@ -4854,7 +5041,7 @@ mod tests {
 
         // First would be "oversize" length for a slot, but no slot → no retry.
         let provider = Arc::new(ScriptedLengthProvider::new(&[
-            "XXXXXXXXXXXXXXXX",
+            "ABCDEFGHIJKLMNOP",
             "should-not-be-used",
         ]));
         let capture = provider.clone();
@@ -4889,7 +5076,7 @@ mod tests {
             .into_iter()
             .find(|e| e.id == "plain")
             .unwrap();
-        assert_eq!(saved.translation.as_deref(), Some("XXXXXXXXXXXXXXXX"));
+        assert_eq!(saved.translation.as_deref(), Some("ABCDEFGHIJKLMNOP"));
     }
 
     #[tokio::test]

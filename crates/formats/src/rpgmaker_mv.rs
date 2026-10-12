@@ -1387,11 +1387,15 @@ impl RpgMakerMvPlugin {
         // Wrap to the width the game's own text was wrapped at; the floor
         // keeps messages with only short lines from wrapping absurdly early.
         let width = max_width.max(40);
+        let markers = source_line_markers(&source_lines);
         let wrap = |text: &str| {
             let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
             // A leading name tag (\n<Name>) may contain spaces; wrap only its body.
             let (name_tag, body) = split_name_tag(&flat);
-            let mut lines = wrap_message(body, width);
+            let mut lines: Vec<String> = split_before_markers(body, &markers)
+                .into_iter()
+                .flat_map(|item| wrap_message(item, width))
+                .collect();
             if !name_tag.is_empty() {
                 lines[0] = format!("{}{}", name_tag, lines[0]);
             }
@@ -1728,6 +1732,44 @@ fn preserve_blank_line_layout(
         lines.extend(std::iter::repeat_with(String::new).take(blank_count));
     }
     Some(lines)
+}
+
+/// List markers (`・`, `■`, ...) that open a line of the source block, after
+/// its leading blanks and any name tag. Providers flatten such lists into one
+/// paragraph; these markers say where the game's own items began.
+fn source_line_markers(source_lines: &[&str]) -> Vec<char> {
+    const MARKERS: &str = "・■□●○◆◇★☆※▶▷•";
+    let mut found = Vec::new();
+    for line in source_lines {
+        let (_, body) = split_name_tag(line);
+        if let Some(first) = body.trim_start().chars().next() {
+            if MARKERS.contains(first) && !found.contains(&first) {
+                found.push(first);
+            }
+        }
+    }
+    found
+}
+
+/// Split before each marker occurrence (never at the start), trimming the
+/// pieces, so each list item wraps on its own lines.
+fn split_before_markers<'a>(text: &'a str, markers: &[char]) -> Vec<&'a str> {
+    if markers.is_empty() {
+        return vec![text];
+    }
+    let mut items = Vec::new();
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        if i > start && markers.contains(&c) {
+            let item = text[start..i].trim();
+            if !item.is_empty() {
+                items.push(item);
+            }
+            start = i;
+        }
+    }
+    items.push(text[start..].trim());
+    items
 }
 
 pub(crate) fn wrap_message(text: &str, width: usize) -> Vec<String> {
@@ -3265,6 +3307,35 @@ mod tests {
             &["", "\\n<Demon Girl>Hello", "", " \t ", "-Hizor", ""],
             "\\n<Chica Demonio>Hola\r\n \t\r\n-Hizor",
             &["", "\\n<Chica Demonio>Hola", "", "", "-Hizor", ""],
+        );
+    }
+
+    #[test]
+    fn message_bullets_from_the_source_start_their_own_lines() {
+        // Real game: providers flatten a bullet list into one paragraph and the
+        // width wrap then split items mid-way ("... 15 o / superior ...").
+        assert_message_layout_roundtrip(
+            "Map001.json",
+            401,
+            &[
+                "\\n<【貴族】リディア視点>　■解放条件　",
+                "　・好感度１４以上",
+                "　・「精力を集める」を選択",
+            ],
+            "\\n<[Noble] Lydia>■Condiciones de desbloqueo ・Favorabilidad 14 o superior ・Selecciona \"Reunir energía\"",
+            &[
+                "\\n<[Noble] Lydia>■Condiciones de desbloqueo",
+                "・Favorabilidad 14 o superior",
+                "・Selecciona \"Reunir energía\"",
+            ],
+        );
+        // Markers the source never starts a line with stay inline.
+        assert_message_layout_roundtrip(
+            "Map001.json",
+            401,
+            &["こんにちは", "元気？"],
+            "Hola ・ amigo ■ ¿qué tal?",
+            &["Hola ・ amigo ■ ¿qué tal?"],
         );
     }
 
