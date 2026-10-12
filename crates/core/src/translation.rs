@@ -4434,6 +4434,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn namebox_provider_translation_is_saved() {
+        for source in [r"\n<ルイ>あの……", r"\n<Louis>Um..."] {
+            let (db, glossary) = setup();
+            let entry = StringEntry::new("namebox", source, PathBuf::from("Map001.json"));
+            db.save_entries(std::slice::from_ref(&entry)).unwrap();
+            let provider = Arc::new(ScriptedLengthProvider::new(&["{PL_0}<Luis>Eh..."]));
+            let manager = TranslationManager::new(provider, db.clone(), glossary);
+            let (tx, mut rx) = mpsc::channel(100);
+            manager
+                .translate_entries(
+                    vec![entry],
+                    TranslationOptions {
+                        use_memory: false,
+                        use_glossary: false,
+                        ..Default::default()
+                    },
+                    tx,
+                    "namebox-job".into(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            while let Some(event) = rx.recv().await {
+                assert!(
+                    !matches!(
+                        event,
+                        ProgressEvent::BatchFailed { .. } | ProgressEvent::Failed { .. }
+                    ),
+                    "{event:?}"
+                );
+            }
+            let saved = db.get_entry("namebox").unwrap().unwrap();
+            assert_eq!(saved.status, StringStatus::Translated);
+            assert_eq!(saved.translation.as_deref(), Some(r"\n<Luis>Eh..."));
+        }
+    }
+
+    #[tokio::test]
     async fn test_no_binary_slot_provider_called_once() {
         let (db, glossary) = setup();
         let entry = StringEntry::new("plain", "Hello", PathBuf::from("script.txt"));

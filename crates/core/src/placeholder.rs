@@ -186,6 +186,18 @@ impl PlaceholderProcessor {
                     i += 2;
                     continue;
                 }
+                // Name-box arguments are translatable; protect only the escape.
+                if let Some(code_len) = namebox_escape_len(&bytes[i..]) {
+                    let end = i + code_len;
+                    matches.push(PatternMatch {
+                        start: i,
+                        end,
+                        text: source[i..end].to_string(),
+                        kind: PlaceholderKind::RpgMakerCode,
+                    });
+                    i = end;
+                    continue;
+                }
                 // Codes with brackets: \c[N], \v[N], \n[N], \p[N]
                 if b"cvnpi".contains(&next) && i + 2 < len && bytes[i + 2] == b'[' {
                     if let Some(close) = source[i + 3..].find(']') {
@@ -222,6 +234,20 @@ impl PlaceholderProcessor {
         let bytes = source.as_bytes();
         let len = bytes.len();
         while i < len {
+            if bytes[i] == b'\\' {
+                if bytes.get(i + 1) == Some(&b'\\') {
+                    i += 2;
+                    continue;
+                }
+                if let Some(code_len) = namebox_escape_len(&bytes[i..]) {
+                    if let Some(close) = source[i + code_len..].find('>') {
+                        // <Name> belongs to the name box, even when it looks
+                        // like HTML. Other scanners still protect codes in it.
+                        i += code_len + close + 1;
+                        continue;
+                    }
+                }
+            }
             if bytes[i] == b'<' {
                 if let Some(close) = source[i..].find('>') {
                     let end = i + close + 1;
@@ -404,6 +430,19 @@ impl PlaceholderProcessor {
             result.push(m);
         }
         result
+    }
+}
+
+/// YEP Message Core's case-insensitive name-box escapes, immediately before '<'.
+/// Keep this explicit: other plugin arguments (e.g. \fn<font>) are not names.
+fn namebox_escape_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() != Some(&b'\\') || !bytes.get(1)?.eq_ignore_ascii_case(&b'n') {
+        return None;
+    }
+    match bytes.get(2)? {
+        b'<' => Some(2),
+        b'c' | b'C' | b'r' | b'R' if bytes.get(3) == Some(&b'<') => Some(3),
+        _ => None,
     }
 }
 
@@ -636,6 +675,121 @@ fn is_renpy_interpolation(inner: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namebox_translated_japanese_names_validate() {
+        for (source, translated) in [
+            (
+                r"\n<冒険者>いや～、街があって助かったよ。",
+                r"\n<Adventurer> Well, I'm glad there's a town.",
+            ),
+            (r"\n<ルイ>あの……", r"\n<Louis>Um..."),
+        ] {
+            assert_eq!(PlaceholderProcessor::validate(source, translated), vec![]);
+        }
+    }
+
+    #[test]
+    fn namebox_pivot_name_is_visible_and_escape_roundtrips() {
+        let source = r"\n<Lydia>Hello";
+        let (safe, controls) = PlaceholderProcessor::extract(source);
+        assert_eq!(safe, "{PL_0}<Lydia>Hello");
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].original, r"\n");
+        let translated = PlaceholderProcessor::restore("{PL_0}<Lidia>Hola", &controls).unwrap();
+        assert_eq!(translated, r"\n<Lidia>Hola");
+        assert!(PlaceholderProcessor::validate(source, &translated).is_empty());
+        assert!(PlaceholderProcessor::restore("<Lidia>Hola", &controls).is_err());
+    }
+
+    #[test]
+    fn namebox_variants_preserve_complete_escape_and_case() {
+        for escape in [r"\n", r"\nc", r"\nr", r"\N", r"\NC", r"\NR", r"\nC", r"\Nr"] {
+            let source = format!("{escape}<名前>こんにちは");
+            let translated = format!("{escape}<Name>Hello");
+            for text in [&source, &translated] {
+                let (safe, controls) = PlaceholderProcessor::extract(text);
+                assert_eq!(controls.len(), 1, "{text}");
+                assert_eq!(controls[0].original, escape);
+                assert!(safe.starts_with("{PL_0}<"), "{safe}");
+                assert_eq!(
+                    PlaceholderProcessor::restore(&safe, &controls).unwrap(),
+                    *text
+                );
+            }
+            assert!(PlaceholderProcessor::validate(&source, &translated).is_empty());
+            assert!(PlaceholderProcessor::validate(&source, "<名前>Hello")
+                .iter()
+                .any(|m| m.kind == MismatchKind::Missing && m.placeholder == escape));
+        }
+        assert!(!PlaceholderProcessor::validate(r"\nc<Name>Hello", r"\nr<Name>Hola").is_empty());
+        let (safe, controls) = PlaceholderProcessor::extract(r"Line\nNext");
+        assert_eq!(safe, "Line{PL_0}Next");
+        assert!(matches!(controls[0].pattern_type, PlaceholderKind::CFormat));
+    }
+
+    #[test]
+    fn namebox_does_not_hide_real_markup_mismatches() {
+        let source = r"\n<名前><b>Hello</b>";
+        assert_eq!(
+            PlaceholderProcessor::validate(source, r"\n<Nombre>Hola</b>"),
+            vec![PlaceholderMismatch {
+                kind: MismatchKind::Missing,
+                placeholder: "<b>".into()
+            }]
+        );
+        assert_eq!(
+            PlaceholderProcessor::validate(r"\n<名前>Hello", r"\n<Nombre><b>Hola"),
+            vec![PlaceholderMismatch {
+                kind: MismatchKind::Extra,
+                placeholder: "<b>".into()
+            }]
+        );
+        assert!(PlaceholderProcessor::validate(
+            r"\n<名前><i>Hello</i>{b}[player]{/b}",
+            r"\n<Nombre><i>Hola</i>{b}[player]{/b}",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn namebox_exception_requires_an_immediate_unescaped_known_code() {
+        for source in [
+            r"\\n<Lydia>",
+            r"\n <Lydia>",
+            "\n<Lydia>",
+            r"\fn<Lydia>",
+            r"\nl<Lydia>",
+            r"\ntl<Lydia>",
+            r"\nonsense<Lydia>",
+            "<Lydia>",
+        ] {
+            assert!(
+                PlaceholderProcessor::extract(source).1.iter().any(|p| {
+                    p.original == "<Lydia>" && matches!(p.pattern_type, PlaceholderKind::HtmlTag)
+                }),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn namebox_embedded_controls_stay_protected() {
+        let source = r"Text \n<Lady \c[2]\n[1]>Hello";
+        let (safe, controls) = PlaceholderProcessor::extract(source);
+        assert_eq!(safe, "Text {PL_0}<Lady {PL_1}{PL_2}>Hello");
+        assert_eq!(
+            controls
+                .iter()
+                .map(|p| p.original.as_str())
+                .collect::<Vec<_>>(),
+            vec![r"\n", r"\c[2]", r"\n[1]"]
+        );
+        assert_eq!(
+            PlaceholderProcessor::restore(&safe, &controls).unwrap(),
+            source
+        );
+    }
 
     #[test]
     fn test_extract_rpgmaker_codes() {

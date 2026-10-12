@@ -1694,6 +1694,7 @@ async fn cmd_translate(
     let mut cost_is_complete = false;
     let mut total_translated = 0;
     let mut errors = 0u64;
+    let mut error_counts = std::collections::HashMap::<String, u64>::new();
     let start = std::time::Instant::now();
 
     while let Some(event) = rx.recv().await {
@@ -1735,15 +1736,20 @@ async fn cmd_translate(
             ProgressEvent::BatchFailed { error, .. } | ProgressEvent::Failed { error, .. } => {
                 errors += 1;
                 if errors <= 3 {
-                    bar.println(format!("Error: {error}"));
+                    if bar.is_hidden() {
+                        eprintln!("Error: {error}");
+                    } else {
+                        bar.println(format!("Error: {error}"));
+                    }
                 }
+                *error_counts.entry(error).or_default() += 1;
             }
             _ => {}
         }
     }
 
     bar.finish_with_message("Done!");
-    handle.await??;
+    let result = handle.await;
 
     let elapsed = start.elapsed().as_secs_f64();
     let mut table = Table::new();
@@ -1757,6 +1763,14 @@ async fn cmd_translate(
     table.add_row(vec!["Batch errors", &errors.to_string()]);
     println!("{table}");
 
+    if !error_counts.is_empty() {
+        eprintln!("Translation errors (top 5):");
+        for line in translation_error_summary(&error_counts) {
+            eprintln!("  {line}");
+        }
+    }
+    result??;
+
     let left = load_pending_entries(&db)?.len();
     if left > 0 {
         println!(
@@ -1766,6 +1780,25 @@ async fn cmd_translate(
         println!("\nAll strings translated.");
     }
     Ok(())
+}
+
+fn translation_error_summary(errors: &std::collections::HashMap<String, u64>) -> Vec<String> {
+    let mut ranked: Vec<_> = errors.iter().collect();
+    ranked.sort_by(|(a, a_count), (b, b_count)| b_count.cmp(a_count).then_with(|| a.cmp(b)));
+    ranked
+        .into_iter()
+        .take(5)
+        .map(|(message, count)| {
+            // Keep summaries on one line and truncate on Unicode boundaries.
+            let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+            let message = if message.chars().count() > 240 {
+                format!("{}...", message.chars().take(237).collect::<String>())
+            } else {
+                message
+            };
+            format!("{count} x {message}")
+        })
+        .collect()
 }
 
 async fn cmd_inject(
@@ -2552,6 +2585,47 @@ mod tests {
     use super::*;
     use locust_core::models::StringStatus;
     use std::fs;
+
+    #[test]
+    fn translation_error_summary_ranks_counts_and_limits_to_five() {
+        let errors = [
+            ("zeta", 1),
+            ("beta", 4),
+            ("alpha", 4),
+            ("gamma", 3),
+            ("delta", 2),
+            ("common failure", 8193),
+        ]
+        .into_iter()
+        .map(|(message, count)| (message.to_string(), count))
+        .collect();
+        assert_eq!(
+            translation_error_summary(&errors),
+            vec![
+                "8193 x common failure",
+                "4 x alpha",
+                "4 x beta",
+                "3 x gamma",
+                "2 x delta",
+            ]
+        );
+        assert!(translation_error_summary(&Default::default()).is_empty());
+    }
+
+    #[test]
+    fn translation_error_summary_truncates_unicode_and_flattens_lines() {
+        let errors = [
+            (format!("  {}\r\n tail", "名".repeat(300)), 2),
+            ("first\nsecond\tthird".into(), 1),
+            ("a".repeat(240), 1),
+        ]
+        .into_iter()
+        .collect();
+        let summary = translation_error_summary(&errors);
+        assert_eq!(summary[0], format!("2 x {}...", "名".repeat(237)));
+        assert_eq!(summary[1], format!("1 x {}", "a".repeat(240)));
+        assert_eq!(summary[2], "1 x first second third");
+    }
 
     fn extract_root_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Database) {
         let dir = tempfile::tempdir().unwrap();
