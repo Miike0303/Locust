@@ -4,14 +4,14 @@
 
 Leer primero [docs/IMPROVEMENT-GOAL.md](docs/IMPROVEMENT-GOAL.md), especialmente la ultima entrada **Done** y el backlog; el mapa tecnico esta en [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Los HANDOFF y checkpoints fechados de abajo son historia, no la cola actual ni el estado de publicacion. Sus preferencias y restricciones explicitas del usuario siguen vigentes salvo autorizacion posterior.
 
-Checkpoint observado por el padre (2026-10-10): `main` remoto y local con el codigo del candidato probado `ff407bf` (el commit siguiente es solo documental). [GitHub Actions run 38028547744](https://github.com/Miike0303/Locust/actions/runs/38028547744):
+Checkpoint observado por el padre (2026-10-12): `main` remoto y local con el codigo del candidato probado `bab56c9` (el commit siguiente es solo documental). [GitHub Actions run 38278034213](https://github.com/Miike0303/Locust/actions/runs/38278034213):
 
 | Plataforma | Rust (pasan / fallan / ignorados) | Frontend (pasan / fallan / ignorados) |
 |---|---|---|
-| Ubuntu | 2143 / 0 / 19 | 426 / 0 / 0 |
-| Windows | 2154 / 0 / 19 | 426 / 0 / 0 |
+| Ubuntu | 2159 / 0 / 19 | 439 / 0 / 0 |
+| Windows | 2170 / 0 / 19 | 439 / 0 / 0 |
 
-Ambas plataformas pasaron `npm ci`, build frontend, fmt, Clippy estricto y tests del workspace, incluido el crate Tauri. Los tests ignorados no se ejecutaron. No verifica la UI Tauri nativa ni juegos reales; las capturas headless usaron el build de produccion con un backend real aislado y fixtures sinteticos. El 2026-10-09 se entregaron 30 unidades de codigo (ver las entradas Done del 2026-10-09 en el ledger).
+Ambas plataformas pasaron `npm ci`, build frontend, fmt, Clippy estricto y tests del workspace, incluido el crate Tauri. Los tests ignorados no se ejecutaron. No verifica la UI Tauri nativa ni juegos reales; las capturas headless usaron el build de produccion con un backend real aislado y fixtures sinteticos. El 2026-10-09 se entregaron 30 unidades de codigo (ver las entradas Done del 2026-10-09 en el ledger). Los temporales de los tests van a `.test-tmp/` (ver Build); al final de cada sesion correr `tools/cleanup-scratch.ps1 -Apply`.
 
 Secuencia autorizada: una unidad acotada, checks completos, publicacion de la rama de trabajo y CI manual, luego fast-forward de `main` antes de empezar otra unidad. Este checkpoint registra una observacion; no garantiza que `main` permanezca limpio o verificado tras futuros cambios.
 
