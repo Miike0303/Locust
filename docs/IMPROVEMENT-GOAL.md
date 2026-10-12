@@ -20,6 +20,7 @@ Standing bans. Each exists for a reason; do not re-litigate them.
 ## Backlog
 
 
+- **[storage · core · M] Every Direct injection or revision stores another full copy of the game** in `%LOCALAPPDATA%\project-locustackups` (real 640 MB MV game: first inject 640 MB, one-line revision another 644 MB). Check: a revision backs up only the files it changes, or reuses the verified pristine backup, while recovery and restore stay intact; `locust backups` shows the total size.
 - **[defect · core · S] Runaway repeated patterns with separators** (`N-n-n-n-...`, 90+ repetitions) are not caught by the letter-run cap (real game, Gemini JA→EN, one line). Check: a repeated unit of 1-3 letters plus a separator capped like letter runs, keeping source-spelled repetitions.
 - **[ux · core · S] Pivot EN→ES leaves some speaker titles in English** (`\n<Alchemist>` in the Gemini Spanish build). Check: name-tag text is translated in pivot targets.
 - **[defect · test · S] Intermittent WebSocket reset in `patch_status_detects_receipt_drift`** (`crates/server/tests/integration.rs`, `collect_patch_ws_frames`). Observed once on 2026-10-12 in a full Windows workspace run (`ws frame: Io(... 10054 ConnectionReset)`); 8/8 isolated runs and two further full runs passed. Check: find whether the patch WebSocket closes abruptly after the terminal frame under load; a fix should make the collector tolerate a close after `done`/`error` only if the server behavior is correct.
