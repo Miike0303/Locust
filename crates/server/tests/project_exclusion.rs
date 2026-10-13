@@ -361,7 +361,19 @@ async fn cancelled_job_keeps_project_until_actual_worker_exit() {
     drop(websocket);
     server.shutdown().await;
     drop(state);
-    other.close().unwrap();
+    // Windows may release the opened project database a moment after the
+    // last handle drops (os error 32 on a hosted runner); the folder must
+    // still go away, just not necessarily on the first attempt.
+    let other = other.keep();
+    let mut attempts = 0;
+    while let Err(error) = std::fs::remove_dir_all(&other) {
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "temp folder still in use after 5 s: {error}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
