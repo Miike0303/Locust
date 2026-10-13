@@ -131,7 +131,7 @@ enum Commands {
         game_path: PathBuf,
         #[arg(short = 'P', long)]
         project: PathBuf,
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = ["replace", "add"])]
         mode: Option<String>,
         /// One target language for this project DB. Use a separate pivot/DB per
         /// target language. Required for Replace/Add; optional with --direct
@@ -764,7 +764,9 @@ fn add_mode_remedy(
     let g = game_path.display();
     let p = project.display();
     let langs = languages.join(" ");
-    if writes_to_entry_tree(format_id) {
+    // Wolf RPG once wrote into the original tree too, but its Replace mode now
+    // writes the per-language copy (wolf_replace_records_the_copy_and_preserves_the_original).
+    if writes_to_entry_tree(format_id) && format_id != "wolf-rpg" {
         format!(
             "This engine does not support Add mode, and it writes translations into \
              the original game files, so Replace mode cannot work for it either. Use \
@@ -1518,6 +1520,44 @@ fn preview_extract_merge(
     result
 }
 
+/// A Direct (or legacy, mode-unknown) injection replaced the game's own text
+/// with translations. Extracting it reads that text as the source, and the
+/// merge drops translated rows whose ids its own wrapping shifted (a real
+/// 2489-row game lost 965 translations). Add injections leave originals alone.
+fn warn_or_refuse_direct_injection(
+    game_root: &Path,
+    dry_run: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    use locust_core::injection_transaction::{game_status, InjectionMode};
+    let status = game_status(game_root)?;
+    let in_place = status
+        .injections
+        .iter()
+        .any(|injection| injection.mode != Some(InjectionMode::Add));
+    if !in_place && !status.injection_pending {
+        return Ok(());
+    }
+    let reason = format!(
+        "{} contains a Locust Direct injection: its files hold translated text, so extracting would \
+         read translations as the source and remove translated rows whose ids moved.",
+        game_root.display()
+    );
+    if dry_run {
+        eprintln!("warning: {reason}");
+        return Ok(());
+    }
+    if force {
+        eprintln!("warning: {reason} Continuing because --force was given.");
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{reason} Keep using the project database that injected it, restore the original \
+         first (`locust backups`, then `locust restore-backup <id>`), or pass --force to \
+         extract the translated files anyway."
+    )
+}
+
 fn cmd_extract(
     path: PathBuf,
     format: Option<String>,
@@ -1533,6 +1573,7 @@ fn cmd_extract(
     }
     let game_root = path.canonicalize()?;
     let _source_lock = locust_core::project::lock_game_source(&path)?;
+    warn_or_refuse_direct_injection(&game_root, dry_run, force)?;
     let registry = locust_formats::default_registry();
 
     let plugin = if let Some(ref fmt) = format {
@@ -3746,6 +3787,23 @@ mod tests {
         save_translated(&db, "BasicData.wolf#0", "テストデータ", &wolf_file, "test");
         drop(db);
         (game_dir, wolf_file, db_path)
+    }
+
+    #[test]
+    fn test_add_mode_remedy_offers_replace_where_it_works() {
+        let game = PathBuf::from("game");
+        let project = PathBuf::from("proj.db");
+        let langs = ["es".to_string()];
+        // Wolf Replace writes the per-language copy and keeps the original
+        // (wolf_replace_records_the_copy_and_preserves_the_original).
+        let wolf = add_mode_remedy("wolf-rpg", &game, &project, &langs);
+        assert!(wolf.contains("-o <output_dir>"), "{wolf}");
+        assert!(!wolf.contains("cannot work"), "{wolf}");
+        for engine in ["unity", "unreal"] {
+            let remedy = add_mode_remedy(engine, &game, &project, &langs);
+            assert!(remedy.contains("--direct"), "{remedy}");
+            assert!(!remedy.contains("-o <output_dir>"), "{remedy}");
+        }
     }
 
     #[test]

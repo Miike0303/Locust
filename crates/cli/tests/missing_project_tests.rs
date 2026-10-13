@@ -342,3 +342,40 @@ fn a_file_that_is_not_a_project_database_gets_one_clear_error() {
         "the selected file must stay untouched"
     );
 }
+
+#[test]
+fn an_unknown_injection_mode_is_rejected_before_any_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let game = dir.path().join("game");
+    std::fs::create_dir_all(game.join("game")).unwrap();
+    std::fs::write(
+        game.join("game/script.rpy"),
+        "label start:
+    e \"Hi\"
+",
+    )
+    .unwrap();
+    let output = locust()
+        .current_dir(dir.path())
+        .args([
+            "inject",
+            "game",
+            "-P",
+            "p.locust.db",
+            "-m",
+            "nonsense",
+            "-l",
+            "es",
+            "-o",
+            "out",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("nonsense") && stderr.contains("replace") && stderr.contains("add"),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("out").exists());
+}

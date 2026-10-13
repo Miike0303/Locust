@@ -329,10 +329,11 @@ fn unsupported_add_mode_fails_loudly_and_the_advice_unblocks() {
 }
 
 #[test]
-fn unsupported_add_advice_is_direct_only_for_entry_tree_writers() {
-    // E5 flavor (Wolf RPG): the Replace branch hits the containment
-    // hard-error for this engine class, so the advice must NOT send the user
-    // there — per-engine advice, like the containment error's.
+fn unsupported_add_advice_offers_working_modes_for_wolf() {
+    // Wolf RPG once hit the Replace containment hard-error, so this advice
+    // used to be Direct-only. Replace now writes the per-language copy
+    // (wolf_replace_records_the_copy_and_preserves_the_original), so both
+    // working modes are offered.
     let base_guard = base_dir();
     let base = base_guard.path().to_path_buf();
     let (game, db) = wolf_game_project(&base);
@@ -351,9 +352,8 @@ fn unsupported_add_advice_is_direct_only_for_entry_tree_writers() {
         "direct mode is the advice that works for this engine: {stderr}"
     );
     assert!(
-        !stderr.contains("-o <output_dir>"),
-        "Replace advice would dead-end in the containment error for this \
-         engine and must not be offered: {stderr}"
+        stderr.contains("-o <output_dir>") && !stderr.contains("cannot work"),
+        "Replace works for Wolf RPG and must be offered: {stderr}"
     );
 
     // Execute the advised command verbatim; it must unblock patch.
