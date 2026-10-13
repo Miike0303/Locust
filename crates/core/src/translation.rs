@@ -206,6 +206,21 @@ fn default_max_batch_tokens() -> Option<usize> {
     Some(6000)
 }
 
+/// Reuse the existing strict legacy inference, narrowing its broad RPG Maker
+/// profile to MV/MZ extensions. Explicit provenance always wins, even when it
+/// is unknown or malformed; a .json path alone is never sufficient.
+fn has_mv_mz_provenance(entry: &StringEntry) -> bool {
+    if let Some(id) = entry.metadata.get(crate::models::FORMAT_ID_METADATA_KEY) {
+        return matches!(id.as_str(), Some("rpgmaker-mv" | "rpgmaker-mz"));
+    }
+    entry.placeholder_profile() == PlaceholderProfile::RpgMaker
+        && entry
+            .file_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "json" | "jsono" | "js"))
+}
+
 /// Only occurrence locators/state are excluded. Raw source also pins the
 /// placeholder map: two different controls can sanitize to the same request.
 /// Languages, game context, glossary and fit policy are constant within a run.
@@ -213,6 +228,8 @@ fn default_max_batch_tokens() -> Option<usize> {
 struct RepeatedSourceKey {
     source: String,
     placeholder_profile: PlaceholderProfile,
+    // MV/MZ speaker guidance must not leak to another engine sharing a profile.
+    namebox_guidance: bool,
     context: Option<String>,
     tags: Vec<String>,
     char_limit: Option<usize>,
@@ -236,6 +253,13 @@ impl RepeatedSources {
             let key = RepeatedSourceKey {
                 source: entry.source.clone(),
                 placeholder_profile: entry.placeholder_profile(),
+                namebox_guidance: has_mv_mz_provenance(&entry)
+                    && !PlaceholderProcessor::extract_with_namebox_positions(
+                        &entry.source,
+                        entry.placeholder_profile(),
+                    )
+                    .2
+                    .is_empty(),
                 context: entry.context.clone(),
                 tags: entry.tags.clone(),
                 char_limit: entry.char_limit,
@@ -1691,10 +1715,25 @@ impl TranslationManager {
                             // glossary unbudgeted so a long term can still share the blob.
                             slot_budget = None;
                         }
-                        let (sanitized, phs) = PlaceholderProcessor::extract_with_profile(
-                            &entry.source,
-                            entry.placeholder_profile(),
-                        );
+                        let (sanitized, phs, nameboxes) =
+                            PlaceholderProcessor::extract_with_namebox_positions(
+                                &entry.source,
+                                entry.placeholder_profile(),
+                            );
+                        if has_mv_mz_provenance(entry) && !nameboxes.is_empty() {
+                            let positions = nameboxes
+                                .iter()
+                                .map(|(offset, token)| format!("byte {offset} ({token}<...>)"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let hint = format!(
+                                "RECORD-LOCAL RPG Maker MV/MZ speaker arguments at sanitized UTF-8 {positions}: only the angle-bracket arguments immediately following these placeholders are speaker text, not HTML. Translate generic roles, occupations and descriptive titles into the target language; preserve established proper names and follow this record's glossary. Preserve every placeholder token and control code exactly, and keep the angle brackets. This note does not apply to other angle-bracket text."
+                            );
+                            context = Some(match context {
+                                Some(c) => format!("{c} | {hint}"),
+                                None => hint,
+                            });
+                        }
                         placeholders_by_id.insert(entry.id.clone(), phs);
                         // Per-entry glossary: terms present in source; for binary
                         // slots also drop translations that cannot fit the budget.
@@ -5055,6 +5094,282 @@ mod tests {
         let saved = db.get_entry("duplicate-token").unwrap().unwrap();
         assert_eq!(saved.status, StringStatus::Pending);
         assert!(saved.translation.is_none());
+    }
+
+    #[tokio::test]
+    async fn namebox_record_local_context_maps_sanitized_positions_and_legacy_rows() {
+        let mut entries = vec![StringEntry::new(
+            "ordinary",
+            "Hello",
+            PathBuf::from("text.json"),
+        )];
+        for (i, escape) in [r"\n", r"\nc", r"\nr", r"\N", r"\NC", r"\NR", r"\nC", r"\Nr"]
+            .iter()
+            .enumerate()
+        {
+            entries.push(
+                StringEntry::new(
+                    format!("variant-{i}"),
+                    format!(r"\C[2]é {escape}<Alchemist>Hi {i} \V[1]"),
+                    PathBuf::from("text.json"),
+                )
+                .with_format_id(if i % 2 == 0 {
+                    "rpgmaker-mv"
+                } else {
+                    "rpgmaker-mz"
+                })
+                .with_context("scene"),
+            );
+        }
+        for (id, path) in [
+            ("Map001.json#0#event_1#page_0#cmd_0#msg", "data/Map001.json"),
+            ("Map001.jsono#displayName", "data/Map001.jsono"),
+            ("plugins.js#plugins#0#Plugin#text", "js/plugins.js"),
+        ] {
+            entries.push(
+                StringEntry::new(id, r"\nr<Adventurer>Hello", PathBuf::from(path))
+                    .with_context(path),
+            );
+        }
+        let original_contexts: HashMap<_, _> = entries
+            .iter()
+            .map(|e| (e.id.clone(), e.context.clone()))
+            .collect();
+        let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+        let (db, _) = run_repeated_job(
+            entries,
+            provider.clone(),
+            TranslationOptions {
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let calls = provider.calls.lock().unwrap();
+        let requests: Vec<_> = calls.iter().flatten().collect();
+        assert_eq!(requests.len(), 12);
+        assert_eq!(requests[0].entry_id, "ordinary");
+        assert!(requests[0].context.is_none());
+        for req in &requests[1..] {
+            let note = req
+                .context
+                .as_deref()
+                .expect("confirmed namebox needs context");
+            for rule in [
+                "RECORD-LOCAL",
+                "generic roles, occupations and descriptive titles",
+                "target language",
+                "established proper names",
+                "glossary",
+                "every placeholder",
+                "control code",
+                "angle brackets",
+            ] {
+                assert!(note.contains(rule), "missing {rule}: {note}");
+            }
+            if req.entry_id.starts_with("variant-") {
+                assert!(req.source.starts_with("{PL_0}é {PL_1}<Alchemist>"));
+                assert!(note.starts_with("scene | "));
+                assert!(note.contains("byte 9 ({PL_1}<...>)"), "{note}");
+                assert!(!note.contains("{PL_0}<...>"), "{note}");
+            } else {
+                assert_eq!(req.source, "{PL_0}<Adventurer>Hello");
+                assert!(note.contains("byte 0 ({PL_0}<...>)"), "{note}");
+            }
+            let saved = db.get_entry(&req.entry_id).unwrap().unwrap();
+            assert!(saved.require_preserved_translation_controls().is_ok());
+            assert_eq!(saved.context, original_contexts[&req.entry_id]);
+        }
+    }
+
+    #[tokio::test]
+    async fn namebox_context_excludes_html_unknown_other_formats_and_malformed_arguments() {
+        let mut entries = Vec::new();
+        for (i, (source, format, path)) in [
+            (r"\n<Boy>Hello", "rpgmaker-vxa", "Actors.rvdata2"),
+            (r"\n<Boy>Hello", "wolf-rpg", "Map.wolf"),
+            (r"\n<Boy>Hello", "renpy", "script.rpy"),
+            (r"\n<Boy>Hello", "html", "page.html"),
+            (r"\n<Boy>Hello", "unknown", "Map001.json"),
+            (r"\n<Boy>Hello", "", "Map001.json"),
+            (r"\n<Boy>Hello", "", "Actors.rvdata2"),
+            (r"\n<Boy>Hello", "", "Map.wolf"),
+            ("<Boy>Hello</Boy>", "rpgmaker-mv", "Map001.json"),
+            (r"\\n<Boy>Hello", "rpgmaker-mv", "Map001.json"),
+            (r"\fn<Boy>Hello", "rpgmaker-mv", "Map001.json"),
+            (r"\nl<Boy>Hello", "rpgmaker-mv", "Map001.json"),
+            (r"\n <Boy>Hello", "rpgmaker-mv", "Map001.json"),
+            (r"\n<Boy", "rpgmaker-mv", "Map001.json"),
+            (r"\n<>Hello", "rpgmaker-mv", "Map001.json"),
+            (r"\n< >Hello", "rpgmaker-mv", "Map001.json"),
+            (r"\n<<Boy>>Hello", "rpgmaker-mv", "Map001.json"),
+            ("\\n<Boy\nAlchemist>Hello", "rpgmaker-mv", "Map001.json"),
+            (
+                r#"<b title="\n<Boy>">Hello</b>"#,
+                "rpgmaker-mv",
+                "Map001.json",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut entry = StringEntry::new(format!("negative-{i}"), *source, PathBuf::from(path))
+                .with_context(format!("record-{i}"));
+            if !format.is_empty() {
+                entry = entry.with_format_id(format);
+            }
+            if *format == "unknown" {
+                entry.id = "Map001.json#0#event_1#page_0#cmd_0#msg".into();
+            }
+            entries.push(entry);
+        }
+        let mut malformed_id = StringEntry::new(
+            "Map002.json#0#event_1#page_0#cmd_0#msg",
+            r"\n<Boy>Hello",
+            PathBuf::from("Map002.json"),
+        )
+        .with_context("malformed metadata");
+        malformed_id.metadata.insert(
+            crate::models::FORMAT_ID_METADATA_KEY.into(),
+            serde_json::json!(42),
+        );
+        entries.push(malformed_id);
+        // Identical RPG Maker profiles are not enough to share the new guidance.
+        entries.push(
+            StringEntry::new("confirmed", r"\n<Boy>Hello", PathBuf::from("Map001.json"))
+                .with_format_id("rpgmaker-mv")
+                .with_context("record-0"),
+        );
+        let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+        let _ = run_repeated_job(entries.clone(), provider.clone(), Default::default()).await;
+        let calls = provider.calls.lock().unwrap();
+        let requests: Vec<_> = calls.iter().flatten().collect();
+        assert_eq!(
+            requests.len(),
+            entries.len(),
+            "guidance must not be deduplicated with VXA"
+        );
+        for source in [r"Hello \V[1]", r"\n<Missing close"] {
+            let (representatives, _) = RepeatedSources::collect(
+                ["rpgmaker-mv", "rpgmaker-vxa"]
+                    .into_iter()
+                    .map(|format| {
+                        StringEntry::new(format, source, PathBuf::from("text.json"))
+                            .with_format_id(format)
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                representatives.len(),
+                1,
+                "unchanged grouping without guidance"
+            );
+        }
+        for req in requests {
+            if req.entry_id == "confirmed" {
+                assert!(req.context.as_deref().unwrap().contains("RECORD-LOCAL"));
+            } else {
+                let entry = entries.iter().find(|e| e.id == req.entry_id).unwrap();
+                assert_eq!(req.context, entry.context, "{}", req.entry_id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn namebox_guidance_keeps_names_glossary_controls_and_cached_bypasses() {
+        let (db, _) = setup();
+        let entries: Vec<_> = [
+            ("memory", r"\n<Boy>Hi"),
+            ("exact", r"\n<Alchemist>Hi"),
+            (
+                "provider",
+                r"\C[2]é \n<Lydia \V[1]>Hi \nr<Young Boy><b>Hello</b>",
+            ),
+        ]
+        .into_iter()
+        .map(|(id, source)| {
+            StringEntry::new(id, source, PathBuf::from("Map001.json")).with_format_id("rpgmaker-mv")
+        })
+        .collect();
+        db.save_entries(&entries).unwrap();
+        // Existing memory is deliberately not retroactively repaired.
+        db.save_memory(
+            &entries[0].source_hash(),
+            &entries[0].source,
+            r"\n<Boy>Hola",
+            "en-es",
+        )
+        .await
+        .unwrap();
+        for (term, translation) in [
+            (&*entries[1].source, r"\n<Maestro>Hola"),
+            ("Lydia", "Lidia"),
+        ] {
+            db.save_glossary_entry(&crate::database::GlossaryEntry {
+                term: term.into(),
+                translation: translation.into(),
+                lang_pair: "en-es".into(),
+                context: None,
+                case_sensitive: true,
+            })
+            .unwrap();
+        }
+        let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+        run_group_job(
+            db.clone(),
+            provider.clone(),
+            entries.clone(),
+            TranslationOptions {
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let calls = provider.calls.lock().unwrap();
+        let requests: Vec<_> = calls.iter().flatten().collect();
+        assert_eq!(requests.len(), 1);
+        let req = requests[0];
+        assert_eq!(req.entry_id, "provider");
+        assert_eq!(
+            req.source,
+            "{PL_0}é {PL_1}<Lydia {PL_2}>Hi {PL_3}<Young Boy>{PL_4}Hello{PL_5}"
+        );
+        assert!(req
+            .glossary_hint
+            .as_deref()
+            .unwrap()
+            .contains("Lydia → Lidia"));
+        let note = req.context.as_deref().unwrap();
+        assert!(note.contains("byte 9 ({PL_1}<...>)"), "{note}");
+        assert!(note.contains("byte 32 ({PL_3}<...>)"), "{note}");
+        assert!(!note.contains("{PL_4}<...>"));
+        assert!(
+            note.contains("preserve established proper names and follow this record's glossary"),
+            "{note}"
+        );
+        for (id, expected, attribution) in [
+            ("memory", r"\n<Boy>Hola", "memory"),
+            ("exact", r"\n<Maestro>Hola", "glossary"),
+            (
+                "provider",
+                r"en: \C[2]é \n<Lydia \V[1]>Hi \nr<Young Boy><b>Hello</b>",
+                "repeat-test",
+            ),
+        ] {
+            let saved = db.get_entry(id).unwrap().unwrap();
+            assert_eq!(saved.translation.as_deref(), Some(expected));
+            assert_eq!(saved.provider_used.as_deref(), Some(attribution));
+            assert!(saved.require_preserved_translation_controls().is_ok());
+            assert!(saved.context.is_none());
+        }
+        assert_eq!(
+            db.lookup_memory(&entries[0].source_hash(), "en-es")
+                .unwrap()
+                .as_deref(),
+            Some(r"\n<Boy>Hola")
+        );
     }
 
     #[tokio::test]

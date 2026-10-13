@@ -95,7 +95,7 @@ pub(crate) fn build_system_prompt(req: &TranslationRequest) -> String {
         prompt.push_str(&format!("\n{}", hint));
     }
     prompt.push_str(
-        "\nRules:\n- Preserve all placeholder tokens like {PL_0}, {PL_1} exactly as-is\n- Preserve control codes such as \\C[6], \\N[1], \\V[2] exactly, but DO translate any visible text around or between them (e.g. a title inside \\C[5]...\\C[0])\n- Translate EVERY line fully, including labels, speaker prefixes and menu text; do not lazily echo untranslated source text just because translating feels redundant. It is fine for the output to equal the input ONLY when that is genuinely correct: lines made solely of placeholders/control codes, bare numbers, proper nouns, or words that are identical in both languages\n- Return ONLY a JSON array of translated strings, in the same order as input\n- Do not add explanations or notes",
+        "\nRules:\n- Preserve all placeholder tokens like {PL_0}, {PL_1} exactly as-is\n- Preserve control codes such as \\C[6], \\N[1], \\V[2] exactly, but DO translate any visible text around or between them (e.g. a title inside \\C[5]...\\C[0])\n- Translate EVERY line fully, including labels, speaker prefixes and menu text; do not lazily echo untranslated source text just because translating feels redundant. It is fine for the output to equal the input ONLY when that is genuinely correct: lines made solely of placeholders/control codes, bare numbers, established proper nouns (follow the record's glossary), or words that are identical in both languages\n- When record-local context identifies a speaker argument, apply its role/title guidance only there; capitalization alone does not make a generic role a proper noun\n- Return ONLY a JSON array of translated strings, in the same order as input\n- Do not add explanations or notes",
     );
     prompt.push_str(target_language_rules(&req.target_lang));
     prompt
@@ -365,6 +365,28 @@ mod tests {
             records[1]["context"],
             "A long line of dialogue, no width restriction"
         );
+    }
+
+    #[test]
+    fn prompt_keeps_nonfirst_namebox_guidance_record_local() {
+        let first = make_request(None, None);
+        let mut speaker = make_request(
+            Some("RECORD-LOCAL RPG Maker MV/MZ speaker arguments: byte 0 ({PL_0}<...>). Translate generic roles, occupations and descriptive titles into the target language; preserve established proper names and follow this record's glossary. Preserve every placeholder token and control code exactly, and keep the angle brackets."),
+            Some("Lydia = Lidia"),
+        );
+        speaker.source = "{PL_0}<Alchemist>Hello".into();
+        let (system, input) = build_batch_prompt(&[first, speaker.clone()]).unwrap();
+        assert!(system.contains("established proper nouns (follow the record's glossary)"));
+        assert!(system.contains("capitalization alone does not make a generic role a proper noun"));
+        assert!(
+            !system.contains("byte 0"),
+            "position guidance must stay local"
+        );
+        let records: serde_json::Value = serde_json::from_str(&input).unwrap();
+        assert!(records[0]["context"].is_null());
+        assert_eq!(records[1]["source"], speaker.source);
+        assert_eq!(records[1]["context"], speaker.context.unwrap());
+        assert_eq!(records[1]["glossary"], "Lydia = Lidia");
     }
 
     #[tokio::test]

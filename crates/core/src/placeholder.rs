@@ -72,6 +72,18 @@ impl PlaceholderProcessor {
         source: &str,
         profile: PlaceholderProfile,
     ) -> (String, Vec<Placeholder>) {
+        let (sanitized, placeholders, _) = Self::extract_with_namebox_positions(source, profile);
+        (sanitized, placeholders)
+    }
+
+    /// Map recognized speaker escapes to their positions in the sanitized text.
+    /// Use the accepted, non-overlapping matches, not a second tag scanner: a
+    /// control inside protected HTML must not become speaker guidance. These
+    /// positions carry no format provenance; the caller must confirm MV/MZ.
+    pub(crate) fn extract_with_namebox_positions(
+        source: &str,
+        profile: PlaceholderProfile,
+    ) -> (String, Vec<Placeholder>, Vec<(usize, String)>) {
         let mut matches = Vec::new();
 
         // Collect all pattern matches
@@ -89,17 +101,33 @@ impl PlaceholderProcessor {
         let matches = Self::remove_overlaps(matches);
 
         if matches.is_empty() {
-            return (source.to_string(), Vec::new());
+            return (source.to_string(), Vec::new(), Vec::new());
         }
 
         // Build sanitized string and placeholders
         let mut sanitized = String::new();
         let mut placeholders = Vec::new();
+        let mut nameboxes = Vec::new();
         let mut last_end = 0;
 
         for (idx, m) in matches.into_iter().enumerate() {
             sanitized.push_str(&source[last_end..m.start]);
             let token = format!("{{PL_{}}}", idx);
+            if matches!(m.kind, PlaceholderKind::RpgMakerCode)
+                && namebox_escape_len(&source.as_bytes()[m.start..]) == Some(m.end - m.start)
+            {
+                // The protector leaves the first closed <argument> visible.
+                // Malformed/empty/nested/multiline arguments get no guidance;
+                // existing protection and validation behavior stays unchanged.
+                if let Some((argument, _)) = source[m.end + 1..].split_once('>') {
+                    if !argument.trim().is_empty()
+                        && !argument.contains('<')
+                        && !argument.chars().any(char::is_control)
+                    {
+                        nameboxes.push((sanitized.len(), token.clone()));
+                    }
+                }
+            }
             sanitized.push_str(&token);
             placeholders.push(Placeholder {
                 index: idx,
@@ -111,7 +139,7 @@ impl PlaceholderProcessor {
         }
         sanitized.push_str(&source[last_end..]);
 
-        (sanitized, placeholders)
+        (sanitized, placeholders, nameboxes)
     }
 
     pub fn restore(translated: &str, placeholders: &[Placeholder]) -> Result<String> {
