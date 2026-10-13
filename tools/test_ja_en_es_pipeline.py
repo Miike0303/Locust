@@ -1,0 +1,1263 @@
+"""Deterministic safety and release gates; production transport tests below."""
+import copy
+from dataclasses import replace
+import errno
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from io import StringIO
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch
+
+SCRATCH = Path(__file__).resolve().parents[1] / ".test-tmp"
+CLI = Path(__file__).resolve().parents[1] / "target/debug" / ("locust.exe" if os.name == "nt" else "locust")
+
+import ja_en_es_pipeline as pipeline
+
+
+def row(root, **updates):
+    value = {"id": "script.rpy#1", "file_path": str(root / "game/script.rpy"),
+             "source": "こんにちは", "translation": "Hello", "status": "translated",
+             "context": None, "tags": [], "metadata": {"format_id": "renpy"},
+             "char_limit": None, "provider_used": "pipeline-scripted",
+             "created_at": "2026-01-01", "translated_at": "2026-01-01", "reviewed_at": None}
+    value.update(updates)
+    return value
+
+
+class PipelineCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pipeline-test-", dir=SCRATCH)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.game = self.root / "source"
+        (self.game / "game").mkdir(parents=True)
+        (self.game / "game/script.rpy").write_text('label start:\n    "こんにちは"\n', encoding="utf-8")
+        self.cli = self.root / "locust.exe"
+        self.cli.write_bytes(b"mock executable")
+        self.cli.chmod(0o700)
+
+    def options(self, **updates):
+        values = dict(cli=str(self.cli), game=str(self.game), output=str(self.root / "run"),
+                      format="renpy", provider="google")
+        values.update(updates)
+        return pipeline.Options(**values)
+
+
+class SafetyTests(PipelineCase):
+    def test_overlap_both_directions_and_occupied_root(self):
+        for output in (self.game, self.game / "nested", self.root):
+            with self.subTest(output=output), self.assertRaises(pipeline.PipelineError):
+                pipeline.preflight(self.options(output=str(output)))
+        occupied = self.root / "occupied"
+        occupied.mkdir()
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.preflight(self.options(output=str(occupied)))
+        self.assertEqual(list(occupied.iterdir()), [])
+
+    def test_link_components_and_tree_are_refused(self):
+        link = self.root / "alias"
+        try:
+            link.symlink_to(self.game, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.preflight(self.options(game=str(link)))
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.preflight(self.options(output=str(link / "out")))
+        (self.game / "linked").symlink_to(self.cli)
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.preflight(self.options())
+
+    def test_installed_state_and_archives_refused(self):
+        for name in (".locust", ".locust-injections", "game/archive.rpa", "scenario/data.xp3"):
+            game = self.root / str(len(list(self.root.iterdir())))
+            (game / Path(name).parent).mkdir(parents=True, exist_ok=True)
+            (game / name).write_bytes(b"do not inspect archive")
+            with self.subTest(name=name), self.assertRaises(pipeline.PipelineError):
+                pipeline.preflight(self.options(game=str(game)))
+
+    def test_endpoint_literal_loopback_only(self):
+        for endpoint in ("https://example.com", "http://localhost:7", "http://127.0.0.1.evil:7",
+                         "http://user:pass@127.0.0.1:7", "http://127.0.0.1:7/?key=secret",
+                         "http://127.0.0.1:0", "http://127.0.0.1:7\n"):
+            with self.subTest(endpoint=endpoint), self.assertRaises(pipeline.PipelineError):
+                pipeline.preflight(self.options(test_endpoint=endpoint))
+
+    def test_blank_stale_malformed_and_shrunken_rows_refused(self):
+        valid = [row(self.game)]
+        baseline = pipeline.inventory(valid, self.game, "renpy")
+        variants = [[], [row(self.game, translation=" ")], [row(self.game, status="pending")],
+                    [row(self.game, metadata={"format_id": "renpy", "locust_stale_translation": None})],
+                    [row(self.game, metadata=[])], [row(self.game, source="changed")]]
+        for rows in variants:
+            with self.subTest(rows=rows), self.assertRaises(pipeline.PipelineError):
+                pipeline.gate_rows(rows, baseline, self.game, "renpy", ready=True)
+
+    def test_malformed_warning_skip_and_outcome_reports_refused(self):
+        report = {"mode": "direct", "languages_processed": ["es"], "languages_failed": [],
+                  "backup_id": "owned", "pristine_backup_id": "owned",
+                  "backup_path": str(self.root / "run/backups/owned"),
+                  "files_modified": 1, "strings_written": 1, "strings_skipped": 0,
+                  "warnings": [], "files_written": [str(self.game / "game/script.rpy")],
+                  "reports": {"es": {"skip_reasons": {}, "files_modified": 1, "strings_written": 1,
+                                     "strings_skipped": 0, "warnings": [],
+                                     "files_written": [str(self.game / "game/script.rpy")]}},
+                  "outcomes": [["es", {"Recorded": {"files": 1}}]]}
+        variants = []
+        for key, value in (("strings_written", True), ("strings_skipped", -1), ("warnings", ["partial"]),
+                           ("languages_failed", [["es", "failed"]]), ("outcomes", [["es", "NothingRecorded"]])):
+            broken = copy.deepcopy(report)
+            broken[key] = value
+            variants.append(broken)
+        broken = copy.deepcopy(report)
+        broken["reports"]["es"]["skip_reasons"] = {"unclassified": 1}
+        variants.append(broken)
+        for edit in (lambda value: value["reports"]["es"].update(files_modified=True),
+                     lambda value: value.update(outcomes=[["es", {"Recorded": {"files": True}}]])):
+            broken = copy.deepcopy(report)
+            edit(broken)
+            variants.append(broken)
+        for value in variants:
+            with self.subTest(value=value), self.assertRaises(pipeline.PipelineError):
+                pipeline.gate_injection(value, [row(self.game)], self.game, self.root / "run/backups")
+
+
+class AdditionalGates(PipelineCase):
+    def test_filesystem_directory_alias_cannot_hide_source_output_overlap(self):
+        alias_parent = self.root / "alias-parent"
+        alias_parent.mkdir()
+        real_identity = pipeline.directory_identity
+        source_identity = real_identity(self.game / "game")
+        def identity(path):
+            return source_identity if Path(path) == alias_parent else real_identity(path)
+        with patch.object(pipeline, "directory_identity", side_effect=identity):
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.preflight(self.options(output=str(alias_parent / "fresh")))
+        self.assertFalse((alias_parent / "fresh").exists())
+
+    def test_parent_traversal_does_not_hide_link_components(self):
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.preflight(self.options(game=str(self.root / "alias/../source")))
+
+    def test_sensitive_names_hardlinks_and_special_files(self):
+        # Never read a sensitive member: the name is rejected before hashing.
+        (self.game / ".env").write_bytes(b"synthetic, not a credential")
+        with patch.object(pipeline, "file_hash", wraps=pipeline.file_hash) as hashed:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.preflight(self.options())
+            self.assertFalse(any(Path(call.args[0]).name == ".env" for call in hashed.call_args_list))
+        other = self.root / "hardlinked"
+        other.mkdir()
+        try:
+            os.link(self.cli, other / "same.exe")
+        except OSError as error:
+            self.skipTest(f"hardlinks unavailable: {error}")
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.scan(other)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO branch; Windows reparse branch tested separately")
+    def test_fifo_refused_without_open(self):
+        os.mkfifo(self.game / "pipe")
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.preflight(self.options())
+
+    def test_reparse_attribute_detected_even_without_symlink_mode(self):
+        class Junction:
+            st_mode = 0o040755
+            st_file_attributes = 0x400
+        self.assertTrue(pipeline.linked(Junction()))
+
+    def test_nonsecret_environment_and_subscription_discovery(self):
+        inherited = {"LOCUST_CONFIG": "owner-secret-config", "LOCUST_DATA_DIR": "owner-data",
+                     "HTTP_PROXY": "owner-proxy", "https_proxy": "owner-proxy", "ALL_PROXY": "owner-proxy",
+                     "OPENAI_API_KEY": "not-real", "PATH": "agy-path", "HOME": "owner-profile",
+                     "USERPROFILE": "owner-profile", "APPDATA": "owner-roaming", "LOCALAPPDATA": "owner-local"}
+        with patch.dict(os.environ, inherited, clear=True):
+            env = pipeline.child_environment(self.root / "run", self.options(test_endpoint="http://127.0.0.1:7"))
+            self.assertNotIn("LOCUST_CONFIG", env)
+            self.assertFalse(any("proxy" in key.lower() and key != "NO_PROXY" for key in env))
+            self.assertNotIn("OPENAI_API_KEY", env)
+            self.assertEqual(env["PATH"], "agy-path")
+            self.assertEqual(env["HOME"], str(self.root / "run/profile"))
+            subscription = pipeline.child_environment(self.root / "run", self.options(provider="antigravity"))
+            self.assertEqual(subscription["HOME"], "owner-profile")
+            self.assertEqual(subscription["USERPROFILE"], "owner-profile")
+            self.assertEqual(subscription["LOCUST_DATA_DIR"], str(self.root / "run/profile"))
+            self.assertNotIn("LOCUST_CONFIG", subscription)
+            self.assertNotIn("OPENAI_API_KEY", subscription)
+            ordinary = pipeline.child_environment(self.root / "run", self.options(provider="antigravity"), subscription_login=False)
+            self.assertEqual(ordinary["HOME"], str(self.root / "run/profile"))
+            self.assertEqual(ordinary["USERPROFILE"], str(self.root / "run/profile"))
+
+    def test_preflight_io_failure_returns_nonsecret_json(self):
+        output = StringIO()
+        arguments = ["--cli", str(self.cli), "--game", str(self.game), "--output", str(self.root / "run"),
+                     "--format", "renpy", "--provider", "google"]
+        with patch.object(pipeline, "preflight", side_effect=OSError("synthetic private diagnostic")), patch("sys.stdout", output):
+            self.assertEqual(pipeline.main(arguments), 1)
+        summary = json.loads(output.getvalue())
+        self.assertEqual(summary["status"], "failed")
+        self.assertNotIn("private", summary["diagnostic"])
+
+    def test_json_counts_duplicates_nan_and_controls(self):
+        for text in ('{"count":0,"count":0,"issues":[]}', '{"count":NaN}', 'no json'):
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.strict_json(text)
+        for report in ({"count": False, "issues": []}, {"count": 1, "issues": []}, {"count": 0, "issues": ["warning"]}):
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.gate_validation(report)
+        good = row(self.game, source='こんにちは [emb exp="f.player"][l]', translation='Hello [emb exp="f.player"][l]',
+                   metadata={"format_id": "kirikiri"})
+        baseline = pipeline.inventory([good], self.game, "kirikiri")
+        pipeline.gate_rows([good], baseline, self.game, "kirikiri", ready=True)
+        bad = copy.deepcopy(good)
+        bad["translation"] = 'Hello [emb exp="f.other"][l]'
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.gate_rows([bad], baseline, self.game, "kirikiri", ready=True)
+
+    def test_resource_identity_duplicates_and_bounded_wrap(self):
+        original = row(self.game, id="Map#event_1#page_0#cmd_1#msg", source="森へ\n進む", translation="Continuar hacia el bosque",
+                       metadata={"format_id": "rpgmaker-mv"})
+        actual = dict(original, id="Map#event_1#page_0#cmd_3#msg", source="Continuar hacia\nel bosque")
+        evidence = pipeline.compare_reextraction([original], self.game, [actual], self.game, "rpgmaker-mv")
+        self.assertEqual(evidence["normalized_rpg_dialogues"], 1)
+        for invalid in ([], [actual, actual], [dict(actual, source="Continuar el bosque")],
+                        [dict(actual, id="Map#event_2#page_0#cmd_3#msg")]):
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.compare_reextraction([original], self.game, invalid, self.game, "rpgmaker-mv")
+
+    def test_readonly_sqlite_wal_not_immutable(self):
+        # Metadata-only fixture. No translations are seeded by SQL.
+        database = self.root / "wal.db"
+        connection = sqlite3.connect(database)
+        self.addCleanup(connection.close)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        connection.execute("CREATE TABLE strings (" + ",".join(key + " TEXT" for key in pipeline.COLUMNS) + ")")
+        connection.execute("CREATE TABLE project_metadata (key TEXT, value TEXT)")
+        connection.execute("CREATE TABLE translation_memory (source TEXT)")
+        connection.execute("INSERT INTO project_metadata VALUES ('extraction_warnings','[]')")
+        connection.commit()
+        before = pipeline.file_hash(database)
+        rows, metadata = pipeline.read_database(database)
+        self.assertEqual(rows, [])
+        self.assertEqual(metadata["extraction_warnings"], [])
+        self.assertEqual(before, pipeline.file_hash(database))
+        connection.execute("UPDATE project_metadata SET value='[\"partial\"]'")
+        connection.commit()
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.read_database(database)
+
+
+class MockCli:
+    """Virtual rows only: Python never writes SQL translations, even in mocks."""
+    def __init__(self, case):
+        self.case, self.rows, self.calls = case, {}, []
+        self.missing = True
+        self.timeout_stage = None
+        self.inject_called_after_marker = False
+
+    def read(self, path):
+        return copy.deepcopy(self.rows[Path(path)]), {"extraction_warnings": [], "game_root": str(self.case.root / "run/work-game")}
+
+    def run(self, argv, **kwargs):
+        self.case.assertEqual(argv[:3], [str(self.case.cli), "--config", str(self.case.root / "run/profile/config.json")])
+        args = argv[3:]
+        self.calls.append(args)
+        self.case.assertEqual(kwargs["cwd"], self.case.root / "run")
+        self.case.assertEqual(kwargs["timeout"], 900)
+        self.case.assertNotIn(str(self.case.game), list(map(str, args)))
+        self.case.assertNotIn("LOCUST_CONFIG", kwargs["env"])
+        if args[0] == self.timeout_stage:
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        stdout, returncode = b"", 0
+        if args[0] == "extract":
+            db = Path(args[-1])
+            db.write_bytes(b"virtual database, not sqlite")
+            self.rows[db] = [row(Path(args[1]), translation=None, status="pending", provider_used=None, translated_at=None)]
+        elif args[0] == "translate":
+            db = Path(args[1])
+            if self.missing:
+                self.missing = False
+            else:
+                for value in self.rows[db]:
+                    if value["status"] == "pending":
+                        value.update(translation="Hello" if "ja" in args else "Hola", status="translated",
+                                     provider_used="google", translated_at="2026-01-02")
+        elif args[0] == "validate":
+            stdout = b'{"count":0,"issues":[]}'
+        elif args[0] == "pivot":
+            source, target = Path(args[1]), Path(args[3])
+            self.rows[target] = copy.deepcopy(self.rows[source])
+            target.write_bytes(b"virtual pivot")
+            for value in self.rows[target]:
+                value["metadata"]["locust_injection_source"] = value["source"]
+                value.update(source=value["translation"], translation=None, status="pending", provider_used=None, translated_at=None)
+        elif args[0] == "inject" and "--help" not in args:
+            manifest = pipeline.read_json_file(self.case.root / "run/pipeline-manifest.json")
+            self.inject_called_after_marker = manifest["injection_started"] is True
+            returncode = 1
+        return subprocess.CompletedProcess(argv, returncode, stdout, b"do not log source/credentials")
+
+
+class OrchestratorTests(PipelineCase):
+    def mock_session(self):
+        cli = MockCli(self)
+        return cli, patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(pipeline.subprocess, "run", side_effect=cli.run)
+
+    def test_pending_translation_resume_and_injection_boundary(self):
+        mock_cli, reader, runner = self.mock_session()
+        with reader, runner:
+            with self.assertRaisesRegex(pipeline.PipelineError, "Missing/blank/pending"):
+                pipeline.Pipeline(self.options()).run()
+            before = pipeline.read_json_file(self.root / "run/pipeline-manifest.json")
+            self.assertEqual(before["phase"], "english-pending")
+            self.assertFalse(before["injection_started"])
+            self.assertFalse((self.root / "run/spanish.db").exists())
+            with self.assertRaisesRegex(pipeline.PipelineError, "Child command failed"):
+                pipeline.Pipeline(self.options(resume=True)).run()
+            self.assertTrue(mock_cli.inject_called_after_marker)
+            self.assertEqual(sum(args[0] == "extract" for args in mock_cli.calls), 1)
+            self.assertEqual(sum(args[0] == "pivot" for args in mock_cli.calls), 1)
+            self.assertTrue(all("--no-memory" in args for args in mock_cli.calls if args[0] == "translate"))
+            with self.assertRaisesRegex(pipeline.PipelineError, "Resume refused"):
+                pipeline.Pipeline(self.options(resume=True)).run()
+
+    def test_resume_rejects_settings_and_database_drift(self):
+        mock_cli, reader, runner = self.mock_session()
+        with reader, runner:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(self.options()).run()
+            total = len(mock_cli.calls)
+            for option in (self.options(resume=True, concurrency=2), self.options(resume=True, provider="antigravity")):
+                with self.assertRaises(pipeline.PipelineError):
+                    pipeline.Pipeline(option).run()
+            self.assertEqual(len(mock_cli.calls), total)
+            database = self.root / "run/english.db"
+            database.write_bytes(b"changed virtual DB")
+            with self.assertRaisesRegex(pipeline.PipelineError, "database hashes"):
+                pipeline.Pipeline(self.options(resume=True)).run()
+            # No recovery or overwrite of a drifted database.
+            self.assertEqual(database.read_bytes(), b"changed virtual DB")
+
+    def test_resume_rejects_source_binary_work_pristine_config_and_inventory_drift(self):
+        mock_cli, reader, runner = self.mock_session()
+        with reader, runner:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(self.options()).run()
+            count = len(mock_cli.calls)
+            paths = [self.game / "game/script.rpy", self.cli,
+                     self.root / "run/work-game/game/script.rpy", self.root / "run/pristine/game/script.rpy",
+                     self.root / "run/profile/config.json"]
+            for path in paths:
+                with self.subTest(path=path.name):
+                    before, mode = path.read_bytes(), path.stat().st_mode
+                    path.chmod(0o600)
+                    path.write_bytes(b"synthetic drift")
+                    try:
+                        with self.assertRaises(pipeline.PipelineError):
+                            pipeline.Pipeline(self.options(resume=True)).run()
+                        self.assertEqual(len(mock_cli.calls), count)
+                    finally:
+                        path.write_bytes(before)
+                        path.chmod(mode)
+            database = self.root / "run/english.db"
+            mock_cli.rows[database][0]["source"] = "different Japanese inventory"
+            with self.assertRaisesRegex(pipeline.PipelineError, "database hashes/inventory drift"):
+                pipeline.Pipeline(self.options(resume=True)).run()
+            self.assertEqual(len(mock_cli.calls), count)
+
+    def assert_resume_refused_without_child(self, options):
+        # A launch sentinel prevents a vulnerable implementation from changing
+        # the virtual DB or contaminating subsequent coordinated mutations.
+        with patch.object(pipeline.subprocess, "run", side_effect=AssertionError("Untrusted resume attempted child launch")) as child:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(replace(options, resume=True)).run()
+            child.assert_not_called()
+
+    def test_coordinated_config_and_manifest_mutations_never_launch_children(self):
+        options = self.options(test_endpoint="http://127.0.0.1:7")
+        mock_cli, reader, runner = self.mock_session()
+        with reader, runner:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(options).run()
+            root = Path(options.output)
+            manifest_path, config_path = root / "pipeline-manifest.json", root / "profile/config.json"
+            original = pipeline.read_json_file(manifest_path)
+            config = pipeline.read_json_file(config_path)
+            variants = []
+            for endpoint in ("http://192.0.2.1:7000", "http://127.0.0.1:8"):
+                altered = copy.deepcopy(config)
+                altered["providers"][pipeline.PROVIDER]["base_url"] = endpoint
+                variants.append(("endpoint", pipeline.encoded(altered)))
+            for provider in ("antigravity", "unexpected"):
+                altered = copy.deepcopy(config)
+                altered["providers"][provider] = {"extra": {"agy_path": str(root / "profile/untrusted-agy.cmd")}}
+                variants.append(("executable", pipeline.encoded(altered)))
+            for key in ("unknown", "http_proxy"):
+                variants.append(("unknown-config-field", pipeline.encoded(dict(config, **{key: "untrusted"}))))
+            altered = copy.deepcopy(config)
+            altered["providers"][pipeline.PROVIDER]["extra"]["agy_path"] = "untrusted-agy"
+            variants.append(("unknown-provider-key", pipeline.encoded(altered)))
+            variants.append(("noncanonical-bytes", json.dumps(config, indent=2).encode()))
+            count = len(mock_cli.calls)
+            for name, data in variants:
+                with self.subTest(mutation=name):
+                    config_path.write_bytes(data)
+                    altered_manifest = copy.deepcopy(original)
+                    # Coordinated forgery: the recorded hash/size agrees with
+                    # the attack. Hash agreement must never authorize config.
+                    altered_manifest["config"] = pipeline.file_hash(config_path)
+                    manifest_path.write_bytes(pipeline.encoded(altered_manifest))
+                    self.assert_resume_refused_without_child(options)
+                    self.assertEqual(len(mock_cli.calls), count, "Refusal must precede every resumed child")
+                    self.assertEqual(manifest_path.read_bytes(), pipeline.encoded(altered_manifest))
+            config_path.write_bytes(pipeline.encoded(config))
+            manifest_path.write_bytes(pipeline.encoded(original))
+
+    def test_subscription_config_cannot_grant_agy_path_on_resume(self):
+        options = self.options(provider="antigravity")
+        mock_cli, reader, runner = self.mock_session()
+        with reader, runner:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(options).run()
+            root = Path(options.output)
+            config_path, manifest_path = root / "profile/config.json", root / "pipeline-manifest.json"
+            forged = {"providers": {"antigravity": {"extra": {"agy_path": str(root / "profile/agy.cmd")}}}}
+            config_path.write_bytes(pipeline.encoded(forged))
+            manifest = pipeline.read_json_file(manifest_path)
+            manifest["config"] = pipeline.file_hash(config_path)
+            manifest_path.write_bytes(pipeline.encoded(manifest))
+            count = len(mock_cli.calls)
+            self.assert_resume_refused_without_child(options)
+            self.assertEqual(len(mock_cli.calls), count)
+
+    def test_resume_manifest_schema_is_closed_typed_and_ordered(self):
+        mock_cli, reader, runner = self.mock_session()
+        with reader, runner:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(self.options()).run()
+            path = self.root / "run/pipeline-manifest.json"
+            original = pipeline.read_json_file(path)
+            def validation_mutation(manifest, count, code=0):
+                manifest["phase"] = "english-ready"
+                manifest["stages"].append(dict(manifest["stages"][-1], stage="validate-english", exit_code=code,
+                                                classified_identical_resources=count))
+            mutations = [
+                ("unknown", lambda m: m.update(untrusted="passthrough")),
+                ("settings-key", lambda m: m["settings"].update(untrusted="passthrough")),
+                ("binary-key", lambda m: m["binary"].update(untrusted="passthrough")),
+                ("source-key", lambda m: m["source"].update(untrusted="passthrough")),
+                ("file-key", lambda m: next(iter(m["source"]["files"].values())).update(untrusted=True)),
+                ("database-key", lambda m: m["databases"]["english.db"].update(untrusted=True)),
+                ("database-count", lambda m: m["databases"]["english.db"].update(rows=True)),
+                ("unknown-database", lambda m: m["databases"].update(foreign=m["databases"]["english.db"])),
+                ("stage-key", lambda m: m["stages"][0].update(untrusted=True)),
+                ("stage-name", lambda m: m["stages"][0].update(stage="untrusted")),
+                ("stage-order", lambda m: m["stages"].reverse()),
+                ("stage-repeat", lambda m: m["stages"].append(m["stages"][0])),
+                ("exit-type", lambda m: m["stages"][0].update(exit_code=True)),
+                ("exit-range", lambda m: m["stages"][0].update(exit_code=2**64)),
+                ("failed-predecessor", lambda m: m["stages"][0].update(exit_code=2)),
+                ("duration-type", lambda m: m["stages"][0].update(seconds=True)),
+                ("duration-negative", lambda m: m["stages"][0].update(seconds=-1)),
+                ("duration-overflow", lambda m: m["stages"][0].update(seconds=10**400)),
+                ("timeout-overflow", lambda m: m["settings"].update(timeout=10**400)),
+                ("stdout-hash", lambda m: m["stages"][0].update(stdout_sha256="not-a-hash")),
+                ("misplaced-count", lambda m: m["stages"][0].update(classified_identical_resources=0)),
+                ("negative-count", lambda m: validation_mutation(m, -1)),
+                ("boolean-count", lambda m: validation_mutation(m, True)),
+                ("excess-count", lambda m: validation_mutation(m, 2)),
+                ("count-code-mismatch", lambda m: validation_mutation(m, 0, 1)),
+                ("settings-bool", lambda m: m["settings"].update(concurrency=True)),
+                ("config-size-bool", lambda m: m["config"].update(size=True)),
+                ("logical-hash", lambda m: m["databases"]["english.db"].update(logical_sha256=[])),
+                ("db-file-key", lambda m: m["databases"]["english.db"]["files"][""].update(untrusted=True)),
+                ("resource-hash", lambda m: m["japanese_inventory"].update({next(iter(m["japanese_inventory"])): False})),
+                ("empty-stages", lambda m: m.update(stages=[])),
+                ("active-command-type", lambda m: m.update(active_command=False)),
+                ("uncertain-type", lambda m: m.update(uncertain_child=0)),
+                ("injection-type", lambda m: m.update(injection_started=0)),
+                ("status", lambda m: m.update(status="arbitrary")),
+                ("completed-status", lambda m: m.update(status="completed")),
+                ("diagnostic-type", lambda m: m.update(diagnostic=[])),
+                ("run-id", lambda m: m.update(run_id=True)),
+                ("missing-field", lambda m: m.pop("stages")),
+                ("phase-history", lambda m: m.update(phase="spanish-ready")),
+                ("premature-proof", lambda m: m.update(rollback_verified=True)),
+            ]
+            count = len(mock_cli.calls)
+            for name, mutate in mutations:
+                with self.subTest(mutation=name):
+                    manifest = copy.deepcopy(original)
+                    mutate(manifest)
+                    path.write_bytes(pipeline.encoded(manifest))
+                    self.assert_resume_refused_without_child(self.options())
+                    self.assertEqual(len(mock_cli.calls), count, "Invalid manifest must launch no child")
+                    self.assertEqual(path.read_bytes(), pipeline.encoded(manifest), "Invalid data must not be republished")
+            path.write_bytes(pipeline.encoded(original))
+
+    def test_ready_checkpoint_resumes_preserve_order_and_never_repeat_pivot(self):
+        parent = self.root
+        for phase, database in (("english-ready", "english.db"), ("spanish-ready", "spanish.db")):
+            with self.subTest(phase=phase):
+                self.root = parent / phase
+                self.root.mkdir()
+                mock_cli, reader, _ = self.mock_session()
+                mock_cli.missing = False
+                validations = 0
+                def intercept(argv, **kwargs):
+                    nonlocal validations
+                    result = mock_cli.run(argv, **kwargs)
+                    if argv[3] == "validate" and Path(argv[4]).name == database:
+                        validations += 1
+                        if validations == 2:
+                            report = {"count": 1, "issues": [{"entry_id": "script.rpy#1", "kind": "Bad", "message": "synthetic"}]}
+                            return subprocess.CompletedProcess(argv, 1, json.dumps(report).encode(), b"")
+                    return result
+                with reader, patch.object(pipeline.subprocess, "run", side_effect=intercept):
+                    with self.assertRaisesRegex(pipeline.PipelineError, "Validation issue cannot release"):
+                        pipeline.Pipeline(self.options()).run()
+                    manifest = pipeline.read_json_file(self.root / "run/pipeline-manifest.json")
+                    self.assertEqual(manifest["phase"], phase)
+                    pipeline.validate_resume_manifest(manifest)
+                    with self.assertRaisesRegex(pipeline.PipelineError, "Child command failed: inject-spanish"):
+                        pipeline.Pipeline(self.options(resume=True)).run()
+                    self.assertTrue(mock_cli.inject_called_after_marker)
+                    self.assertEqual(sum(args[0] == "extract" for args in mock_cli.calls), 1)
+                    self.assertEqual(sum(args[0] == "pivot" for args in mock_cli.calls), 1)
+        self.root = parent
+
+    def test_timeout_is_ambiguous_and_never_resumeable(self):
+        mock_cli, reader, runner = self.mock_session()
+        mock_cli.timeout_stage = "translate"
+        with reader, runner:
+            with self.assertRaisesRegex(pipeline.PipelineError, "descendant cleanup is NOT guaranteed"):
+                pipeline.Pipeline(self.options()).run()
+            manifest = pipeline.read_json_file(self.root / "run/pipeline-manifest.json")
+            self.assertTrue(manifest["uncertain_child"])
+            self.assertIsNotNone(manifest["active_command"])
+            with self.assertRaisesRegex(pipeline.PipelineError, "Resume refused"):
+                pipeline.Pipeline(self.options(resume=True)).run()
+
+
+PUBLICATION_FAILURE = "pipeline-publication-failure.json"
+
+
+class PublicationTests(PipelineCase):
+    def publisher(self, name="run", durable=True):
+        program = pipeline.Pipeline(self.options(output=str(self.root / name)))
+        program.root.mkdir()
+        program.manifest = {"owner": pipeline.OWNER, "version": pipeline.VERSION,
+                            "run_id": "01234567-89ab-4cde-8fab-0123456789ab", "status": "running",
+                            "phase": "english-pending", "injection_started": False,
+                            "active_command": None, "uncertain_child": False, "stages": []}
+        if durable:
+            program.save()
+        program.manifest["active_command"] = "ja-en"
+        return program
+
+    def fingerprint(self, path):
+        info = path.stat()
+        return (info.st_dev, info.st_ino, pipeline.file_hash(path))
+
+    def denied(self):
+        error = PermissionError(errno.EACCES, "synthetic primary private diagnostic")
+        error.winerror = 5
+        return error
+
+    def test_transient_denials_retry_same_next_inode_and_bytes(self):
+        actual_replace = pipeline.os.replace
+        for denials in (1, 2, 3):
+            with self.subTest(denials=denials):
+                program = self.publisher("transient-" + str(denials))
+                target = program.root / "pipeline-manifest.json"
+                before, fingerprints = target.read_bytes(), []
+                def intercept(source, destination):
+                    self.assertEqual(Path(destination), target)
+                    self.assertEqual(target.read_bytes(), before)
+                    fingerprints.append(self.fingerprint(Path(source)))
+                    self.assertEqual(fingerprints[-1], fingerprints[0])
+                    if len(fingerprints) <= denials:
+                        raise self.denied()
+                    return actual_replace(source, destination)
+                with patch.object(pipeline.os, "replace", side_effect=intercept) as moved, patch.object(pipeline.time, "sleep") as slept:
+                    program.save()
+                self.assertEqual(moved.call_count, denials + 1)
+                self.assertEqual([call.args[0] for call in slept.call_args_list], [0.05, 0.1, 0.2][:denials])
+                self.assertEqual(self.fingerprint(target), fingerprints[0])
+                self.assertEqual(target.read_bytes(), pipeline.encoded(program.manifest) + b"\n")
+                self.assertFalse((program.root / "pipeline-manifest.next").exists())
+                self.assertFalse((program.root / PUBLICATION_FAILURE).exists())
+
+    def test_permanent_denial_retains_durable_and_next_and_records_ambiguity(self):
+        program = pipeline.Pipeline(self.options())
+        mock_cli, actual_replace = MockCli(self), pipeline.os.replace
+        denied, blocked, old_bytes, next_fingerprints = self.denied(), 0, None, []
+        def intercept(source, destination):
+            nonlocal blocked, old_bytes
+            pending = pipeline.read_json_file(Path(source))
+            if pending["stages"] and pending["stages"][-1]["stage"] == "extract-japanese":
+                blocked += 1
+                if old_bytes is None:
+                    old_bytes = Path(destination).read_bytes()
+                self.assertEqual(Path(destination).read_bytes(), old_bytes)
+                next_fingerprints.append(self.fingerprint(Path(source)))
+                self.assertEqual(next_fingerprints[-1], next_fingerprints[0])
+                raise denied
+            return actual_replace(source, destination)
+        with patch.object(pipeline, "read_database", side_effect=mock_cli.read), patch.object(pipeline.subprocess, "run", side_effect=mock_cli.run), patch.object(pipeline.os, "replace", side_effect=intercept), patch.object(pipeline.time, "sleep") as slept:
+            with self.assertRaises(pipeline.PipelineError) as failure:
+                program.run()
+            self.assertIn("Manifest publication failed", str(failure.exception))
+            self.assertIs(failure.exception.__cause__, denied)
+            self.assertEqual(blocked, 4)
+            self.assertEqual([call.args[0] for call in slept.call_args_list], [0.05, 0.1, 0.2])
+            self.assertEqual([args[0] for args in mock_cli.calls], ["inject", "extract"], "No next child after unpersisted extraction result")
+        target, next_path = program.root / "pipeline-manifest.json", program.root / "pipeline-manifest.next"
+        self.assertEqual(target.read_bytes(), old_bytes)
+        self.assertEqual(self.fingerprint(next_path), next_fingerprints[0])
+        record_path = program.root / PUBLICATION_FAILURE
+        self.assertLessEqual(record_path.stat().st_size, 4096)
+        record = pipeline.read_json_file(record_path)
+        self.assertEqual(record["owner"], pipeline.OWNER)
+        self.assertEqual(record["run_id"], program.manifest["run_id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertIs(record["resume_safe"], False)
+        self.assertEqual(record["attempts"], 4)
+        self.assertEqual(record["winerror"], 5)
+        self.assertEqual(record["durable_state"]["active_command"], "extract-japanese")
+        self.assertEqual(record["durable_state"]["stage_count"], 1)
+        self.assertEqual(record["attempted_state"]["last_stage"], "extract-japanese")
+        self.assertEqual(record["attempted_state"]["last_exit_code"], 0)
+        self.assertEqual(record["attempted_state"]["stage_count"], 2)
+        self.assertIsNone(record["attempted_state"]["active_command"])
+        self.assertNotIn("private", record_path.read_text())
+        self.assertTrue((program.root / "pipeline.lock").exists(), "Publication ambiguity retains the owned run marker")
+        with patch.object(pipeline.subprocess, "run") as child:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(self.options(resume=True)).run()
+            child.assert_not_called()
+        with patch.object(pipeline.os, "replace") as moved:
+            with self.assertRaises(pipeline.PipelineError) as repeated:
+                program.save()
+            self.assertIs(repeated.exception, failure.exception)
+            moved.assert_not_called()
+
+    def test_nonpermission_replace_failure_is_not_retried(self):
+        program = self.publisher()
+        error = OSError(errno.EIO, "synthetic nonpermission failure")
+        target = program.root / "pipeline-manifest.json"
+        before = target.read_bytes()
+        with patch.object(pipeline.os, "replace", side_effect=error) as moved, patch.object(pipeline.time, "sleep") as slept:
+            with self.assertRaises(pipeline.PipelineError) as failure:
+                program.save()
+            self.assertIs(failure.exception.__cause__, error)
+            self.assertEqual(moved.call_count, 1)
+            slept.assert_not_called()
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(pipeline.read_json_file(program.root / PUBLICATION_FAILURE)["attempts"], 1)
+
+    def test_retry_refuses_changed_or_foreign_source_and_target(self):
+        for member in ("source", "target"):
+            for mutation in ("bytes", "replacement"):
+                with self.subTest(member=member, mutation=mutation):
+                    program = self.publisher(member + "-" + mutation)
+                    denied, preserved, victim = self.denied(), None, None
+                    def intercept(source, target):
+                        nonlocal victim
+                        victim = Path(source if member == "source" else target)
+                        raise denied
+                    def during_delay(_):
+                        nonlocal preserved
+                        if preserved is not None:
+                            return
+                        old = victim.read_bytes()
+                        if mutation == "replacement":
+                            # Retain the original fixture file; never delete it.
+                            victim.rename(program.root / "retained-test-original")
+                            victim.write_bytes(old)  # Same hash, different inode.
+                        else:
+                            victim.write_bytes(b"foreign changed bytes")
+                        preserved = self.fingerprint(victim)
+                    with patch.object(pipeline.os, "replace", side_effect=intercept) as moved, patch.object(pipeline.time, "sleep", side_effect=during_delay), patch.object(pipeline.subprocess, "run") as child:
+                        with self.assertRaises(pipeline.PipelineError) as failure:
+                            program.save()
+                        self.assertIs(failure.exception.__cause__, denied)
+                        self.assertEqual(moved.call_count, 1, "Guard must refuse before a second replace")
+                        child.assert_not_called()
+                    path = program.root / ("pipeline-manifest.next" if member == "source" else "pipeline-manifest.json")
+                    self.assertEqual(self.fingerprint(path), preserved, "Foreign file must not be modified")
+                    record = pipeline.read_json_file(program.root / PUBLICATION_FAILURE)
+                    self.assertEqual(record["reason"], "retry-guard-refused")
+
+    def test_retry_refuses_source_target_reparse_or_multiple_links(self):
+        actual_lstat = Path.lstat
+        class StatView:
+            def __init__(self, info, overrides):
+                self.info, self.overrides = info, overrides
+            def __getattr__(self, key):
+                return self.overrides[key] if key in self.overrides else getattr(self.info, key)
+        for member in ("source", "target"):
+            for mutation in ("reparse", "multiple-links", "special"):
+                with self.subTest(member=member, mutation=mutation):
+                    program = self.publisher(member + "-" + mutation)
+                    armed, victim, fingerprints = False, None, {}
+                    denied = self.denied()
+                    def intercept(source, target):
+                        nonlocal armed, victim
+                        victim = Path(source if member == "source" else target)
+                        for path in (Path(source), Path(target)):
+                            fingerprints[path] = self.fingerprint(path)
+                        armed = True
+                        raise denied
+                    def lstat(path, *args, **kwargs):
+                        info = actual_lstat(path, *args, **kwargs)
+                        if armed and path == victim:
+                            overrides = {"reparse": {"st_file_attributes": 0x400}, "multiple-links": {"st_nlink": 2},
+                                         "special": {"st_mode": 0o010600}}
+                            return StatView(info, overrides[mutation])
+                        return info
+                    with patch.object(pipeline.os, "replace", side_effect=intercept) as moved, patch.object(pipeline.time, "sleep"), patch.object(Path, "lstat", autospec=True, side_effect=lstat):
+                        with self.assertRaises(pipeline.PipelineError) as failure:
+                            program.save()
+                        self.assertIs(failure.exception.__cause__, denied)
+                        self.assertEqual(moved.call_count, 1)
+                    self.assertEqual(pipeline.read_json_file(program.root / PUBLICATION_FAILURE)["reason"], "retry-guard-refused")
+                    for path, fingerprint in fingerprints.items():
+                        self.assertEqual(self.fingerprint(path), fingerprint)
+
+    def test_retry_refuses_changed_root_or_parent_identity_without_foreign_writes(self):
+        actual_identity = pipeline.directory_identity
+        for member in ("root", "parent"):
+            with self.subTest(member=member):
+                program = self.publisher("changed-" + member)
+                target = program.root / "pipeline-manifest.json"
+                before, armed = target.read_bytes(), False
+                denied = self.denied()
+                def intercept(*_):
+                    nonlocal armed
+                    armed = True
+                    raise denied
+                def identity(path):
+                    result = actual_identity(path)
+                    victim = program.root if member == "root" else program.root.parent
+                    return (result[0], result[1] + 1) if armed and path == victim else result
+                with patch.object(pipeline.os, "replace", side_effect=intercept) as moved, patch.object(pipeline.time, "sleep"), patch.object(pipeline, "directory_identity", side_effect=identity):
+                    with self.assertRaises(pipeline.PipelineError) as failure:
+                        program.save()
+                    self.assertIs(failure.exception.__cause__, denied)
+                    self.assertEqual(moved.call_count, 1)
+                self.assertEqual(target.read_bytes(), before)
+                self.assertTrue((program.root / "pipeline-manifest.next").exists())
+                self.assertFalse((program.root / PUBLICATION_FAILURE).exists(), "Do not create a record in a foreign root")
+
+    def test_first_publication_refuses_new_foreign_target_before_retry(self):
+        program = self.publisher(durable=False)
+        target = program.root / "pipeline-manifest.json"
+        denied = self.denied()
+        def intercept(*_):
+            target.write_bytes(b"foreign target appeared")
+            raise denied
+        with patch.object(pipeline.os, "replace", side_effect=intercept) as moved, patch.object(pipeline.time, "sleep"):
+            with self.assertRaises(pipeline.PipelineError) as failure:
+                program.save()
+            self.assertIs(failure.exception.__cause__, denied)
+            self.assertEqual(moved.call_count, 1)
+        self.assertEqual(target.read_bytes(), b"foreign target appeared")
+
+    def test_preoccupied_next_is_never_recreated_or_replaced(self):
+        program = self.publisher()
+        target, next_path = program.root / "pipeline-manifest.json", program.root / "pipeline-manifest.next"
+        before = self.fingerprint(target)
+        next_path.write_bytes(b"foreign next retained")
+        foreign = self.fingerprint(next_path)
+        with patch.object(pipeline.os, "replace") as moved, patch.object(pipeline.time, "sleep") as slept:
+            with self.assertRaises(pipeline.PipelineError):
+                program.save()
+            moved.assert_not_called()
+            slept.assert_not_called()
+        self.assertEqual(self.fingerprint(target), before)
+        self.assertEqual(self.fingerprint(next_path), foreign)
+        record = pipeline.read_json_file(program.root / PUBLICATION_FAILURE)
+        self.assertEqual(record["attempts"], 0)
+        self.assertIsNone(record["expected_next"], "Foreign next is not claimed as operation-owned")
+
+    def test_failure_record_denial_or_occupation_never_masks_original_failure(self):
+        actual_open = Path.open
+        class DeniedWrite:
+            def __init__(self, stream):
+                self.stream = stream
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+            def write(self, _):
+                raise PermissionError(errno.EACCES, "secondary private write denial")
+        for fault in ("denied", "write-denied", "occupied"):
+            with self.subTest(fault=fault):
+                program = self.publisher("record-" + fault)
+                record_path = program.root / PUBLICATION_FAILURE
+                if fault == "occupied":
+                    record_path.write_bytes(b"foreign record retained")
+                denied, record_attempts = self.denied(), []
+                target_before = self.fingerprint(program.root / "pipeline-manifest.json")
+                def opened(path, *args, **kwargs):
+                    if path == record_path:
+                        record_attempts.append(args[0] if args else kwargs.get("mode"))
+                        if fault == "denied":
+                            raise PermissionError(errno.EACCES, "secondary private record denial")
+                        if fault == "write-denied":
+                            return DeniedWrite(actual_open(path, *args, **kwargs))
+                    return actual_open(path, *args, **kwargs)
+                with patch.object(pipeline.os, "replace", side_effect=denied) as moved, patch.object(pipeline.time, "sleep"), patch.object(Path, "open", autospec=True, side_effect=opened):
+                    with self.assertRaises(pipeline.PipelineError) as failure:
+                        program.save()
+                    self.assertIs(failure.exception.__cause__, denied)
+                    self.assertEqual(moved.call_count, 4)
+                    self.assertNotIn("secondary", str(failure.exception))
+                    self.assertEqual(record_attempts, ["xb"], "One exclusive record attempt, no replacement or retry")
+                self.assertEqual(self.fingerprint(program.root / "pipeline-manifest.json"), target_before)
+                self.assertTrue((program.root / "pipeline-manifest.next").exists())
+                if fault == "occupied":
+                    self.assertEqual(record_path.read_bytes(), b"foreign record retained")
+                elif fault == "write-denied":
+                    self.assertEqual(record_path.read_bytes(), b"", "Retain the operation-owned partial record")
+                else:
+                    self.assertFalse(record_path.exists())
+
+    def test_failed_error_reporting_publication_preserves_primary_gate_failure(self):
+        program, mock_cli = pipeline.Pipeline(self.options()), MockCli(self)
+        actual_replace = pipeline.os.replace
+        denied, attempts = self.denied(), 0
+        def intercept(source, target):
+            nonlocal attempts
+            if pipeline.read_json_file(Path(source))["status"] == "failed":
+                attempts += 1
+                raise denied
+            return actual_replace(source, target)
+        with patch.object(pipeline, "read_database", side_effect=mock_cli.read), patch.object(pipeline.subprocess, "run", side_effect=mock_cli.run), patch.object(pipeline.os, "replace", side_effect=intercept), patch.object(pipeline.time, "sleep"):
+            with self.assertRaisesRegex(pipeline.PipelineError, "Missing/blank/pending"):
+                program.run()
+            self.assertEqual(attempts, 4)
+            self.assertEqual([args[0] for args in mock_cli.calls], ["inject", "extract", "translate"])
+        self.assertEqual(pipeline.read_json_file(program.root / PUBLICATION_FAILURE)["status"], "failed")
+
+
+class ScriptedEndpoint:
+    def __init__(self, answers, fault=None):
+        self.answers, self.fault, self.requests, self.errors = answers, fault, [], []
+        endpoint = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def setup(self):
+                super().setup()
+                self.connection.settimeout(2)
+
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                try:
+                    if self.path != "/v1/chat/completions" or self.headers.get("Authorization") != "Bearer " + pipeline.DUMMY_KEY:
+                        raise ValueError("wrong endpoint or key")
+                    length = int(self.headers["Content-Length"])
+                    if not 0 < length <= 1024 * 1024:
+                        raise ValueError("request size")
+                    body = json.loads(self.rfile.read(length))
+                    if body["model"] != pipeline.MODEL:
+                        raise ValueError("wrong model")
+                    system = body["messages"][0]["content"]
+                    match = re.search(r"from (ja|en) to (en|es)\.", system)
+                    if not match or "Preserve all placeholder tokens" not in system:
+                        raise ValueError("wrong language/control prompt")
+                    source, target = match.groups()
+                    records = json.loads(body["messages"][1]["content"])
+                    translated = []
+                    for record in records:
+                        key = (source, target, record["source"])
+                        endpoint.requests.append(key)
+                        answer = endpoint.answers[key]
+                        if endpoint.fault == "missing" and source == "ja" and "{PL_0}" in key[2]:
+                            continue
+                        if endpoint.fault == "placeholder" and target == "es" and "{PL_0}" in answer:
+                            answer = answer.replace("{PL_0}", "{PL_99}")
+                        if endpoint.fault == "kag" and target == "es":
+                            answer = answer.replace('exp="f.player"', 'exp="f.other"')
+                        translated.append(answer)
+                    response = {"choices": [{"message": {"content": json.dumps(translated)}}],
+                                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+                    status = 200
+                except (ValueError, KeyError, TypeError, OSError) as error:
+                    endpoint.errors.append(type(error).__name__)
+                    response, status = {"error": "unscripted fixture request"}, 400
+                payload = json.dumps(response).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.worker = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05})
+        self.worker.start()
+        self.url = "http://127.0.0.1:" + str(self.server.server_port)
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.worker.join(timeout=3)
+        if self.worker.is_alive():
+            raise AssertionError("fixture endpoint failed to stop")
+
+
+def fixture(root, engine, mixed_kirikiri=False):
+    title = ("錬金術師", "Alchemist", "Alquimista")
+    duplicate = ("こんにちは", "Hello", "Hola")
+    next_line = ("進む", "Continue", "Continuar")
+    back = ("戻る", "Return", "Volver")
+    alice = ("Alice", "Alice", "Alice")
+    lines = [title, duplicate, next_line, back, alice]
+    if engine == "renpy":
+        control = ("こんにちは [player] {b}旅人{/b}！", "Hello [player] {b}traveler{/b}!", "Hola [player] {b}viajero{/b}!")
+        masked = ("こんにちは {PL_0} {PL_1}旅人{PL_2}！", "Hello {PL_0} {PL_1}traveler{PL_2}!", "Hola {PL_0} {PL_1}viajero{PL_2}!")
+        script = '\n'.join([f'define e = Character("{title[0]}")', 'define a = Character("Alice")', 'label start:',
+                            '    $ asset = "NON_TEXT_SENTINEL.png"', f'    e "{control[0]}"', f'    e "{duplicate[0]}"',
+                            f'    e "{duplicate[0]}"', '    menu:', f'        "{next_line[0]}":', '            jump next',
+                            f'        "{back[0]}":', '            return', 'label next:', '    return', ''])
+        files = {"game/script.rpy": script.encode()}
+    elif engine == "rpgmaker-mv":
+        control = (r"\n<錬金術師>こんにちは \V[1]！", r"\n<Alchemist>Hello \V[1]!", r"\n<Alquimista>Hola \V[1]!")
+        masked = ("{PL_0}<錬金術師>こんにちは {PL_1}！", "{PL_0}<Alchemist>Hello {PL_1}!", "{PL_0}<Alquimista>Hola {PL_1}!")
+        wrapped = ("森へ\n進む", "Continue towards the forest", "Continuar hacia el bosque")
+        lines.append(wrapped)
+        commands = []
+        for message in (control[0], duplicate[0], duplicate[0], wrapped[0]):
+            commands.append({"code": 101, "indent": 0, "parameters": ["", 0, 0, 2]})
+            for part in message.split("\n"):
+                commands.append({"code": 401, "indent": 0, "parameters": [part]})
+        commands.extend([{"code": 102, "indent": 0, "parameters": [[next_line[0], back[0]], 1, 0, 2, 0]},
+                         {"code": 402, "indent": 0, "parameters": [0, next_line[0]]},
+                         {"code": 121, "indent": 1, "parameters": [7, 7, 0]},
+                         {"code": 402, "indent": 0, "parameters": [1, back[0]]},
+                         {"code": 404, "indent": 0, "parameters": []}, {"code": 0, "indent": 0, "parameters": []}])
+        game_map = {"displayName": "", "note": "NON_TEXT_SENTINEL", "width": 1, "height": 1, "data": [17, 23, 42],
+                    "events": [None, {"id": 1, "name": "NON_TEXT_SENTINEL", "pages": [{"conditions": {"switch1Id": 7},
+                              "image": {"characterName": "NON_TEXT_SENTINEL.png"}, "list": commands}]}]}
+        system = {"gameTitle": title[0], "terms": {"basic": [], "commands": []}, "currencyUnit": "G", "switches": [None, "NON_TEXT_SENTINEL"]}
+        files = {"data/Map001.json": json.dumps(game_map, ensure_ascii=False).encode(),
+                 "data/System.json": json.dumps(system, ensure_ascii=False).encode(),
+                 "data/Actors.json": json.dumps([None, {"id": 1, "name": "Alice", "nickname": "", "profile": ""}]).encode()}
+    else:
+        control = ('こんにちは [emb exp="f.player"][l]', 'Hello [emb exp="f.player"][l]', 'Hola [emb exp="f.player"][l]')
+        masked = ('こんにちは [emb exp="f.player"]{PL_0}', 'Hello [emb exp="f.player"]{PL_0}', 'Hola [emb exp="f.player"]{PL_0}')
+        next_line = tuple("[link target=*next]" + part + "[endlink]" for part in next_line)
+        back = tuple("[link target=*back]" + part + "[endlink]" for part in back)
+        lines[2:4] = [next_line, back]
+        names = ['@name text="Alice"'] if mixed_kirikiri else []
+        if not mixed_kirikiri:
+            lines.remove(alice)
+        script = '\n'.join(['; NON_TEXT_SENTINEL', '*start', f'@name text="{title[0]}"', *names,
+                            control[0], duplicate[0], '[p]', duplicate[0], next_line[0], back[0],
+                            '[iscript]', 'f.asset = "NON_TEXT_SENTINEL.png";', '[endscript]', '*next', '[jump target=*back]', '*back', ''])
+        files = {"scenario/story.ks": script.encode()}
+    answers = {}
+    for line in lines:
+        masks = tuple(part.replace("[endlink]", "{PL_0}") for part in line) if engine == "kirikiri" else line
+        for index, pair in enumerate((("ja", "en"), ("en", "es"))):
+            answers[(*pair, masks[index])] = masks[index + 1]
+    for index, pair in enumerate((("ja", "en"), ("en", "es"))):
+        answers[(*pair, masked[index])] = masked[index + 1]
+    files.update({".locust-not-metadata.bin": b"\x00KEEP\xff\x10", "assets/NON_TEXT_SENTINEL.png": b"\x89PNG\r\nfixture\0"})
+    for path, content in files.items():
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    return answers, files, control
+
+
+class ProductionTransportTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(CLI.is_file(), "Build the checkout CLI in target/debug with cargo build -p locust-cli before these tests")
+        self.temp = tempfile.TemporaryDirectory(prefix="pipeline-transport-", dir=SCRATCH)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+
+    def scenario(self, engine, fault=None, mixed_kirikiri=False):
+        source = self.root / "source"
+        answers, files, control = fixture(source, engine, mixed_kirikiri)
+        server = ScriptedEndpoint(answers, fault)
+        self.addCleanup(server.close)
+        options = pipeline.Options(str(CLI), str(source), str(self.root / "run"), engine, "google",
+                                   test_endpoint=server.url, batch_size=1, concurrency=2, timeout=60)
+        return options, server, files, control
+
+    def positive(self, engine):
+        options, server, files, _ = self.scenario(engine)
+        original = pipeline.scan(Path(options.game), source=True)
+        actual_run, outputs = subprocess.run, []
+        def record(argv, **kwargs):
+            result = actual_run(argv, **kwargs)
+            outputs.append(result)
+            return result
+        try:
+            with patch.object(pipeline.subprocess, "run", side_effect=record):
+                summary = pipeline.Pipeline(options).run()
+        except pipeline.PipelineError as error:
+            self.fail(str(error) + ": " + ((outputs[-1].stderr + outputs[-1].stdout).decode("utf-8", errors="replace") if outputs else "no child"))
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(pipeline.scan(Path(options.game)), original)
+        manifest = pipeline.read_json_file(Path(options.output) / "pipeline-manifest.json")
+        self.assertTrue(manifest["rollback_verified"])
+        self.assertEqual(manifest["final_install"]["verification"], "strict")
+        self.assertEqual(manifest["final_install"]["baseline"], "pristine")
+        self.assertEqual(summary["translated_copy"], str(Path(options.output) / "install-game"))
+        self.assertEqual(pipeline.file_hash(Path(summary["patch"]))["sha256"], summary["patch_sha256"])
+        spanish, _ = pipeline.read_database(Path(options.output) / "spanish.db")
+        english, _ = pipeline.read_database(Path(options.output) / "english.db")
+        by_id = {value["id"]: value for value in english}
+        self.assertEqual(len(spanish), {"renpy": 7, "rpgmaker-mv": 8, "kirikiri": 6}[engine])
+        self.assertEqual(summary["resources_verified"], len(spanish))
+        for value in spanish:
+            self.assertEqual(value["source"], by_id[value["id"]]["translation"])
+            self.assertEqual(value["metadata"]["locust_injection_source"], by_id[value["id"]]["source"])
+            self.assertEqual(value["provider_used"], pipeline.PROVIDER)
+        self.assertTrue(any(value["translation"] == "Alquimista" for value in spanish))
+        self.assertEqual(sum(value["translation"] == "Hola" for value in spanish), 2)
+        self.assertEqual(manifest["injection"]["skip_reasons"], {} if engine == "kirikiri" else {"unchanged": 1})
+        self.assertTrue(manifest["injection"]["retained_originals_verified"])
+        self.assertTrue(manifest["injection"]["informational_notice_verified"])
+        self.assertEqual(manifest["final_equivalence"]["resources_verified"], len(spanish))
+        self.assertEqual(len([stage for stage in manifest["stages"] if stage["stage"] == "final-reapply"]), 1)
+        self.assertEqual(Path(summary["translated_copy"]).joinpath(".locust-not-metadata.bin").read_bytes(), files[".locust-not-metadata.bin"])
+        self.assertEqual(server.errors, [])
+        self.assertEqual(set(server.requests), set(server.answers))
+        boundary = next(index for index, key in enumerate(server.requests) if key[0] == "en")
+        self.assertTrue(all(key[0] == "ja" for key in server.requests[:boundary]))
+        self.assertTrue(all(key[0] == "en" for key in server.requests[boundary:]))
+        report_text = Path(options.output, "pipeline-manifest.json").read_text()
+        self.assertNotIn(pipeline.DUMMY_KEY, report_text)
+        self.assertNotIn("こんにちは", report_text)
+        self.assertFalse(summary["runtime_verified"])
+
+    def test_renpy_final_install_is_spanish(self):
+        self.positive("renpy")
+
+    def test_mv_wrapping_offsets_and_final_install(self):
+        self.positive("rpgmaker-mv")
+
+    def test_loose_kirikiri_controls_and_final_install(self):
+        self.positive("kirikiri")
+
+    def negative(self, engine, fault):
+        options, server, _, _ = self.scenario(engine, fault)
+        before = pipeline.scan(Path(options.game))
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.Pipeline(options).run()
+        manifest = pipeline.read_json_file(Path(options.output) / "pipeline-manifest.json")
+        self.assertEqual(manifest["status"], "failed")
+        self.assertFalse(manifest["injection_started"])
+        self.assertFalse(Path(options.output, "spanish-patch.zip").exists())
+        for name in ("work-game", "install-game", "pristine"):
+            self.assertEqual(pipeline.scan(Path(options.output) / name), before)
+        self.assertEqual(pipeline.scan(Path(options.game)), before)
+        self.assertEqual(server.errors, [])
+        self.assertTrue(server.requests, "Negative must reach scripted translation, not fail extraction")
+        if fault == "missing":
+            self.assertFalse(Path(options.output, "spanish.db").exists())
+        return options, server
+
+    def test_missing_answer_refuses_release_and_pending_resume_retries(self):
+        options, server = self.negative("renpy", "missing")
+        server.fault = None
+        count = len(server.requests)
+        summary = pipeline.Pipeline(replace(options, resume=True)).run()
+        self.assertEqual(summary["status"], "completed")
+        retries = [key for key in server.requests[count:] if key[0] == "ja"]
+        self.assertTrue(retries)
+        self.assertTrue(all("{PL_0}" in key[2] for key in retries))
+
+    def test_corrupt_spanish_placeholder_refuses_release(self):
+        self.negative("rpgmaker-mv", "placeholder")
+
+    def test_altered_raw_kag_argument_refuses_release(self):
+        self.negative("kirikiri", "kag")
+
+    def test_mixed_kirikiri_unchanged_row_omission_rejects(self):
+        options, _, _, _ = self.scenario("kirikiri", mixed_kirikiri=True)
+        original = pipeline.scan(Path(options.game))
+        with self.assertRaisesRegex(pipeline.PipelineError, "Injection inventory count mismatch"):
+            pipeline.Pipeline(options).run()
+        manifest = pipeline.read_json_file(Path(options.output) / "pipeline-manifest.json")
+        self.assertEqual(manifest["status"], "failed")
+        self.assertTrue(manifest["injection_started"])
+        self.assertFalse(Path(options.output, "spanish-patch.zip").exists())
+        self.assertEqual(pipeline.scan(Path(options.game)), original)
+        with self.assertRaisesRegex(pipeline.PipelineError, "Resume refused"):
+            pipeline.Pipeline(replace(options, resume=True)).run()
+
+    def test_informational_notice_does_not_hide_warnings_or_bad_provenance(self):
+        cases = ("warning", "altered-notice", "phase", "retained-original", "whole-backup", "foreign-backup", "nested-count", "outcome-count")
+        real_run = subprocess.run
+        for fault in cases:
+            with self.subTest(fault=fault):
+                case_root = self.root / fault
+                case_root.mkdir()
+                answers, _, _ = fixture(case_root / "source", "renpy")
+                server = ScriptedEndpoint(answers)
+                options = pipeline.Options(str(CLI), str(case_root / "source"), str(case_root / "run"), "renpy", "google",
+                                           test_endpoint=server.url, batch_size=1, concurrency=1, timeout=60)
+                original = pipeline.scan(Path(options.game))
+                altered = False
+
+                def intercept(argv, **kwargs):
+                    nonlocal altered
+                    result = real_run(argv, **kwargs)
+                    if argv[3] != "inject" or "--help" in argv:
+                        return result
+                    self.assertEqual(result.returncode, 0)
+                    altered = True
+                    report = json.loads(result.stdout)
+                    root = Path(options.output)
+                    active = pipeline.read_json_file(root / "work-game/.locust-injections/active.json")
+                    operation = root / "work-game/.locust-injections/operations" / active["transaction_id"]
+                    if fault == "warning":
+                        report["warnings"].append("partial insertion synthetic warning")
+                        report["reports"]["es"]["warnings"] = report["warnings"]
+                    elif fault == "altered-notice":
+                        report["warnings"][0] += " unverified suffix"
+                        report["reports"]["es"]["warnings"] = report["warnings"]
+                    elif fault == "phase":
+                        (operation / "phase.json").write_text('"committed_unrecorded"')
+                    elif fault == "retained-original":
+                        (operation / "originals/0").write_bytes(b"corrupted retained original")
+                    elif fault == "whole-backup":
+                        (root / "backups" / report["backup_id"] / "payload/game/script.rpy").write_bytes(b"corrupted full backup")
+                    elif fault == "foreign-backup":
+                        report["backup_path"] = options.game
+                    elif fault == "nested-count":
+                        report["reports"]["es"]["files_modified"] = True
+                    else:
+                        report["outcomes"][0][1]["Recorded"]["files"] = True
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(report).encode(), result.stderr)
+
+                try:
+                    with patch.object(pipeline.subprocess, "run", side_effect=intercept):
+                        with self.assertRaises(pipeline.PipelineError):
+                            pipeline.Pipeline(options).run()
+                    self.assertTrue(altered)
+                    manifest = pipeline.read_json_file(Path(options.output) / "pipeline-manifest.json")
+                    self.assertEqual(manifest["status"], "failed")
+                    self.assertNotIn("translated_copy", manifest)
+                    self.assertFalse(Path(options.output, "spanish-patch.zip").exists())
+                    self.assertEqual(pipeline.scan(Path(options.game)), original)
+                    self.assertEqual(server.errors, [])
+                finally:
+                    server.close()
+
+    def test_spanish_pending_resume_preserves_pivot_and_does_not_reextract(self):
+        options, server = self.negative("rpgmaker-mv", "placeholder")
+        english = pipeline.file_hash(Path(options.output) / "english.db")
+        pivot_rows, _ = pipeline.read_database(Path(options.output) / "spanish.db")
+        signature = pipeline.inventory(pivot_rows, Path(options.output) / "work-game", options.format)
+        server.fault = None
+        previous_requests = len(server.requests)
+        summary = pipeline.Pipeline(replace(options, resume=True)).run()
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(pipeline.file_hash(Path(options.output) / "english.db"), english)
+        current, _ = pipeline.read_database(Path(options.output) / "spanish.db")
+        self.assertEqual(pipeline.inventory(current, Path(options.output) / "work-game", options.format), signature)
+        self.assertTrue(all(key[0] == "en" for key in server.requests[previous_requests:]))
+        manifest = pipeline.read_json_file(Path(options.output) / "pipeline-manifest.json")
+        self.assertEqual(sum(stage["stage"] == "extract-japanese" for stage in manifest["stages"]), 1)
+        self.assertEqual(sum(stage["stage"] == "strict-pivot" for stage in manifest["stages"]), 1)
+
+    def test_bad_receipt_final_bytes_or_final_resource_cannot_complete(self):
+        real_run, real_reader = subprocess.run, pipeline.read_database
+        for fault in ("legacy-receipt", "final-bytes", "final-resource"):
+            with self.subTest(fault=fault):
+                case_root = self.root / fault
+                case_root.mkdir()
+                answers, _, _ = fixture(case_root / "source", "renpy")
+                server = ScriptedEndpoint(answers)
+                options = pipeline.Options(str(CLI), str(case_root / "source"), str(case_root / "run"), "renpy", "google",
+                                           test_endpoint=server.url, batch_size=2, concurrency=1, timeout=60)
+                original = pipeline.scan(Path(options.game))
+                applies = 0
+                altered = False
+
+                def intercept(argv, **kwargs):
+                    nonlocal applies, altered
+                    result = real_run(argv, **kwargs)
+                    if argv[3] != "apply":
+                        return result
+                    applies += 1
+                    install = Path(options.output) / "install-game"
+                    if fault == "legacy-receipt" and applies == 2:
+                        receipt = pipeline.read_json_file(install / ".locust/receipt.json")
+                        receipt["verification"] = "legacy"
+                        (install / ".locust/receipt.json").write_text(json.dumps(receipt))
+                        altered = True
+                    if fault == "final-bytes" and applies == 3:
+                        (install / "game/script.rpy").write_bytes(b"synthetic final byte drift")
+                        altered = True
+                    return result
+
+                def read(path):
+                    nonlocal altered
+                    rows, metadata = real_reader(path)
+                    if fault == "final-resource" and Path(path).name == "final-install-proof.db":
+                        rows[0]["source"] = "synthetic wrong resource"
+                        altered = True
+                    return rows, metadata
+
+                try:
+                    with patch.object(pipeline.subprocess, "run", side_effect=intercept), patch.object(pipeline, "read_database", side_effect=read):
+                        with self.assertRaises(pipeline.PipelineError) as failure:
+                            pipeline.Pipeline(options).run()
+                    self.assertTrue(altered, str(failure.exception) + " endpoint errors=" + repr(server.errors))
+                    manifest = pipeline.read_json_file(Path(options.output) / "pipeline-manifest.json")
+                    self.assertEqual(manifest["status"], "failed")
+                    self.assertNotIn("translated_copy", manifest)
+                    self.assertEqual(pipeline.scan(Path(options.game)), original)
+                    self.assertEqual(server.errors, [])
+                finally:
+                    server.close()
+
+    def test_failed_final_reapply_never_complete_or_resumeable(self):
+        options, _, _, _ = self.scenario("renpy")
+        real_run = subprocess.run
+        applies = 0
+
+        def intercept(argv, **kwargs):
+            nonlocal applies
+            if argv[3] == "apply":
+                applies += 1
+                if applies == 3:
+                    return subprocess.CompletedProcess(argv, 1, b"", b"synthetic final failure")
+            return real_run(argv, **kwargs)
+
+        with patch.object(pipeline.subprocess, "run", side_effect=intercept):
+            with self.assertRaisesRegex(pipeline.PipelineError, "final-reapply"):
+                pipeline.Pipeline(options).run()
+        manifest = pipeline.read_json_file(Path(options.output) / "pipeline-manifest.json")
+        self.assertEqual(manifest["status"], "failed")
+        self.assertTrue(manifest["rollback_verified"])
+        self.assertNotIn("translated_copy", manifest)
+        self.assertEqual(pipeline.scan(Path(options.output) / "install-game"), manifest["source"])
+        with self.assertRaisesRegex(pipeline.PipelineError, "Resume refused"):
+            pipeline.Pipeline(replace(options, resume=True)).run()
+
+
+if __name__ == "__main__":
+    unittest.main()

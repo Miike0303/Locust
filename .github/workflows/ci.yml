@@ -20,6 +20,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       # `apps/desktop/src-tauri` is a workspace member, so `cargo test --workspace`
       # links against webkit2gtk. Same dependency list the release build uses.
       - name: Install system dependencies
@@ -45,6 +50,23 @@ jobs:
       - name: Install frontend deps
         working-directory: apps/desktop
         run: npm ci
+
+      # The Python integration tests require this normal-target production CLI;
+      # missing target/debug/locust is a failure, never a skipped gate.
+      - name: Build CLI for Python tests
+        env:
+          CARGO_TARGET_DIR: target
+        run: cargo build -p locust-cli
+
+      - name: Python pipeline tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m unittest discover -s tools -p test_ja_en_es_pipeline.py
+
+      - name: Python replay-oracle tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python tools/test_qa_replay_oracle.py
 
       # tauri-build reads tauri.conf.json > frontendDist (apps/desktop/dist),
       # so the frontend must be built before any cargo command touches the
@@ -72,6 +94,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -90,6 +117,22 @@ jobs:
       - name: Install frontend deps
         working-directory: apps/desktop
         run: npm ci
+
+      # Build in target/debug, not an alternate verification target directory.
+      - name: Build CLI for Python tests
+        env:
+          CARGO_TARGET_DIR: target
+        run: cargo build -p locust-cli
+
+      - name: Python pipeline tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m unittest discover -s tools -p test_ja_en_es_pipeline.py
+
+      - name: Python replay-oracle tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python tools/test_qa_replay_oracle.py
 
       # tauri-build requires apps/desktop/dist before workspace Rust checks.
       - name: Build frontend
