@@ -146,6 +146,26 @@ locust patch-rollback "<clean_copy>"   # restores .locust/backup
 
 After a new Direct injection, `patch` can omit `--pristine`: it retrieves the exact recorded backup and verifies its original hashes, including after restart or switching between CLI and desktop profiles. Repeating an injection that writes nothing keeps the previous association. A missing or modified recorded backup stops packaging; supply an intact `--pristine` copy to recover. Older records without backup provenance retain the legacy fallback behavior. The backup belongs to that injection generation, which may start from an already translated working copy.
 
+### Complete Japanese → English → Spanish pivot
+
+After translating a Japanese project into English, gate the next stage on every
+extracted row rather than silently pivoting only the finished subset:
+
+```bash
+locust pivot game-en.locust.db -o game-es.locust.db --require-complete
+locust translate game-es.locust.db -p google -s en -t es
+```
+
+`--require-complete` refuses an empty project or any row with a missing/blank
+translation (including Unicode whitespace), a status other than translated,
+reviewed or approved, a stale source, or damaged protected controls. Refusal
+creates no output database or sidecars and leaves source rows and existing output
+files unchanged. A successful pivot carries every row into the new project's
+source text while retaining the original injection baseline. This gate checks
+recorded completeness and controls, not linguistic quality or game runtime behavior.
+Without the flag, `pivot` retains its partial-editing workflow and skips missing or
+blank translations. Existing output files are never overwritten in either mode.
+
 Got suspicious strings? Open the Editor, filter by tag (`dialogue`, `ui_label`, `menu`, etc.), and edit or approve translations manually before injecting.
 
 If a Direct/Add insertion is interrupted, run `locust inject-status "<work_copy>"` and `locust inject-recover "<work_copy>"` before modifying that game again. Recovery uses verified originals and preserves conflicting edits when explicitly forced. See [insertion recovery](docs/INJECTION-RECOVERY.md) for commands, backup behavior, disk costs, and limits.

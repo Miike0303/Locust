@@ -216,6 +216,10 @@ enum Commands {
         source: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
+        /// Require every row to have a nonblank, current, control-preserving
+        /// translation with translated/reviewed/approved status (no partial pivot)
+        #[arg(long)]
+        require_complete: bool,
     },
     /// Package translated files into a distributable patch zip (patch-only:
     /// just the translated game files, not the whole game)
@@ -535,7 +539,11 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_replace(project, find, replace, case_sensitive, dry_run).await?,
         Commands::Stats { project, by_file } => cmd_stats(project, by_file)?,
         Commands::BackupProject { project, output } => cmd_backup_project(project, output)?,
-        Commands::Pivot { source, output } => cmd_pivot(source, output)?,
+        Commands::Pivot {
+            source,
+            output,
+            require_complete,
+        } => cmd_pivot(source, output, require_complete)?,
         Commands::Patch {
             game_path,
             project,
@@ -1287,10 +1295,14 @@ fn verify_patch_receipt_files(
     Ok(())
 }
 
-fn cmd_pivot(source: PathBuf, output: PathBuf) -> anyhow::Result<()> {
-    // Shared with HTTP `POST /api/pivot` and the Tauri `run_pivot` command.
+fn cmd_pivot(source: PathBuf, output: PathBuf, require_complete: bool) -> anyhow::Result<()> {
     let src_db = open_existing_project(&source)?;
-    let result = src_db.pivot_to(&output)?;
+    let result = if require_complete {
+        src_db.pivot_to_complete(&output)?
+    } else {
+        // Legacy partial workflow, also used by HTTP and Tauri pivots.
+        src_db.pivot_to(&output)?
+    };
 
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
@@ -3019,7 +3031,7 @@ mod tests {
         drop(src);
 
         let out = dir.join("out.locust.db");
-        cmd_pivot(src_path.clone(), out.clone()).unwrap();
+        cmd_pivot(src_path.clone(), out.clone(), false).unwrap();
         let new_db = Database::open(&out).unwrap();
         let pivoted = new_db.get_entries(&EntryFilter::default()).unwrap();
         assert_eq!(pivoted.len(), 1);
@@ -3029,7 +3041,7 @@ mod tests {
         let src = Database::open(&src_path).unwrap();
         assert_eq!(src.get_entries(&EntryFilter::default()).unwrap().len(), 2);
 
-        let err = cmd_pivot(src_path, out.clone()).expect_err("must refuse overwrite");
+        let err = cmd_pivot(src_path, out.clone(), false).expect_err("must refuse overwrite");
         assert!(
             err.to_string().to_lowercase().contains("exist")
                 || err.to_string().to_lowercase().contains("overwrite"),

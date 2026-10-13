@@ -1164,7 +1164,21 @@ impl Database {
 
     /// Write a new project DB at `output` whose SOURCE text is this project's
     /// non-empty translations. Does not modify `self`. Refuses to overwrite.
+    /// This legacy partial workflow skips missing/blank translations and does
+    /// not require a ready status. Use [`Self::pivot_to_complete`] for a full gate.
     pub fn pivot_to(&self, output: &Path) -> Result<PivotResult> {
+        self.pivot_to_impl(output, false)
+    }
+
+    /// Pivot every row from one consistent snapshot, or refuse before creating
+    /// the output DB. Each translation must be nonblank (Unicode whitespace),
+    /// Translated/Reviewed/Approved, current, and preserve protected controls.
+    /// Empty projects and existing outputs are refused; source rows are unchanged.
+    pub fn pivot_to_complete(&self, output: &Path) -> Result<PivotResult> {
+        self.pivot_to_impl(output, true)
+    }
+
+    fn pivot_to_impl(&self, output: &Path, require_complete: bool) -> Result<PivotResult> {
         if output.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -1173,9 +1187,32 @@ impl Database {
             .into());
         }
 
-        let entries = self.entries_with_nonempty_translation()?;
+        let entries = if require_complete {
+            // One unfiltered SELECT materializes the entire row snapshot. Check
+            // and pivot this same inventory, never count then reload/filter it.
+            self.get_entries(&EntryFilter::default())?
+        } else {
+            self.entries_with_nonempty_translation()?
+        };
         let mut pivoted: Vec<StringEntry> = Vec::with_capacity(entries.len());
         for e in entries {
+            if require_complete {
+                if e.translation.as_deref().is_none_or(|t| t.trim().is_empty()) {
+                    return Err(LocustError::Other(anyhow::anyhow!(
+                        "incomplete pivot: entry '{}' has a missing or blank translation",
+                        e.id
+                    )));
+                }
+                if !matches!(
+                    e.status,
+                    StringStatus::Translated | StringStatus::Reviewed | StringStatus::Approved
+                ) {
+                    return Err(LocustError::Other(anyhow::anyhow!(
+                        "incomplete pivot: entry '{}' is not ready (status: {}); expected translated, reviewed, or approved",
+                        e.id, e.status
+                    )));
+                }
+            }
             e.require_current_translation()
                 .map_err(|message| LocustError::Other(anyhow::anyhow!(message)))?;
             e.require_preserved_translation_controls()
@@ -6444,6 +6481,181 @@ mod tests {
         let world = original.iter().find(|e| e.id == "b").unwrap();
         assert_eq!(world.source, "World");
         assert!(world.translation.is_none());
+    }
+
+    fn assert_complete_pivot_refused(entries: &[StringEntry], reason: &str) {
+        let src = Database::open_in_memory().unwrap();
+        src.save_entries(entries).unwrap();
+        let before =
+            serde_json::to_value(src.get_entries(&EntryFilter::default()).unwrap()).unwrap();
+        let dir = recording_tempdir();
+        let error = src
+            .pivot_to_complete(&dir.path().join("complete.db"))
+            .expect_err(reason);
+        assert!(error.to_string().contains(reason), "{error}");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no DB or sidecars on refusal"
+        );
+        let after =
+            serde_json::to_value(src.get_entries(&EntryFilter::default()).unwrap()).unwrap();
+        assert_eq!(after, before, "refusal must not change source rows");
+    }
+
+    #[test]
+    fn pivot_complete_refuses_missing_or_empty_translation_in_two_row_inventory() {
+        for translation in [None, Some("")] {
+            let done = translated_entry("a", "日本語", "script.rpy", "English");
+            let mut missing = translated_entry("z", "別の行", "script.rpy", "unused");
+            missing.translation = translation.map(str::to_owned);
+            assert_complete_pivot_refused(&[done, missing], "missing or blank translation");
+        }
+    }
+
+    #[test]
+    fn pivot_complete_refuses_unicode_whitespace_translation() {
+        for translation in ["   ", "\t\n", "\u{a0}\u{2003}\u{3000}"] {
+            assert_complete_pivot_refused(
+                &[
+                    translated_entry("a", "日本語", "script.rpy", "English"),
+                    translated_entry("z", "別の行", "script.rpy", translation),
+                ],
+                "missing or blank translation",
+            );
+        }
+    }
+
+    #[test]
+    fn pivot_complete_refuses_not_ready_nonempty_retained_translation() {
+        for status in [StringStatus::Pending, StringStatus::Error] {
+            let mut retained = translated_entry("z", "別の行", "script.rpy", "Retained English");
+            retained.status = status;
+            assert_complete_pivot_refused(
+                &[
+                    translated_entry("a", "日本語", "script.rpy", "English"),
+                    retained,
+                ],
+                "not ready",
+            );
+        }
+    }
+
+    #[test]
+    fn pivot_complete_uses_one_snapshot_and_preserves_every_ready_row() {
+        let src = Database::open_in_memory().unwrap();
+        let mut name = translated_entry(
+            "a",
+            r"\n<錬金術師>こんにちは",
+            "data/Map001.json",
+            r"\n<Alchemist>Hello",
+        );
+        name.context = Some("speaker".into());
+        name.tags = vec!["dialogue".into()];
+        name.metadata
+            .insert("format_id".into(), serde_json::json!("rpgmaker-mv"));
+        let mut reviewed = translated_entry("b", "こんにちは [name]", "script.rpy", "Hello [name]");
+        reviewed.status = StringStatus::Reviewed;
+        let mut approved = translated_entry("c", "開始", "script.rpy", "Start");
+        approved.status = StringStatus::Approved;
+        src.save_entries(&[approved, name, reviewed]).unwrap();
+        src.set_project_metadata("source_lang", &serde_json::json!("ja"))
+            .unwrap();
+        let before =
+            serde_json::to_value(src.get_entries(&EntryFilter::default()).unwrap()).unwrap();
+        let dir = recording_tempdir();
+        let output = dir.path().join("complete.db");
+        STRINGS_QUERIES.with(|count| count.set(Some(0)));
+        let result = src.pivot_to_complete(&output);
+        let queries = STRINGS_QUERIES.with(|count| count.replace(None));
+        assert_eq!(result.unwrap().entries, 3);
+        assert_eq!(
+            queries,
+            Some(1),
+            "validate and pivot one row snapshot, not count then reload"
+        );
+        let pivot = Database::open(&output).unwrap();
+        let rows = pivot.get_entries(&EntryFilter::default()).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        for row in &rows {
+            let original = src.get_entry(&row.id).unwrap().unwrap();
+            assert_eq!(Some(row.source.as_str()), original.translation.as_deref());
+            assert_eq!(row.injection_source().unwrap(), original.source);
+            assert_eq!(row.status, StringStatus::Pending);
+            assert!(row.translation.is_none());
+            assert_eq!(row.context, original.context);
+            assert_eq!(row.tags, original.tags);
+        }
+        assert_eq!(rows[0].source, r"\n<Alchemist>Hello");
+        let (provider_text, _) = crate::placeholder::PlaceholderProcessor::extract_with_profile(
+            &rows[0].source,
+            rows[0].placeholder_profile(),
+        );
+        assert!(
+            provider_text.contains("<Alchemist>"),
+            "speaker title must remain translatable"
+        );
+        assert_eq!(
+            pivot.get_project_metadata("source_lang").unwrap(),
+            Some(serde_json::json!("ja"))
+        );
+        assert_eq!(
+            serde_json::to_value(src.get_entries(&EntryFilter::default()).unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn pivot_complete_keeps_control_and_stale_preflight_before_output_creation() {
+        let missing_control = translated_entry("z", "日本語 [name]", "script.rpy", "English");
+        let mut physical_control = translated_entry("z", "English", "script.rpy", "Spanish");
+        physical_control.metadata.insert(
+            INJECTION_SOURCE_METADATA_KEY.into(),
+            serde_json::json!("日本語 [name]"),
+        );
+        let mut stale = translated_entry("z", "新しい原文", "script.rpy", "Old English");
+        stale.metadata.insert(
+            STALE_TRANSLATION_METADATA_KEY.into(),
+            serde_json::json!({
+                "version": 1,
+                "translated_source_sha256": "0".repeat(64),
+                "current_source_sha256": stale.source_hash(),
+            }),
+        );
+        for (invalid, reason) in [
+            (missing_control, "changed protected controls"),
+            (physical_control, "changed protected controls"),
+            (stale, "stale translation"),
+        ] {
+            assert_complete_pivot_refused(
+                &[
+                    translated_entry("a", "日本語", "script.rpy", "English"),
+                    invalid,
+                ],
+                reason,
+            );
+        }
+    }
+
+    #[test]
+    fn pivot_complete_refuses_empty_database_and_preserves_existing_output() {
+        assert_complete_pivot_refused(&[], "no translated entries");
+        let src = Database::open_in_memory().unwrap();
+        src.save_entries(&[translated_entry("a", "日本語", "script.rpy", "English")])
+            .unwrap();
+        let dir = recording_tempdir();
+        let output = dir.path().join("existing.db");
+        std::fs::write(&output, b"existing output").unwrap();
+        let error = src.pivot_to_complete(&output).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing output");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]
