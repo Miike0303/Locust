@@ -21,7 +21,7 @@ registerHooks({
         "react-router-dom": `export const useNavigate=()=>()=>{};`,
         "../lib/i18n": `export const useT=()=>globalThis.__queueExecution.t; export const useLocale=()=>({locale:'en'});`,
         "../stores/editorStore": `export const useEditorStore=Object.assign(()=>globalThis.__queueExecution.editor.getState(),globalThis.__queueExecution.editor);`,
-        "../lib/modalA11y": `export const useModalA11y=()=>({}); export const MODAL_BACKDROP_CLASS=''; export const modalPanelClass=x=>x;`,
+        "../lib/modalA11y": `export const useModalA11y=()=>({}); export const MODAL_BACKDROP_CLASS='', MODAL_BODY_CLASS=''; export const modalPanelClass=x=>x;`,
       };
       if (stubs[specifier]) return { url: `data:text/javascript,${encodeURIComponent(stubs[specifier])}`, shortCircuit: true };
     }

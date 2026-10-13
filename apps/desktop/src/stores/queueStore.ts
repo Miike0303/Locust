@@ -1,7 +1,9 @@
 import { create } from "zustand";
 import { startTranslation, cancelTranslation, validate, type TranslationStartParams } from "../lib/api";
-import { completeOpenProject } from "../lib/openProjectFlow";
-import { queryClient } from "../lib/queryClient";
+import { completeOpenProject, projectFromOpenResponse } from "../lib/openProjectFlow";
+import { queryClient, refreshTranslationQueries } from "../lib/queryClient";
+import { draftProjectKey } from "../lib/projectScope";
+import type { ProjectInfo } from "../lib/api";
 import { waitForJob } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
 import { useEditorStore } from "./editorStore";
@@ -135,6 +137,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     activeJobId = null;
     const pending = items.filter((i) => i.status === "pending");
     const partialItemIds = new Set<string>();
+    const translatedProjects = new Map<string, ProjectInfo>();
     addLog("info", t("activity.queue.started", { count: pending.length }), undefined, "queue");
 
     for (let idx = 0; idx < pending.length; idx++) {
@@ -206,6 +209,8 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
         const job = await startTranslation(translationParams);
         activeJobId = job.job_id;
+        const translationProject = projectFromOpenResponse(result);
+        translatedProjects.set(draftProjectKey(translationProject), translationProject);
         let failedBatches = 0;
         let lastBatchReason = "";
         let translated = 0;
@@ -239,6 +244,9 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           });
         } finally {
           activeJobId = null;
+          // Failed/cancelled jobs can have saved some rows. Await active refetches
+          // before opening the next item: the backend API serves the live project.
+          await refreshTranslationQueries(translationProject);
         }
 
         if (get().cancelRequested) {
@@ -312,6 +320,11 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       }
     }
 
+    const currentProject = useProjectStore.getState().project;
+    for (const project of translatedProjects.values()) {
+      const stillOpen = currentProject && draftProjectKey(currentProject) === draftProjectKey(project);
+      await refreshTranslationQueries(project, queryClient, stillOpen ? "active" : "none");
+    }
     set({ isRunning: false, globalProgress: null });
     if (get().cancelRequested) {
       addLog("info", t("activity.queue.cancelled"), undefined, "queue");

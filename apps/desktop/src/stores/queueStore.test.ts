@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { beforeEach, test } from "node:test";
+import { after, beforeEach, test } from "node:test";
+import { QueryObserver } from "@tanstack/react-query";
+import { queryClient } from "../lib/queryClient.ts";
+import { draftProjectKey } from "./draftStore.ts";
 import { registerHooks } from "node:module";
 import {
   getProjectOpenChoice, resolveProjectOpenChoice,
@@ -10,7 +13,7 @@ import type { ProjectOpenPreflight, TranslationStartParams } from "../lib/api.ts
 const h = {
   calls: [] as string[], toasts: [] as unknown[][],
   logs: [] as unknown[][], jobError: null as string | null,
-  batchErrors: [] as string[], translated: 1, progressTotal: 100, onJob: () => {},
+  batchErrors: [] as string[], translated: 1, progressTotal: 100, onJob: () => {}, onValidate: () => {},
   preflight: { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" } as ProjectOpenPreflight,
 };
 (globalThis as any).__resumeQueue = h;
@@ -25,7 +28,7 @@ registerHooks({
         export async function startTranslation(){h.calls.push('translate');return {job_id:'job'};}
         export async function cancelTranslation(){h.calls.push('cancelTranslation');}
         export async function getWsUrl(){return 'ws://fixture/translation';}
-        export async function validate(){h.calls.push('validate');return {validation:{issues_found:0}};}`,
+        export async function validate(){h.calls.push('validate');h.onValidate();return {validation:{issues_found:0}};}`,
       "/src/stores/logStore.ts": `export function addLog(...args){globalThis.__resumeQueue.logs.push(args);}`,
       "/src/stores/toastStore.ts": `export function addToast(...args){globalThis.__resumeQueue.toasts.push(args);}`,
     };
@@ -65,16 +68,100 @@ const params: TranslationStartParams = {
   },
 };
 const originalProject = { path: "/other", format_id: "renpy", name: "Other" };
+after(() => queryClient.clear());
 beforeEach(() => {
+  queryClient.clear();
   const pending = getProjectOpenChoice();
   if (pending) resolveProjectOpenChoice(pending, "cancel");
   queue.setState({ items: [], isRunning: false, cancelRequested: false, globalProgress: null, translationParams: params });
   editor.setState({ isTranslating: false });
   project.setState({ project: originalProject });
   h.calls = []; h.toasts = []; h.logs = []; h.jobError = null;
-  h.batchErrors = []; h.translated = 1; h.progressTotal = 100; h.onJob = () => {};
+  h.batchErrors = []; h.translated = 1; h.progressTotal = 100; h.onJob = () => {}; h.onValidate = () => {};
   h.preflight = { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" };
   setLocale("en");
+});
+
+test("queue item completion refreshes active editor rows/stats and queue completion invalidates scoped caches again", async () => {
+  h.preflight = { kind: "extract" };
+  const completedProject = { path: "/fixture/game", format_id: "renpy", name: "Fixture", database_path: "/fixture/game.locust.db" };
+  const scope = draftProjectKey(completedProject);
+  const keys = [["strings", {}, scope], ["stats", scope], ["string", "row", scope], ["workflow", scope], ["patchStatus", "/fixture/game", 0]];
+  const unrelated = ["patchStatus", "/unrelated/game", 0];
+  let rowReads = 0;
+  let statsReads = 0;
+  const unsubscribe: (() => void)[] = [];
+  h.onJob = () => {
+    for (const key of [...keys, unrelated]) queryClient.setQueryData(key, { translated: false });
+    for (const [index, increment] of [[0, () => { rowReads++; }], [1, () => { statsReads++; }]] as const) {
+      const observer = new QueryObserver(queryClient, {
+        queryKey: keys[index], staleTime: Infinity,
+        queryFn: async () => { increment(); return { translated: true }; },
+      });
+      unsubscribe.push(observer.subscribe(() => {}));
+    }
+  };
+  h.onValidate = () => {
+    assert.equal(rowReads, 1, "the completed item refreshes editor rows before validation/next project");
+    assert.equal(statsReads, 1, "stats drive the workflow guide");
+    assert.deepEqual(queryClient.getQueryData(keys[0]), { translated: true });
+    // A validation-time read is fresh; the final queue refresh must still mark it stale.
+    for (const key of keys) queryClient.setQueryData(key, { translated: true });
+  };
+  queue.getState().addItem("/fixture/game");
+  try {
+    await queue.getState().startQueue();
+    assert.equal(queue.getState().items[0].status, "done");
+    assert.equal(rowReads, 2);
+    assert.equal(statsReads, 2);
+    for (const key of keys.slice(2)) assert.equal(queryClient.getQueryState(key)?.isInvalidated, true, JSON.stringify(key));
+    assert.equal(queryClient.getQueryState(unrelated)?.isInvalidated, false, "another game's badge stays fresh");
+  } finally { for (const close of unsubscribe) close(); }
+});
+
+test("queue final refresh marks its captured project stale without refetching its rows after a project switch", async () => {
+  h.preflight = { kind: "extract" };
+  const scope = draftProjectKey({ path: "/fixture/game", format_id: "renpy", name: "Fixture", database_path: "/fixture/game.locust.db" });
+  const key = ["strings", {}, scope];
+  let reads = 0;
+  let close = () => {};
+  h.onJob = () => {
+    queryClient.setQueryData(key, "old");
+    const observer = new QueryObserver(queryClient, { queryKey: key, staleTime: Infinity,
+      queryFn: async () => { reads++; return "translated"; } });
+    close = observer.subscribe(() => {});
+  };
+  h.onValidate = () => {
+    assert.equal(reads, 1);
+    queryClient.setQueryData(key, "validation-time cache");
+    project.setState({ project: originalProject });
+  };
+  queue.getState().addItem("/fixture/game");
+  try {
+    await queue.getState().startQueue();
+    assert.equal(reads, 1, "the live backend now serves another project");
+    assert.equal(queryClient.getQueryState(key)?.isInvalidated, true);
+    assert.equal(project.getState().project, originalProject);
+  } finally { close(); }
+});
+
+test("queue partial failures and cancellation still invalidate translations that reached the database", async () => {
+  h.preflight = { kind: "extract" };
+  const scope = draftProjectKey({ path: "/fixture/game", format_id: "renpy", name: "Fixture", database_path: "/fixture/game.locust.db" });
+  const key = ["strings", {}, scope];
+  for (const cancel of [false, true]) {
+    queue.setState({ items: [], cancelRequested: false });
+    h.batchErrors = ["provider unavailable"];
+    h.translated = 2;
+    h.onJob = () => {
+      queryClient.setQueryData(key, ["old row"]);
+      if (cancel) queue.getState().cancelQueue();
+    };
+    queue.getState().addItem("/fixture/game");
+    await queue.getState().startQueue();
+    assert.equal(queryClient.getQueryState(key)?.isInvalidated, true, `cancel=${cancel}`);
+    assert.equal(queue.getState().items[0].status, cancel ? "cancelled" : "error");
+  }
 });
 
 async function pendingChoice(): Promise<ProjectOpenChoiceRequest> {

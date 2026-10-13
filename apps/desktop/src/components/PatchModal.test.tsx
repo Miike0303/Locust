@@ -11,7 +11,7 @@ const h = {
   t, a11y, values: [] as unknown[], cursor: 0,
   toasts: [] as unknown[][], logs: [] as unknown[][],
   changed: 0,
-  jobHandlers: null as null | { onDone(event: any): void; onError(error: Error): void },
+  jobHandlers: null as null | { onDone(event: any): void; onError(error: { message: string }): void; onClosed(): void },
   state(initial: unknown) {
     const index = this.cursor++;
     if (!(index in this.values)) this.values[index] = typeof initial === "function" ? initial() : initial;
@@ -50,6 +50,11 @@ let failed = false;
 let deferred: (() => void) | null = null;
 let deferRollback = false;
 let status = "interrupted";
+let statusFailed = false;
+let verification = {
+  outcome: "Clean", tier: "Strict", replaced: ["data/original.txt"], added: [] as string[], conflicts: [] as string[],
+  messages: ["verification retained"], backup_compromised: false, manifest: {},
+};
 let report = {
   restored: 2, deleted: 1, baseline: "Pristine", dry_run: true,
   messages: ["preview <message>"], aborted_edited: ["data/user<edit>.txt"], torn_deleted: [] as string[],
@@ -71,10 +76,8 @@ globalThis.fetch = async (url, init) => {
     return new Response(failed ? "cannot preview rollback" : JSON.stringify({ ...report, dry_run: body.dry_run ?? false }), { status: failed ? 500 : 200 });
   }
   if (path.endsWith("/patch/apply")) return new Response(JSON.stringify({ job_id: "test-job" }));
-  if (path.endsWith("/patch/verify")) return new Response(JSON.stringify({
-    outcome: "Clean", tier: "Strict", replaced: ["data/original.txt"], added: [], conflicts: [],
-    messages: ["verification retained"], backup_compromised: false, manifest: {},
-  }));
+  if (path.endsWith("/patch/verify")) return new Response(JSON.stringify(verification));
+  if (path.endsWith("/patch/status") && statusFailed) return new Response("status unavailable", { status: 500 });
   return new Response(JSON.stringify({ status, patch_id: "test-patch" }));
 };
 const { default: PatchModal } = await import("./PatchModal.tsx");
@@ -110,7 +113,9 @@ function reset(locale: "en" | "es") {
   setLocale(locale);
   h.values = []; h.changed = 0; h.toasts = []; h.logs = [];
   calls.length = 0; failed = false; deferRollback = false; deferred = null;
-  status = "interrupted"; h.jobHandlers = null;
+  status = "interrupted"; statusFailed = false; h.jobHandlers = null;
+  verification = { outcome: "Clean", tier: "Strict", replaced: ["data/original.txt"], added: [], conflicts: [],
+    messages: ["verification retained"], backup_compromised: false, manifest: {} };
   report = { restored: 2, deleted: 1, baseline: "Pristine", dry_run: true,
     messages: ["preview <message>"], aborted_edited: ["data/user<edit>.txt"], torn_deleted: [] };
   render();
@@ -218,8 +223,8 @@ test("a successful preview does not clear the modal's recovery warning after an 
   await verifyAndInterrupt();
   await button(t("patch.applyBtn")).props.onClick();
   assert.ok(h.jobHandlers);
-  status = "not_patched"; // Warning must be driven by needsRollback, not status.
-  h.jobHandlers.onError(new Error("partial apply"));
+  status = "interrupted"; // The backend journal, not the error itself, requires recovery.
+  h.jobHandlers.onError({ message: "partial apply" });
   for (let i = 0; button(t("patch.applyBtn")).props.disabled && i < 20; i++) {
     await new Promise(resolve => setTimeout(resolve, 0));
   }
@@ -232,6 +237,125 @@ test("a successful preview does not clear the modal's recovery warning after an 
   assert.equal(calls.length, 1);
   assert.equal(h.changed, 0);
   assert.deepEqual(h.toasts, []);
+});
+
+async function settleApply() {
+  for (let i = 0; button(t("patch.applyBtn")).props.disabled && i < 30; i++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  assert.equal(button(t("patch.applyBtn")).props.disabled, false);
+}
+function selectSource() {
+  nodes(render()).find(node => node.type === "input" && node.props.placeholder === t("patch.zipPlaceholder"))
+    .props.onChange({ target: { value: "/patch.zip" } });
+}
+for (const locale of ["en", "es"] as const) {
+  test(`${locale} verification refusal before writes reports an unchanged game, not a partial apply`, async () => {
+    reset(locale);
+    status = "not_patched";
+    selectSource();
+    await button(t("patch.applyBtn")).props.onClick();
+    const raw = "patch verification failed: data/new.txt: expected absent (added path), found present";
+    h.jobHandlers!.onError({ message: raw });
+    await settleApply();
+    const message = locale === "en"
+      ? "This patch does not match the selected game. Nothing was changed. Check the game folder and version."
+      : "Este parche no corresponde al juego seleccionado. No se realizó ningún cambio. Compruebe la carpeta y la versión del juego.";
+    const html = renderToStaticMarkup(render());
+    assert.ok(html.includes(message), html);
+    assert.ok(!html.includes(t("patch.partialWarning")), html);
+    assert.ok(!html.includes(t("patch.rollbackNow")), html);
+    assert.deepEqual(h.toasts, [["error", t("patch.toast.applyFailed", { error: message })]]);
+    assert.equal(h.logs.filter(([, , detail]) => detail === raw).length, 1);
+    assert.ok(!h.toasts.some(([, text]) => String(text).includes(raw)));
+  });
+
+  test(`${locale} conflicting verification is a localized warning with per-file lines and technical-only Debug text`, async () => {
+    reset(locale);
+    status = "not_patched";
+    selectSource();
+    const outcome = 'Mismatch([FileMismatch { path: "data/new.txt", expected: "absent (added path)", found: "present" }, FileMismatch { path: "data/original.txt", expected: "aaaa", found: "bbbb" }])';
+    verification = { ...verification, outcome, conflicts: ["data/new.txt"], messages: ["opaque backend detail"] };
+    await button(t("patch.verify")).props.onClick();
+    const summary = locale === "en" ? "Verification found 2 file conflicts. Nothing was changed."
+      : "La verificación detectó 2 conflictos de archivos. No se realizó ningún cambio.";
+    assert.deepEqual(h.toasts, [["warning", summary]]);
+    const tree = render();
+    const details = nodes(tree).filter(node => node.type === "details");
+    assert.equal(details.length, 1, "raw diagnostics must be explicitly technical details");
+    assert.ok(text(details[0]).includes(outcome) && text(details[0]).includes("opaque backend detail"));
+    const html = renderToStaticMarkup(tree);
+    assert.ok(html.includes(summary), html);
+    assert.ok(html.includes(locale === "en" ? "data/new.txt: already exists" : "data/new.txt: ya existe"), html);
+    assert.ok(html.includes(locale === "en" ? "data/original.txt: content does not match" : "data/original.txt: el contenido no coincide"), html);
+    assert.ok(!html.includes("not_patched"), html);
+    assert.equal(h.logs[0][0], "warning");
+    assert.ok(String(h.logs[0][2]).includes(outcome));
+  });
+
+  test(`${locale} clean verification still succeeds and unknown/downgrade/interrupted outcomes never succeed`, async () => {
+    reset(locale); selectSource();
+    status = "not_patched";
+    await button(t("patch.verify")).props.onClick();
+    assert.equal(h.toasts[0][0], "success");
+    for (const outcome of ["Unknown", "Interrupted", 'DowngradeBlocked { installed: "2.0.0", incoming: "1.0.0" }', "FutureOutcome"]) {
+      h.toasts = [];
+      verification.outcome = outcome;
+      await button(t("patch.verify")).props.onClick();
+      assert.equal(h.toasts[0][0], "warning", outcome);
+      assert.ok(!String(h.toasts[0][1]).includes("DowngradeBlocked"));
+      assert.ok(!String(h.toasts[0][1]).includes("FutureOutcome"));
+    }
+  });
+}
+
+test("failed status lookup and stream loss do not invent a partly patched state", async () => {
+  reset("en"); selectSource();
+  statusFailed = true;
+  await button(t("patch.applyBtn")).props.onClick();
+  h.jobHandlers!.onClosed();
+  await settleApply();
+  const html = renderToStaticMarkup(render());
+  assert.ok(!html.includes(t("patch.partialWarning")), html);
+  assert.ok(!h.toasts.some(([, text]) => String(text).includes("Nothing was changed")));
+  assert.ok(html.includes("Could not confirm the game state"), html);
+  assert.ok(calls.some(call => call.url.endsWith("/patch/status")), "stream loss must refresh actual backend state");
+});
+
+test("mismatch paths escaped by Rust Debug remain readable and duplicate added conflicts count once", async () => {
+  for (const found of ["missing", "absent"]) {
+    reset("en"); selectSource();
+    verification.outcome = String.raw`Mismatch([FileMismatch { path: "data/quote\"name.txt", expected: "aaaa", found: "${found}" }])`;
+    verification.conflicts = ['data/quote"name.txt'];
+    await button(t("patch.verify")).props.onClick();
+    assert.deepEqual(h.toasts, [["warning", "Verification found 1 file conflict. Nothing was changed."]]);
+    assert.ok(renderToStaticMarkup(render()).includes("data/quote&quot;name.txt: missing file"), found);
+  }
+});
+
+test("a recovery banner belongs to the game whose backend status was read", async () => {
+  reset("en");
+  await button(t("patch.refreshStatus")).props.onClick();
+  assert.ok(renderToStaticMarkup(render()).includes(t("patch.partialWarning")));
+  const game = nodes(render()).find(node => node.type === "input" && node.props.value === " /game ");
+  game.props.onChange({ target: { value: "/other-game" } });
+  const html = renderToStaticMarkup(render());
+  assert.ok(!html.includes(t("patch.partialWarning")), html);
+  assert.ok(!html.includes(t("patch.rollbackNow")), html);
+});
+
+for (const partial of [false, true]) test(`cancellation preserves recovery only when the backend reports an interruption (partial=${partial})`, async () => {
+  reset("en"); selectSource();
+  status = partial ? "interrupted" : "not_patched";
+  await button(t("patch.applyBtn")).props.onClick();
+  await button(t("patch.cancelApply")).props.onClick();
+  h.toasts = [];
+  h.jobHandlers!.onError({ message: "cancelled" });
+  await settleApply();
+  const html = renderToStaticMarkup(render());
+  assert.equal(html.includes(t("patch.partialWarning")), partial);
+  assert.equal(h.toasts[0][0], "warning");
+  assert.equal(h.toasts[0][1], t(partial ? "patch.toast.applyCancelled" : "patch.toast.applyCancelledSafe"));
 });
 
 for (const recovery of [false, true]) test(`${recovery ? "recovery" : "regular"} real rollback still omits dry_run and resets verification, refreshes status and reports success`, async () => {

@@ -52,6 +52,24 @@ function spanTexts(node: any): string[] {
 }
 
 for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
+  test(`known validation messages are localized while unknown details remain intact (${locale})`, () => {
+    (globalThis as any).__badgeTranslate = (key: string, vars?: any) => translate(catalog, locale, key, vars);
+    const messages = [
+      ["IdenticalToSource", "translation is identical to source", locale === "en" ? "The translation is identical to the source." : "La traducción es idéntica al texto original."],
+      ["EmptyTranslation", "translation is empty", locale === "en" ? "The translation is empty." : "La traducción está vacía."],
+      ["FutureKind", "unknown diagnostic", "unknown diagnostic"],
+      ["InvalidInjectionProvenance", "specific provenance diagnostic", "specific provenance diagnostic"],
+    ];
+    const tree = ValidationResultsModal({ open: true, onClose() {}, onSelectEntry() {}, result: {
+      validation: { total_checked: messages.length, issues_found: messages.length, entries_with_issues: messages.length, by_kind: {},
+        issues: messages.map(([kind, message], i) => ({ entry_id: `entry-${i}`, kind: kind as ValidationKind, message })) }, fonts: [],
+    } });
+    const text = textOf(tree);
+    for (const [, raw, expected] of messages) {
+      assert.ok(text.includes(expected), `${locale}: missing ${expected}`);
+      if (locale === "es" && expected !== raw) assert.ok(!text.includes(raw), text);
+    }
+  });
   test(`all known validation badge kinds use catalog labels (${locale})`, async () => {
     const { validationBadgeLabel } = await import("./validationLabels.ts");
     const t = (key: any) => translate(catalog, locale, key);

@@ -9,7 +9,7 @@ import type {
 	FontSuggestion,
 } from "../lib/api";
 import { validationKindLabel } from "../lib/api";
-import { validationBadgeLabel } from "../lib/validationLabels";
+import { localizeValidationMessage, validationBadgeLabel } from "../lib/validationLabels";
 import { useT, type TranslateFn } from "../lib/i18n";
 import {
 	useModalA11y,
@@ -215,9 +215,9 @@ export default function ValidationResultsModal({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-2xl max-h-[85vh] flex flex-col")}
+				className={modalPanelClass("max-w-2xl flex flex-col")}
 			>
-				<div className="flex justify-between items-center px-5 py-4 border-b border-border">
+				<div className="shrink-0 flex justify-between items-center px-5 py-4 border-b border-border">
 					<div className="flex items-center gap-2">
 						<Shield size={18} className="text-accent-fg" />
 						<h2 {...titleProps} className="text-section font-bold">
@@ -232,7 +232,7 @@ export default function ValidationResultsModal({
 					</button>
 				</div>
 
-				<div className="px-5 py-4 overflow-y-auto flex-1 space-y-4">
+				<div className="min-h-0 px-5 py-4 overflow-y-auto overscroll-contain flex-1 space-y-4">
 					{/* Summary */}
 					<div className="flex flex-wrap gap-3 text-body">
 						<span className="text-text-muted">
@@ -331,7 +331,7 @@ export default function ValidationResultsModal({
 															</div>
 														)}
 														<div className="text-caption text-text-muted mt-0.5">
-															{detail || issue.message}
+															{detail || localizeValidationMessage(issue.message, t)}
 														</div>
 													</div>
 												</div>

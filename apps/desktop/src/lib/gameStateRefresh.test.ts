@@ -37,6 +37,21 @@ after(() => {
   else Reflect.deleteProperty(globalThis, "window");
 });
 
+test("translation refresh shares the editor's project scope without refreshing another database or game", async () => {
+  const refresh = await import("./queryClient.ts");
+  assert.equal(typeof refresh.refreshTranslationQueries, "function");
+  const project = { path: " /game ", database_path: "/game.locust.db", format_id: "renpy", name: "Game" };
+  const scope = JSON.stringify([project.database_path, project.path, project.format_id]);
+  const otherScope = JSON.stringify(["/other.locust.db", project.path, project.format_id]);
+  const matching = [["strings", {}, scope], ["stats", scope], ["string", "row", scope], ["workflow", scope], ["string-facets", project.path], ["patchStatus", "/game", 8]];
+  const unrelated = [["strings", {}, otherScope], ["stats", otherScope], ["string", "row", otherScope], ["workflow", otherScope], ["patchStatus", "/other", 8], ["providers"]];
+  for (const key of [...matching, ...unrelated]) queryClient.setQueryData(key, "cached");
+  await refresh.refreshTranslationQueries(project);
+  for (const key of matching) assert.equal(queryClient.getQueryState(key)?.isInvalidated, true, JSON.stringify(key));
+  for (const key of unrelated) assert.equal(queryClient.getQueryState(key)?.isInvalidated, false, JSON.stringify(key));
+  queryClient.clear();
+});
+
 for (const operation of ["inject", "restore", "recover"] as const) {
   for (const rejects of [false, true]) {
     test(`${operation} settlement refreshes the editor badge (failure=${rejects})`, async () => {

@@ -32,7 +32,7 @@ export default function ResumeProjectDialog({ request, onChoose }: Props) {
   return (
     <div className={MODAL_BACKDROP_CLASS} onClick={cancel}>
       <div ref={dialogRef} {...dialogProps} aria-describedby={descriptionId}
-        className={modalPanelClass("max-w-lg p-5 max-h-[90vh] overflow-y-auto")}
+        className={modalPanelClass("max-w-lg p-5")}
         onClick={(event) => event.stopPropagation()}>
         <h2 {...titleProps} className="text-section font-bold mb-2">
           {t(verified ? "resume.title" : "resume.attentionTitle")}

@@ -44,6 +44,8 @@ import {
 } from "../lib/patchSource";
 import { defaultEntryPath, patchPublishFields, publishCommand } from "../lib/patchPublish";
 import { subscribeToJob } from "../lib/ws";
+import { localizeApiError, parseApiError } from "../lib/apiError";
+import { patchVerificationSummary } from "../lib/patchVerification";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
 import {
@@ -84,6 +86,7 @@ export default function PatchModal({
 	const t = useT();
 	const patchValue = (value: string): string => {
 		const labels: Record<string, string> = {
+			not_patched: t("patch.status.notPatched"),
 			pristine: t("patch.status.pristine"),
 			patched: t("patch.status.patched"),
 			interrupted: t("patch.status.interrupted"),
@@ -137,11 +140,14 @@ export default function PatchModal({
 		report: PatchRollbackResult;
 	} | null>(null);
 	const [packResult, setPackResult] = useState<PatchPackResult | null>(null);
-	const [status, setStatus] = useState<PatchStatusResult | null>(null);
+	const [statusSnapshot, setStatusSnapshot] = useState<{
+		gamePath: string;
+		report: PatchStatusResult;
+	} | null>(null);
+	const status = statusSnapshot?.gamePath === gamePath.trim() ? statusSnapshot.report : null;
 	const [error, setError] = useState<string | null>(null);
 	const [applying, setApplying] = useState(false);
 	const [cancellingApply, setCancellingApply] = useState(false);
-	const [needsRollback, setNeedsRollback] = useState(false);
 	const [applyProgress, setApplyProgress] = useState<{
 		current: number;
 		total: number;
@@ -344,11 +350,13 @@ export default function PatchModal({
 		setRollbackPreview(null);
 		try {
 			const s = await patchStatus({ game_path: gamePath.trim() });
-			setStatus(s);
+			setStatusSnapshot({ gamePath: gamePath.trim(), report: s });
 			onPatchStateChanged?.();
+			return s;
 		} catch (err: any) {
-			setStatus(null);
+			setStatusSnapshot(null);
 			setError(err.message);
+			return null;
 		}
 	};
 
@@ -377,13 +385,14 @@ export default function PatchModal({
 			rememberPatchSource(resolvedSource);
 			setVerify(report);
 			await refreshStatus();
+			const display = patchVerificationSummary(report, t);
 			addLog(
-				"info",
-				t("activity.patch.verified", { outcome: patchValue(report.outcome) }),
-				report.messages?.join("\n") || "",
+				display.severity === "warning" ? "warning" : "info",
+				t("activity.patch.verified", { outcome: display.summary }),
+				[report.outcome, ...(report.messages ?? [])].join("\n"),
 				"patch",
 			);
-			addToast("success", t("patch.toast.verify", { outcome: patchValue(report.outcome) }));
+			addToast(display.severity, display.summary);
 		} catch (err: any) {
 			setError(err.message);
 			addLog("error", t("activity.patch.verifyFailed"), err.message, "patch");
@@ -416,30 +425,33 @@ export default function PatchModal({
 		);
 	};
 
-	const finishApplyInterrupted = async (opts: {
+	const finishApplyFailure = async (opts: {
 		cancelled: boolean;
 		error?: string;
 	}) => {
-		setNeedsRollback(true);
-		if (opts.cancelled) {
-			addLog(
-				"warning",
-				t("activity.patch.cancelledPartial"),
-				undefined,
-				"patch",
-			);
-			addToast("warning", t("patch.toast.applyCancelled"));
-		} else {
-			const message = opts.error ?? t("ws.patchJobStreamLost");
-			setError(message);
-			addLog("error", t("activity.patch.applyFailed"), message, "patch");
-			addToast(
-				"warning",
-				t("patch.toast.applyFailedPartial", { error: message }),
-			);
-		}
 		try {
-			await refreshStatus();
+			// An error can be a pre-write refusal. Only the backend's journal status
+			// establishes an interrupted apply; a lost stream is not that evidence.
+			const currentStatus = await refreshStatus();
+			const partial = currentStatus?.status === "interrupted";
+			const unconfirmed = !currentStatus || currentStatus.status === "unknown";
+			const raw = opts.error ?? t("ws.patchJobStreamLost");
+			let message = localizeApiError(raw);
+			if (!partial && currentStatus?.status === "not_patched" &&
+				parseApiError(raw).body.startsWith("patch verification failed: ")) {
+				message = t("patch.verificationRefused");
+			}
+			if (opts.cancelled) {
+				message = t(partial ? "patch.toast.applyCancelled" : "patch.toast.applyCancelledSafe");
+				addLog(partial ? "warning" : "info", partial ? t("activity.patch.cancelledPartial") : message, opts.error, "patch");
+			} else {
+				addLog("error", t("activity.patch.applyFailed"), raw, "patch");
+			}
+			if (unconfirmed) message += ` ${t("patch.stateUnconfirmed")}`;
+			setError(message);
+			addToast(partial || opts.cancelled ? "warning" : "error", opts.cancelled
+				? message
+				: t(partial ? "patch.toast.applyFailedPartial" : "patch.toast.applyFailed", { error: message }));
 		} finally {
 			setApplying(false);
 			setCancellingApply(false);
@@ -464,7 +476,7 @@ export default function PatchModal({
 		setError(null);
 		setApplyResult(null);
 		setApplyProgress(null);
-		setNeedsRollback(false);
+		setStatusSnapshot(null);
 		setApplying(true);
 		setCancellingApply(false);
 		applyFinishedRef.current = false;
@@ -509,7 +521,7 @@ export default function PatchModal({
 						applyUnsubRef.current?.();
 						applyUnsubRef.current = null;
 						applyJobIdRef.current = null;
-						void finishApplyInterrupted(
+						void finishApplyFailure(
 							applyCancelRequestedRef.current
 								? { cancelled: true }
 								: { cancelled: false, error: e.message },
@@ -520,30 +532,17 @@ export default function PatchModal({
 						applyFinishedRef.current = true;
 						applyUnsubRef.current = null;
 						applyJobIdRef.current = null;
-						if (applyCancelRequestedRef.current) {
-							void finishApplyInterrupted({ cancelled: true });
-							return;
-						}
-						const message = t("ws.patchJobStreamLost");
-						setError(message);
-						addLog("error", t("activity.patch.applyFailed"), message, "patch");
-						addToast(
-							"error",
-							t("patch.toast.applyFailed", { error: message }),
-						);
-						setApplying(false);
-						setCancellingApply(false);
+						void finishApplyFailure({
+							cancelled: applyCancelRequestedRef.current,
+							error: t("ws.patchJobStreamLost"),
+						});
 					},
 				},
 				"patch",
 			);
 		} catch (err: any) {
 			applyFinishedRef.current = true;
-			setError(err.message);
-			addLog("error", t("activity.patch.applyFailed"), err.message, "patch");
-			addToast("error", t("patch.toast.applyFailed", { error: err.message }));
-			setApplying(false);
-			setCancellingApply(false);
+			await finishApplyFailure({ cancelled: false, error: err.message });
 		}
 	};
 
@@ -620,7 +619,6 @@ export default function PatchModal({
 						deleted: report.deleted,
 					}),
 				);
-				setNeedsRollback(false);
 			}
 			addLog(
 				"info",
@@ -701,8 +699,8 @@ export default function PatchModal({
 		}
 	};
 
-	const showPartialWarning =
-		needsRollback || status?.status === "interrupted";
+	const showPartialWarning = status?.status === "interrupted";
+	const verifyDisplay = verify ? patchVerificationSummary(verify, t) : null;
 
 	const tabBtn = (id: Tab, label: string) => (
 		<button
@@ -726,7 +724,7 @@ export default function PatchModal({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-xl p-6 max-h-[90vh] overflow-y-auto")}
+				className={modalPanelClass("max-w-xl p-6")}
 			>
 				<div className="flex justify-between items-center mb-2">
 					<h2
@@ -1092,9 +1090,14 @@ export default function PatchModal({
 								</div>
 							)}
 
-							{verify && (
-								<div className="p-3 border border-border rounded text-body space-y-1">
-									<div className="font-medium">{t("patch.verifyLine", { outcome: patchValue(verify.outcome) })}</div>
+							{verify && verifyDisplay && (
+								<div className={`p-3 border rounded text-body space-y-1 ${verifyDisplay.severity === "warning" ? "border-warning bg-warning-muted text-warning" : "border-border"}`}>
+									<div className="font-medium">{verifyDisplay.summary}</div>
+									{verifyDisplay.files.length > 0 && (
+										<ul className="list-disc pl-5 text-caption break-words">
+											{verifyDisplay.files.map((line) => <li key={line}>{line}</li>)}
+										</ul>
+									)}
 									{verify.tier && (
 										<div className="text-caption">{t("patch.tier", { tier: patchValue(verify.tier) })}</div>
 									)}
@@ -1111,11 +1114,10 @@ export default function PatchModal({
 											{t("patch.backupCompromised")}
 										</div>
 									)}
-									{verify.messages?.map((m, i) => (
-										<div key={i} className="text-caption text-text-muted">
-											{m}
-										</div>
-									))}
+									<details className="text-caption text-text-muted">
+										<summary className="cursor-pointer">{t("patch.technicalDetails")}</summary>
+										<pre className="whitespace-pre-wrap break-words mt-1">{[verify.outcome, ...(verify.messages ?? [])].join("\n")}</pre>
+									</details>
 								</div>
 							)}
 

@@ -60,7 +60,7 @@ export default function HotkeyHelp({ open, onClose }: Props) {
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-xl max-h-[80vh] overflow-y-auto")}
+				className={modalPanelClass("max-w-xl")}
 				onClick={(e) => e.stopPropagation()}
 			>
 				<div className="flex items-center justify-between p-4 border-b border-border">

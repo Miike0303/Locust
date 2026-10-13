@@ -311,10 +311,10 @@ export default function QueuePanel() {
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-2xl max-h-[80vh] flex flex-col")}
+				className={modalPanelClass("max-w-2xl flex flex-col")}
 			>
 				{/* Header */}
-				<div className="flex items-center justify-between p-4 border-b border-border">
+				<div className="shrink-0 flex items-center justify-between p-4 border-b border-border">
 					<h2 {...titleProps} className="font-bold text-section">
 						{t("queue.title")}
 					</h2>
@@ -339,7 +339,7 @@ export default function QueuePanel() {
 					</div>
 				</div>
 
-				<div className="flex-1 overflow-y-auto">
+				<div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
 					{/* Queue list */}
 					{items.length === 0 ? (
 						<EmptyState
@@ -526,7 +526,7 @@ export default function QueuePanel() {
 				</div>
 
 				{/* Footer */}
-				<div className="p-4 border-t border-border">
+				<div className="shrink-0 p-4 border-t border-border">
 					{!providerReadiness.ready &&
 						providerReadiness.reason === "missing_key" &&
 						!isRunning &&

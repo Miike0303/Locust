@@ -374,7 +374,7 @@ export default function InjectModal({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-lg p-6 max-h-[90vh] overflow-y-auto")}
+				className={modalPanelClass("max-w-lg p-6")}
 			>
 				<div className="flex justify-between items-center mb-4">
 					<h2 {...titleProps} className="text-section font-bold">

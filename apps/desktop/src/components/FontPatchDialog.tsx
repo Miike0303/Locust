@@ -53,12 +53,12 @@ export default function FontPatchDialog({ open, defaultGamePath, onClose, onUseP
     ["base_patch", "fontPatch.base", true], ["output_path", "fontPatch.output", true],
   ] as const;
   return <div className={MODAL_BACKDROP_CLASS}>
-    <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-2xl max-h-[90vh] flex flex-col")}>
-      <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+    <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-2xl flex flex-col")}>
+      <div className="shrink-0 flex items-center justify-between px-5 py-4 border-b border-border">
         <h2 {...titleProps} className="text-section font-semibold">{t("fontPatch.title")}</h2>
         <button onClick={close} disabled={busy} aria-label={t("common.close")}><X size={20} /></button>
       </div>
-      <div className="px-5 py-4 space-y-3 overflow-y-auto">
+      <div className="min-h-0 flex-1 px-5 py-4 space-y-3 overflow-y-auto overscroll-contain">
         <p className="text-body text-text-muted">{t("fontPatch.description")}</p>
         <p className="text-caption text-text-muted">{t("fontPatch.combineNote")}</p>
         <fieldset disabled={busy} className="space-y-3">

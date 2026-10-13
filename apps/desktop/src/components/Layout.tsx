@@ -82,7 +82,7 @@ export default function Layout() {
 						>
 							<Icon size={18} />
 							<span className="flex-1">{t(labelKey)}</span>
-							<kbd className="text-caption text-text-muted opacity-0 group-hover:opacity-100 transition-opacity">
+							<kbd className="text-caption opacity-0 group-hover:opacity-100 transition-opacity">
 								{shortcut}
 							</kbd>
 						</NavLink>

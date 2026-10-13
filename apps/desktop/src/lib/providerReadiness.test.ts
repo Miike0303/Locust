@@ -2,12 +2,28 @@
  * Lightweight asserts for providerReadiness (run: npx --yes tsx src/lib/providerReadiness.test.ts).
  */
 import assert from "node:assert/strict";
+import { test } from "node:test";
+import { setLocale } from "./i18n/index.ts";
 import {
+	formatProviderOptionLabel,
 	hasAnyReadyProvider,
 	readProviderSetupHintDismissed,
 	resolveProviderReadiness,
 	saveProviderSetupHintDismissed,
 } from "./providerReadiness.ts";
+
+for (const locale of ["en", "es"] as const) test(`provider availability is localized exactly once (${locale})`, () => {
+  setLocale(locale);
+  const suffix = locale === "en" ? "free" : "gratuito";
+  for (const name of ["Google Translate", "Google Translate (free)", "Google Translate (free) (free)"]) {
+    assert.equal(formatProviderOptionLabel({ name, is_free: true }), `Google Translate (${suffix})`);
+  }
+  assert.equal(formatProviderOptionLabel({ name: "Free Speech (preview)", is_free: true }), `Free Speech (preview) (${suffix})`);
+  assert.equal(formatProviderOptionLabel({ name: "Custom (free)", is_free: false }), "Custom (free)");
+  const needsKey = locale === "en" ? "needs API key" : "falta la clave API";
+  assert.equal(formatProviderOptionLabel({ name: "Google Translate (free)", is_free: true, configured: false }), `Google Translate (${suffix}) (${needsKey})`);
+  setLocale("en");
+});
 
 const providers = [
 	{ id: "mock", requires_api_key: false },

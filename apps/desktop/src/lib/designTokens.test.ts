@@ -72,6 +72,18 @@ for (const selector of [":root", ".dark"]) {
   });
 }
 
+test("sidebar shortcut inherits its item's foreground and meets AA on the active dark background", () => {
+  const layout = readFileSync(new URL("../components/Layout.tsx", import.meta.url), "utf8");
+  const kbd = layout.match(/<kbd className="([^"]+)"/);
+  assert.ok(kbd);
+  assert.ok(!kbd[1].includes("text-text-muted"), "the shortcut must inherit active/hover foreground instead of overriding it");
+  const dark = declarations(".dark");
+  const active = contrast(dark.get("--accent-fg"), dark.get("--accent-muted"));
+  assert.ok(active >= 4.5, `active shortcut contrast: ${active.toFixed(2)}:1`);
+  const hover = contrast(dark.get("--text"), dark.get("--border"));
+  assert.ok(hover >= 4.5, `hover shortcut contrast (even on opaque border): ${hover.toFixed(2)}:1`);
+});
+
 function luminance(value: string | undefined): number {
   assert.ok(value && /^#[0-9a-f]{6}$/i.test(value), `expected an explicit sRGB palette color, got ${value}`);
   const channels = [1, 3, 5].map(offset => {

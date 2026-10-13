@@ -35,6 +35,7 @@ import { addLog } from "../stores/logStore";
 import FilterBar from "../components/FilterBar";
 import StringTable from "../components/StringTable";
 import DetailPanel from "../components/DetailPanel";
+import { refreshTranslationQueries } from "../lib/queryClient";
 import { draftEntryKey, draftProjectKey } from "../stores/draftStore";
 import TranslationModal from "../components/TranslationModal";
 import InjectModal from "../components/InjectModal";
@@ -162,12 +163,8 @@ export default function Editor() {
 	}, []);
 
 	const handleRefetch = useCallback(() => {
-		refetch();
-		queryClient.invalidateQueries({ queryKey: ["stats"] });
-		if (selectedEntryId) {
-			queryClient.invalidateQueries({ queryKey: ["string", selectedEntryId] });
-		}
-	}, [refetch, queryClient, selectedEntryId]);
+		void refreshTranslationQueries(project, queryClient);
+	}, [project, queryClient]);
 
 	const wasTranslating = useRef(false);
 	useEffect(() => {

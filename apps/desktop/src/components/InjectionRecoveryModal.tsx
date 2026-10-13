@@ -97,7 +97,7 @@ export default function InjectionRecoveryModal({
 
   return (
     <div className={MODAL_BACKDROP_CLASS}>
-      <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-2xl mx-4 max-h-[90vh] overflow-y-auto")}>
+      <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-2xl")}>
         <header className="flex items-center justify-between border-b border-border px-5 py-4">
           <h2 {...titleProps} className="text-section font-semibold flex items-center gap-2"><RotateCcw size={18} />{t("recovery.title")}</h2>
           <button type="button" onClick={onClose} disabled={busy} aria-label={t("recovery.close")} className="p-1 disabled:opacity-40"><X size={20} /></button>

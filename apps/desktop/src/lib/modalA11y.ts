@@ -57,15 +57,19 @@ export function shouldOwnModalEscape({
 }
 
 export const MODAL_BACKDROP_CLASS =
-	"fixed inset-0 bg-black/50 flex items-center justify-center z-50";
+	"fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50";
 
 /** Shared modal action footer. Append layout extras with clsx. */
 export const MODAL_FOOTER_CLASS =
-	"flex justify-end gap-2 border-t border-border px-5 py-3";
+	"flex shrink-0 flex-wrap justify-end gap-2 border-t border-border px-5 py-3";
 
-/** Shared modal panel chrome; pass size/overflow utilities as extraClass. */
+/** Use between non-shrinking header/actions in a flex-column panel. */
+export const MODAL_BODY_CLASS =
+	"min-h-0 flex-1 overflow-y-auto overscroll-contain";
+
+/** Shared viewport-bounded chrome. Small panels scroll; larger forms can use MODAL_BODY_CLASS. */
 export function modalPanelClass(extraClass = ""): string {
-	const base = "bg-surface text-text border border-border rounded-lg shadow-xl w-full";
+	const base = "bg-surface text-text border border-border rounded-lg shadow-xl w-full max-h-[calc(100dvh-2rem)] overflow-y-auto overscroll-contain";
 	return extraClass ? `${base} ${extraClass}` : base;
 }
 

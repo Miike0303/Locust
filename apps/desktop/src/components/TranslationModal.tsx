@@ -35,6 +35,7 @@ import { addToast } from "../stores/toastStore";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_BODY_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
 import {
@@ -305,9 +306,9 @@ export default function TranslationModal({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-lg p-6")}
+				className={modalPanelClass("max-w-lg p-6 flex flex-col")}
 			>
-				<div className="flex justify-between items-center mb-4">
+				<div data-modal-header className="shrink-0 flex justify-between items-center mb-4">
 					<h2 {...titleProps} className="text-section font-bold">
 						{step === "configure"
 							? t("translate.title")
@@ -323,7 +324,7 @@ export default function TranslationModal({
 				</div>
 
 				{step === "configure" && (
-					<div className="space-y-4">
+					<div data-modal-body className={`${MODAL_BODY_CLASS} space-y-4 pr-1`}>
 						<div>
 							<div className="flex items-end justify-between gap-2">
 								<label className="text-body font-medium">{t("translate.provider")}</label>
@@ -566,17 +567,11 @@ export default function TranslationModal({
 								{startError}
 							</div>
 						)}
-						<button
-							onClick={handleStart}
-							className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium transition-colors"
-						>
-							{t("translate.start")}
-						</button>
 					</div>
 				)}
 
 				{step === "progress" && (
-					<div className="space-y-4">
+					<div data-modal-body className={`${MODAL_BODY_CLASS} space-y-4 pr-1`}>
 						<div className="w-full bg-border rounded-full h-3">
 							<div
 								className={`h-3 rounded-full transition-all ${error ? "bg-danger" : completedWithErrors ? "bg-warning" : "bg-accent"}`}
@@ -629,39 +624,53 @@ export default function TranslationModal({
 								<p>{t("translate.pendingRetryHint")}</p>
 							</div>
 						)}
-						{!done && !cancelled && !error && (
-							<button
-								onClick={handleCancel}
-								disabled={cancelling}
-								className="w-full py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
-							>
-								{cancelling ? t("translate.cancelling") : t("translate.cancel")}
-							</button>
-						)}
-						{(done || cancelled || error) && (
-							<div className="flex gap-2">
-								<button
-									onClick={handleClose}
-									className={`w-full py-2 rounded font-medium ${
-										done && onReview
-											? "bg-surface-muted text-text hover:bg-surface"
-											: "bg-accent hover:bg-accent-hover text-white"
-									}`}
-								>
-									{t("common.close")}
-								</button>
-								{done && onReview && (
-									<button
-										onClick={handleReview}
-										className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
-									>
-										{t("translate.review")}
-									</button>
-								)}
-							</div>
-						)}
 					</div>
 				)}
+
+				<div data-modal-actions className="shrink-0 pt-4">
+					{step === "configure" ? (
+						<button
+							onClick={handleStart}
+							className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium transition-colors"
+						>
+							{t("translate.start")}
+						</button>
+					) : (
+						<>
+							{!done && !cancelled && !error && (
+								<button
+									onClick={handleCancel}
+									disabled={cancelling}
+									className="w-full py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
+								>
+									{cancelling ? t("translate.cancelling") : t("translate.cancel")}
+								</button>
+							)}
+							{(done || cancelled || error) && (
+								<div className="flex gap-2">
+									<button
+										onClick={handleClose}
+										className={`w-full py-2 rounded font-medium ${
+											done && onReview
+												? "bg-surface-muted text-text hover:bg-surface"
+												: "bg-accent hover:bg-accent-hover text-white"
+										}`}
+									>
+										{t("common.close")}
+									</button>
+									{done && onReview && (
+										<button
+											onClick={handleReview}
+											className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
+										>
+											{t("translate.review")}
+										</button>
+									)}
+								</div>
+							)}
+						</>
+					)}
+				</div>
 			</div>
 		</div>
 	);

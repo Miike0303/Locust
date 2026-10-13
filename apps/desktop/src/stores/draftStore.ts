@@ -1,11 +1,8 @@
 import { create } from "zustand";
-import type { ProjectInfo } from "../lib/api";
+export { draftProjectKey } from "../lib/projectScope";
 import { ApiError } from "../lib/apiError";
 import { createDraftPersistence, DRAFT_PREFIX, type DraftStorageIssue, type DurableDraft } from "../lib/draftPersistence";
 
-export function draftProjectKey(project: ProjectInfo): string {
-  return JSON.stringify([project.database_path ?? null, project.path, project.format_id]);
-}
 export function draftEntryKey(projectKey: string, id: string): string {
   return JSON.stringify([projectKey, id]);
 }
