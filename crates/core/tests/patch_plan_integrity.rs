@@ -19,6 +19,7 @@ fn manifest() -> PatchManifest {
         generator_version: "0.1.0".into(),
         created_at: "now".into(),
         files: vec![PatchFileEntry {
+            added: false,
             path: "fonts/game.ttf".into(),
             size: 4,
             patched_sha256: sha256_hex(b"FONT"),
@@ -171,6 +172,7 @@ fn corrupted_late_member_rejected_before_backup_or_asset_mutation() {
     let zip = dir.path().join("bad.zip");
     let mut m = manifest();
     m.files.push(PatchFileEntry {
+        added: false,
         path: "later.txt".into(),
         size: 12,
         patched_sha256: sha256_hex(b"LATERCONTENT"),
@@ -595,6 +597,7 @@ fn duplicate_manifest_cannot_bypass_verified_plan() {
     let mut altered = safe.clone();
     altered.patch_id = "unverified-id".into();
     altered.files.push(PatchFileEntry {
+        added: false,
         path: "user-settings.json".into(),
         size: 6,
         patched_sha256: sha256_hex(b"ERASED"),

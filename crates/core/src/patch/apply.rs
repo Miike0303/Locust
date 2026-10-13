@@ -819,6 +819,7 @@ mod tests {
             generator_version: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             files: vec![PatchFileEntry {
+                added: false,
                 path: path.into(),
                 patched_sha256: sha256_hex(content),
                 size: content.len() as u64,

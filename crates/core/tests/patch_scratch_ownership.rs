@@ -18,6 +18,7 @@ fn game() -> tempfile::TempDir {
 
 fn patch(root: &Path, entry_name: &str, added: bool) -> PathBuf {
     let mut files = vec![PatchFileEntry {
+        added: false,
         path: entry_name.into(),
         size: 4,
         patched_sha256: sha256_hex(b"FONT"),
@@ -25,6 +26,7 @@ fn patch(root: &Path, entry_name: &str, added: bool) -> PathBuf {
     }];
     if added {
         files.push(PatchFileEntry {
+            added: false,
             path: "fonts/added.ttf".into(),
             size: 3,
             patched_sha256: sha256_hex(b"ADD"),

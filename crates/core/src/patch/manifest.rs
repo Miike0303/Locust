@@ -49,6 +49,11 @@ pub struct PatchFileEntry {
     /// a committed `.locust/backup/`). Absence degrades verify to structural.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_sha256: Option<String>,
+    /// The packager knew the pristine game and this path was not in it: the
+    /// patch adds the file (Ren'Py `tl/` scripts, language packs), so its
+    /// absence from a target game is expected, not a sign of the wrong game.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub added: bool,
 }
 
 impl PatchManifest {
@@ -199,6 +204,7 @@ mod tests {
             generator_version: "0.1.0".into(),
             created_at: "t".into(),
             files: vec![PatchFileEntry {
+                added: false,
                 path: "game/a.rpy".into(),
                 patched_sha256: "aa".into(),
                 size: 1,
@@ -224,6 +230,7 @@ mod tests {
             generator_version: "0.1.0".into(),
             created_at: "t".into(),
             files: vec![PatchFileEntry {
+                added: false,
                 path: "www/data/Map001.json".into(),
                 patched_sha256: "aa".into(),
                 size: 1,
@@ -247,12 +254,14 @@ mod tests {
             created_at: "t".into(),
             files: vec![
                 PatchFileEntry {
+                    added: false,
                     path: "game/a.rpy".into(),
                     patched_sha256: "aa".into(),
                     size: 1,
                     original_sha256: Some("bb".into()),
                 },
                 PatchFileEntry {
+                    added: false,
                     path: "game/new.rpy".into(),
                     patched_sha256: "cc".into(),
                     size: 1,

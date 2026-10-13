@@ -47,6 +47,7 @@ fn build_patch_zip(path: &Path, files: &[PatchZipFile<'_>], version: &str, patch
         files: files
             .iter()
             .map(|(rel, patched, orig)| PatchFileEntry {
+                added: false,
                 path: (*rel).into(),
                 patched_sha256: sha256_hex(patched),
                 size: patched.len() as u64,

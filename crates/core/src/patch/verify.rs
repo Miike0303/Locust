@@ -659,14 +659,18 @@ fn verify_structural(
             // Structural without originals: classify absent as added, present
             // as replaced.
             added.push(f.path.clone());
-            missing_replaced.push(f.path.clone());
+            // A path the packager knew to be new is expected to be absent;
+            // it never counts toward the wrong-game heuristic below.
+            if !f.added {
+                missing_replaced.push(f.path.clone());
+            }
         }
     }
 
     // Structural confirmation is required at apply time; verify reports Clean
     // when all present paths exist and no hard mismatches. If ALL files are
     // absent, this may be the wrong game → Mismatch.
-    let all_absent = replaced.is_empty() && conflicts.is_empty() && !added.is_empty();
+    let all_absent = replaced.is_empty() && conflicts.is_empty() && !missing_replaced.is_empty();
     let outcome = if all_absent && manifest.files.len() > 1 {
         VerificationOutcome::Mismatch(
             missing_replaced
@@ -972,24 +976,28 @@ mod tests {
         std::fs::write(game.path().join("added.rpy"), b"patched").unwrap();
         let files = vec![
             PatchFileEntry {
+                added: false,
                 path: "replaced.rpy".into(),
                 patched_sha256: crate::database::sha256_hex(b"translated"),
                 size: 10,
                 original_sha256: Some(crate::database::sha256_hex(b"original")),
             },
             PatchFileEntry {
+                added: false,
                 path: "added.rpy".into(),
                 patched_sha256: crate::database::sha256_hex(b"patched"),
                 size: 7,
                 original_sha256: None,
             },
             PatchFileEntry {
+                added: false,
                 path: "missing-replaced.rpy".into(),
                 patched_sha256: crate::database::sha256_hex(b"translated"),
                 size: 10,
                 original_sha256: Some(crate::database::sha256_hex(b"original")),
             },
             PatchFileEntry {
+                added: false,
                 path: "missing-added.rpy".into(),
                 patched_sha256: crate::database::sha256_hex(b"patched"),
                 size: 7,
@@ -1026,6 +1034,7 @@ mod tests {
         std::fs::create_dir(game.path().join("nested")).unwrap();
         std::fs::write(game.path().join("nested/added.pak"), b"user edit").unwrap();
         let files = [PatchFileEntry {
+            added: false,
             path: "nested/added.pak".into(),
             patched_sha256: crate::database::sha256_hex(b"patched"),
             size: 7,
@@ -1077,6 +1086,7 @@ mod tests {
             generator_version: "test".into(),
             created_at: "test".into(),
             files: vec![PatchFileEntry {
+                added: false,
                 path: "script.rpy".into(),
                 patched_sha256: crate::database::sha256_hex(patched),
                 size: patched.len() as u64,

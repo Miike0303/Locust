@@ -645,6 +645,8 @@ fn pack_selected_recording(
                 return Err(pack_err(format!("zip write {}: {error}", f.rel)));
             }
         }
+        // Known pristine tree without this path: the injection created it.
+        let file_is_new = original.is_none() && pristine_root.is_some();
         if let Some((sha256, size)) = original {
             fingerprint.push(FingerprintEntry {
                 path: f.rel.clone(),
@@ -657,6 +659,7 @@ fn pack_selected_recording(
             patched_sha256: f.hash.clone(),
             size: f.size,
             original_sha256,
+            added: file_is_new,
         });
         added += 1;
     }

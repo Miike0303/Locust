@@ -128,6 +128,7 @@ pub fn build_font_patch(
         generator_version: env!("CARGO_PKG_VERSION").into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         files: vec![PatchFileEntry {
+            added: false,
             path: archive_path.clone(),
             patched_sha256: sha256_hex(&replacement),
             size: replacement.len() as u64,
@@ -453,6 +454,7 @@ mod tests {
             generator_version: "0.1.0".into(),
             created_at: "2026-09-11T00:00:00Z".into(),
             files: vec![PatchFileEntry {
+                added: false,
                 path: file_path.into(),
                 size: new.len() as u64,
                 original_sha256: Some(sha256_hex(old)),

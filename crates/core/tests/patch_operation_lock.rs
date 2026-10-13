@@ -26,6 +26,7 @@ fn fixture(base: &Path, version: &str) -> (PathBuf, PathBuf) {
         generator_version: "test".into(),
         created_at: "now".into(),
         files: vec![PatchFileEntry {
+            added: false,
             path: "asset.txt".into(),
             patched_sha256: sha256_hex(b"PATCHED"),
             size: 7,
