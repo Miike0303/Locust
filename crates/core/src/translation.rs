@@ -384,24 +384,82 @@ pub fn collapse_runaway_letters(source: &str, translation: &str) -> String {
     }
 
     let runs = letter_runs(translation);
-    if runs.iter().all(|(_, run)| run.len() <= MAX_LETTER_RUN) {
-        return translation.to_string();
+    let letters_capped: String = if runs.iter().all(|(_, run)| run.len() <= MAX_LETTER_RUN) {
+        translation.to_string()
+    } else {
+        let mut source_max: HashMap<char, usize> = HashMap::new();
+        for (key, run) in letter_runs(source) {
+            let longest = source_max.entry(key).or_default();
+            *longest = (*longest).max(run.len());
+        }
+        runs.into_iter()
+            .flat_map(|(key, run)| {
+                let keep = if run[0].is_alphabetic() {
+                    MAX_LETTER_RUN.max(source_max.get(&key).copied().unwrap_or(0))
+                } else {
+                    run.len()
+                };
+                run.into_iter().take(keep)
+            })
+            .collect()
+    };
+    collapse_repeated_units(source, &letters_capped)
+}
+
+/// The same stretch with separators: `N-n-n-n-...`, `ha-ha-ha-...`. Units of
+/// two to four characters containing a letter repeat at most
+/// `MAX_LETTER_RUN` times in a row, unless the source repeats that unit more.
+fn collapse_repeated_units(source: &str, text: &str) -> String {
+    fn lower(text: &str) -> Vec<char> {
+        text.chars()
+            .map(|c| c.to_lowercase().next().unwrap_or(c))
+            .collect()
     }
-    let mut source_max: HashMap<char, usize> = HashMap::new();
-    for (key, run) in letter_runs(source) {
-        let longest = source_max.entry(key).or_default();
-        *longest = (*longest).max(run.len());
+    fn repeats_at(chars: &[char], start: usize, unit: &[char]) -> usize {
+        let mut count = 0;
+        while chars
+            .get(start + count * unit.len()..start + (count + 1) * unit.len())
+            .is_some_and(|window| window == unit)
+        {
+            count += 1;
+        }
+        count
     }
-    runs.into_iter()
-        .flat_map(|(key, run)| {
-            let keep = if run[0].is_alphabetic() {
-                MAX_LETTER_RUN.max(source_max.get(&key).copied().unwrap_or(0))
-            } else {
-                run.len()
+    fn longest_repeat(chars: &[char], unit: &[char]) -> usize {
+        (0..chars.len())
+            .map(|start| repeats_at(chars, start, unit))
+            .max()
+            .unwrap_or(0)
+    }
+
+    let original: Vec<char> = text.chars().collect();
+    let folded = lower(text);
+    let source_folded = lower(source);
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    'scan: while i < original.len() {
+        for len in 2..=4 {
+            let Some(unit) = folded.get(i..i + len) else {
+                break;
             };
-            run.into_iter().take(keep)
-        })
-        .collect()
+            if !unit.iter().any(|c| c.is_alphabetic()) {
+                continue;
+            }
+            let count = repeats_at(&folded, i, unit);
+            if count <= MAX_LETTER_RUN {
+                continue;
+            }
+            let allowed = MAX_LETTER_RUN.max(longest_repeat(&source_folded, unit));
+            if count > allowed {
+                out.extend(&original[i..i + allowed * len]);
+                i += count * len;
+                continue 'scan;
+            }
+        }
+        out.push(original[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Restore placeholder tokens in a provider result (best-effort on failure).
@@ -2614,6 +2672,41 @@ mod runaway_letter_tests {
             collapse_runaway_letters("うひぃ……あぁ", &translation),
             "Uuuuuhiiiii... Aaaaa"
         );
+    }
+
+    #[test]
+    fn separated_stutters_are_capped_at_five_repetitions() {
+        // Real game: Gemini answered a moan with "N-n-n-..." ninety times.
+        let stutter = format!("\\n<Lydia>N{}!", "-n".repeat(90));
+        assert_eq!(
+            collapse_runaway_letters("\\n<リディア>んゔぃっ！", &stutter),
+            "\\n<Lydia>N-n-n-n-n-n!"
+        );
+        assert_eq!(
+            collapse_runaway_letters("あはは", &format!("{}ha!", "ha-".repeat(40))),
+            "ha-ha-ha-ha-ha-ha!"
+        );
+        assert_eq!(
+            collapse_runaway_letters("んちゅ", &"chu ".repeat(30)),
+            "chu chu chu chu chu "
+        );
+    }
+
+    #[test]
+    fn short_or_source_spelled_patterns_are_kept() {
+        for text in [
+            "N-n-no, please!",
+            "Ha-ha-ha, very funny.",
+            "1-2-3-4-5-6-7-8-9",
+            "... ... ... ... ... ... ...",
+            "Bye bye bye bye",
+            "",
+        ] {
+            assert_eq!(collapse_runaway_letters("そのまま", text), text);
+        }
+        let source = "la-la-la-la-la-la-la-la song";
+        let translation = "canción la-la-la-la-la-la-la-la";
+        assert_eq!(collapse_runaway_letters(source, translation), translation);
     }
 }
 
