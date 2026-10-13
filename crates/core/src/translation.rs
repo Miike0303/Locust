@@ -486,32 +486,61 @@ fn collapse_repeated_units(source: &str, text: &str) -> String {
     out
 }
 
-/// Restore placeholder tokens in a provider result (best-effort on failure).
+/// Raw sentinel integrity and restored control integrity are separate gates.
+/// Never manufacture missing controls or accept literal controls instead of tokens.
 fn restore_placeholders_in_result(
     result: &mut TranslationResult,
-    placeholders_by_id: &std::collections::HashMap<String, Vec<Placeholder>>,
-) {
+    placeholders_by_id: &HashMap<String, Vec<Placeholder>>,
+) -> bool {
     let Some(phs) = placeholders_by_id.get(&result.entry_id) else {
-        return;
+        return false;
     };
-    if phs.is_empty() {
-        return;
+    // Check unknown/malformed spellings in the raw answer beyond restore's
+    // bounded numeric scan. Protected originals can themselves contain this
+    // spelling, so testing the restored text would reject legitimate controls.
+    if result.translation.match_indices("{PL_").any(|(offset, _)| {
+        !phs.iter()
+            .any(|ph| result.translation[offset..].starts_with(&ph.token))
+    }) {
+        return false;
     }
     match PlaceholderProcessor::restore(&result.translation, phs) {
-        Ok(restored) => result.translation = restored,
-        Err(e) => {
-            tracing::warn!(
-                "Failed to restore placeholders for {}: {}. Falling back to original with any missing tokens replaced.",
-                result.entry_id, e
-            );
-            let mut t = result.translation.clone();
-            for ph in phs {
-                t = t.replace(&ph.token, &ph.original);
-            }
-            result.translation = t;
+        Ok(restored) => {
+            result.translation = restored;
+            true
         }
+        Err(_) => false,
     }
 }
+
+fn protected_control_inventory(phs: &[Placeholder]) -> String {
+    let tokens = phs
+        .iter()
+        .map(|ph| ph.token.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "EXPECTED SENTINELS: {tokens}. Preserve each exactly once; output no additional sentinel or control tokens."
+    )
+}
+
+fn protected_control_repair_request(
+    original: &TranslationRequest,
+    phs: &[Placeholder],
+) -> TranslationRequest {
+    let mut request = original.clone();
+    let inventory = protected_control_inventory(phs);
+    // Keep the original sanitized source and all record-local guidance, with
+    // one inventory rather than accumulating copies across logical repairs.
+    let context = original.context.as_deref().unwrap_or_default();
+    let context = context.strip_suffix(&inventory).unwrap_or(context);
+    let correction = "PROTECTED-CONTROL CORRECTION: The previous answer did not preserve this record's protected tokens. Translate the original source again, preserving only its expected sentinels, without adding literal control codes. Return only the requested translation.";
+    request.context = Some(format!("{context}{correction} | {inventory}"));
+    request
+}
+
+/// Semantic repairs are logical calls; transport retries remain call_provider's policy.
+const MAX_PROTECTED_CONTROL_REPAIRS: usize = 2;
 
 /// Tight UI slots (short source labels) need a harsher first-pass budget hint.
 /// Threshold is in **encoded bytes** of the source string.
@@ -1054,6 +1083,40 @@ impl TranslationManager {
         }
     }
 
+    /// Additional logical calls share the run's prepaid budget, including all
+    /// source/context/glossary bytes and costs from previously rejected answers.
+    async fn additional_request_budget_error(
+        &self,
+        request: &TranslationRequest,
+        opts: &TranslationOptions,
+        observed_cost: ObservedCost,
+    ) -> Option<LocustError> {
+        let limit = opts.cost_limit_usd?;
+        if !observed_cost.complete {
+            return Some(LocustError::ProviderError(
+                "cannot enforce a cost limit: preceding calls have unknown cost".into(),
+            ));
+        }
+        let chars = request
+            .source
+            .len()
+            .saturating_add(request.context.as_ref().map_or(0, String::len))
+            .saturating_add(request.glossary_hint.as_ref().map_or(0, String::len));
+        match self.provider.estimate_cost(chars, &opts.target_lang).await {
+            Some(estimate) if estimate.is_finite() && estimate >= 0.0 => (observed_cost.amount
+                + estimate
+                > limit)
+                .then_some(LocustError::CostLimitExceeded {
+                    estimated: observed_cost.amount + estimate,
+                    limit,
+                }),
+            None if self.provider.is_free() => None,
+            _ => Some(LocustError::ProviderError(
+                "cannot enforce a cost limit: this provider has no valid cost estimate".into(),
+            )),
+        }
+    }
+
     pub fn with_retry_config(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
         self
@@ -1330,7 +1393,12 @@ impl TranslationManager {
                                         continue 'rounds;
                                     }
                                     for result in &mut results {
-                                        restore_placeholders_in_result(result, &acc.placeholders);
+                                        if !restore_placeholders_in_result(
+                                            result,
+                                            &acc.placeholders,
+                                        ) {
+                                            continue;
+                                        }
                                         if let Some(entry) = entries_by_id.get(&result.entry_id) {
                                             result.translation = collapse_runaway_letters(
                                                 &entry.source,
@@ -1734,6 +1802,13 @@ impl TranslationManager {
                                 None => hint,
                             });
                         }
+                        if !phs.is_empty() {
+                            let inventory = protected_control_inventory(&phs);
+                            context = Some(match context {
+                                Some(c) => format!("{c} | {inventory}"),
+                                None => inventory,
+                            });
+                        }
                         placeholders_by_id.insert(entry.id.clone(), phs);
                         // Per-entry glossary: terms present in source; for binary
                         // slots also drop translations that cannot fit the budget.
@@ -1837,18 +1912,135 @@ impl TranslationManager {
                         in_flight.abort_all();
                         break;
                     }
-                    // Restore placeholders in translations before saving
+                    // Restore/collapse first, then repair controls before any length fitting.
+                    let mut invalid_controls = HashSet::new();
                     for result in &mut results {
-                        restore_placeholders_in_result(result, &placeholders_by_id);
-                        if let Some(source) = sources_by_id.get(&result.entry_id) {
-                            result.translation =
-                                collapse_runaway_letters(source, &result.translation);
+                        let restored = restore_placeholders_in_result(result, &placeholders_by_id);
+                        let entry = &entries_by_id[&result.entry_id];
+                        result.translation =
+                            collapse_runaway_letters(&entry.source, &result.translation);
+                        if !restored
+                            || !PlaceholderProcessor::validate_with_profile(
+                                &entry.source,
+                                &result.translation,
+                                entry.placeholder_profile(),
+                            )
+                            .is_empty()
+                        {
+                            invalid_controls.insert(result.entry_id.clone());
                         }
                     }
+                    for result in &mut results {
+                        if !invalid_controls.contains(&result.entry_id) {
+                            continue;
+                        }
+                        let original = requests
+                            .iter()
+                            .find(|r| r.entry_id == result.entry_id)
+                            .expect("batch IDs validated");
+                        let retry_req = protected_control_repair_request(
+                            original,
+                            &placeholders_by_id[&result.entry_id],
+                        );
+                        let entry = &entries_by_id[&result.entry_id];
+                        for _ in 0..MAX_PROTECTED_CONTROL_REPAIRS {
+                            if cancel.is_cancelled() || budget_error.is_some() {
+                                break;
+                            }
+                            budget_error = self
+                                .additional_request_budget_error(&retry_req, &opts, observed_cost)
+                                .await;
+                            if cancel.is_cancelled() || budget_error.is_some() {
+                                break;
+                            }
+                            match call_provider(
+                                self.provider.clone(),
+                                std::slice::from_ref(&retry_req),
+                                &self.retry,
+                                &cancel,
+                            )
+                            .await
+                            {
+                                Ok(call) => {
+                                    // Billing precedes ID/content acceptance, even for a
+                                    // malformed retry or a response cancelled before saving.
+                                    observed_cost.observe_batch(
+                                        call.results.iter().map(|r| r.cost_usd),
+                                        self.provider.is_free(),
+                                    );
+                                    if call.attempts > 1 && !self.provider.is_free() {
+                                        observed_cost.complete = false;
+                                    }
+                                    budget_error =
+                                        observed_budget_error(observed_cost, opts.cost_limit_usd);
+                                    for usage in &call.results {
+                                        total_tokens += usage.tokens_used.unwrap_or(0) as u64;
+                                        total_input_tokens +=
+                                            usage.input_tokens.unwrap_or(0) as u64;
+                                        total_output_tokens +=
+                                            usage.output_tokens.unwrap_or(0) as u64;
+                                    }
+                                    if cancel.is_cancelled() {
+                                        break;
+                                    }
+                                    if call.results.len() != 1
+                                        || call.results[0].entry_id != result.entry_id
+                                    {
+                                        let _ = tx.send(ProgressEvent::BatchFailed {
+                                            entry_id: Some(result.entry_id.clone()),
+                                            error: "protected-control repair returned mismatched or duplicate entry IDs; entry remains pending".into(),
+                                        }).await;
+                                        continue;
+                                    }
+                                    let mut repaired = call.results.into_iter().next().unwrap();
+                                    if !restore_placeholders_in_result(
+                                        &mut repaired,
+                                        &placeholders_by_id,
+                                    ) {
+                                        continue;
+                                    }
+                                    repaired.translation = collapse_runaway_letters(
+                                        &entry.source,
+                                        &repaired.translation,
+                                    );
+                                    if repaired.translation.trim().is_empty()
+                                        || !PlaceholderProcessor::validate_with_profile(
+                                            &entry.source,
+                                            &repaired.translation,
+                                            entry.placeholder_profile(),
+                                        )
+                                        .is_empty()
+                                    {
+                                        continue;
+                                    }
+                                    result.translation = repaired.translation;
+                                    invalid_controls.remove(&result.entry_id);
+                                    break;
+                                }
+                                Err(error) => {
+                                    observed_cost.complete &= self.provider.is_free();
+                                    budget_error =
+                                        observed_budget_error(observed_cost, opts.cost_limit_usd);
+                                    tracing::warn!(entry_id = %result.entry_id, %error, "protected-control repair failed; entry remains pending");
+                                    // Do not dispatch a new logical call after transport
+                                    // failure/deadline exhaustion. Cancellation wins below.
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Repeated-source fan-out cannot bypass failed raw sentinel integrity.
+                    invalid_controls = invalid_controls
+                        .into_iter()
+                        .flat_map(|id| repeated.members[&id].clone())
+                        .collect();
 
                     // Length-aware retries: up to MAX_BINARY_SLOT_LENGTH_RETRIES
                     // extra provider attempts per oversize binary-slot entry.
                     for result in &mut results {
+                        if invalid_controls.contains(&result.entry_id) {
+                            continue;
+                        }
                         let Some((slot, budget)) = budgets_by_id.get(&result.entry_id) else {
                             continue;
                         };
@@ -1884,41 +2076,11 @@ impl TranslationManager {
                             if budget_error.is_some() {
                                 break;
                             }
-                            if let Some(limit) = opts.cost_limit_usd {
-                                if !observed_cost.complete {
-                                    budget_error = Some(LocustError::ProviderError(
-                                        "cannot enforce a cost limit: preceding calls have unknown cost".into(),
-                                    ));
-                                    break;
-                                }
-                                let chars = retry_req
-                                    .source
-                                    .len()
-                                    .saturating_add(
-                                        retry_req.context.as_ref().map_or(0, String::len),
-                                    )
-                                    .saturating_add(
-                                        retry_req.glossary_hint.as_ref().map_or(0, String::len),
-                                    );
-                                match self.provider.estimate_cost(chars, &opts.target_lang).await {
-                                    Some(estimate) if estimate.is_finite() && estimate >= 0.0 => {
-                                        if observed_cost.amount + estimate > limit {
-                                            budget_error = Some(LocustError::CostLimitExceeded {
-                                                estimated: observed_cost.amount + estimate,
-                                                limit,
-                                            });
-                                        }
-                                    }
-                                    None if self.provider.is_free() => {}
-                                    _ => {
-                                        budget_error = Some(LocustError::ProviderError(
-                                            "cannot enforce a cost limit: this provider has no valid cost estimate".into(),
-                                        ));
-                                    }
-                                }
-                                if budget_error.is_some() {
-                                    break;
-                                }
+                            budget_error = self
+                                .additional_request_budget_error(&retry_req, &opts, observed_cost)
+                                .await;
+                            if cancel.is_cancelled() || budget_error.is_some() {
+                                break;
                             }
 
                             match call_provider(
@@ -1966,11 +2128,10 @@ impl TranslationManager {
                                         continue;
                                     }
                                     let mut retry_result = retry_batch.remove(0);
-                                    restore_placeholders_in_result(
+                                    if !restore_placeholders_in_result(
                                         &mut retry_result,
                                         &placeholders_by_id,
-                                    );
-                                    if retry_result.translation.trim().is_empty()
+                                    ) || retry_result.translation.trim().is_empty()
                                         || entries_by_id.get(&result.entry_id).is_some_and(
                                             |entry| {
                                                 !PlaceholderProcessor::validate_with_profile(
@@ -2121,12 +2282,13 @@ impl TranslationManager {
                             continue;
                         }
                         if let Some(entry) = entries_by_id.get(&result.entry_id) {
-                            if !PlaceholderProcessor::validate_with_profile(
-                                &entry.source,
-                                &result.translation,
-                                entry.placeholder_profile(),
-                            )
-                            .is_empty()
+                            if invalid_controls.contains(&result.entry_id)
+                                || !PlaceholderProcessor::validate_with_profile(
+                                    &entry.source,
+                                    &result.translation,
+                                    entry.placeholder_profile(),
+                                )
+                                .is_empty()
                             {
                                 let _ = tx.send(ProgressEvent::BatchFailed {
                                     entry_id: Some(result.entry_id.clone()),
@@ -5090,7 +5252,8 @@ mod tests {
             rejected,
             "duplicate tokens must fail placeholder validation"
         );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        // Initial answer plus two bounded semantic repairs; all remain invalid.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
         let saved = db.get_entry("duplicate-token").unwrap().unwrap();
         assert_eq!(saved.status, StringStatus::Pending);
         assert!(saved.translation.is_none());
@@ -5210,6 +5373,7 @@ mod tests {
                 "rpgmaker-mv",
                 "Map001.json",
             ),
+            ("Hello", "rpgmaker-mv", "Map001.json"),
         ]
         .iter()
         .enumerate()
@@ -5242,7 +5406,7 @@ mod tests {
                 .with_context("record-0"),
         );
         let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
-        let _ = run_repeated_job(entries.clone(), provider.clone(), Default::default()).await;
+        let (db, _) = run_repeated_job(entries.clone(), provider.clone(), Default::default()).await;
         let calls = provider.calls.lock().unwrap();
         let requests: Vec<_> = calls.iter().flatten().collect();
         assert_eq!(
@@ -5267,11 +5431,46 @@ mod tests {
             );
         }
         for req in requests {
+            let entry = entries.iter().find(|e| e.id == req.entry_id).unwrap();
+            let context = req.context.as_deref().unwrap();
+            let original_context = entry.context.as_deref().unwrap();
+            assert!(context.starts_with(original_context), "{}", req.entry_id);
+            assert_eq!(
+                db.get_entry(&req.entry_id).unwrap().unwrap().context,
+                entry.context,
+                "stored record context must remain unchanged"
+            );
             if req.entry_id == "confirmed" {
-                assert!(req.context.as_deref().unwrap().contains("RECORD-LOCAL"));
+                assert!(context.contains("RECORD-LOCAL"));
             } else {
-                let entry = entries.iter().find(|e| e.id == req.entry_id).unwrap();
-                assert_eq!(req.context, entry.context, "{}", req.entry_id);
+                for speaker_note in [
+                    "RECORD-LOCAL",
+                    "speaker arguments",
+                    "generic roles, occupations and descriptive titles",
+                ] {
+                    assert!(
+                        !context.contains(speaker_note),
+                        "{}: {context}",
+                        req.entry_id
+                    );
+                }
+                let (_, phs) = PlaceholderProcessor::extract_with_profile(
+                    &entry.source,
+                    entry.placeholder_profile(),
+                );
+                let expected = if phs.is_empty() {
+                    original_context.to_owned()
+                } else {
+                    let inventory = phs
+                        .iter()
+                        .map(|ph| ph.token.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!(
+                        "{original_context} | EXPECTED SENTINELS: {inventory}. Preserve each exactly once; output no additional sentinel or control tokens."
+                    )
+                };
+                assert_eq!(context, expected, "{}", req.entry_id);
             }
         }
     }
