@@ -20,7 +20,17 @@ use locust_core::validation::{count_binary_slot_oversize, Validator};
 
 fn open_existing_project(path: &Path) -> anyhow::Result<Database> {
     require_existing_project(path)?;
-    Ok(Database::open(path)?)
+    Database::open(path).map_err(|error| {
+        // SQLite's own wording repeats three times through the cause chain.
+        if error.to_string().contains("file is not a database") {
+            anyhow::anyhow!(
+                "not a Locust project database: {}. Select the .locust.db file created by `locust extract`.",
+                path.display()
+            )
+        } else {
+            error.into()
+        }
+    })
 }
 
 fn require_existing_project(path: &Path) -> anyhow::Result<()> {
@@ -1515,6 +1525,12 @@ fn cmd_extract(
     dry_run: bool,
     force: bool,
 ) -> anyhow::Result<()> {
+    if !path.try_exists()? {
+        anyhow::bail!(
+            "game folder not found: {}. Check the path and try again.",
+            path.display()
+        );
+    }
     let game_root = path.canonicalize()?;
     let _source_lock = locust_core::project::lock_game_source(&path)?;
     let registry = locust_formats::default_registry();

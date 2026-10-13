@@ -291,3 +291,54 @@ fn glossary_delete_updates_an_existing_project() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn extract_of_a_missing_game_folder_names_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no such game");
+    let output = locust()
+        .args(["extract", missing.to_str().unwrap(), "--dry-run"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("game folder not found") && stderr.contains("no such game"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("os error"), "{stderr}");
+}
+
+#[test]
+fn a_file_that_is_not_a_project_database_gets_one_clear_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let not_db = dir.path().join("script.rpy");
+    std::fs::write(
+        &not_db,
+        "label start:
+    e \"Hello\"
+",
+    )
+    .unwrap();
+    for args in [
+        vec!["validate", not_db.to_str().unwrap()],
+        vec!["translate", not_db.to_str().unwrap(), "-p", "mock"],
+        vec!["stats", not_db.to_str().unwrap()],
+    ] {
+        let output = locust().args(&args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            stderr.contains("not a Locust project database") && stderr.contains("script.rpy"),
+            "{args:?}: {stderr}"
+        );
+        assert!(!stderr.contains("Caused by"), "{args:?}: {stderr}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&not_db).unwrap(),
+        "label start:
+    e \"Hello\"
+",
+        "the selected file must stay untouched"
+    );
+}
