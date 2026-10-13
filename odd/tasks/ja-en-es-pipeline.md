@@ -1,50 +1,33 @@
 # Trustworthy Japanese -> English -> Spanish game pipeline
 
-## Goal
-Reliable JA -> EN -> ES -> patch -> easy automatic installation for Japanese visual novels, Ren'Py and RPG Maker. Universal linguistic correctness is not a testable guarantee; report only observed completeness, source/control preservation, safe isolated installation and truthful failures/unsupported states.
-
-## Scope and constraints
-- Baseline `01c9561`; branch `feat/ja-en-es-pipeline`.
-- Preserve three dirty `.claude` tooling files and separate verified UI branch `fix/desktop-audit-findings` (`34b05b2`); exclude them from this feature.
-- Never modify original games, read credentials, spend money, delete existing backups, or weaken unsupported/encrypted-format guards. Testing installs only into operation-owned copies.
-- Free/subscription providers only where already registered; no purchases/account changes. Deterministic local providers use dummy keys and loopback.
-- Partial editing workflows remain supported; automated releases use strict completeness.
-- One delegated writer at a time. Applicable tests: observed RED then GREEN. RDD off; native assessment failures receive independent verification.
-- Delivery: verified default/main branch chain, each work unit with full checks and manual exact-SHA hosted CI before non-force main delivery. YOLO supplies ordinary delivery permission, not destructive authorization.
-- Forecast 600-1000 authored diff lines in three coherent units; actual PIPE-1 440 excluding task tracking. Advisory size heuristic only; no code golf or removal of tests.
+## Goal and constraints
+Reliable JA -> EN -> ES -> patch -> easy installation for Japanese VN, Ren'Py and RPG Maker. Universal linguistic correctness is not promised. Never modify original games, read owner credentials, spend money, delete existing backups, weaken unsupported/encrypted guards, or claim unobserved runtime/native/linguistic checks.
+Baseline `01c9561`, feature `feat/ja-en-es-pipeline`. Preserve three dirty `.claude` files and separate UI branch `34b05b2`. One writer, deterministic behavior changes use observed RED/GREEN. RDD off; unavailable assessment => independent verifier. Free/subscription or isolated dummy-key loopback providers only.
+Delivery: verified main chain; full checks and manual exact-SHA hosted CI before non-force main delivery, YOLO ordinary permission. Size heuristic advisory: keep readable coherent slices. Running authored code/tests approximately1824 lines; growth reflects self-contained transport/engine oracles, not production breadth.
 
 ## Tasks
-- [x] PIPE-1 (done; delegated worker + verifier): Strict complete pivot API/CLI flag; refuse absent/Unicode-blank/Pending/Error rows before artifacts, retain provenance/control checks and partial compatibility. Commit `4afefbda8ff8b730b1754b816c49b4666054bcaf`, exact-SHA CI passed and main fast-forwarded/pushed.
-- [ ] PIPE-2 (in progress; delegated): Deterministic CLI JA -> EN -> ES -> inject -> package -> apply -> re-extract -> rollback for Ren'Py, RPG Maker MV and loose KiriKiri. Use a local scripted OpenAI-compatible endpoint, not SQL translation seeding. Cover titles, controls, duplicate slots, missing/corrupt answers and original hashes. Edit surfaces: `crates/cli/tests/ja_en_es_pipeline.rs`, `crates/cli/tests/support/scripted_openai.rs`. Work-unit commit pending.
-- [ ] PIPE-3 (pending; delegated): Safe repeatable stdlib Python orchestration around existing commands with strict gates, isolated translated/install copies, reports and fail-closed resumability. Proposed surfaces `tools/ja_en_es_pipeline.py`, `tools/test_ja_en_es_pipeline.py`, `tools/ja_en_es_pipeline.md`; map details before dispatch. Audit real available games read-only/owned copies with free/subscription providers; explicitly report language/runtime/unsupported limitations. Commit pending.
+- [x] PIPE-1 (delegated): Strict complete pivot API/CLI. Commit `4afefbda8ff8b730b1754b816c49b4666054bcaf`, hosted verified and main delivered.
+- [x] PIPE-2 (delegated): Scripted real-transport CLI round trips for Ren'Py/MV/loose KiriKiri, duplicate slots, titles/controls, strict patch/receipts, re-extract and exact asset rollback. Commit `7f8d5b3bb2a4d0b2d5e980d8e88be46db1172beb`, hosted verified and main delivered.
+- [ ] PIPE-3A (in progress; delegated): Machine-readable CLI injection report, keeping human output compatible, so automation cannot silently miss warnings/skips. Derive/test exact supported contract. Surfaces `crates/cli/src/main.rs`, `crates/cli/tests/inject_json.rs`, small README usage. Commit pending.
+- [ ] PIPE-3B (pending; delegated): Safe stdlib Python orchestration around existing commands, strict row/extraction gates, isolated pristine/work/install copies, machine-readable injection evidence, artifact/re-extract/rollback checks, reports and conservative resumability. Surfaces `tools/ja_en_es_pipeline.py`, `tools/test_ja_en_es_pipeline.py`, `tools/ja_en_es_pipeline.md`. Commit pending.
+- [ ] PIPE-4 (pending; delegated): Audit real available Japanese games and saved JA/EN/ES text read-only; translate small representative isolated copies with already available free/subscription providers, evaluate names/titles/control codes/line layouts and untranslated/degenerate text. Fix deterministic causes in separately scoped units; report linguistic/runtime/unsupported limits and require no owner-game writes. Commit evidence pending.
 
 ## Acceptance
-- No release-success when inventory shrinks, translations are absent/stale or controls damaged.
-- Strict pivot preserves every row; refusal creates no output DB/sidecar and changes no source rows.
-- Synthetic outputs preserve controls, strictly install on pristine copies, re-extract exact expected text, rollback asset bytes, and leave originals unchanged.
-- Automation never injects into originals; rejects incomplete extraction/stages, unsafe or occupied roots and unsupported formats. Exit status alone is not a completeness gate.
-- Evidence binds checks to commits and distinguishes scripted/real providers and technical/linguistic/runtime claims.
+No release-success for shrinking inventory, warnings of incomplete extraction, missing/stale translations, damaged controls or partial injection. Partial editing remains supported. Strict pivot refusal creates no output/sidecar and changes no source. Automation refuses unsafe/occupied/overlapping roots, never injects originals, strictly installs expected payloads, re-extracts correct slots and proves rollback against immutable pristine assets. Evidence distinguishes scripted/real providers and technical/linguistic/runtime guarantees.
 
 ## Evidence
 ### PIPE-1
-- RED: four core failures and four CLI failures before implementation. GREEN: core pivot 24/0; CLI pivot 9/0.
-- Independent local workspace 2275 passed / 0 failed / 21 ignored; frontend 439/0 and production build; fmt/whitespace passed.
-- Initial Clippy nonminimal_bool failure corrected with equivalent `is_none_or`; independently rerun full strict Clippy, fmt and CLI9/0 passed. `.test-tmp` only `.gitignore`.
-- Assessment unavailable due undeclared untracked files; conservatively treated high, separate verifier used. No native RDD because off.
-- Hosted [38453099882](https://github.com/Miike0303/Locust/actions/runs/38453099882) exact `4afefbd`: Ubuntu Rust2264/0/21; Windows2275/0/21; frontend439/0/0 each; npm ci/build, fmt, strict Clippy and workspace including Tauri pass. Ignored tests not run. No real linguistic/game/native-UI claim.
-### PIPE-2 map
-- Unknown configured providers with base_url register OpenAI-compatible transport; existing seam can test real translate CLI twice with masked source-keyed local answers.
-- Direct-injected root cannot be refreshed normally: re-extract separately patch-applied pristine copy into a new DB.
-- CLI factory creates a profile per command by default; override one operation-owned profile per case.
-- Extraction warnings persist as `project_metadata.extraction_warnings` and pivot copies metadata. Strict pivot is a row gate, not an extraction completeness gate.
+RED core4 + CLI4 failures; GREEN core24/CLI9. Independent workspace2275/0/21, frontend439/0+build; fmt/whitespace pass. Clippy initial nonminimal_bool failure corrected equivalently; independent strictClippy/fmt/CLI9 pass. `.test-tmp` only `.gitignore`. Assessment unavailable due untracked declarations, conservative high path used.
+Hosted [38453099882](https://github.com/Miike0303/Locust/actions/runs/38453099882), exact4afefbd: Ubuntu2264/0/21, Windows2275/0/21, frontend439/0 each. Full CI gates pass, ignored not run.
+### PIPE-2
+Six resource slots/engine, literal JA/EN/ES expectations, both real CLI provider requests, complete inventory/provenance, ZIP hashes, strict pristine receipt, original asset hashes, exact file-byte rollback. Six broken-answer scenarios observe rejected pending rows and strict pivot refusal. Seeded extraction warning only characterizes metadata carry-forward, not actual extraction warning prevention.
+Characterization exception: no product behavior changed; no product RED. Initial5/0; separate reviewer found slow-trickle endpoint shutdown hazard. Regression RED5pass2fail, then 50ms poll/shared2sec deadline + cancellation corrected; writer twice8/0 and independent8/0/fmt pass. Initial full workspace2280/0/21, frontend439/0+build/strictClippy pass; corrected full hosted verification follows.
+Hosted [38459104899](https://github.com/Miike0303/Locust/actions/runs/38459104899), exact7f8d5b3: Ubuntu2272/0/21, Windows2283/0/21, frontend439/0 each; all gates pass. Main delivered. No real-game/linguistic/native claims.
+### Follow-up map
+Injection currently prints tables and can return success with warnings/skips; serializable core reports already exist. Add JSON seam before automation instead of parsing tables. Generic control checker does not protect argument-bearing KAG tags; injector rejects altered tag inventory. Characterize malicious tag answers and ensure automation never accepts partial results. Preserve proper names/unchanged source carefully: a skip is not automatically corruption, but requires explicit reason and exact artifact equivalence.
 
-### PIPE-2 implementation
-- Added scripted real-transport CLI round trips for Ren'Py, MV and loose KiriKiri (six resource slots each), exact JA/EN/ES literals, duplicated slots, names/controls, ZIP payload/manifest hashes, strict receipts, unchanged original assets and complete file-byte rollback.
-- Six negative missing-JA-answer / corrupted-ES-placeholder scenarios actually run translation and observe rejected pending rows plus strict pivot refusal and no DB sidecars/artifacts. Extraction-warning test is metadata carry-forward only, not a completeness gate.
-- Initial characterization exception: no product-change RED applicable. Initial focused5/0 and independent full workspace2280/0/21, frontend439/0+build, strictClippy/fmt passed.
-- Independent reviewer found fixture endpoint teardown unbounded under slow trickle. Added deadline/cancellation tests: observed RED5passed/2failed, corrected 50ms polls/shared2sec deadline, then writer two focused8/0 runs and independent8/0/fmt passed. Writer strictClippy passed. `.test-tmp` only `.gitignore`.
-- Total tests/helpers 1384 new lines: self-contained bounded HTTP transport plus three engine oracles; exceeds forecast, kept as one test-only behavior slice without mixing production changes or compressing coverage. Hosted corrected-candidate CI pending.
-- Follow-up limitation: generic placeholder validator does not protect argument-bearing KAG tags, while KiriKiri injection rejects altered tag inventory. No malformed-tag product CLI reproduction yet; automation must reject injection warnings/skips, not label a partial patch complete.
+### PIPE-3A implementation
+CLI `inject --json` emits exactly one existing DirectInjectReport or MultiLangReport, with mode discriminator, warnings, skip reasons, recording outcomes and backups. Human output unchanged; JSON-mode diagnostics/tracing go stderr; errors retain nonzero exit. RED1pass6fail (flag missing); GREEN7/0 injectJSON +8/0 pipelines. Independent full workspace2290/0/21, frontend439/0+build, strictClippy/fmt/whitespace pass. `.test-tmp` only `.gitignore`. No-op counter semantics verified: staged strings can be nonzero even when no physical paths changed, so automation must not infer completeness from counts alone. Assessment unavailable/untracked, independent conservative path used. Commit/hosted CI pending.
 
 ## Next step
-Commit and hosted-verify PIPE-2, then implement PIPE-3 safety gates and quality audits. No source production changes until a deterministic failing behavior justifies a separate bounded fix.
+Commit and hosted-verify PIPE-3A, then implement safe orchestration and execute real quality audits without treating scripted results as linguistic proof.

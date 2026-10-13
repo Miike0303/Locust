@@ -143,6 +143,9 @@ enum Commands {
         /// Install translations in place using a recoverable private work copy
         #[arg(long)]
         direct: bool,
+        /// Emit the complete core injection report as one JSON object on stdout
+        #[arg(long)]
+        json: bool,
     },
     /// Validate translations
     Validate {
@@ -416,10 +419,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let filter = if cli.verbose { "debug" } else { "info" };
-    tracing_subscriber::fmt()
+    let logging = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false)
-        .init();
+        .with_target(false);
+    if matches!(&cli.command, Commands::Inject { json: true, .. }) {
+        // Only inject --json reserves stdout for its core report. Keep all
+        // other commands' existing logging/output behavior unchanged.
+        logging.with_writer(std::io::stderr).init();
+    } else {
+        logging.init();
+    }
 
     let config = load_config(&cli.config);
 
@@ -469,11 +478,12 @@ async fn main() -> anyhow::Result<()> {
             languages,
             output_dir,
             direct,
+            json,
         } => {
             if direct {
-                cmd_inject_direct(game_path, project, languages).await?
+                cmd_inject_direct(game_path, project, languages, json).await?
             } else {
-                cmd_inject(game_path, project, mode, languages, output_dir).await?
+                cmd_inject(game_path, project, mode, languages, output_dir, json).await?
             }
         }
         Commands::Validate { project, json } => cmd_validate(project, json)?,
@@ -1890,6 +1900,7 @@ async fn cmd_inject(
     mode: Option<String>,
     languages: Vec<String>,
     output_dir: Option<PathBuf>,
+    json: bool,
 ) -> anyhow::Result<()> {
     let mode = match mode.as_deref() {
         Some("add") => OutputMode::Add,
@@ -1951,7 +1962,9 @@ async fn cmd_inject(
     let preflight_entries = db.get_entries(&EntryFilter::default())?;
     warn_binary_slot_oversize(&preflight_entries);
 
-    println!("Creating backup...");
+    if !json {
+        println!("Creating backup...");
+    }
     let injector =
         locust_core::extraction::MultiLangInjector::new(registry, db.clone(), backup_mgr);
 
@@ -1979,33 +1992,37 @@ async fn cmd_inject(
         locust_core::extraction::record_multilang_injection(&db, &report, &languages, &|lang| {
             replace_containment_remedy(&format_id, &game_path, &project, lang)
         })?;
-    for (lang, outcome) in &outcomes {
-        if let Some(rep) = report.reports.get(lang) {
-            print_record_outcome(lang, outcome, rep);
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        for (lang, outcome) in &outcomes {
+            if let Some(rep) = report.reports.get(lang) {
+                print_record_outcome(lang, outcome, rep);
+            }
         }
-    }
 
-    let mut table = Table::new();
-    table.set_header(vec!["Property", "Value"]);
-    table.add_row(vec![
-        "Languages processed",
-        &report.languages_processed.join(", "),
-    ]);
-    table.add_row(vec!["Backup ID", &report.backup_id]);
-    for (lang, rep) in &report.reports {
-        for (reason, count) in &rep.skip_reasons {
-            table.add_row(vec![format!("{lang} skipped: {reason}"), count.to_string()]);
+        let mut table = Table::new();
+        table.set_header(vec!["Property", "Value"]);
+        table.add_row(vec![
+            "Languages processed",
+            &report.languages_processed.join(", "),
+        ]);
+        table.add_row(vec!["Backup ID", &report.backup_id]);
+        for (lang, rep) in &report.reports {
+            for (reason, count) in &rep.skip_reasons {
+                table.add_row(vec![format!("{lang} skipped: {reason}"), count.to_string()]);
+            }
+            table.add_row(vec![
+                &format!("{} files modified", lang),
+                &rep.files_modified.to_string(),
+            ]);
+            table.add_row(vec![
+                &format!("{} strings written", lang),
+                &rep.strings_written.to_string(),
+            ]);
         }
-        table.add_row(vec![
-            &format!("{} files modified", lang),
-            &rep.files_modified.to_string(),
-        ]);
-        table.add_row(vec![
-            &format!("{} strings written", lang),
-            &rep.strings_written.to_string(),
-        ]);
+        println!("{table}");
     }
-    println!("{table}");
 
     // Surface per-language failures. These used to be swallowed silently:
     // injection could fail for EVERY language while the command printed a
@@ -2040,6 +2057,7 @@ async fn cmd_inject_direct(
     game_path: PathBuf,
     project: PathBuf,
     languages: Vec<String>,
+    json: bool,
 ) -> anyhow::Result<()> {
     if languages.len() > 1 {
         anyhow::bail!(
@@ -2057,13 +2075,15 @@ async fn cmd_inject_direct(
 
     let format_id = plugin.id().to_string();
     let entries = db.get_entries(&EntryFilter::default())?;
-    let translated_count = entries.iter().filter(|e| e.translation.is_some()).count();
-    println!(
-        "Direct inject: {} translated strings into {} ({})",
-        translated_count,
-        game_path.display(),
-        plugin.name()
-    );
+    if !json {
+        let translated_count = entries.iter().filter(|e| e.translation.is_some()).count();
+        println!(
+            "Direct inject: {} translated strings into {} ({})",
+            translated_count,
+            game_path.display(),
+            plugin.name()
+        );
+    }
     warn_binary_slot_oversize(&entries);
 
     // Shared core path (HTTP + desktop): backup, inject in place, record
@@ -2071,10 +2091,16 @@ async fn cmd_inject_direct(
     let backup_root = locust_backup_root();
     std::fs::create_dir_all(&backup_root).ok();
     let mgr = BackupManager::new(backup_root);
-    println!("Creating backup before writing the original game tree...");
+    if !json {
+        println!("Creating backup before writing the original game tree...");
+    }
     let report = locust_core::extraction::inject_direct(
         &registry, &db, &mgr, &game_path, &format_id, &languages,
     )?;
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
 
     // Contractual zero-write reporting (same messages as multilang inject):
     // silent keeps / silent nothing-recorded are the stale-recording hazard.
@@ -4275,6 +4301,7 @@ mod tests {
                 game_dir.clone(),
                 db_path.clone(),
                 vec!["es".to_string(), "fr".to_string()],
+                false,
             )
             .await
             .unwrap_err();
@@ -4322,7 +4349,7 @@ mod tests {
 
         {
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
-            cmd_inject_direct(game_dir.clone(), db_path, vec!["es".to_string()])
+            cmd_inject_direct(game_dir.clone(), db_path, vec!["es".to_string()], false)
                 .await
                 .unwrap();
         }
@@ -4388,7 +4415,7 @@ mod tests {
 
         {
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
-            cmd_inject_direct(game.clone(), db_path, vec!["es".into()])
+            cmd_inject_direct(game.clone(), db_path, vec!["es".into()], false)
                 .await
                 .unwrap();
         }
@@ -4424,7 +4451,7 @@ mod tests {
 
         {
             std::env::set_var("LOCUST_BACKUP_ROOT", &bak);
-            cmd_inject_direct(game_dir, db_path.clone(), Vec::new())
+            cmd_inject_direct(game_dir, db_path.clone(), Vec::new(), false)
                 .await
                 .unwrap();
         }

@@ -146,6 +146,31 @@ locust patch-rollback "<clean_copy>"   # restores .locust/backup
 
 After a new Direct injection, `patch` can omit `--pristine`: it retrieves the exact recorded backup and verifies its original hashes, including after restart or switching between CLI and desktop profiles. Repeating an injection that writes nothing keeps the previous association. A missing or modified recorded backup stops packaging; supply an intact `--pristine` copy to recover. Older records without backup provenance retain the legacy fallback behavior. The backup belongs to that injection generation, which may start from an already translated working copy.
 
+### Machine-readable injection reports
+
+```bash
+locust inject "<work_copy>" -P project.locust.db --direct -l es --json > inject.json
+locust inject "<work_copy>" -P project.locust.db -m add -l es --json > inject.json
+# Replace also supports --json (requires -l es and -o <output_dir>).
+```
+
+`inject --json` writes exactly one existing core report object to stdout, without
+an envelope: `mode: "direct"` selects `DirectInjectReport`; `mode: "add"` or
+`"replace"` selects `MultiLangReport`. Each language's `reports` entry includes
+counts, `files_written`, `warnings`, and `skip_reasons` (including `unclassified`
+when the plugin supplies no precise reason). Direct exposes `outcomes` as
+`[language, outcome]` pairs and retained `backup_id`, `backup_path`, and
+`pristine_backup_id`; Add/Replace expose `recording_outcomes`, `injected_roots`,
+and `backup_id`. Outcomes retain core serialization: `{"Recorded":{"files":N}}`,
+`{"KeptPrevious":{"recorded_at":"..."}}`, or `"NothingRecorded"`.
+
+Counts retain engine semantics: a pristine-replay no-op can count staged strings
+while writing zero files. Inspect paths, skips, warnings, and recording outcomes,
+not just `strings_written` or exit status. JSON adds no fail-on-warning policy.
+Diagnostics/logs go to stderr; unflagged human output is unchanged. Failed
+languages still exit nonzero after emitting the report when one is available;
+earlier fatal errors emit stderr diagnostics with no report.
+
 ### Complete Japanese → English → Spanish pivot
 
 After translating a Japanese project into English, gate the next stage on every
