@@ -307,6 +307,170 @@ class MockCli:
         return subprocess.CompletedProcess(argv, returncode, stdout, b"do not log source/credentials")
 
 
+class FallbackTests(PipelineCase):
+    def test_explicit_fallback_preserves_primary_rows_and_completes_both_stages(self):
+        options = self.options(provider="antigravity", fallback_provider="google")
+        cli = MockCli(self)
+        cli.missing = False
+        actual = cli.run
+        ready_before = {}
+        def run(argv, **kwargs):
+            args = argv[3:]
+            result = actual(argv, **kwargs)
+            if args[0] == "extract":
+                db = Path(args[-1])
+                cli.rows[db].append(dict(copy.deepcopy(cli.rows[db][0]), id="script.rpy#2", source="進む"))
+            if args[0] == "translate":
+                db, provider = Path(args[1]), args[args.index("-p") + 1]
+                if provider == "antigravity":
+                    cli.rows[db][0]["provider_used"] = provider
+                    ready_before[db] = copy.deepcopy(cli.rows[db][0])
+                    cli.rows[db][1].update(translation=None, status="pending", provider_used=None, translated_at=None)
+                else:
+                    self.assertEqual(kwargs["env"]["HOME"], str(self.root / "run/profile"))
+                    self.assertEqual(cli.rows[db][0], ready_before[db])
+            return result
+        with patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(pipeline.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(pipeline.PipelineError, "inject-spanish"):
+                pipeline.Pipeline(options).run()
+        manifest = pipeline.read_json_file(self.root / "run/pipeline-manifest.json")
+        self.assertEqual([s["stage"] for s in manifest["stages"] if "fallback" in s["stage"]],
+                         ["ja-en-fallback-google", "en-es-fallback-google"])
+        for database in ("english.db", "spanish.db"):
+            rows = cli.rows[self.root / "run" / database]
+            self.assertEqual([r["provider_used"] for r in rows], ["antigravity", "google"])
+            self.assertEqual(len(rows), 2)
+
+    def test_complete_primary_never_invokes_optional_fallback(self):
+        cli = MockCli(self)
+        cli.missing = False
+        actual = cli.run
+        def run(argv, **kwargs):
+            result = actual(argv, **kwargs)
+            if argv[3] == "translate":
+                self.assertIn("antigravity", argv)
+                for r in cli.rows[Path(argv[4])]:
+                    r["provider_used"] = "antigravity"
+            return result
+        with patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(pipeline.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(pipeline.PipelineError, "inject-spanish"):
+                pipeline.Pipeline(self.options(provider="antigravity", fallback_provider="google")).run()
+        self.assertEqual(sum(c[0] == "translate" for c in cli.calls), 2)
+        self.assertFalse(any("google" in c for c in cli.calls))
+
+    def test_fallback_settings_are_explicit_and_test_routes_cannot_conflict(self):
+        for changes in ({"fallback_provider": "openai"}, {"fallback_provider": "google"},
+                        {"provider": "antigravity", "fallback_provider": "google", "test_endpoint": "http://127.0.0.1:7"},
+                        {"provider": "antigravity", "fallback_provider": "google", "test_endpoint": "http://127.0.0.1:7",
+                         "test_fallback_endpoint": "http://127.0.0.1:7"}):
+            with self.subTest(changes=changes), self.assertRaises(pipeline.PipelineError):
+                pipeline.preflight(self.options(**changes))
+
+
+    def test_failed_timed_out_or_unpublished_primary_never_falls_back(self):
+        parent = self.root
+        for fault in ("failure", "timeout", "publication"):
+            with self.subTest(fault=fault):
+                self.root = parent / fault
+                self.root.mkdir()
+                cli = MockCli(self)
+                actual_run, actual_replace = cli.run, pipeline.os.replace
+                def run(argv, **kwargs):
+                    if argv[3] == "translate":
+                        if fault == "timeout":
+                            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+                        if fault == "failure":
+                            return subprocess.CompletedProcess(argv, 1, b"", b"synthetic")
+                    return actual_run(argv, **kwargs)
+                def publish(source, target):
+                    manifest = pipeline.read_json_file(Path(source))
+                    if fault == "publication" and manifest["stages"] and manifest["stages"][-1]["stage"] == "ja-en":
+                        raise OSError(errno.EIO, "synthetic publication failure")
+                    return actual_replace(source, target)
+                with patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(pipeline.subprocess, "run", side_effect=run) as child, patch.object(pipeline.os, "replace", side_effect=publish):
+                    with self.assertRaises(pipeline.PipelineError):
+                        pipeline.Pipeline(self.options(provider="antigravity", fallback_provider="google")).run()
+                self.assertEqual(sum(c.args[0][3] == "translate" for c in child.call_args_list), 1)
+                self.assertFalse((self.root / "run/spanish.db").exists())
+        self.root = parent
+
+    def test_fallback_failure_timeout_and_unproven_rows_cannot_advance(self):
+        parent = self.root
+        for fault in ("failure", "timeout", "provider", "static", "ready-columns", "unknown-control"):
+            with self.subTest(fault=fault):
+                self.root = parent / fault
+                self.root.mkdir()
+                cli = MockCli(self)
+                cli.missing = False
+                actual = cli.run
+                def run(argv, **kwargs):
+                    args = argv[3:]
+                    fallback = args[0] == "translate" and "google" in args
+                    if fallback and fault == "failure":
+                        return subprocess.CompletedProcess(argv, 1, b"", b"synthetic")
+                    if fallback and fault == "timeout":
+                        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+                    result = actual(argv, **kwargs)
+                    if args[0] == "extract":
+                        db = Path(args[-1])
+                        cli.rows[db].append(dict(copy.deepcopy(cli.rows[db][0]), id="script.rpy#2", source="進む"))
+                    if args[0] == "translate":
+                        db = Path(args[1])
+                        if not fallback:
+                            cli.rows[db][0]["provider_used"] = "antigravity"
+                            cli.rows[db][1].update(translation=None, status="pending", provider_used=None, translated_at=None)
+                        elif fault == "provider":
+                            cli.rows[db][1]["provider_used"] = "unproven"
+                        elif fault == "static":
+                            cli.rows[db][1]["context"] = "changed"
+                        elif fault == "ready-columns":
+                            cli.rows[db][0]["reviewed_at"] = "changed"
+                    if args[0] == "validate" and fault == "unknown-control":
+                        report = {"count": 1, "issues": [{"entry_id": "script.rpy#1", "kind": "UnknownControl", "message": "unclassified"}]}
+                        return subprocess.CompletedProcess(argv, 1, json.dumps(report).encode(), b"")
+                    return result
+                with patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(pipeline.subprocess, "run", side_effect=run):
+                    with self.assertRaises(pipeline.PipelineError):
+                        pipeline.Pipeline(self.options(provider="antigravity", fallback_provider="google")).run()
+                manifest = pipeline.read_json_file(self.root / "run/pipeline-manifest.json")
+                self.assertFalse(manifest["injection_started"])
+                self.assertFalse((self.root / "run/spanish.db").exists())
+                self.assertEqual(manifest["phase"], "english-pending")
+                if fault == "timeout":
+                    self.assertTrue(manifest["uncertain_child"])
+        self.root = parent
+
+    def test_version_defaults_and_forged_fallback_stage_refuse_resume(self):
+        cli = MockCli(self)
+        options = self.options(provider="antigravity", fallback_provider="google")
+        # Both transports leave pending; fallback finishes orderly but readiness
+        # refuses. This is the exact safe pre-injection retry checkpoint.
+        actual = cli.run
+        def run(argv, **kwargs):
+            result = actual(argv, **kwargs)
+            if argv[3] == "translate":
+                cli.rows[Path(argv[4])][0].update(translation=None, status="pending", provider_used=None, translated_at=None)
+            return result
+        with patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(pipeline.subprocess, "run", side_effect=run):
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(options).run()
+        path = self.root / "run/pipeline-manifest.json"
+        original = pipeline.read_json_file(path)
+        pipeline.validate_resume_manifest(original)
+        with patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(pipeline.subprocess, "run") as child:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(replace(options, fallback_provider=None, resume=True)).run()
+            child.assert_not_called()
+        for mutate in (lambda m: m.update(version=1),
+                       lambda m: m["stages"][-2].pop("classified_identical_resources"),
+                       lambda m: m["settings"].update(fallback_provider=None),
+                       lambda m: m["accepted_rows"]["english.db"].update({"script.rpy#1": {"row_sha256": "0" * 64, "stage": "forged", "provider": "google"}})):
+            changed = copy.deepcopy(original)
+            mutate(changed)
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.validate_resume_manifest(changed)
+
+
 class OrchestratorTests(PipelineCase):
     def mock_session(self):
         cli = MockCli(self)
@@ -886,7 +1050,7 @@ class ScriptedEndpoint:
                         key = (source, target, record["source"])
                         endpoint.requests.append(key)
                         answer = endpoint.answers[key]
-                        if endpoint.fault == "missing" and source == "ja" and "{PL_0}" in key[2]:
+                        if (endpoint.fault == "missing" and source == "ja" or endpoint.fault == "partial-both") and "{PL_0}" in key[2]:
                             continue
                         if endpoint.fault == "placeholder" and target == "es" and "{PL_0}" in answer:
                             answer = answer.replace("{PL_0}", "{PL_99}")
@@ -1049,6 +1213,334 @@ class ProductionTransportTests(unittest.TestCase):
         self.assertNotIn(pipeline.DUMMY_KEY, report_text)
         self.assertNotIn("こんにちは", report_text)
         self.assertFalse(summary["runtime_verified"])
+
+    def closed_seed(self):
+        options, primary, _, _ = self.scenario("renpy", "missing")
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.Pipeline(options).run()
+        seed = Path(options.output) / "english.db"
+        before = pipeline.file_hash(seed)
+        seed_rows, _ = pipeline.read_database(seed)
+        accepted = {r["id"]: r["translation"] for r in seed_rows if r["status"] == "translated"}
+        # Fixture owner closes its WAL reader state through its ordinary CLI;
+        # the pipeline under test must never open/migrate this input afterward.
+        closed = subprocess.run([str(CLI), "--config", str(Path(options.output) / "profile/config.json"),
+                                 "export", str(seed), "-f", "xliff", "-l", "en", "-o", str(self.root / "owner-close.xliff")],
+                                env=pipeline.child_environment(Path(options.output), options, subscription_login=False),
+                                cwd=Path(options.output), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(closed.returncode, 0)
+        self.assertEqual(pipeline.file_hash(seed), before)
+        return options, primary, seed, before, seed_rows, accepted
+
+    def test_closed_partial_seed_actual_export_import_and_fallback_install(self):
+        options, primary, seed, before, seed_rows, accepted = self.closed_seed()
+        primary.fault = "partial-both"
+        fallback = ScriptedEndpoint(primary.answers)
+        self.addCleanup(fallback.close)
+        fresh = replace(options, output=str(self.root / "fresh"), provider="antigravity", english_seed=str(seed),
+                        fallback_provider="google", test_fallback_endpoint=fallback.url)
+        actual = subprocess.run
+        calls = []
+        def run(argv, **kwargs):
+            calls.append(argv[3:])
+            self.assertNotIn(str(seed), argv, "Never migrate/export the owner's seed")
+            return actual(argv, **kwargs)
+        with patch.object(pipeline.subprocess, "run", side_effect=run):
+            summary = pipeline.Pipeline(fresh).run()
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(pipeline.file_hash(seed), before)
+        english, _ = pipeline.read_database(Path(fresh.output) / "english.db")
+        for r in english:
+            if r["id"] in accepted:
+                self.assertEqual((r["translation"], r["provider_used"]), (accepted[r["id"]], "import"))
+        self.assertTrue(any(c[0] == "export" and "xliff" in c for c in calls))
+        self.assertTrue(any(c[0] == "import" and "--keep-existing" in c for c in calls))
+        self.assertTrue(fallback.requests)
+        self.assertTrue(all("{PL_0}" in key[2] for key in fallback.requests if key[0] == "ja"))
+        self.assertFalse((Path(options.output) / "spanish.db").exists())
+        self.assertEqual(primary.errors + fallback.errors, [])
+        manifest = pipeline.read_json_file(Path(fresh.output) / "pipeline-manifest.json")
+        self.assertEqual(manifest["seed"]["targets"].keys(), accepted.keys())
+        self.assertEqual(manifest["final_install"]["verification"], "strict")
+        self.assertEqual(manifest["injection"]["strings_written"] + manifest["injection"]["strings_skipped"], len(english))
+        self.assertEqual({r["provider_used"] for r in english}, {"import", pipeline.FALLBACK_TEST_PROVIDER})
+        self.assertEqual({v["provider"] for v in manifest["accepted_rows"]["spanish.db"].values()},
+                         {pipeline.PROVIDER, pipeline.FALLBACK_TEST_PROVIDER})
+
+    def test_seed_owner_links_sidecars_remnants_unknown_and_unsafe_states(self):
+        options, _, seed, before, _, _ = self.closed_seed()
+        owner_path = seed.parent / "pipeline-manifest.json"
+        original = pipeline.read_json_file(owner_path)
+        source = pipeline.scan(Path(options.game), source=True)
+        destination = self.root / "fresh"
+        mutations = {
+            "unknown-owner": lambda m: m.update(owner="unknown"),
+            "active-child": lambda m: m.update(active_command="ja-en"),
+            "uncertain-child": lambda m: m.update(uncertain_child=True),
+            "injection": lambda m: m.update(injection_started=True),
+            "wrong-phase": lambda m: m.update(phase="spanish-ready"),
+            "wrong-format": lambda m: m["settings"].update(format="kirikiri"),
+            "wrong-source": lambda m: next(iter(m["source"]["files"].values())).update(sha256="0" * 64),
+            "wrong-root": lambda m: m["settings"].update(output=str(self.root / "foreign")),
+            "malformed-provenance": lambda m: m["stages"][-1].update(stage="unknown"),
+            "nonempty-wal-history": lambda m: m["databases"]["english.db"]["files"].update({"-wal": {"sha256": "0" * 64, "size": 10}}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                changed = copy.deepcopy(original)
+                mutate(changed)
+                owner_path.write_bytes(pipeline.encoded(changed))
+                with self.assertRaises(pipeline.PipelineError):
+                    pipeline.seed_owner(seed, source, "renpy", destination, Path(options.game))
+        owner_path.write_bytes(pipeline.encoded(original))
+        for name in ("english.db-wal", "english.db-shm", "english.db-journal", "pipeline.lock",
+                     "pipeline-manifest.next", pipeline.PUBLICATION_FAILURE, "spanish.db", "spanish-patch.zip"):
+            with self.subTest(name=name):
+                remnant = seed.parent / name
+                remnant.write_bytes(b"synthetic remnant")
+                with self.assertRaises(pipeline.PipelineError):
+                    pipeline.seed_owner(seed, source, "renpy", destination, Path(options.game))
+                remnant.rename(self.root / ("retained-" + name))
+        alias = self.root / "seed-link"
+        alias.symlink_to(seed.parent, target_is_directory=True)
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.seed_owner(alias / "english.db", source, "renpy", destination, Path(options.game))
+        hard = self.root / "seed-hardlink"
+        os.link(seed, hard)
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.seed_owner(seed, source, "renpy", destination, Path(options.game))
+        # End this fixture here: retaining the hardlink is deliberate negative
+        # evidence, not something the production pipeline may unlink.
+        self.assertEqual(pipeline.file_hash(seed), before)
+
+    def test_seed_independent_full_inventory_and_ready_evidence(self):
+        options, primary, seed, before, seed_rows, _ = self.closed_seed()
+        owner_path = seed.parent / "pipeline-manifest.json"
+        original_owner = pipeline.read_json_file(owner_path)
+        actual_read, actual_run = pipeline.read_database, subprocess.run
+        variants = ("foreign-file", "foreign-id", "source", "context", "metadata", "stale", "format", "warning",
+                    "root", "pivot", "blank-ready", "provider", "shrink", "created")
+        for fault in variants:
+            with self.subTest(fault=fault):
+                changed = copy.deepcopy(seed_rows)
+                metadata = {"extraction_warnings": [], "game_root": str(seed.parent / "work-game")}
+                ready = next(r for r in changed if r["status"] == "translated")
+                if fault == "foreign-file": ready["file_path"] = str(seed.parent / "other/game/script.rpy")
+                elif fault == "foreign-id": ready["id"] += "foreign"
+                elif fault == "source": ready["source"] = "違う"
+                elif fault == "context": ready["context"] = "different"
+                elif fault == "metadata": ready["metadata"]["unknown"] = True
+                elif fault == "stale": ready["metadata"]["locust_stale_translation"] = True
+                elif fault == "format": ready["metadata"]["format_id"] = "kirikiri"
+                elif fault == "warning": metadata["extraction_warnings"] = ["partial"]
+                elif fault == "root": metadata["game_root"] = str(self.root / "foreign")
+                elif fault == "pivot": ready["metadata"]["locust_injection_source"] = ready["source"]
+                elif fault == "blank-ready": ready["translation"] = " "
+                elif fault == "provider": ready["provider_used"] = "import"
+                elif fault == "shrink": changed.pop()
+                elif fault == "created": ready["created_at"] = None
+                owner = copy.deepcopy(original_owner)
+                # Coordinated data forgery cannot authorize another source or
+                # defeat comparison against a NEW actual CLI extraction.
+                owner["databases"]["english.db"]["logical_sha256"] = pipeline.digest([changed, metadata])
+                owner_path.write_bytes(pipeline.encoded(owner))
+                fresh = replace(options, output=str(self.root / ("fresh-" + fault)), english_seed=str(seed))
+                reads, calls = [], []
+                def read(path):
+                    reads.append(Path(path))
+                    if Path(path).name == "seed-snapshot.db":
+                        return copy.deepcopy(changed), copy.deepcopy(metadata)
+                    return actual_read(path)
+                def run(argv, **kwargs):
+                    calls.append(argv[3:])
+                    return actual_run(argv, **kwargs)
+                with patch.object(pipeline, "read_database", side_effect=read), patch.object(pipeline.subprocess, "run", side_effect=run):
+                    with self.assertRaises(pipeline.PipelineError):
+                        pipeline.Pipeline(fresh).run()
+                self.assertNotIn(seed, reads)
+                self.assertFalse(any(c[0] in {"export", "import", "translate", "inject"} and "--help" not in c for c in calls))
+                self.assertEqual(pipeline.file_hash(seed), before)
+        owner_path.write_bytes(pipeline.encoded(original_owner))
+        self.assertEqual(primary.errors, [])
+
+    def test_seed_run_languages_memory_and_recordings_are_checked_on_copy(self):
+        options, _, seed, before, _, _ = self.closed_seed()
+        cases = {
+            "foreign-language": "UPDATE translation_runs SET source_lang='en', target_lang='es'",
+            "unknown-provider": "UPDATE translation_runs SET provider='unknown'",
+            "missing-runs": "DELETE FROM translation_runs",
+            "malformed-count": "UPDATE translation_runs SET strings_translated=-1",
+            "recorded": "INSERT INTO injected_files(lang,root,rel,hash,size,recorded_at) VALUES ('en','foreign','game/script.rpy','bad',1,'date')",
+            "memory": "INSERT INTO translation_memory(source_hash,lang_pair,source,translation,last_used) VALUES ('x','ja-en','synthetic','synthetic','date')",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name=name):
+                snapshot = self.root / (name + ".db")
+                with snapshot.open("xb") as stream:
+                    stream.write(seed.read_bytes())
+                connection = sqlite3.connect(snapshot)
+                try:
+                    connection.execute(sql)
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(pipeline.PipelineError):
+                    if name == "memory":
+                        pipeline.read_database(snapshot)
+                    else:
+                        pipeline.seed_database_evidence(snapshot, {pipeline.PROVIDER})
+        self.assertEqual(pipeline.file_hash(seed), before)
+
+    def test_seed_manifest_is_not_command_config_or_binary_authority(self):
+        options, primary, seed, before, _, _ = self.closed_seed()
+        manifest_path = seed.parent / "pipeline-manifest.json"
+        manifest = pipeline.read_json_file(manifest_path)
+        # Version 1 may be borrowed as closed data, but is never resumable by
+        # the version 2 orchestrator. Its command authority is not adopted.
+        manifest["version"] = 1
+        manifest.pop("accepted_rows")
+        for key in ("english_seed", "fallback_provider", "test_fallback_endpoint"):
+            manifest["settings"].pop(key)
+        manifest["settings"].update(cli=str(self.root / "untrusted.exe"), game=str(self.root / "foreign-game"),
+                                    test_endpoint="https://untrusted.example", timeout=1)
+        manifest["binary"]["sha256"] = "0" * 64
+        manifest["tool_sha256"] = "0" * 64
+        manifest["config"]["sha256"] = "0" * 64
+        manifest_path.write_bytes(pipeline.encoded(manifest))
+        (seed.parent / "profile/config.json").write_bytes(b"untrusted config must not be read")
+        primary.fault = None
+        fresh = replace(options, output=str(self.root / "fresh-untrusted-data"), english_seed=str(seed))
+        actual = subprocess.run
+        def run(argv, **kwargs):
+            self.assertEqual(argv[:3], [str(CLI), "--config", str(Path(fresh.output) / "profile/config.json")])
+            self.assertNotIn(str(seed), argv)
+            return actual(argv, **kwargs)
+        with patch.object(pipeline.subprocess, "run", side_effect=run):
+            self.assertEqual(pipeline.Pipeline(fresh).run()["status"], "completed")
+        self.assertEqual(pipeline.file_hash(seed), before)
+
+    def test_seed_resume_uses_verified_owned_artifacts_without_seed_flag(self):
+        options, primary, seed, before, _, _ = self.closed_seed()
+        fresh = replace(options, output=str(self.root / "seeded-pending"), english_seed=str(seed))
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.Pipeline(fresh).run()
+        manifest = pipeline.read_json_file(Path(fresh.output) / "pipeline-manifest.json")
+        pipeline.validate_resume_manifest(manifest)
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.Pipeline(replace(fresh, resume=True)).run()  # flag is fresh-only
+        primary.fault = None
+        actual = subprocess.run
+        calls = []
+        def run(argv, **kwargs):
+            calls.append(argv[3:])
+            return actual(argv, **kwargs)
+        with patch.object(pipeline.subprocess, "run", side_effect=run):
+            summary = pipeline.Pipeline(replace(fresh, english_seed=None, resume=True)).run()
+        self.assertEqual(summary["status"], "completed")
+        self.assertFalse(any(c[0] in {"export", "import"} for c in calls))
+        self.assertEqual(pipeline.file_hash(seed), before)
+
+    def test_damaged_catalog_and_ready_controls_cannot_seed_or_advance(self):
+        options, primary, seed, before, _, _ = self.closed_seed()
+        actual = subprocess.run
+        for fault in ("language", "source", "target", "incomplete", "unknown-control"):
+            with self.subTest(fault=fault):
+                fresh = replace(options, output=str(self.root / ("bad-cat-" + fault)), english_seed=str(seed))
+                imported = False
+                def run(argv, **kwargs):
+                    nonlocal imported
+                    result = actual(argv, **kwargs)
+                    if argv[3] == "export":
+                        path = Path(argv[argv.index("-o") + 1])
+                        text = path.read_text(encoding="utf-8")
+                        if fault == "language": text = text.replace('target-language="en"', 'target-language="es"')
+                        elif fault == "source": text = text.replace("こんにちは", "違う")
+                        elif fault == "target": text = text.replace("Hello", "Forged")
+                        elif fault == "incomplete": text = re.sub(r"<trans-unit.*?</trans-unit>", "", text, count=1, flags=re.S)
+                        if fault != "unknown-control": path.write_text(text, encoding="utf-8")
+                    if argv[3] == "import": imported = True
+                    if fault == "unknown-control" and argv[3] == "validate":
+                        report = {"count": 1, "issues": [{"entry_id": "unknown", "kind": "UnknownControl", "message": "unsafe"}]}
+                        return subprocess.CompletedProcess(argv, 1, json.dumps(report).encode(), b"")
+                    return result
+                with patch.object(pipeline.subprocess, "run", side_effect=run):
+                    with self.assertRaises(pipeline.PipelineError):
+                        pipeline.Pipeline(fresh).run()
+                self.assertEqual(imported, fault == "unknown-control")
+                manifest = pipeline.read_json_file(Path(fresh.output) / "pipeline-manifest.json")
+                self.assertFalse(manifest["injection_started"])
+                self.assertFalse((Path(fresh.output) / "spanish.db").exists())
+                self.assertEqual(pipeline.file_hash(seed), before)
+        self.assertEqual(primary.errors, [])
+
+    def test_invalid_pending_seed_target_is_ignored_but_damaged_ready_controls_refuse(self):
+        options, primary, seed, before, seed_rows, _ = self.closed_seed()
+        owner_path = seed.parent / "pipeline-manifest.json"
+        owner_original = pipeline.read_json_file(owner_path)
+        actual_read, actual_run = pipeline.read_database, subprocess.run
+        for ready_damage in (False, True):
+            with self.subTest(ready_damage=ready_damage):
+                changed = copy.deepcopy(seed_rows)
+                chosen = next(r for r in changed if (r["status"] in pipeline.READY) == ready_damage)
+                chosen["translation"] = "Invalid [unknown]"
+                metadata = {"extraction_warnings": [], "game_root": str(seed.parent / "work-game")}
+                owner = copy.deepcopy(owner_original)
+                owner["databases"]["english.db"]["logical_sha256"] = pipeline.digest([changed, metadata])
+                if ready_damage:
+                    owner["accepted_rows"]["english.db"][chosen["id"]]["row_sha256"] = pipeline.digest(chosen)
+                owner_path.write_bytes(pipeline.encoded(owner))
+                fresh = replace(options, output=str(self.root / ("target-ready" if ready_damage else "target-pending")), english_seed=str(seed))
+                def read(path):
+                    if Path(path).name == "seed-snapshot.db":
+                        return copy.deepcopy(changed), copy.deepcopy(metadata)
+                    return actual_read(path)
+                def run(argv, **kwargs):
+                    result = actual_run(argv, **kwargs)
+                    if ready_damage and argv[3] == "export":
+                        path = Path(argv[argv.index("-o") + 1])
+                        text = path.read_text(encoding="utf-8")
+                        # Forge a fully matching catalog + old snapshot. The
+                        # independent production validator must still refuse
+                        # newly invented controls after import into the NEW DB.
+                        escaped_id = chosen["id"].replace("&", "&amp;").replace('"', "&quot;")
+                        pattern = r'(<trans-unit id="' + re.escape(escaped_id) + r'">.*?<target>).*?(</target>)'
+                        text, count = re.subn(pattern, r'\g<1>Invalid [unknown]\g<2>', text, flags=re.S)
+                        self.assertEqual(count, 1)
+                        path.write_text(text, encoding="utf-8")
+                    return result
+                primary.fault = None
+                with patch.object(pipeline, "read_database", side_effect=read), patch.object(pipeline.subprocess, "run", side_effect=run):
+                    if ready_damage:
+                        with self.assertRaisesRegex(pipeline.PipelineError, "Validation issue cannot release"):
+                            pipeline.Pipeline(fresh).run()
+                        self.assertFalse((Path(fresh.output) / "spanish.db").exists())
+                    else:
+                        self.assertEqual(pipeline.Pipeline(fresh).run()["status"], "completed")
+                        english, _ = actual_read(Path(fresh.output) / "english.db")
+                        pending = next(r for r in english if r["id"] == chosen["id"])
+                        self.assertEqual(pending["provider_used"], pipeline.PROVIDER)
+                        self.assertNotEqual(pending["translation"], "Invalid [unknown]")
+                self.assertEqual(pipeline.file_hash(seed), before)
+        owner_path.write_bytes(pipeline.encoded(owner_original))
+
+    def test_seed_input_changed_after_snapshot_never_imports(self):
+        options, _, seed, before, _, _ = self.closed_seed()
+        actual_hash, actual_run = pipeline.file_hash, subprocess.run
+        changed = False
+        def hashed(path):
+            value = actual_hash(path)
+            return dict(value, sha256="0" * 64) if changed and Path(path) == seed else value
+        def run(argv, **kwargs):
+            nonlocal changed
+            result = actual_run(argv, **kwargs)
+            if argv[3] == "export": changed = True
+            self.assertNotEqual(argv[3], "import")
+            return result
+        fresh = replace(options, output=str(self.root / "changed-input"), english_seed=str(seed))
+        with patch.object(pipeline, "file_hash", side_effect=hashed), patch.object(pipeline.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(pipeline.PipelineError, "bytes changed"):
+                pipeline.Pipeline(fresh).run()
+        self.assertEqual(pipeline.file_hash(seed), before)
 
     def test_renpy_final_install_is_spanish(self):
         self.positive("renpy")

@@ -23,10 +23,13 @@ import time
 from urllib.parse import urlsplit
 import uuid
 import zipfile
+import xml.etree.ElementTree as ET
 
-VERSION = 1
+VERSION = 2
 OWNER = "locust-ja-en-es-pipeline"
 PROVIDER = "pipeline-scripted"
+FALLBACK_TEST_PROVIDER = "pipeline-google-scripted"
+READY = {"translated", "reviewed", "approved"}
 DUMMY_KEY = "pipeline-dummy-not-a-credential"
 MODEL = "scripted-fixture"
 RESERVED = {".locust", ".locust-injections"}
@@ -251,11 +254,26 @@ class Options:
     concurrency: int = 4
     timeout: float = 900
     resume: bool = False
+    fallback_provider: str = None
+    english_seed: str = None
+    test_fallback_endpoint: str = None
 
 
 def preflight(options):
     require(options.format in {"renpy", "rpgmaker-mv", "kirikiri"}, "Unsupported format")
     require(options.provider in {"google", "antigravity"}, "Unsupported provider")
+    require(options.fallback_provider is None or
+            (options.fallback_provider == "google" and options.provider == "antigravity"),
+            "Fallback requires explicit google after primary antigravity")
+    require(options.english_seed is None or (nonblank(options.english_seed) and not options.resume),
+            "English seed is fresh-run-only")
+    require(options.test_fallback_endpoint is None or
+            (options.fallback_provider == "google" and options.test_endpoint is not None),
+            "Test fallback requires explicit fallback and scripted primary")
+    require(not (options.fallback_provider and options.test_endpoint) or
+            (options.test_fallback_endpoint is not None and
+             options.test_endpoint.rstrip("/") != options.test_fallback_endpoint.rstrip("/")),
+            "Scripted fallback requires a separate explicit loopback route")
     require(type(options.batch_size) is int and 1 <= options.batch_size <= 200, "Batch size must be 1..200")
     require(type(options.concurrency) is int and 1 <= options.concurrency <= 16, "Concurrency must be 1..16")
     require(type(options.timeout) in (int, float) and 1 <= options.timeout <= 86400
@@ -268,10 +286,12 @@ def preflight(options):
     require(not under(cli, output), "CLI cannot be inside output")
     require(output.parent.is_dir(), "Output parent must already exist")
     require(options.resume or not output.exists(), "Output occupied (even an empty directory is refused)")
-    if options.test_endpoint is not None:
-        require(isinstance(options.test_endpoint, str) and not any(char.isspace() or ord(char) < 32 for char in options.test_endpoint), "Malformed test endpoint")
+    for test_endpoint in (options.test_endpoint, options.test_fallback_endpoint):
+        if test_endpoint is None:
+            continue
+        require(isinstance(test_endpoint, str) and not any(char.isspace() or ord(char) < 32 for char in test_endpoint), "Malformed test endpoint")
         try:
-            endpoint = urlsplit(options.test_endpoint)
+            endpoint = urlsplit(test_endpoint)
             address = ipaddress.ip_address(endpoint.hostname or "")
             valid = (endpoint.scheme == "http" and address.is_loopback and endpoint.port is not None and endpoint.port >= 1
                      and not endpoint.username and not endpoint.password and not endpoint.query
@@ -320,6 +340,10 @@ def permitted_config(options):
         providers[PROVIDER] = {"api_key": DUMMY_KEY, "model": MODEL,
                                "base_url": options.test_endpoint.rstrip("/"),
                                "extra": {"requests_per_minute": "4294967295"}}
+    if options.test_fallback_endpoint is not None:
+        providers[FALLBACK_TEST_PROVIDER] = {"api_key": DUMMY_KEY, "model": MODEL,
+                                           "base_url": options.test_fallback_endpoint.rstrip("/"),
+                                           "extra": {"requests_per_minute": "4294967295"}}
     return {"providers": providers}
 
 
@@ -346,7 +370,7 @@ def manifest_inventory(value):
         safe_rel(locator[0])
 
 
-def validate_resume_manifest(value):
+def validate_resume_manifest(value, seed_legacy=False):
     """Validate the ENTIRE resumable schema before trusting or republishing it.
 
     Copying, uncertain and post-injection states are refused outright; no proof
@@ -355,7 +379,8 @@ def validate_resume_manifest(value):
     Its hashes are evidence of drift, not authentication or config authority.
     """
     require(isinstance(value, dict) and value.get("owner") == OWNER
-            and type(value.get("version")) is int and value["version"] == VERSION,
+            and type(value.get("version")) is int and
+            (value["version"] == VERSION or (seed_legacy and value["version"] == 1)),
             "Unrecognized ownership/version")
     phase = value.get("phase")
     require(isinstance(phase, str) and phase in RESUME_PHASES
@@ -367,7 +392,10 @@ def validate_resume_manifest(value):
                 "config", "japanese_inventory"}
     if spanish:
         required.add("spanish_inventory")
-    fields(value, required, {"diagnostic"})
+    legacy = value["version"] == 1
+    if not legacy:
+        required.add("accepted_rows")
+    fields(value, required, {"diagnostic"} if legacy else {"diagnostic", "seed"})
     require(isinstance(value["run_id"], str)
             and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value["run_id"]),
             "Malformed resume run ID")
@@ -376,7 +404,22 @@ def validate_resume_manifest(value):
             or (value["status"] == "running" and "diagnostic" not in value), "Malformed resume diagnostic/status")
     require(sha256_value(value["tool_sha256"]), "Malformed resume tool hash")
     settings = value["settings"]
-    fields(settings, {"cli", "game", "output", "format", "provider", "test_endpoint", "batch_size", "concurrency", "timeout"})
+    setting_keys = {"cli", "game", "output", "format", "provider", "test_endpoint", "batch_size", "concurrency", "timeout"}
+    if not legacy:
+        setting_keys |= {"fallback_provider", "english_seed", "test_fallback_endpoint"}
+    fields(settings, setting_keys)
+    if not legacy:
+        require(settings["fallback_provider"] is None or
+                (settings["fallback_provider"] == "google" and settings["provider"] == "antigravity"),
+                "Malformed resume fallback")
+        require(settings["english_seed"] is None or nonblank(settings["english_seed"]), "Malformed resume seed setting")
+        require(settings["test_fallback_endpoint"] is None or
+                (nonblank(settings["test_fallback_endpoint"]) and settings["fallback_provider"] == "google"
+                 and nonblank(settings["test_endpoint"])
+                 and settings["test_endpoint"].rstrip("/") != settings["test_fallback_endpoint"].rstrip("/")),
+                "Malformed resume test fallback")
+        require(not (settings["fallback_provider"] and settings["test_endpoint"]) or
+                settings["test_fallback_endpoint"] is not None, "Missing resume test fallback")
     require(all(nonblank(settings[key]) for key in ("cli", "game", "output", "format", "provider"))
             and settings["format"] in {"renpy", "rpgmaker-mv", "kirikiri"}
             and settings["provider"] in {"google", "antigravity"}
@@ -427,6 +470,20 @@ def validate_resume_manifest(value):
         "validate-spanish": {"validate-spanish-current", "validate-english-current"},
         "validate-spanish-current": {"validate-english-current"},
     }
+    if not legacy:
+        successors["extract-japanese"] |= {"seed-export-english", "ja-en"}
+        successors["seed-export-english"] = {"seed-import-english"}
+        successors["seed-import-english"] = {"validate-seed-english"}
+        successors["validate-seed-english"] = {"ja-en"}
+        for translation, validation, language in (("ja-en", "validate-english", "english"),
+                                                   ("en-es", "validate-spanish", "spanish")):
+            partial = "validate-" + language + "-partial"
+            fallback = translation + "-fallback-google"
+            successors[translation].add(partial)
+            successors[partial] = {fallback}
+            successors[fallback] = {validation, translation, "validate-english-current"}
+        successors["en-es"].add("en-es")
+        successors["validate-spanish"].add("en-es")
     stages = value["stages"]
     require(isinstance(stages, list) and len(stages) >= 2, "Malformed resume stage history")
     previous, checkpoint, pivot_seen = None, "copying", False
@@ -445,11 +502,11 @@ def validate_resume_manifest(value):
             identical = stage["classified_identical_resources"]
             require(name.startswith("validate-") and integer(identical) and identical <= count
                     and code == (1 if identical else 0), "Malformed resume classified validation count/code")
-        if name in {"cli-capability", "extract-japanese", "strict-pivot"}:
+        if name in {"cli-capability", "extract-japanese", "strict-pivot", "seed-export-english", "seed-import-english"}:
             require(code == 0, "Failed resume prerequisite stage")
         if name == "extract-japanese":
             checkpoint = "english-pending"
-        elif name == "ja-en":
+        elif name in {"ja-en", "ja-en-fallback-google"}:
             require(checkpoint == "english-pending", "JA retry after readiness checkpoint")
         elif name == "validate-english":
             require(prior["exit_code"] == 0, "Validation after failed translation")
@@ -461,9 +518,10 @@ def validate_resume_manifest(value):
             require(checkpoint == "english-ready" and not pivot_seen
                     and "classified_identical_resources" in prior, "Unverified/repeated resume pivot")
             checkpoint, pivot_seen = "spanish-pending", True
-        elif name == "en-es":
+        elif name in {"en-es", "en-es-fallback-google"}:
             require(checkpoint == "spanish-pending" and pivot_seen
-                    and (previous == "strict-pivot" or "classified_identical_resources" in prior),
+                    and (previous in {"strict-pivot", "en-es", "en-es-fallback-google"}
+                         or "classified_identical_resources" in prior),
                     "Premature Spanish translation stage")
         elif name == "validate-spanish":
             require(prior["exit_code"] == 0, "Validation after failed translation")
@@ -472,8 +530,74 @@ def validate_resume_manifest(value):
         elif name == "validate-spanish-current":
             require(checkpoint == "spanish-ready" and "classified_identical_resources" in prior,
                     "Premature Spanish readiness stage")
+        if name.startswith("seed-") or name == "validate-seed-english":
+            require(nonblank(settings.get("english_seed")), "Unauthorized seed stage")
+        if name.endswith("-partial") or name == "validate-seed-english":
+            require(prior["exit_code"] == 0, "Partial validation after failed prerequisite")
+        if name.endswith("-fallback-google"):
+            require(settings.get("fallback_provider") == "google" and prior["exit_code"] in (0, 1)
+                    and "classified_identical_resources" in prior, "Unproven fallback stage")
+        if name == "ja-en" and previous == "validate-seed-english":
+            require("classified_identical_resources" in prior, "Unvalidated seed targets")
         previous, prior = name, stage
     require(checkpoint == phase and pivot_seen == spanish, "Resume phase/history mismatch")
+    if not legacy:
+        validate_accepted_manifest(value, count)
+
+
+def stage_provider(settings, stage):
+    if stage in {"ja-en", "en-es"}:
+        return PROVIDER if settings["test_endpoint"] else settings["provider"]
+    if stage in {"ja-en-fallback-google", "en-es-fallback-google"}:
+        require(settings["fallback_provider"] == "google", "Unauthorized fallback attribution")
+        return FALLBACK_TEST_PROVIDER if settings["test_fallback_endpoint"] else "google"
+    if stage == "seed-import-english":
+        return "import"
+    raise PipelineError("Unknown attribution stage")
+
+
+def validate_accepted_manifest(value, count):
+    accepted = value["accepted_rows"]
+    fields(accepted, {"english.db", "spanish.db"})
+    require(all(isinstance(rows, dict) and len(rows) <= count for rows in accepted.values()),
+            "Malformed accepted row evidence")
+    successful = {s["stage"] for s in value["stages"] if s["exit_code"] == 0}
+    seed = value.get("seed")
+    if seed is not None:
+        fields(seed, {"run_id", "database", "manifest_sha256", "snapshot", "snapshot_logical_sha256", "catalog", "targets"})
+        require(isinstance(seed["run_id"], str)
+                and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", seed["run_id"])
+                and sha256_value(seed["manifest_sha256"]), "Malformed seed ownership evidence")
+        hash_identity(seed["database"])
+        hash_identity(seed["snapshot"])
+        require(sha256_value(seed["snapshot_logical_sha256"]), "Malformed seed snapshot hash")
+        hash_identity(seed["catalog"])
+        require(isinstance(seed["targets"], dict) and seed["targets"] and len(seed["targets"]) <= count,
+                "Malformed seed targets")
+        for identifier, target in seed["targets"].items():
+            require(nonblank(identifier), "Malformed seed ID")
+            fields(target, {"source_sha256", "target_sha256", "provider", "status"})
+            require(sha256_value(target["source_sha256"]) and sha256_value(target["target_sha256"])
+                    and isinstance(target["provider"], str)
+                    and target["provider"] in {"antigravity", "google", PROVIDER, FALLBACK_TEST_PROVIDER}
+                    and isinstance(target["status"], str) and target["status"] in READY, "Malformed seed target")
+    require(("seed-import-english" in successful) == (seed is not None)
+            and (value["settings"]["english_seed"] is not None) == (seed is not None), "Unbound/incomplete seed history")
+    if value["phase"] != "english-pending":
+        require(len(accepted["english.db"]) == count, "Incomplete English readiness attribution")
+    if value["phase"] == "spanish-ready":
+        require(len(accepted["spanish.db"]) == count, "Incomplete Spanish readiness attribution")
+    for database, rows in accepted.items():
+        permitted = {"ja-en", "ja-en-fallback-google", "seed-import-english"} if database == "english.db" else {"en-es", "en-es-fallback-google"}
+        for identifier, evidence in rows.items():
+            require(nonblank(identifier), "Malformed accepted ID")
+            fields(evidence, {"row_sha256", "stage", "provider"})
+            require(sha256_value(evidence["row_sha256"]) and isinstance(evidence["stage"], str)
+                    and evidence["stage"] in permitted & successful
+                    and evidence["provider"] == stage_provider(value["settings"], evidence["stage"]),
+                    "Unproven accepted row attribution")
+            if evidence["provider"] == "import":
+                require(seed is not None and identifier in seed["targets"], "Unbound imported row")
 
 
 def child_environment(root, options, subscription_login=True):
@@ -913,6 +1037,98 @@ def verify_install(root, original, manifest, work):
             "receipt_sha256": tree["files"][".locust/receipt.json"]["sha256"]}
 
 
+def seed_owner(path, original, format_id, output, game):
+    """Manifest is closed data evidence, NEVER executable/config/path authority."""
+    path = plain(path)
+    require(path.is_absolute() and path.name == "english.db", "Seed must be owned english.db")
+    root = path.parent
+    require(not any(under(root, p) or under(p, root) for p in (output, game)), "Conflicting seed root")
+    for name in ("pipeline.lock", "pipeline-manifest.next", PUBLICATION_FAILURE, "spanish.db",
+                 "spanish.db-wal", "spanish.db-shm", "spanish.db-journal", "spanish-patch.zip"):
+        require(not plain(root / name, missing=True).exists(), "Seed active/pivot/publication remnant refused")
+    for suffix in ("-wal", "-shm", "-journal"):
+        require(not plain(str(path) + suffix, missing=True).exists(), "Seed SQLite sidecar refused")
+    identity = publication_file(path)
+    owner_path = root / "pipeline-manifest.json"
+    owner_identity = publication_file(owner_path)
+    manifest = read_json_file(owner_path)
+    validate_resume_manifest(manifest, seed_legacy=True)
+    require(manifest["status"] == "failed" and manifest["phase"] in {"english-pending", "english-ready"}
+            and "seed" not in manifest and manifest["settings"]["format"] == format_id
+            and norm(manifest["settings"]["output"]) == norm(root)
+            and manifest["source"] == original, "Seed owner/source/format mismatch")
+    recorded_files = manifest["databases"]["english.db"]["files"]
+    require(recorded_files.get("") == {k: identity[k] for k in ("sha256", "size")}
+            and set(recorded_files) <= {"", "-wal"}
+            and ("-wal" not in recorded_files or recorded_files["-wal"] ==
+                 {"sha256": hashlib.sha256(b"").hexdigest(), "size": 0}),
+            "Seed database fingerprint/nonempty recorded WAL mismatch")
+    require(scan(root / "work-game", source=True) == original
+            and scan(root / "pristine", source=True) == original
+            and scan(root / "install-game", source=True) == original, "Seed physical Japanese provenance drift")
+    return path, identity, owner_path, owner_identity, manifest
+
+
+def seed_database_evidence(path, providers):
+    """Only called on the exclusive snapshot, never on the input DB."""
+    connection = None
+    try:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        connection.execute("PRAGMA query_only=ON")
+        require(connection.execute("SELECT COUNT(*) FROM injected_files").fetchone()[0] == 0,
+                "Seed injection recording refused")
+        runs = list(connection.execute("SELECT provider,source_lang,target_lang,strings_translated FROM translation_runs"))
+        require(runs and all(p in providers and s == "ja" and t == "en" and integer(n) for p, s, t, n in runs),
+                "Seed translation-run language/provider evidence malformed")
+        return {p for p, _, _, n in runs if n > 0}
+    except sqlite3.Error as error:
+        raise PipelineError("Seed provenance tables malformed") from error
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def remapped_inventory(rows, old_root, new_root, format_id):
+    # IDs, context and metadata are NEVER normalized. Only the known root in
+    # file_path changes. This deliberately refuses root-dependent extractor IDs.
+    inventory(rows, old_root, format_id)
+    mapped = [dict(r, file_path=str(new_root / relative(r["file_path"], old_root))) for r in rows]
+    return inventory(mapped, new_root, format_id)
+
+
+def verify_seed_catalog(path, targets):
+    path = plain(path)
+    require(path.stat().st_size <= 64 * 1024 * 1024, "Seed catalog size refused")
+    data = path.read_bytes()
+    require(b"<!" not in data, "Seed catalog declaration refused")
+    try:
+        xml = ET.fromstring(data)
+    except ET.ParseError as error:
+        raise PipelineError("Malformed seed XLIFF") from error
+    namespace = "{urn:oasis:names:tc:xliff:document:1.2}"
+    require(xml.tag == namespace + "xliff" and xml.attrib == {"version": "1.2"}
+            and len(xml) == 1, "Unexpected seed catalog structure")
+    file = xml[0]
+    require(file.tag == namespace + "file" and file.attrib ==
+            {"source-language": "ja", "target-language": "en", "datatype": "plaintext"}
+            and len(file) == 1 and file[0].tag == namespace + "body" and file[0].attrib == {},
+            "Seed catalog language/structure mismatch")
+    found = {}
+    for unit in file[0]:
+        require(unit.tag == namespace + "trans-unit" and set(unit.attrib) == {"id"} and len(unit) == 2,
+                "Malformed seed catalog unit")
+        identifier = unit.attrib["id"]
+        require(identifier in targets and identifier not in found, "Unknown/duplicate seed catalog ID")
+        source, target = unit
+        require(source.tag == namespace + "source" and target.tag == namespace + "target"
+                and not source.attrib and not target.attrib and not len(source) and not len(target)
+                and source.text == targets[identifier]["source"] and target.text == targets[identifier]["translation"],
+                "Seed catalog source/target mismatch")
+        found[identifier] = target.text
+    require(found.keys() == targets.keys(), "Incomplete seed catalog")
+    return file_hash(path)
+
+
 class Pipeline:
     def __init__(self, options):
         self.options = options
@@ -924,6 +1140,7 @@ class Pipeline:
         self.owned_directories = None
         self.durable_file = None
         self.durable_state = None
+        self.seed_input = None
         self.original = scan(self.game, source=True)
         self.binary = file_hash(self.cli)
         self.settings = asdict(options)
@@ -1020,6 +1237,14 @@ class Pipeline:
         require(scan(self.pristine) == self.original, "Pristine copy changed")
         if before_injection:
             require(scan(self.work) == self.original and scan(self.install) == self.original, "Pre-injection copy drift")
+        if self.seed_input is not None:
+            path, identity, owner_path, owner_identity, _ = self.seed_input
+            publication_file(path, identity)
+            publication_file(owner_path, owner_identity)
+            for suffix in ("-wal", "-shm", "-journal"):
+                require(not plain(str(path) + suffix, missing=True).exists(), "Seed sidecar appeared")
+            for name in ("pipeline.lock", "pipeline-manifest.next", PUBLICATION_FAILURE):
+                require(not plain(path.parent / name, missing=True).exists(), "Seed owner became active/uncertain")
         # Refuse any new linked/special member anywhere in the owned run.
         scan(self.root)
 
@@ -1049,7 +1274,7 @@ class Pipeline:
         start = time.monotonic()
         try:
             result = subprocess.run([str(self.cli), "--config", str(self.root / "profile/config.json"), *map(str, args)],
-                                    cwd=self.root, env=self.env if args[0] == "translate" else
+                                    cwd=self.root, env=self.env if args[0] == "translate" and not stage.endswith("-fallback-google") else
                                     child_environment(self.root, self.options, subscription_login=False), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     timeout=self.options.timeout, check=False)
@@ -1080,14 +1305,161 @@ class Pipeline:
     def ready(self, path, baseline, stage):
         rows = self.db_rows(path)
         gate_rows(rows, baseline, self.work, self.options.format, ready=True)
-        require(all(value["provider_used"] == (PROVIDER if self.options.test_endpoint else self.options.provider) for value in rows), "Unexpected translation provider")
+        self.proven_rows(path, rows)
         self.validate(path, stage)
         return rows
 
+    def proven_rows(self, path, rows):
+        evidence = self.manifest["accepted_rows"][path.name]
+        ready = {r["id"]: r for r in rows if r["status"] in READY}
+        require(ready.keys() == evidence.keys(), "Unproven ready row inventory")
+        for identifier, r in ready.items():
+            proof = evidence[identifier]
+            require(proof["row_sha256"] == digest(r) and proof["provider"] == r["provider_used"]
+                    and proof["provider"] == stage_provider(self.settings, proof["stage"])
+                    and any(s["stage"] == proof["stage"] and s["exit_code"] == 0 for s in self.manifest["stages"]),
+                    "Unexpected translation provider/row attribution")
+            if proof["provider"] == "import":
+                target = self.manifest["seed"]["targets"].get(identifier)
+                require(target is not None and target["source_sha256"] == digest(r["source"])
+                        and target["target_sha256"] == digest(r["translation"]), "Unbound imported target")
+
+    def accept_changes(self, path, before, stage, baseline, targets=None):
+        after = self.db_rows(path)
+        gate_rows(after, baseline, self.work, self.options.format)
+        prior = {r["id"]: r for r in before}
+        provider = stage_provider(self.settings, stage)
+        accepted = dict(self.manifest["accepted_rows"][path.name])
+        for r in after:
+            old = prior[r["id"]]
+            if old["status"] != "pending":
+                require(r == old, "Translation changed previously accepted/nonpending row columns")
+            elif r["status"] in READY:
+                require(nonblank(r["translation"]) and nonblank(r["translated_at"])
+                        and r["provider_used"] == provider, "Unproven stage translation attribution")
+                # Static inventory excludes creation/review timestamps; they too
+                # are immutable for pending-only translation/import.
+                require(r["created_at"] == old["created_at"] and r["reviewed_at"] == old["reviewed_at"],
+                        "Translation changed immutable timestamp columns")
+                if targets is not None:
+                    require(r["id"] in targets and r["translation"] == targets[r["id"]]["translation"],
+                            "Unbound seed import")
+                accepted[r["id"]] = {"row_sha256": digest(r), "stage": stage, "provider": provider}
+            else:
+                require(r == old, "Unaccepted pending row changed")
+        if targets is not None:
+            require(set(accepted) == set(targets), "Incomplete seed import")
+        self.manifest["accepted_rows"][path.name] = accepted
+        self.manifest["databases"] = self.checkpoints()
+        self.save()
+        self.proven_rows(path, after)
+        return after
+
     def translate(self, path, source, target):
-        self.command(source + "-" + target, ["translate", path, "-p", PROVIDER if self.options.test_endpoint else self.options.provider,
-                                             "-s", source, "-t", target, "--batch-size", self.options.batch_size,
-                                             "--concurrency", self.options.concurrency, "--no-memory"])
+        baseline = self.manifest["japanese_inventory" if source == "ja" else "spanish_inventory"]
+        language = "english" if source == "ja" else "spanish"
+        before = self.db_rows(path)
+        gate_rows(before, baseline, self.work, self.options.format)
+        self.proven_rows(path, before)
+        stage = source + "-" + target
+        def dispatch(name):
+            self.command(name, ["translate", path, "-p", stage_provider(self.settings, name),
+                                "-s", source, "-t", target, "--batch-size", self.options.batch_size,
+                                "--concurrency", self.options.concurrency, "--no-memory"])
+        # Even an all-seeded project gets an orderly no-work primary result.
+        dispatch(stage)
+        after = self.accept_changes(path, before, stage, baseline)
+        if self.options.fallback_provider and any(r["status"] == "pending" for r in after):
+            # Validate already accepted controls before handing pending work to
+            # the fallback. This is NOT a readiness checkpoint.
+            self.validate(path, "validate-" + language + "-partial")
+            fallback = stage + "-fallback-google"
+            dispatch(fallback)
+            self.accept_changes(path, after, fallback, baseline)
+
+    def import_seed(self):
+        self.seed_input = seed_owner(self.options.english_seed, self.original, self.options.format, self.root, self.game)
+        path, identity, _, owner_identity, owner = self.seed_input
+        snapshot = self.root / "seed-snapshot.db"
+        publication_file(path, identity)
+        with path.open("rb") as incoming, snapshot.open("xb") as outgoing:
+            for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                outgoing.write(chunk)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        self.invariants(before_injection=True)
+        require(file_hash(snapshot) == {k: identity[k] for k in ("sha256", "size")}, "Seed snapshot hash mismatch")
+        rows, metadata = read_database(snapshot)
+        old_root = path.parent / "work-game"
+        require(set(metadata) == {"game_root", "extraction_warnings"} and metadata["extraction_warnings"] == []
+                and norm(metadata["game_root"]) == norm(old_root), "Seed root/metadata/pivot mismatch")
+        require(remapped_inventory(rows, old_root, self.work, self.options.format) == self.manifest["japanese_inventory"]
+                and inventory(rows, old_root, self.options.format) == owner["japanese_inventory"]
+                and digest([rows, metadata]) == owner["databases"]["english.db"]["logical_sha256"]
+                and len(rows) == owner["databases"]["english.db"]["rows"], "Seed complete Japanese inventory/snapshot drift")
+        successful = {s["stage"] for s in owner["stages"] if s["exit_code"] == 0}
+        providers = {stage_provider(owner["settings"], s) for s in successful
+                     if s in {"ja-en", "ja-en-fallback-google"}}
+        run_providers = seed_database_evidence(snapshot, providers)
+        targets = {r["id"]: r for r in rows if r["status"] in READY}
+        require(targets, "Seed has no accepted English targets")
+        if owner["version"] == VERSION:
+            proofs = owner["accepted_rows"]["english.db"]
+            require(proofs.keys() == targets.keys()
+                    and all(proofs[i]["row_sha256"] == digest(r) and proofs[i]["provider"] == r["provider_used"]
+                            for i, r in targets.items()), "Seed accepted row binding mismatch")
+        for r in targets.values():
+            gate_rows([r], inventory([r], old_root, self.options.format), old_root, self.options.format, ready=True)
+            require(r["provider_used"] in run_providers and "locust_injection_source" not in r["metadata"],
+                    "Seed row language/provider/pivot evidence mismatch")
+        catalog = self.root / "seed-english.xliff"
+        self.command("seed-export-english", ["export", snapshot, "-f", "xliff", "-l", "en", "-o", catalog,
+                                            "--status", "translated", "--status", "reviewed", "--status", "approved"])
+        catalog_hash = verify_seed_catalog(catalog, targets)
+        # Export may migrate only the owned copy. Compare all row columns after
+        # export, not just catalog text.
+        require(read_database(snapshot) == (rows, metadata), "Seed snapshot rows changed during export")
+        before = self.db_rows(self.en)
+        self.command("seed-import-english", ["import", self.en, "-f", "xliff", "-l", "en", "-i", catalog, "--keep-existing"])
+        require(file_hash(catalog) == catalog_hash, "Seed catalog changed during import")
+        # The fresh DB has only catalog targets and untouched pending rows;
+        # invalid retained translations of pending seed rows are never imported.
+        self.validate(self.en, "validate-seed-english")
+        self.manifest["seed"] = {"run_id": owner["run_id"], "database": {k: identity[k] for k in ("sha256", "size")},
+                                 "manifest_sha256": owner_identity["sha256"], "snapshot": file_hash(snapshot),
+                                 "snapshot_logical_sha256": digest([rows, metadata]), "catalog": catalog_hash,
+                                 "targets": {i: {"source_sha256": digest(r["source"]), "target_sha256": digest(r["translation"]),
+                                                   "provider": r["provider_used"], "status": r["status"]} for i, r in targets.items()}}
+        self.accept_changes(self.en, before, "seed-import-english", self.manifest["japanese_inventory"], targets)
+        self.invariants(before_injection=True)
+
+    def verify_seed_resume(self, candidate):
+        evidence = candidate.get("seed")
+        require((candidate["settings"]["english_seed"] is not None) == (evidence is not None),
+                "Incomplete seed checkpoint cannot resume")
+        if evidence is None:
+            return
+        snapshot, catalog = self.root / "seed-snapshot.db", self.root / "seed-english.xliff"
+        require(file_hash(snapshot) == evidence["snapshot"] and file_hash(catalog) == evidence["catalog"],
+                "Resume seed artifact hash drift")
+        rows, metadata = read_database(snapshot)
+        require(digest([rows, metadata]) == evidence["snapshot_logical_sha256"]
+                and set(metadata) == {"game_root", "extraction_warnings"}, "Resume seed snapshot drift")
+        # Historical seed path is only a root-normalization datum. Never open
+        # the old input/manifest/config/executable or re-export/re-import it.
+        old_root = Path(candidate["settings"]["english_seed"]).parent / "work-game"
+        require(norm(metadata["game_root"]) == norm(old_root)
+                and remapped_inventory(rows, old_root, self.work, self.options.format) == candidate["japanese_inventory"],
+                "Resume seed full Japanese inventory drift")
+        targets = {r["id"]: r for r in rows if r["status"] in READY}
+        require(targets.keys() == evidence["targets"].keys(), "Resume seed target inventory drift")
+        for i, r in targets.items():
+            expected = evidence["targets"][i]
+            require(expected == {"source_sha256": digest(r["source"]), "target_sha256": digest(r["translation"]),
+                                 "provider": r["provider_used"], "status": r["status"]}, "Resume seed target provenance drift")
+        require(verify_seed_catalog(catalog, targets) == evidence["catalog"], "Resume seed catalog drift")
+        providers = seed_database_evidence(snapshot, {"antigravity", "google", PROVIDER, FALLBACK_TEST_PROVIDER})
+        require({r["provider_used"] for r in targets.values()} <= providers, "Resume seed run attribution drift")
 
     def change_phase(self, phase):
         self.manifest["phase"] = phase
@@ -1102,7 +1474,8 @@ class Pipeline:
                     and not (self.root / PUBLICATION_FAILURE).exists(), "Interrupted manifest publication; " + RECOVERY)
             candidate = read_json_file(self.root / "pipeline-manifest.json")
             validate_resume_manifest(candidate)
-            require(candidate["settings"] == self.settings and candidate["binary"] == self.binary
+            expected_settings = dict(self.settings, english_seed=candidate["settings"]["english_seed"])
+            require(candidate["settings"] == expected_settings and candidate["binary"] == self.binary
                     and candidate["source"] == self.original
                     and candidate["tool_sha256"] == file_hash(Path(__file__).absolute())["sha256"], "Resume inputs/binary/settings/tool drift")
             config_path = plain(self.root / "profile/config.json")
@@ -1117,6 +1490,8 @@ class Pipeline:
             expected_identity = {"sha256": hashlib.sha256(expected_bytes).hexdigest(), "size": len(expected_bytes)}
             require(candidate["config"] == expected_identity == file_hash(config_path), "Resume config drift")
             self.invariants(before_injection=True)
+            self.verify_seed_resume(candidate)
+            self.settings = expected_settings
             require(candidate["databases"] == self.checkpoints(), "Resume database hashes/inventory drift")
             require(not self.es.exists() or candidate["phase"] in {"spanish-pending", "spanish-ready"}, "Ambiguous pivot; " + RECOVERY)
             # Invalid data is never assigned to the live manifest or republished.
@@ -1130,7 +1505,8 @@ class Pipeline:
                              "settings": self.settings, "binary": self.binary, "source": self.original,
                              "tool_sha256": file_hash(Path(__file__).absolute())["sha256"],
                              "injection_started": False, "uncertain_child": False, "active_command": None,
-                             "status": "running", "stages": [], "databases": {}}
+                             "status": "running", "stages": [], "databases": {},
+                             "accepted_rows": {"english.db": {}, "spanish.db": {}}}
             self.save()
         lock_path = plain(self.root / "pipeline.lock", missing=True)
         try:
@@ -1160,6 +1536,8 @@ class Pipeline:
         baseline = self.manifest.get("japanese_inventory")
         gate_rows(self.db_rows(self.en), baseline, self.work, self.options.format)
         if phase == "english-pending":
+            if self.options.english_seed:
+                self.import_seed()
             self.translate(self.en, "ja", "en")
             self.ready(self.en, baseline, "validate-english")
             self.change_phase("english-ready")
@@ -1301,6 +1679,9 @@ def main(argv=None):
     parser.add_argument("--output", required=True, help="Fresh, absent directory (or an owned pre-injection run with --resume)")
     parser.add_argument("--format", required=True, choices=("renpy", "rpgmaker-mv", "kirikiri"))
     parser.add_argument("--provider", required=True, choices=("google", "antigravity"))
+    parser.add_argument("--fallback-provider", choices=("google",), help="Explicit pending-only Google fallback after orderly Antigravity success")
+    parser.add_argument("--english-seed", help="Fresh-run-only closed owned English DB; copy/export/import verified ready targets")
+    parser.add_argument("--test-fallback-endpoint", help="Test-only separate literal-loopback fallback route; requires scripted primary and explicit Google fallback")
     parser.add_argument("--test-endpoint", help="Dummy-key OpenAI-compatible literal-loopback HTTP endpoint only")
     parser.add_argument("--batch-size", type=int, default=40)
     parser.add_argument("--concurrency", type=int, default=4)

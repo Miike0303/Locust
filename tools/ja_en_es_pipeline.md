@@ -1,4 +1,4 @@
-# Safe JA → EN → ES patch pipeline (PIPE-3B)
+# Safe JA → EN → ES patch pipeline (PIPE-4D)
 
 `ja_en_es_pipeline.py` is a Python standard-library CLI orchestrator for an
 owner-authorized game. It never injects into the source folder. A successful run
@@ -30,7 +30,10 @@ python tools/ja_en_es_pipeline.py `
 The same flags work on POSIX with an absolute executable path. Supported formats
 are `renpy`, `rpgmaker-mv`, and `kirikiri`. Providers are `google` (free) and
 `antigravity` (the existing logged-in `agy` executable on PATH). There is no
-API-key argument, paid-provider option, automatic fallback, or login operation.
+API-key argument, paid-provider option, implicit fallback, or login operation.
+`--fallback-provider google` is optional and valid **only** with primary
+`--provider antigravity`. It applies to both JA→EN and EN→ES, never changes the
+selected primary, and never selects an arbitrary provider.
 Batch size is 1–200, concurrency 1–16, and per-child wall timeout 1–86400 seconds;
 defaults are 40, 4, and 900 respectively. Large games may need a larger explicit
 timeout; a timeout is not automatically retried.
@@ -41,6 +44,12 @@ fixed **dummy**, noncredential key `pipeline-dummy-not-a-credential`. Only liter
 loopback HTTP addresses with explicit ports are accepted, including `::1`;
 DNS names, credentials, paths other than `/`, query strings and fragments are
 refused. Use a trusted local fixture server, not a real translation service.
+With explicit Google fallback, a scripted primary additionally requires a
+**different** `--test-fallback-endpoint http://127.0.0.1:OTHER_PORT`. This test-only
+seam uses a second fixed dummy OpenAI-compatible provider,
+`pipeline-google-scripted`, to simulate Google without live requests. It is not
+an override of Google's real transport. A fallback test route without a scripted
+primary, an implicit fallback route, or conflicting primary/fallback URLs refuses.
 This URL guard is not a network sandbox for an adversarial local server.
 Inherited proxy and provider-key variables are not forwarded. The selected CLI
 and the operator's PATH/login environment are conservatively trusted; this tool
@@ -59,6 +68,7 @@ The fresh output root contains:
 | `install-game/` | Owned strict patch installation; Spanish-labelled when completed |
 | `proof-game/` | Resource-only post-injection copy for independent re-extraction |
 | `english.db`, `spanish.db` | CLI-generated Japanese-source EN project and semantic EN-source ES pivot |
+| `seed-snapshot.db`, `seed-english.xliff` | Optional exclusive seed copy and hash/ID/source/target-verified CLI catalog |
 | `work-proof.db`, `install-proof.db`, `final-install-proof.db` | Separate re-extraction evidence; never semantic pivots |
 | `spanish-patch.zip` | Verified patch artifact |
 | `profile/`, `backups/`, `temp/` | Operation-local Locust profile, backups and temporary files |
@@ -166,7 +176,8 @@ rollback or cleanup of foreign files is performed.
 
 1. Hash the executable and entire source, create verified pristine/work/install
    copies, and extract the work copy into a fresh EN database.
-2. Translate JA→EN using `--no-memory`. Require the exact original inventory,
+2. Optionally borrow verified ready English targets as described below, then
+   translate JA→EN using `--no-memory`. Require the exact original inventory,
    sources, tags, context, metadata and physical identity; every row must have a
    nonblank current translation, ready status, timestamp and expected provider.
    Extraction warnings must be present as a valid empty project array. Run
@@ -249,6 +260,91 @@ looks correct. The homogeneous six-slot KAG positive fixture avoids unchanged
 rows; a seven-slot mixed-file negative proves the omission remains rejected.
 No Rust counter repair or silent inferred skip is included here.
 
+## Explicit pending-only Google fallback
+
+After the primary returns **exit 0** and that result is durably published, the
+wrapper checks the entire static inventory and every row column. Rows already
+ready before the child must remain byte-for-byte logically identical, including
+status, provider, translation and timestamps. Newly ready rows must have the
+exact dispatched provider and are bound by full-row hash to its typed successful
+stage. Pending rows must remain unchanged if they were not accepted. The complete
+resource inventory is never filtered down to provider successes.
+
+If pending rows remain and fallback was explicitly requested, run classified CLI
+validation of accepted targets first, then dispatch Google once with the same
+language pair and `--no-memory`. Locust's pending-only selector—not SQL edits—
+selects its work. Google uses isolated HOME/USERPROFILE/XDG/AppData paths, never
+the inherited agy login profile. Its result is durably published and the same
+inventory/column/provenance checks repeat. Prior-ready rows cannot be reattributed
+or overwritten, even if the fallback returns exit 0. The manifest records exact
+`ja-en-fallback-google` / `en-es-fallback-google` stages and mixed attribution in
+`accepted_rows`. Test-route attribution remains distinct from real Google.
+
+No fallback runs after a nonzero primary exit, timeout, active/uncertain child,
+or publication failure. It is not a watchdog recovery mechanism. A nonzero or
+timed-out fallback never advances readiness; an orderly exit 0 with pending rows
+still fails the original full-readiness gate. Partial-validation stages cannot
+release a pivot, injection, or patch. All final recording, ZIP and strict-install
+gates still operate on **the whole inventory**, not just the borrowed/Google rows.
+
+## Fresh-only verified English seed
+
+An optional `--english-seed /absolute/closed-owned-run/english.db` can reuse ready
+JA→EN rows without resuming that run. Example additions to the fresh invocation:
+
+```text
+--provider antigravity --fallback-provider google --english-seed D:/TranslationRuns/closed-run/english.db
+```
+
+The input must be a **closed**, known owned failed run at `english-pending` or
+`english-ready`, with no active/uncertain child or injection marker. Interrupted
+runs are not seeds: never forge an active marker, take over an old lock, or resume
+the interrupted first Lydia run. The input and its parent components must be
+plain/nonreparse and the file must be single-link. Reject all actual SQLite
+WAL/SHM/journal sidecars, publication remnants/failure records, locks, Spanish
+pivots/patches, and overlapping source/output/seed roots. A historical checkpoint
+may record an empty WAL (exact empty SHA/zero size) only if it is now absent;
+nonempty recorded WAL refuses. The operator must independently establish closure;
+the wrapper never checkpoints, migrates, removes sidecars, or repairs the owner.
+
+Seed acceptance binds a closed version-1 or version-2 ownership manifest, its
+English fingerprint and logical snapshot, the independently hashed current
+Japanese source, and the old pristine/work/install Japanese copies. Manifest
+paths, binary/tool/config hashes and network/executable settings are **data
+only**, never command authority. The old profile/config/executable and its
+claimed source-game path are never opened or invoked. Current invocation's CLI,
+config, source and tool checks remain independent and strict. Seed reports are
+provenance evidence, not authenticated signatures or a hostile-FS sandbox.
+
+Python exclusively copies the seed into `seed-snapshot.db` and inspects/exports
+**only that copy**. It checks the original file/manifest identities and hashes
+before/after and throughout the run. SQLite reads enforce integrity, empty
+extraction warnings/memory, no injection recording, and JA→EN translation-run
+provider/language evidence. Full Japanese inventory must match a **new actual CLI
+extraction**: IDs, relative file paths, source, context, tags, format, static
+metadata and character limits all match. Only the known root in `file_path` is
+mapped; IDs and other strings are not normalized. Foreign/stale/shrunk/pivoted
+inventories refuse. Version-2 ready rows must also match their owner stage bindings.
+
+The existing CLI exports only `translated`, `reviewed` and `approved` targets to
+XLIFF. The wrapper requires the exact emitted plain-text XLIFF structure,
+declared source `ja` / target `en`, no inline/DTD/unknown structures, and exact
+unique IDs, Japanese sources and English snapshot targets. Missing/damaged ready
+rows or a partial catalog refuse; pending/invalid nonready targets are never
+borrowed and never reduce inventory. CLI `import --keep-existing` then fills the
+**new** English DB. Before accepting imports, production CLI validation checks
+controls in that fresh DB, and the wrapper proves exactly the verified targets
+were filled, other pending rows remained unchanged, and fresh JA physical metadata
+and immutable timestamps survived. No Python SQL translation writes occur.
+
+Imported rows retain the CLI's `provider_used=import` / translated status (not
+an invented Google/Antigravity or review attribution). `seed.targets` separately
+records original provider/status and hash/ID-bound source/target provenance;
+`accepted_rows` binds the new row to `seed-import-english`. Remaining pending
+rows still go through the primary and optional Google fallback. No seed path
+becomes a game/injection root. The retained snapshot/catalog are private game-text
+artifacts; failed fresh runs are retained rather than cleaned or adopted.
+
 ## Conservative resume
 
 Repeat the **same** invocation with `--resume` and the same output root only after
@@ -277,6 +373,17 @@ independently reconstructed fingerprint. SQLite reads use URI `mode=ro`,
 `immutable=1` (which can hide WAL contents). No Python SQL translation seeding or
 DB repair occurs. SHM is link-checked but not fingerprinted because it is mutable
 coordination state; logical snapshots and WAL hashes remain mandatory.
+
+Manifest **version 2** records the exact fallback/seed/test-route settings and
+closed typed seed/fallback stage graph. Version-1 runs **cannot resume**, even
+though a separately verified closed failed English DB can be borrowed as a seed.
+Changing explicit fallback/defaults or a test destination refuses resume.
+`--english-seed` itself is fresh-run-only: when resuming a seeded pre-injection
+run, omit that flag. Its recorded path remains historical normalization data;
+resume independently verifies the retained snapshot/catalog/full inventory and
+imported target bindings without reopening/exporting/importing the old input.
+An incomplete seed-import checkpoint is not resumable. Ready checkpoint counts
+must be backed by complete successful stage-bound row attribution.
 
 Only EN-pending/ready and ES-pending/ready checkpoints qualify. Retrying
 translation sends pending work with `--no-memory`; it never re-extracts the
@@ -331,6 +438,15 @@ launches** and without rewriting the forged manifest. Monkeypatched publication
 tests cover transient/permanent permission denials, exact retry budgets, unchanged
 pending inode/bytes, foreign replacement during retry delays, reparse/special/
 multiple-link refusal, retained stage ambiguity, and secondary failure-record
-creation/write denial without masking the primary error. Real
+creation/write denial without masking the primary error. PIPE-4D tests additionally
+exercise primary/fallback failure/timeout/publication, immutable accepted columns,
+mixed stage/import provenance, isolated Google profiles, version/default refusal,
+seed links/sidecars/locks/remnants/foreign or stale inventories, warning/memory/
+recording/language evidence, forged catalogs and invented ready controls. Actual
+CLI export/import (no SQL translation seeding), legacy seed-data-only authority,
+owned-snapshot-only inspection, seed before/after hashes, seeded resume and
+loopback pending completion all reach strict Spanish patch/install/rollback.
+The existing Windows FIFO-only skip remains; missing CLI is a failure, not a skip.
+Real
 Google/Antigravity requests, purchases, owner credential reads, full workspace
 suites, native UI, game runtime and linguistic evaluation are outside these tests.
