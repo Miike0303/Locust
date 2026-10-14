@@ -1,37 +1,42 @@
-/**
- * Lightweight asserts for injectModes (run: npx --yes tsx src/lib/injectModes.test.ts).
- */
 import assert from "node:assert/strict";
+import { test } from "node:test";
 import {
   availableInjectModes,
   coerceInjectMode,
   defaultInjectMode,
+  type OutputMode,
 } from "./injectModes.ts";
 
-// Unknown / empty → all modes, historical default add
-assert.deepEqual(availableInjectModes(undefined), ["replace", "add", "direct"]);
-assert.deepEqual(availableInjectModes([]), ["replace", "add", "direct"]);
-assert.equal(defaultInjectMode(undefined), "add");
-assert.equal(defaultInjectMode([]), "add");
+test("Replace-only defaults and illegal Add selections use a translated copy", () => {
+  assert.deepEqual(availableInjectModes(["replace"]), ["replace", "direct"]);
+  assert.equal(defaultInjectMode(["replace"]), "replace");
+  assert.equal(coerceInjectMode("add", ["replace"]), "replace");
+});
 
-// Replace-only (Unity / KiriKiri / YU-RIS)
-assert.deepEqual(availableInjectModes(["replace"]), ["replace", "direct"]);
-assert.equal(defaultInjectMode(["replace"]), "direct");
-assert.equal(coerceInjectMode("add", ["replace"]), "direct");
-assert.equal(coerceInjectMode("direct", ["replace"]), "direct");
-assert.equal(coerceInjectMode("replace", ["replace"]), "replace");
+test("Replace-only preserves explicit Direct and Replace choices", () => {
+  assert.equal(coerceInjectMode("direct", ["replace"]), "direct");
+  assert.equal(coerceInjectMode("replace", ["replace"]), "replace");
+});
 
-// Replace + Add (Ren'Py / RPG Maker)
-assert.deepEqual(availableInjectModes(["replace", "add"]), [
-  "replace",
-  "direct",
-  "add",
-]);
-assert.equal(defaultInjectMode(["replace", "add"]), "add");
-assert.equal(coerceInjectMode("add", ["replace", "add"]), "add");
+test("Replace + Add keeps the historical Add default and valid choices", () => {
+  assert.deepEqual(availableInjectModes(["replace", "add"]), ["replace", "direct", "add"]);
+  assert.equal(defaultInjectMode(["replace", "add"]), "add");
+  for (const mode of ["add", "replace", "direct"] as const) {
+    assert.equal(coerceInjectMode(mode, ["replace", "add"]), mode);
+  }
+});
 
-// Add-only (defensive)
-assert.deepEqual(availableInjectModes(["add"]), ["add"]);
-assert.equal(defaultInjectMode(["add"]), "add");
+test("Add-only remains Add and coerces unsupported choices", () => {
+  assert.deepEqual(availableInjectModes(["add"]), ["add"]);
+  assert.equal(defaultInjectMode(["add"]), "add");
+  assert.equal(coerceInjectMode("direct", ["add"]), "add");
+  assert.equal(coerceInjectMode("replace", ["add"]), "add");
+});
 
-console.log("injectModes.test.ts: ok");
+test("unknown, empty and unrecognized modes preserve the legacy non-Direct default", () => {
+  for (const supported of [undefined, null, [], ["future"] as unknown as OutputMode[]]) {
+    assert.deepEqual(availableInjectModes(supported), ["replace", "add", "direct"]);
+    assert.equal(defaultInjectMode(supported), "add");
+    assert.equal(coerceInjectMode("direct", supported), "direct");
+  }
+});

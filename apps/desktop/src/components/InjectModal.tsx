@@ -48,6 +48,12 @@ import { useT } from "../lib/i18n";
 
 const INJECT_LANG_KEY = "locust.inject.langs";
 
+// The native backend returns actual per-language roots for Add/Replace.
+// Optional for compatibility with reports that do not include this field.
+type NativeInjectReport = MultiLangReport & {
+	injected_roots?: Record<string, string>;
+};
+
 interface InjectModalProps {
 	open: boolean;
 	onClose: () => void;
@@ -72,7 +78,7 @@ export default function InjectModal({
 		[project?.supported_modes],
 	);
 	const [mode, setMode] = useState<InjectUiMode>(() =>
-		defaultInjectMode(undefined),
+		defaultInjectMode(project?.supported_modes),
 	);
 	// When project/format modes change, drop illegal selections (e.g. Add on Unity).
 	useEffect(() => {
@@ -92,7 +98,7 @@ export default function InjectModal({
 	);
 	const [outputDir, setOutputDir] = useState("");
 	const [loading, setLoading] = useState(false);
-	const [result, setResult] = useState<MultiLangReport | null>(null);
+	const [result, setResult] = useState<NativeInjectReport | null>(null);
 	const [regLoading, setRegLoading] = useState(false);
 	const [regReports, setRegReports] = useState<
 		{ lang: string; label: string; report: RegisterLangReport }[]
@@ -273,7 +279,7 @@ export default function InjectModal({
 			}
 
 			const isDirect = mode === "direct";
-			const report = await inject({
+			const report: NativeInjectReport = await inject({
 				project_path: project.path,
 				format_id: project.format_id,
 				mode: isDirect ? undefined : mode,
@@ -291,7 +297,9 @@ export default function InjectModal({
 				? `Direct inject into ${project.path}` +
 					(report.backup_path ? `\nBackup: ${report.backup_path}` : "")
 				: mode === "replace"
-					? `Output: ${outputDir}`
+					? Object.entries(report.injected_roots ?? {}).map(([lang, path]) =>
+						t("inject.copyDestination", { lang, path }),
+					).join("\n")
 					: `Added translation folders in ${project.path}`;
 			const failDetail = report.languages_failed?.length
 				? `Failed: ${report.languages_failed.map(([l, e]) => `${l}: ${e}`).join(", ")}`
@@ -538,7 +546,9 @@ export default function InjectModal({
 								? t("inject.injecting")
 								: mode === "direct"
 									? t("inject.directAction")
-									: t("inject.injectAction")}
+									: mode === "replace"
+										? t("inject.copyAction")
+										: t("inject.injectAction")}
 						</button>
 
 						{isRpgMaker && (
@@ -668,11 +678,11 @@ export default function InjectModal({
 									{t("inject.backup", { path: result.backup_path })}
 								</p>
 							)}
-							{!isDirectResult && mode === "replace" && outputDir && (
-								<p className="text-body opacity-90">
-									{t("inject.output", { path: outputDir })}
+							{result.mode === "replace" && Object.entries(result.injected_roots ?? {}).map(([lang, path]) => (
+								<p key={lang} className="text-body break-all opacity-90">
+									{t("inject.copyDestination", { lang, path })}
 								</p>
-							)}
+							))}
 							{result.reports && Object.keys(result.reports).length > 0 && (
 								<div className="mt-2 space-y-1">
 									{Object.entries(result.reports).map(([lang, report]) => (

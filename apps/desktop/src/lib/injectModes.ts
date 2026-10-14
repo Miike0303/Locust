@@ -27,7 +27,7 @@ export function availableInjectModes(
 
 /**
  * Default mode:
- * - Replace-only engines (Unity, KiriKiri, YU-RIS, …) → `direct` (in-place + patch recording)
+ * - Replace-only engines (Unity, KiriKiri, YU-RIS, …) → `replace` (translated copy)
  * - Formats with Add (Ren'Py, RPG Maker) → `add`
  * - Unknown supported_modes → `add` (historical desktop default)
  */
@@ -38,9 +38,6 @@ export function defaultInjectMode(
     return "add";
   }
   const avail = availableInjectModes(supported);
-  if (!supported.includes("add") && avail.includes("direct")) {
-    return "direct";
-  }
   if (avail.includes("add")) {
     return "add";
   }

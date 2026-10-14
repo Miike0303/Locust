@@ -1,0 +1,25 @@
+# Native Japanese visual novel translation
+
+## Goal
+Make Locust's native application safe and straightforward for the owner's visual novels under D:/juegos/VN, starting with one verified readable Japanese-bearing game. No scripts as the final required user workflow. Preserve originals and existing saved databases; do not promise universal engine, encryption, font, runtime or semantic support.
+
+## Evidence and scope
+Read-only mapping: tmp/ja-en-es-pipeline/vn-native-map-20261014.json. Eight roots: VN02 YU-RIS has bounded Japanese dialogue evidence but mixed/duplicate sources; sampled KiriKiri dialogue in VN04/VN06/VN07 is English, VN03 gameplay scripts protected/hashed; VN01 RenPy compiled language unconfirmed; DAT/XFL families unidentified or unsupported. Engine markers are not source-language proof.
+Native Replace already creates a separate translated copy; Direct mutates selected root. Replace-only engines currently default to Direct. Core/CLI have strict pivot but native HTTP/Tauri call legacy partial pivot. Wrapper-only full pipeline orchestration is not native app acceptance.
+Previous glossary unit363c1ac delivered main after CI38597761738 (Ubuntu2325/0/21ignored, Windows2336/0/21ignored, frontend439/0/0). Old PIPE4F2/4G deferred by owner focus; malformed Lydia remains unresolved.
+
+## Constraints
+Single bounded writer. Preserve unrelated .claude edits, originals, saved DBs and backups. No credentials, purchases, publishing releases or real-game Direct injection. Real checks use fresh owned scratch roots, isolated config/state and copied source assets. Reports use aliases/counts, not private prose. Never claim translated Japanese originals when active assets are already English. Native gameplay/font/human linguistic review requires separate proof.
+Route: delegated mapping, one scoped writer per implementation unit, independent command-running verification when assessment requires it. Applicable deterministic behavior changes use observed RED/GREEN. RDD currently off. Delivery strategy: existing verified-main work-unit chain, one isolated unit with tests/docs; nonforce branch publication and exact-SHA Windows/Ubuntu CI before main delivery. Forecast: copy UX ~150-300 diff lines, strict pivot ~150-350, real audit metadata only; report actual workload without cosmetic shrinking.
+
+## Tasks
+- [ ] VN-N1 (implemented and independently verified; awaiting exact-SHA CI/delivery): Default Replace-only engines to translated-copy mode in the native UI. Preserve explicit Direct as an informed choice. Require an output folder; communicate copy vs original and returned destination. Tests pin default/coercion/request safety; EN/ES copy consistent. Do not change CLI backward compatibility or silently modify files.
+- [ ] VN-N2: Expose existing complete-pivot gate through native HTTP/Tauri/UI so JA->EN->ES cannot silently omit incomplete/stale/control-invalid rows. Keep legacy API compatibility where needed; native UI requests strict mode; refusal produces no output and keeps source DB intact.
+- [ ] VN-N3: Validate VN02 source surface/provenance, then extract and translate bounded Japanese display samples using existing subscribed provider in a fresh copy. Verify controls/locators, injection/re-extraction and original hashes; expand only after first proof. Record mixed-source/cipher exclusions; do not substitute mocked translation for live proof.
+- [ ] VN-N4: Native app functional verification against real isolated backend plus concise user steps. Record exact build availability and limits; no native Tauri/runtime/font claim without observed evidence.
+
+## Acceptance
+Safe default must never send Direct on a Replace-only engine without explicit selection. Destination required for copy. Strict pivot fails closed before output when data incomplete. Actual Japanese source confirmed independently; originals unchanged. Injection must preserve non-display data and controls; re-extraction must match expected physical rows without hiding skips. Test and live limitations reported explicitly.
+
+## Progress
+2026-10-14: VN-N1 writer RED16pass/5fail -> focusedGREEN21pass; frontend449pass/build passed after replacing test-only unsupported Array.at. Native assessment unassessable due untracked task document; RDD off, treated high, independent verifier added. Verifier focused21/frontend449/build passed and actual production headless UI with real isolated backend passed33/33. EN/ES copy requests direct:false; original five fixture trees hashes unchanged; both actual copy results2strings/1file/0skips and exact-script integrity passed. Mock produced zero injected strings in an initial attempt; final copy proof used manually seeded synthetic KAG-safe translations, not live linguistic proof. Direct persistence checked without execution. Six helper runs with escaping/diagnostic failures recorded. Evidence tmp/native-japanese-vn/verify-n1-20261014/. Backend debug build previously verified at363c1ac; frontend unit212diff lines/six files. Pending exact-SHA CI and delivery before VN-N2 source changes.
