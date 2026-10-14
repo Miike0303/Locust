@@ -762,7 +762,7 @@ export const en = {
   "inject.mode.direct": "Direct — write into the game folder (backup created first)",
   "inject.hint.replace": "Copies the game to a new folder with translations applied — your original stays untouched. Creates: [output]/{gameName}-[lang]/",
   "inject.hint.add": "Adds the translation as an extra language the game can switch to (a tl/[lang]/ folder inside the game)",
-  "inject.hint.direct": "Writes translations into the game folder in place (a backup is created first). Required before packing a patch in Patch → Pack.",
+  "inject.hint.direct": "Changes the selected game folder in place (a backup is created first). Create a translated copy to keep it unchanged. A recorded translated copy can also be packed as a patch.",
   "inject.hint.noAdd": "This format has no Add language packs. Use Replace for a translated copy, or explicitly choose Direct to modify the original.",
   "inject.direct.warnTitle": "Direct mode mutates original game files",
   "inject.direct.li1": "The game folder is backed up before anything is written. Restore it from Settings → Data.",

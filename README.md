@@ -239,6 +239,8 @@ MIT. See [LICENSE](LICENSE).
 
 ## Contributing
 
+For app users: [Safe native visual-novel workflow](docs/NATIVE-VN-WORKFLOW.md) — Japanese → English → Spanish, complete pivots, translated copies and encoding limits; no Python required.
+
 Pull requests welcome. Start with the [architecture map](docs/ARCHITECTURE.md) and the [improvement ledger](docs/IMPROVEMENT-GOAL.md) (latest **Done** entry and backlog). See [CLAUDE.md](CLAUDE.md) for agent instructions and [RELEASE.md](RELEASE.md) for the release process.
 
 Priority areas:

@@ -742,7 +742,7 @@ export const es: Record<keyof typeof en, string> = {
   "inject.mode.direct": "Directo — escribir en la carpeta del juego (se crea una copia de seguridad primero)",
   "inject.hint.replace": "Copia el juego a una carpeta nueva con las traducciones aplicadas — el original no se toca. Crea: [salida]/{gameName}-[lang]/",
   "inject.hint.add": "Añade la traducción como un idioma extra al que el juego puede cambiar (una carpeta tl/[lang]/ dentro del juego)",
-  "inject.hint.direct": "Escribe las traducciones en la carpeta del juego (se crea una copia de seguridad primero). Obligatorio antes de empaquetar un parche en Parche → Empaquetar.",
+  "inject.hint.direct": "Modifica la carpeta del juego seleccionada (primero se crea una copia de seguridad). Crea una copia traducida para conservarla sin cambios. Una copia traducida con registro de inserción también se puede empaquetar como parche.",
   "inject.hint.noAdd": "Este formato no admite paquetes de idioma Añadir. Use Reemplazar para crear una copia traducida o elija Directo explícitamente para modificar el original.",
   "inject.direct.warnTitle": "El modo directo modifica los archivos originales del juego",
   "inject.direct.li1": "Se hace una copia de seguridad de la carpeta del juego antes de escribir nada. Puede restaurarla desde Ajustes → Datos.",
