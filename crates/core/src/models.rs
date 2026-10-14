@@ -12,6 +12,11 @@ pub const INJECTION_SOURCE_METADATA_KEY: &str = "locust_injection_source";
 pub const INJECTION_CAPACITY_METADATA_KEY: &str = "locust_injection_capacity";
 pub const STALE_TRANSLATION_METADATA_KEY: &str = "locust_stale_translation";
 pub const FORMAT_ID_METADATA_KEY: &str = "format_id";
+/// Extractor-owned representation, not a command role or runtime display claim.
+/// Only the exact supported parser/writer contract opts out of Ren'Py brackets.
+/// Old unmarked YU-RIS rows require fresh extraction; never infer from `.ybn`.
+pub const YURIS_LITERAL_METADATA_KEY: &str = "yuris_literal_representation";
+pub const YURIS_QUOTED_LITERAL_V1: &str = "ystb-0x22b-attr3-push0x4d-quoted-sjis-v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StringEntry {
@@ -81,6 +86,15 @@ impl StringEntry {
         // Explicit provenance wins, including unknown or malformed IDs. It is
         // persisted with the row and survives exports, pivots and DB reloads.
         if let Some(format_id) = self.metadata.get(FORMAT_ID_METADATA_KEY) {
+            if format_id.as_str() == Some("yuris")
+                && self
+                    .metadata
+                    .get(YURIS_LITERAL_METADATA_KEY)
+                    .and_then(|v| v.as_str())
+                    == Some(YURIS_QUOTED_LITERAL_V1)
+            {
+                return PlaceholderProfile::YurisQuotedLiteral;
+            }
             return PlaceholderProfile::for_format(format_id.as_str().unwrap_or_default());
         }
         let extension = self

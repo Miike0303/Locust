@@ -11,6 +11,9 @@ pub enum PlaceholderProfile {
     #[default]
     Full,
     RpgMaker,
+    /// Only source-extracted, versioned YU-RIS quoted push-string literals.
+    /// Never selected by the format-global mapping without row provenance.
+    YurisQuotedLiteral,
 }
 
 impl PlaceholderProfile {
@@ -309,7 +312,7 @@ impl PlaceholderProcessor {
         Self::find_python_format(source, &mut matches);
         Self::find_rust_format(source, &mut matches);
         Self::find_c_format(source, &mut matches);
-        if profile != PlaceholderProfile::RpgMaker {
+        if profile == PlaceholderProfile::Full {
             Self::find_custom_brackets(source, &mut matches);
         }
 

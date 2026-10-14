@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use crate::archive_replace::{guard_target, note_backups, replace_files};
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{FormatPlugin, InjectionReport};
-use locust_core::models::{OutputMode, StringEntry};
+use locust_core::models::{
+    OutputMode, StringEntry, YURIS_LITERAL_METADATA_KEY, YURIS_QUOTED_LITERAL_V1,
+};
 use locust_core::patch::GameLock;
 use tracing::warn;
 
@@ -1406,7 +1408,18 @@ fn entries_with_commands(
         } else {
             format!("{rel}#attr{}", s.attr_index)
         };
-        let mut entry = StringEntry::new(id, &s.text, file_path.clone());
+        let mut entry = StringEntry::new(id, &s.text, file_path.clone()).with_format_id("yuris");
+        // ATTR_EXPRESSION rows reach this point only through the exact bounded
+        // 0x4D + u16 length + quoted Shift-JIS parser in the supported 0x22B
+        // layout. Brackets are literal in that representation, independent of
+        // whether the command is display or an unproven indirect GOSUB role.
+        // Raw controls and captions deliberately receive no literal opt-out.
+        if !ystb.caption && s.attr_type == ATTR_EXPRESSION {
+            entry.metadata.insert(
+                YURIS_LITERAL_METADATA_KEY.into(),
+                serde_json::json!(YURIS_QUOTED_LITERAL_V1),
+            );
+        }
         entry.tags = vec!["dialogue".into()];
         entry.context = Some(context.clone());
         all.push(entry);
@@ -2237,6 +2250,88 @@ mod tests {
 
     fn fixture_expr(text: &str) -> Vec<u8> {
         pushstring_double_quoted(text)
+    }
+
+    #[test]
+    fn quoted_literal_profile_roundtrips_brackets_without_touching_technical_structure() {
+        use locust_core::placeholder::PlaceholderProfile;
+        for quote in ['"', '\'', '`'] {
+            let body = encode_sjis(&format!("{quote}[カナ]{quote}")).unwrap();
+            let mut expression = vec![PUSH_STRING];
+            expression.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            expression.extend_from_slice(&body);
+            let technical = fixture_expr("ES.INTERNAL.KEY");
+            let original = real_layout(
+                &[
+                    // The GOSUB argument is indirect, not proven player display.
+                    (
+                        43,
+                        vec![(0, 3, fixture_expr("ES.UNKNOWN")), (33, 3, expression)],
+                    ),
+                    (26, vec![(2, 3, technical.clone())]),
+                    (108, vec![(0, 0, b"Hello raw display".to_vec())]),
+                ],
+                TRUE_KEY_B4626AD8,
+            );
+            let mut rows =
+                entries_from_ystb_bytes(&original, "story.ybn", "story.ybn".into()).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].source, "[カナ]");
+            assert_eq!(rows[0].metadata["format_id"], "yuris");
+            assert_eq!(
+                rows[0].metadata["yuris_literal_representation"],
+                "ystb-0x22b-attr3-push0x4d-quoted-sjis-v1"
+            );
+            assert_eq!(rows[1].placeholder_profile(), PlaceholderProfile::Full);
+            assert!(!rows[1]
+                .metadata
+                .contains_key("yuris_literal_representation"));
+            rows[0].translation = Some("[Kana]".into());
+            rows[0].require_preserved_translation_controls().unwrap();
+            let before = load_ystb(&original, "story").unwrap().unwrap();
+            let mut warnings = Vec::new();
+            let (translations, skipped) =
+                translations_from_entries(&[&rows[0]], &before, &mut warnings);
+            assert_eq!(skipped, 0, "{warnings:?}");
+            assert_eq!(translations.len(), 1);
+            let output = inject_into_ystb(&before, &translations).unwrap();
+            let after = load_ystb(&output, "story").unwrap().unwrap();
+            assert_eq!(layout_context(&before), layout_context(&after));
+            let (_, _, old_values, old_lines) = section_offsets(&before.hdr);
+            let (_, _, new_values, new_lines) = section_offsets(&after.hdr);
+            assert_eq!(&before.data[old_lines..], &after.data[new_lines..]);
+            for index in [0, 2, 3] {
+                let old = &before.attrs[index];
+                let new = &after.attrs[index];
+                assert_eq!(
+                    &before.data[old_values + old.offset as usize
+                        ..old_values + (old.offset + old.size) as usize],
+                    &after.data[new_values + new.offset as usize
+                        ..new_values + (new.offset + new.size) as usize],
+                );
+            }
+            let again = entries_from_ystb_bytes(&output, "story.ybn", "story.ybn".into()).unwrap();
+            assert_eq!(again[0].source, "[Kana]");
+            assert_eq!(again[0].metadata, rows[0].metadata);
+            assert_eq!(again[1].source, rows[1].source);
+        }
+    }
+
+    #[test]
+    fn unsupported_literal_expressions_never_gain_provenance() {
+        let valid = fixture_expr("[カナ]");
+        for expression in [
+            [valid.clone(), vec![0]].concat(),
+            vec![PUSH_STRING, 2, 0, b'"', b'\''],
+            vec![0x42, 1, 0, 1],
+        ] {
+            let original = real_layout(&[(250, vec![(0, 3, expression)])], 0);
+            assert!(
+                entries_from_ystb_bytes(&original, "story.ybn", "story.ybn".into())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
