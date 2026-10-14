@@ -26,13 +26,17 @@ import clsx from "clsx";
 interface PivotModalProps {
 	open: boolean;
 	onClose: () => void;
+	/** Translated/reviewed/approved status count, not strict-pivot validation. */
 	carryOverCount: number | null;
+	/** Inventory total from the same statistics snapshot as carryOverCount. */
+	totalEntries: number | null;
 }
 
 export default function PivotModal({
 	open,
 	onClose,
 	carryOverCount,
+	totalEntries,
 }: PivotModalProps) {
 	const t = useT();
 	const queryClient = useQueryClient();
@@ -57,10 +61,6 @@ export default function PivotModal({
 	if (!open || !project) return null;
 
 	const pickAndCreate = async () => {
-		if (carryOverCount === 0) {
-			addToast("info", t("pivot.toast.noTranslations"));
-			return;
-		}
 		setLoading(true);
 		setError(null);
 		try {
@@ -89,7 +89,7 @@ export default function PivotModal({
 				path = typed;
 			}
 
-			const created = await runPivot(path);
+			const created = await runPivot(path, true);
 			setResult(created);
 			addLog(
 				"info",
@@ -230,9 +230,12 @@ export default function PivotModal({
 						<p className="text-body text-text-muted">
 							{t("pivot.skipNote")}
 						</p>
-						{carryOverCount !== null && (
+						{carryOverCount !== null && totalEntries !== null && (
 							<p className="text-body font-medium">
-								{t("pivot.carry", { count: carryOverCount })}
+								{t("pivot.statusCount", {
+									count: carryOverCount,
+									total: totalEntries,
+								})}
 							</p>
 						)}
 						{error && (
@@ -251,7 +254,7 @@ export default function PivotModal({
 								onClick={() => {
 									void pickAndCreate();
 								}}
-								disabled={loading || carryOverCount === 0}
+								disabled={loading}
 								className="flex items-center gap-1.5 px-4 py-2 text-body font-medium rounded text-white bg-accent hover:bg-accent-hover disabled:opacity-50"
 							>
 								{loading ? (

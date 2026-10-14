@@ -349,9 +349,8 @@ export const en = {
   // ── pivot ───────────────────────────────────────────────────────────────
   "pivot.title": "Pivot to a new project",
   "pivot.explain": "The current translations become the source text of a new project, so you can translate onward into another language.",
-  "pivot.skipNote": "Entries with no translation are skipped.",
-  "pivot.carry.one": "{count} entry will carry over.",
-  "pivot.carry.other": "{count} entries will carry over.",
+  "pivot.skipNote": "All entries must have a non-blank translation, be translated, reviewed or approved, match the current source, and preserve protected controls. If any entry fails these checks, no pivot database is created.",
+  "pivot.statusCount": "Entries marked translated, reviewed or approved: {count} of {total}.",
   "pivot.create": "Create project…",
   "pivot.creating": "Creating…",
   "pivot.dialog.save": "Save pivoted project",

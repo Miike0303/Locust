@@ -346,9 +346,8 @@ export const es: Record<keyof typeof en, string> = {
 
   "pivot.title": "Pivotar a un nuevo proyecto",
   "pivot.explain": "Las traducciones actuales pasan a ser el texto de origen de un nuevo proyecto, para continuar la traducción a otro idioma.",
-  "pivot.skipNote": "Se omiten las entradas sin traducción.",
-  "pivot.carry.one": "Se transferirá {count} entrada.",
-  "pivot.carry.other": "Se transferirán {count} entradas.",
+  "pivot.skipNote": "Todas las entradas deben tener una traducción no vacía, estar traducidas, revisadas o aprobadas, corresponder al texto fuente actual y conservar los controles protegidos. Si alguna entrada no cumple estas condiciones, no se crea la base de datos puente.",
+  "pivot.statusCount": "Entradas marcadas como traducidas, revisadas o aprobadas: {count} de {total}.",
   "pivot.create": "Crear proyecto…",
   "pivot.creating": "Creando…",
   "pivot.dialog.save": "Guardar proyecto pivotado",

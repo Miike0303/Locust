@@ -488,13 +488,21 @@ export interface PivotResult {
   entries: number;
 }
 
-/** New project whose SOURCE is the current project's translations. */
-export const runPivot = (outputPath: string): Promise<PivotResult> =>
+/** New project whose SOURCE is the current project's translations.
+ * Omitted/false requireComplete retains legacy partial-pivot compatibility.
+ */
+export const runPivot = (outputPath: string, requireComplete?: boolean): Promise<PivotResult> =>
   IS_TAURI
-    ? tauriInvoke("run_pivot", { outputPath })
+    ? tauriInvoke("run_pivot", {
+        outputPath,
+        ...(requireComplete === undefined ? {} : { requireComplete }),
+      })
     : request("/pivot", {
         method: "POST",
-        body: JSON.stringify({ output_path: outputPath }),
+        body: JSON.stringify({
+          output_path: outputPath,
+          ...(requireComplete === undefined ? {} : { require_complete: requireComplete }),
+        }),
       });
 
 export const getString = (id: string) =>

@@ -634,6 +634,7 @@ export default function Editor() {
 				carryOverCount={
 					statsData ? pivotCarryOverCount(statsData) : null
 				}
+				totalEntries={statsData?.total ?? null}
 			/>
 
 			<SearchReplaceModal

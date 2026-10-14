@@ -879,6 +879,8 @@ async fn project_current(
 #[derive(Deserialize)]
 struct PivotRequest {
     output_path: String,
+    #[serde(default)]
+    require_complete: bool,
 }
 
 async fn pivot_project(
@@ -891,7 +893,12 @@ async fn pivot_project(
     }
     // Pivot reads every translated row from the live DB — open must not reopen under it.
     let output = PathBuf::from(&req.output_path);
-    state.db.pivot_to(&output).map(Json).map_err(|e| {
+    let result = if req.require_complete {
+        state.db.pivot_to_complete(&output)
+    } else {
+        state.db.pivot_to(&output)
+    };
+    result.map(Json).map_err(|e| {
         let msg = e.to_string();
         let status = match &e {
             locust_core::error::LocustError::IoError(io)

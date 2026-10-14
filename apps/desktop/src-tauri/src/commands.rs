@@ -326,15 +326,28 @@ pub async fn list_injection_recordings(
 #[tauri::command]
 pub async fn run_pivot(
     output_path: String,
+    require_complete: Option<bool>,
     state: State<'_, AppStateWrapper>,
 ) -> Result<PivotResult, String> {
-    let s = &state.0;
+    apply_run_pivot(&state.0, output_path, require_complete).await
+}
+
+async fn apply_run_pivot(
+    s: &Arc<AppState>,
+    output_path: String,
+    require_complete: Option<bool>,
+) -> Result<PivotResult, String> {
     let _exclusive = try_project_operation(s)?;
     if s.current_project.read().await.is_none() {
         return Err("no project open".into());
     }
-    s.db.pivot_to(&PathBuf::from(output_path))
-        .map_err(|e| e.to_string())
+    let output = PathBuf::from(output_path);
+    let result = if require_complete.unwrap_or(false) {
+        s.db.pivot_to_complete(&output)
+    } else {
+        s.db.pivot_to(&output)
+    };
+    result.map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize)]
@@ -882,6 +895,262 @@ async fn apply_add_glossary_entry(s: &AppState, entry: &GlossaryEntry) -> Result
 
 #[cfg(test)]
 mod tests {
+    fn pivot_ready(id: &str) -> StringEntry {
+        let mut row = StringEntry::new(id, "日本語 [name]", "script.rpy".into());
+        row.translation = Some("English [name]".into());
+        row.status = StringStatus::Translated;
+        row
+    }
+
+    async fn pivot_project(state: &AppState) {
+        *state.current_project.write().await = Some(
+            serde_json::from_value(serde_json::json!({
+                "path":"synthetic-game", "format_id":"renpy", "name":"Fixture"
+            }))
+            .unwrap(),
+        );
+    }
+
+    fn pivot_snapshot(state: &AppState) -> serde_json::Value {
+        serde_json::to_value(state.db.get_entries(&EntryFilter::default()).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pivot_dispatch_strict_refuses_incomplete_stale_and_invalid_controls() {
+        for case in [
+            "missing",
+            "empty",
+            "blank",
+            "pending",
+            "error",
+            "stale",
+            "control",
+            "physical-control",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = locust_server::create_test_state();
+            pivot_project(&state).await;
+            let mut invalid = pivot_ready("z");
+            let reason = match case {
+                "missing" => {
+                    invalid.translation = None;
+                    "missing or blank translation"
+                }
+                "empty" => {
+                    invalid.translation = Some(String::new());
+                    "missing or blank translation"
+                }
+                "blank" => {
+                    invalid.translation = Some("\t\u{a0}\u{2003}\u{3000}".into());
+                    "missing or blank translation"
+                }
+                "pending" => {
+                    invalid.status = StringStatus::Pending;
+                    "not ready"
+                }
+                "error" => {
+                    invalid.status = StringStatus::Error;
+                    "not ready"
+                }
+                "stale" => {
+                    invalid.metadata.insert(
+                        locust_core::models::STALE_TRANSLATION_METADATA_KEY.into(),
+                        serde_json::json!({
+                            "version": 1,
+                            "translated_source_sha256": "0".repeat(64),
+                            "current_source_sha256": invalid.source_hash(),
+                        }),
+                    );
+                    "stale translation"
+                }
+                "physical-control" => {
+                    invalid.source = "English".into();
+                    invalid.translation = Some("Spanish".into());
+                    invalid.metadata.insert(
+                        "locust_injection_source".into(),
+                        serde_json::json!("日本語 [name]"),
+                    );
+                    "changed protected controls"
+                }
+                _ => {
+                    invalid.translation = Some("English".into());
+                    "changed protected controls"
+                }
+            };
+            state.db.save_entries(&[pivot_ready("a"), invalid]).unwrap();
+            let before = pivot_snapshot(&state);
+            let error = apply_run_pivot(
+                &state,
+                temp.path().join("out.db").to_string_lossy().into_owned(),
+                Some(true),
+            )
+            .await
+            .expect_err(case);
+            assert!(error.contains(reason), "{case}: {error}");
+            assert_eq!(
+                std::fs::read_dir(temp.path()).unwrap().count(),
+                0,
+                "no output or sidecars"
+            );
+            assert_eq!(pivot_snapshot(&state), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn pivot_dispatch_complete_preserves_all_rows_and_physical_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = locust_server::create_test_state();
+        pivot_project(&state).await;
+        let mut slot = pivot_ready("a");
+        slot.source = "English".into();
+        slot.translation = Some("Spanish".into());
+        slot.metadata
+            .insert("binary_slot".into(), serde_json::json!("utf8"));
+        slot.metadata.insert(
+            "locust_injection_source".into(),
+            serde_json::json!("日本語文"),
+        );
+        slot.metadata.insert(
+            "locust_injection_capacity".into(),
+            serde_json::json!({"encoding":"utf8", "bytes":12}),
+        );
+        slot.context = Some("speaker".into());
+        slot.tags = vec!["dialogue".into()];
+        let mut reviewed = pivot_ready("b");
+        reviewed.status = StringStatus::Reviewed;
+        let mut approved = pivot_ready("c");
+        approved.status = StringStatus::Approved;
+        state.db.save_entries(&[slot, reviewed, approved]).unwrap();
+        let before = pivot_snapshot(&state);
+        let output = temp.path().join("complete.db");
+        let result = apply_run_pivot(&state, output.to_string_lossy().into_owned(), Some(true))
+            .await
+            .unwrap();
+        assert_eq!(result.entries, 3);
+        assert_eq!(result.database_path, output.to_string_lossy());
+        let pivot = locust_core::database::Database::open(&output).unwrap();
+        for row in pivot.get_entries(&EntryFilter::default()).unwrap() {
+            let original = state.db.get_entry(&row.id).unwrap().unwrap();
+            assert_eq!(Some(row.source.as_str()), original.translation.as_deref());
+            assert_eq!(
+                row.injection_source().unwrap(),
+                original.injection_source().unwrap()
+            );
+            assert_eq!(
+                row.injection_capacity().unwrap(),
+                original.injection_capacity().unwrap()
+            );
+            assert_eq!(row.status, StringStatus::Pending);
+            assert!(row.translation.is_none());
+            assert_eq!(row.context, original.context);
+            assert_eq!(row.tags, original.tags);
+        }
+        assert_eq!(pivot_snapshot(&state), before);
+    }
+
+    #[tokio::test]
+    async fn pivot_dispatch_legacy_absent_and_false_keep_partial_behavior() {
+        for strict in [None, Some(false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = locust_server::create_test_state();
+            pivot_project(&state).await;
+            let mut retained = pivot_ready("retained");
+            retained.status = StringStatus::Pending;
+            let mut blank = pivot_ready("blank");
+            blank.translation = Some("  ".into());
+            state
+                .db
+                .save_entries(&[
+                    pivot_ready("ready"),
+                    retained,
+                    blank,
+                    StringEntry::new("missing", "Source", "script.rpy".into()),
+                ])
+                .unwrap();
+            let before = pivot_snapshot(&state);
+            let result = apply_run_pivot(
+                &state,
+                temp.path()
+                    .join("partial.db")
+                    .to_string_lossy()
+                    .into_owned(),
+                strict,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.entries, 2);
+            assert_eq!(pivot_snapshot(&state), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn pivot_dispatch_keeps_persisted_source_bytes_and_refuses_source_as_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        let output_dir = tempfile::tempdir().unwrap();
+        // Close the seed writer so its WAL is checkpointed before measuring bytes.
+        let seed = locust_core::database::Database::open(&source).unwrap();
+        seed.save_entries(&[
+            pivot_ready("a"),
+            StringEntry::new("z", "Missing", "script.rpy".into()),
+        ])
+        .unwrap();
+        drop(seed);
+        let state = locust_server::create_test_state_with_db(&source);
+        pivot_project(&state).await;
+        let before = std::fs::read(&source).unwrap();
+        let rows_before = pivot_snapshot(&state);
+        for output in [output_dir.path().join("refused.db"), source.clone()] {
+            let error = apply_run_pivot(&state, output.to_string_lossy().into_owned(), Some(true))
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains(if output == source {
+                    "refusing to overwrite"
+                } else {
+                    "missing or blank translation"
+                }),
+                "{error}"
+            );
+        }
+        assert_eq!(std::fs::read_dir(output_dir.path()).unwrap().count(), 0);
+        assert_eq!(pivot_snapshot(&state), rows_before);
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        drop(state);
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn pivot_dispatch_preserves_admission_and_overwrite_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = locust_server::create_test_state();
+        state.db.save_entries(&[pivot_ready("a")]).unwrap();
+        let output = temp.path().join("out.db").to_string_lossy().into_owned();
+        assert_eq!(
+            apply_run_pivot(&state, output.clone(), Some(true))
+                .await
+                .unwrap_err(),
+            "no project open"
+        );
+        pivot_project(&state).await;
+        let guard = try_project_operation(&state).unwrap();
+        assert_eq!(
+            apply_run_pivot(&state, output.clone(), Some(true))
+                .await
+                .unwrap_err(),
+            locust_server::PROJECT_BUSY_MESSAGE
+        );
+        drop(guard);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        std::fs::write(&output, b"keep output").unwrap();
+        assert!(apply_run_pivot(&state, output.clone(), Some(true))
+            .await
+            .unwrap_err()
+            .contains("refusing to overwrite"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep output");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
     use super::*;
 
     #[tokio::test]
