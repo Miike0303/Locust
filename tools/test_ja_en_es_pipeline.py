@@ -19,6 +19,7 @@ SCRATCH = Path(__file__).resolve().parents[1] / ".test-tmp"
 CLI = Path(__file__).resolve().parents[1] / "target/debug" / ("locust.exe" if os.name == "nt" else "locust")
 
 import ja_en_es_pipeline as pipeline
+from test_qa_replay_oracle import LAYOUT_CASES, layout_rejections, layout_row
 
 
 def row(root, **updates):
@@ -223,15 +224,32 @@ class AdditionalGates(PipelineCase):
             pipeline.gate_rows([bad], baseline, self.game, "kirikiri", ready=True)
 
     def test_resource_identity_duplicates_and_bounded_wrap(self):
-        original = row(self.game, id="Map#event_1#page_0#cmd_1#msg", source="森へ\n進む", translation="Continuar hacia el bosque",
+        original = row(self.game, id="Map#event_1#page_0#cmd_1#msg", source="森へ\n進む", translation="Continuar hacia el bosque", tags=["dialogue"],
                        metadata={"format_id": "rpgmaker-mv"})
-        actual = dict(original, id="Map#event_1#page_0#cmd_3#msg", source="Continuar hacia\nel bosque")
+        actual = dict(original, id="Map#event_1#page_0#cmd_3#msg", source="Continuar hacia el bosque")
         evidence = pipeline.compare_reextraction([original], self.game, [actual], self.game, "rpgmaker-mv")
-        self.assertEqual(evidence["normalized_rpg_dialogues"], 1)
+        self.assertEqual(evidence["normalized_rpg_dialogues"], 0)
         for invalid in ([], [actual, actual], [dict(actual, source="Continuar el bosque")],
                         [dict(actual, id="Map#event_2#page_0#cmd_3#msg")]):
             with self.assertRaises(pipeline.PipelineError):
                 pipeline.compare_reextraction([original], self.game, invalid, self.game, "rpgmaker-mv")
+
+    def test_exact_neutral_writer_layouts_and_whitespace_corruption(self):
+        for label, kind, physical, literal, written in LAYOUT_CASES:
+            with self.subTest(label=label):
+                original = layout_row(kind, physical, literal)
+                actual = dict(original, source=written)
+                root = Path("C:/fixture")
+                self.assertEqual(pipeline.compare_reextraction([original], root, [actual], root, "rpgmaker-mv")["resources_verified"], 1)
+                for corrupt in (written + " ", written + "!", written.replace(" ", "\n", 1)):
+                    if corrupt != written:
+                        with self.assertRaises(pipeline.PipelineError):
+                            pipeline.compare_reextraction([original], root, [dict(actual, source=corrupt)], root, "rpgmaker-mv")
+
+    def test_layout_cannot_accept_controls_tags_lists_blanks_or_position_corruption(self):
+        for original, actual in layout_rejections():
+            with self.subTest(actual=actual), self.assertRaises(pipeline.PipelineError):
+                pipeline.compare_reextraction([original], Path("C:/fixture"), [actual], Path("C:/fixture"), "rpgmaker-mv")
 
     def test_readonly_sqlite_wal_not_immutable(self):
         # Metadata-only fixture. No translations are seeded by SQL.
@@ -510,6 +528,20 @@ class OrchestratorTests(PipelineCase):
                 pipeline.Pipeline(self.options(resume=True)).run()
             # No recovery or overwrite of a drifted database.
             self.assertEqual(database.read_bytes(), b"changed virtual DB")
+
+    def test_shared_layout_helper_drift_cannot_resume(self):
+        mock_cli, reader, runner = self.mock_session()
+        with reader, runner:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(self.options()).run()
+            count = len(mock_cli.calls)
+            actual_hash = pipeline.file_hash
+            def fingerprint(path):
+                return {"sha256": "0" * 64, "size": 1} if Path(path).name == "qa_replay_oracle.py" else actual_hash(path)
+            with patch.object(pipeline, "file_hash", side_effect=fingerprint):
+                with self.assertRaisesRegex(pipeline.PipelineError, "tool drift"):
+                    pipeline.Pipeline(self.options(resume=True)).run()
+            self.assertEqual(len(mock_cli.calls), count)
 
     def test_resume_rejects_source_binary_work_pristine_config_and_inventory_drift(self):
         mock_cli, reader, runner = self.mock_session()
@@ -1085,7 +1117,7 @@ class ScriptedEndpoint:
             raise AssertionError("fixture endpoint failed to stop")
 
 
-def fixture(root, engine, mixed_kirikiri=False):
+def fixture(root, engine, mixed_kirikiri=False, layouts=False):
     title = ("錬金術師", "Alchemist", "Alquimista")
     duplicate = ("こんにちは", "Hello", "Hola")
     next_line = ("進む", "Continue", "Continuar")
@@ -1105,8 +1137,22 @@ def fixture(root, engine, mixed_kirikiri=False):
         masked = ("{PL_0}<錬金術師>こんにちは {PL_1}！", "{PL_0}<Alchemist>Hello {PL_1}!", "{PL_0}<Alquimista>Hola {PL_1}!")
         wrapped = ("森へ\n進む", "Continue towards the forest", "Continuar hacia el bosque")
         lines.append(wrapped)
+        extra_messages = []
+        profile = ""
+        if layouts:
+            for label, kind, physical, literal, _ in LAYOUT_CASES[:6]:
+                semantic = "A different English source for " + label
+                if kind == "msg":
+                    extra_messages.append(physical)
+                else:
+                    profile = physical
+                # Name-box escape masking is the production provider contract.
+                lines.append(tuple(part.replace(r"\n", "{PL_0}") for part in (physical, semantic, literal))
+                             if label == "name-spacing" else (physical, semantic, literal))
+                if label == "name-spacing":
+                    lines[-1] = (lines[-1][0], "{PL_0}<Forest guide>" + semantic, lines[-1][2])
         commands = []
-        for message in (control[0], duplicate[0], duplicate[0], wrapped[0]):
+        for message in (control[0], duplicate[0], duplicate[0], wrapped[0], *extra_messages):
             commands.append({"code": 101, "indent": 0, "parameters": ["", 0, 0, 2]})
             for part in message.split("\n"):
                 commands.append({"code": 401, "indent": 0, "parameters": [part]})
@@ -1121,7 +1167,7 @@ def fixture(root, engine, mixed_kirikiri=False):
         system = {"gameTitle": title[0], "terms": {"basic": [], "commands": []}, "currencyUnit": "G", "switches": [None, "NON_TEXT_SENTINEL"]}
         files = {"data/Map001.json": json.dumps(game_map, ensure_ascii=False).encode(),
                  "data/System.json": json.dumps(system, ensure_ascii=False).encode(),
-                 "data/Actors.json": json.dumps([None, {"id": 1, "name": "Alice", "nickname": "", "profile": ""}]).encode()}
+                 "data/Actors.json": json.dumps([None, {"id": 1, "name": "Alice", "nickname": "", "profile": profile}]).encode()}
     else:
         control = ('こんにちは [emb exp="f.player"][l]', 'Hello [emb exp="f.player"][l]', 'Hola [emb exp="f.player"][l]')
         masked = ('こんにちは [emb exp="f.player"]{PL_0}', 'Hello [emb exp="f.player"]{PL_0}', 'Hola [emb exp="f.player"]{PL_0}')
@@ -1213,6 +1259,34 @@ class ProductionTransportTests(unittest.TestCase):
         self.assertNotIn(pipeline.DUMMY_KEY, report_text)
         self.assertNotIn("こんにちは", report_text)
         self.assertFalse(summary["runtime_verified"])
+
+    def test_production_cli_layouts_use_immutable_ja_after_semantic_pivot(self):
+        source = self.root / "source"
+        answers, _, _ = fixture(source, "rpgmaker-mv", layouts=True)
+        server = ScriptedEndpoint(answers)
+        self.addCleanup(server.close)
+        options = pipeline.Options(str(CLI), str(source), str(self.root / "run"), "rpgmaker-mv", "google",
+                                   test_endpoint=server.url, batch_size=1, concurrency=2, timeout=60)
+        before = pipeline.scan(source)
+        summary = pipeline.Pipeline(options).run()
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(pipeline.scan(source), before)
+        english, _ = pipeline.read_database(Path(options.output) / "english.db")
+        spanish, _ = pipeline.read_database(Path(options.output) / "spanish.db")
+        actual, _ = pipeline.read_database(Path(options.output) / "final-install-proof.db")
+        wanted = pipeline.resource_slots(spanish, Path(options.output) / "work-game", "rpgmaker-mv")
+        found = pipeline.resource_slots(actual, Path(options.output) / "install-game", "rpgmaker-mv")
+        for label, kind, physical, literal, written in LAYOUT_CASES[:6]:
+            key, entry = next((key, value) for key, value in wanted.items()
+                              if value["metadata"]["locust_injection_source"] == physical)
+            en = next(value for value in english if value["id"] == entry["id"])
+            self.assertEqual(en["source"], physical)
+            self.assertEqual(entry["source"], en["translation"])
+            self.assertNotEqual(entry["source"], physical)
+            self.assertEqual(entry["translation"], literal)
+            self.assertEqual(found[key]["source"], written, label)
+        self.assertEqual(summary["resources_verified"], 14)
+        self.assertEqual(server.errors, [])
 
     def closed_seed(self):
         options, primary, _, _ = self.scenario("renpy", "missing")

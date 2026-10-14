@@ -1,4 +1,4 @@
-# Safe JA → EN → ES patch pipeline (PIPE-4D)
+# Safe JA → EN → ES patch pipeline (PIPE-4E)
 
 `ja_en_es_pipeline.py` is a Python standard-library CLI orchestrator for an
 owner-authorized game. It never injects into the source folder. A successful run
@@ -248,10 +248,38 @@ MV command offsets can move when the injector rewrites author-wrapped dialogue.
 Following the bounded `qa_replay_oracle.py` pattern, the comparison groups rows by
 physical file and structural event/page prefix, orders `(command offset, kind)`,
 and compares ordered slot/kind identities. Missing, extra, swapped-text or wrong
-page/file resources refuse. Only `#msg`/`#description` rows whose original JA
-source was multiline may replace re-extracted LF with single spaces to match
-exact target text. There is no generic whitespace folding, choice/name exception,
-arbitrary command rearrangement migration, or language/markup correction.
+page/file resources refuse. After identity and slot-tag checks, both this pipeline
+and the historical matrix use the pure `qa_replay_oracle.expected_layout` helper.
+It derives **one exact expected string** from immutable Japanese
+`locust_injection_source` (or the original nonpivot source), the literal saved
+Spanish translation and the known slot kind. The observed re-extraction is never
+whitespace-normalized, nor accepted by non-whitespace equivalence.
+
+The mirror follows `crates/formats/src/rpgmaker_mv.rs`: Replace's initial
+`rewrap_to_source_width`, then `apply_message_block` for `#msg`. It includes
+Unicode-scalar `visible_len`, whitespace word boundaries, overlong unsplit words,
+source width, the message-only floor of 40, provider-newline flattening,
+name-box/body spacing, source list markers, and source paragraph/blank counts
+(including leading/trailing blank commands). Ambiguous paragraph counts take the
+writer's whole-translation fallback, not a guessed mapping. Unchanged physical
+text retains the writer's original-byte skip. Multiline `#description` and
+`#profile` fields use only the initial source-width stage; single-line fields,
+choices, names, technical/plugin/JavaScript resources, other kinds and other
+engines remain literal-exact. This is not a general RPG plugin/runtime emulator.
+
+Before accepting a supported layout, an independent ordered control inventory
+checks physical/translated/observed standard numeric controls, symbol controls
+and YEP name-box escapes (including embedded controls). Literal case and numeric
+arguments stay protected. Name text is translatable but must exactly match the
+expected writer output. Unknown/nested controls, wrong slot tags, arbitrary
+markup, blank/malformed name headers (including malformed physical headers) and
+unexpected C0 characters refuse even if observed text equals the target. The
+writer-visible `\\#` fallback is literal punctuation, not a zero-width protected
+control; exact replay still pins every occurrence and its position in the saved
+target. No generic whitespace folding, choice/name exception, arbitrary command
+migration, language correction or saved-row repair is performed. Consequently a
+historical full-size dataset may still refuse for pre-existing malformed rows;
+matching its writer layout alone is not a release.
 
 **Known conservative KiriKiri refusal:** a modified loose file containing both
 changed and unchanged rows currently omits an unchanged row from CLI written/
@@ -349,7 +377,8 @@ artifacts; failed fresh runs are retained rather than cleaned or adopted.
 
 Repeat the **same** invocation with `--resume` and the same output root only after
 an orderly, verified failure before injection. Version/owner, tool and binary
-hashes, input source/copy hashes, settings, generated config, logical DB inventory
+hashes (the tool fingerprint binds both the orchestrator and shared layout helper),
+input source/copy hashes, settings, generated config, logical DB inventory
 and DB/WAL/journal hashes must all match. Before acquiring a run lock or launching
 any resumed child, the entire pre-injection manifest is checked against a closed
 schema: exact required/optional keys at every level, typed status/phase/run ID,
@@ -446,6 +475,16 @@ recording/language evidence, forged catalogs and invented ready controls. Actual
 CLI export/import (no SQL translation seeding), legacy seed-data-only authority,
 owned-snapshot-only inspection, seed before/after hashes, seeded resume and
 loopback pending completion all reach strict Spanish patch/install/rollback.
+PIPE-4E neutral literal fixtures additionally cover single-line message wrapping,
+provider line breaks, name-box spacing/embedded color controls, source lists and
+blank lines, profiles/descriptions, CRLF, Unicode scalar/word boundaries,
+overlong words, unchanged text and paragraph-count fallback. Incorrect spaces,
+line positions, words, punctuation, list symbols, blank counts, dynamic controls,
+escaped literal-symbol positions, malformed headers and unknown tags refuse.
+An actual production-CLI fixture carries five additional messages plus a profile
+through both scripted language stages, immutable-JA semantic pivot checks,
+Direct injection, strict patch/install, rollback and final reapply/re-extraction.
+Helper-source drift also refuses resume before any child launch.
 The existing Windows FIFO-only skip remains; missing CLI is a failure, not a skip.
 Real
 Google/Antigravity requests, purchases, owner credential reads, full workspace

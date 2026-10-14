@@ -25,6 +25,8 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 
+from qa_replay_oracle import expected_layout
+
 VERSION = 2
 OWNER = "locust-ja-en-es-pipeline"
 PROVIDER = "pipeline-scripted"
@@ -892,6 +894,12 @@ def verify_injection_evidence(report, root, backups, original, format_id):
     return notice, evidence
 
 
+def tool_fingerprint():
+    # Resume must bind the shared acceptance code as well as this orchestrator.
+    return digest({name: file_hash(Path(__file__).absolute().with_name(name))
+                   for name in ("ja_en_es_pipeline.py", "qa_replay_oracle.py")})
+
+
 def resource_slots(rows, root, format_id):
     """Bounded qa_replay_oracle pattern, not a general identity migration."""
     result, groups = {}, defaultdict(list)
@@ -922,15 +930,13 @@ def compare_reextraction(expected, expected_root, actual, actual_root, format_id
     normalized = 0
     for key, value in wanted.items():
         source, translation = found[key]["source"], value["translation"]
-        if source == translation:
-            continue
-        # Only message/description author wrapping, never generic whitespace
-        # folding or choice/name text. Structural order and kind remain exact.
-        wrapping = format_id == "rpgmaker-mv" and (value["id"].endswith("#msg") or value["id"].endswith("#description"))
-        physical = value["metadata"].get("locust_injection_source", value["source"])
-        require(wrapping and "\n" in physical and source.replace("\n", " ") == translation,
-                "Reextracted Spanish differs")
-        normalized += 1
+        require(value.get("tags") == found[key].get("tags"), "Reextraction slot tags differ")
+        try:
+            written = expected_layout(format_id, value, source)
+        except AssertionError as error:
+            raise PipelineError("Unsupported/altered reextraction controls or layout") from error
+        require(source == written, "Reextracted Spanish differs")
+        normalized += source != translation
     return {"resources_verified": len(wanted), "normalized_rpg_dialogues": normalized}
 
 
@@ -1477,7 +1483,7 @@ class Pipeline:
             expected_settings = dict(self.settings, english_seed=candidate["settings"]["english_seed"])
             require(candidate["settings"] == expected_settings and candidate["binary"] == self.binary
                     and candidate["source"] == self.original
-                    and candidate["tool_sha256"] == file_hash(Path(__file__).absolute())["sha256"], "Resume inputs/binary/settings/tool drift")
+                    and candidate["tool_sha256"] == tool_fingerprint(), "Resume inputs/binary/settings/tool drift")
             config_path = plain(self.root / "profile/config.json")
             expected = permitted_config(self.options)
             expected_bytes = encoded(expected)
@@ -1503,7 +1509,7 @@ class Pipeline:
             self.root.mkdir(mode=0o700)
             self.manifest = {"owner": OWNER, "version": VERSION, "run_id": str(uuid.uuid4()), "phase": "copying",
                              "settings": self.settings, "binary": self.binary, "source": self.original,
-                             "tool_sha256": file_hash(Path(__file__).absolute())["sha256"],
+                             "tool_sha256": tool_fingerprint(),
                              "injection_started": False, "uncertain_child": False, "active_command": None,
                              "status": "running", "stages": [], "databases": {},
                              "accepted_rows": {"english.db": {}, "spanish.db": {}}}
