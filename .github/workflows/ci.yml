@@ -94,6 +94,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Isolated x86 Unicode runtime proof
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/yuris-unicode-runtime/build-proof.ps1 -OutputDirectory tmp/native-japanese-vn/unicode-proof-20261014 -RunTests
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:

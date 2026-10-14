@@ -1,0 +1,5 @@
+LIBRARY locust_unicode_proof
+EXPORTS
+    UniInitialize
+    UniUninstall
+    UniProbeImage
