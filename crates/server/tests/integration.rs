@@ -213,11 +213,27 @@ async fn test_full_rpgmaker_mv_flow() {
         "expected {} translated, got {}",
         total, translated_count
     );
+    let mut canonical_profiles = 0;
     for e in &strings.entries {
         let t = e["translation"].as_str().unwrap_or("");
         let src = e["source"].as_str().unwrap_or("");
+        if src == "A brave hero." {
+            // Step 5's explicit Hero → Héroe mapping expands this nonbinary
+            // profile after Mock fits the sanitized source. Pin the canonical
+            // output, not an incompatible pre-restoration source-byte cap.
+            let entry: locust_core::models::StringEntry =
+                serde_json::from_value(e.clone()).unwrap();
+            assert!(locust_core::validation::binary_slot_budget(&entry)
+                .unwrap()
+                .is_none());
+            assert!(!locust_core::textasset_group::is_grouped_entry(&entry));
+            assert_eq!(e["provider_used"].as_str(), Some("mock"));
+            assert_eq!(t, "[MOCK:es]Héroe");
+            canonical_profiles += 1;
+            continue;
+        }
         // Exact glossary hits short-circuit the provider and are free to grow;
-        // only the mock output is length-bound. See step 5.
+        // unaffected mock output remains source-length-bound. See step 5.
         if e["provider_used"].as_str() == Some("glossary") {
             continue;
         }
@@ -243,6 +259,8 @@ async fn test_full_rpgmaker_mv_flow() {
             }
         }
     }
+
+    assert_eq!(canonical_profiles, 1, "canonical profile must be exercised");
 
     // 9. Check stats after translation
     let stats: StatsResponse = client()

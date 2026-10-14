@@ -9,11 +9,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::database::{Database, TranslationSaveGuard};
 use crate::error::{LocustError, Result};
-use crate::glossary::Glossary;
+use crate::glossary::{Glossary, VisibleGlossary};
 use crate::models::{
     ProgressEvent, StringEntry, StringStatus, TranslationRequest, TranslationResult,
 };
-use crate::placeholder::{Placeholder, PlaceholderProcessor, PlaceholderProfile};
+use crate::placeholder::{
+    Placeholder, PlaceholderKind, PlaceholderProcessor, PlaceholderProfile, SpeakerArgumentTrace,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LangPair {
@@ -221,6 +223,12 @@ fn has_mv_mz_provenance(entry: &StringEntry) -> bool {
             .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "json" | "jsono" | "js"))
 }
 
+#[derive(Clone)]
+struct RecordProtection {
+    placeholders: Vec<Placeholder>,
+    speakers: SpeakerArgumentTrace,
+}
+
 /// Only occurrence locators/state are excluded. Raw source also pins the
 /// placeholder map: two different controls can sanitize to the same request.
 /// Languages, game context, glossary and fit policy are constant within a run.
@@ -286,7 +294,7 @@ impl RepeatedSources {
     fn expand(
         &self,
         results: Vec<TranslationResult>,
-        placeholders: &mut HashMap<String, Vec<Placeholder>>,
+        placeholders: &mut HashMap<String, RecordProtection>,
         budgets: &mut HashMap<String, (String, usize)>,
     ) -> Vec<TranslationResult> {
         let mut expanded = Vec::new();
@@ -490,11 +498,12 @@ fn collapse_repeated_units(source: &str, text: &str) -> String {
 /// Never manufacture missing controls or accept literal controls instead of tokens.
 fn restore_placeholders_in_result(
     result: &mut TranslationResult,
-    placeholders_by_id: &HashMap<String, Vec<Placeholder>>,
+    placeholders_by_id: &HashMap<String, RecordProtection>,
 ) -> bool {
-    let Some(phs) = placeholders_by_id.get(&result.entry_id) else {
+    let Some(protection) = placeholders_by_id.get(&result.entry_id) else {
         return false;
     };
+    let phs = &protection.placeholders;
     // Check unknown/malformed spellings in the raw answer beyond restore's
     // bounded numeric scan. Protected originals can themselves contain this
     // spelling, so testing the restored text would reject legitimate controls.
@@ -504,13 +513,42 @@ fn restore_placeholders_in_result(
     }) {
         return false;
     }
-    match PlaceholderProcessor::restore(&result.translation, phs) {
+    match PlaceholderProcessor::restore_with_speaker_trace(
+        &result.translation,
+        phs,
+        &protection.speakers,
+    ) {
         Ok(restored) => {
             result.translation = restored;
             true
         }
         Err(_) => false,
     }
+}
+
+/// Apply the existing body runaway cap without rewriting explicit canonical
+/// values. Matching targets are restored after the cap, never target-searched.
+fn restore_and_collapse_result(
+    result: &mut TranslationResult,
+    placeholders: &HashMap<String, RecordProtection>,
+    source: &str,
+) -> bool {
+    let canonical = placeholders
+        .get(&result.entry_id)
+        .is_some_and(|protection| {
+            protection
+                .placeholders
+                .iter()
+                .any(|ph| matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm))
+        });
+    if canonical {
+        result.translation = collapse_runaway_letters(source, &result.translation);
+    }
+    let restored = restore_placeholders_in_result(result, placeholders);
+    if !canonical {
+        result.translation = collapse_runaway_letters(source, &result.translation);
+    }
+    restored
 }
 
 fn protected_control_inventory(phs: &[Placeholder]) -> String {
@@ -557,7 +595,7 @@ struct GroupAccumulator {
     changed_groups: HashSet<String>,
     results: HashMap<String, TranslationResult>,
     requests: HashMap<String, TranslationRequest>,
-    placeholders: HashMap<String, Vec<Placeholder>>,
+    placeholders: HashMap<String, RecordProtection>,
     failed: HashSet<String>,
     finalized: HashSet<String>,
 }
@@ -1517,7 +1555,7 @@ impl TranslationManager {
         }
 
         // 1. Filter translatable entries
-        let mut translatable: Vec<StringEntry> = entries
+        let translatable: Vec<StringEntry> = entries
             .into_iter()
             .filter(|e| {
                 e.is_translatable() && !(opts.skip_approved && e.status == StringStatus::Approved)
@@ -1562,6 +1600,74 @@ impl TranslationManager {
         let started_at = chrono::Utc::now().to_rfc3339();
         let lang_pair = format!("{}-{}", opts.source_lang, opts.target_lang);
 
+        // Compile only explicit entries for this pair, once per run. Capacity
+        // eligibility comes from the original row, never a cleared hint budget.
+        let glossary_entries = if opts.use_glossary && !translatable.is_empty() {
+            self.glossary.get_all(&lang_pair).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let matcher = VisibleGlossary::compile(&glossary_entries, &lang_pair);
+        let mut glossary_plans = HashMap::new();
+        let mut eligible = Vec::with_capacity(translatable.len());
+        for entry in translatable {
+            if !glossary_entries.is_empty()
+                && !crate::textasset_group::is_grouped_entry(&entry)
+                && crate::validation::binary_slot_budget(&entry)?.is_none()
+            {
+                match matcher.mask(&entry.source, entry.placeholder_profile()) {
+                    Ok((source, phs)) => {
+                        if phs
+                            .iter()
+                            .any(|ph| matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm))
+                        {
+                            let mut nameboxes =
+                                PlaceholderProcessor::extract_with_namebox_positions(
+                                    &entry.source,
+                                    entry.placeholder_profile(),
+                                )
+                                .2;
+                            for (offset, token) in &mut nameboxes {
+                                *offset = source
+                                    .find(token.as_str())
+                                    .expect("control token preserved");
+                            }
+                            let recognized = if has_mv_mz_provenance(&entry) {
+                                nameboxes.as_slice()
+                            } else {
+                                &[]
+                            };
+                            let speakers = SpeakerArgumentTrace::from_sanitized(
+                                &source,
+                                &phs,
+                                recognized,
+                                has_mv_mz_provenance(&entry),
+                            );
+                            if !PlaceholderProcessor::canonical_source_is_safe(
+                                &source, &phs, &speakers,
+                            ) {
+                                let _ = tx.send(ProgressEvent::BatchFailed {
+                                    entry_id: Some(entry.id.clone()),
+                                    error: "canonical glossary insertion changes source speaker syntax or reserved identities; entry remains pending".into(),
+                                }).await;
+                                continue;
+                            }
+                            glossary_plans.insert(entry.id.clone(), (source, phs, speakers));
+                        }
+                    }
+                    Err(()) => {
+                        let _ = tx.send(ProgressEvent::BatchFailed {
+                            entry_id: Some(entry.id.clone()),
+                            error: "conflicting glossary targets or unsafe canonical controls; entry remains pending".into(),
+                        }).await;
+                        continue;
+                    }
+                }
+            }
+            eligible.push(entry);
+        }
+        let mut translatable = eligible;
+
         // 3. Look up memory in bulk, preserving entry order for saves and events.
         let mut remaining = Vec::new();
         if opts.use_memory {
@@ -1574,6 +1680,11 @@ impl TranslationManager {
             let mut updates = Vec::new();
             let mut memory_events = Vec::new();
             for (entry, hash) in translatable.drain(..).zip(hashes) {
+                if glossary_plans.contains_key(&entry.id) {
+                    // Source-only memory predates/does not encode canonical policy.
+                    remaining.push(entry);
+                    continue;
+                }
                 if let Some(cached) = memory.get(&hash) {
                     // Memory written before the cap existed may hold stretched text.
                     let cached = &collapse_runaway_letters(&entry.source, cached);
@@ -1600,17 +1711,20 @@ impl TranslationManager {
             remaining = translatable;
         }
 
-        let glossary_entries = if opts.use_glossary && !remaining.is_empty() {
-            self.glossary.get_all(&lang_pair).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
         // 3b. Exact glossary hits (full-string): short-circuit provider — key for
         // short UI binary slots where the user already fixed a fitting form.
         if opts.use_glossary && !remaining.is_empty() {
             let mut still = Vec::with_capacity(remaining.len());
             for entry in remaining.drain(..) {
+                if glossary_plans.get(&entry.id).is_some_and(|(_, phs, _)| {
+                    phs.iter()
+                        .any(|ph| !matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm))
+                }) {
+                    // A whole-record exact shortcut must not bypass the visible
+                    // term identities and speaker anchors around its controls.
+                    still.push(entry);
+                    continue;
+                }
                 let Some(term) =
                     Glossary::lookup_exact_in_entries(&glossary_entries, &entry.source)
                 else {
@@ -1677,7 +1791,7 @@ impl TranslationManager {
         type SlotBudget = (String, usize);
         type BatchOutcome = (
             Vec<TranslationRequest>,
-            std::collections::HashMap<String, Vec<Placeholder>>,
+            std::collections::HashMap<String, RecordProtection>,
             std::collections::HashMap<String, SlotBudget>,
             Result<ProviderCall>,
         );
@@ -1740,7 +1854,7 @@ impl TranslationManager {
 
                 // 5c. Build TranslationRequests — sanitize placeholders so the translator
                 // doesn't translate variable names like [player_name] or Ren'Py tags {i}{/i}
-                let mut placeholders_by_id: std::collections::HashMap<String, Vec<Placeholder>> =
+                let mut placeholders_by_id: std::collections::HashMap<String, RecordProtection> =
                     std::collections::HashMap::new();
                 let mut budgets_by_id: std::collections::HashMap<String, SlotBudget> =
                     std::collections::HashMap::new();
@@ -1783,11 +1897,23 @@ impl TranslationManager {
                             // glossary unbudgeted so a long term can still share the blob.
                             slot_budget = None;
                         }
-                        let (sanitized, phs, nameboxes) =
+                        let (mut sanitized, mut phs, mut nameboxes) =
                             PlaceholderProcessor::extract_with_namebox_positions(
                                 &entry.source,
                                 entry.placeholder_profile(),
                             );
+                        let speakers = if let Some((source, composite, speakers)) = glossary_plans.get(&entry.id) {
+                            sanitized.clone_from(source);
+                            phs.clone_from(composite);
+                            // Stable control identity remaps UTF-8 positions after
+                            // every glossary span edit, including multiple boxes.
+                            for (offset, token) in &mut nameboxes {
+                                *offset = sanitized.find(token.as_str()).expect("control token preserved");
+                            }
+                            speakers.clone()
+                        } else {
+                            SpeakerArgumentTrace::default()
+                        };
                         if has_mv_mz_provenance(entry) && !nameboxes.is_empty() {
                             let positions = nameboxes
                                 .iter()
@@ -1802,6 +1928,12 @@ impl TranslationManager {
                                 None => hint,
                             });
                         }
+                        if let Some(hint) = speakers.hint() {
+                            context = Some(match context {
+                                Some(c) => format!("{c} | {hint}"),
+                                None => hint,
+                            });
+                        }
                         if !phs.is_empty() {
                             let inventory = protected_control_inventory(&phs);
                             context = Some(match context {
@@ -1809,7 +1941,9 @@ impl TranslationManager {
                                 None => inventory,
                             });
                         }
-                        placeholders_by_id.insert(entry.id.clone(), phs);
+                        placeholders_by_id.insert(entry.id.clone(), RecordProtection {
+                            placeholders: phs, speakers,
+                        });
                         // Per-entry glossary: terms present in source; for binary
                         // slots also drop translations that cannot fit the budget.
                         let glossary_hint = if opts.use_glossary {
@@ -1915,10 +2049,9 @@ impl TranslationManager {
                     // Restore/collapse first, then repair controls before any length fitting.
                     let mut invalid_controls = HashSet::new();
                     for result in &mut results {
-                        let restored = restore_placeholders_in_result(result, &placeholders_by_id);
                         let entry = &entries_by_id[&result.entry_id];
-                        result.translation =
-                            collapse_runaway_letters(&entry.source, &result.translation);
+                        let restored =
+                            restore_and_collapse_result(result, &placeholders_by_id, &entry.source);
                         if !restored
                             || !PlaceholderProcessor::validate_with_profile(
                                 &entry.source,
@@ -1940,7 +2073,7 @@ impl TranslationManager {
                             .expect("batch IDs validated");
                         let retry_req = protected_control_repair_request(
                             original,
-                            &placeholders_by_id[&result.entry_id],
+                            &placeholders_by_id[&result.entry_id].placeholders,
                         );
                         let entry = &entries_by_id[&result.entry_id];
                         for _ in 0..MAX_PROTECTED_CONTROL_REPAIRS {
@@ -1993,16 +2126,13 @@ impl TranslationManager {
                                         continue;
                                     }
                                     let mut repaired = call.results.into_iter().next().unwrap();
-                                    if !restore_placeholders_in_result(
+                                    if !restore_and_collapse_result(
                                         &mut repaired,
                                         &placeholders_by_id,
+                                        &entry.source,
                                     ) {
                                         continue;
                                     }
-                                    repaired.translation = collapse_runaway_letters(
-                                        &entry.source,
-                                        &repaired.translation,
-                                    );
                                     if repaired.translation.trim().is_empty()
                                         || !PlaceholderProcessor::validate_with_profile(
                                             &entry.source,
@@ -5533,7 +5663,7 @@ mod tests {
         assert_eq!(req.entry_id, "provider");
         assert_eq!(
             req.source,
-            "{PL_0}é {PL_1}<Lydia {PL_2}>Hi {PL_3}<Young Boy>{PL_4}Hello{PL_5}"
+            "{PL_0}é {PL_1}<{G_0_0} {PL_2}>Hi {PL_3}<Young Boy>{PL_4}Hello{PL_5}"
         );
         assert!(req
             .glossary_hint
@@ -5542,7 +5672,7 @@ mod tests {
             .contains("Lydia → Lidia"));
         let note = req.context.as_deref().unwrap();
         assert!(note.contains("byte 9 ({PL_1}<...>)"), "{note}");
-        assert!(note.contains("byte 32 ({PL_3}<...>)"), "{note}");
+        assert!(note.contains("byte 34 ({PL_3}<...>)"), "{note}");
         assert!(!note.contains("{PL_4}<...>"));
         assert!(
             note.contains("preserve established proper names and follow this record's glossary"),
@@ -5553,7 +5683,7 @@ mod tests {
             ("exact", r"\n<Maestro>Hola", "glossary"),
             (
                 "provider",
-                r"en: \C[2]é \n<Lydia \V[1]>Hi \nr<Young Boy><b>Hello</b>",
+                r"en: \C[2]é \n<Lidia \V[1]>Hi \nr<Young Boy><b>Hello</b>",
                 "repeat-test",
             ),
         ] {

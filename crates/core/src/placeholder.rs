@@ -41,6 +41,8 @@ pub enum PlaceholderKind {
     RustFormat,
     CFormat,
     CustomBracket,
+    /// Canonical target for one visible explicit glossary source span.
+    GlossaryTerm,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -61,6 +63,221 @@ struct PatternMatch {
     end: usize,
     text: String,
     kind: PlaceholderKind,
+}
+
+/// Private, run-local provenance of recognized source MV/MZ speaker arguments.
+/// Each argument owns token identities, not their grammatical order or labels.
+#[derive(Clone, Default)]
+pub(crate) struct SpeakerArgumentTrace {
+    arguments: Vec<SpeakerArgumentAnchor>,
+    candidate_prefixes: Vec<String>,
+    // Syntax baseline only, not glossary ownership/format authority. This lets
+    // an already present unanchored argument retain its shape without allowing
+    // a body canonical value (or provider context) to create a new one.
+    source_literal_arguments: std::collections::HashSet<String>,
+    invalid_source: bool,
+}
+
+#[derive(Clone)]
+struct SpeakerArgumentAnchor {
+    prefix: String,
+    glossary: std::collections::HashSet<String>,
+}
+
+impl SpeakerArgumentTrace {
+    pub(crate) fn from_sanitized(
+        source: &str,
+        placeholders: &[Placeholder],
+        recognized: &[(usize, String)],
+        has_mv_mz_provenance: bool,
+    ) -> Self {
+        if !placeholders
+            .iter()
+            .any(|ph| matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm))
+        {
+            return Self::default();
+        }
+        let candidate_prefixes: Vec<_> = placeholders
+            .iter()
+            .filter(|ph| {
+                !matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm)
+                    && namebox_escape_len(format!("{}<", ph.original).as_bytes())
+                        == Some(ph.original.len())
+            })
+            .map(|ph| ph.token.clone())
+            .collect();
+        let source_literal_arguments = candidate_prefixes
+            .iter()
+            .filter(|prefix| {
+                source.find(prefix.as_str()).is_some_and(|offset| {
+                    Self::argument(&source[offset + prefix.len()..]).is_some()
+                })
+            })
+            .cloned()
+            .collect();
+        // Valid anchors intentionally omit malformed arguments. Preserve the
+        // original MV/MZ syntax failure separately, before seeing any provider
+        // output: removing the opener or guessing a close cannot make it safe.
+        // Only an immediate name-box opener is authoritative, not an ordinary
+        // '<' elsewhere in the body, nor speaker-like text in unknown formats.
+        let mut invalid_source = has_mv_mz_provenance
+            && candidate_prefixes.iter().any(|prefix| {
+                source.find(prefix.as_str()).is_some_and(|offset| {
+                    let tail = &source[offset + prefix.len()..];
+                    tail.starts_with('<') && Self::argument(tail).is_none()
+                })
+            });
+        let arguments = recognized
+            .iter()
+            .filter_map(|(offset, prefix)| {
+                // A control may itself contain the apparent source closing
+                // delimiter. If the protected source has no closed literal
+                // argument, fail closed rather than panic or guess its shape.
+                let Some(argument) = Self::argument(&source[offset + prefix.len()..]) else {
+                    invalid_source = true;
+                    return None;
+                };
+                Some(SpeakerArgumentAnchor {
+                    prefix: prefix.clone(),
+                    glossary: placeholders
+                        .iter()
+                        .filter(|ph| {
+                            matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm)
+                                && argument.contains(&ph.token)
+                        })
+                        .map(|ph| ph.token.clone())
+                        .collect(),
+                })
+            })
+            .collect();
+        Self {
+            arguments,
+            candidate_prefixes,
+            source_literal_arguments,
+            invalid_source,
+        }
+    }
+
+    pub(crate) fn hint(&self) -> Option<String> {
+        if self.arguments.is_empty() {
+            return None;
+        }
+        let ownership = self
+            .arguments
+            .iter()
+            .map(|anchor| {
+                let mut tokens: Vec<_> = anchor.glossary.iter().map(String::as_str).collect();
+                tokens.sort_unstable();
+                format!("{}<...> owns [{}]", anchor.prefix, tokens.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!("SPEAKER ARGUMENT SENTINELS: {ownership}. Keep each listed identity in that exact speaker argument and keep its immediate angle brackets. Other glossary identities stay in the body, never a new speaker argument. Grammar may reorder glossary tokens within one argument or within the body; translate unmasked role/title text normally."))
+    }
+
+    fn argument(tail: &str) -> Option<&str> {
+        let (argument, _) = tail.strip_prefix('<')?.split_once('>')?;
+        (!argument.trim().is_empty()
+            && !argument.contains('<')
+            && !argument.chars().any(char::is_control))
+        .then_some(argument)
+    }
+
+    fn accepts(&self, translated: &str, placeholders: &[Placeholder]) -> bool {
+        // The caller has already checked exact inventory/counts in raw text.
+        if self.invalid_source {
+            return false;
+        }
+        for prefix in &self.candidate_prefixes {
+            let Some(offset) = translated.find(prefix) else {
+                return false;
+            };
+            let tail = &translated[offset + prefix.len()..];
+            let anchor = self
+                .arguments
+                .iter()
+                .find(|anchor| &anchor.prefix == prefix);
+            if let Some(anchor) = anchor {
+                let Some(argument) = Self::argument(tail) else {
+                    return false;
+                };
+                let actual: std::collections::HashSet<_> = placeholders
+                    .iter()
+                    .filter(|ph| {
+                        matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm)
+                            && argument.contains(&ph.token)
+                    })
+                    .map(|ph| ph.token.clone())
+                    .collect();
+                if actual != anchor.glossary {
+                    return false;
+                }
+            } else if let Some(open) = tail.strip_prefix('<') {
+                // A body identity cannot be smuggled into a newly fabricated
+                // header, even when its argument is malformed or the format
+                // has no trusted MV/MZ speaker trace. Never guess a repair.
+                let candidate = open.split(['>', '\r', '\n']).next().unwrap_or(open);
+                if placeholders.iter().any(|ph| {
+                    matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm)
+                        && candidate.contains(&ph.token)
+                }) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn accepts_canonical(&self, raw: &str, canonical: &str, placeholders: &[Placeholder]) -> bool {
+        // PL identities remain opaque and validated at this phase. Neither
+        // canonical targets nor provider/context strings can create authority.
+        for prefix in &self.candidate_prefixes {
+            let Some(raw_offset) = raw.find(prefix) else {
+                return false;
+            };
+            let Some(offset) = canonical.find(prefix) else {
+                return false;
+            };
+            let raw_tail = &raw[raw_offset + prefix.len()..];
+            let tail = &canonical[offset + prefix.len()..];
+            let anchored = self.arguments.iter().any(|anchor| &anchor.prefix == prefix);
+            if anchored || tail.starts_with('<') {
+                if !self.source_literal_arguments.contains(prefix) {
+                    return false;
+                }
+                let Some(raw_argument) = Self::argument(raw_tail) else {
+                    return false;
+                };
+                let Some(argument) = Self::argument(tail) else {
+                    return false;
+                };
+                // Compare with the expansion of this candidate's raw argument,
+                // not the source label: generic role text remains translatable.
+                // An inserted '>' closing early, '<' nesting/opening, or control
+                // character cannot change the existing literal delimiters.
+                if argument != PlaceholderProcessor::restore_spans(raw_argument, placeholders, true)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Reserved sentinel families, including common mangled spellings. They are
+/// opaque literals in source, but never additional provider-invented tokens.
+fn sentinel_lookalike(text: &str) -> bool {
+    let Some(inner) = text.strip_prefix('{') else {
+        return false;
+    };
+    let inner = inner.trim_start();
+    ["PL", "G"].iter().any(|prefix| {
+        inner
+            .strip_prefix(prefix)
+            .and_then(|tail| tail.chars().next())
+            .is_some_and(|c| matches!(c, '_' | '-' | ':') || c.is_whitespace())
+    })
 }
 
 impl PlaceholderProcessor {
@@ -104,6 +321,12 @@ impl PlaceholderProcessor {
             return (source.to_string(), Vec::new(), Vec::new());
         }
 
+        // Keep minted controls distinct from literal sentinel lookalikes.
+        let mut nonce = 0;
+        while source.contains(&format!("{{PL_{nonce}_")) {
+            nonce += 1;
+        }
+        let collision = source.contains("{PL_");
         // Build sanitized string and placeholders
         let mut sanitized = String::new();
         let mut placeholders = Vec::new();
@@ -112,7 +335,11 @@ impl PlaceholderProcessor {
 
         for (idx, m) in matches.into_iter().enumerate() {
             sanitized.push_str(&source[last_end..m.start]);
-            let token = format!("{{PL_{}}}", idx);
+            let token = if collision {
+                format!("{{PL_{nonce}_{idx}}}")
+            } else {
+                format!("{{PL_{idx}}}")
+            };
             if matches!(m.kind, PlaceholderKind::RpgMakerCode)
                 && namebox_escape_len(&source.as_bytes()[m.start..]) == Some(m.end - m.start)
             {
@@ -143,21 +370,36 @@ impl PlaceholderProcessor {
     }
 
     pub fn restore(translated: &str, placeholders: &[Placeholder]) -> Result<String> {
-        let mut result = translated.to_string();
+        Self::restore_checked(translated, placeholders, None)
+    }
 
-        // Check for extra tokens
-        for i in 0..100 {
-            let token = format!("{{PL_{}}}", i);
-            if result.contains(&token) && !placeholders.iter().any(|p| p.index == i) {
-                return Err(LocustError::PlaceholderError {
-                    entry_id: String::new(),
-                    message: format!("extra placeholder token {} in translation", token),
-                });
-            }
+    fn validate_inventory(
+        translated: &str,
+        placeholders: &[Placeholder],
+        include_glossary: bool,
+    ) -> Result<()> {
+        let expected: Vec<_> = placeholders
+            .iter()
+            .filter(|ph| {
+                include_glossary || !matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm)
+            })
+            .collect();
+        // Validate before each insertion phase, including partial canonical
+        // values that combine with other text into a reserved sentinel.
+        if translated.match_indices('{').any(|(offset, _)| {
+            sentinel_lookalike(&translated[offset..])
+                && !expected
+                    .iter()
+                    .any(|ph| translated[offset..].starts_with(&ph.token))
+        }) {
+            return Err(LocustError::PlaceholderError {
+                entry_id: String::new(),
+                message: "unknown or malformed sentinel".into(),
+            });
         }
-
-        // Replace tokens with originals
-        for ph in placeholders {
+        // Exact token identities/counts, not their global order, pin canonical
+        // values. Target-language grammar may reorder body or speaker terms.
+        for ph in expected {
             let count = translated.matches(ph.token.as_str()).count();
             if count == 0 {
                 return Err(LocustError::PlaceholderError {
@@ -177,10 +419,77 @@ impl PlaceholderProcessor {
                     ),
                 });
             }
-            result = result.replacen(&ph.token, &ph.original, 1);
         }
 
-        Ok(result)
+        Ok(())
+    }
+
+    // Each pass edits only the input's spans. Control originals are inserted
+    // last and never reparsed; canonical insertion cannot synthesize PL/G
+    // identities that would be recursively restored in the following phase.
+    fn restore_spans(text: &str, phs: &[Placeholder], glossary: bool) -> String {
+        let mut spans: Vec<_> = phs
+            .iter()
+            .filter(|ph| matches!(ph.pattern_type, PlaceholderKind::GlossaryTerm) == glossary)
+            .filter_map(|ph| text.find(&ph.token).map(|start| (start, ph)))
+            .collect();
+        spans.sort_by_key(|(start, _)| *start);
+        let mut out = String::new();
+        let mut last = 0;
+        for (start, ph) in spans {
+            out.push_str(&text[last..start]);
+            out.push_str(&ph.original);
+            last = start + ph.token.len();
+        }
+        out.push_str(&text[last..]);
+        out
+    }
+
+    fn restore_checked(
+        translated: &str,
+        placeholders: &[Placeholder],
+        speakers: Option<&SpeakerArgumentTrace>,
+    ) -> Result<String> {
+        Self::validate_inventory(translated, placeholders, true)?;
+        if speakers.is_some_and(|trace| !trace.accepts(translated, placeholders)) {
+            return Err(LocustError::PlaceholderError {
+                entry_id: String::new(),
+                message: "glossary sentinel changed speaker argument membership or syntax".into(),
+            });
+        }
+        let canonical = Self::restore_spans(translated, placeholders, true);
+        Self::validate_inventory(&canonical, placeholders, false)?;
+        if speakers
+            .is_some_and(|trace| !trace.accepts_canonical(translated, &canonical, placeholders))
+        {
+            return Err(LocustError::PlaceholderError {
+                entry_id: String::new(),
+                message: "canonical glossary insertion changed speaker argument syntax".into(),
+            });
+        }
+        Ok(Self::restore_spans(&canonical, placeholders, false))
+    }
+
+    /// Core-owned speaker provenance is never derived from provider context.
+    /// Validate raw token membership before accepting composite restoration.
+    pub(crate) fn restore_with_speaker_trace(
+        translated: &str,
+        placeholders: &[Placeholder],
+        speakers: &SpeakerArgumentTrace,
+    ) -> Result<String> {
+        Self::restore_checked(translated, placeholders, Some(speakers))
+    }
+
+    /// Catch impossible canonical source layouts without spending provider
+    /// usage. Do not reinterpret malformed source: its existing raw guard must
+    /// still fail closed through the ordinary restoration paths.
+    pub(crate) fn canonical_source_is_safe(
+        source: &str,
+        placeholders: &[Placeholder],
+        speakers: &SpeakerArgumentTrace,
+    ) -> bool {
+        !speakers.accepts(source, placeholders)
+            || Self::restore_checked(source, placeholders, Some(speakers)).is_ok()
     }
 
     pub fn validate(original: &str, translated: &str) -> Vec<PlaceholderMismatch> {
@@ -394,12 +703,30 @@ impl PlaceholderProcessor {
             if bytes[i] == b'{' {
                 // Double opening braces escape a literal brace in Ren'Py and format strings.
                 if bytes.get(i + 1) == Some(&b'{') {
-                    i += 2;
+                    // Escaped literal sentinels still need opaque protection;
+                    // keep the leading brace literal and visit the inner one.
+                    i += if sentinel_lookalike(&source[i + 1..]) {
+                        1
+                    } else {
+                        2
+                    };
                     continue;
                 }
-                // Check for PL_ tokens — skip those
-                if source[i..].starts_with("{PL_") {
-                    i += 1;
+                // Source sentinel lookalikes are opaque literals, not visible
+                // glossary text, and must not collide with newly minted tokens.
+                if sentinel_lookalike(&source[i..]) {
+                    let tail = &source[i..];
+                    let end = i + tail.find('}').map_or_else(
+                        || tail.find(['\r', '\n']).unwrap_or(tail.len()),
+                        |close| close + 1,
+                    );
+                    matches.push(PatternMatch {
+                        start: i,
+                        end,
+                        text: source[i..end].into(),
+                        kind: PlaceholderKind::CustomBracket,
+                    });
+                    i = end;
                     continue;
                 }
                 if let Some(close) = source[i..].find('}') {

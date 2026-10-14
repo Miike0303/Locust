@@ -23,12 +23,13 @@ pub struct MockProvider;
 /// short sources get a same-slot reverse so inject still has something
 /// different without overflowing.
 ///
-/// **Placeholder tokens** (`{PL_0}`, `{PL_1}`, …) are always kept intact.
+/// **Opaque sentinels** (`{PL_0}`, collision-namespaced `{PL_1_0}`,
+/// and glossary `{G_0_0}`) are always kept intact.
 fn mock_fit(source: &str, target_lang: &str) -> String {
     if source.is_empty() {
         return String::new();
     }
-    if source.contains("{PL_") {
+    if source.contains("{PL_") || source.contains("{G_") {
         return mock_fit_preserving_pl(source, target_lang);
     }
     mock_fit_plain(source, target_lang, source.len(), utf16_byte_len(source))
@@ -75,7 +76,7 @@ fn mock_fit_plain(source: &str, target_lang: &str, max_utf8: usize, max_utf16: u
     append_while_fits("", &rev, max_utf8, max_utf16)
 }
 
-/// Keep every `{PL_N}` token byte-for-byte; mock only free text under the
+/// Keep every control/glossary sentinel byte-for-byte; mock only free text under the
 /// remaining dual budget so translate→restore never drops tokens.
 fn mock_fit_preserving_pl(source: &str, target_lang: &str) -> String {
     let max_utf8 = source.len();
@@ -147,8 +148,28 @@ fn split_pl_segments(source: &str) -> Vec<PlSeg> {
     let mut out = Vec::new();
     let mut i = 0;
     let mut free_start = 0;
+    let has_glossary = source.contains("{G_");
     while i < source.len() {
-        if let Some(tok_len) = pl_token_len_at(source, i) {
+        if let Some(mut tok_len) = pl_token_len_at(source, i) {
+            // In composite requests retain closed argument templates around
+            // control prefixes as a unit. Mock must not move '<'/'>' into its
+            // concatenated free text and strand canonical speaker identities.
+            // This is source fidelity, not engine provenance or header repair;
+            // core alone owns/validates the typed speaker trace. Plain PL-only
+            // requests keep their existing fitting behavior.
+            if has_glossary && source[i..].starts_with("{PL_") {
+                if let Some(open) = source[i + tok_len..].strip_prefix('<') {
+                    if let Some(close) = open.find('>') {
+                        let argument = &open[..close];
+                        if !argument.trim().is_empty()
+                            && !argument.contains('<')
+                            && !argument.chars().any(char::is_control)
+                        {
+                            tok_len += close + 2;
+                        }
+                    }
+                }
+            }
             if free_start < i {
                 out.push(PlSeg::Free(source[free_start..i].to_string()));
             }
@@ -171,22 +192,18 @@ fn split_pl_segments(source: &str) -> Vec<PlSeg> {
     out
 }
 
-/// Length of a `{PL_<digits>}` token starting at `i`, if any.
+/// Length of an opaque control/glossary sentinel starting at `i`, if any.
+/// Do not parse, renumber or repair its payload: malformed/unknown spellings
+/// must survive unchanged for the core's exact inventory validator to reject.
 fn pl_token_len_at(source: &str, i: usize) -> Option<usize> {
     let rest = &source[i..];
-    if !rest.starts_with("{PL_") {
+    if !rest.starts_with("{PL_") && !rest.starts_with("{G_") {
         return None;
     }
-    let after = &rest[4..];
-    let digits = after.bytes().take_while(|b| b.is_ascii_digit()).count();
-    if digits == 0 {
-        return None;
-    }
-    if after.as_bytes().get(digits) == Some(&b'}') {
-        Some(4 + digits + 1)
-    } else {
-        None
-    }
+    Some(rest.find('}').map_or_else(
+        || rest.find(['\r', '\n']).unwrap_or(rest.len()),
+        |close| close + 1,
+    ))
 }
 
 fn pl_tokens(source: &str) -> Vec<String> {

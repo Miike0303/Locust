@@ -4,6 +4,185 @@ use crate::error::Result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Run-local trie: language filtering and Unicode case folding happen once, not
+/// once per database row. Original byte offsets remain authoritative for edits.
+#[derive(Default)]
+struct TermNode {
+    next: std::collections::HashMap<char, usize>,
+    entries: Vec<usize>,
+}
+
+pub(crate) struct VisibleGlossary {
+    nodes: Vec<TermNode>,
+    entries: Vec<GlossaryEntry>,
+}
+
+fn word_char(c: char) -> bool {
+    // Unicode letters/numbers plus combining-mark blocks and connectors. Other
+    // non-ASCII non-delimiters conservatively count as word continuations: an
+    // unfamiliar script/mark must not permit an unsafe partial-word match.
+    c.is_alphanumeric()
+        || matches!(
+            c,
+            '_' | '\u{200c}' | '\u{200d}' | '\u{203f}' | '\u{2040}' | '\u{2054}' | '\u{ff3f}'
+        )
+        || (!c.is_ascii()
+            && !c.is_whitespace()
+            && !matches!(c, '«' | '»' | '¡' | '¿' | '\u{2000}'..='\u{206f}' | '\u{2e00}'..='\u{2e7f}'
+                | '\u{3000}'..='\u{303f}' | '\u{ff01}'..='\u{ff0f}'
+                | '\u{ff1a}'..='\u{ff20}' | '\u{ff3b}'..='\u{ff40}'
+                | '\u{ff5b}'..='\u{ff65}'))
+}
+
+impl VisibleGlossary {
+    pub(crate) fn compile(entries: &[GlossaryEntry], pair: &str) -> Self {
+        let entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.lang_pair == pair && !e.term.is_empty())
+            .cloned()
+            .collect();
+        let mut nodes = vec![TermNode::default()];
+        for (index, entry) in entries.iter().enumerate() {
+            let mut node = 0;
+            for c in entry.term.to_lowercase().chars() {
+                let next = if let Some(next) = nodes[node].next.get(&c) {
+                    *next
+                } else {
+                    let next = nodes.len();
+                    nodes.push(TermNode::default());
+                    nodes[node].next.insert(c, next);
+                    next
+                };
+                node = next;
+            }
+            nodes[node].entries.push(index);
+        }
+        Self { nodes, entries }
+    }
+
+    /// Protect controls first. Each leftmost-longest visible match gets a unique
+    /// opaque token; equivalent matches with contradictory targets fail closed.
+    pub(crate) fn mask(
+        &self,
+        source: &str,
+        profile: crate::placeholder::PlaceholderProfile,
+    ) -> std::result::Result<(String, Vec<crate::placeholder::Placeholder>), ()> {
+        use crate::placeholder::{Placeholder, PlaceholderKind, PlaceholderProcessor};
+        let (sanitized, mut phs, nameboxes) =
+            PlaceholderProcessor::extract_with_namebox_positions(source, profile);
+        // Speaker delimiters are syntax, not visible term spans. An explicit
+        // term containing '<...>' must not consume a recognized argument's
+        // wrapper (or make the private source trace impossible to construct).
+        let speaker_delimiters: std::collections::HashSet<_> = nameboxes
+            .iter()
+            .flat_map(|(offset, prefix)| {
+                let open = offset + prefix.len();
+                std::iter::once(open).chain(
+                    sanitized[open + 1..]
+                        .find('>')
+                        .map(|close| open + 1 + close),
+                )
+            })
+            .collect();
+        // Extraction emits controls in source order and masks all literal PL
+        // lookalikes, so these positions are exactly the minted control spans.
+        let opaque: std::collections::HashMap<_, _> = sanitized
+            .match_indices("{PL_")
+            .zip(phs.iter())
+            .map(|((start, _), ph)| {
+                debug_assert!(sanitized[start..].starts_with(&ph.token));
+                (start, start + ph.token.len())
+            })
+            .collect();
+        let chars: Vec<_> = sanitized.char_indices().collect();
+        let mut edits = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let start = chars[i].0;
+            if let Some(end) = opaque.get(&start) {
+                while i < chars.len() && chars[i].0 < *end {
+                    i += 1;
+                }
+                continue;
+            }
+            let mut node = 0;
+            let mut best: Option<(usize, &str)> = None;
+            let mut conflict = false;
+            'walk: for j in i..chars.len() {
+                if opaque.contains_key(&chars[j].0) || speaker_delimiters.contains(&chars[j].0) {
+                    break;
+                }
+                for c in chars[j].1.to_lowercase() {
+                    let Some(next) = self.nodes[node].next.get(&c) else {
+                        break 'walk;
+                    };
+                    node = *next;
+                }
+                let end = chars.get(j + 1).map_or(sanitized.len(), |c| c.0);
+                let text = &sanitized[start..end];
+                for index in &self.nodes[node].entries {
+                    let entry = &self.entries[*index];
+                    if entry.case_sensitive && text != entry.term {
+                        continue;
+                    }
+                    if word_char(chars[i].1) && i > 0 && word_char(chars[i - 1].1)
+                        || word_char(chars[j].1) && chars.get(j + 1).is_some_and(|c| word_char(c.1))
+                    {
+                        continue;
+                    }
+                    if let Some((previous_end, target)) = best {
+                        if previous_end == end {
+                            conflict |= target != entry.translation;
+                            continue;
+                        }
+                    }
+                    best = Some((end, &entry.translation));
+                    conflict = false;
+                }
+            }
+            if let Some((end, target)) = best {
+                if conflict
+                    || target.trim().is_empty()
+                    || target.contains('\\')
+                    || target.contains("{PL_")
+                    || target.contains("{G_")
+                    || !PlaceholderProcessor::extract_with_profile(target, profile)
+                        .1
+                        .is_empty()
+                {
+                    return Err(());
+                }
+                edits.push((start, end, target));
+                while i < chars.len() && chars[i].0 < end {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        let mut nonce = 0;
+        while source.contains(&format!("{{G_{nonce}_")) {
+            nonce += 1;
+        }
+        let mut out = String::new();
+        let mut last = 0;
+        for (index, (start, end, target)) in edits.into_iter().enumerate() {
+            out.push_str(&sanitized[last..start]);
+            let token = format!("{{G_{nonce}_{index}}}");
+            out.push_str(&token);
+            phs.push(Placeholder {
+                index: phs.len(),
+                token,
+                original: target.into(),
+                pattern_type: PlaceholderKind::GlossaryTerm,
+            });
+            last = end;
+        }
+        out.push_str(&sanitized[last..]);
+        Ok((out, phs))
+    }
+}
+
 pub struct Glossary {
     db: Arc<Database>,
     #[cfg(test)]
@@ -179,6 +358,123 @@ impl Glossary {
 mod tests {
     use super::*;
     use crate::database::Database;
+
+    fn explicit(term: &str, target: &str, sensitive: bool) -> GlossaryEntry {
+        GlossaryEntry {
+            term: term.into(),
+            translation: target.into(),
+            lang_pair: "en-es".into(),
+            context: None,
+            case_sensitive: sensitive,
+        }
+    }
+
+    fn canonical(entries: &[GlossaryEntry], text: &str) -> std::result::Result<String, ()> {
+        let (masked, phs) = VisibleGlossary::compile(entries, "en-es")
+            .mask(text, crate::placeholder::PlaceholderProfile::RpgMaker)?;
+        crate::placeholder::PlaceholderProcessor::restore(&masked, &phs).map_err(|_| ())
+    }
+
+    #[test]
+    fn visible_plan_is_leftmost_longest_case_aware_and_unicode_word_bounded() {
+        let entries = vec![
+            explicit("Boy", "Chico", false),
+            explicit("Boy King", "Rey", false),
+            explicit("Louis", "Louis", true),
+            explicit("Émile", "Emilio", false),
+        ];
+        assert_eq!(canonical(&entries,
+            "Boy King Boy Boyfriend Louis LouisLongIdentifier louis ÉMILE préÉmile Émile2 Émile\u{301} Boy_foo Boy\u{203f}foo").unwrap(),
+            "Rey Chico Boyfriend Louis LouisLongIdentifier louis Emilio préÉmile Émile2 Émile\u{301} Boy_foo Boy\u{203f}foo");
+        assert_eq!(
+            canonical(&entries, "«Boy» — Émile。Boy").unwrap(),
+            "«Chico» — Emilio。Chico"
+        );
+    }
+
+    #[test]
+    fn visible_terms_do_not_consume_recognized_speaker_delimiters() {
+        let entries = vec![
+            explicit("<Old house>", "WRONG", true),
+            explicit("Old", "Vieja", true),
+            explicit("house", "casa", true),
+        ];
+        assert_eq!(
+            canonical(&entries, r"\n<Old house>").unwrap(),
+            r"\n<Vieja casa>"
+        );
+    }
+
+    #[test]
+    fn public_restore_keeps_canonical_identity_without_freezing_grammar() {
+        let entries = vec![
+            explicit("Old", "Vieja", true),
+            explicit("house", "casa", true),
+        ];
+        let (masked, phs) = VisibleGlossary::compile(&entries, "en-es")
+            .mask(
+                "Old house",
+                crate::placeholder::PlaceholderProfile::RpgMaker,
+            )
+            .unwrap();
+        assert_eq!(masked, "{G_0_0} {G_0_1}");
+        assert_eq!(
+            crate::placeholder::PlaceholderProcessor::restore("{G_0_1} {G_0_0}", &phs).unwrap(),
+            "casa Vieja"
+        );
+        assert!(
+            crate::placeholder::PlaceholderProcessor::restore("{G_0_1} {G_0_1}", &phs).is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_equivalents_coalesce_but_conflicts_and_wrong_pair_do_not_win() {
+        let entries = vec![
+            explicit("Boy", "Chico", false),
+            explicit("boy", "Chico", false),
+        ];
+        assert_eq!(canonical(&entries, "BOY").unwrap(), "Chico");
+        let mut conflict = entries.clone();
+        conflict.push(explicit("Boy", "Muchacho", true));
+        assert!(canonical(&conflict, "Boy").is_err());
+        assert_eq!(canonical(&conflict, "boy").unwrap(), "Chico");
+        let mut wrong_pair = explicit("Boy", "Garçon", false);
+        wrong_pair.lang_pair = "en-fr".into();
+        assert_eq!(canonical(&[wrong_pair], "Boy").unwrap(), "Boy");
+    }
+
+    #[test]
+    fn source_controls_and_sentinel_lookalikes_are_opaque_and_canonical_not_recursive() {
+        let entries = vec![
+            explicit("Boy", "Chico", false),
+            explicit("Person", "Boy", false),
+            explicit("PL", "WRONG", false),
+            explicit("G", "WRONG", false),
+        ];
+        let source = r"Person {font=Boy.ttf}Boy{/font} \C[Boy] {PL_0} {PL_1} {G_Boy} {G_0_0}";
+        let (masked, phs) = VisibleGlossary::compile(&entries, "en-es")
+            .mask(source, crate::placeholder::PlaceholderProfile::RpgMaker)
+            .unwrap();
+        assert_eq!(
+            crate::placeholder::PlaceholderProcessor::restore(&masked, &phs).unwrap(),
+            r"Boy {font=Boy.ttf}Chico{/font} \C[Boy] {PL_0} {PL_1} {G_Boy} {G_0_0}"
+        );
+        assert!(!masked.contains("Boy"));
+        assert!(masked.contains("{G_1_0}"));
+        assert!(masked.contains("{PL_0_0}"));
+        assert_eq!(
+            canonical(&entries, r"\\n<Boy> Boy").unwrap(),
+            r"\\n<Boy> Chico"
+        );
+        assert_eq!(
+            canonical(&entries, r"\n<Boy> Boy").unwrap(),
+            r"\n<Chico> Chico"
+        );
+        assert_eq!(
+            canonical(&entries, "{{G_0_0} { G-Boy} Boy").unwrap(),
+            "{{G_0_0} { G-Boy} Chico"
+        );
+    }
 
     fn setup() -> (Arc<Database>, Glossary) {
         let db = Arc::new(Database::open_in_memory().unwrap());
