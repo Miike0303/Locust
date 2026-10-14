@@ -11,6 +11,7 @@ const cases = [
   [{ ExtraPlaceholder: { placeholder: "{name}" } }, "ExtraPlaceholder", "validate.kind.extraLabel"],
   [{ ExceedsCharLimit: { actual: 3, limit: 2 } }, "ExceedsCharLimit", "validate.kind.charLimitLabel"],
   [{ ExceedsBinarySlot: { actual: 3, limit: 2, encoding: "utf8" } }, "ExceedsBinarySlot", "validate.kind.binarySlotLabel"],
+  [{ UnencodableTranslation: { encoding: "Shift-JIS" } } as ValidationKind, "UnencodableTranslation", "validate.kind.unencodableLabel"],
   ["EmptyTranslation", "EmptyTranslation", "validate.kind.emptyLabel"],
   ["IdenticalToSource", "IdenticalToSource", "validate.kind.identicalLabel"],
   ["StaleTranslation", "StaleTranslation", "validate.kind.staleLabel"],

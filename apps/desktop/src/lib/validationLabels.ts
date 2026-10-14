@@ -10,6 +10,7 @@ const BADGE_LABEL_KEYS = {
   ExtraPlaceholder: "validate.kind.extraLabel",
   ExceedsCharLimit: "validate.kind.charLimitLabel",
   ExceedsBinarySlot: "validate.kind.binarySlotLabel",
+  UnencodableTranslation: "validate.kind.unencodableLabel",
   EmptyTranslation: "validate.kind.emptyLabel",
   IdenticalToSource: "validate.kind.identicalLabel",
   StaleTranslation: "validate.kind.staleLabel",

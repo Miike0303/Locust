@@ -31,6 +31,29 @@ pub fn encoded_byte_len(encoding: &str, text: &str) -> Option<usize> {
     }
 }
 
+/// Passive representability diagnosis for the exact extractor-owned YU-RIS
+/// quoted literal contract. No path/role inference, byte budget or text fitting.
+/// The serializer's light escaping adds/removes only encodable ASCII (LF, TAB,
+/// CR, backslash, delimiters), so testing the semantic text is equivalent for
+/// representability. Raw/caption/unknown representations remain unsupported.
+pub fn unencodable_translation_issue(entry: &StringEntry) -> Option<ValidationIssue> {
+    if entry.placeholder_profile() != crate::placeholder::PlaceholderProfile::YurisQuotedLiteral {
+        return None;
+    }
+    let translation = entry.translation.as_deref()?;
+    if encoded_byte_len("shift_jis", translation).is_some() {
+        return None;
+    }
+    Some(ValidationIssue {
+        entry_id: entry.id.clone(),
+        kind: ValidationKind::UnencodableTranslation {
+            encoding: "Shift-JIS".into(),
+        },
+        message: "translation cannot be encoded as Shift-JIS for the declared YU-RIS quoted literal; injection is refused before backup or output; the original game and saved translation remain unchanged".into(),
+        source: None,
+    })
+}
+
 /// Effective per-entry binary capacity. A pivot records an explicit immutable
 /// value; older/non-pivot rows derive it from the physical injection source.
 /// Grouped Unity locale/CSV rows intentionally have no per-cell capacity
@@ -493,6 +516,12 @@ impl Validator {
             }),
         }
 
+        // Representability is independent of binary-slot capacity and never
+        // changes the semantic translation or its immutable pivot provenance.
+        if let Some(issue) = unencodable_translation_issue(entry) {
+            issues.push(issue);
+        }
+
         // Check 5 — Binary inject slot (Unity UTF-8 / Unreal UTF-16LE / Wolf SJIS)
         if !translation.is_empty() {
             if let Ok(Some((enc, src_len))) = slot_budget {
@@ -539,8 +568,11 @@ impl Validator {
             .map(|e| (e.id.as_str(), e.source.as_str()))
             .collect();
         for issue in &mut issues {
-            if let Some(src) = source_by_id.get(issue.entry_id.as_str()) {
-                issue.source = Some(truncate_snippet(src, 100));
+            // Encoding guidance needs no private source excerpt.
+            if !matches!(issue.kind, ValidationKind::UnencodableTranslation { .. }) {
+                if let Some(src) = source_by_id.get(issue.entry_id.as_str()) {
+                    issue.source = Some(truncate_snippet(src, 100));
+                }
             }
         }
 
@@ -553,6 +585,7 @@ impl Validator {
                 ValidationKind::ExtraPlaceholder { .. } => "ExtraPlaceholder",
                 ValidationKind::ExceedsCharLimit { .. } => "ExceedsCharLimit",
                 ValidationKind::ExceedsBinarySlot { .. } => "ExceedsBinarySlot",
+                ValidationKind::UnencodableTranslation { .. } => "UnencodableTranslation",
                 ValidationKind::EmptyTranslation => "EmptyTranslation",
                 ValidationKind::IdenticalToSource => "IdenticalToSource",
                 ValidationKind::InvalidInjectionProvenance => "InvalidInjectionProvenance",

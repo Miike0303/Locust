@@ -270,6 +270,7 @@ export type ValidationKind =
   | { ExtraPlaceholder: { placeholder: string } }
   | { ExceedsCharLimit: { limit: number; actual: number } }
   | { ExceedsBinarySlot: { encoding: string; limit: number; actual: number } }
+  | { UnencodableTranslation: { encoding: string } }
   | "EmptyTranslation"
   | "InvalidInjectionProvenance"
   | "StaleTranslation"
@@ -361,6 +362,7 @@ export function validationKindLabel(kind: ValidationKind): string {
   if ("ExtraPlaceholder" in kind) return "ExtraPlaceholder";
   if ("ExceedsCharLimit" in kind) return "ExceedsCharLimit";
   if ("ExceedsBinarySlot" in kind) return "ExceedsBinarySlot";
+  if ("UnencodableTranslation" in kind) return "UnencodableTranslation";
   return "Unknown";
 }
 

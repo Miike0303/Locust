@@ -1152,6 +1152,9 @@ fn validated_injection_source(entry: &StringEntry) -> Result<&str> {
             entry.id
         ))
     })?;
+    if let Some(issue) = crate::validation::unencodable_translation_issue(entry) {
+        return Err(LocustError::InjectionError(issue.message));
+    }
     entry
         .injection_source()
         .map_err(LocustError::InjectionError)

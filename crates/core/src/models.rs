@@ -461,6 +461,11 @@ pub enum ValidationKind {
         limit: usize,
         actual: usize,
     },
+    /// Declared literal encoding cannot represent the semantic translation.
+    /// This is not a capacity limit and must never trigger lossy fitting.
+    UnencodableTranslation {
+        encoding: String,
+    },
     EmptyTranslation,
     IdenticalToSource,
     InvalidInjectionProvenance,

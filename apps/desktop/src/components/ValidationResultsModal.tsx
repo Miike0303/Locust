@@ -42,6 +42,8 @@ const KIND_BADGE: Record<string, string> = {
 		"bg-danger-muted text-danger",
 	ExceedsBinarySlot:
 		"bg-danger-muted text-danger",
+	UnencodableTranslation:
+		"bg-danger-muted text-danger",
 	EmptyTranslation:
 		"bg-surface-muted text-text",
 	IdenticalToSource:
@@ -68,6 +70,10 @@ function kindDetail(
 		const { limit, actual } = kind.ExceedsCharLimit;
 		return t("validate.kind.charLimit", { actual, limit });
 	}
+	if ("UnencodableTranslation" in kind)
+		return t("validate.kind.unencodable", {
+			encoding: kind.UnencodableTranslation.encoding,
+		});
 	if ("ExceedsBinarySlot" in kind) {
 		const { encoding, limit, actual } = kind.ExceedsBinarySlot;
 		return t("validate.kind.binarySlot", { actual, limit, encoding });
@@ -322,7 +328,7 @@ export default function ValidationResultsModal({
 														<div className="font-mono text-caption text-text-muted truncate">
 															{issue.entry_id}
 														</div>
-														{issue.source && (
+														{issue.source && label !== "UnencodableTranslation" && (
 															<div
 																className="text-body text-text truncate mt-0.5"
 																title={issue.source}
