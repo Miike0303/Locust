@@ -1436,7 +1436,7 @@ async fn handle_job_ws(
 ) {
     let Some((mut rx, replay)) = found else {
         let _ = socket.send(Message::Text(not_found.to_string())).await;
-        let _ = socket.close().await;
+        close_job_ws(&mut socket).await;
         return;
     };
 
@@ -1445,11 +1445,11 @@ async fn handle_job_ws(
         let key = event.to_string();
         seen.insert(key);
         if socket.send(Message::Text(event.to_string())).await.is_err() {
-            let _ = socket.close().await;
+            close_job_ws(&mut socket).await;
             return;
         }
         if job_event_is_terminal(&event) {
-            let _ = socket.close().await;
+            close_job_ws(&mut socket).await;
             return;
         }
     }
@@ -1476,7 +1476,23 @@ async fn handle_job_ws(
             }
         }
     }
-    let _ = socket.close().await;
+    close_job_ws(&mut socket).await;
+}
+
+async fn close_job_ws(socket: &mut WebSocket) {
+    // Axum's consuming close() only sends Close. Dropping TCP with unread
+    // inbound frames can reset the connection on Windows and lose the terminal
+    // event at the peer. Retain the socket until the peer acknowledges Close.
+    // Bound both the close write and the entire drain for unresponsive clients.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let _ = socket.send(Message::Close(None)).await;
+        while let Some(Ok(message)) = socket.recv().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
 }
 
 #[derive(Deserialize)]
@@ -6667,3 +6683,6 @@ mod exclusion_tests;
 
 #[cfg(test)]
 mod backup_operation_tests;
+
+#[cfg(test)]
+mod job_ws_tests;
