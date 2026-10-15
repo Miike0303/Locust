@@ -5,6 +5,7 @@ import type { MessageKey } from "./i18n";
  * `description` is developer documentation (codecs, XOR keys, test notes) and
  * stays only as the fallback for a format the UI does not know yet. */
 export const KNOWN_FORMAT_IDS = [
+  "godot-dialogic",
   "renpy",
   "rpgmaker-mv",
   "rpgmaker-vxa",

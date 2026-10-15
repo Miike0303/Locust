@@ -57,7 +57,7 @@ type NativeInjectReport = MultiLangReport & {
 interface InjectModalProps {
 	open: boolean;
 	onClose: () => void;
-	/** Optional: open Patch modal on the Pack tab after a successful direct inject. */
+	/** Optional: open Patch modal on Pack after a recorded injection. */
 	onOpenPack?: (backupId?: string) => void;
 }
 
@@ -376,7 +376,7 @@ export default function InjectModal({
 	const resultWritten = result ? sumStringsWritten(result) : 0;
 	const resultSkips = result ? collectSkipReasons(result) : [];
 	const offerPack =
-		Boolean(result) && isDirectResult && shouldOfferPackAfterInject(result!);
+		Boolean(result) && shouldOfferPackAfterInject(result!);
 
 	return (
 		<div className={MODAL_BACKDROP_CLASS}>
@@ -426,7 +426,7 @@ export default function InjectModal({
 							</select>
 							<p className="text-caption text-text-muted mt-1">
 								{mode === "replace" && <>
-									{t("inject.hint.replace", { gameName })}
+									{project.format_id === "godot-dialogic" ? t("inject.archiveOnly") : t("inject.hint.replace", { gameName })}
 									<span className="block mt-0.5">{t("inject.hint.binarySlotFit")}</span>
 								</>}
 								{mode === "add" && t("inject.hint.add")}

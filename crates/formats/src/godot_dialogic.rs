@@ -1,4 +1,4 @@
-//! Unregistered experimental adapter for explicitly selected standalone PCK v2.
+//! Experimental adapter for explicitly selected standalone PCK v2.
 //!
 //! Positive profile: stock Dialogic syntax understood by `dialogic`, with unique
 //! `.dch` file stems in this archive as character identifiers. Display names are

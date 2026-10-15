@@ -2,6 +2,11 @@ import type { en } from "./en";
 
 /** Spanish UI catalog. Missing keys are a compile error. Neutral professional Spanish. */
 export const es: Record<keyof typeof en, string> = {
+  "welcome.source.title": "Elegir origen del juego",
+  "welcome.source.hint": "Elige una carpeta o un archivo del juego. Godot/Dialogic requiere un archivo .pck independiente.",
+  "welcome.format.chooseSource": "Elegir origen del juego…",
+  "format.desc.godot-dialogic": "Godot 4 .pck independiente con líneas de tiempo de Dialogic (experimental). Reemplazar crea una copia solo del archivo, no una carpeta de juego ejecutable.",
+  "inject.archiveOnly": "Reemplazar crea una copia solo del PCK seleccionado. No incluye un juego ejecutable ni su lanzador.",
   "common.providerDefault": "Predeterminado del proveedor",
   "activity.translation.startingDefault": "Iniciando traducción con la cadena de proveedores: {chain}, origen: {source}, destino: {target}, lote: predeterminado",
   // Activity-log messages. Raw detail and source remain diagnostic data.
@@ -237,8 +242,8 @@ export const es: Record<keyof typeof en, string> = {
   "welcome.providerHintDismiss": "Cerrar el aviso de configuración del proveedor",
   "welcome.format.title": "Seleccionar formato",
   "welcome.format.detectFailed": "No se pudo detectar el motor del juego automáticamente — elija uno:",
-  "welcome.format.manualHint": "Elija primero el formato del motor y después la carpeta del juego.",
-  "welcome.format.openDbHint": "Se abre la base tal cual (sin reextraer). Elija el motor que corresponda a la carpeta del juego.",
+  "welcome.format.manualHint": "Elija primero el formato del motor y después su carpeta o archivo de origen.",
+  "welcome.format.openDbHint": "Se abre la base tal cual (sin reextraer). Elija el motor que corresponda a la carpeta o archivo del juego seleccionado.",
   "welcome.format.auto": "Detección automática",
   "welcome.format.autoHint": "Deje que Locust detecte el formato automáticamente",
   "format.desc.renpy": "Novelas visuales de Ren'Py (scripts .rpy)",
@@ -797,7 +802,7 @@ export const es: Record<keyof typeof en, string> = {
   "inject.recordingNothing": "{lang}: no se registró nada — empaquetar un parche fallará hasta que una inyección escriba archivos.",
   "inject.recordingKept": "{lang}: se conservó el registro anterior de {at} (esta ejecución no escribió archivos).",
   "inject.recordingSaved": "Registro guardado",
-  "inject.recordingHint": "Ahora puede empaquetar un zip de parche a partir de este registro (modal Parche → pestaña Empaquetar). Apunte la carpeta del juego a esta ruta de proyecto para la inyección directa.",
+  "inject.recordingHint": "Ya puede empaquetar un parche ZIP con este registro (Parche → Empaquetar). Se usa la carpeta de salida registrada: la copia traducida para Reemplazar o la ubicación original del juego para Directo.",
   "inject.openPack": "Abrir Parche → Empaquetar",
   "inject.failedLanguages": "Idiomas fallidos:",
   "inject.registerInUi": "Registrar idioma en la interfaz del juego",

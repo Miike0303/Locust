@@ -890,6 +890,7 @@ export const patchIdentity = (gamePath: string): Promise<{ detected_dlsite_code:
   request(`/patch/identity?${new URLSearchParams({ game_path: gamePath })}`);
 
 export interface PatchRecordings {
+  roots?: Record<string, string>;
   languages: Array<string | null>;
   pristine_languages?: Array<string | null>;
 }

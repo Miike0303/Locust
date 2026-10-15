@@ -60,6 +60,8 @@ interface PatchModalProps {
 	onClose: () => void;
 	/** Optional default game path (e.g. current project folder). */
 	defaultGamePath?: string;
+	/** File sources never imply an apply destination directory. */
+	defaultGamePathIsFile?: boolean;
 	initialZipPath?: string;
 	/** Exact pre-injection backup, scoped to defaultGamePath. */
 	initialBackupId?: string;
@@ -75,6 +77,7 @@ export default function PatchModal({
 	open,
 	onClose,
 	defaultGamePath,
+	defaultGamePathIsFile = false,
 	initialZipPath,
 	initialBackupId,
 	initialTab = "apply",
@@ -106,7 +109,11 @@ export default function PatchModal({
 		}
 	})();
 	const [tab, setTab] = useState<Tab>(initialTab);
-	const [gamePath, setGamePath] = useState(defaultGamePath ?? "");
+	const [packGamePath, setPackGamePath] = useState(defaultGamePath ?? "");
+	const [applyGamePath, setApplyGamePath] = useState(defaultGamePathIsFile ? "" : defaultGamePath ?? "");
+	const [recordingRoots, setRecordingRoots] = useState<Record<string, string>>({});
+	const gamePath = tab === "pack" ? packGamePath : applyGamePath;
+	const setGamePath = tab === "pack" ? setPackGamePath : setApplyGamePath;
 	const [zipPath, setZipPath] = useState(remembered.zipPath);
 	const [zipUrl, setZipUrl] = useState(remembered.zipUrl);
 	const [outputPath, setOutputPath] = useState("");
@@ -160,7 +167,11 @@ export default function PatchModal({
 	useEffect(() => {
 		if (!open) return;
 		if (applyJobIdRef.current) return;
-		if (defaultGamePath) setGamePath(defaultGamePath);
+		setPackGamePath(defaultGamePath ?? "");
+		setApplyGamePath(defaultGamePathIsFile ? "" : defaultGamePath ?? "");
+		setRecordings([]);
+		setPristineRecordings([]);
+		setRecordingRoots({});
 		if (initialBackupId) { setPristine(true); setPristinePath(""); }
 		if (initialZipPath) { setZipPath(initialZipPath); setZipUrl(""); setVerify(null); setApplyResult(null); }
 		setTab(allowPack ? initialTab : "apply");
@@ -176,6 +187,7 @@ export default function PatchModal({
 			.then(([rec, cfg]) => {
 				if (cancelled) return;
 				setRecordings(rec.languages);
+				setRecordingRoots(rec.roots ?? {});
 				setPristineRecordings(rec.pristine_languages ?? []);
 				setLanguages((prev) =>
 					preferredPackLang(rec.languages, cfg.default_target_lang, prev),
@@ -187,7 +199,12 @@ export default function PatchModal({
 				setPristineRecordings([]);
 			});
 		return () => { cancelled = true; };
-	}, [open, defaultGamePath, initialZipPath, initialBackupId, initialTab, allowPack]);
+	}, [open, defaultGamePath, defaultGamePathIsFile, initialZipPath, initialBackupId, initialTab, allowPack]);
+
+	useEffect(() => {
+		const root = recordingRoots[languages.trim()];
+		if (root) setPackGamePath(root);
+	}, [recordingRoots, languages]);
 
 	useEffect(() => {
 		if (!open || !allowPack || tab !== "pack") return;
@@ -676,7 +693,7 @@ export default function PatchModal({
 				output_path: outputPath.trim(),
 				languages: langs,
 				pristine,
-				pristine_path: pristinePath.trim() || undefined,
+				pristine_path: pristine ? pristinePath.trim() || undefined : undefined,
 				pristine_backup_id: pristine && !pristinePath.trim() && gamePath.trim() === defaultGamePath?.trim() ? initialBackupId : undefined,
 			});
 			setPackResult(report);
@@ -1235,7 +1252,7 @@ export default function PatchModal({
 
 							<div>
 							<label className="text-body font-medium">{t("patch.pristinePath")}</label>
-							{pristine && (initialBackupId || pristineRecordings.some(lang => isPackLangSelected(languages, lang))) && gamePath.trim() === defaultGamePath?.trim() && !pristinePath.trim() && <p className="mt-1 text-caption text-success">{t("patch.injectionBackup")}</p>}
+							{pristine && (pristineRecordings.some(lang => isPackLangSelected(languages, lang)) || (initialBackupId && gamePath.trim() === defaultGamePath?.trim())) && !pristinePath.trim() && <p className="mt-1 text-caption text-success">{t("patch.injectionBackup")}</p>}
 								<div className="flex gap-2 mt-1">
 									<input
 										value={pristinePath}

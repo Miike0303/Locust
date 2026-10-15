@@ -2,6 +2,7 @@ import { lazy, useEffect } from "react";
 import { Routes, Route } from "react-router-dom";
 import Layout from "./components/Layout";
 import UpdateChecker from "./components/UpdateChecker";
+import GameSourceDialog from "./components/GameSourceDialog";
 import { ResumeProjectDialogHost } from "./components/ResumeProjectDialog";
 import { getConfig, getCurrentProject } from "./lib/api";
 import { applyAppearance } from "./lib/appearance";
@@ -44,6 +45,7 @@ export default function App() {
       </Routes>
       <UpdateChecker />
       <ResumeProjectDialogHost />
+      <GameSourceDialog />
     </>
   );
 }

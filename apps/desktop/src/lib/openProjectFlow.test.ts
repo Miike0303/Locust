@@ -20,6 +20,7 @@ import {
   projectOpenHttpBody,
   projectOpenTauriArgs,
   runOpenAction,
+  pickGameSource,
   shouldOpenProjectDb,
 } from "./openProjectFlow.ts";
 
@@ -144,6 +145,10 @@ const h = {
 };
 (globalThis as any).__resumeFlow = h;
 registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === "@tauri-apps/plugin-dialog") return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent("export async function open(options) { const h = globalThis.__gd5Picker; h.calls.push(options); return h.selected; }")}` };
+    return nextResolve(specifier, context);
+  },
   load(url, context, nextLoad) {
     if (url.replace(/\\/g, "/").endsWith("/src/lib/api.ts")) {
       return { format: "module", shortCircuit: true, source: `
@@ -284,5 +289,43 @@ test("choice broker preserves the pending owner and ignores stale callbacks", as
     nodeAssert.equal(getProjectOpenChoice(), null);
   } finally {
     unsubscribe();
+  }
+});
+
+
+test("native Godot manual selection, cancellation and saved DB preserve the exact PCK file", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const picker = { selected: "/shared/game.pck" as string | null, calls: [] as any[] };
+  (globalThis as any).__gd5Picker = picker;
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: {} } });
+  try {
+    const { t } = await import("./i18n/index.ts");
+    const formats = [{ id: "godot-dialogic", name: "Godot", description: "", extensions: ["pck"], supported_modes: ["replace"] as const }];
+    const path = await pickGameSource(t, formats as any, "godot-dialogic");
+    nodeAssert.equal(path, "/shared/game.pck");
+    nodeAssert.equal(picker.calls[0].directory, false);
+    nodeAssert.ok(picker.calls[0].filters[0].extensions.includes("pck"));
+    reset({ kind: "extract" });
+    await completeOpenProject(path!, "godot-dialogic", deps("cancel"));
+    nodeAssert.deepEqual(h.calls[0], ["preflight", "/shared/game.pck", "godot-dialogic"]);
+    reset();
+    await completeOpenProjectDb("/saved.locust.db", path!, "godot-dialogic", deps("cancel"));
+    nodeAssert.deepEqual(h.calls[0], ["open-db", "/saved.locust.db", "/shared/game.pck", "godot-dialogic"]);
+    picker.selected = null;
+    nodeAssert.equal(await pickGameSource(t, formats as any, "godot-dialogic"), null);
+    const { resolveGameSourceChoice } = await import("./gameSource.ts");
+    picker.calls = [];
+    const cancelled = pickGameSource(t);
+    resolveGameSourceChoice(null);
+    nodeAssert.equal(await cancelled, null);
+    nodeAssert.deepEqual(picker.calls, []);
+    picker.selected = "/shared/game.pck";
+    const explicitFile = pickGameSource(t, formats as any);
+    resolveGameSourceChoice("file");
+    nodeAssert.equal(await explicitFile, "/shared/game.pck");
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, "window", descriptor);
+    else Reflect.deleteProperty(globalThis, "window");
+    Reflect.deleteProperty(globalThis, "__gd5Picker");
   }
 });

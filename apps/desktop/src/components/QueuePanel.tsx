@@ -23,6 +23,7 @@ import type { MessageKey } from "../lib/i18n";
 import { useQueueStore, type QueueItem, type QueueItemStatus } from "../stores/queueStore";
 import {
 	getProviders,
+	getFormats,
 	getConfig,
 	type TranslationStartParams,
 } from "../lib/api";
@@ -45,6 +46,7 @@ import {
 	formatProviderOptionLabel,
 } from "../lib/providerReadiness";
 import { buildSettingsPath } from "../lib/settingsNav";
+import { gameFileExtensions } from "../lib/gameSource";
 import EmptyState from "./EmptyState";
 import { useT } from "../lib/i18n";
 
@@ -110,6 +112,7 @@ export default function QueuePanel() {
 		startQueue,
 		cancelQueue,
 	} = useQueueStore();
+	const { data: formats } = useQuery({ queryKey: ["formats"], queryFn: getFormats, enabled: isPanelOpen });
 	const { data: providers } = useQuery({
 		queryKey: ["providers"],
 		queryFn: getProviders,
@@ -216,15 +219,7 @@ export default function QueuePanel() {
 				filters: [
 					{
 						name: t("queue.dialog.gameFiles"),
-						extensions: [
-							"exe",
-							"html",
-							"htm",
-							"rpy",
-							"rpa",
-							"rpgproject",
-							"rvproj2",
-						],
+						extensions: gameFileExtensions(formats ?? await getFormats()),
 					},
 					{ name: t("queue.dialog.allFiles"), extensions: ["*"] },
 				],

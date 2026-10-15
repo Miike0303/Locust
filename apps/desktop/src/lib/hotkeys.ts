@@ -9,7 +9,7 @@ import {
 import {
   completeOpenProject,
   isDetectionFailure,
-  pickGameFolder,
+  pickGameSource,
 } from "./openProjectFlow";
 import {
   PENDING_AFTER_STALE_FILTER,
@@ -119,7 +119,7 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
     void (async () => {
       openProjectInFlight = true;
       try {
-        const path = await pickGameFolder(t);
+        const path = await pickGameSource(t);
         if (!path) return;
         try {
           const result = await completeOpenProject(path, undefined, {
@@ -151,6 +151,9 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
             addToast("error", t("welcome.toast.failedOpen", { error: msg }));
           }
         }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        addToast("error", t("welcome.toast.failedOpen", { error: msg }));
       } finally {
         openProjectInFlight = false;
       }

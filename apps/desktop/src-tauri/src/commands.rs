@@ -220,7 +220,11 @@ pub async fn open_project_db(
 
 #[tauri::command]
 pub fn get_formats(state: State<AppStateWrapper>) -> Vec<PluginInfo> {
-    state.0.format_registry.list()
+    format_list(&state.0)
+}
+
+fn format_list(state: &Arc<AppState>) -> Vec<PluginInfo> {
+    state.format_registry.list()
 }
 
 #[tauri::command]
@@ -910,6 +914,100 @@ async fn apply_add_glossary_entry(s: &AppState, entry: &GlossaryEntry) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn godot_get_formats_transport_parity() {
+        let state = locust_server::create_test_state();
+        let list = super::format_list(&state);
+        let godot = list
+            .iter()
+            .find(|format| format.id == "godot-dialogic")
+            .unwrap();
+        assert_eq!(godot.extensions, ["pck"]);
+        assert_eq!(
+            godot.supported_modes,
+            [locust_core::models::OutputMode::Replace]
+        );
+        assert_eq!(
+            godot.stability,
+            locust_core::extraction::FormatStability::Experimental
+        );
+    }
+
+    #[tokio::test]
+    async fn godot_native_open_saved_file_and_inject_transport_parity() {
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let game = shared.join("game.pck");
+        let mut header = vec![0; 100];
+        header[..4].copy_from_slice(b"GDPC");
+        header[4..8].copy_from_slice(&2u32.to_le_bytes());
+        header[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let mut source = Cursor::new(header);
+        let index = locust_formats::godot_pck::read_index(&mut source).unwrap();
+        let mut original = Vec::new();
+        locust_formats::godot_pck::rebuild(
+            &mut source,
+            &index,
+            &[],
+            &[("res://main.dtl", b"Hello\n")],
+            &mut original,
+        )
+        .unwrap();
+        std::fs::write(&game, &original).unwrap();
+        std::fs::write(shared.join("index.html"), "<p>Foreign game</p>").unwrap();
+        let state = locust_server::create_test_state();
+        let selected = game.to_string_lossy().into_owned();
+        let opened = super::apply_open_project(&state, selected.clone(), None, false)
+            .await
+            .unwrap();
+        assert_eq!(opened.format_id, "godot-dialogic");
+        assert_eq!(opened.supported_modes, [OutputMode::Replace]);
+        assert!(locust_core::database::paths_identical(
+            Path::new(&opened.project_path),
+            &game
+        ));
+        let saved = super::apply_open_project_db(
+            &state,
+            opened.database_path,
+            selected.clone(),
+            "godot-dialogic".into(),
+        )
+        .await
+        .unwrap();
+        assert!(locust_core::database::paths_identical(
+            Path::new(&saved.project_path),
+            &game
+        ));
+        let mut rows = state.db.get_entries(&Default::default()).unwrap();
+        rows[0].translation = Some("Hola, una traduccion mas larga".into());
+        rows[0].status = StringStatus::Approved;
+        state.db.save_entries(&rows).unwrap();
+        for direct in [false, true] {
+            let params = serde_json::from_value(serde_json::json!({
+                "project_path": selected, "format_id": "godot-dialogic",
+                "languages": ["es"], "direct": direct, "mode": "replace",
+                "output_dir": temp.path().join("copies")
+            }))
+            .unwrap();
+            let report = super::apply_run_inject(params, &state).await.unwrap();
+            assert_eq!(report["languages_processed"], serde_json::json!(["es"]));
+            let recorded = state.db.get_injection(Some("es")).unwrap().unwrap();
+            assert_eq!(recorded.files.len(), 1);
+            assert_eq!(recorded.files[0].rel, "game.pck");
+            if direct {
+                assert!(locust_core::database::paths_identical(
+                    &recorded.root,
+                    &shared
+                ));
+            } else {
+                assert_eq!(std::fs::read(&game).unwrap(), original);
+                assert!(!recorded.root.join("index.html").exists());
+            }
+        }
+    }
+
     struct CapacitySentinel;
 
     impl locust_core::extraction::FormatPlugin for CapacitySentinel {

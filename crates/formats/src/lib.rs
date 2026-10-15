@@ -37,6 +37,9 @@ use locust_core::extraction::FormatRegistry;
 
 pub fn default_registry() -> FormatRegistry {
     let mut r = FormatRegistry::new();
+    // File-only positive detection must precede plugins that inspect a selected
+    // file's parent. Existing formats keep their relative first-match order.
+    r.register(Box::new(godot_dialogic::GodotDialogicPlugin::new()));
     r.register(Box::new(rpgmaker_mv::RpgMakerMvPlugin::new()));
     r.register(Box::new(rpgmaker_vxa::RpgMakerVxaPlugin::new()));
     r.register(Box::new(renpy::RenPyPlugin::new()));

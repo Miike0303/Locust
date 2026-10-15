@@ -512,3 +512,113 @@ async fn cli_extract_dry_run_partial_preserves_missing_rows() {
     );
     assert_eq!(summary_count(&real, "Removed"), 0);
 }
+
+#[test]
+fn cli_formats_lists_godot_experimental_replace() {
+    let output = locust().arg("formats").assert().success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("godot-dialogic"))
+        .unwrap();
+    assert!(
+        line.contains("experimental") && line.contains("Replace"),
+        "{line}"
+    );
+    assert!(!line.contains("Add"), "{line}");
+}
+
+#[tokio::test]
+async fn cli_godot_extract_replace_direct_and_pack_keep_file_scope() {
+    use locust_formats::godot_pck;
+    use std::io::{Cursor, Read};
+    let temp = tempfile::tempdir().unwrap();
+    let shared = temp.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    let game = shared.join("game.pck");
+    let mut header = vec![0; 100];
+    header[..4].copy_from_slice(b"GDPC");
+    header[4..8].copy_from_slice(&2u32.to_le_bytes());
+    header[8..12].copy_from_slice(&4u32.to_le_bytes());
+    let mut source = Cursor::new(header);
+    let index = godot_pck::read_index(&mut source).unwrap();
+    let mut original = Vec::new();
+    godot_pck::rebuild(
+        &mut source,
+        &index,
+        &[],
+        &[("res://main.dtl", b"Hello\n"), ("res://raw.bin", &[0, 255])],
+        &mut original,
+    )
+    .unwrap();
+    fs::write(&game, &original).unwrap();
+    fs::write(shared.join("index.html"), b"<p>Foreign game</p>").unwrap();
+    let project = temp.path().join("project.locust.db");
+    extract(&game, &project);
+    let db = Database::open(&project).unwrap();
+    let rows = db.get_entries(&EntryFilter::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    approve(&db, &rows[0].id, "Hola, un saludo mucho mas largo").await;
+    drop(db);
+    let backup_root = temp.path().join("backups");
+    for direct in [false, true] {
+        let mut command = locust();
+        command
+            .env("LOCUST_BACKUP_ROOT", &backup_root)
+            .arg("inject")
+            .arg(&game)
+            .arg("-P")
+            .arg(&project)
+            .args(["-l", "es", "--json"]);
+        if direct {
+            command.arg("--direct");
+        } else {
+            command
+                .args(["-m", "replace", "-o"])
+                .arg(temp.path().join("copies"));
+        }
+        command.assert().success();
+        let db = Database::open(&project).unwrap();
+        let recording = db.get_injection(Some("es")).unwrap().unwrap();
+        assert_eq!(recording.files.len(), 1);
+        assert_eq!(recording.files[0].rel, "game.pck");
+        if !direct {
+            assert_eq!(fs::read(&game).unwrap(), original);
+            assert!(!recording.root.join("index.html").exists());
+        } else {
+            assert!(locust_core::database::paths_identical(
+                &recording.root,
+                &shared
+            ));
+        }
+        let zip_path = temp
+            .path()
+            .join(if direct { "direct.zip" } else { "replace.zip" });
+        drop(db);
+        locust()
+            .env("LOCUST_BACKUP_ROOT", &backup_root)
+            .arg("patch")
+            .arg(&recording.root)
+            .arg("-P")
+            .arg(&project)
+            .args(["-l", "es", "--no-detect-id", "-o"])
+            .arg(&zip_path)
+            .assert()
+            .success();
+        let mut zip = zip::ZipArchive::new(fs::File::open(zip_path).unwrap()).unwrap();
+        let mut manifest = String::new();
+        zip.by_name("locust-patch.json")
+            .unwrap()
+            .read_to_string(&mut manifest)
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        assert!(
+            manifest["files"][0]["original_sha256"].is_string(),
+            "{manifest}"
+        );
+    }
+    assert_eq!(
+        fs::read(shared.join("index.html")).unwrap(),
+        b"<p>Foreign game</p>"
+    );
+}

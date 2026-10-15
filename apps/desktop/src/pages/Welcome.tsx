@@ -1,4 +1,3 @@
-import { IS_TAURI } from "../lib/runtime";
 import { useState, useEffect } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -43,6 +42,8 @@ import {
 	isDetectionFailure,
 	openDbCanConfirm,
 	pickGameFolder,
+	pickGameSource,
+	pickGameFile,
 	pickLocustDbFile,
 	runOpenAction,
 	shouldOpenProjectDb,
@@ -301,9 +302,9 @@ export default function Welcome() {
 			await openWithPath(picker.path, formatId);
 			return;
 		}
-		// Manual mode: format chosen first, now pick the game folder.
+		// Manual mode keeps file-source selections as files.
 		await runOpenAction(async () => {
-			const path = await pickFolderPath();
+			const path = await pickGameSource(t, formats, formatId);
 			if (path) await openWithPath(path, formatId);
 		}, reportDialogFailure);
 	};
@@ -315,7 +316,7 @@ export default function Welcome() {
 			addToast("info", t("welcome.toast.needLocustDb"));
 			return;
 		}
-		const gamePath = await pickFolderPath();
+		const gamePath = await pickGameSource(t, formats);
 		if (!gamePath) {
 			addToast("info", t("welcome.toast.cancelledOpenDb"));
 			return;
@@ -332,31 +333,7 @@ export default function Welcome() {
 	};
 
 	const handleOpenFile = () => runOpenAction(async () => {
-		let path: string | null = null;
-		if (IS_TAURI) {
-			const { open } = await import("@tauri-apps/plugin-dialog");
-			const selected = await open({
-				title: t("welcome.dialog.selectFile"),
-				filters: [
-					{
-						name: t("welcome.dialog.gameFiles"),
-						extensions: [
-							"exe",
-							"html",
-							"htm",
-							"rpy",
-							"rpa",
-							"rpgproject",
-							"rvproj2",
-						],
-					},
-					{ name: t("welcome.dialog.allFiles"), extensions: ["*"] },
-				],
-			});
-			if (typeof selected === "string") path = selected;
-		} else {
-			path = prompt(t("welcome.prompt.filePath"));
-		}
+		const path = await pickGameFile(t, formats);
 		if (path) await openWithPath(path);
 	}, reportDialogFailure);
 
@@ -690,7 +667,7 @@ export default function Welcome() {
 									? t("welcome.format.openDbConfirm")
 									: picker?.path
 										? t("welcome.format.openProject")
-										: t("welcome.format.chooseFolder")}
+										: t("welcome.format.chooseSource")}
 						</button>
 					</div>
 				</div>

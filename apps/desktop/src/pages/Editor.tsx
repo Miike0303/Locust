@@ -1,3 +1,4 @@
+import { formatSourceKind } from "../lib/gameSource";
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -615,6 +616,7 @@ export default function Editor() {
 					setPatchBackupId(undefined);
 				}}
 				defaultGamePath={fontPatchSelection?.gamePath ?? project?.path}
+				defaultGamePathIsFile={!fontPatchSelection && formatSourceKind(project?.format_id) === "file"}
 				initialZipPath={fontPatchSelection?.path}
 				initialBackupId={patchBackupId}
 				initialTab={patchInitialTab}

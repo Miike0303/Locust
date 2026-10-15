@@ -4,6 +4,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
+import { gameFileExtensions } from "../lib/gameSource.ts";
 import Welcome from "./Welcome.tsx";
 import { setLocale, t, type TranslateKey } from "../lib/i18n/index.ts";
 import type { AppConfig, PluginInfo, ProviderInfo } from "../lib/api.ts";
@@ -19,6 +20,7 @@ after(() => {
 });
 
 const formats: PluginInfo[] = [
+  { id: "godot-dialogic", name: "Godot / Dialogic", description: "Backend-only Godot description", extensions: ["pck"], supported_modes: ["replace"], stability: "experimental" },
   { id: "rpgmaker-mv", name: "RPG Maker MV/MZ", description: "Backend-only description",
     extensions: [".json"], supported_modes: ["add", "replace"], stability: "stable" },
   { id: "unity", name: "Unity", description: "Backend-only Unity description",
@@ -91,7 +93,7 @@ for (const locale of ["en", "es"] as const) {
       assert.equal(html.includes(`aria-label="${t("welcome.providerHintDismiss")}"`), showHint);
       assert.equal(hasText(html, t("welcome.recent")), scenario === "recent");
       assert.equal(hasText(html, t("welcome.availableFormats")), scenario !== "loading");
-      assert.ok(hasText(html, t("welcome.formatsAvailable", { count: scenario === "loading" ? 0 : 3 })));
+      assert.ok(hasText(html, t("welcome.formatsAvailable", { count: scenario === "loading" ? 0 : 4 })));
       assert.ok(hasText(html, t("welcome.recentCount", { count: scenario === "recent" ? 2 : 0 })));
       if (scenario === "recent") {
         for (const text of ["Demo Game", "Saved Project", "/projects/Saved.locust.db", t("welcome.recentDbBadge"),
@@ -100,7 +102,7 @@ for (const locale of ["en", "es"] as const) {
         }
       }
       if (scenario !== "loading") {
-        for (const text of ["RPG Maker MV/MZ", "Unity", "Unknown engine", "Unknown format fallback",
+        for (const text of ["Godot / Dialogic", t("format.desc.godot-dialogic"), "RPG Maker MV/MZ", "Unity", "Unknown engine", "Unknown format fallback",
           t("format.desc.rpgmaker-mv"), t("welcome.format.experimental"), ".json", ".assets", ".custom"]) {
           assert.ok(hasText(html, text), `retained format content: ${text}`);
         }
@@ -121,3 +123,11 @@ for (const locale of ["en", "es"] as const) {
     });
   }
 }
+
+
+test("Welcome and Queue's shared native file filter includes registered PCKs and existing shortcuts", () => {
+  const extensions = gameFileExtensions(formats);
+  for (const extension of ["pck", "exe", "rpgproject", "rvproj2", "json", "assets", "bundle"]) assert.ok(extensions.includes(extension));
+  assert.ok(!extensions.includes("hidden") && !extensions.includes(".json"));
+  assert.equal(new Set(extensions).size, extensions.length);
+});

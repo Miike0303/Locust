@@ -1,5 +1,10 @@
 /** English UI catalog. Keys are dotted namespaces. Keep in sync with es.ts. */
 export const en = {
+  "welcome.source.title": "Choose game source",
+  "welcome.source.hint": "Choose a folder or an individual game file. Godot/Dialogic requires a standalone .pck file.",
+  "welcome.format.chooseSource": "Choose Game Source…",
+  "format.desc.godot-dialogic": "Godot 4 standalone .pck with Dialogic timelines (experimental). Replace creates an archive-only copy, not a runnable game folder.",
+  "inject.archiveOnly": "Replace creates an archive-only copy of the selected PCK. It does not include a runnable game or launcher.",
   "common.providerDefault": "Provider default",
   "activity.translation.startingDefault": "Starting translation with chain: {chain}, source: {source}, target: {target}, batch: default",
   // Activity-log messages. Raw detail and source remain diagnostic data.
@@ -238,8 +243,8 @@ export const en = {
   "welcome.providerHintDismiss": "Dismiss provider setup hint",
   "welcome.format.title": "Select Format",
   "welcome.format.detectFailed": "Couldn't detect the game engine automatically — pick one:",
-  "welcome.format.manualHint": "Choose the game engine format first, then pick the game folder.",
-  "welcome.format.openDbHint": "This opens the database as-is (no re-extract). Pick the engine that matches the game folder.",
+  "welcome.format.manualHint": "Choose the game engine format first, then select its game folder or source file.",
+  "welcome.format.openDbHint": "This opens the database as-is (no re-extract). Pick the engine that matches the selected game folder or file.",
   "welcome.format.auto": "Auto-detect",
   "welcome.format.autoHint": "Let Locust detect the format automatically",
   "format.desc.renpy": "Ren'Py visual novels (.rpy scripts)",
@@ -817,7 +822,7 @@ export const en = {
   "inject.recordingNothing": "{lang}: nothing was recorded — packing a patch will refuse until an inject writes files.",
   "inject.recordingKept": "{lang}: kept the previous recording from {at} (this run wrote no files).",
   "inject.recordingSaved": "Recording saved",
-  "inject.recordingHint": "You can now pack a patch zip from this recording (Patch modal → Pack tab). Point the game folder at this project path for direct inject.",
+  "inject.recordingHint": "You can now pack a patch zip from this recording (Patch modal → Pack tab). Pack uses the recorded output folder: the translated copy for Replace, or the original game location for Direct.",
   "inject.openPack": "Open Patch → Pack",
   "inject.failedLanguages": "Failed languages:",
   "inject.registerInUi": "Register language in game UI",

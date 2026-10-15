@@ -391,3 +391,15 @@ test("Add injection still skips automatic registration when no translations were
   await inject("add");
   assert.equal(registerCalls().length, 0);
 });
+
+
+for (const locale of ["en", "es"] as const) test(`${locale} Godot defaults to Replace, offers Direct, omits Add and explains archive-only copy`, () => {
+  reset(locale, "add");
+  replaceOnly("godot-dialogic");
+  h.project.path = "/shared/game.pck";
+  h.values = [];
+  assert.equal(modeSelect().props.value, "replace");
+  const options = nodes(modeSelect()).filter(node => node.type === "option").map(node => node.props.value);
+  assert.deepEqual(options, ["replace", "direct"]);
+  assert.ok(text(render()).includes(t("inject.archiveOnly")));
+});

@@ -1995,9 +1995,15 @@ async fn patch_pack(
     let pristine_backup_id = req.pristine_backup_id;
     let backups = state.backup_manager.clone();
     let require_pristine = req.pristine;
-    let engine = locust_formats::default_registry()
-        .detect(&game_root)
-        .map(|p| p.id().to_string());
+    // The recorded output may be a directory containing only a file-source
+    // format, or a shared parent containing unrelated engines. The open project
+    // already knows the format; detecting that parent would mislabel the ZIP.
+    let engine = state
+        .current_project
+        .read()
+        .await
+        .as_ref()
+        .map(|p| p.format_id.clone());
 
     let db = state.db.clone();
     let db_path_for_errors = db.path();
@@ -2084,6 +2090,8 @@ struct PatchRecordingsResponse {
     languages: Vec<Option<String>>,
     /// Provenance is recorded; the payload is verified again when packing.
     pristine_languages: Vec<Option<String>>,
+    /// Actual output roots, keyed by language (empty key for unspecified).
+    roots: std::collections::HashMap<String, PathBuf>,
 }
 
 async fn patch_recordings(
@@ -2095,6 +2103,7 @@ async fn patch_recordings(
         return Ok(Json(PatchRecordingsResponse {
             languages: vec![],
             pristine_languages: vec![],
+            roots: std::collections::HashMap::new(),
         }));
     }
     let languages = state
@@ -2102,19 +2111,23 @@ async fn patch_recordings(
         .list_recorded_langs()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let mut pristine_languages = Vec::new();
+    let mut roots = std::collections::HashMap::new();
     for language in &languages {
-        if state
+        if let Some(record) = state
             .db
             .get_injection(language.as_deref())
             .map_err(map_patch_err)?
-            .is_some_and(|record| record.pristine_backup.is_some())
         {
-            pristine_languages.push(language.clone());
+            roots.insert(language.clone().unwrap_or_default(), record.root);
+            if record.pristine_backup.is_some() {
+                pristine_languages.push(language.clone());
+            }
         }
     }
     Ok(Json(PatchRecordingsResponse {
         languages,
         pristine_languages,
+        roots,
     }))
 }
 

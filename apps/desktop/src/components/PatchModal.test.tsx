@@ -11,6 +11,17 @@ const h = {
   t, a11y, values: [] as unknown[], cursor: 0,
   toasts: [] as unknown[][], logs: [] as unknown[][],
   changed: 0,
+  runEffects: false, effectCursor: 0, effectDeps: [] as unknown[][], effects: [] as (() => void)[],
+  pickerCalls: [] as any[], selectedDirectory: null as string | null,
+  effect(fn: () => void, deps: unknown[]) {
+    if (!this.runEffects) return;
+    const index = this.effectCursor++;
+    const previous = this.effectDeps[index];
+    if (!previous || deps.some((dep, i) => !Object.is(dep, previous[i]))) {
+      this.effectDeps[index] = deps;
+      this.effects.push(fn);
+    }
+  },
   jobHandlers: null as null | { onDone(event: any): void; onError(error: Error): void },
   state(initial: unknown) {
     const index = this.cursor++;
@@ -28,9 +39,10 @@ const h = {
 (globalThis as any).__patchModal = h;
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
+    if (specifier === "@tauri-apps/plugin-dialog") return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent("export async function open(options) { const h=globalThis.__patchModal; h.pickerCalls.push(options); return h.selectedDirectory; }")}` };
     if (context.parentURL?.endsWith("/components/PatchModal.tsx")) {
       const stubs: Record<string, string> = {
-        react: `const h=globalThis.__patchModal;export const useState=initial=>h.state(initial);export const useRef=initial=>h.ref(initial);export const useEffect=()=>{};`,
+        react: `const h=globalThis.__patchModal;export const useState=initial=>h.state(initial);export const useRef=initial=>h.ref(initial);export const useEffect=(fn,deps)=>h.effect(fn,deps);`,
         "../lib/i18n": `export const useT=()=>globalThis.__patchModal.t;`,
         "../stores/toastStore": `export const addToast=(...args)=>globalThis.__patchModal.toasts.push(args);`,
         "../stores/logStore": `export const addLog=(...args)=>globalThis.__patchModal.logs.push(args);`,
@@ -50,6 +62,7 @@ let failed = false;
 let deferred: (() => void) | null = null;
 let deferRollback = false;
 let status = "interrupted";
+let recordedRoot = "/copies/game.pck-es";
 let report = {
   restored: 2, deleted: 1, baseline: "Pristine", dry_run: true,
   messages: ["preview <message>"], aborted_edited: ["data/user<edit>.txt"], torn_deleted: [] as string[],
@@ -58,6 +71,7 @@ const originalFetch = globalThis.fetch;
 const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
 Object.defineProperty(globalThis, "window", { configurable: true, value: {
   __TAURI_INTERNALS__: { invoke: async (command: string) => {
+    if (command === "get_config") return { default_target_lang: "es" };
     assert.equal(command, "get_server_port");
     return 7842;
   } },
@@ -70,6 +84,9 @@ globalThis.fetch = async (url, init) => {
     if (deferRollback) await new Promise<void>(resolve => { deferred = resolve; });
     return new Response(failed ? "cannot preview rollback" : JSON.stringify({ ...report, dry_run: body.dry_run ?? false }), { status: failed ? 500 : 200 });
   }
+  if (path.endsWith("/patch/recordings")) return new Response(JSON.stringify({ languages: ["es"], pristine_languages: ["es"], roots: { es: recordedRoot } }));
+  if (path.endsWith("/config")) return new Response(JSON.stringify({ default_target_lang: "es" }));
+  if (path.endsWith("/patch/pack")) return new Response(JSON.stringify({ patch_id: "godot", patch_version: "1", files_packed: 1, size_bytes: 200, tier: "Strict" }));
   if (path.endsWith("/patch/apply")) return new Response(JSON.stringify({ job_id: "test-job" }));
   if (path.endsWith("/patch/verify")) return new Response(JSON.stringify({
     outcome: "Clean", tier: "Strict", replaced: ["data/original.txt"], added: [], conflicts: [],
@@ -96,10 +113,11 @@ function text(node: any): string {
   if (Array.isArray(node)) return node.map(text).join("");
   return node && typeof node === "object" ? text(node.props?.children) : "";
 }
+let renderOptions: Partial<Parameters<typeof PatchModal>[0]> = {};
 function render() {
-  h.cursor = 0;
+  h.cursor = 0; h.effectCursor = 0;
   return PatchModal({ open: true, onClose() {}, defaultGamePath: " /game ", allowPack: false,
-    onPatchStateChanged() { h.changed++; } });
+    onPatchStateChanged() { h.changed++; }, ...renderOptions });
 }
 function button(label: string, index = 0) {
   const found = nodes(render()).filter(node => node.type === "button" && text(node).trim() === label)[index];
@@ -246,4 +264,64 @@ for (const recovery of [false, true]) test(`${recovery ? "recovery" : "regular"}
   assert.equal(h.changed, 1);
   assert.ok(h.toasts.some(toast => toast[0] === "success" && toast[1] === t("patch.toast.rollback", { restored: 2, deleted: 1 })));
   assert.ok(!renderToStaticMarkup(render()).includes("verification retained"));
+});
+
+
+async function flushEffects() {
+  for (let i = 0; i < 8; i++) {
+    render();
+    h.effects.splice(0).forEach(effect => effect());
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+}
+
+for (const root of ["/copies/game.pck-es", "/shared"]) test(`Godot pack uses recorded ${root} root; apply requires an explicit directory and preserves cancellation`, async () => {
+  recordedRoot = root;
+  reset("en");
+  h.values = []; h.runEffects = true; h.effectDeps = [];
+  renderOptions = { defaultGamePath: "/shared/game.pck", defaultGamePathIsFile: true, initialTab: "pack", initialBackupId: "original", allowPack: true };
+  try {
+    await flushEffects();
+    assert.ok(nodes(render()).some(node => node.type === "input" && node.props.value === root));
+    const pristine = nodes(render()).find(node => node.type === "input" && node.props.type === "checkbox" && node.props.checked === true);
+    assert.ok(pristine, "incoming backup enables pristine hashes");
+    const output = nodes(render()).find(node => node.type === "input" && node.props.placeholder === t("patch.outputPlaceholder"));
+    output.props.onChange({ target: { value: "/patch.zip" } });
+    await button(t("patch.packBtn"), 1).props.onClick();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.ok(calls.some(call => call.url.endsWith("/patch/pack")), JSON.stringify(h.toasts));
+    let request = [...calls].reverse().find(call => call.url.endsWith("/patch/pack"))!.body;
+    assert.equal(request.game_path, root);
+    assert.equal(request.pristine, true);
+    const pristineFolder = nodes(render()).find(node => node.type === "input" && node.props.placeholder === t("patch.pristinePathPlaceholder"));
+    pristineFolder.props.onChange({ target: { value: "/clean" } });
+    pristine.props.onChange({ target: { checked: false } });
+    await button(t("patch.packBtn"), 1).props.onClick();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    request = [...calls].reverse().find(call => call.url.endsWith("/patch/pack"))!.body;
+    assert.equal(request.pristine, false);
+    assert.ok(!("pristine_path" in request) && !("pristine_backup_id" in request));
+    pristine.props.onChange({ target: { checked: true } });
+    await button(t("patch.packBtn"), 1).props.onClick();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    request = [...calls].reverse().find(call => call.url.endsWith("/patch/pack"))!.body;
+    assert.equal(request.pristine_path, "/clean");
+    assert.ok(!("pristine_backup_id" in request));
+    await button(t("patch.apply")).props.onClick();
+    const input = () => nodes(render()).find(node => node.type === "input" && node.props.placeholder === t("patch.placeholder.game"));
+    assert.equal(input().props.value, "");
+    assert.equal(button(t("patch.verify")).props.disabled, true);
+    const browse = () => nodes(render()).find(node => node.type === "button" && node.props.title === t("common.browse"));
+    h.selectedDirectory = null;
+    await browse().props.onClick();
+    assert.equal(input().props.value, "");
+    h.selectedDirectory = "/explicit-target";
+    await browse().props.onClick();
+    assert.equal(input().props.value, "/explicit-target");
+    assert.ok(h.pickerCalls.every(options => options.directory === true));
+    await button(t("patch.pack")).props.onClick();
+    assert.ok(nodes(render()).some(node => node.type === "input" && node.props.value === root));
+  } finally {
+    h.runEffects = false; h.effects = []; renderOptions = {};
+  }
 });

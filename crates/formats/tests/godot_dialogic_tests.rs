@@ -105,7 +105,7 @@ fn godot_dialogic_detection_and_source_matrix() {
     assert!(plugin.validate_source(&path).is_err());
     assert!(locust_formats::default_registry()
         .get("godot-dialogic")
-        .is_none());
+        .is_some());
 }
 
 #[test]

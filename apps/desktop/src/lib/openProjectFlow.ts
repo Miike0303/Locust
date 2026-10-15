@@ -3,6 +3,8 @@ import type { QueryClient } from "@tanstack/react-query";
 import type { ProjectInfo, ProjectOpenPreflight, ProjectOpenResponse } from "./api";
 import { t } from "./i18n";
 import type { TranslateFn } from "./i18n";
+import { formatSourceKind, gameFileExtensions, requestGameSourceChoice } from "./gameSource";
+import type { PluginInfo } from "./api";
 
 /** Backend detection failure (Tauri: "Could not detect game format"; HTTP 422: "format not detected"). */
 export function isDetectionFailure(msg: string): boolean {
@@ -84,6 +86,29 @@ export async function pickGameFolder(t: TranslateFn): Promise<string | null> {
     return typeof selected === "string" ? selected : null;
   }
   return prompt(t("welcome.prompt.folderPath"));
+}
+
+/** Explicit source selection; a selected archive is passed through unchanged. */
+export async function pickGameSource(t: TranslateFn, formats?: PluginInfo[], formatId?: string): Promise<string | null> {
+  const kind = formatSourceKind(formatId) ?? await requestGameSourceChoice();
+  if (!kind) return null;
+  if (kind === "directory") return pickGameFolder(t);
+  return pickGameFile(t, formats);
+}
+
+export async function pickGameFile(t: TranslateFn, formats?: PluginInfo[]): Promise<string | null> {
+  if (!isTauri()) return prompt(t("welcome.prompt.filePath"));
+  const registered = formats ?? await (await import("./api")).getFormats();
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    title: t("welcome.dialog.selectFile"),
+    directory: false,
+    filters: [
+      { name: t("welcome.dialog.gameFiles"), extensions: gameFileExtensions(registered) },
+      { name: t("welcome.dialog.allFiles"), extensions: ["*"] },
+    ],
+  });
+  return typeof selected === "string" ? selected : null;
 }
 
 /**

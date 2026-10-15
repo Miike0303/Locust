@@ -40,3 +40,10 @@ test("unknown, empty and unrecognized modes preserve the legacy non-Direct defau
     assert.equal(coerceInjectMode("direct", supported), "direct");
   }
 });
+
+
+test("Godot/Dialogic's advertised replace capability selects Replace and Direct without Add", () => {
+  const godot = { id: "godot-dialogic", supported_modes: ["replace"] as OutputMode[] };
+  assert.equal(defaultInjectMode(godot.supported_modes), "replace");
+  assert.deepEqual(availableInjectModes(godot.supported_modes), ["replace", "direct"]);
+});
