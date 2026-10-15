@@ -43,6 +43,38 @@ for (const locale of ["en", "es"] as const) {
 	});
 }
 
+const capacityError = (count: string) =>
+	`injection error: ${count} translation(s) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues`;
+for (const locale of ["en", "es"] as const) {
+	test(`known capacity refusal maps only the exact count-only diagnostic in ${locale}`, () => {
+		setLocale(locale);
+		for (const count of ["1", "27", "9007199254740993"]) {
+			const expected = locale === "en"
+				? `${count} translation(s) exceed known binary slot capacity. The translated copy was refused before backup or output creation. Run Validate and resolve the capacity issues.`
+				: `${count} traducción(es) superan la capacidad conocida de los espacios binarios. Se rechazó la copia traducida antes de crear copias de seguridad o archivos de salida. Ejecute Validar y resuelva los problemas de capacidad.`;
+			for (const frame of ["", "422: "]) {
+				assert.equal(localizeApiError(frame + capacityError(count)), expected);
+				assert.equal(new ApiError(frame + capacityError(count)).message, expected);
+			}
+		}
+	});
+
+	test(`capacity near-misses and prose-bearing errors retain existing fallback in ${locale}`, () => {
+		setLocale(locale);
+		const raw = capacityError("2");
+		for (const body of [
+			...["0", "02", "-2", "+2", "2.5", "N", "private source / translated prose"].map(capacityError),
+			`prefix: ${raw}`, raw.replace("Replace", "Add"), raw.replace("known binary", "binary"),
+			`${raw}; source: private source; translation: private translation`,
+			...['\n', '\r\n', '\u2028', '\u2029'].flatMap(line => [raw + line, raw + line + "opaque", line + raw]),
+		]) {
+			assert.equal(localizeApiError(body), body.trim());
+			assert.equal(localizeApiError(`422: ${body}`),
+				`${locale === "en" ? "Server error" : "Error del servidor"} 422: ${body.trim()}`);
+		}
+	});
+}
+
 // parseApiError
 assert.deepEqual(parseApiError("409: hello"), { status: 409, body: "hello" });
 assert.deepEqual(parseApiError("no project open"), {

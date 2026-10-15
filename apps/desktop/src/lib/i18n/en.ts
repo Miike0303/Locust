@@ -761,6 +761,7 @@ export const en = {
   "inject.mode.add": "Add — create translation folders inside original game",
   "inject.mode.direct": "Direct — write into the game folder (backup created first)",
   "inject.hint.replace": "Copies the game to a new folder with translations applied — your original stays untouched. Creates: [output]/{gameName}-[lang]/",
+  "inject.hint.binarySlotFit": "Known binary slot limits are checked before backup or copy creation. This does not guarantee a complete translation.",
   "inject.hint.add": "Adds the translation as an extra language the game can switch to (a tl/[lang]/ folder inside the game)",
   "inject.hint.direct": "Changes the selected game folder in place (a backup is created first). Create a translated copy to keep it unchanged. A recorded translated copy can also be packed as a patch.",
   "inject.hint.noAdd": "This format has no Add language packs. Use Replace for a translated copy, or explicitly choose Direct to modify the original.",
@@ -830,7 +831,7 @@ export const en = {
   "inject.toast.registerFailed": "Could not register the language in the game's UI: {error}",
   "inject.toast.selectOutput": "Select an output folder for Replace mode",
   "inject.toast.selectLang": "Select at least one language",
-  "inject.toast.binarySlots": "{count} translation(s) exceed binary inject slots and will be skipped — shorten them or re-run Validate",
+  "inject.toast.binarySlots": "{count} translation(s) exceed binary inject slots — resolve capacity issues before injection",
   "inject.toast.direct": "Direct inject: {count} string(s) written",
   "inject.toast.injected": "Injected {count} language(s)",
   "inject.toast.nothingWritten": "Inject finished but wrote no translations — check languages, filters, and the activity log",
@@ -1186,6 +1187,8 @@ export const en = {
     "Backup {id} is damaged and cannot be restored. It is listed in Settings → Data.",
   "api.error.exportDestinationProtected":
     "The chosen export file is the project database or one of its companion files. Choose a different file name.",
+  "api.error.binarySlotCapacity":
+    "{count} translation(s) exceed known binary slot capacity. The translated copy was refused before backup or output creation. Run Validate and resolve the capacity issues.",
   "api.error.directFormatIncompatible":
     "The saved Direct project format is incompatible. Locust cannot resume this project with the selected format.",
   "api.error.patchAlreadyApplied":

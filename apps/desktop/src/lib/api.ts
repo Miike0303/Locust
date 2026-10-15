@@ -236,6 +236,8 @@ export interface InjectParams {
   output_dir?: string;
   /** In-place inject + injection recording for Patch → Pack (CLI `--direct`). */
   direct?: boolean;
+  /** Replace copies only: refuse known binary-slot overflows before backup/output. */
+  require_binary_slot_fit?: boolean;
 }
 
 /** Serde externally-tagged core::extraction::RecordOutcome. */

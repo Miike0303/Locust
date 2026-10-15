@@ -286,6 +286,7 @@ export default function InjectModal({
 				languages: selectedLangs,
 				output_dir: isDirect ? undefined : outputDir.trim() || undefined,
 				direct: isDirect,
+				...(mode === "replace" ? { require_binary_slot_fit: true } : {}),
 			});
 			setResult(report);
 
@@ -424,8 +425,10 @@ export default function InjectModal({
 								)}
 							</select>
 							<p className="text-caption text-text-muted mt-1">
-								{mode === "replace" &&
-									t("inject.hint.replace", { gameName })}
+								{mode === "replace" && <>
+									{t("inject.hint.replace", { gameName })}
+									<span className="block mt-0.5">{t("inject.hint.binarySlotFit")}</span>
+								</>}
 								{mode === "add" && t("inject.hint.add")}
 								{mode === "direct" && t("inject.hint.direct")}
 								{!injectModes.includes("add") && (

@@ -741,6 +741,7 @@ export const es: Record<keyof typeof en, string> = {
   "inject.mode.add": "Añadir — crear carpetas de traducción dentro del juego original",
   "inject.mode.direct": "Directo — escribir en la carpeta del juego (se crea una copia de seguridad primero)",
   "inject.hint.replace": "Copia el juego a una carpeta nueva con las traducciones aplicadas — el original no se toca. Crea: [salida]/{gameName}-[lang]/",
+  "inject.hint.binarySlotFit": "Los límites conocidos de los espacios binarios se comprueban antes de crear la copia de seguridad o la copia traducida. Esto no garantiza una traducción completa.",
   "inject.hint.add": "Añade la traducción como un idioma extra al que el juego puede cambiar (una carpeta tl/[lang]/ dentro del juego)",
   "inject.hint.direct": "Modifica la carpeta del juego seleccionada (primero se crea una copia de seguridad). Crea una copia traducida para conservarla sin cambios. Una copia traducida con registro de inserción también se puede empaquetar como parche.",
   "inject.hint.noAdd": "Este formato no admite paquetes de idioma Añadir. Use Reemplazar para crear una copia traducida o elija Directo explícitamente para modificar el original.",
@@ -810,7 +811,7 @@ export const es: Record<keyof typeof en, string> = {
   "inject.toast.registerFailed": "No se pudo registrar el idioma en la interfaz del juego: {error}",
   "inject.toast.selectOutput": "Seleccione una carpeta de salida para el modo Reemplazar",
   "inject.toast.selectLang": "Seleccione al menos un idioma",
-  "inject.toast.binarySlots": "{count} traducción(es) superan los huecos binarios de inyección y se omitirán — acórtelas o vuelva a Validar",
+  "inject.toast.binarySlots": "{count} traducción(es) superan los huecos binarios de inyección — resuelva los problemas de capacidad antes de inyectar",
   "inject.toast.direct": "Inyección directa: {count} cadena(s) escritas",
   "inject.toast.injected": "Se inyectaron {count} idioma(s)",
   "inject.toast.nothingWritten": "La inyección terminó pero no escribió traducciones — revise idiomas, filtros y el registro de actividad",
@@ -1157,6 +1158,8 @@ export const es: Record<keyof typeof en, string> = {
     "La copia de seguridad {id} está dañada y no se puede restaurar. Figura en Ajustes → Datos.",
   "api.error.exportDestinationProtected":
     "El archivo elegido para exportar es la base de datos del proyecto o uno de sus archivos auxiliares. Elija otro nombre de archivo.",
+  "api.error.binarySlotCapacity":
+    "{count} traducción(es) superan la capacidad conocida de los espacios binarios. Se rechazó la copia traducida antes de crear copias de seguridad o archivos de salida. Ejecute Validar y resuelva los problemas de capacidad.",
   "api.error.directFormatIncompatible":
     "El formato del proyecto guardado con inyección directa es incompatible. Locust no puede reanudar este proyecto con el formato seleccionado.",
   "api.error.patchAlreadyApplied":

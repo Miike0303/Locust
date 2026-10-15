@@ -9,6 +9,7 @@ import * as a11y from "../lib/modalA11y.ts";
 // hook harness. Keep the API client real and capture its Tauri commands.
 const h = {
   t, a11y, values: [] as unknown[], cursor: 0,
+  setTauri: (_value: boolean) => {},
   effects: [] as (() => void)[], changed: false,
   toasts: [] as unknown[][], logs: [] as unknown[][],
   effect(callback: () => void, deps: unknown[]) {
@@ -32,6 +33,15 @@ const h = {
 };
 (globalThis as any).__injectModal = h;
 const hooks = registerHooks({
+  load(url, context, nextLoad) {
+    if (url.replace(/\\/g, "/").endsWith("/src/lib/runtime.ts")) {
+      return { format: "module", shortCircuit: true, source: `
+        export let IS_TAURI=true;
+        export const isTauri=()=>IS_TAURI;
+        globalThis.__injectModal.setTauri=value=>{IS_TAURI=value;};` };
+    }
+    return nextLoad(url, context);
+  },
   resolve(specifier, context, nextResolve) {
     if (context.parentURL?.endsWith("/components/InjectModal.tsx")) {
       const stubs: Record<string, string> = {
@@ -56,10 +66,14 @@ const storage = new Map<string, string>();
 const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
 const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 let stringsWritten = 3;
+let injectFailure: string | Error | undefined;
+const originalFetch = globalThis.fetch;
 Object.defineProperty(globalThis, "window", { configurable: true, value: {
   __TAURI_INTERNALS__: { invoke: async (command: string, args: any) => {
     calls.push({ command, params: args?.params });
     if (command === "run_validation") return { validation: { by_kind: {} } };
+    if (command === "get_server_port") return 7842;
+    if (command === "run_inject" && injectFailure !== undefined) throw injectFailure;
     if (command === "run_inject") return {
       mode: args.params.direct ? "direct" : args.params.mode,
       languages_processed: ["es"], languages_failed: [], backup_id: "backup",
@@ -79,8 +93,13 @@ Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
   removeItem: (key: string) => { storage.delete(key); },
 } });
 const { default: InjectModal } = await import("./InjectModal.tsx");
+// Resolve the base through the mocked native port before switching to HTTP in Node.
+globalThis.fetch = async () => new Response(null, { status: 404 });
+await (await import("../lib/api")).getCurrentProject();
+globalThis.fetch = originalFetch;
 after(() => {
   hooks.deregister();
+  globalThis.fetch = originalFetch;
   setLocale("en");
   if (windowDescriptor) Object.defineProperty(globalThis, "window", windowDescriptor);
   else Reflect.deleteProperty(globalThis, "window");
@@ -123,6 +142,9 @@ function selectMode(mode: "add" | "direct" | "replace") {
 }
 function reset(locale: "en" | "es", mode: "add" | "direct" | "replace", autoRegister = true) {
   storage.clear();
+  injectFailure = undefined;
+  globalThis.fetch = originalFetch;
+  h.setTauri(true);
   storage.set("locust.inject.autoRegister", autoRegister ? "1" : "0");
   h.values = []; h.toasts = []; h.logs = []; calls.length = 0; stringsWritten = 3;
   h.project = { path: "/game", name: "Game", format_id: "rpgmaker-mz", supported_modes: ["replace", "add"] };
@@ -202,7 +224,7 @@ for (const locale of ["en", "es"] as const) {
     await action.props.onClick();
     assert.deepEqual(calls.find(call => call.command === "run_inject")?.params, {
       project_path: "/game", format_id: "yuris", mode: "replace", languages: ["es"],
-      output_dir: "/output", direct: false,
+      output_dir: "/output", direct: false, require_binary_slot_fit: true,
     });
   });
 
@@ -211,6 +233,10 @@ for (const locale of ["en", "es"] as const) {
     replaceOnly();
     const originalHint = locale === "en" ? "your original stays untouched" : "el original no se toca";
     assert.ok(text(render()).includes(originalHint));
+    const capacityHint = locale === "en"
+      ? "Known binary slot limits are checked before backup or copy creation. This does not guarantee a complete translation."
+      : "Los límites conocidos de los espacios binarios se comprueban antes de crear la copia de seguridad o la copia traducida. Esto no garantiza una traducción completa.";
+    assert.ok(text(render()).includes(capacityHint));
     await inject("replace");
     const destination = locale === "en"
       ? "Translated copy (es): /returned/actual-copy-es"
@@ -221,10 +247,68 @@ for (const locale of ["en", "es"] as const) {
   });
 }
 
+for (const locale of ["en", "es"] as const) {
+  for (const shape of ["string", "Error", "HTTP"] as const) {
+    test(`${locale} capacity refusal (${shape}) shows count-only guidance, not success`, async () => {
+      reset(locale, "replace");
+      replaceOnly("unity");
+      const raw = "injection error: 2 translation(s) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues";
+      injectFailure = shape === "Error" ? new Error(raw) : raw;
+      if (shape === "HTTP") {
+        h.setTauri(false);
+        globalThis.fetch = async (url, init) => {
+          if (String(url).endsWith("/validate")) return new Response(JSON.stringify({ validation: { by_kind: {} } }));
+          assert.equal(String(url), "http://localhost:7842/api/inject");
+          calls.push({ command: "run_inject", params: JSON.parse(String(init?.body)) });
+          return new Response(raw, { status: 422 });
+        };
+      }
+      setOutput("/output");
+      await button(t("inject.copyAction")).props.onClick();
+      const expected = locale === "en"
+        ? "2 translation(s) exceed known binary slot capacity. The translated copy was refused before backup or output creation. Run Validate and resolve the capacity issues."
+        : "2 traducción(es) superan la capacidad conocida de los espacios binarios. Se rechazó la copia traducida antes de crear copias de seguridad o archivos de salida. Ejecute Validar y resuelva los problemas de capacidad.";
+      assert.deepEqual(h.toasts, [["error", t("inject.toast.failed", { error: expected })]]);
+      assert.ok(!text(render()).includes(t("inject.injectionComplete")));
+      assert.equal(calls.find(call => call.command === "run_inject")?.params.require_binary_slot_fit, true);
+      assert.ok(!JSON.stringify(h.toasts).includes("injection error:"));
+    });
+  }
+}
+
+// Exercise the real inject client at both mocked transport boundaries, including legacy callers.
+for (const tauri of [true, false]) {
+  test(`${tauri ? "Tauri" : "HTTP"} injection preserves the optional capacity flag and normal response`, async () => {
+    reset("en", "replace");
+    h.setTauri(tauri);
+    const { inject: sendInject } = await import("../lib/api");
+    const httpCalls: unknown[][] = [];
+    globalThis.fetch = async (url, init) => {
+      httpCalls.push([String(url), init?.method, JSON.parse(String(init?.body))]);
+      return new Response(JSON.stringify({ mode: "replace", languages_processed: ["es"], languages_failed: [], reports: {} }));
+    };
+    for (const flag of [undefined, false, true]) {
+      const params = {
+        project_path: "/game", format_id: "unity", mode: "replace" as const,
+        languages: ["es"], output_dir: "/output", direct: false,
+        ...(flag === undefined ? {} : { require_binary_slot_fit: flag }),
+      };
+      const result = await sendInject(params);
+      assert.equal(result.mode, "replace");
+      assert.deepEqual(result.languages_failed, []);
+      if (tauri) assert.deepEqual(calls[calls.length - 1], { command: "run_inject", params });
+      else assert.deepEqual(httpCalls[httpCalls.length - 1], ["http://localhost:7842/api/inject", "POST", params]);
+    }
+    h.setTauri(true);
+    globalThis.fetch = originalFetch;
+  });
+}
+
 test("Direct injection preserves the stored auto-register preference without calling register-lang", async () => {
   reset("en", "direct");
   await inject("direct");
   assert.equal(registerCalls().length, 0);
+  assert.notEqual(calls.find(call => call.command === "run_inject")?.params.require_binary_slot_fit, true);
   assert.equal(storage.get("locust.inject.autoRegister"), "1");
 });
 
@@ -232,6 +316,7 @@ test("Add injection with the stored preference registers the selected language e
   reset("en", "add");
   await inject("add");
   assert.deepEqual(registerCalls(), [{ command: "register_lang", params: { game_path: "/game", lang: "es", label: "Español" } }]);
+  assert.notEqual(calls.find(call => call.command === "run_inject")?.params.require_binary_slot_fit, true);
   assert.equal(storage.get("locust.inject.autoRegister"), "1");
 });
 

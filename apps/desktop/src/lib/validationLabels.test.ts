@@ -53,6 +53,16 @@ function spanTexts(node: any): string[] {
 }
 
 for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
+  test(`binary capacity warning reports validation without predicting skipped translations (${locale})`, () => {
+    for (const count of [1, 3]) {
+      const warning = translate(catalog, locale, "inject.toast.binarySlots", { count });
+      assert.doesNotMatch(warning, /will be skipped|se omitirán/);
+      assert.equal(warning, locale === "en"
+        ? `${count} translation(s) exceed binary inject slots — resolve capacity issues before injection`
+        : `${count} traducción(es) superan los huecos binarios de inyección — resuelva los problemas de capacidad antes de inyectar`);
+    }
+  });
+
   test(`all known validation badge kinds use catalog labels (${locale})`, async () => {
     const { validationBadgeLabel } = await import("./validationLabels.ts");
     const t = (key: any) => translate(catalog, locale, key);

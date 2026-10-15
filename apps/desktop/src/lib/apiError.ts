@@ -211,6 +211,12 @@ function mapProviderFailure(body: string): string | null {
 }
 
 function mapBody(body: string, originalBody: string): string | null {
+	// Owned count-only InjectionError; do not trim away added lines or accept prose.
+	const capacity = /^injection error: ([1-9][0-9]*) translation\(s\) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues$/.exec(originalBody);
+	if (capacity?.[0] === originalBody) {
+		return t("api.error.binarySlotCapacity", { count: capacity[1] });
+	}
+
 	const provider = mapProviderFailure(originalBody);
 	if (provider) return provider;
 
