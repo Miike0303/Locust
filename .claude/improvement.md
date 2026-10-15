@@ -1,4 +1,6 @@
 ---
+
+**CURRENT (owner 2026-10-12, overrides every Codex model line below): Codex `gpt-6.1-sol` ONLY, standard tier (no Fast), for every researcher, writer, correction, reviewer, agent and subagent. Never `gpt-6-astra`, `gpt-6-sol` (6.0), any `luna` or `terra`. Owner: "quitar todos los otros modelos, solo dejar sol". Defaults in `~/.codex/config.toml`, `codex-write.ps1`, `codex-loop.ps1`, the fleet-orchestrator skill and global CLAUDE.md are sol 6.1, so no `-Model` flag is needed.**
 ledger: docs/IMPROVEMENT-GOAL.md
 categories: [capability, optimization, defect]
 delivery: commit-only
@@ -48,10 +50,6 @@ Owned by no lane; Claude applies these after the writers finish.
 
 ## Writer traps
 
-- **Grok stops at the TDD red phase.** It writes the failing tests, then ends the
-  turn without implementing. Observed on single-task briefs too, so "one task per
-  dispatch" does not prevent it. Expect a second `-Continue` dispatch per change,
-  and check for a red suite before assuming the work is finished.
 - A writer that exits `0` may still have produced nothing — a lost connection ends
   the process cleanly. Check the output size, not the exit code.
 - `httpmock`'s matcher is `body_contains`, not `body_includes`.
@@ -63,18 +61,14 @@ Owned by no lane; Claude applies these after the writers finish.
   stray `*.locust.db` files sit in `apps/desktop/`. The backlog of uncommitted
   work since 2026-09-03 was snapshotted in `e0e5268..` on 2026-09-26. A dirty
   tree at cycle start means someone else is working here: stop.
-- **Writers: Codex first (user, 2026-09-27); Cursor Grok 4.7 only as the fallback below (user, 2026-09-28).** No Grok Build. Use
-  Codex until its quota and resets are exhausted or the user says otherwise.
-  Supersedes the 2026-09-26 Codex+Cursor authorization.
-- **Fallback: Cursor Grok 4.7 when Codex is unavailable (user, 2026-09-28: "usa cursor, grok 4.7 si codex no esta
-  disponible").** Codex stays primary. "Unavailable" means: the trivial `codex exec` probe gets no answer within
-  180 s, a Codex session stalls or fails the sandbox twice in a row for the same step, or Codex quota is exhausted.
-  Then use Cursor: writers `~/.claude/bin/cursor-write.ps1 -WorkDir <repo> -Model grok-4.7-xhigh -PromptFile <brief>`;
-  researchers `~/.claude/bin/cursor-ask.ps1 -WorkDir <repo> -Mode ask -Model grok-4.7-high -PromptFile <brief>`
-  (`ask`, not `plan`: plan returned empty output before). Never the `-fast` variants. Probe Codex again at the next
-  step and switch back as soon as it answers. Cursor Ultra is credit-metered: only as a fallback, never in parallel with
-  a Codex writer on this tree. Grok historically stops at the TDD red phase (see above): check the suite is not red
-  before accepting its report, and expect one `-Continue` dispatch.
+- **Writers and researchers: Codex only (owner, 2026-10-09; supersedes the 2026-09-27/28 writer and fallback rules).**
+  Owner: "cambia que siempre use codex, aunque diga que tengo 0% a menos que diga lo contrario, quiero gastar los creditos que tengo ... elimina todo lo que tenga que ver con cursor".
+  Cursor is removed entirely: no cursor-agent, `cursor-write`/`cursor-ask`/`cursor-plan`, Grok via Cursor or Cursor
+  fallback; no Grok Build. Always dispatch Codex, even when `fleet-quota.ps1` or any other quota reading says 0%
+  remaining or exhausted; never reroute, pause or downgrade because of quota. A research duel is two independent Codex
+  runs with the same brief. If Codex errors or stalls (the trivial `codex exec` probe gets no answer within 180 s, or the
+  sandbox fails), retry Codex; after 3 failed Codex rounds for the same unit Claude implements it directly. Only an
+  explicit owner instruction changes this.
 - **Model allow-list (user, 2026-09-27, supersedes 2026-09-26). Never substitute. No Fast tier:**
   - **Updated 2026-09-29 (user: "ya esta el modelo 6.1 sol, cambialo"; needs Codex CLI >= 0.159.1): Sol 6.1 replaces Astra.**
   - Codex writers: `gpt-6.1-sol` with `-c model_reasoning_effort=xhigh`.
@@ -136,10 +130,6 @@ Owned by no lane; Claude applies these after the writers finish.
   widened sandbox. Claude reads the report, reviews any production hunk outside
   the brief, reruns the gates once and commits. Report this as "research duel
   skipped (single researcher)".
-- **Use `cursor-ask -Mode ask`, not `plan`, for research.** `plan` returned empty
-  stdout (exit 0) on the long brief twice, with both cursor-grok-4.6-xhigh and
-  grok-4.7-high. `ask` with the same brief reads the repo and answers. Always
-  check the output size, and never count an empty answer as a proposal.
 - Playwright is available as `py -3.13` with its bundled Chromium. The default
   `python` has no Playwright.
 - A new placeholder syntax needs a detector in
@@ -155,12 +145,13 @@ Owned by no lane; Claude applies these after the writers finish.
 - **Ledger edits via a Python FILE script** (split on a newline only, placeholder `PENDINGnnn` hash replaced with `sed` after the commit, check for U+FFFD). Backslash-U inside an inline Python string literal with a Windows path is a syntax error: use forward slashes or raw strings, and write the script with the file tool.
 - **Audit tooling for Unity and the VN engines** lives in `tools/ground-truth/unity` and `tools/ground-truth/vn` (the UnityPy venv is recreated by `bootstrap.py`).
 
-- **Model update (user, 2026-10-01: "si cambie a astra con priority eh fast, checalo"). Supersedes the allow-list above and the "no Fast tier" lines.** Codex writers: `gpt-6-astra` with `model_reasoning_effort=xhigh`; researchers and subagents: `gpt-6-astra` with `high`; service tier `priority` (Fast), which is the default of `~/.claude/bin/codex-write.ps1` (`-Model gpt-6-astra -ServiceTier priority`) and of `~/.codex/config.toml`. Do not pass `-Model gpt-6.1-sol` any more. Fast uses the plan quota faster. Do not run `fleet-quota.ps1` any more (user, 2026-10-04: only Gentle Shell); writers stay Codex via `codex exec`. Cursor fallback is unchanged (`grok-4.7-xhigh`/`-high`, never `-fast`). Verified 2026-10-01: wrapper defaults and config.toml both say astra + priority; the 2026-10-01 cycle 113/114 runs passed `gpt-6.1-sol` but no `-ServiceTier`, so they ran with `priority` anyway.
+- **Model update (user, 2026-10-01: "si cambie a astra con priority eh fast, checalo"). Supersedes the allow-list above and the "no Fast tier" lines.** Codex writers: `gpt-6-astra` with `model_reasoning_effort=xhigh`; researchers and subagents: `gpt-6-astra` with `high`; service tier `priority` (Fast), which is the default of `~/.claude/bin/codex-write.ps1` (`-Model gpt-6-astra -ServiceTier priority`) and of `~/.codex/config.toml`. Do not pass `-Model gpt-6.1-sol` any more. Fast uses the plan quota faster. Do not run `fleet-quota.ps1` any more (user, 2026-10-04: only Gentle Shell); writers stay Codex via `codex exec`. Verified 2026-10-01: wrapper defaults and config.toml both say astra + priority; the 2026-10-01 cycle 113/114 runs passed `gpt-6.1-sol` but no `-ServiceTier`, so they ran with `priority` anyway.
 - **Scratch hygiene (2026-10-01, after 44 folders = 309.8 GB were left in `%TEMP%`).** Each old scratch root held its own full cargo `target/` with debuginfo (25-41 GB). Rules for every researcher, writer and verification: (1) one scratch root per role named `%TEMP%\locust-<cycle>-<role>` (for example `locust-c113-unity-reaudit`), kept under 5 GB; (2) never create a cargo target inside it: build with `CARGO_TARGET_DIR=%LOCALAPPDATA%\locust-shared-target CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0` (`tools/ground-truth/unity/run_all.py` already does) and copy only the finished exe; (3) never copy a whole game, copy only the files a probe needs; (4) briefs must include this rule and the final `tools/cleanup-scratch.ps1` report-only run; (5) Claude runs `powershell -NoProfile -File tools/cleanup-scratch.ps1 -Apply` at the END of every cycle (it removes `locust-*` folders older than 2 h without a `.keep` file, deletes the shared target above 15 GB, and prunes worktrees) and again at the START of the first cycle of a session; (6) `git worktree remove --force` every verification worktree in the same step it was created for. The `Temp\claude` session folder is Claude Code's own and is not covered here.
 
 - **Coordinator prepares writer scratch (cycle 116).** Inside the Codex sandbox, Git's `tar.exe` fails (`CreateFileMapping ... Win32 error 5`) and `prepare.py` downloads fail (`URLError WinError 10061`); PowerShell keeps going after a failed native exe, so exit 0 proves nothing. Before dispatch, Claude creates the scratch root (`icacls ... /grant *S-1-5-32-545:(OI)(CI)M`, needs `MSYS_NO_PATHCONV=1` from Git Bash), runs `prepare.py`, extracts `git archive HEAD` into `snapshot\`, builds the BEFORE CLI with the shared target and runs the BEFORE audit; the writer only edits and measures AFTER. Inside the sandbox free disk reads 0 GB (artifact).
 - **Double-verify behaviour, not only the numbers (cycle 116).** The YU-RIS writer met every metric (recall 100%, 1843 tests, negative control) and still broke re-injection: its stale-row guard hashed the whole file. Before landing an inject change, run extract -> translate -> Direct inject -> edit -> Direct inject again on a real copy with both HEAD and the new CLI.
 - **Shared target can reuse a test binary from another worktree (cycle 119).** A `locust-core` test built in the c118 verify worktree kept its baked `CARGO_MANIFEST_DIR`, so a live-repo `cargo test --workspace` failed on a missing fixture under `locust-c118-verify`. `cargo clean -p locust-core` (or the package that fails) before trusting a red outside the writer's file.
+- **Shared target across worktrees silently links STALE workspace crates (2026-10-12, c153).** Cargo fingerprints a workspace crate by the dep-info paths of the worktree that last built it; another worktree with changed sources but the same package/feature set reuses that rlib. c153 failed 8 tests under `--workspace` (stale `locust-core` from c152) and passed under `-p locust-formats`. Before trusting a local verification in a worktree, run `cargo clean -p locust-core -p locust-formats -p locust-providers -p locust-server -p locust-cli -p locust-desktop` (dependencies stay cached), and never verify while another writer builds in the same target. Hosted CI is the independent check.
 - **Launch Codex writers from Git Bash, not a `Start-Process` PowerShell launcher (cycle 119).** `$prompt | & $codex @args *> log` inside a hidden `Start-Process` never spawned codex.exe. `nohup codex.exe exec ... - < prompt > log 2>&1 &` with the widened-sandbox `-c` flags works.
 - **pwsh profile noise is not a stop reason (cycle 131/132, 2026-10-05).** Every sandboxed shell call prints oh-my-posh `Failed to write init script ... Acceso denegado` and `Set-PSReadLineOption` errors and exits 1; two writers obeyed "stop only on a real tool error in your own calls" and quit having done nothing. Naming the noise as harmless was not enough: on the retry one writer stopped on its own `Get-Content AGENTS.md` (no such file) and the other on an npm cache `EPERM`. Use this rule instead: "Failing commands are normal here and are NEVER a reason to stop ... diagnose, work around it and keep going. The only stop condition is being unable to edit files in the repo at all." Suggest `pwsh -NoProfile` and `npm_config_cache=<scratch>`.
 - **Codex cannot spawn node (`spawn EPERM`) and leaves LF lines in CRLF files (cycle 130).** Claude runs tsc, `npm run test:unit`, the build and the negative control for UI cycles, and normalizes line endings (`Settings.tsx` is CRLF in the index) before committing.
