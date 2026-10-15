@@ -1,0 +1,34 @@
+# Native Godot / Dialogic translation
+
+Parent: `odd/tasks/reliable-installed-engines.md`, REL-5.
+Branch: `feat/godot-dialogic-native`; starting checkpoint `a1ce77e` (documentation), verified implementation `77e5c96`, CI `38678826007`.
+
+## Goal and authority
+Provide a narrow, experimental native workflow for the installed Godot/Dialogic profile: extract proven visible text, translate through Locust, create a safe copy, and produce a strictly bound reversible patch. This is not general Godot binary-resource rewriting or a promise of error-free localization. Scripts are internal QA only.
+
+Preserve original games, databases, proof artifacts, the three owner `.claude` edits, and unfinished Unicode containment sources. No game/executable launch, provider spending, credentials, global installation, elevation, executable patching, profile/registry changes, or blind cleanup. One source writer at a time. Use observed meaningful RED/GREEN, independent verification, and exact-SHA Windows/Ubuntu CI before each source unit reaches main. RDD is off. Normal Cargo/build/GameLock and owned-fixture outputs are allowed.
+
+## Evidence and uncertainty
+- G01 is a standalone 327,672,864-byte PCK: format 2, Godot 4.3.0, 2,112 entries, 100-byte header plus 220,156-byte index. Observed flags are zero; no duplicate canonical names or overlapping payloads.
+- It contains 112 `.dtl` and seven `.dch` resources, not text scenes/CSV/JSON. Primary Godot contract: `77dcf97d82cbfe4e4615475fa52ca03da645dbd8`.
+- Official Dialogic reference `2.0-alpha-16`, commit `fed4736c400d809d248e77f2dd40ae93b5feb4db`, declares Godot 4.2+. This is a compatible reference, NOT identification of the installed addon version.
+- MD5-verified class cache (12,311 bytes) has 73 records: 72 inside Dialogic, including timeline/character resource loaders. No cached DialogicIndexer subclasses were found; runtime/dynamic custom indexers remain unknown.
+- MD5-verified ECFG (18,247 bytes) declares exactly 112 timeline and seven character paths, all present in the index; Dialogic autoload is present. No explicit locale/remap keys were observed. This establishes declared mappings, not runtime reachability or precedence.
+- Existing core preserves a directly detected file as the copy source; its parent is used for locking/relative paths. Replace dispatches the copied destination directory: physical archive identity must survive in row locators. No Godot-specific parent-root exception is justified.
+- Existing structural patch verification is provenance-based, not engine-aware. Require strict original hashes for the intended Replace workflow. Never bypass confirmation or call Structural a content oracle.
+
+## Tasks
+- [x] GD-0 — Read-only contracts, declared resource authority, and native path-scope mapping. Evidence is the bounded research above; no game execution or implementation claim. This task document is the research work-unit artifact; commit pending.
+- [x] GD-1 — Bounded standalone PCK v2 index reader. Validate versions, flags, arithmetic, index/path limits, canonical virtual identities and payload ranges. Keep metadata and selected payload access separate; do not claim unchecked MD5s are verified. Hermetic malformed fixtures and an explicit optional read-only installed-fixture check. No plugin registration or archive writes in this unit. Verified locally: 27 hermetic tests pass; two guard mutations (nonempty overlap, index overlap) each fail one test, source restored byte-identical; optional installed G01 check passes read-only with unchanged original SHA-256; fmt, workspace strict Clippy and `locust-formats` 983/0/17 ignored pass. Exact-SHA CI pending at commit time.
+- [ ] GD-2 — Bounded selective payload authentication and streaming atomic append/replacement. Preserve untouched member bytes and index fields; verify generated archives independently. Reuse/extend transactional replacement, including failure/recovery tests. No in-place partial index updates and no executable/embedded PCK support.
+- [ ] GD-3 — Lossless Dialogic visible-span codec and precisely scoped validation. Preserve commands, indentation, continuations, speakers/identities, choices, variables, tags and `#id:`. Use inert bounded parsing for character/authority metadata, never Variant/GDScript evaluation. Unsupported constructs produce explicit diagnostics rather than arbitrary-string translation.
+- [ ] GD-4 — Backward-compatible extraction diagnostics, including zero-row incomplete extraction. Keep legacy APIs and existing partial-merge behavior; incomplete extraction must not erase saved translations. Derive exact caller surfaces read-only before this unit.
+- [ ] GD-5 — Experimental native registration and end-to-end file scope, copy, Direct/revision safety, recording, strict pack/apply/rollback/reapply. Explicitly support selected PCK files in native UI where necessary; refuse ambiguity and wrong-archive/stale provenance. Existing format capabilities should drive UI defaults. Do not advertise native support before these gates.
+- [ ] GD-6 — Installed G01 owned-copy proof, release rebuild and clear support guide. Independent resource/structure/byte oracle, unchanged original hashes, complete reextraction for supported spans, no accidental parent-folder copy, strict patch lifecycle. Runtime/font/linguistic checks remain pending without a separately safe execution procedure.
+
+## Verification and storage
+Each source task closes with a Conventional Commit and exact-SHA Windows/Ubuntu CI; record source identity and observed counts here, then update the Engram mirror and visible todo. Keep failed checks and unexecuted checks explicit. Passive docs do not have a meaningful RED; use structural verification.
+Owned evidence belongs under `tmp/godot-dialogic-native/`. Preserve prior REL-4 evidence separately. Before actual full-PCK copies, estimate retained bytes and enforce a bounded budget (initial maximum 4 GiB, measured free-space floor 16 GiB); no deletion or unbounded whole-folder copies to meet the budget. Synthetic tests use normal isolated test fixtures. Do not run broad scratch cleanup.
+
+## Current outcome
+GD-1 is implemented as an unregistered read-only index reader; GD-2 is next. No native Godot support, rewritten PCK, translated game, runtime/font proof or linguistic quality is established yet. REL-4 RenPy Add confirmation and YU-RIS containment remain separate blockers, not reasons to stop this independent work.
