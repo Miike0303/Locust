@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use locust_core::error::Result;
 use locust_core::models::{StringEntry, TranslationRequest, TranslationResult};
 use locust_core::translation::{TranslationOptions, TranslationProvider};
@@ -302,15 +302,26 @@ async fn cancelled_job_keeps_project_until_actual_worker_exit() {
         .await
         .unwrap();
     let terminal = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let message = websocket.next().await.unwrap().unwrap();
-            if let Ok(text) = message.to_text() {
-                let event: serde_json::Value = serde_json::from_str(text).unwrap();
+        let mut terminal = None;
+        while let Some(message) = websocket.next().await {
+            let message = match message {
+                Ok(message) => message,
+                Err(_) if terminal.is_some() => break,
+                Err(error) => panic!("translate ws frame before terminal event: {error}"),
+            };
+            if message.is_close() {
+                break;
+            }
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let event: serde_json::Value = serde_json::from_str(&text).unwrap();
                 if event["type"] == "failed" {
-                    break event;
+                    terminal = Some(event);
                 }
             }
         }
+        let terminal = terminal.expect("translate stream closed before terminal event");
+        let _ = websocket.flush().await;
+        terminal
     })
     .await
     .unwrap();

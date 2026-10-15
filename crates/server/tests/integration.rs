@@ -1379,19 +1379,28 @@ async fn collect_patch_ws_frames(base_url: &str, job_id: &str) -> Vec<serde_json
         .unwrap_or_else(|e| panic!("ws connect {ws_url}: {e}"));
     let mut frames = Vec::new();
     let collect = async {
-        use futures_util::StreamExt;
+        use futures_util::{SinkExt, StreamExt};
+        let mut terminal = false;
         while let Some(msg) = ws.next().await {
-            let msg = msg.expect("ws frame");
+            let msg = match msg {
+                Ok(msg) => msg,
+                Err(_) if terminal => break,
+                Err(error) => panic!("ws frame before terminal event: {error}"),
+            };
+            if msg.is_close() {
+                break;
+            }
             let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
                 continue;
             };
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-            let term = matches!(v["type"].as_str(), Some("done" | "error"));
+            terminal |= matches!(v["type"].as_str(), Some("done" | "error"));
             frames.push(v);
-            if term {
-                break;
-            }
         }
+        assert!(terminal, "patch job stream closed before terminal event");
+        // Flush the queued Close reply. Teardown errors after the terminal
+        // event cannot invalidate the job result already received.
+        let _ = ws.flush().await;
     };
     tokio::time::timeout(std::time::Duration::from_secs(30), collect)
         .await
