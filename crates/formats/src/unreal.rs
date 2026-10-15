@@ -1976,6 +1976,31 @@ fn has_pak_magic_in_tail<R: Read + Seek>(reader: &mut R, len: u64) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn default_diagnostics_keep_exact_unreal_metadata_warnings() {
+        let root = tempfile::tempdir().unwrap();
+        write_loose_locres(root.path(), crate::unreal_locres::LocresVersion::Compact);
+        let mut header = [0u8; 144];
+        header[..16].copy_from_slice(b"-==--==--==--==-");
+        header[16] = 5;
+        header[20..24].copy_from_slice(&144u32.to_le_bytes());
+        header[80] = 2;
+        fs::write(root.path().join("extra.utoc"), header).unwrap();
+        let plugin = UnrealPlugin::new();
+        let legacy = plugin.extract(root.path()).unwrap();
+        let expected = locust_core::project::extraction_warnings(&legacy);
+        assert_eq!(expected.len(), 1);
+        assert!(expected[0].contains("encrypted"));
+        let extraction = plugin.extract_with_diagnostics(root.path()).unwrap();
+        assert!(!extraction.complete);
+        assert_eq!(extraction.entries.len(), legacy.len());
+        assert_eq!(
+            serde_json::to_vec(&extraction.warnings).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert_eq!(extraction.bounded_warnings(), expected);
+    }
+
+    #[test]
     fn held_lock_injects_loose_locres_without_releasing_exclusion() {
         let root = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();

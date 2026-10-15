@@ -1587,6 +1587,24 @@ fn cmd_extract(
     dry_run: bool,
     force: bool,
 ) -> anyhow::Result<()> {
+    cmd_extract_with_registry(
+        path,
+        format,
+        output,
+        dry_run,
+        force,
+        &locust_formats::default_registry(),
+    )
+}
+
+fn cmd_extract_with_registry(
+    path: PathBuf,
+    format: Option<String>,
+    output: Option<PathBuf>,
+    dry_run: bool,
+    force: bool,
+    registry: &locust_core::extraction::FormatRegistry,
+) -> anyhow::Result<()> {
     if !path.try_exists()? {
         anyhow::bail!(
             "game folder not found: {}. Check the path and try again.",
@@ -1596,8 +1614,6 @@ fn cmd_extract(
     let game_root = path.canonicalize()?;
     let _source_lock = locust_core::project::lock_game_source(&path)?;
     warn_or_refuse_direct_injection(&game_root, dry_run, force)?;
-    let registry = locust_formats::default_registry();
-
     let plugin = if let Some(ref fmt) = format {
         registry
             .get(fmt)
@@ -1611,9 +1627,10 @@ fn cmd_extract(
 
     println!("Format: {} ({})", plugin.name(), plugin.id());
 
-    let entries = plugin.extract(&path)?;
+    let extraction = plugin.extract_with_diagnostics(&path)?;
+    let extraction_warnings = extraction.bounded_warnings();
+    let entries = extraction.entries;
     let total = entries.len();
-    let extraction_warnings = locust_core::project::extraction_warnings(&entries);
     for warning in &extraction_warnings {
         eprintln!("warning: partial extraction: {warning}");
     }
@@ -1627,7 +1644,7 @@ fn cmd_extract(
         PathBuf::from(format!("{}.locust.db", name))
     });
 
-    let preserve_missing = !extraction_warnings.is_empty();
+    let preserve_missing = !extraction.complete;
     let merge = if dry_run {
         preview_extract_merge(&db_path, &game_root, &entries, preserve_missing, force)?
     } else {
@@ -2694,6 +2711,111 @@ mod tests {
     use super::*;
     use locust_core::models::StringStatus;
     use std::fs;
+
+    struct DiagnosticExtractPlugin;
+
+    impl locust_core::extraction::FormatPlugin for DiagnosticExtractPlugin {
+        fn id(&self) -> &str {
+            "diagnostics-test"
+        }
+        fn name(&self) -> &str {
+            "Diagnostics test"
+        }
+        fn supported_extensions(&self) -> &[&str] {
+            &[]
+        }
+        fn extract(&self, _: &Path) -> locust_core::error::Result<Vec<StringEntry>> {
+            panic!("CLI must use the diagnostics channel")
+        }
+        fn extract_with_diagnostics(
+            &self,
+            path: &Path,
+        ) -> locust_core::error::Result<locust_core::extraction::Extraction> {
+            let complete = !path.join("partial").exists();
+            let entries = fs::read_to_string(path.join("story.txt"))?
+                .lines()
+                .map(|id| StringEntry::new(id, id, path.join("story.txt")))
+                .collect();
+            Ok(locust_core::extraction::Extraction {
+                entries,
+                warnings: if complete {
+                    vec![]
+                } else {
+                    vec!["story.txt: unreadable member".into()]
+                },
+                complete,
+            })
+        }
+        fn inject(
+            &self,
+            _: &Path,
+            _: &[StringEntry],
+        ) -> locust_core::error::Result<locust_core::extraction::InjectionReport> {
+            unreachable!("extraction-only fixture")
+        }
+    }
+
+    #[test]
+    fn cli_plugin_diagnostics_preserve_zero_rows_and_dry_run_then_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("story.txt"), "hero\nnpc").unwrap();
+        let project = temp.path().join("project.db");
+        let mut registry = locust_core::extraction::FormatRegistry::new();
+        registry.register(Box::new(DiagnosticExtractPlugin));
+        let extract = |dry_run| {
+            cmd_extract_with_registry(
+                game.clone(),
+                Some("diagnostics-test".into()),
+                Some(project.clone()),
+                dry_run,
+                false,
+                &registry,
+            )
+            .unwrap()
+        };
+        extract(false);
+        let db = Database::open(&project).unwrap();
+        let mut rows = db.get_entries(&EntryFilter::default()).unwrap();
+        for row in &mut rows {
+            row.translation = Some("Traducción".into());
+            row.status = StringStatus::Approved;
+        }
+        db.save_entries(&rows).unwrap();
+        let before = serde_json::to_value(&rows).unwrap();
+        drop(db);
+        fs::write(game.join("story.txt"), "").unwrap();
+        fs::write(game.join("partial"), "").unwrap();
+        extract(true);
+        let db = Database::open(&project).unwrap();
+        assert!(locust_core::project::saved_extraction_warnings(&db)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            serde_json::to_value(db.get_entries(&EntryFilter::default()).unwrap()).unwrap(),
+            before
+        );
+        drop(db);
+        extract(false);
+        let db = Database::open(&project).unwrap();
+        assert_eq!(
+            serde_json::to_value(db.get_entries(&EntryFilter::default()).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            locust_core::project::saved_extraction_warnings(&db).unwrap(),
+            ["story.txt: unreadable member"]
+        );
+        drop(db);
+        fs::remove_file(game.join("partial")).unwrap();
+        extract(false);
+        let db = Database::open(&project).unwrap();
+        assert_eq!(db.get_stats().unwrap().total, 0);
+        assert!(locust_core::project::saved_extraction_warnings(&db)
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn provider_translation_defaults_cli_settings_and_partial_flags() {

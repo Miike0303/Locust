@@ -449,14 +449,14 @@ fn open_project_with(
     let format_id = plugin.id().to_string();
     let format_name = plugin.name().to_string();
     let supported_modes = plugin.supported_modes();
-    let entries = plugin.extract(&path)?;
-    let extraction_warnings = extraction_warnings(&entries);
+    let extraction = plugin.extract_with_diagnostics(&path)?;
+    let extraction_warnings = extraction.bounded_warnings();
 
     let candidate = Database::open(&database_path)?;
-    let merge = if extraction_warnings.is_empty() {
-        candidate.merge_entries(&entries)?
+    let merge = if extraction.complete {
+        candidate.merge_entries(&extraction.entries)?
     } else {
-        candidate.merge_entries_preserving_missing(&entries)?
+        candidate.merge_entries_preserving_missing(&extraction.entries)?
     };
     candidate.set_project_metadata(
         "extraction_warnings",

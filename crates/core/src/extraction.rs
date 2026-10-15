@@ -51,6 +51,35 @@ impl FormatStability {
     }
 }
 
+/// Extracted rows and diagnostics that do not require a row to carry them.
+#[derive(Clone, Debug)]
+pub struct Extraction {
+    pub entries: Vec<StringEntry>,
+    pub warnings: Vec<String>,
+    /// Only a complete extraction authorizes removing saved rows absent here.
+    /// A complete empty result therefore removes all saved rows, as before.
+    pub complete: bool,
+}
+
+impl Extraction {
+    /// Bound persisted/displayed diagnostics using the legacy warning ordering
+    /// and limits. Completeness is independent of the presentation limit.
+    pub fn bounded_warnings(&self) -> Vec<String> {
+        let mut warnings = std::collections::BTreeSet::new();
+        for message in self.warnings.iter().filter(|message| !message.is_empty()) {
+            warnings.insert(message.chars().take(2048).collect::<String>());
+            if warnings.len() >= 128 {
+                break;
+            }
+        }
+        if !self.complete && warnings.is_empty() {
+            warnings
+                .insert("Extraction is incomplete; missing saved entries were preserved.".into());
+        }
+        warnings.into_iter().collect()
+    }
+}
+
 pub trait FormatPlugin: Send + Sync {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
@@ -80,6 +109,18 @@ pub trait FormatPlugin: Send + Sync {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>>;
+
+    /// Override to report incomplete extraction even when no rows are readable.
+    /// Legacy plugins keep their extraction API and Unreal metadata diagnostics.
+    fn extract_with_diagnostics(&self, path: &Path) -> Result<Extraction> {
+        let entries = self.extract(path)?;
+        let warnings = crate::project::extraction_warnings(&entries);
+        Ok(Extraction {
+            complete: warnings.is_empty(),
+            entries,
+            warnings,
+        })
+    }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport>;
 
