@@ -641,6 +641,9 @@ pub struct InjectParams {
     /// CLI `--direct`: in-place inject + recording for patch pack.
     #[serde(default)]
     pub direct: bool,
+    /// Opt-in known-capacity preflight, supported only for Replace copies.
+    #[serde(default)]
+    pub require_binary_slot_fit: bool,
 }
 
 /// Unblocking advice attached to a containment failure when recording an
@@ -671,6 +674,15 @@ async fn apply_run_inject(
     // zero work and zero recording — a silent no-op that breaks `locust patch`.
     if params.languages.is_empty() {
         return Err(INJECT_EMPTY_LANGUAGES_MESSAGE.to_string());
+    }
+    if params.require_binary_slot_fit
+        && (params.direct
+            || params
+                .mode
+                .as_ref()
+                .is_some_and(|mode| *mode != OutputMode::Replace))
+    {
+        return Err("require_binary_slot_fit is supported only for Replace mode".into());
     }
     let s = s.clone();
     let exclusive = try_project_operation(&s)?;
@@ -712,10 +724,13 @@ async fn apply_run_inject(
 
         let languages = params.languages.clone();
         let report = injector
-            .inject(
+            .inject_with_options(
                 &PathBuf::from(&params.project_path),
                 &params.format_id,
-                mode,
+                locust_core::extraction::MultiLangInjectionOptions {
+                    mode,
+                    require_binary_slot_fit: params.require_binary_slot_fit,
+                },
                 params.languages,
                 params.output_dir.map(PathBuf::from),
                 tx,
@@ -895,6 +910,122 @@ async fn apply_add_glossary_entry(s: &AppState, entry: &GlossaryEntry) -> Result
 
 #[cfg(test)]
 mod tests {
+    struct CapacitySentinel;
+
+    impl locust_core::extraction::FormatPlugin for CapacitySentinel {
+        fn id(&self) -> &str {
+            "capacity-sentinel"
+        }
+        fn name(&self) -> &str {
+            "Capacity sentinel"
+        }
+        fn supported_extensions(&self) -> &[&str] {
+            &["bin"]
+        }
+        fn extract(&self, _: &Path) -> locust_core::error::Result<Vec<StringEntry>> {
+            unreachable!()
+        }
+        fn inject(
+            &self,
+            path: &Path,
+            _: &[StringEntry],
+        ) -> locust_core::error::Result<locust_core::extraction::InjectionReport> {
+            let file = path.join("story.bin");
+            std::fs::write(&file, b"partial output")?;
+            Ok(locust_core::extraction::InjectionReport {
+                files_modified: 1,
+                strings_written: 1,
+                strings_skipped: 1,
+                files_written: vec![file],
+                skip_reasons: Default::default(),
+                warnings: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_slot_fit_run_inject_transport_contract() {
+        for (flag, target, direct, mode, refused) in [
+            (Some(true), "oversize", false, None, true),
+            (Some(true), "fit", false, None, false),
+            (Some(true), "fit", false, Some("replace"), false),
+            (None, "oversize", false, None, false),
+            (Some(false), "oversize", false, None, false),
+            (Some(true), "fit", true, None, true),
+            (Some(true), "fit", false, Some("add"), true),
+            (Some(false), "oversize", true, Some("add"), false),
+            (None, "oversize", true, Some("add"), false),
+        ] {
+            let mut state = locust_server::create_test_state();
+            let root = state.config_path.parent().unwrap().to_path_buf();
+            let game = root.join("game");
+            let output = root.join("output");
+            let backups = root.join("backups");
+            std::fs::create_dir(&game).unwrap();
+            std::fs::write(game.join("story.bin"), b"original").unwrap();
+            let mut registry = locust_core::extraction::FormatRegistry::new();
+            registry.register(Box::new(CapacitySentinel));
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.format_registry = Arc::new(registry);
+            mutable.backup_manager =
+                Arc::new(locust_core::backup::BackupManager::new(backups.clone()));
+            pivot_project(&state).await;
+            let mut row = StringEntry::new("slot", "abc", "story.bin".into());
+            row.translation = Some(target.into());
+            row.status = StringStatus::Translated;
+            row.metadata
+                .insert("binary_slot".into(), serde_json::json!("utf8"));
+            state.db.save_entries(&[row]).unwrap();
+            let before = pivot_snapshot(&state);
+            let mut request = serde_json::json!({
+                "project_path": game, "format_id": "capacity-sentinel",
+                "languages": ["es"], "output_dir": output, "direct": direct
+            });
+            if let Some(flag) = flag {
+                request["require_binary_slot_fit"] = flag.into();
+            }
+            if let Some(mode) = mode {
+                request["mode"] = mode.into();
+            }
+            // run_inject delegates directly here; constructing Tauri State needs
+            // the unavailable test feature (StateManager constructors are private).
+            let result =
+                apply_run_inject(serde_json::from_value(request.clone()).unwrap(), &state).await;
+            if refused {
+                let error = result.expect_err(&request.to_string());
+                assert_eq!(
+                    error,
+                    if direct || mode == Some("add") {
+                        "require_binary_slot_fit is supported only for Replace mode"
+                    } else {
+                        "injection error: 1 translation(s) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues"
+                    }
+                );
+                assert!(!backups.exists());
+                assert!(!output.exists());
+                assert!(state.db.get_injection(Some("es")).unwrap().is_none());
+                assert_eq!(std::fs::read_dir(&game).unwrap().count(), 1);
+            } else {
+                let body = result.unwrap();
+                assert!(backups.exists());
+                assert!(state.db.get_injection(Some("es")).unwrap().is_some());
+                if !direct {
+                    assert_eq!(body["reports"]["es"]["strings_skipped"], 1);
+                    assert!(output.exists());
+                }
+            }
+            assert_eq!(pivot_snapshot(&state), before);
+            assert_eq!(
+                std::fs::read(game.join("story.bin")).unwrap(),
+                if direct && !refused {
+                    b"partial output".as_slice()
+                } else {
+                    b"original".as_slice()
+                }
+            );
+        }
+    }
+
     fn pivot_ready(id: &str) -> StringEntry {
         let mut row = StringEntry::new(id, "日本語 [name]", "script.rpy".into());
         row.translation = Some("English [name]".into());
@@ -1752,6 +1883,7 @@ mod tests {
                 languages: vec!["es".into()],
                 output_dir: None,
                 direct,
+                require_binary_slot_fit: false,
             };
             assert_eq!(
                 apply_run_inject(params, &state).await.unwrap_err(),

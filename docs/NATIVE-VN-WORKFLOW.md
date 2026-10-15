@@ -37,7 +37,24 @@ This path does not silently remove accents, fit the text into an invented byte b
 
 ## 4. Create and inspect the translated copy
 
-**Known-capacity gate (core API only; native wiring pending REL-3):** callers of `MultiLangInjector::inject_with_options` can set `MultiLangInjectionOptions { mode: OutputMode::Replace, require_binary_slot_fit: true }` to refuse known binary-slot overflows before backup or output creation. The gate reuses physical pivot capacities and shared TextAsset budgets, retaining untranslated group members. Physical-source, stale-translation, protected-control and encoding checks still run first. Strict Add is explicitly unsupported; Direct retains its separate API. The legacy `inject` method and default options retain partial-output behavior. This is **not** `require_complete`: missing/empty translations, unknown capacities and unexpected plugin skips are not made complete by this flag. The native UI, HTTP and Tauri do **not yet** opt in; continue to validate and inspect skipped counts manually.
+**Known-capacity gate (opt-in API; UI default pending REL-3B):** callers of `MultiLangInjector::inject_with_options` can set `MultiLangInjectionOptions { mode: OutputMode::Replace, require_binary_slot_fit: true }` to refuse known binary-slot overflows before backup or output creation. HTTP `POST /api/inject` and Tauri `run_inject` now accept the optional boolean `require_binary_slot_fit` in their injection parameters. Omitted or `false` preserves legacy partial-output behavior, the default Replace mode and the separate Direct path. `true` requires Replace (`mode: "replace"` or omitted) and `direct: false` or omitted; strict Add and Direct are explicitly refused before backup/output.
+
+The gate reuses physical pivot capacities and shared TextAsset budgets, retaining untranslated group members. Physical-source, stale-translation, protected-control and encoding checks still run before capacity validation. This is **not** `require_complete`: missing/empty translations, unknown capacities and unexpected plugin skips are not made complete by this flag. **The native UI does not yet send this opt-in flag**; continue to validate and inspect skipped counts manually.
+
+API example (HTTP body; for Tauri wrap the same object as `{ "params": ... }` when invoking `run_inject`):
+
+```json
+{
+  "project_path": "<original game folder>",
+  "format_id": "unity",
+  "languages": ["es"],
+  "output_dir": "<separate output parent>",
+  "mode": "replace",
+  "require_binary_slot_fit": true
+}
+```
+
+Diagnostics for REL-3B localization retain the existing transport shapes: HTTP errors are **plain-text bodies**, not JSON error objects; Tauri rejects with the same string. Strict invalid mode is HTTP **400** with `require_binary_slot_fit is supported only for Replace mode`. Known capacity refusal is HTTP **422** with `injection error: N translation(s) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues`, where `N` is the decimal issue count. This diagnostic contains no source or translated prose. Other injection errors keep their existing status mapping. Successful response schemas are unchanged.
 
 **Previously Direct-injected source:** when retained injection history shows that the selected source is still Direct-modified, Replace refuses **before creating a backup or output**, even with the project that recorded that injection. Restore the verified original backup first, or select a pristine game folder. **Do not delete injection history to force a copy.** Verified Direct revision remains a separate, existing in-place workflow—not a workaround for a refused copy. This check does not detect every source edit.
 

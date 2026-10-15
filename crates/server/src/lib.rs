@@ -1492,6 +1492,9 @@ struct InjectRequest {
     /// (CLI `--direct`). Default false preserves Replace/Add MultiLangInjector.
     #[serde(default)]
     direct: bool,
+    /// Opt-in known-capacity preflight, supported only for Replace copies.
+    #[serde(default)]
+    require_binary_slot_fit: bool,
 }
 
 /// Unblocking advice attached to a containment failure when recording an
@@ -1519,6 +1522,19 @@ async fn inject(
         return Err(err(
             StatusCode::BAD_REQUEST,
             "One project database can inject only one target language. Use a separate pivot database for each target language.",
+        ));
+    }
+
+    if req.require_binary_slot_fit
+        && (req.direct
+            || req
+                .mode
+                .as_ref()
+                .is_some_and(|mode| *mode != OutputMode::Replace))
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "require_binary_slot_fit is supported only for Replace mode",
         ));
     }
 
@@ -1565,16 +1581,34 @@ async fn inject_owned(
 
     let languages = req.languages.clone();
     let report = injector
-        .inject(
+        .inject_with_options(
             &PathBuf::from(&req.project_path),
             &req.format_id,
-            mode,
+            locust_core::extraction::MultiLangInjectionOptions {
+                mode,
+                require_binary_slot_fit: req.require_binary_slot_fit,
+            },
             req.languages,
             req.output_dir.map(PathBuf::from),
             tx,
         )
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| {
+            // Only the new count-only core refusal is a 422. Other injection
+            // errors retain their existing status and diagnostic contract.
+            let capacity_refusal = req.require_binary_slot_fit
+                && matches!(&e, locust_core::error::LocustError::InjectionError(message)
+                    if message.strip_suffix(" translation(s) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues")
+                        .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())));
+            err(
+                if capacity_refusal {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                e,
+            )
+        })?;
 
     // Persist what each language's injection wrote — `locust patch` packs
     // exclusively from this recording, so an inject seam that skips it
@@ -3156,6 +3190,232 @@ mod test_server;
 mod tests {
     use super::*;
     use locust_core::translation::TranslationOptions;
+
+    /// Real core dispatch/recording, with an intentionally partial plugin.
+    struct CapacitySentinel;
+
+    impl locust_core::extraction::FormatPlugin for CapacitySentinel {
+        fn id(&self) -> &str {
+            "capacity-sentinel"
+        }
+        fn name(&self) -> &str {
+            "Capacity sentinel"
+        }
+        fn supported_extensions(&self) -> &[&str] {
+            &["bin"]
+        }
+        fn extract(&self, _: &Path) -> locust_core::error::Result<Vec<StringEntry>> {
+            unreachable!()
+        }
+        fn inject(
+            &self,
+            path: &Path,
+            _: &[StringEntry],
+        ) -> locust_core::error::Result<locust_core::extraction::InjectionReport> {
+            let file = path.join("story.bin");
+            std::fs::write(&file, b"partial output")?;
+            Ok(locust_core::extraction::InjectionReport {
+                files_modified: 1,
+                strings_written: 1,
+                strings_skipped: 1,
+                files_written: vec![file],
+                skip_reasons: Default::default(),
+                warnings: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_slot_fit_http_transport_contract() {
+        for (flag, target, direct, mode, status) in [
+            (Some(true), "oversize", false, None, 422),
+            (Some(true), "fit", false, None, 200),
+            (Some(true), "fit", false, Some("replace"), 200),
+            (None, "oversize", false, None, 200),
+            (Some(false), "oversize", false, None, 200),
+            (Some(true), "fit", true, None, 400),
+            (Some(true), "fit", false, Some("add"), 400),
+            (Some(false), "oversize", true, Some("add"), 200),
+            (None, "oversize", true, Some("add"), 200),
+        ] {
+            let mut state = create_test_state();
+            let root = state.config_path.parent().unwrap().to_path_buf();
+            let game = root.join("game");
+            let output = root.join("output");
+            let backups = root.join("backups");
+            std::fs::create_dir(&game).unwrap();
+            std::fs::write(game.join("story.bin"), b"original").unwrap();
+            let mut registry = FormatRegistry::new();
+            registry.register(Box::new(CapacitySentinel));
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.format_registry = Arc::new(registry);
+            mutable.backup_manager = Arc::new(BackupManager::new(backups.clone()));
+            mark_project_open(&state).await;
+            let mut row = StringEntry::new("slot", "abc", "story.bin".into());
+            row.translation = Some(target.into());
+            row.status = StringStatus::Translated;
+            row.metadata
+                .insert("binary_slot".into(), serde_json::json!("utf8"));
+            state.db.save_entries(&[row]).unwrap();
+            let before =
+                serde_json::to_value(state.db.get_entries(&EntryFilter::default()).unwrap())
+                    .unwrap();
+            let mut request = serde_json::json!({
+                "project_path": game, "format_id": "capacity-sentinel",
+                "languages": ["es"], "output_dir": output, "direct": direct
+            });
+            if let Some(flag) = flag {
+                request["require_binary_slot_fit"] = flag.into();
+            }
+            if let Some(mode) = mode {
+                request["mode"] = mode.into();
+            }
+            let (url, server) = start_test_server(state.clone()).await;
+            let response = client()
+                .post(format!("{url}/api/inject"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let actual_status = response.status();
+            let body = response.text().await.unwrap();
+            server.abort();
+            let _ = server.await;
+            assert_eq!(actual_status.as_u16(), status, "{request}: {body}");
+            if status != 200 {
+                let message = if status == 422 {
+                    "injection error: 1 translation(s) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues"
+                } else {
+                    "require_binary_slot_fit is supported only for Replace mode"
+                };
+                assert_eq!(body, message);
+                assert!(!backups.exists());
+                assert!(!output.exists());
+                assert!(state.db.get_injection(Some("es")).unwrap().is_none());
+                assert_eq!(std::fs::read_dir(&game).unwrap().count(), 1);
+            } else {
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert!(backups.exists());
+                assert!(state.db.get_injection(Some("es")).unwrap().is_some());
+                if !direct {
+                    assert_eq!(body["reports"]["es"]["strings_skipped"], 1);
+                    assert!(output.exists());
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(state.db.get_entries(&EntryFilter::default()).unwrap())
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                std::fs::read(game.join("story.bin")).unwrap(),
+                if direct && status == 200 {
+                    b"partial output".as_slice()
+                } else {
+                    b"original".as_slice()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_slot_fit_http_unity_real_plugin() {
+        for (flag, oversize) in [
+            (Some(true), true),
+            (Some(true), false),
+            (None, true),
+            (Some(false), true),
+        ] {
+            let mut state = create_test_state();
+            let root = state.config_path.parent().unwrap().to_path_buf();
+            let game = root.join("game");
+            let output = root.join("output");
+            let backups = root.join("backups");
+            Arc::get_mut(&mut state).unwrap().backup_manager =
+                Arc::new(BackupManager::new(backups.clone()));
+            std::fs::create_dir_all(game.join("TestGame_Data")).unwrap();
+            std::fs::write(
+                game.join("UnityPlayer.dll"),
+                b"fixture marker, not executable",
+            )
+            .unwrap();
+            // Same minimal length-prefixed heuristic layout as Unity's
+            // create_unity_fixture; exercises the actual extractor and writer.
+            let mut bytes = vec![0; 64];
+            for text in ["Hello World", "Press any key to continue"] {
+                bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(text.as_bytes());
+                bytes.push(0);
+                bytes.extend_from_slice(&[0xFF; 8]);
+            }
+            bytes.extend_from_slice(&[0; 32]);
+            let asset = game.join("TestGame_Data/resources.assets");
+            std::fs::write(&asset, &bytes).unwrap();
+            let plugin = state.format_registry.get("unity").unwrap();
+            let mut rows = plugin.extract(&game).unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in &mut rows {
+                assert_eq!(row.metadata["binary_slot"], "utf8");
+                row.translation = Some(
+                    if oversize && row.source == "Hello World" {
+                        "This translation exceeds the physical slot"
+                    } else {
+                        "Hola mundo"
+                    }
+                    .into(),
+                );
+                row.status = StringStatus::Translated;
+            }
+            state.db.save_entries(&rows).unwrap();
+            mark_project_open(&state).await;
+            let mut request = serde_json::json!({
+                "project_path": game, "format_id": "unity",
+                "languages": ["es"], "output_dir": output
+            });
+            if let Some(flag) = flag {
+                request["require_binary_slot_fit"] = flag.into();
+            }
+            let (url, server) = start_test_server(state.clone()).await;
+            let response = client()
+                .post(format!("{url}/api/inject"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            server.abort();
+            let _ = server.await;
+            if flag == Some(true) && oversize {
+                assert_eq!(status, 422, "{body}");
+                assert!(!body.contains("Hello World") && !body.contains("This translation"));
+                assert!(!backups.exists() && !output.exists());
+                assert!(state.db.get_injection(Some("es")).unwrap().is_none());
+            } else {
+                assert_eq!(status, 200, "{body}");
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(
+                    body["reports"]["es"]["strings_skipped"],
+                    usize::from(oversize)
+                );
+                assert_eq!(
+                    body["reports"]["es"]["strings_written"],
+                    if oversize { 1 } else { 2 }
+                );
+                assert!(state.db.get_injection(Some("es")).unwrap().is_some());
+                let copied = PathBuf::from(body["injected_roots"]["es"].as_str().unwrap());
+                let extracted = plugin.extract(&copied).unwrap();
+                assert_eq!(
+                    extracted
+                        .iter()
+                        .filter(|r| r.source == "Hola mundo")
+                        .count(),
+                    if oversize { 1 } else { 2 }
+                );
+            }
+            assert_eq!(std::fs::read(&asset).unwrap(), bytes);
+        }
+    }
 
     fn registration_fixture(root: &Path) -> Vec<(&'static str, Vec<u8>)> {
         let map = serde_json::json!({"events": [null, {"pages": [{"list": [
