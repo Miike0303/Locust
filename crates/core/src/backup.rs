@@ -62,6 +62,42 @@ impl RevisionOriginal {
         Ok(Self { path, sha256, size })
     }
 
+    /// Verify the entire physical original with bounded streaming memory, then
+    /// rewind the SAME handle for seekable member reads. No whole-file buffer
+    /// or unchecked path is exposed. Callers must keep the original stable and
+    /// authenticate the member bytes they consume (as container readers do).
+    /// Windows pins the file against deletion but permits core's write-capable
+    /// staging ownership handles to coexist with the reader.
+    pub fn open_verified(&self) -> Result<fs::File> {
+        use std::io::{Seek, SeekFrom};
+        let path = checked_absolute(&self.path)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0x0000_0003); // FILE_SHARE_READ | FILE_SHARE_WRITE
+        }
+        let mut file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(failure("revision original is not a regular file"));
+        }
+        let read =
+            crate::patch::stream::stream_bounded(&mut file, self.size, None).map_err(|error| {
+                failure(format!(
+                    "revision original changed or could not be read: {error:?}"
+                ))
+            })?;
+        if read.actual_len != self.size || read.sha256_hex != self.sha256 {
+            return Err(failure(format!(
+                "revision original changed since verification: {}",
+                self.path.display()
+            )));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
     pub fn read_text(&self) -> Result<String> {
         let path = checked_absolute(&self.path)?;
         let mut file = fs::File::open(&path)?;
@@ -1452,6 +1488,54 @@ mod tests {
                 .file_type()
                 .is_symlink());
         }
+    }
+
+    #[test]
+    fn revision_seekable_reader_verifies_and_rewinds_without_buffering() {
+        use std::io::{Read, Seek, SeekFrom};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.pck");
+        let bytes = vec![0xa5; 2 * 1024 * 1024 + 17];
+        fs::write(&path, &bytes).unwrap();
+        let original = RevisionOriginal::capture(&path).unwrap();
+        {
+            let mut file = original.open_verified().unwrap();
+            assert_eq!(file.stream_position().unwrap(), 0);
+            file.seek(SeekFrom::End(-17)).unwrap();
+            let mut tail = [0; 17];
+            file.read_exact(&mut tail).unwrap();
+            assert_eq!(tail, [0xa5; 17]);
+            #[cfg(windows)]
+            assert!(fs::remove_file(&path).is_err());
+        }
+        for changed in [
+            vec![0xa6; bytes.len()],
+            vec![0; bytes.len() + 1],
+            vec![0; 9],
+        ] {
+            fs::write(&path, changed).unwrap();
+            assert!(original.open_verified().is_err());
+        }
+        fs::remove_file(&path).unwrap();
+        assert!(original.open_verified().is_err());
+        fs::create_dir(&path).unwrap();
+        assert!(original.open_verified().is_err());
+    }
+
+    #[test]
+    fn revision_seekable_reader_accepts_core_pristine_staging_ownership_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = crate::patch::stream::StagingDir::create_prepared(dir.path()).unwrap();
+        let mut output = stage.create_file("original.pck").unwrap();
+        output.write_all(b"original bytes").unwrap();
+        drop(output);
+        // StagingDir still owns a cloned write-capable identity handle, just
+        // as with_verified_pristine_tree does for single-file backups.
+        let original = RevisionOriginal::capture(&stage.child("original.pck")).unwrap();
+        let mut verified = original.open_verified().unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut verified, &mut bytes).unwrap();
+        assert_eq!(bytes, b"original bytes");
     }
 
     #[test]

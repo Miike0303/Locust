@@ -470,7 +470,11 @@ fn inject_direct_revision(
         return plugin.inject(selected_copy, entries);
     };
     let Some(provenance) = &prior.provenance else {
-        return plugin.inject(selected_copy, entries);
+        // Preserve the revision dispatch even without a pristine counterpart.
+        // Default plugins retain their existing behavior; containers that need
+        // original bytes can explicitly refuse instead of treating this as a
+        // fresh injection into a previously translated archive.
+        return plugin.inject_revision(selected_copy, entries, &HashMap::new());
     };
     let manager = provenance
         .storage_root
@@ -4405,6 +4409,65 @@ mod tests {
     struct SourceMatchWriter;
 
     struct RevisionReader;
+
+    #[test]
+    fn direct_revision_without_provenance_still_dispatches_original_requirement() {
+        struct RequiresOriginal;
+        impl FormatPlugin for RequiresOriginal {
+            fn id(&self) -> &str {
+                "requires-original"
+            }
+            fn name(&self) -> &str {
+                "requires-original"
+            }
+            fn supported_extensions(&self) -> &[&str] {
+                &["pck"]
+            }
+            fn extract(&self, _: &Path) -> Result<Vec<StringEntry>> {
+                Ok(vec![])
+            }
+            fn inject(&self, _: &Path, _: &[StringEntry]) -> Result<InjectionReport> {
+                panic!("a prior Direct output must not silently become a fresh injection")
+            }
+            fn prepare_revision_entries(
+                &self,
+                _: &mut [StringEntry],
+                originals: &HashMap<PathBuf, RevisionOriginal>,
+            ) -> Result<()> {
+                assert!(originals.is_empty());
+                Err(LocustError::InjectionError(
+                    "verified original required".into(),
+                ))
+            }
+        }
+        let run = DirectBackupRun {
+            entry: crate::backup::BackupEntry {
+                id: "unused".into(),
+                path: "unused".into(),
+                created_at: chrono::Utc::now(),
+                source_path: "unused".into(),
+                file_count: 0,
+                size_bytes: 0,
+            },
+            prior: Some(DirectPriorMerge {
+                files: vec![],
+                provenance: None,
+            }),
+            report_backup: None,
+        };
+        let error = inject_direct_revision(
+            &RequiresOriginal,
+            &mut [],
+            &BackupManager::new("unused".into()),
+            Path::new("unused"),
+            Path::new("unused"),
+            Path::new("unused"),
+            &run,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("verified original required"));
+    }
+
     impl FormatPlugin for RevisionReader {
         fn id(&self) -> &str {
             "source-match"

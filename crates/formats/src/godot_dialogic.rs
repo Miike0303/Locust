@@ -4,14 +4,15 @@
 //! `.dch` file stems in this archive as character identifiers. Display names are
 //! never identifiers. Custom/dynamic indexers, identifier overrides and the
 //! installed addon version are not proven. Replace produces an archive-only copy.
-//! Direct's first pass works; unchanged original member MD5s are required on every
-//! pass, so old rows refuse changed members on a second pass. Revision hooks are
-//! intentionally left at their defaults until GD-5b supplies revision proofs.
+//! Direct revisions require core-verified prior output and pristine provenance.
+//! Each touched member is rebuilt from authenticated original bytes after an
+//! exact codec reconstruction proves the current member's compatible structure.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 
+use locust_core::backup::RevisionOriginal;
 use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{Extraction, FormatPlugin, FormatStability, InjectionReport};
 use locust_core::models::StringEntry;
@@ -448,6 +449,38 @@ impl FormatPlugin for GodotDialogicPlugin {
         self.inject_under_lock(path, entries, &lock)
     }
 
+    fn revision_original_path(&self, file_path: &Path) -> PathBuf {
+        file_path
+            .ancestors()
+            .find(|p| {
+                p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pck"))
+                    && (p.is_file() || (!p.is_absolute() && p.components().count() == 1))
+            })
+            .unwrap_or(file_path)
+            .to_path_buf()
+    }
+
+    fn inject_revision(
+        &self,
+        path: &Path,
+        entries: &mut [StringEntry],
+        originals: &HashMap<PathBuf, RevisionOriginal>,
+    ) -> Result<InjectionReport> {
+        let Some(target) = target(path, entries)? else {
+            return Ok(empty_report());
+        };
+        let canonical = target.path.canonicalize()?;
+        let original = originals
+            .get(&target.path)
+            .or_else(|| originals.get(&canonical))
+            .ok_or_else(|| {
+                refused("revision requires a verified original for this exact physical PCK")
+            })?;
+        let lock = GameLock::acquire(target.path.parent().unwrap())?;
+        let (report, replacements) = prepare_injection_from(&target, Some(original))?;
+        install(&lock, target.path, report, replacements)
+    }
+
     fn inject_under_lock(
         &self,
         path: &Path,
@@ -463,26 +496,66 @@ impl FormatPlugin for GodotDialogicPlugin {
         if !entries.iter().any(|e| e.translation.is_some()) {
             return Ok(report);
         }
-        let (mut report, replacements) = prepare_injection(&target)?;
-        if !replacements.is_empty() {
-            let refs = replacements
-                .iter()
-                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-                .collect::<Vec<_>>();
-            godot_pck::replace_archive(lock, &target.path, &refs, &[])?;
-            report.files_modified = 1;
-            report.files_written.push(target.path);
-        }
-        Ok(report)
+        let (report, replacements) = prepare_injection(&target)?;
+        install(lock, target.path, report, replacements)
     }
+}
+
+fn install(
+    lock: &GameLock,
+    path: PathBuf,
+    mut report: InjectionReport,
+    replacements: Replacements,
+) -> Result<InjectionReport> {
+    if !replacements.is_empty() {
+        let refs = replacements
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        godot_pck::replace_archive(lock, &path, &refs, &[])?;
+        report.files_modified = 1;
+        report.files_written.push(path);
+    }
+    Ok(report)
 }
 
 // All member provenance and codec checks run before transactional staging.
 // Kept separate so malformed-input refusal is testable without an OS lock.
 type Replacements = Vec<(String, Vec<u8>)>;
 fn prepare_injection(target: &Target<'_>) -> Result<(InjectionReport, Replacements)> {
+    prepare_injection_from(target, None)
+}
+
+fn prepare_injection_from(
+    target: &Target<'_>,
+    revision: Option<&RevisionOriginal>,
+) -> Result<(InjectionReport, Replacements)> {
     let mut report = empty_report();
     let (mut file, index) = source_index(&target.path)?;
+    // Verification scans the physical original with bounded memory; only the
+    // index and requested timeline payloads are subsequently retained/read.
+    let mut original_file = revision.map(RevisionOriginal::open_verified).transpose()?;
+    let original_index = original_file
+        .as_mut()
+        .map(godot_pck::read_index)
+        .transpose()?;
+    if let Some(original) = &original_index {
+        if index.format_version != original.format_version
+            || index.engine_version != original.engine_version
+            || index.flags != original.flags
+            || index.reserved != original.reserved
+            || index.entries.len() != original.entries.len()
+            || index.entries.iter().zip(&original.entries).any(|(a, b)| {
+                a.path != b.path
+                    || a.padded_path != b.padded_path
+                    || a.flags != b.flags
+                    || (a.path.ends_with(".dch")
+                        && (a.stored_md5 != b.stored_md5 || a.size != b.size))
+            })
+        {
+            return Err(refused("revision archive structure/order or character authority differs from verified original"));
+        }
+    }
     let (characters, duplicate) = characters(&mut file, &index, &mut report.warnings);
     if duplicate || !report.warnings.is_empty() {
         return Err(refused("character authority cannot be authenticated; re-extract after resolving character diagnostics"));
@@ -500,7 +573,8 @@ fn prepare_injection(target: &Target<'_>) -> Result<(InjectionReport, Replacemen
         if count == 0 {
             continue;
         }
-        let entry = index
+        let base_index = original_index.as_ref().unwrap_or(&index);
+        let entry = base_index
             .entries
             .iter()
             .find(|e| e.path == member)
@@ -509,23 +583,74 @@ fn prepare_injection(target: &Target<'_>) -> Result<(InjectionReport, Replacemen
             .iter()
             .any(|(_, l)| l.original_md5 != md5_hex(&entry.stored_md5))
         {
+            if revision.is_some() {
+                return Err(refused(format!(
+                    "original member MD5 differs from row provenance: {member}"
+                )));
+            }
             report.skip("stale-member", count);
-            warn(&mut report.warnings, member, "original member MD5 differs; stale/wrong archive or unsupported second Direct pass; re-extract (revision proof pending)");
+            warn(&mut report.warnings, member, "original member MD5 differs; stale/wrong archive or revision requires a core-verified original");
             continue;
         }
-        let original =
-            match godot_pck::read_member(&mut file, entry, dialogic::MAX_INPUT_BYTES as u64)
-                .and_then(|bytes| String::from_utf8(bytes).map_err(std::io::Error::other))
-            {
-                Ok(text) => text,
-                Err(e) => {
-                    report.skip("unreadable-member", count);
-                    warn(&mut report.warnings, member, e);
-                    continue;
+        let original = match godot_pck::read_member(
+            original_file.as_mut().unwrap_or(&mut file),
+            entry,
+            dialogic::MAX_INPUT_BYTES as u64,
+        )
+        .and_then(|bytes| String::from_utf8(bytes).map_err(std::io::Error::other))
+        {
+            Ok(text) => text,
+            Err(e) => {
+                if revision.is_some() {
+                    return Err(refused(format!(
+                        "verified original member unreadable: {member}: {e}"
+                    )));
                 }
-            };
+                report.skip("unreadable-member", count);
+                warn(&mut report.warnings, member, e);
+                continue;
+            }
+        };
         let timeline = dialogic::parse_timeline(&original, &characters)?;
         let mut translations = HashMap::new();
+        let current = if revision.is_some() {
+            let current_entry = index.entries.iter().find(|e| e.path == member).unwrap();
+            let bytes =
+                godot_pck::read_member(&mut file, current_entry, dialogic::MAX_INPUT_BYTES as u64)?;
+            String::from_utf8(bytes)
+                .map_err(|e| refused(format!("current member is not UTF-8: {e}")))?
+        } else {
+            original.clone()
+        };
+        let current_timeline = dialogic::parse_timeline(&current, &characters)?;
+        if revision.is_some() {
+            if timeline.diagnostics != current_timeline.diagnostics
+                || timeline.spans.len() != current_timeline.spans.len()
+            {
+                return Err(refused(format!(
+                    "revision codec structure differs: {member}"
+                )));
+            }
+            for (a, b) in timeline.spans.iter().zip(&current_timeline.spans) {
+                if a.id != b.id || a.speaker != b.speaker {
+                    return Err(refused(format!(
+                        "revision codec identity differs: {member}"
+                    )));
+                }
+                translations.insert(
+                    a.id.clone(),
+                    a.encode_literal_translation(&b.literal_text())?,
+                );
+            }
+            // Stronger than matching visible text/IDs/counts: every byte outside
+            // translated pieces, segment edges, and all controls must survive.
+            if dialogic::rebuild(&original, &timeline, &translations)? != current {
+                return Err(refused(format!(
+                    "revision codec structure differs outside translated spans: {member}"
+                )));
+            }
+        }
+        let mut changed = 0;
         for (row, locator) in rows {
             let span = timeline
                 .spans
@@ -540,7 +665,12 @@ fn prepare_injection(target: &Target<'_>) -> Result<(InjectionReport, Replacemen
             let Some(translation) = &row.translation else {
                 continue;
             };
-            if translation == &row.source {
+            let current_span = current_timeline
+                .spans
+                .iter()
+                .find(|s| s.id == span.id)
+                .unwrap();
+            if translation == &current_span.literal_text() {
                 continue;
             }
             // Validate each row independently so one bad row cannot discard
@@ -557,6 +687,7 @@ fn prepare_injection(target: &Target<'_>) -> Result<(InjectionReport, Replacemen
                 }) {
                 Ok(encoded) => {
                     translations.insert(span.id.clone(), encoded);
+                    changed += 1;
                 }
                 Err(e) => {
                     report.skip("invalid-translation", 1);
@@ -572,8 +703,8 @@ fn prepare_injection(target: &Target<'_>) -> Result<(InjectionReport, Replacemen
             continue;
         }
         let rebuilt = dialogic::rebuild(&original, &timeline, &translations)?;
-        if rebuilt != original {
-            report.strings_written += translations.len();
+        if rebuilt != current {
+            report.strings_written += changed;
             replacements.push((member.to_owned(), rebuilt.into_bytes()));
         }
     }
@@ -613,6 +744,193 @@ mod tests {
 
     fn plan(path: &Path, rows: &[StringEntry]) -> Result<(InjectionReport, Replacements)> {
         prepare_injection(&target(path, rows)?.unwrap())
+    }
+
+    fn rewrite(path: &Path, replacements: &Replacements, additions: &[(&str, &[u8])]) {
+        let mut source = File::open(path).unwrap();
+        let index = godot_pck::read_index(&mut source).unwrap();
+        let refs = replacements
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+        godot_pck::rebuild(&mut source, &index, &refs, additions, &mut output).unwrap();
+        drop(source);
+        std::fs::write(path, output).unwrap();
+    }
+
+    #[test]
+    fn revision_plan_abc_partial_noop_and_original_restoration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("game.pck");
+        let mut rows = fixture(&path);
+        assert_eq!(
+            GodotDialogicPlugin.revision_original_path(&rows[0].file_path),
+            Path::new("game.pck")
+        );
+        assert_eq!(
+            GodotDialogicPlugin.revision_original_path(&path.join("folder.pck/story.dtl")),
+            path
+        );
+        let pristine = temp.path().join("original");
+        std::fs::copy(&path, &pristine).unwrap();
+        let original = RevisionOriginal::capture(&pristine).unwrap();
+        rows[0].translation = Some("Primera [b]{player}[/b]!".into());
+        rows[1].translation = Some("Sí".into());
+        rows[2].translation = Some("Otro texto traducido".into());
+        rewrite(&path, &plan(&path, &rows).unwrap().1, &[]);
+        for value in ["Segunda muy larga [b]{player}[/b]!", "C [b]{player}[/b]!"] {
+            rows[0].translation = Some(value.into());
+            let selected = target(&path, &rows[..1]).unwrap().unwrap();
+            let (report, replacements) =
+                prepare_injection_from(&selected, Some(&original)).unwrap();
+            assert_eq!(report.strings_written, 1);
+            assert_eq!(replacements.len(), 1);
+            let text = String::from_utf8_lossy(&replacements[0].1);
+            assert!(text.contains(value));
+            assert!(text.ends_with("\n- Sí\n"), "prior span lost: {text}");
+            rewrite(&path, &replacements, &[]);
+        }
+        let selected = target(&path, &rows[..1]).unwrap().unwrap();
+        let (report, replacements) = prepare_injection_from(&selected, Some(&original)).unwrap();
+        assert_eq!(report.strings_written, 0);
+        assert!(replacements.is_empty());
+        // An explicit translation back to source must undo the prior span.
+        rows[0].translation = Some(rows[0].source.clone());
+        let selected = target(&path, &rows[..1]).unwrap().unwrap();
+        let (report, replacements) = prepare_injection_from(&selected, Some(&original)).unwrap();
+        assert_eq!(report.strings_written, 1);
+        assert!(String::from_utf8_lossy(&replacements[0].1).contains("Hello [b]{player}[/b]!"));
+        let mut current = File::open(&path).unwrap();
+        let index = godot_pck::read_index(&mut current).unwrap();
+        let other = index
+            .entries
+            .iter()
+            .find(|e| e.path == "res://other.dtl")
+            .unwrap();
+        assert_eq!(
+            godot_pck::read_member(&mut current, other, 4096).unwrap(),
+            b"Otro texto traducido\n"
+        );
+    }
+
+    #[test]
+    fn revision_plan_refuses_original_md5_and_codec_or_archive_structure_without_writes() {
+        for variant in [
+            "md5",
+            "comment",
+            "control",
+            "event",
+            "authority",
+            "member-set",
+            "order",
+            "header",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("game.pck");
+            let mut rows = fixture(&path);
+            let pristine = temp.path().join("original");
+            std::fs::copy(&path, &pristine).unwrap();
+            let original = RevisionOriginal::capture(&pristine).unwrap();
+            rows[0].translation = Some("Nuevo [b]{player}[/b]!".into());
+            match variant {
+                "md5" => {
+                    rows[0].metadata.get_mut(LOCATOR_KEY).unwrap()["original_md5"] =
+                        serde_json::json!("00000000000000000000000000000000")
+                }
+                "comment" => rewrite(
+                    &path,
+                    &vec![(
+                        "res://story.dtl".into(),
+                        b"hero: Hello [b]{player}[/b]!\n- Yes\n# added comment\n".to_vec(),
+                    )],
+                    &[],
+                ),
+                "control" => rewrite(
+                    &path,
+                    &vec![(
+                        "res://story.dtl".into(),
+                        b"hero: Hello [i]{player}[/i]!\n- Yes\n".to_vec(),
+                    )],
+                    &[],
+                ),
+                "event" => rewrite(
+                    &path,
+                    &vec![(
+                        "res://story.dtl".into(),
+                        b"hero: Hello [b]{player}[/b]!\n- Yes\nNew event\n".to_vec(),
+                    )],
+                    &[],
+                ),
+                "authority" => rewrite(
+                    &path,
+                    &vec![(
+                        "res://hero.dch".into(),
+                        br#"{"display_name":"Changed"}"#.to_vec(),
+                    )],
+                    &[],
+                ),
+                "member-set" => rewrite(&path, &vec![], &[("res://added.bin", b"new")]),
+                "order" => {
+                    let mut file = File::open(&path).unwrap();
+                    let mut index = godot_pck::read_index(&mut file).unwrap();
+                    index.entries.swap(0, 1);
+                    let mut output = Vec::new();
+                    // A genuine reordered archive, not a forged index argument.
+                    let additions = index
+                        .entries
+                        .iter()
+                        .map(|e| {
+                            (
+                                e.path.clone(),
+                                godot_pck::read_member(&mut file, e, 4096).unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    drop(file);
+                    let mut empty = vec![0; 100];
+                    empty[..4].copy_from_slice(b"GDPC");
+                    empty[4..8].copy_from_slice(&2u32.to_le_bytes());
+                    empty[8..12].copy_from_slice(&4u32.to_le_bytes());
+                    let mut source = Cursor::new(empty);
+                    let index = godot_pck::read_index(&mut source).unwrap();
+                    let refs = additions
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_slice()))
+                        .collect::<Vec<_>>();
+                    godot_pck::rebuild(&mut source, &index, &[], &refs, &mut output).unwrap();
+                    std::fs::write(&path, output).unwrap();
+                }
+                "header" => {
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    bytes[32] = 1;
+                    std::fs::write(&path, bytes).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(&path).unwrap();
+            let selected = target(&path, &rows[..1]).unwrap().unwrap();
+            assert!(
+                prepare_injection_from(&selected, Some(&original)).is_err(),
+                "{variant}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn revision_api_refuses_missing_original_before_lock_or_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("game.pck");
+        let mut rows = fixture(&path);
+        rows[0].translation = Some("Nuevo [b]{player}[/b]!".into());
+        let before = std::fs::read(&path).unwrap();
+        assert!(GodotDialogicPlugin
+            .inject_revision(&path, &mut rows, &HashMap::new())
+            .unwrap_err()
+            .to_string()
+            .contains("verified original"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
