@@ -900,6 +900,7 @@ impl MultiLangInjector {
         // backup, copy, plugin dispatch and atomic provenance recording.
         let source_lock = crate::patch::GameLock::acquire(source_root)?;
         crate::injection_transaction::ensure_no_pending_under_lock(&source_lock)?;
+        crate::injection_transaction::refuse_direct_copy_source(&selected)?;
         let backup = self.backup_manager.create_backup(&selected).map_err(|e| {
             LocustError::BackupError(format!(
                 "{e} — injection is refused without a backup for recovery. \
@@ -3108,7 +3109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_after_direct_does_not_copy_game_bound_history() {
+    async fn replace_after_restored_direct_does_not_copy_game_bound_history() {
         let (_injector_guards, injector, game, output) = setup_contained_injector();
         fs::create_dir(game.join(".locust-injections-notes")).unwrap();
         fs::write(game.join(".locust-injections-notes/user.txt"), b"user").unwrap();
@@ -3116,7 +3117,7 @@ mod tests {
         fs::write(game.join("assets/.locust-injections/user.txt"), b"nested").unwrap();
         fs::create_dir_all(game.join(".locust")).unwrap();
         fs::write(game.join(".locust/user.txt"), b"existing metadata").unwrap();
-        inject_direct(
+        let direct = inject_direct(
             &injector.registry,
             &injector.db,
             &injector.backup_manager,
@@ -3127,6 +3128,27 @@ mod tests {
         .unwrap();
         assert!(crate::injection_transaction::validate_store(&game).unwrap());
         let source_marker = fs::read(game.join(".locust-injections/store.json")).unwrap();
+        assert!(game.join("game.injected").is_file());
+        // Replace refuses active Direct outputs. Restore the verified original
+        // first, retaining committed history to exercise copy exclusion safely.
+        injector.backup_manager.restore(&direct.backup_id).unwrap();
+        assert!(!game.join("game.injected").exists());
+        assert_eq!(fs::read(game.join("game.mock")).unwrap(), b"");
+        assert_eq!(fs::read(game.join("image.png")).unwrap(), b"fake png data");
+        assert!(crate::injection_transaction::validate_store(&game).unwrap());
+        assert!(crate::injection_transaction::status(&game)
+            .unwrap()
+            .applied
+            .is_empty());
+        let source_history = || {
+            WalkDir::new(game.join(crate::injection_transaction::STORE_DIR))
+                .into_iter()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| (entry.path().to_path_buf(), fs::read(entry.path()).unwrap()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let restored_history = source_history();
         let (tx, _rx) = mpsc::channel(10);
         let report = injector
             .inject(
@@ -3181,6 +3203,7 @@ mod tests {
             fs::read(copy.join(".locust-injections/store.json")).unwrap(),
             source_marker
         );
+        assert_eq!(source_history(), restored_history);
     }
 
     #[tokio::test]

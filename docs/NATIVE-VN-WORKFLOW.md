@@ -37,6 +37,8 @@ This path does not silently remove accents, fit the text into an invented byte b
 
 ## 4. Create and inspect the translated copy
 
+**Previously Direct-injected source:** when retained injection history shows that the selected source is still Direct-modified, Replace refuses **before creating a backup or output**, even with the project that recorded that injection. Restore the verified original backup first, or select a pristine game folder. **Do not delete injection history to force a copy.** Verified Direct revision remains a separate, existing in-place workflow—not a workaround for a refused copy. This check does not detect every source edit.
+
 1. Select “Inject” / “Inyectar”. Choose “Replace — create a translated copy (original untouched)” / “Reemplazar — crear una copia traducida (original intacto)”. Replace-only engines default to this mode, but check the selection every time.
 2. Select only the language actually translated in this database. Choose a separate “Output folder” / “Carpeta de salida”, outside the original game. Review the proposed destination, then select “Create translated copy” / “Crear copia traducida”. Do not choose “Direct” to work around a refusal.
 3. Inspect the **actual returned translated-copy path**, not just the chosen parent folder or predicted name. Check strings written, files modified, skipped counts, skip reasons, warnings, failed languages and recording problems. “Injection complete” is not whole-game coverage; unexplained skips or unchanged Japanese prevent a complete-result claim.

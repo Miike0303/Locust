@@ -679,11 +679,44 @@ pub(crate) fn refuse_unrecorded_direct_outputs(
     selection: &Path,
     recording: Option<&crate::database::InjectionRecording>,
 ) -> Result<()> {
+    if let Some(path) = unrecorded_direct_output(selection, recording)? {
+        return Err(error(format!(
+            "Direct re-injection refused: previously injected file {path:?} has no matching \
+             recording with pristine-backup provenance in this project. To revise in place, \
+             use the project DB that recorded this injection; otherwise restore the original \
+             backup first (locust backups, then locust restore-backup <id>), or inject into a \
+             fresh pristine game copy. No new output has been installed.",
+        )));
+    }
+    Ok(())
+}
+
+/// Replace copies live source bytes and does not use Direct's verified-pristine
+/// revision path. Even this project's own recording cannot authorize that copy:
+/// stale source locators could silently produce a mixed-language generation.
+/// Called under the source GameLock, before creating a backup or destination.
+pub(crate) fn refuse_direct_copy_source(selection: &Path) -> Result<()> {
+    if let Some(path) = unrecorded_direct_output(selection, None)? {
+        return Err(error(format!(
+            "Replace copy refused: source file {path:?} is still owned by a Direct or \
+             unknown-mode injection. Restore the original backup first (locust backups, \
+             then locust restore-backup <id>), or use a fresh pristine game copy. \
+             To revise in place, use Direct with the project DB that recorded the injection. \
+             No new backup or output has been created.",
+        )));
+    }
+    Ok(())
+}
+
+fn unrecorded_direct_output(
+    selection: &Path,
+    recording: Option<&crate::database::InjectionRecording>,
+) -> Result<Option<String>> {
     let root = root_for(selection)?;
     let generations = committed_generations_with(&root, true)?;
     let owners = committed_owners(&generations)?;
     if owners.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let active = load(&root)?;
     let identities = generations
@@ -716,16 +749,9 @@ pub(crate) fn refuse_unrecorded_direct_outputs(
         }) {
             continue;
         }
-        return Err(error(format!(
-            "Direct re-injection refused: previously injected file {:?} has no matching \
-             recording with pristine-backup provenance in this project. To revise in place, \
-             use the project DB that recorded this injection; otherwise restore the original \
-             backup first (locust backups, then locust restore-backup <id>), or inject into a \
-             fresh pristine game copy. No new output has been installed.",
-            change.path,
-        )));
+        return Ok(Some(change.path.clone()));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Reconcile only completed Direct outputs explicitly retired by backup restore.
