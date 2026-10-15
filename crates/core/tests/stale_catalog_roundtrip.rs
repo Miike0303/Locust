@@ -36,6 +36,67 @@ impl Catalog {
     }
 }
 
+async fn catalog_line_endings_keep_source_matching_exact(format: Catalog) {
+    for file_ending in ["\n", "\r\n", "\r"] {
+        let db = Database::open_in_memory().unwrap();
+        let entries: Vec<_> = [
+            ("lf", "  First\nsecond\t "),
+            ("crlf", "First\r\nsecond"),
+            ("cr", "First\rsecond"),
+            ("changed", "Old\nsource"),
+            ("whitespace", "  Same\nsource\t "),
+            ("content-ending", "Same\nsource"),
+        ]
+        .into_iter()
+        .map(|(id, source)| {
+            let mut entry = StringEntry::new(id, source, "story.json".into());
+            entry.translation = Some("  Uno\r\ndos\rtres\ncuatro\t ".into());
+            entry.status = StringStatus::Approved;
+            entry
+        })
+        .collect();
+        let catalog = format.export(&entries).replace('\n', file_ending);
+        db.save_entries(&entries).unwrap();
+        for (id, source) in [
+            ("changed", "Current\nsource"),
+            ("whitespace", "  Same\nsource "),
+            ("content-ending", "Same\r\nsource"),
+        ] {
+            let mut entry = db.get_entry(id).unwrap().unwrap();
+            entry.source = source.into();
+            db.save_entries(&[entry]).unwrap();
+        }
+        let before: Vec<_> = entries
+            .iter()
+            .map(|entry| db.get_entry(&entry.id).unwrap().unwrap())
+            .collect();
+        let (updates, skipped) = format.parse(&catalog);
+        assert_eq!(skipped, 0);
+        assert_eq!(updates.len(), 6);
+        let report = db.save_imported_translations_batch(updates).await.unwrap();
+        assert_eq!(report.imported, 3, "file ending: {file_ending:?}");
+        assert_eq!(report.unchanged, 3);
+        assert_eq!(report.stale_sources, 3);
+        assert_eq!(report.unknown_ids, 0);
+        for expected in before {
+            assert_eq!(
+                serde_json::to_value(db.get_entry(&expected.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn xliff_line_endings_keep_source_matching_exact() {
+    catalog_line_endings_keep_source_matching_exact(Catalog::Xliff).await;
+}
+
+#[tokio::test]
+async fn po_line_endings_keep_source_matching_exact() {
+    catalog_line_endings_keep_source_matching_exact(Catalog::Po).await;
+}
+
 fn stale_row() -> (Database, StringEntry) {
     let db = Database::open_in_memory().unwrap();
     let mut entry = StringEntry::new("story#0#message", "Hello", "story.json".into());

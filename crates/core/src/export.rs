@@ -2,7 +2,18 @@ use crate::error::{LocustError, Result};
 use crate::models::{StringEntry, STALE_TRANSLATION_METADATA_KEY};
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::Path;
+
+// Normalize physical file line endings before decoding XML references or PO escapes.
+// XML 1.0 §2.11 requires this for the entire document, including CDATA.
+fn normalize_line_endings(content: &str) -> Cow<'_, str> {
+    if content.contains('\r') {
+        Cow::Owned(content.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(content)
+    }
+}
 
 /// Refuse destinations that would replace the project or its SQLite sidecars.
 pub fn check_export_destination(output: &Path, project_db: &Path) -> Result<()> {
@@ -97,6 +108,7 @@ pub fn export_po(entries: &[StringEntry], source_lang: &str, target_lang: &str) 
 }
 
 pub fn import_po(content: &str) -> Result<Vec<PoEntry>> {
+    let content = normalize_line_endings(content);
     let mut entries = Vec::new();
     let mut current_id: Option<String> = None;
     let mut current_reference_id: Option<String> = None;
@@ -258,6 +270,7 @@ enum ReadingState {
 fn escape_po(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
+        .replace('\r', "\\r")
         .replace('\n', "\\n")
 }
 
@@ -268,6 +281,7 @@ fn unescape_po(s: &str) -> String {
         if c == '\\' {
             match chars.next() {
                 Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
                 Some('"') => result.push('"'),
                 Some('\\') => result.push('\\'),
                 Some(other) => {
@@ -379,7 +393,8 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
         has_source: bool,
         has_target: bool,
     }
-    let mut reader = NsReader::from_str(content);
+    let content = normalize_line_endings(content);
+    let mut reader = NsReader::from_str(&content);
     reader.config_mut().expand_empty_elements = true;
     let mut stack = Vec::new();
     let mut root_seen = false;
@@ -614,6 +629,7 @@ fn escape_xml(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\r', "&#13;")
 }
 
 #[cfg(test)]
@@ -1165,6 +1181,129 @@ msgstr "Hola"
         assert!(xliff.contains("<trans-unit id=\"e1\">"));
         assert!(xliff.contains("<source>Hello</source>"));
         assert!(xliff.contains("<target>Hola</target>"));
+    }
+
+    fn assert_xliff_document_line_endings(ending: &str) {
+        let input = concat!(
+            "<xliff><file><body><trans-unit id=\" story#0&amp;日本語 \t\">",
+            "<source>  First\n<![CDATA[second\nthird]]>\t </source>",
+            "<target>  Uno\n<![CDATA[dos\ntres]]>\t </target>",
+            "</trans-unit></body></file></xliff>"
+        )
+        .replace('\n', ending);
+        let units = import_xliff(&input).unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].id, " story#0&日本語 \t");
+        assert_eq!(units[0].source, "  First\nsecond\nthird\t ");
+        assert_eq!(units[0].target, "  Uno\ndos\ntres\t ");
+    }
+
+    #[test]
+    fn xliff_crlf_document_normalizes_text_and_cdata() {
+        assert_xliff_document_line_endings("\r\n");
+    }
+
+    #[test]
+    fn xliff_lone_cr_document_normalizes_text_and_cdata() {
+        assert_xliff_document_line_endings("\r");
+    }
+
+    #[test]
+    fn xliff_line_endings_do_not_normalize_character_references() {
+        let units = import_xliff(concat!(
+            "<xliff>\r\n<file><body><trans-unit id=\"id&#13;&#xD;\">",
+            "<source>A\r\nB\rC&#13;D&#xD;\n&amp;#13;</source>",
+            "<target>X&#13;\r\nY&#xD;\rZ</target>",
+            "</trans-unit></body></file></xliff>"
+        ))
+        .unwrap();
+        assert_eq!(units[0].id, "id\r\r");
+        assert_eq!(units[0].source, "A\nB\nC\rD\r\n&#13;");
+        assert_eq!(units[0].target, "X\r\nY\r\nZ");
+    }
+
+    #[test]
+    fn xliff_roundtrip_preserves_crlf_cr_and_lf_content() {
+        for ending in ["\r\n", "\r", "\n"] {
+            let mut entry = StringEntry::new(
+                format!(" story#0{ending}&日本語 "),
+                format!("  First{ending}second\t & <tag> &#13; "),
+                "story.json".into(),
+            );
+            entry.translation = Some(format!("  Uno{ending}dos\t &#xD; "));
+            let exported = export_xliff(std::slice::from_ref(&entry), "en", "es");
+            assert!(!exported.contains('\r'), "literal CR must be a reference");
+            if ending.contains('\r') {
+                assert!(exported.contains("&#13;"));
+            }
+            for file_ending in ["\n", "\r\n", "\r"] {
+                let units = import_xliff(&exported.replace('\n', file_ending)).unwrap();
+                assert_eq!(units[0].id, entry.id);
+                assert_eq!(units[0].source, entry.source);
+                assert_eq!(Some(units[0].target.as_str()), entry.translation.as_deref());
+            }
+        }
+    }
+
+    #[test]
+    fn po_crlf_document_preserves_multiline_strings() {
+        let input = concat!(
+            "msgctxt \" story#0&日本語 \"\n",
+            "msgid \"  First\\n\"\n\"second\\nthird\t \"\n",
+            "msgstr \"  Uno\\n\"\n\"dos\\ntres\t \"\n"
+        )
+        .replace('\n', "\r\n");
+        let entries = import_po(&input).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id.as_deref(), Some(" story#0&日本語 "));
+        assert_eq!(entries[0].source, "  First\nsecond\nthird\t ");
+        assert_eq!(entries[0].translation, "  Uno\ndos\ntres\t ");
+    }
+
+    #[test]
+    fn po_lone_cr_document_preserves_multiline_strings() {
+        let input = "msgctxt \"id\"\rmsgid \"First\\nsecond\"\rmsgstr \"Uno\\ndos\"\r";
+        let entries = import_po(input).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id.as_deref(), Some("id"));
+        assert_eq!(entries[0].source, "First\nsecond");
+        assert_eq!(entries[0].translation, "Uno\ndos");
+    }
+
+    #[test]
+    fn po_line_endings_do_not_normalize_escaped_cr() {
+        let entries = import_po(concat!(
+            "msgctxt \"id\\r\"\r\n",
+            "msgid \"A\\r\\nB\\rC\\nD\\\\r\"\r\n",
+            "msgstr \"X\\r\\nY\\rZ\\nW\\\\r\"\r\n"
+        ))
+        .unwrap();
+        assert_eq!(entries[0].id.as_deref(), Some("id\r"));
+        assert_eq!(entries[0].source, "A\r\nB\rC\nD\\r");
+        assert_eq!(entries[0].translation, "X\r\nY\rZ\nW\\r");
+    }
+
+    #[test]
+    fn po_roundtrip_preserves_crlf_cr_and_lf_content() {
+        for ending in ["\r\n", "\r", "\n"] {
+            let mut entry = StringEntry::new(
+                format!(" story#0{ending}&日本語 "),
+                format!("  First{ending}second\t \\r "),
+                "story.json".into(),
+            );
+            entry.translation = Some(format!("  Uno{ending}dos\t \\r "));
+            let exported = export_po(std::slice::from_ref(&entry), "en", "es");
+            assert!(!exported.contains('\r'), "literal CR must be escaped");
+            for file_ending in ["\n", "\r\n", "\r"] {
+                let entries = import_po(&exported.replace('\n', file_ending)).unwrap();
+                assert_eq!(entries[0].id.as_deref(), Some(entry.id.as_str()));
+                assert_eq!(entries[0].source, entry.source);
+                assert_eq!(
+                    Some(entries[0].translation.as_str()),
+                    entry.translation.as_deref()
+                );
+            }
+        }
     }
 
     #[test]

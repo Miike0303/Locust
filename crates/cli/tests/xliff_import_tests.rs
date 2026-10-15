@@ -3,6 +3,7 @@ use locust_core::{
     database::Database,
     models::{StringEntry, StringStatus},
 };
+use predicates::prelude::PredicateBooleanExt;
 use std::{fs, path::Path};
 
 fn command(root: &Path, database: &Path, input: &Path) -> Command {
@@ -83,4 +84,78 @@ fn old_source_from_xliff_is_skipped_instead_of_replacing_a_current_translation()
     let entry = db.get_entry("entry").unwrap().unwrap();
     assert_eq!(entry.translation.as_deref(), Some("Current translation"));
     assert_eq!(entry.status, StringStatus::Approved);
+}
+
+fn exported_crlf_catalog_roundtrips_counts(format: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("project.locust.db");
+    let config = temp.path().join("offline.json");
+    fs::write(&config, r#"{"providers":{},"default_provider":null}"#).unwrap();
+    let db = Database::open(&database).unwrap();
+    // Reproduce the reported shape: 525 rows, including 57 multiline sources.
+    let entries: Vec<_> = (0..525)
+        .map(|index| {
+            let source = if index < 57 {
+                format!("First line {index}\nSecond line")
+            } else {
+                format!("Single line {index}")
+            };
+            let mut entry = StringEntry::new(
+                format!("story#{index}#message"),
+                source,
+                "story.json".into(),
+            );
+            entry.translation = Some(format!("Traducción {index}\nSegunda línea"));
+            entry.status = StringStatus::Approved;
+            entry
+        })
+        .collect();
+    db.save_entries(&entries).unwrap();
+    drop(db);
+    let catalog = temp.path().join(format!("translations.{format}"));
+    for operation in ["export", "import"] {
+        let mut command = Command::cargo_bin("locust").unwrap();
+        command
+            .env("LOCUST_DATA_DIR", temp.path().join("profile"))
+            .env("LOCUST_BACKUP_ROOT", temp.path().join("backups"))
+            .arg("--config")
+            .arg(&config)
+            .arg(operation)
+            .arg(&database)
+            .args(["-f", format, "-l", "es"])
+            .arg(if operation == "export" { "-o" } else { "-i" })
+            .arg(&catalog);
+        if operation == "export" {
+            command.assert().success();
+            let content = fs::read_to_string(&catalog).unwrap();
+            assert!(!content.contains('\r'));
+            fs::write(&catalog, content.replace('\n', "\r\n")).unwrap();
+        } else {
+            command
+                .assert()
+                .success()
+                .stdout(predicates::str::contains("Imported 525 translations"))
+                .stdout(predicates::str::contains(
+                    "Unchanged 525 (already identical)",
+                ))
+                .stdout(predicates::str::contains("Skipped").not());
+        }
+    }
+    let db = Database::open(&database).unwrap();
+    for expected in entries {
+        assert_eq!(
+            serde_json::to_value(db.get_entry(&expected.id).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+}
+
+#[test]
+fn exported_crlf_xliff_roundtrips_all_525_rows() {
+    exported_crlf_catalog_roundtrips_counts("xliff");
+}
+
+#[test]
+fn exported_crlf_po_roundtrips_all_525_rows() {
+    exported_crlf_catalog_roundtrips_counts("po");
 }
