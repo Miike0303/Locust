@@ -806,6 +806,26 @@ pub struct MultiLangReport {
     pub recording_outcomes: HashMap<String, RecordOutcome>,
 }
 
+/// Policy for Add or Replace injection. Direct has its own unchanged API.
+#[derive(Debug, Clone)]
+pub struct MultiLangInjectionOptions {
+    pub mode: OutputMode,
+    /// Refuse Replace before backup/output when a known binary capacity is
+    /// exceeded. This is not a completeness guarantee: unknown capacities,
+    /// missing translations and unexpected plugin skips are not covered.
+    /// Unsupported modes are refused rather than silently ignoring the flag.
+    pub require_binary_slot_fit: bool,
+}
+
+impl Default for MultiLangInjectionOptions {
+    fn default() -> Self {
+        Self {
+            mode: OutputMode::Replace,
+            require_binary_slot_fit: false,
+        }
+    }
+}
+
 pub struct MultiLangInjector {
     pub registry: Arc<FormatRegistry>,
     pub db: Arc<Database>,
@@ -834,6 +854,37 @@ impl MultiLangInjector {
         output_dir: Option<PathBuf>,
         tx: mpsc::Sender<ProgressEvent>,
     ) -> Result<MultiLangReport> {
+        self.inject_with_options(
+            project_path,
+            format_id,
+            MultiLangInjectionOptions {
+                mode,
+                ..Default::default()
+            },
+            languages,
+            output_dir,
+            tx,
+        )
+        .await
+    }
+
+    /// Inject with an explicit policy, using one all-rows snapshot for both
+    /// preflight (including untranslated shared-budget members) and dispatch.
+    pub async fn inject_with_options(
+        &self,
+        project_path: &Path,
+        format_id: &str,
+        options: MultiLangInjectionOptions,
+        languages: Vec<String>,
+        output_dir: Option<PathBuf>,
+        tx: mpsc::Sender<ProgressEvent>,
+    ) -> Result<MultiLangReport> {
+        let mode = options.mode;
+        if options.require_binary_slot_fit && mode != OutputMode::Replace {
+            return Err(LocustError::InjectionError(
+                "require_binary_slot_fit is supported only for Replace mode".into(),
+            ));
+        }
         if languages.len() != 1 {
             return Err(LocustError::InjectionError(
                 "one project database can inject exactly one target language per run; use a separate pivot/database for each target language"
@@ -849,6 +900,22 @@ impl MultiLangInjector {
             check_entries_for_target(&mut entries, project_path, false)?;
             for entry in &entries {
                 validated_injection_source(entry)?;
+            }
+        }
+        if options.require_binary_slot_fit {
+            // Physical provenance, stale sources and encoding checks above
+            // retain precedence. Check the same physical representation the
+            // plugin receives: a semantic-equal pivot target can still grow a
+            // grouped blob. Never filter out untranslated group members.
+            entries = restore_physical_sources(entries)?;
+            let issues = crate::validation::binary_slot_oversize_issues(&entries);
+            if !issues.is_empty() {
+                // Return a fatal error even when nobody consumes progress.
+                // Counts only: validator details may contain private prose.
+                return Err(LocustError::InjectionError(format!(
+                    "{} translation(s) exceed known binary slot capacity; Replace is refused before backup or output; run validation and resolve the capacity issues",
+                    issues.len()
+                )));
             }
         }
         let plugin = self.registry.get(format_id).ok_or_else(|| {
