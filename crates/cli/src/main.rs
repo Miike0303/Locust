@@ -1611,9 +1611,6 @@ fn cmd_extract_with_registry(
             path.display()
         );
     }
-    let game_root = path.canonicalize()?;
-    let _source_lock = locust_core::project::lock_game_source(&path)?;
-    warn_or_refuse_direct_injection(&game_root, dry_run, force)?;
     let plugin = if let Some(ref fmt) = format {
         registry
             .get(fmt)
@@ -1624,6 +1621,10 @@ fn cmd_extract_with_registry(
             .detect(&path)
             .ok_or_else(|| anyhow::anyhow!("format not detected for path: {}", path.display()))?
     };
+    plugin.validate_source(&path)?;
+    let game_root = path.canonicalize()?;
+    let _source_lock = locust_core::project::lock_game_source(&path)?;
+    warn_or_refuse_direct_injection(&game_root, dry_run, force)?;
 
     println!("Format: {} ({})", plugin.name(), plugin.id());
 
@@ -1959,12 +1960,13 @@ async fn cmd_inject(
         );
     }
 
-    let db = Arc::new(open_existing_project(&project)?);
     let registry = Arc::new(locust_formats::default_registry());
 
     let plugin = registry
         .detect(&game_path)
         .ok_or_else(|| anyhow::anyhow!("format not detected"))?;
+    plugin.validate_source(&game_path)?;
+    let db = Arc::new(open_existing_project(&project)?);
 
     let format_id = plugin.id().to_string();
 
@@ -2083,12 +2085,13 @@ async fn cmd_inject_direct(
              run inject once per DB."
         );
     }
-    let db = open_existing_project(&project)?;
     let registry = locust_formats::default_registry();
 
     let plugin = registry
         .detect(&game_path)
         .ok_or_else(|| anyhow::anyhow!("format not detected for: {}", game_path.display()))?;
+    plugin.validate_source(&game_path)?;
+    let db = open_existing_project(&project)?;
 
     let format_id = plugin.id().to_string();
     let entries = db.get_entries(&EntryFilter::default())?;
@@ -2711,6 +2714,57 @@ mod tests {
     use super::*;
     use locust_core::models::StringStatus;
     use std::fs;
+
+    struct SourceScopePlugin;
+    impl locust_core::extraction::FormatPlugin for SourceScopePlugin {
+        fn id(&self) -> &str {
+            "source-scope"
+        }
+        fn name(&self) -> &str {
+            "Source scope"
+        }
+        fn supported_extensions(&self) -> &[&str] {
+            &[]
+        }
+        fn validate_source(&self, _: &Path) -> locust_core::error::Result<()> {
+            Err(locust_core::error::LocustError::UnsupportedFormat(
+                "source scope refused".into(),
+            ))
+        }
+        fn extract(&self, _: &Path) -> locust_core::error::Result<Vec<StringEntry>> {
+            panic!("preflight bypassed")
+        }
+        fn inject(
+            &self,
+            _: &Path,
+            _: &[StringEntry],
+        ) -> locust_core::error::Result<locust_core::extraction::InjectionReport> {
+            panic!("preflight bypassed")
+        }
+    }
+
+    #[test]
+    fn cli_source_scope_refuses_manual_directory_before_output_or_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("must-not-exist.db");
+        let mut registry = locust_core::extraction::FormatRegistry::new();
+        registry.register(Box::new(SourceScopePlugin));
+        let error = cmd_extract_with_registry(
+            temp.path().to_owned(),
+            Some("source-scope".into()),
+            Some(output.clone()),
+            false,
+            false,
+            &registry,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("source scope refused"),
+            "{error}"
+        );
+        assert!(!output.exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
 
     struct DiagnosticExtractPlugin;
 

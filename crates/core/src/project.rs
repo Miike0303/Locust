@@ -27,6 +27,28 @@ pub fn lock_game_source(path: &Path) -> Result<crate::patch::GameLock> {
     Ok(lock)
 }
 
+fn source_plugin<'a>(
+    registry: &'a FormatRegistry,
+    raw: &Path,
+    resolved: &Path,
+    format_id: Option<&str>,
+) -> Result<&'a dyn crate::extraction::FormatPlugin> {
+    let plugin = if let Some(id) = format_id {
+        registry
+            .get(id)
+            .ok_or_else(|| LocustError::UnsupportedFormat(format!("Unknown format: {id}")))?
+    } else {
+        registry
+            .detect(resolved)
+            .ok_or_else(|| LocustError::UnsupportedFormat("format not detected".into()))?
+    };
+    plugin.validate_source(raw)?;
+    if raw != resolved {
+        plugin.validate_source(resolved)?;
+    }
+    Ok(plugin)
+}
+
 /// Outcome of opening a game into the live [`Database`] (merge, never wipe).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectOpenOutcome {
@@ -79,6 +101,9 @@ fn preflight_project_open_with(
 ) -> Result<ProjectOpenPreflight> {
     let verify = || -> Result<ProjectOpenPreflight> {
         let path = resolve_game_root(raw_path, registry);
+        if format_id.is_some() || registry.detect(&path).is_some() {
+            source_plugin(registry, raw_path, &path, format_id)?;
+        }
         let existing = unique_existing_saved_dbs_with(
             &saved_project_db_candidates(&path, config_dir),
             |candidate| std::fs::metadata(candidate),
@@ -105,6 +130,8 @@ fn preflight_project_open_with(
         let plugin = registry.get(&committed_format).ok_or_else(|| {
             LocustError::UnsupportedFormat(format!("Unknown format: {committed_format}"))
         })?;
+        plugin.validate_source(raw_path)?;
+        plugin.validate_source(&path)?;
         if format_id.is_some_and(|fid| fid != committed_format)
             || !plugin.supported_modes().contains(&OutputMode::Replace)
             || plugin.stability() == crate::extraction::FormatStability::ComingSoon
@@ -138,6 +165,7 @@ pub fn open_verified_saved_project(
     format_id: &str,
 ) -> Result<ProjectOpenOutcome> {
     let path = resolve_game_root(game_path, registry);
+    source_plugin(registry, game_path, &path, Some(format_id))?;
     let _source_lock = lock_game_source(&path)?;
     match preflight_project_open(registry, &path, Some(format_id))? {
         ProjectOpenPreflight::ResumeAvailable {
@@ -431,20 +459,11 @@ fn open_project_with(
     }
 
     let path = resolve_game_root(raw_path, registry);
+    let plugin = source_plugin(registry, raw_path, &path, format_id)?;
     // Reuse saved work regardless of current writability, and reject ambiguity
     // before extraction or opening either candidate database for writing.
     let database_path = folder_open_db_path_with(&path, config_dir, writable)?;
     let _source_lock = lock_game_source(&path)?;
-
-    let plugin = if let Some(fid) = format_id {
-        registry
-            .get(fid)
-            .ok_or_else(|| LocustError::UnsupportedFormat(format!("Unknown format: {fid}")))?
-    } else {
-        registry
-            .detect(&path)
-            .ok_or_else(|| LocustError::UnsupportedFormat("format not detected".to_string()))?
-    };
 
     let format_id = plugin.id().to_string();
     let format_name = plugin.name().to_string();
@@ -548,9 +567,7 @@ pub fn open_project_db(
     game_path: &Path,
     format_id: &str,
 ) -> Result<ProjectOpenOutcome> {
-    registry
-        .get(format_id)
-        .ok_or_else(|| LocustError::UnsupportedFormat(format!("Unknown format: {format_id}")))?;
+    source_plugin(registry, game_path, game_path, Some(format_id))?;
 
     let total_strings = probe_locust_project_db(database_path)?;
     // Offline database editing remains available when its game was moved.
@@ -581,6 +598,7 @@ fn open_project_db_under_lock(
     let plugin = registry
         .get(format_id)
         .ok_or_else(|| LocustError::UnsupportedFormat(format!("Unknown format: {format_id}")))?;
+    plugin.validate_source(game_path)?;
     let candidate = Database::open(database_path)?;
 
     let project_name = game_path
@@ -650,6 +668,9 @@ fn open_recent_project_with_metadata(
     }
 
     let path = resolve_game_root(raw_path, registry);
+    if format_id.is_some() || registry.detect(&path).is_some() {
+        source_plugin(registry, raw_path, &path, format_id)?;
+    }
     let existing =
         unique_existing_saved_dbs_with(&saved_project_db_candidates(&path, config_dir), metadata)?;
     match existing.as_slice() {

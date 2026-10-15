@@ -185,6 +185,58 @@ pub struct Span {
     pieces: Vec<Piece>,
 }
 
+impl Span {
+    /// Literal protected tokens for storage/provider input, never codec sentinels.
+    /// Continuations use one translator LF per physical continuation segment.
+    pub fn literal_text(&self) -> String {
+        self.pieces
+            .iter()
+            .map(|piece| {
+                let mut text = piece.template.clone();
+                for (marker, raw) in &piece.tokens {
+                    text = text.replacen(marker, raw, 1);
+                }
+                text
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Re-establish codec tokens only from verbatim, ordered original controls.
+    /// decode_piece additionally refuses new controls in the intervening prose.
+    pub fn encode_literal_translation(&self, translation: &str) -> Result<String> {
+        if translation.len() > MAX_INPUT_BYTES || translation.contains([OPEN, CLOSE]) {
+            return Err(invalid(
+                "translation exceeds bounds or contains private codec placeholders",
+            ));
+        }
+        let segments = translation.split('\n').collect::<Vec<_>>();
+        if segments.len() != self.pieces.len() {
+            return Err(invalid("translation changes continuation segment count"));
+        }
+        self.pieces
+            .iter()
+            .zip(segments)
+            .map(|(piece, segment)| {
+                let mut rest = segment;
+                let mut encoded = String::new();
+                for (marker, raw) in &piece.tokens {
+                    let at = rest.find(raw).ok_or_else(|| {
+                        invalid("missing or altered protected token (verbatim order required)")
+                    })?;
+                    encoded.push_str(&rest[..at]);
+                    encoded.push_str(marker);
+                    rest = &rest[at + raw.len()..];
+                }
+                encoded.push_str(rest);
+                decode_piece(piece, &encoded)?;
+                Ok(encoded)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|parts| parts.join("\n"))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Piece {
     range: Range<usize>,

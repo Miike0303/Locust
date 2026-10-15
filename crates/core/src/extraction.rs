@@ -87,6 +87,12 @@ pub trait FormatPlugin: Send + Sync {
         ""
     }
     fn supported_extensions(&self) -> &[&str];
+    /// Validate the user's source selection before locks, backup, inventory,
+    /// output reservation or writes. This is distinct from inject's copied
+    /// destination (which may be a directory for a single-file source).
+    fn validate_source(&self, _source: &Path) -> Result<()> {
+        Ok(())
+    }
     fn supported_modes(&self) -> Vec<OutputMode> {
         vec![OutputMode::Replace]
     }
@@ -298,6 +304,7 @@ pub fn inject_direct(
     let plugin = registry
         .get(format_id)
         .ok_or_else(|| LocustError::UnsupportedFormat(format!("format not found: {format_id}")))?;
+    plugin.validate_source(game_path)?;
 
     let entries = db.get_entries(&EntryFilter::default())?;
     let translated: Vec<_> = entries
@@ -932,6 +939,10 @@ impl MultiLangInjector {
                     .into(),
             ));
         }
+        let plugin = self.registry.get(format_id).ok_or_else(|| {
+            LocustError::UnsupportedFormat(format!("format not found: {}", format_id))
+        })?;
+        plugin.validate_source(project_path)?;
         let mut entries = self.db.get_entries(&EntryFilter::default())?;
         if mode == OutputMode::Add {
             entries = restore_physical_sources(entries_for_target(entries, project_path)?)?;
@@ -959,9 +970,6 @@ impl MultiLangInjector {
                 )));
             }
         }
-        let plugin = self.registry.get(format_id).ok_or_else(|| {
-            LocustError::UnsupportedFormat(format!("format not found: {}", format_id))
-        })?;
         if mode == OutputMode::Add {
             return self
                 .inject_add(project_path, plugin, languages, entries, tx)
@@ -1143,7 +1151,7 @@ impl MultiLangInjector {
             let mut created_backup = None;
             let result = crate::injection_transaction::run_add(
                 &selected,
-                plugin.id(),
+                plugin,
                 Some(lang),
                 || {
                     let prior = crate::injection_transaction::matching_add_recording(

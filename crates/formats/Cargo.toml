@@ -37,5 +37,6 @@ lzma-rs = "0.3"
 markup5ever = "0.14.1"
 
 [dev-dependencies]
+tokio.workspace = true
 tempfile = "3"
 tracing-subscriber.workspace = true

@@ -2,6 +2,7 @@ mod archive_replace;
 pub mod binary_search;
 pub mod dialogic;
 mod discovery;
+pub mod godot_dialogic;
 pub mod godot_pck;
 pub mod html_game;
 pub mod qsp;

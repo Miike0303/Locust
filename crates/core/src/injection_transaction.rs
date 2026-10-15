@@ -534,15 +534,16 @@ pub(crate) fn created_outputs_since(
 /// Add uses the same transaction machinery, recording the user's selected mode.
 pub(crate) fn run_add<B, T>(
     selection: &Path,
-    format: &str,
+    plugin: &dyn crate::extraction::FormatPlugin,
     language: Option<&str>,
     backup: impl FnOnce() -> Result<B>,
     inject: impl FnOnce(&Path, &Path) -> Result<InjectionReport>,
     record: impl FnOnce(&InjectionReport, &B) -> Result<T>,
 ) -> Result<(B, InjectionReport, T)> {
+    plugin.validate_source(selection)?;
     run_with_mode_hook(
         selection,
-        (format, language, InjectionMode::Add),
+        (plugin.id(), language, InjectionMode::Add),
         backup,
         |work, selected, _| inject(work, selected),
         (record, |_, _, _| Ok(())),
