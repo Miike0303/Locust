@@ -125,6 +125,154 @@ fn rpa_ui_injection_matches_loose_and_replaces_only_the_selected_literal() {
     assert!(rpa_output.contains(r#"tooltip ("选项")"#));
 }
 
+// The expected script is assembled from literal bytes, not from the injector's
+// escaping or newline helpers. Only the selected literal may differ.
+fn assert_replace_preserves_script_bytes(endings: &[&str], archived: bool) {
+    let selected = "\ttextbutton \"Back\" action Return(\"Back\")  # keep \"Back\"  ";
+    let translated = r#"	textbutton "Retour \"principal\" \\ menu\nSuite\r\t选项" action Return("Back")  # keep "Back"  "#;
+    let translation = "Retour \"principal\" \\ menu\nSuite\r\t选项";
+
+    // Start with the real audit's shape: a terminating newline plus a blank
+    // line. Also cover an unterminated final line and whitespace-only tails.
+    for tail in [
+        "\n\n",
+        "",
+        "\n",
+        "\n\n\n",
+        "\r\n",
+        "\r\n\r\n",
+        "\n \t\r\n\n",
+    ] {
+        for selected_last in [false, true] {
+            let mut lines = vec![
+                "screen navigation():",
+                "    # untouched comment: 日本語 ",
+                "    text \"History\"  # keep spacing  ",
+                "",
+                "    tooltip (\"Options\")",
+                "    textbutton \"Save\" action FileSave(1)",
+            ];
+            lines.insert(if selected_last { lines.len() } else { 3 }, selected);
+            let mut script = String::new();
+            let mut expected = String::new();
+            for (index, line) in lines.iter().enumerate() {
+                script.push_str(line);
+                expected.push_str(if *line == selected { translated } else { line });
+                if index + 1 < lines.len() {
+                    let ending = endings[index % endings.len()];
+                    script.push_str(ending);
+                    expected.push_str(ending);
+                }
+            }
+            script.push_str(tail);
+            expected.push_str(tail);
+
+            let root = game_fixture("byte_preservation");
+            let loose_path = root.path().join("game/screens.rpy");
+            let archive_path = root.path().join("game/scripts.rpa");
+            let archive = build_rpa("screens.rpy", script.as_bytes());
+            if archived {
+                fs::write(&archive_path, &archive).unwrap();
+            } else {
+                fs::write(&loose_path, &script).unwrap();
+            }
+
+            let plugin = RenPyPlugin::new();
+            let mut entries = plugin.extract(root.path()).unwrap();
+            assert_eq!(entries.len(), 4);
+            for entry in &mut entries {
+                entry.translation = match entry.source.as_str() {
+                    "Back" => Some(translation.to_string()),
+                    "Options" => Some(entry.source.clone()), // identity control
+                    _ => None,                               // untranslated controls
+                };
+            }
+            let report = plugin.inject(root.path(), &entries).unwrap();
+            assert_eq!(report.strings_written, 1);
+            assert_eq!(report.files_modified, 1);
+            assert_eq!(report.strings_skipped, 3);
+            assert_eq!(
+                fs::read(&loose_path).unwrap(),
+                expected.as_bytes(),
+                "archived={archived}, endings={endings:?}, tail={tail:?}, selected_last={selected_last}"
+            );
+            if archived {
+                assert_eq!(fs::read(&archive_path).unwrap(), archive);
+            }
+        }
+    }
+}
+
+#[test]
+fn loose_replace_preserves_lf_script_bytes() {
+    assert_replace_preserves_script_bytes(&["\n"], false);
+}
+
+#[test]
+fn loose_replace_preserves_crlf_script_bytes() {
+    assert_replace_preserves_script_bytes(&["\r\n"], false);
+}
+
+#[test]
+fn loose_replace_preserves_mixed_script_bytes() {
+    assert_replace_preserves_script_bytes(&["\n", "\r\n", "\r\n", "\n"], false);
+}
+
+#[test]
+fn rpa_replace_preserves_lf_script_bytes() {
+    assert_replace_preserves_script_bytes(&["\n"], true);
+}
+
+#[test]
+fn rpa_replace_preserves_crlf_script_bytes() {
+    assert_replace_preserves_script_bytes(&["\r\n"], true);
+}
+
+#[test]
+fn rpa_replace_preserves_mixed_script_bytes() {
+    assert_replace_preserves_script_bytes(&["\n", "\r\n", "\r\n", "\n"], true);
+}
+
+#[test]
+fn replace_without_an_authorized_change_preserves_script_bytes() {
+    let script =
+        "screen navigation():\r\n\ttextbutton \"Back\" action Return(\"Back\") # keep\n\r\n\n";
+    for archived in [false, true] {
+        for control in ["untranslated", "identity", "stale"] {
+            let root = game_fixture("unchanged_bytes");
+            let loose_path = root.path().join("game/screens.rpy");
+            let archive_path = root.path().join("game/scripts.rpa");
+            let archive = build_rpa("screens.rpy", script.as_bytes());
+            if archived {
+                fs::write(&archive_path, &archive).unwrap();
+            } else {
+                fs::write(&loose_path, script).unwrap();
+            }
+            let plugin = RenPyPlugin::new();
+            let mut entries = plugin.extract(root.path()).unwrap();
+            assert_eq!(entries.len(), 1);
+            match control {
+                "identity" => entries[0].translation = Some(entries[0].source.clone()),
+                "stale" => {
+                    entries[0].source = "Previous Back".to_string();
+                    entries[0].translation = Some("Retour".to_string());
+                }
+                _ => {}
+            }
+            let report = plugin.inject(root.path(), &entries).unwrap();
+            assert_eq!(report.strings_written, 0, "{control}, archived={archived}");
+            assert_eq!(report.files_modified, 0);
+            assert_eq!(report.strings_skipped, 1);
+            if archived {
+                assert!(!loose_path.exists());
+                assert_eq!(fs::read(&archive_path).unwrap(), archive);
+            } else {
+                assert_eq!(fs::read(&loose_path).unwrap(), script.as_bytes());
+            }
+        }
+    }
+}
+
 #[test]
 fn rpa_ui_injection_rejects_a_stale_physical_source() {
     let script = "screen navigation():\n    textbutton \"Back\" action Return(\"Back\")\n";

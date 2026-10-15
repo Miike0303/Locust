@@ -361,7 +361,9 @@ impl RenPyPlugin {
             // known; the entry id alone only carries the bare basename.
             let mut local_matched = 0usize;
 
-            for (line_idx, line) in content.lines().enumerate() {
+            // Keep each original terminator (including CRLF and trailing blank
+            // lines); literal replacement leaves the rest of the slice intact.
+            for (line_idx, line) in content.split_inclusive('\n').enumerate() {
                 let line_num = line_idx + 1;
                 let key = (filename.clone(), line_num);
 
@@ -382,7 +384,7 @@ impl RenPyPlugin {
                 }
                 new_lines.push(line.to_string());
             }
-            let new_content = new_lines.join("\n");
+            let new_content = new_lines.concat();
 
             if modified {
                 // Write translated .rpy to game/ dir (preserving subdirectory structure)
@@ -2753,7 +2755,9 @@ impl FormatPlugin for RenPyPlugin {
 
             let mut new_lines = Vec::new();
             let mut modified = false;
-            for (line_idx, line) in content.lines().enumerate() {
+            // Retain per-line terminators rather than normalizing the script
+            // or dropping its final newline when a selected literal changes.
+            for (line_idx, line) in content.split_inclusive('\n').enumerate() {
                 let line_num = line_idx + 1;
                 let mut replaced_line = None;
                 if let Some(entry) = line_translations.get(&line_num) {
@@ -2774,7 +2778,7 @@ impl FormatPlugin for RenPyPlugin {
             }
 
             if modified {
-                std::fs::write(file_path, new_lines.join("\n"))?;
+                std::fs::write(file_path, new_lines.concat())?;
                 files_modified += 1;
                 files_written.push(file_path.clone());
 
@@ -3258,7 +3262,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&current).unwrap(),
-            "label start:\n    \"Primera frase\"\n    \"Frase corregida\"\n    return"
+            "label start:\n    \"Primera frase\"\n    \"Frase corregida\"\n    return\n"
         );
         let mut revert = vec![entries[1].clone()];
         revert[0].translation = Some(revert[0].source.clone());
@@ -3269,7 +3273,7 @@ mod tests {
             plugin.inject(game.path(), &revert).unwrap().strings_written,
             1
         );
-        let expected = "label start:\n    \"Primera frase\"\n    \"Hello traveler\"\n    return";
+        let expected = "label start:\n    \"Primera frase\"\n    \"Hello traveler\"\n    return\n";
         assert_eq!(std::fs::read_to_string(&current).unwrap(), expected);
         let mut fresh = RenPyPlugin::extract_file(&current).unwrap();
         for entry in &mut fresh {
@@ -3297,7 +3301,7 @@ mod tests {
         assert_eq!(report.skip_reasons.get("source_changed"), Some(&1));
         assert_eq!(
             std::fs::read_to_string(&current).unwrap(),
-            "label start:\n    \"Primera frase\"\n    \"Cambio permitido\"\n    return"
+            "label start:\n    \"Primera frase\"\n    \"Cambio permitido\"\n    return\n"
         );
     }
 
