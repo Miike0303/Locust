@@ -1,7 +1,9 @@
-//! Experimental, read-only standalone Godot PCK v2 **metadata** helper.
+//! Experimental standalone Godot PCK v2 metadata and streaming rebuild helpers.
 //!
-//! This is not a registered format or native Godot translation support. No payload
-//! is read, decoded or hashed; `stored_md5` is an unauthenticated index field.
+//! This is not a registered format or native Godot translation support.
+//! `read_index` reads metadata only: `stored_md5` remains an unauthenticated index
+//! field. Explicit payload APIs check plain member bytes against that field.
+//! MD5 provides format integrity, not authenticity against a malicious producer.
 //!
 //! # Primary contract and supported profile
 //!
@@ -44,12 +46,39 @@
 //! allocation; complete record and remaining-count bounds precede path allocation.
 //! Heap usage is O(bounded index bytes + bounded entry count), not a 16 MiB total
 //! heap guarantee. No full-file buffering, embedded/executable scanning, payload
-//! reads, file writes, or dependency on the physical archive's filename occur.
-//! Raw field positions and values remain available for a future streaming writer;
-//! retaining positions does not authorize writing or prove archive authenticity.
+//! reads or file writes occur in `read_index`.
+//!
+//! # Rebuild layout and installation
+//!
+//! The writer follows [`PCKPacker`](https://github.com/godotengine/godot/blob/77dcf97d82cbfe4e4615475fa52ca03da645dbd8/core/io/pck_packer.cpp#L38-L261):
+//! `_get_pad`, `_bind_methods` and `add_file` establish configurable alignment
+//! (default 32), plain-source MD5 and aligned relative offsets; `flush` writes
+//! four-byte zero-padded UTF-8 paths, offset/size/MD5/flags records, an aligned
+//! file base, and aligned payloads including final padding. We choose 32 bytes;
+//! the source's original alignment is not encoded and cannot be inferred safely.
+//! Original padded path bytes, directory order, versions, flags and reserved
+//! words survive. Replacements keep the original path encoding and member flags;
+//! additions use canonical paths and zero flags, and follow caller order.
+//! Inter-member gaps, header padding and trailing bytes are regenerated, not
+//! preserved. `file_base` becomes the aligned index end and offsets are rebased.
+//! This agrees with the reader's
+//! [file-base addition and record layout](https://github.com/godotengine/godot/blob/77dcf97d82cbfe4e4615475fa52ca03da645dbd8/core/io/file_access_pack.cpp#L192-L247),
+//! including relative-to-start bit 1 at standalone offset zero; flag definitions
+//! are in [`file_access_pack.h:39-49`](https://github.com/godotengine/godot/blob/77dcf97d82cbfe4e4615475fa52ca03da645dbd8/core/io/file_access_pack.h#L39-L49).
+//!
+//! Rebuild revalidates source metadata, then authenticates untouched members
+//! while copying each exactly once through a 64 KiB buffer. A late mismatch can
+//! leave partial output in the sink: discard it on **any** error. Never use the
+//! source file as that sink. `verify_rebuild` independently rereads the completed
+//! output, compares all planned fields and raw paths, and verifies every MD5.
+//! `replace_archive` performs both steps in owned staging under the caller's
+//! GameLock, closes source handles before install, and keeps the previous backup.
+//! Sources must remain stable throughout the operation; the lock excludes
+//! cooperating writers, not arbitrary external changes. No engine run is implied.
 
-use std::collections::HashSet;
-use std::io::{self, Read, Seek, SeekFrom};
+use md5::{Digest, Md5};
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 pub const HEADER_SIZE: u64 = 100;
 pub const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
@@ -60,9 +89,11 @@ const MIN_RECORD_BYTES: u64 = 4 + 8 + 36;
 const PACK_DIR_ENCRYPTED: u32 = 1;
 const PACK_REL_FILEBASE: u32 = 2;
 const PACK_FILE_ENCRYPTED: u32 = 1;
+const PAYLOAD_BUFFER_BYTES: usize = 64 * 1024;
+const ALIGNMENT: u64 = 32;
 
 /// One index record, in original directory order. All positions are absolute.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PckEntry {
     /// Canonical, case-sensitive virtual identity; never a filesystem path.
     pub path: String,
@@ -70,6 +101,8 @@ pub struct PckEntry {
     pub path_position: u64,
     /// Original padded byte length, not the canonical name's length.
     pub path_length: u32,
+    /// Original UTF-8 spelling including its 0-3 zero padding bytes.
+    pub padded_path: Vec<u8>,
     pub offset_position: u64,
     pub size_position: u64,
     pub md5_position: u64,
@@ -85,7 +118,7 @@ pub struct PckEntry {
 }
 
 /// Validated index structure, not authenticated payloads or a live-file snapshot.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PckIndex {
     pub file_size: u64,
     pub format_version: u32,
@@ -259,6 +292,7 @@ pub fn read_index<R: Read + Seek>(reader: &mut R) -> io::Result<PckIndex> {
             path_length_position,
             path_position,
             path_length,
+            padded_path: path_bytes,
             offset_position,
             size_position: offset_position + 8,
             md5_position: offset_position + 16,
@@ -300,5 +334,274 @@ pub fn read_index<R: Read + Seek>(reader: &mut R) -> io::Result<PckIndex> {
         reserved,
         index_end: position,
         entries,
+    })
+}
+
+// Exactly size bytes are read; neither hashing nor copying probes the next byte.
+fn copy_hashed<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    entry: &PckEntry,
+    writer: &mut W,
+) -> io::Result<bool> {
+    entry
+        .offset
+        .checked_add(entry.size)
+        .ok_or_else(|| invalid("PCK member range overflow"))?;
+    reader.seek(SeekFrom::Start(entry.offset))?;
+    let mut buffer = [0; PAYLOAD_BUFFER_BYTES];
+    let mut remaining = entry.size;
+    let mut digest = Md5::new();
+    while remaining != 0 {
+        let n = remaining.min(buffer.len() as u64) as usize;
+        reader.read_exact(&mut buffer[..n])?;
+        digest.update(&buffer[..n]);
+        writer.write_all(&buffer[..n])?;
+        remaining -= n as u64;
+    }
+    Ok(<[u8; 16]>::from(digest.finalize()) == entry.stored_md5)
+}
+
+/// Stream only this validated entry's range and compare its plain-byte MD5.
+/// Returns false on mismatch; truncation and source I/O failures are errors.
+/// The entry must come from `read_index` on this stable source. No index or
+/// unselected payload is read, and the entry's metadata is never marked verified.
+pub fn verify_member<R: Read + Seek>(reader: &mut R, entry: &PckEntry) -> io::Result<bool> {
+    copy_hashed(reader, entry, &mut io::sink())
+}
+
+/// Read a selected member only if its size fits the caller's cap and its MD5
+/// matches. A cap refusal performs no source I/O; a mismatch returns no bytes.
+pub fn read_member<R: Read + Seek>(
+    reader: &mut R,
+    entry: &PckEntry,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    if entry.size > max_bytes {
+        return Err(invalid("PCK member exceeds selected read size cap"));
+    }
+    let size = usize::try_from(entry.size).map_err(|_| invalid("PCK member cannot fit memory"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| invalid("PCK selected member allocation failed"))?;
+    if !copy_hashed(reader, entry, &mut bytes)? {
+        return Err(invalid("PCK member MD5 mismatch"));
+    }
+    Ok(bytes)
+}
+
+/// Opaque expectation produced by a successful rebuild, not by parsing its
+/// output. Retain it for independent verification before committing the sink.
+#[derive(Debug)]
+pub struct RebuildPlan {
+    index: PckIndex,
+}
+
+/// A canonical virtual path and caller-owned replacement/addition bytes.
+/// Slices preserve input order and let duplicate keys be rejected explicitly.
+pub type MemberBytes<'a> = (&'a str, &'a [u8]);
+
+fn checked_add(a: u64, b: u64) -> io::Result<u64> {
+    a.checked_add(b)
+        .ok_or_else(|| invalid("PCK rebuild arithmetic overflow"))
+}
+
+fn aligned(position: u64) -> io::Result<u64> {
+    checked_add(position, (ALIGNMENT - position % ALIGNMENT) % ALIGNMENT)
+}
+
+fn check_key(path: &str) -> io::Result<()> {
+    if path.len() > MAX_PATH_BYTES as usize || canonical_path(path.as_bytes())? != path {
+        return Err(invalid(
+            "PCK change key must be a bounded canonical virtual path",
+        ));
+    }
+    Ok(())
+}
+
+/// Write a whole new standalone PCK to an empty sink positioned at byte zero.
+/// The sink needs only `Write`; output offsets are planned before the first write.
+/// Metadata is reread and must equal `index` (including original padded paths).
+/// Both sets of keys must already be canonical according to `read_index` rules.
+/// Replacements must exist; additions must be new, distinct names. All planning
+/// refusals occur before output. Untouched payloads are hashed while copying;
+/// on any error discard the partial sink. The source and sink must be distinct.
+/// Call `verify_rebuild` before installing or otherwise trusting the result.
+pub fn rebuild<R: Read + Seek, W: Write>(
+    source: &mut R,
+    index: &PckIndex,
+    replacements: &[MemberBytes<'_>],
+    additions: &[MemberBytes<'_>],
+    output: &mut W,
+) -> io::Result<RebuildPlan> {
+    // Also protects against stale or caller-mutated public metadata.
+    if read_index(source)? != *index {
+        return Err(invalid("PCK source index changed before rebuild"));
+    }
+    let count = index
+        .entries
+        .len()
+        .checked_add(additions.len())
+        .filter(|count| *count <= MAX_ENTRIES as usize)
+        .ok_or_else(|| invalid("PCK rebuilt entry count exceeds limit"))?;
+    let mut names: HashSet<&str> = index.entries.iter().map(|e| e.path.as_str()).collect();
+    let mut changes = HashMap::new();
+    for &(path, bytes) in replacements {
+        check_key(path)?;
+        if !names.contains(path) {
+            return Err(invalid("PCK replacement path is unknown"));
+        }
+        if changes.insert(path, bytes).is_some() {
+            return Err(invalid("PCK duplicate replacement key"));
+        }
+    }
+    let mut index_end = index.index_end;
+    for &(path, _) in additions {
+        check_key(path)?;
+        if !names.insert(path) {
+            return Err(invalid(
+                "PCK addition collides with an existing name or key",
+            ));
+        }
+        let path_size = path.len().div_ceil(4) * 4;
+        index_end = checked_add(index_end, 40 + path_size as u64)?;
+        if index_end - HEADER_SIZE > MAX_INDEX_BYTES {
+            return Err(invalid("PCK rebuilt index exceeds bounded index"));
+        }
+    }
+    let file_base = aligned(index_end)?;
+    let mut entries = Vec::with_capacity(count);
+    let mut payloads = Vec::with_capacity(count);
+    for old in &index.entries {
+        let mut entry = old.clone();
+        let payload = changes.get(old.path.as_str()).copied();
+        if let Some(bytes) = payload {
+            entry.size = bytes.len() as u64;
+            entry.stored_md5 = Md5::digest(bytes).into();
+        }
+        entries.push(entry);
+        payloads.push(payload);
+    }
+    for &(path, bytes) in additions {
+        let mut padded_path = path.as_bytes().to_vec();
+        padded_path.resize(path.len().div_ceil(4) * 4, 0);
+        entries.push(PckEntry {
+            path: path.to_owned(),
+            path_length_position: 0,
+            path_position: 0,
+            path_length: padded_path.len() as u32,
+            padded_path,
+            offset_position: 0,
+            size_position: 0,
+            md5_position: 0,
+            flags_position: 0,
+            stored_offset: 0,
+            offset: 0,
+            size: bytes.len() as u64,
+            stored_md5: Md5::digest(bytes).into(),
+            flags: 0,
+        });
+        payloads.push(Some(bytes));
+    }
+    let mut position = HEADER_SIZE;
+    let mut payload_position = file_base;
+    for entry in &mut entries {
+        entry.path_length_position = position;
+        entry.path_position = position + 4;
+        entry.offset_position = entry.path_position + u64::from(entry.path_length);
+        entry.size_position = entry.offset_position + 8;
+        entry.md5_position = entry.offset_position + 16;
+        entry.flags_position = entry.offset_position + 32;
+        position = entry.offset_position + 36;
+        entry.offset = payload_position;
+        entry.stored_offset = payload_position - file_base;
+        payload_position = aligned(checked_add(payload_position, entry.size)?)?;
+    }
+    let plan = RebuildPlan {
+        index: PckIndex {
+            file_size: payload_position,
+            format_version: index.format_version,
+            engine_version: index.engine_version,
+            flags: index.flags,
+            file_base,
+            reserved: index.reserved,
+            index_end,
+            entries,
+        },
+    };
+    output.write_all(b"GDPC")?;
+    for word in [
+        index.format_version,
+        index.engine_version[0],
+        index.engine_version[1],
+        index.engine_version[2],
+        index.flags,
+    ] {
+        output.write_all(&word.to_le_bytes())?;
+    }
+    output.write_all(&file_base.to_le_bytes())?;
+    for word in index.reserved {
+        output.write_all(&word.to_le_bytes())?;
+    }
+    output.write_all(&(count as u32).to_le_bytes())?;
+    for entry in &plan.index.entries {
+        output.write_all(&entry.path_length.to_le_bytes())?;
+        output.write_all(&entry.padded_path)?;
+        output.write_all(&entry.stored_offset.to_le_bytes())?;
+        output.write_all(&entry.size.to_le_bytes())?;
+        output.write_all(&entry.stored_md5)?;
+        output.write_all(&entry.flags.to_le_bytes())?;
+    }
+    let padding = [0; ALIGNMENT as usize];
+    output.write_all(&padding[..(file_base - index_end) as usize])?;
+    for (number, entry) in plan.index.entries.iter().enumerate() {
+        if let Some(bytes) = payloads[number] {
+            for chunk in bytes.chunks(PAYLOAD_BUFFER_BYTES) {
+                output.write_all(chunk)?;
+            }
+        } else if !copy_hashed(source, &index.entries[number], output)? {
+            return Err(invalid("PCK untouched member MD5 mismatch during rebuild"));
+        }
+        let end = entry.offset + entry.size; // Checked during planning, including padding.
+        output.write_all(&padding[..(aligned(end)? - end) as usize])?;
+    }
+    Ok(plan)
+}
+
+/// Independently parse the completed output, compare every planned header/entry
+/// field, original padded path, order and total length, then stream every MD5.
+/// A plan never adopts metadata from the generated file. Matching stored MD5s
+/// alone are insufficient: this also checks them against the expected plan.
+pub fn verify_rebuild<R: Read + Seek>(output: &mut R, plan: &RebuildPlan) -> io::Result<()> {
+    let actual = read_index(output)?;
+    if actual != plan.index {
+        return Err(invalid("PCK generated index differs from rebuild plan"));
+    }
+    for entry in &actual.entries {
+        if !verify_member(output, entry)? {
+            return Err(invalid("PCK generated member MD5 mismatch"));
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild and independently verify in owned staging before transactional
+/// installation. The caller must acquire the game lock before reading the source
+/// and retain it through this call. Returns the retained previous-archive backup.
+/// Uses the shared archive replacement/recovery mechanism; no format registration.
+pub fn replace_archive(
+    lock: &locust_core::patch::GameLock,
+    path: &std::path::Path,
+    replacements: &[MemberBytes<'_>],
+    additions: &[MemberBytes<'_>],
+) -> locust_core::error::Result<std::path::PathBuf> {
+    crate::archive_replace::replace_file_streamed(lock, path, |staging| {
+        let mut source = std::fs::File::open(path)?;
+        let index = read_index(&mut source)?;
+        let plan = rebuild(&mut source, &index, replacements, additions, staging)?;
+        verify_rebuild(staging, &plan)?;
+        // Release the original before the shared replacement moves it aside.
+        drop(source);
+        Ok(())
     })
 }

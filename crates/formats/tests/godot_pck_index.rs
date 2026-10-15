@@ -1,6 +1,9 @@
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
-use locust_formats::godot_pck::read_index;
+use locust_formats::godot_pck::{
+    read_index, read_member, rebuild, replace_archive, verify_member, verify_rebuild, MemberBytes,
+};
+use md5::{Digest, Md5};
 
 fn put32(bytes: &mut [u8], at: usize, value: u32) {
     bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
@@ -33,6 +36,488 @@ fn two_members() -> Vec<u8> {
     bytes[208..211].copy_from_slice(b"one");
     bytes[216..224].copy_from_slice(b"second!!");
     bytes
+}
+
+// Extend GD-1's independent fixture with real hashes, opaque header words and a
+// redundant, padded spelling whose bytes a rebuild must retain verbatim.
+fn authenticated_members(second: &[u8]) -> Vec<u8> {
+    let mut bytes = two_members();
+    bytes.splice(152..160, b"res://./b/b\0".iter().copied());
+    put32(&mut bytes, 148, 12);
+    put64(&mut bytes, 24, 212);
+    bytes.resize(220 + second.len(), 0);
+    bytes[220..].copy_from_slice(second);
+    put64(&mut bytes, 172, second.len() as u64);
+    bytes[128..144].copy_from_slice(&Md5::digest(b"one"));
+    bytes[180..196].copy_from_slice(&Md5::digest(second));
+    put32(&mut bytes, 20, 2);
+    put32(&mut bytes, 16, 99);
+    for word in 0..16 {
+        put32(&mut bytes, 32 + word * 4, 0xfedc_0000 + word as u32);
+    }
+    bytes
+}
+
+struct RangeReader {
+    bytes: Cursor<Vec<u8>>,
+    allowed: Vec<std::ops::Range<u64>>,
+    read_bytes: usize,
+    largest_read: usize,
+}
+
+impl Read for RangeReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let start = self.bytes.position();
+        let end = start + buffer.len() as u64;
+        assert!(buffer.len() <= 65536, "unbounded payload read");
+        assert!(self
+            .allowed
+            .iter()
+            .any(|r| r.start <= start && end <= r.end));
+        self.largest_read = self.largest_read.max(buffer.len());
+        let n = self.bytes.read(buffer)?;
+        self.read_bytes += n;
+        Ok(n)
+    }
+}
+
+impl Seek for RangeReader {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        self.bytes.seek(from)
+    }
+}
+
+#[test]
+fn selective_md5_reads_exactly_the_selected_range_in_bounded_chunks() {
+    let payload = vec![0x91; 3 * 65536 + 7];
+    let bytes = authenticated_members(&payload);
+    let index = read_index(&mut Cursor::new(&bytes)).unwrap();
+    let entry = &index.entries[1];
+    let mut reader = RangeReader {
+        bytes: Cursor::new(bytes),
+        allowed: std::iter::once(entry.offset..entry.offset + entry.size).collect(),
+        read_bytes: 0,
+        largest_read: 0,
+    };
+    assert!(verify_member(&mut reader, entry).unwrap());
+    assert_eq!(reader.read_bytes as u64, entry.size);
+    assert_eq!(reader.bytes.position(), entry.offset + entry.size);
+    assert_eq!(reader.largest_read, 65536);
+    reader.bytes.get_mut()[entry.offset as usize + 65536] ^= 1;
+    assert!(!verify_member(&mut reader, entry).unwrap());
+    assert_eq!(reader.read_bytes as u64, 2 * entry.size);
+}
+
+#[test]
+fn bounded_read_returns_bytes_only_on_hash_match_and_refuses_cap_before_reading() {
+    let bytes = authenticated_members(b"second!!");
+    let index = read_index(&mut Cursor::new(&bytes)).unwrap();
+    let entry = &index.entries[0];
+    let mut reader = RangeReader {
+        bytes: Cursor::new(bytes),
+        allowed: std::iter::once(entry.offset..entry.offset + entry.size).collect(),
+        read_bytes: 0,
+        largest_read: 0,
+    };
+    assert!(read_member(&mut reader, entry, 2).is_err());
+    assert_eq!(reader.read_bytes, 0);
+    assert_eq!(read_member(&mut reader, entry, 3).unwrap(), b"one");
+    reader.bytes.get_mut()[entry.offset as usize] ^= 1;
+    assert_eq!(
+        read_member(&mut reader, entry, 3).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn selected_truncation_is_io_error_and_empty_member_hash_is_checked() {
+    let bytes = authenticated_members(b"");
+    let index = read_index(&mut Cursor::new(&bytes)).unwrap();
+    assert!(verify_member(&mut Cursor::new(&bytes), &index.entries[1]).unwrap());
+    assert!(read_member(&mut Cursor::new(&bytes), &index.entries[1], 0)
+        .unwrap()
+        .is_empty());
+    let truncated = &bytes[..index.entries[0].offset as usize + 2];
+    assert_eq!(
+        verify_member(&mut Cursor::new(truncated), &index.entries[0])
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    let mut wrong = index.entries.into_iter().nth(1).unwrap();
+    wrong.stored_md5 = [0; 16];
+    assert!(!verify_member(&mut Cursor::new(&bytes), &wrong).unwrap());
+    assert!(read_member(&mut Cursor::new(&bytes), &wrong, 0).is_err());
+}
+
+#[test]
+fn rebuild_replaces_shorter_longer_and_empty_and_appends_in_requested_order() {
+    for replacement in [
+        b"x".as_slice(),
+        b"a much longer replacement".as_slice(),
+        b"".as_slice(),
+    ] {
+        let bytes = authenticated_members(b"second!!");
+        let mut source = Cursor::new(&bytes);
+        let original = read_index(&mut source).unwrap();
+        let mut output = Vec::new();
+        let plan = rebuild(
+            &mut source,
+            &original,
+            &[("res://aa", replacement)],
+            &[
+                ("res://new.dtl", b"new".as_slice()),
+                ("res://empty.dch", b"".as_slice()),
+            ],
+            &mut output,
+        )
+        .unwrap();
+        let mut generated = Cursor::new(&output);
+        verify_rebuild(&mut generated, &plan).unwrap();
+        let index = read_index(&mut generated).unwrap();
+        assert_eq!(
+            index
+                .entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            ["res://aa", "res://b/b", "res://new.dtl", "res://empty.dch"]
+        );
+        assert_eq!(index.format_version, original.format_version);
+        assert_eq!(index.engine_version, original.engine_version);
+        assert_eq!(index.flags, original.flags);
+        assert_eq!(index.reserved, original.reserved);
+        assert_eq!(index.file_base % 32, 0);
+        for (number, expected) in [replacement, b"second!!", b"new", b""].iter().enumerate() {
+            let entry = &index.entries[number];
+            assert_eq!(entry.offset % 32, 0);
+            assert_eq!(entry.stored_offset + index.file_base, entry.offset);
+            assert_eq!(entry.size, expected.len() as u64);
+            assert_eq!(entry.stored_md5, <[u8; 16]>::from(Md5::digest(expected)));
+            assert_eq!(read_member(&mut generated, entry, 100).unwrap(), *expected);
+        }
+        for (old, new) in original.entries.iter().zip(&index.entries) {
+            assert_eq!(old.flags, new.flags);
+            let raw = |e: &locust_formats::godot_pck::PckEntry, data: &[u8]| {
+                data[e.path_position as usize
+                    ..(e.path_position + u64::from(e.path_length)) as usize]
+                    .to_vec()
+            };
+            assert_eq!(raw(old, &bytes), raw(new, &output));
+        }
+        assert_eq!(index.entries[1].stored_md5, original.entries[1].stored_md5);
+        assert_eq!(index.entries[1].size, original.entries[1].size);
+    }
+}
+
+#[test]
+fn noop_rebuild_streams_and_preserves_all_member_fields_and_bytes() {
+    let payload = vec![0xad; 200_003];
+    let bytes = authenticated_members(&payload);
+    let original = read_index(&mut Cursor::new(&bytes)).unwrap();
+    let mut source = RangeReader {
+        bytes: Cursor::new(bytes.clone()),
+        allowed: vec![
+            0..original.index_end,
+            212..215,
+            220..220 + payload.len() as u64,
+        ],
+        read_bytes: 0,
+        largest_read: 0,
+    };
+    let mut output = Vec::new();
+    let plan = rebuild(&mut source, &original, &[], &[], &mut output).unwrap();
+    verify_rebuild(&mut Cursor::new(&output), &plan).unwrap();
+    let generated = read_index(&mut Cursor::new(&output)).unwrap();
+    assert_eq!(
+        source.read_bytes as u64,
+        original.index_end + 3 + payload.len() as u64
+    );
+    for (old, new) in original.entries.iter().zip(&generated.entries) {
+        assert_eq!(old.path, new.path);
+        assert_eq!(old.size, new.size);
+        assert_eq!(old.flags, new.flags);
+        assert_eq!(old.stored_md5, new.stored_md5);
+        assert_eq!(
+            &bytes[old.offset as usize..(old.offset + old.size) as usize],
+            &output[new.offset as usize..(new.offset + new.size) as usize]
+        );
+    }
+}
+
+#[test]
+fn replaced_source_payload_is_not_read_even_if_corrupted() {
+    let mut bytes = authenticated_members(b"second!!");
+    bytes[212] ^= 1;
+    let index = read_index(&mut Cursor::new(&bytes)).unwrap();
+    let mut source = RangeReader {
+        bytes: Cursor::new(bytes),
+        allowed: vec![0..index.index_end, 220..228],
+        read_bytes: 0,
+        largest_read: 0,
+    };
+    let mut output = Vec::new();
+    let plan = rebuild(
+        &mut source,
+        &index,
+        &[("res://aa", b"new")],
+        &[],
+        &mut output,
+    )
+    .unwrap();
+    verify_rebuild(&mut Cursor::new(output), &plan).unwrap();
+}
+
+#[test]
+fn rebuild_refuses_unknown_duplicate_colliding_and_noncanonical_keys_before_output() {
+    let bytes = authenticated_members(b"second!!");
+    let index = read_index(&mut Cursor::new(&bytes)).unwrap();
+    type ChangePair<'a> = (Vec<MemberBytes<'a>>, Vec<MemberBytes<'a>>);
+    let cases: Vec<ChangePair<'_>> = vec![
+        (vec![("res://absent", b"x")], vec![]),
+        (vec![("res://aa", b"x"), ("res://aa", b"y")], vec![]),
+        (vec![], vec![("res://aa", b"x")]),
+        (vec![], vec![("res://new", b"x"), ("res://new", b"y")]),
+        (vec![("res://./aa", b"x")], vec![]),
+    ];
+    for (replacements, additions) in cases {
+        let mut output = Vec::new();
+        assert!(rebuild(
+            &mut Cursor::new(&bytes),
+            &index,
+            &replacements,
+            &additions,
+            &mut output
+        )
+        .is_err());
+        assert!(output.is_empty());
+    }
+    for path in [
+        "res://../bad",
+        "res://a/",
+        "C:/bad",
+        "res://a\\b",
+        "res://a\nb",
+        "res://./aa",
+        "res://new\0",
+        "res://a//b",
+    ] {
+        let mut output = Vec::new();
+        assert!(
+            rebuild(
+                &mut Cursor::new(&bytes),
+                &index,
+                &[],
+                &[(path, b"x")],
+                &mut output
+            )
+            .is_err(),
+            "{path:?}"
+        );
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn rebuild_refuses_path_count_and_total_index_bounds() {
+    let bytes = authenticated_members(b"second!!");
+    let index = read_index(&mut Cursor::new(&bytes)).unwrap();
+    let too_long = format!("res://{}", "x".repeat(16_379));
+    let mut output = Vec::new();
+    assert!(rebuild(
+        &mut Cursor::new(&bytes),
+        &index,
+        &[],
+        &[(&too_long, b"")],
+        &mut output
+    )
+    .is_err());
+    let names: Vec<_> = (0..100_000).map(|i| format!("res://{i}")).collect();
+    let additions: Vec<_> = names.iter().map(|s| (s.as_str(), b"".as_slice())).collect();
+    assert!(rebuild(
+        &mut Cursor::new(&bytes),
+        &index,
+        &[],
+        &additions,
+        &mut output
+    )
+    .is_err());
+    let names: Vec<_> = (0..1024)
+        .map(|i| format!("res://{i:04}{}", "x".repeat(16_374)))
+        .collect();
+    let additions: Vec<_> = names.iter().map(|s| (s.as_str(), b"".as_slice())).collect();
+    assert!(rebuild(
+        &mut Cursor::new(&bytes),
+        &index,
+        &[],
+        &additions,
+        &mut output
+    )
+    .is_err());
+    assert!(output.is_empty());
+}
+
+#[test]
+fn corrupt_untouched_member_and_stale_index_abort_rebuild() {
+    let mut bytes = authenticated_members(b"second!!");
+    let index = read_index(&mut Cursor::new(&bytes)).unwrap();
+    bytes[220] ^= 1;
+    let mut output = Vec::new();
+    let error = rebuild(
+        &mut Cursor::new(&bytes),
+        &index,
+        &[("res://aa", b"new")],
+        &[],
+        &mut output,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("MD5"));
+    assert!(!output.is_empty()); // Single-pass copy may reach staging before failing.
+    put32(&mut bytes, 32, 5);
+    let mut output = Vec::new();
+    assert!(rebuild(&mut Cursor::new(&bytes), &index, &[], &[], &mut output).is_err());
+    assert!(output.is_empty());
+}
+
+#[test]
+fn independent_verifier_rejects_payload_metadata_path_order_and_trailing_changes() {
+    let bytes = authenticated_members(b"second!!");
+    let mut source = Cursor::new(&bytes);
+    let original = read_index(&mut source).unwrap();
+    let mut output = Vec::new();
+    let plan = rebuild(&mut source, &original, &[], &[], &mut output).unwrap();
+    let index = read_index(&mut Cursor::new(&output)).unwrap();
+    // Even a self-consistent substituted member must fail the independent plan.
+    let mut substituted = output.clone();
+    let first = &index.entries[0];
+    substituted[first.offset as usize..first.offset as usize + 3].copy_from_slice(b"bad");
+    substituted[first.md5_position as usize..first.md5_position as usize + 16]
+        .copy_from_slice(&Md5::digest(b"bad"));
+    assert!(verify_rebuild(&mut Cursor::new(substituted), &plan).is_err());
+    for position in [
+        index.entries[0].offset,
+        16,
+        20,
+        24,
+        32,
+        120,
+        128,
+        104,
+        index.entries[1].path_position + 7,
+    ] {
+        let mut changed = output.clone();
+        changed[position as usize] ^= 1;
+        assert!(
+            verify_rebuild(&mut Cursor::new(changed), &plan).is_err(),
+            "position {position}"
+        );
+    }
+    let mut reordered = output.clone();
+    let first = output[100..148].to_vec();
+    reordered.splice(100..200, output[148..200].iter().chain(&first).copied());
+    assert!(verify_rebuild(&mut Cursor::new(reordered), &plan).is_err());
+    output.push(0);
+    assert!(verify_rebuild(&mut Cursor::new(output), &plan).is_err());
+}
+
+#[test]
+fn empty_archive_rebuild_and_addition_work() {
+    let mut bytes = two_members();
+    bytes.truncate(100);
+    put32(&mut bytes, 96, 0);
+    put64(&mut bytes, 24, 0);
+    let index = read_index(&mut Cursor::new(&bytes)).unwrap();
+    for additions in [vec![], vec![("res://new", b"".as_slice())]] {
+        let mut output = Vec::new();
+        let plan = rebuild(
+            &mut Cursor::new(&bytes),
+            &index,
+            &[],
+            &additions,
+            &mut output,
+        )
+        .unwrap();
+        verify_rebuild(&mut Cursor::new(output), &plan).unwrap();
+    }
+}
+
+#[test]
+fn rebuild_keeps_directory_order_with_unsorted_absolute_source_offsets() {
+    let mut bytes = authenticated_members(b"second!!");
+    // Payloads switch physical order; directory order and raw paths do not.
+    bytes[212..220].copy_from_slice(b"second!!");
+    bytes[220..223].copy_from_slice(b"one");
+    put64(&mut bytes, 24, 0);
+    put64(&mut bytes, 112, 220);
+    put64(&mut bytes, 164, 212);
+    let index = read_index(&mut Cursor::new(&bytes)).unwrap();
+    let mut output = Vec::new();
+    let plan = rebuild(&mut Cursor::new(&bytes), &index, &[], &[], &mut output).unwrap();
+    let mut output = Cursor::new(output);
+    verify_rebuild(&mut output, &plan).unwrap();
+    let generated = read_index(&mut output).unwrap();
+    assert_eq!(generated.entries[0].path, "res://aa");
+    assert_eq!(generated.entries[1].path, "res://b/b");
+    assert_eq!(
+        read_member(&mut output, &generated.entries[0], 100).unwrap(),
+        b"one"
+    );
+    assert_eq!(
+        read_member(&mut output, &generated.entries[1], 100).unwrap(),
+        b"second!!"
+    );
+}
+
+#[test]
+fn transaction_installs_verified_pck_keeps_exact_backup_and_honors_lock_scope() {
+    use locust_core::patch::GameLock;
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let file = root.path().join("owned.pck");
+    let bytes = authenticated_members(b"second!!");
+    std::fs::write(&file, &bytes).unwrap();
+    let lock = GameLock::acquire(root.path()).unwrap();
+    assert!(GameLock::acquire(root.path()).is_err());
+    let wrong_lock = GameLock::acquire(outside.path()).unwrap();
+    assert!(replace_archive(&wrong_lock, &file, &[], &[]).is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    let backup = replace_archive(
+        &lock,
+        &file,
+        &[("res://aa", b"replacement")],
+        &[("res://added", b"added")],
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&backup).unwrap(), bytes);
+    assert!(backup.extension().is_none());
+    let mut installed = std::fs::File::open(&file).unwrap();
+    let index = read_index(&mut installed).unwrap();
+    assert_eq!(index.entries.len(), 3);
+    for entry in &index.entries {
+        assert!(verify_member(&mut installed, entry).unwrap());
+    }
+    assert_eq!(
+        read_member(&mut installed, &index.entries[0], 100).unwrap(),
+        b"replacement"
+    );
+    drop(installed);
+    drop(wrong_lock);
+    drop(lock);
+}
+
+#[test]
+fn transaction_corrupt_untouched_payload_never_installs_partial_rebuild() {
+    use locust_core::patch::GameLock;
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("owned.pck");
+    let mut bytes = authenticated_members(b"second!!");
+    bytes[220] ^= 1;
+    std::fs::write(&file, &bytes).unwrap();
+    let lock = GameLock::acquire(root.path()).unwrap();
+    assert!(replace_archive(&lock, &file, &[("res://aa", b"replacement")], &[]).is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    drop(lock);
 }
 
 #[test]
@@ -457,6 +942,24 @@ impl Seek for MetadataOnly {
             self.bytes.seek(from)
         }
     }
+}
+
+#[test]
+fn rebuild_refuses_relayout_overflow_before_writing_or_reading_payload() {
+    let mut bytes = two_members();
+    bytes.truncate(196);
+    put64(&mut bytes, 168, u64::MAX - 216);
+    let mut reader = MetadataOnly {
+        bytes: Cursor::new(bytes),
+        file_size: u64::MAX,
+        read_bytes: 0,
+    };
+    let index = read_index(&mut reader).unwrap();
+    let mut output = Vec::new();
+    let error = rebuild(&mut reader, &index, &[], &[], &mut output).unwrap_err();
+    assert!(error.to_string().contains("overflow"));
+    assert!(output.is_empty());
+    assert_eq!(reader.read_bytes, 2 * 196);
 }
 
 #[test]

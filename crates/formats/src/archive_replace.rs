@@ -1,4 +1,4 @@
-//! Owned archive replacement shared by Tyrano and YU-RIS. Callers acquire the
+//! Owned archive replacement shared by archive helpers. Callers acquire the
 //! game lock before opening any source archive, and retain it through commit.
 use locust_core::{
     error::{LocustError, Result},
@@ -99,6 +99,22 @@ pub(crate) fn replace_files(lock: &GameLock, files: &[(PathBuf, Vec<u8>)]) -> Re
         })?);
     }
     commit(lock, prepared, |_, _| Ok(()))
+}
+
+/// Stream a complete replacement into owned staging, reusing batch commit and
+/// recovery. The closure must finish writing AND independently verifying before
+/// returning success. It can seek/read the staging file; any error discards it
+/// before an install or backup is prepared. Close source handles in the closure.
+/// The caller owns the game lock throughout. Successful backups are retained
+/// exactly as for `replace_files`, with an extensionless `previous` filename.
+pub(crate) fn replace_file_streamed(
+    lock: &GameLock,
+    path: &Path,
+    write_and_verify: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<PathBuf> {
+    let prepared = Prepared::create(lock, path, write_and_verify)?;
+    let mut backups = commit(lock, vec![prepared], |_, _| Ok(()))?;
+    Ok(backups.remove(0))
 }
 
 fn commit(

@@ -109,6 +109,82 @@ fn partial_write_failure_preserves_exact_original_and_recursive_sentinels() {
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 3);
 }
 
+#[test]
+fn streamed_partial_output_failure_never_installs_or_retains_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = GameLock::acquire(root.path()).unwrap();
+    let file = root.path().join("owned.pck");
+    fs::write(&file, b"original bytes").unwrap();
+    let error = replace_file_streamed(&lock, &file, |stage| {
+        stage.write_all(b"partial new archive")?;
+        Err(std::io::Error::other("injected after partial output").into())
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("injected after partial output"));
+    assert_eq!(fs::read(&file).unwrap(), b"original bytes");
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    drop(lock);
+}
+
+#[test]
+fn streamed_pck_verification_failure_preserves_original_without_install() {
+    use crate::godot_pck::{read_index, rebuild, verify_rebuild};
+    use md5::{Digest, Md5};
+    use std::io::{Cursor, Seek, SeekFrom};
+
+    // Independent one-record fixture: index ends at 148, payload starts at 160.
+    let mut original = Vec::from(*b"GDPC");
+    for word in [2u32, 4, 3, 0, 0] {
+        original.extend(word.to_le_bytes());
+    }
+    original.extend(160u64.to_le_bytes());
+    original.extend([0; 64]);
+    original.extend(1u32.to_le_bytes());
+    original.extend(8u32.to_le_bytes());
+    original.extend(b"res://aa");
+    original.extend(0u64.to_le_bytes());
+    original.extend(3u64.to_le_bytes());
+    original.extend(Md5::digest(b"old"));
+    original.extend(0u32.to_le_bytes());
+    original.resize(160, 0);
+    original.extend(b"old");
+
+    let root = tempfile::tempdir().unwrap();
+    let lock = GameLock::acquire(root.path()).unwrap();
+    let file = root.path().join("owned.pck");
+    fs::write(&file, &original).unwrap();
+    let error = replace_file_streamed(&lock, &file, |stage| {
+        let mut source = Cursor::new(&original);
+        let index = read_index(&mut source)?;
+        let plan = rebuild(&mut source, &index, &[("res://aa", b"new")], &[], stage)?;
+        stage.seek(SeekFrom::Start(160))?;
+        stage.write_all(b"!")?;
+        verify_rebuild(stage, &plan)?;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("MD5"));
+    assert_eq!(fs::read(&file).unwrap(), original);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    drop(lock);
+}
+
+#[test]
+fn streamed_success_retains_previous_and_closes_staging_before_install() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = GameLock::acquire(root.path()).unwrap();
+    let file = root.path().join("owned.pck");
+    fs::write(&file, b"previous").unwrap();
+    let backup = replace_file_streamed(&lock, &file, |stage| {
+        stage.write_all(b"new")?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(fs::read(&file).unwrap(), b"new");
+    assert_eq!(fs::read(backup).unwrap(), b"previous");
+    drop(lock);
+}
+
 fn prepare(lock: &GameLock, file: &Path, bytes: &[u8]) -> Prepared {
     Prepared::create(lock, file, |f| {
         f.write_all(bytes)?;
