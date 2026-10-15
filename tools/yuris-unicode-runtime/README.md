@@ -5,7 +5,184 @@ measurement, and offscreen rendering through **three actual host imports**. They
 not enable Unicode in Locust's production backend, install a proxy, or establish
 YU-RIS compatibility. Keep the existing Shift-JIS refusal in place.
 
-## Run the proof
+## UNI-S containment experiment — currently blocked, not an execution boundary
+
+The separate `sandbox_probe.cpp` / `build-sandbox.ps1` experiment **does not yet
+prove preventive containment**. The current unnamed, create-only windowstation
+request returns **Win32 error 183 (`ERROR_ALREADY_EXISTS`)** and no handle.
+It refuses the existing generated-name object; it does not open, reuse or change
+it. Earlier caller-named requests returned error 5 (`ERROR_ACCESS_DENIED`).
+Neither result establishes profileless AppContainer support: child creation was
+not reached. No game execution, production activation or sandbox CI step is
+permitted by these results.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/yuris-unicode-runtime/build-sandbox.ps1 -OutputDirectory tmp/native-japanese-vn/unicode-sandbox-20261014 -RunTests
+```
+
+The command builds two original i386/PE32 binaries from the same source with
+`/W4 /WX /std:c++17 /MT`: a parent and a separately compiled adversarial fixture.
+Only installed Microsoft tools/platform APIs are used. The parent embeds the
+fixture's freshly compiled SHA256 and its own exact output directory. There is
+no arbitrary-program, arbitrary-payload, profile, or game-launch option.
+
+The sandbox resolver now follows the UNI-1 logical output policy: any safe
+repository-relative **descendant of `tmp/native-japanese-vn/`**, not that root
+itself or a similarly prefixed sibling. Rooted/device/UNC paths, traversal,
+wildcards, ADS, reserved Windows names, trailing dots/spaces, shell expansion,
+and reparse ancestors are rejected before output creation. Comparisons use
+Windows case-insensitive semantics; the compiled host still binds its exact
+per-run directory. The 27 checks include four no-write positive resolver cases
+(including `unicode-sandbox-verify-20261014`), negative entrypoint calls, and an
+owned retained junction. This worker executes builds only under its authorized
+`unicode-sandbox-20261014/` surface; accepting another safe path is not evidence
+of a build there. This is owned-checkout confinement, not protection from a
+concurrent hostile filesystem editor.
+
+### Windowstation naming and strict ownership
+
+Microsoft's [CreateWindowStationW contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createwindowstationw)
+restricts caller-specified names to Administrators; a null name requests an
+OS-generated logon-derived name. The verifier supplied this precondition after
+all previous named tests had failed. Both strict and diagnostic paths now pass
+`nullptr`, retain `CWF_CREATE_ONLY`, request `0x017F`, and keep their supplied
+security descriptors unchanged. The generated name is not a fresh random name:
+a collision must fail closed, as observed here. There is no elevation or
+retry without the create-only flag.
+
+If creation ever succeeds, the held new handle supplies the actual `UOI_NAME`.
+It must differ from the original station, and `UOI_FLAGS` must be non-visible.
+Security-view handles, startup desktop paths and the child's identity check use
+that actual name, not a nonce-derived fiction. Before child launch, strict
+readback must verify the protected user/AppContainer-only DACL, owner and exact
+low no-write-up label on both private objects. A missing/unreadable/mismatched
+readback fails; diagnostic readbacks remain informational. None of these
+successful-creation paths was reached in the collision runs.
+
+### Intended checks versus observed evidence
+
+| Boundary | Implementation / acceptance | Local observation |
+|---|---|---|
+| Output and payload | Safe descendants of the shared tmp namespace; per-run host binding; reject reparse ancestors; fixed-hash write-locked fixture | 27 resolver/entrypoint/junction checks, source snapshots, PE checks, copies and hash pin succeeded |
+| Profileless identity | Random name; only `DeriveAppContainerSidFromAppContainerName`; zero `SECURITY_CAPABILITIES`; actual suspended token SID/user/low IL/capabilities/privileges and child policy must match | SID derivation succeeded; actual child token not reached |
+| New file permissions | Explicit protected DACLs only at creation of owned case/allowed files; AppContainer grant and low label only on the allowed directory and its fixture | Creation succeeded; contained positive-write probe not reached |
+| Private user objects | Unnamed create-only station; actual name/non-input/strict security readback gates; owned desktop; no input switching or existing ACL edits | Creation now fails with error 183; no handle or desktop |
+| Process/job | No inherited handles; clean minimal environment; suspended creation; assign job and verify token before resume; active process limit 1, no breakaway, kill-on-close, 128 MiB, 2 s CPU, 5 s normal wall deadline | Not reached |
+| Adversarial probes | Own outside sentinel write must return access denied; allowed file bytes must match; `RegOpenKeyExW(HKCU, Software, KEY_SET_VALUE)` must deny; no registry value read/create/set/delete | Only initial uncontained sentinel/allowed-file RED observed |
+| Network | Bind only own IPv4 loopback listener; host positive control must connect; child must receive `WSAEACCES`, with zero child connections accepted | Host control succeeded; contained probe not reached |
+| Children/handles | Actual child-process mitigation plus attempted own `--grandchild` launch denied; inheritable parent event absent in fixture | Not reached; job and child policy are overlapping controls, not separately attributed denial mechanisms |
+| Lifetime | Injected setup-failure unwinding, fixture-ready timeout and kill-on-close cases; verify dead process/empty job and private-object disappearance after handle release | Private-object setup blocked these cases; no cleanup success inferred from absence of creation |
+
+The script runs serially in the foreground: **strict setup-unwinding first**
+(`--fail-objects`, no child), the expected-failing uncontained control, a strict
+proof attempt, a focused repeat, then the diagnostic-only comparison. The
+diagnostic branch returns before fixture/listener/job setup or any desktop
+selection/child launch; no descriptor variant can become a fallback. Logs
+record the naming mode, numeric access mask and immediate `GetLastError`.
+Successful strict setup would require the security readback described above;
+no privilege is adjusted to obtain it.
+Timeout/kill-on-close behavioral tests require successful containment first;
+unexecuted cases remain reported as unexecuted and **cannot make the proof green**.
+The outer host deadline is 30 seconds and persisted per-test logs are capped at
+64 KiB. Child reports have a fixed binary size; child output handles are not
+inherited. Every failed launch/check returns nonzero. Compiling without
+`-RunTests` is only a build, never a containment result.
+
+All generated files are retained. There are no profile creation/deletion APIs,
+registry mutations, filesystem deletion calls, global settings, privilege
+adjustments, downloads, or ACL changes to ancestors/originals. Releasing owned
+kernel handles and process attribute memory is not filesystem deletion. The only
+registry operation requests an existing key handle and closes it without reading
+values or modifying anything. The sentinel is prepared solely for this fixture;
+its initial negative-control mutation is retained as evidence, not applied to
+user data.
+
+The final baseline also requires private non-input objects and a bounded job;
+it omits AppContainer and child policy. Consequently, it now fails at the same
+private-windowstation prerequisite on this machine. It does **not** fall back to
+the default desktop to recover the earlier RED.
+
+### Diagnostic-only mode — not a sandbox or a passing proof
+
+The fixed host mode `--diagnose-objects-only` compares five unnamed,
+system-generated-name windowstation attempts with the same `0x017F` request and
+`CWF_CREATE_ONLY`. It never creates a desktop or child, selects a station, changes
+existing objects, or creates a profile. Each case derives a fresh AppContainer
+SID without registering it. The fixed cases are:
+
+| Case | Descriptor | Observed creation |
+|---|---|---|
+| `existing_ga_low` | Existing current-user/AppContainer GA DACL plus low label | Error 183 |
+| `default_null` | Null security-attributes pointer: OS default descriptor | Error 183 |
+| `explicit_ga_no_sacl` | Same explicit GA DACL, no SACL | Error 183 |
+| `explicit_ga_low_repeat` | Same explicit GA DACL and low label, independent SID nonce | Error 183 |
+| `numeric_full_low` | Explicit `0x000F037F` allow ACEs instead of GA, same low label | Error 183 |
+
+If an owned station is created, diagnostics check that it is non-input, query
+its owner/group/DACL/mandatory label where available, close only acquired
+references, and check disappearance. Here no station was created, so readback
+and successful-object lifetime verification were unavailable. The default/null
+case is **diagnostic-only**, not permission to use a default descriptor in the
+strict proof.
+
+Read-only host diagnostics observed a medium-integrity, non-elevated primary
+token, no AppContainer, no restricted SIDs, no job membership, and no thread
+impersonation token (`ERROR_NO_TOKEN`, 1008). The six queried mitigation flag
+sets were zero. `TokenHasRestrictions` separately returned value 1 in one byte;
+it is not synonymous with `IsTokenRestricted`, which returned false. These
+observations do not establish why creation was denied or rule out unqueried
+host/session access controls. Raw SIDs remain in local evidence, not this guide.
+
+Completing this bounded comparison returns **20**, never strict-proof success
+(0), and emits `containment_verdict=none`. The runner requires both diagnostic
+completion and every independent strict check; diagnostic completion cannot
+turn the overall failing command green. Historical named diagnostic failures
+are in `tmp/native-japanese-vn/unicode-sandbox-20261014/REPORT-diagnostic-20261014.md`.
+The current unnamed attempts, resolver RED/GREEN and regression evidence are in
+`tmp/native-japanese-vn/unicode-sandbox-20261014/REPORT-unnamed-20261014.md`.
+
+### Retained intermediate failures
+
+Under `tmp/native-japanese-vn/unicode-sandbox-20261014/`:
+
+- `run-20261014-232214-7656240`: actual uncontained fixture modified its prepared
+  sentinel and wrote the allowed file; host containment assertion exited **23**.
+  The initial RED-only implementation inherited its existing desktop and did not
+  yet implement private objects. Both strict stub calls returned **1**, diagnostic
+  error **50**. The compiler succeeded despite a `vcvarsall` internal `vswhere.exe`
+  PATH warning; the runner now supplies the installed tool directory.
+- `run-20261014-232501-9825842`: fixture built, but host `/WX` compilation failed
+  with **C2065**, because `DESKTOP_ALL_ACCESS` is not an SDK constant. Replaced it
+  with explicit required desktop access bits; no security fallback was added.
+- `run-20261014-232530-6010644`: both binaries built; all four host invocations
+  stopped at private windowstation creation with **error 5**. Source snapshots,
+  metadata, file fixtures and logs remain available. No child was launched by
+  these invocations.
+
+Each attempt keeps `sandbox_probe.cpp`, `build-sandbox.ps1`, build command/logs,
+`fixture_hash.h`, binaries, source/binary hashes, and individual test logs plus
+`metadata.json`. Original user/logon SIDs and derived SID are recorded in local
+metadata/logs; this guide does not publish them or personal filesystem paths.
+The initial final attempt and UNI-1 regression result are recorded in
+`tmp/native-japanese-vn/unicode-sandbox-20261014/REPORT.md`.
+
+The controlled mask follow-up retained two fresh attempts:
+`run-20261014-233252-7298425` logged `0x037F`, and
+`run-20261014-233308-1345488` logged `0x017F`. All four invocations in each
+attempt returned error 5 at creation. No object handle was returned, so actual
+object-security readback and every later child stage were unavailable, not
+passed. The supplied descriptor, create-only/non-input requirements and all
+containment checks stayed unchanged. Follow-up evidence:
+`tmp/native-japanese-vn/unicode-sandbox-20261014/REPORT-mask-20261014.md`.
+
+Even a future passing result would establish only this owned Win32 fixture's
+observed OS isolation. Standard AppContainer is not malware/exploit-proof, a
+universal COM/broker isolation claim, portable Unicode support, or evidence of
+YU-RIS compatibility. A derived SID alone establishes none of those properties.
+The authoritative task remains
+[`odd/tasks/yuris-unicode-runtime.md`](../../odd/tasks/yuris-unicode-runtime.md).
+
+## Run the UNI-1 Unicode proof
 
 From the repository root on Windows, with existing MSVC x86 tools and Windows SDK:
 
@@ -221,3 +398,11 @@ are used; their ordinary platform license obligations still apply.
 4. Spanish glyph coverage does not imply CJK glyph coverage or real-game compatibility.
 5. Independent fresh builds need a confined output namespace, not a worker-specific directory.
 6. Reported error 32 identifies a fixture-write sharing violation, not the conflicting handle's identity.
+7. The UNI-S local failure occurred at private windowstation creation, before any profileless child-token observation.
+8. SID derivation and a successful compiler build do not demonstrate preventive containment.
+9. A nonzero prerequisite failure must remain distinct from a passed denial probe or verified cleanup.
+10. Removing only the READSCREEN request did not resolve the observed private-windowstation creation denial.
+11. All five diagnostic descriptor cases failed creation; no default descriptor was adopted for sandboxing.
+12. The observed one-byte TokenHasRestrictions result required diagnostic-specific size reporting, not a change to strict child-token checks.
+13. Unnamed create-only requests changed the observed failure from access denied to an existing-object collision, not to a containment pass.
+14. A resolver can validate independent safe destinations without writing outside the worker's authorized test surface.
