@@ -1,6 +1,7 @@
 mod archive_replace;
 pub mod binary_search;
 mod discovery;
+pub mod godot_pck;
 pub mod html_game;
 pub mod qsp;
 pub mod renpy;
