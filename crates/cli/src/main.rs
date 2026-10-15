@@ -895,7 +895,7 @@ fn cmd_patch(
         let suffix = lang.as_deref().map(|l| format!("-{l}")).unwrap_or_default();
         PathBuf::from(format!("{base}{suffix}-patch.zip"))
     });
-    let engine = detect_engine_label(&game_path);
+    let engine = detect_engine_label(&db, &game_path)?;
 
     if let Some(path) = &astro {
         validate_astro_output(path, &game_path, &project, &out, pristine.as_deref())?;
@@ -919,7 +919,7 @@ fn cmd_patch(
             lang: lang.clone(),
             output: out,
             pristine,
-            engine: Some(engine),
+            engine: Some(engine.as_deref().unwrap_or("unknown").to_string()),
             project: project.clone(),
             require_pristine: false,
         },
@@ -938,6 +938,7 @@ fn cmd_patch(
             &game_path,
             report.recording_lang.as_deref(),
             Path::new(&report.output_path),
+            engine.as_deref(),
         )?;
         println!("Astro stub written to {}", astro_path.display());
     }
@@ -992,20 +993,38 @@ fn write_astro_stub(
     game_path: &Path,
     lang: Option<&str>,
     zip_path: &Path,
+    engine: Option<&str>,
 ) -> anyhow::Result<()> {
-    let engine = locust_formats::default_registry()
-        .detect(game_path)
-        .map(|p| p.id().to_string())
-        .unwrap_or_else(|| "other".into());
-    locust_core::patch::release_entry::write_release_entry(path, game_path, lang, zip_path, &engine)
+    locust_core::patch::release_entry::write_release_entry(
+        path,
+        game_path,
+        lang,
+        zip_path,
+        engine.unwrap_or("other"),
+    )
 }
 
-fn detect_engine_label(game_path: &std::path::Path) -> String {
+fn detect_engine_label(db: &Database, game_path: &Path) -> anyhow::Result<Option<String>> {
+    // File-source formats need not detect their Replace output directory, and
+    // a shared parent may detect an unrelated engine. Prefer persisted provenance.
+    let entries = db.get_entries(&EntryFilter::default())?;
+    let mut formats = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .metadata
+                .get(locust_core::models::FORMAT_ID_METADATA_KEY)
+                .and_then(|value| value.as_str())
+        })
+        .filter(|id| !id.trim().is_empty());
+    if let Some(format) = formats.next() {
+        if formats.all(|other| other == format) {
+            return Ok(Some(format.to_string()));
+        }
+    }
+
     let registry = locust_formats::default_registry();
-    registry
-        .detect(game_path)
-        .map(|p| p.id().to_string())
-        .unwrap_or_else(|| "unknown".into())
+    Ok(registry.detect(game_path).map(|p| p.id().to_string()))
 }
 
 fn cmd_apply(
@@ -3273,6 +3292,119 @@ mod tests {
     }
 
     #[test]
+    fn patch_engine_label_prefers_unambiguous_project_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (game, _, _, _) = make_renpy_game(dir.path());
+        let file_source_output = dir.path().join("replace-es");
+        fs::create_dir(&file_source_output).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        // Repeated IDs and unmarked legacy rows do not introduce another format.
+        db.save_entries(&[
+            StringEntry::new("a", "Hello", "game.pck/main.dtl".into())
+                .with_format_id("godot-dialogic"),
+            StringEntry::new("b", "World", "game.pck/main.dtl".into())
+                .with_format_id("godot-dialogic"),
+            StringEntry::new("c", "Legacy", "old.txt".into()),
+        ])
+        .unwrap();
+        // Neither an undetectable output nor a detectable sibling engine
+        // should override the project's format.
+        for (index, game) in [file_source_output, game].into_iter().enumerate() {
+            let engine = detect_engine_label(&db, &game).unwrap();
+            assert_eq!(engine.as_deref(), Some("godot-dialogic"));
+            let stub = dir.path().join(format!("release-{index}.md"));
+            write_astro_stub(
+                &stub,
+                &game,
+                Some("es"),
+                &astro_test_zip(dir.path()),
+                engine.as_deref(),
+            )
+            .unwrap();
+            assert!(fs::read_to_string(stub)
+                .unwrap()
+                .contains("\nengine: \"godot-dialogic\" "));
+        }
+    }
+
+    #[test]
+    fn patch_engine_label_falls_back_for_ambiguous_or_missing_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let (game, _, _, _) = make_renpy_game(dir.path());
+        let unknown = dir.path().join("unknown");
+        fs::create_dir(&unknown).unwrap();
+        for formats in [
+            vec![],
+            vec![None],
+            vec![Some("godot-dialogic"), Some("html-game")],
+        ] {
+            let db = Database::open_in_memory().unwrap();
+            for (index, format) in formats.into_iter().enumerate() {
+                let mut row = StringEntry::new(index.to_string(), "Hello", "file".into());
+                if let Some(format) = format {
+                    row = row.with_format_id(format);
+                }
+                db.save_entries(&[row]).unwrap();
+            }
+            assert_eq!(
+                detect_engine_label(&db, &game).unwrap().as_deref(),
+                Some("renpy")
+            );
+            assert_eq!(detect_engine_label(&db, &unknown).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn patch_engine_label_ignores_invalid_format_metadata() {
+        use locust_core::models::FORMAT_ID_METADATA_KEY;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (game, _, _, _) = make_renpy_game(dir.path());
+        let db = Database::open_in_memory().unwrap();
+        for (index, value) in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!(""),
+            serde_json::json!("   "),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut row = StringEntry::new(index.to_string(), "Hello", "file".into());
+            row.metadata.insert(FORMAT_ID_METADATA_KEY.into(), value);
+            db.save_entries(&[row]).unwrap();
+        }
+        assert_eq!(
+            detect_engine_label(&db, &game).unwrap().as_deref(),
+            Some("renpy")
+        );
+    }
+
+    #[test]
+    fn patch_engine_label_preserves_existing_engine_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        db.save_entries(&[
+            StringEntry::new("a", "Hello", "game/script.rpy".into()).with_format_id("renpy")
+        ])
+        .unwrap();
+        let engine = detect_engine_label(&db, dir.path()).unwrap();
+        assert_eq!(engine.as_deref(), Some("renpy"));
+        let stub = dir.path().join("release.md");
+        write_astro_stub(
+            &stub,
+            dir.path(),
+            Some("es"),
+            &astro_test_zip(dir.path()),
+            engine.as_deref(),
+        )
+        .unwrap();
+        assert!(fs::read_to_string(stub)
+            .unwrap()
+            .contains("\nengine: \"renpy\" "));
+    }
+
+    #[test]
     fn astro_stub_guides_players_to_rule95_patcher() {
         let dir_guard = tempfile::Builder::new()
             .prefix("locust_astro_")
@@ -3282,7 +3414,7 @@ mod tests {
         let stub = dir.join("release.md");
         let game = dir.join("MyGame");
         fs::create_dir_all(&game).unwrap();
-        write_astro_stub(&stub, &game, Some("es"), &astro_test_zip(&dir)).unwrap();
+        write_astro_stub(&stub, &game, Some("es"), &astro_test_zip(&dir), None).unwrap();
         let md = fs::read_to_string(&stub).unwrap();
         let _ = fs::remove_dir_all(&dir);
         assert!(md.contains("gameVersion: \"TODO\"\n"));
@@ -3654,7 +3786,7 @@ mod tests {
         let stub = dir.path().join("release.md");
         fs::write(&stub, "user notes").unwrap();
         let zip = astro_test_zip(dir.path());
-        assert!(write_astro_stub(&stub, dir.path(), Some("es"), &zip).is_err());
+        assert!(write_astro_stub(&stub, dir.path(), Some("es"), &zip, None).is_err());
         assert_eq!(fs::read_to_string(&stub).unwrap(), "user notes");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
