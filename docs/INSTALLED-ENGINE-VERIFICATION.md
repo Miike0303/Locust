@@ -1,17 +1,19 @@
 # Installed-engine verification: partial resource evidence
 
-**REL-4A verifies the Ren’Py Replace fix on an owned projection; R01 remains `pending-policy`, not all green.** The candidate preserves the trailing blank line lost in the historical REL-4 run and passes Replace packaging, installation, rollback and reapplication. Ren’Py Add still correctly refuses installation without structural-tier confirmation; its rollback and reapplication were not run. RPG Maker MZ and Unity retain their historical passing results, not new candidate verification.
+**REL-4A is delivered at verified source `77e5c96`; R01 remains `pending-policy` only for Add, not a failed Replace.** The fix preserves the trailing blank line lost in the historical REL-4 run and passes Replace packaging, installation, rollback and reapplication. Ren’Py Add still correctly refuses installation without structural-tier confirmation; its rollback and reapplication were not run. RPG Maker MZ and Unity retain their historical passing results, not verification at the latest commit.
 
 These are **owned resource projections, not runnable game copies**. Public evidence uses aliases and counts; installed titles, paths, dialogue, databases and raw logs remain in ignored local artifacts.
 
 ## Results at a glance
 
-Both records are dated 2026-10-15. Historical REL-4 used source checkpoint `d2a3fe715e3e60d337e227b2e2f4739f07c7d02a`. REL-4A replayed **only R01**, using the uncommitted Ren’Py fix candidate and release CLI SHA-256 `46289b196e09ee57a2cb81304169b60924b01aebef8ce846124f1c3ce3ab3954`. That candidate is not yet CI-verified; the hash identifies the tested binary, not a released version.
+Both records are dated 2026-10-15. Historical REL-4 used source checkpoint `d2a3fe715e3e60d337e227b2e2f4739f07c7d02a`. REL-4A replayed **only R01**, using the uncommitted Ren’Py fix candidate and release CLI SHA-256 `46289b196e09ee57a2cb81304169b60924b01aebef8ce846124f1c3ce3ab3954`. That source is now delivered to `main` as `77e5c96c252fb8780f87aaac1ffd905541068a92`, verified by [CI `38678826007`](https://github.com/Miike0303/Locust/actions/runs/38678826007). The actual replay reports remain precommit-candidate records with the same verified binary hash; their recorded source SHAs are not rewritten. The hash identifies the tested binary, not an application version bump.
+
+The latest CI passed Rust Ubuntu **2415/0/21 ignored**, Windows **2426/0/21 ignored**, and **494 frontend tests on each**; Python recorded 64 total (one skipped on Windows), the oracle 10, and isolated Unicode checks 108 + 25 path checks. Build, fmt and strict Clippy passed. Ignored Rust tests were not run; 13 npm vulnerabilities remain unresolved. Local release CLI retained the replay hash above; desktop SHA-256 is `ec69ce9b596284d35e4b75594415addbdd5f9f315084ebf63b07100b4ab98a25`, also already hash-verified. These are parent-verified checkpoint results, not checks rerun for this passive update.
 
 | Alias | Installed family and tested resources | Engine version | Extracted rows | Controlled targets | Evidence level and result |
 |---|---|---|---:|---:|---|
 | M01 | RPG Maker MV/MZ family; **MZ** JSON database resources | Unknown | 59 | 3 | Historical owned-projection verification at `d2a3fe7`: exact target fields, remaining JSON structure and Replace recovery passed; not replayed in REL-4A |
-| R01 | Ren’Py; loose UTF-8 source scripts | Unknown | 31,594 | 3 | Candidate owned-projection verification: Replace structure, all rows and recovery passed; Add oracle passed, install refused; overall `pending-policy` |
+| R01 | Ren’Py; loose UTF-8 source scripts | Unknown | 31,594 | 3 | Owned-projection replay of the now-delivered fix: Replace structure, all rows and recovery passed; Add oracle passed, install refused; overall `pending-policy` |
 | U01 | Unity; authored `SCRIPTS~` text and character declarations | Unknown | 169 | 3 | Historical owned-projection verification at `d2a3fe7`: declared-speaker targets, remaining script lines and Replace recovery passed; not replayed in REL-4A |
 
 MV was not separately exercised. U01 does not cover Unity SerializedFile, UnityFS, IL2CPP or arbitrary Unity games. R01 does not cover compiled scripts or RPA archives. Optional KiriKiri, VX Ace and Unreal cases were not added.
@@ -63,13 +65,13 @@ The strict capacity option is Replace-only and was deliberately absent from this
 
 ## Historical defect and remaining blocker
 
-### 1. Ren’Py Replace: historical failure, candidate verification passed
+### 1. Ren’Py Replace: historical failure resolved in verified source
 
 At `d2a3fe7`, the independent oracle expected 59,587 script lines after changing only the three selected literals; the output had 59,586. All common lines matched, and the missing final line was blank. All 31,594 re-extracted rows still matched. This was a resource-preservation failure, **not observed runtime breakage**.
 
 The REL-4A candidate passed the unchanged independent script oracle: **59,587 lines preserved, zero line-ending changes**, all 31,594 re-extracted rows matched, and all three test targets matched their independent slots. The other resource remained byte-identical and the source DB text digest was unchanged. The report also records one negative oracle control. Replace pack/install/rollback/reapply all passed.
 
-This documentation update changes no application or test code and reruns no audit. The recorded candidate result supersedes the historical Replace failure only for this bounded loose-script projection; it does not establish compiled-script, archive or runtime coverage.
+This documentation update changes no application or test code and reruns no audit. The recorded precommit result, now linked to verified source `77e5c96`, supersedes the historical Replace failure only for this bounded loose-script projection; it does not establish compiled-script, archive or runtime coverage. The code regression began at 3 passing/6 failing tests and finished with 9 tests covering 84 byte-exact combinations and 6 no-write controls; three old revision expectations were corrected before the passing workspace run. The earlier CI-watch network timeout was reconciled read-only, not a test failure.
 
 ### 2. Added-only Ren’Py patches require explicit confirmation
 
@@ -84,7 +86,7 @@ These paths are **ignored local evidence, not public links**. No replay is requi
 | Record | Retained local path | Authority |
 |---|---|---|
 | Historical REL-4 report | `tmp/reliable-installed-engines/rel-4/run-1792033780900-2cd5cc83/report.json` | M01/U01 results, original-resource hashes and the original R01 failure |
-| Actual REL-4A report | `tmp/reliable-installed-engines/rel-4/verify-renpy-fix/report.json` | R01 candidate Replace pass, Add policy refusal, binary hash and actual storage |
+| Actual REL-4A report | `tmp/reliable-installed-engines/rel-4/verify-renpy-fix/report.json` | R01 precommit-candidate Replace pass (source now verified at `77e5c96`), Add policy refusal, unchanged binary hash and actual storage |
 | Replay preparation | `tmp/reliable-installed-engines/rel-4/REPLAY.md` | Harness options and storage/isolation contract; its preparation-only status is not the executed result |
 
 Detailed artifacts remain beside the corresponding report:
@@ -112,9 +114,13 @@ Each run allocates fresh retained directories and uses explicit `--config`, `LOC
 
 The independent checks reuse the RPG Maker JSON and Ren’Py literal helpers under `tools/ground-truth/`; the Unity declared-speaker grammar is adapted from `unity/oot_audit.py` without importing its whole-corpus side effects. No game script is executed as Python or JavaScript.
 
+## Read-only next research
+
+REL-5 is in progress, not an implementation or installed-game verification. G01 confirms Godot 4.3/PCK v2 and Dialogic resources (112 `.dtl`, 7 `.dch`); the installed Dialogic version remains unknown. The primary alpha 16 reference is compatible with the observed format, not proof of the installed framework identity. Native support remains unavailable; no game runtime, font or linguistic result follows from this research.
+
 ## Key learnings
 
-1. M01 and U01 retain historical projection-level passes at `d2a3fe7`; only R01 was replayed against the uncommitted, not-yet-CI-verified candidate.
+1. M01 and U01 retain historical projection-level passes at `d2a3fe7`; only R01 was replayed with the precommit binary whose source is now delivered and CI-verified at `77e5c96`.
 2. R01 Replace now preserves all 59,587 script lines with zero line-ending changes and matches 31,594 re-extracted rows, including three controlled targets.
 3. R01 Add verifies three translation targets while preserving both source files and all 31,594 original rows, but its structural-tier installation refusal leaves the case `pending-policy`.
 4. Replace pack/install/rollback/reapply passed; Add rollback and reapply were not run because nothing was installed.
