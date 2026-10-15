@@ -62,12 +62,13 @@ Desktop and HTTP `POST /api/project/open` use `resolve_project_db_path`: `<game-
 
 CLI `extract` without `-o` writes `{game-folder-name}.locust.db` in the **current working directory**. Pass `-o <game-parent>/<game-name>.locust.db` to share the desktop file.
 
-## Verification worktrees
+## Disk hygiene (mandatory)
 
-Agents creating throwaway worktrees for verification must build with
-`CARGO_TARGET_DIR` set to `<main checkout>/target-verify` (covered by `/target-*`)
-instead of a fresh per-worktree target directory. Remove the worktree with
-`git worktree remove` when verification is done.
+Cargo caches regrew to ~88 GB in 4 days (2026-10-15), so every agent must follow these rules:
+
+- **Before and after every build/test batch** (`cargo build`, `cargo test`, `cargo clippy`, `tools/verify-worktree.sh`, `npm run build`), run `powershell -NoProfile -File tools/cleanup-scratch.ps1 -Apply`. Run it once per batch, not once per command. It removes aged scratch and test leftovers. It deletes `<checkout>/target` above 30 GB, the shared target above 15 GB, and stray `target-*` dirs. It skips the deletions while cargo is running.
+- Only two cargo targets may exist: the checkout's own `target/` and `%LOCALAPPDATA%\locust-shared-target`, which is for verification worktrees and scratch builds. Never create `target-verify`, `target-<name>`, or a per-worktree target.
+- Verification worktrees use `tools/verify-worktree.sh`, which already uses the shared target with no debuginfo and no incremental. Run `git worktree remove --force` on them in the same step that finishes the verification.
 
 ## Build
 
