@@ -118,6 +118,8 @@ The independent checks reuse the RPG Maker JSON and Ren’Py literal helpers und
 
 REL-5 is in progress, not an implementation or installed-game verification. G01 confirms Godot 4.3/PCK v2 and Dialogic resources (112 `.dtl`, 7 `.dch`); the installed Dialogic version remains unknown. The primary alpha 16 reference is compatible with the observed format, not proof of the installed framework identity. Native support remains unavailable; no game runtime, font or linguistic result follows from this research.
 
+For current Experimental support and verification, see the [Godot / Dialogic guide](GODOT-DIALOGIC.md).
+
 ## Key learnings
 
 1. M01 and U01 retain historical projection-level passes at `d2a3fe7`; only R01 was replayed with the precommit binary whose source is now delivered and CI-verified at `77e5c96`.
