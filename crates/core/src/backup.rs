@@ -162,6 +162,49 @@ pub struct BackupListing {
     pub unreadable: Vec<(String, String)>,
 }
 
+/// Payload content bytes in readable, completed backups. On-disk bytes count
+/// each physical file once; filesystem allocation/metadata overhead is excluded.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BackupStorageUsage {
+    pub logical_bytes: u64,
+    pub on_disk_bytes: u64,
+}
+
+type PayloadIndex = BTreeMap<(u64, String), Vec<PathBuf>>;
+
+fn try_link_payload(
+    candidates: &[PathBuf],
+    destination: &Path,
+    size: u64,
+    sha256: &str,
+    permissions: &fs::Permissions,
+    link_file: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<bool> {
+    let matches = |path: &Path| -> Result<bool> {
+        checked_absolute(path)?;
+        let meta = fs::metadata(path)?;
+        if !meta.is_file() || meta.len() != size || meta.permissions() != *permissions {
+            return Ok(false);
+        }
+        let (digest, actual_size) = sha256_file(path)?;
+        Ok(actual_size == size && digest == sha256)
+    };
+    for candidate in candidates {
+        // Manifests are only an index: missing, damaged, or unsafe payloads are
+        // never trusted. A different permission set also needs its own copy.
+        if !matches(candidate).unwrap_or(false) || link_file(candidate, destination).is_err() {
+            continue;
+        }
+        // Recheck the linked name in case the candidate changed between hashing
+        // and linking. Unlink before copying; never truncate a shared inode.
+        if matches(destination).unwrap_or(false) {
+            return Ok(true);
+        }
+        fs::remove_file(destination)?;
+    }
+    Ok(false)
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct BackupManifest {
     pub source_path: PathBuf,
@@ -550,6 +593,14 @@ impl BackupManager {
     }
 
     pub fn create_backup(&self, game_path: &Path) -> Result<BackupEntry> {
+        self.create_backup_with_linker(game_path, |from, to| fs::hard_link(from, to))
+    }
+
+    fn create_backup_with_linker(
+        &self,
+        game_path: &Path,
+        mut link_file: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    ) -> Result<BackupEntry> {
         let source = checked_absolute(game_path)?.canonicalize()?;
         let kind = if source.is_dir() {
             SourceKind::Directory
@@ -588,6 +639,9 @@ impl BackupManager {
             BTreeMap::from([(PathBuf::from("file"), InventoryEntry::File { size, sha256 })])
         };
         let (file_count, size_bytes) = totals(&inventory)?;
+        // Build once, before claiming the new backup. Only other completed V2
+        // inventories participate; legacy backups have no trusted saved hashes.
+        let candidates = self.payload_index();
         let now = Utc::now();
         let (id, path) = self.claim_backup_dir(now)?;
         let payload = path.join("payload");
@@ -596,7 +650,7 @@ impl BackupManager {
             let dest = payload.join(rel);
             match entry {
                 InventoryEntry::Directory => fs::create_dir_all(&dest)?,
-                InventoryEntry::File { .. } => {
+                InventoryEntry::File { size, sha256 } => {
                     if let Some(parent) = dest.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -608,6 +662,20 @@ impl BackupManager {
                     checked_absolute(&src)?;
                     let mut input = fs::File::open(src)?;
                     let permissions = input.metadata()?.permissions();
+                    if let Some(paths) = candidates.get(&(*size, sha256.clone())) {
+                        if try_link_payload(
+                            paths,
+                            &dest,
+                            *size,
+                            sha256,
+                            &permissions,
+                            &mut link_file,
+                        )? {
+                            continue;
+                        }
+                    }
+                    // Payloads are immutable once published. In particular,
+                    // create_new must never open an existing hard link to write.
                     let mut output = OpenOptions::new()
                         .write(true)
                         .create_new(true)
@@ -657,6 +725,41 @@ impl BackupManager {
             file_count,
             size_bytes,
         })
+    }
+
+    fn payload_index(&self) -> PayloadIndex {
+        let mut index = PayloadIndex::new();
+        let Ok(directories) = fs::read_dir(&self.backup_root) else {
+            return index;
+        };
+        for directory in directories.flatten() {
+            let path = directory.path();
+            if checked_absolute(&path).is_err() || !path.is_dir() {
+                continue;
+            }
+            let id = directory.file_name().to_string_lossy().into_owned();
+            let Ok((summary, Some(manifest))) = Self::load_manifest(&id, &path) else {
+                continue;
+            };
+            if manifest
+                .inventory
+                .keys()
+                .any(|rel| plain_relative(rel).is_err())
+                || totals(&manifest.inventory).ok()
+                    != Some((summary.file_count, summary.size_bytes))
+            {
+                continue;
+            }
+            for (relative, entry) in manifest.inventory {
+                if let InventoryEntry::File { size, sha256 } = entry {
+                    index
+                        .entry((size, sha256))
+                        .or_default()
+                        .push(path.join("payload").join(relative));
+                }
+            }
+        }
+        index
     }
 
     fn resolve_backup_dir(&self, backup_id: &str) -> Result<PathBuf> {
@@ -970,6 +1073,8 @@ impl BackupManager {
                             .write(true)
                             .create_new(true)
                             .open(&staged)?;
+                        // Always copy OUT to a fresh inode. A game edit must
+                        // never mutate this or another backup's shared payload.
                         let mut input = fs::File::open(payload.join(rel))?;
                         let permissions = input.metadata()?.permissions();
                         std::io::copy(&mut input, &mut output)?;
@@ -1063,6 +1168,48 @@ impl BackupManager {
             return Err(failure(format!("no readable backups: {errors}")));
         }
         Ok(report.entries)
+    }
+
+    /// Count logical inventory bytes and unique physical payload content bytes
+    /// without reading file contents. This is a snapshot; concurrent deletion
+    /// can produce an I/O error. Unreadable manifests are skipped as in listing.
+    pub fn storage_usage(&self) -> Result<BackupStorageUsage> {
+        let mut usage = BackupStorageUsage::default();
+        let mut seen = BTreeSet::new();
+        for backup in self.list_backups_report()?.entries {
+            let (summary, manifest) = Self::load_manifest(&backup.id, &backup.path)?;
+            let logical = match &manifest {
+                Some(manifest) => totals(&manifest.inventory)?.1,
+                None => summary.size_bytes,
+            };
+            usage.logical_bytes = usage
+                .logical_bytes
+                .checked_add(logical)
+                .ok_or_else(|| failure("backup size overflow"))?;
+            let payload = if manifest.is_some() {
+                backup.path.join("payload")
+            } else {
+                backup.path.clone()
+            };
+            checked_absolute(&payload)?;
+            for entry in WalkDir::new(&payload).follow_links(false).min_depth(1) {
+                let entry = entry.map_err(|e| failure(e.to_string()))?;
+                reject_link(entry.path(), &fs::symlink_metadata(entry.path())?)?;
+                if !entry.file_type().is_file()
+                    || (manifest.is_none() && entry.path() == backup.path.join("manifest.json"))
+                {
+                    continue;
+                }
+                let file = fs::File::open(entry.path())?;
+                if seen.insert(crate::file_identity::identity(&file)?) {
+                    usage.on_disk_bytes = usage
+                        .on_disk_bytes
+                        .checked_add(file.metadata()?.len())
+                        .ok_or_else(|| failure("backup size overflow"))?;
+                }
+            }
+        }
+        Ok(usage)
     }
 
     /// Report manifest failures individually while keeping filesystem and link-safety errors fatal.
@@ -1795,6 +1942,337 @@ mod tests {
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("sub").join("nested.txt"), "nested content").unwrap();
         dir_guard
+    }
+
+    #[test]
+    fn backup_dedupe_unchanged_tree_shares_every_payload_file() {
+        let game = create_game_dir();
+        let root = tempdir();
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(game.path()).unwrap();
+        let second = manager.create_backup(game.path()).unwrap();
+        let expected = scan_source(game.path()).unwrap();
+        for (rel, entry) in &expected {
+            if matches!(entry, InventoryEntry::File { .. }) {
+                assert_payload_sharing(&first, &second, rel, true);
+            }
+        }
+        assert_eq!(
+            manager.storage_usage().unwrap(),
+            BackupStorageUsage {
+                logical_bytes: first.size_bytes * 2,
+                on_disk_bytes: first.size_bytes,
+            }
+        );
+        for backup in [&first, &second] {
+            assert_eq!(scan(&backup.path.join("payload"), false).unwrap(), expected);
+            manager
+                .with_pristine_tree(&backup.id, game.path(), |_| Ok(()))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn backup_dedupe_both_backups_restore_and_verify() {
+        let game = create_game_dir();
+        let root = tempdir();
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(game.path()).unwrap();
+        let second = manager.create_backup(game.path()).unwrap();
+        assert_payload_sharing(&first, &second, Path::new("strings.txt"), true);
+        let expected = scan_source(game.path()).unwrap();
+        for backup in [&first, &second] {
+            fs::write(game.path().join("data.json"), "changed").unwrap();
+            manager.restore(&backup.id).unwrap();
+            manager.verify_restore(&backup.id).unwrap();
+            assert_eq!(scan_source(game.path()).unwrap(), expected);
+        }
+    }
+
+    fn assert_payload_sharing(first: &BackupEntry, second: &BackupEntry, rel: &Path, shared: bool) {
+        let a = fs::File::open(first.path.join("payload").join(rel)).unwrap();
+        let b = fs::File::open(second.path.join("payload").join(rel)).unwrap();
+        assert_eq!(crate::file_identity::same_file(&a, &b), shared, "{rel:?}");
+        #[cfg(any(unix, windows))]
+        if shared {
+            assert_eq!(crate::file_identity::link_count(&a).unwrap(), 2);
+            assert_eq!(crate::file_identity::link_count(&b).unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn backup_dedupe_revision_copies_only_changed_file() {
+        let game = create_game_dir();
+        let root = tempdir();
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(game.path()).unwrap();
+        fs::write(game.path().join("data.json"), "one-line revision").unwrap();
+        let second = manager.create_backup(game.path()).unwrap();
+        assert_payload_sharing(&first, &second, Path::new("data.json"), false);
+        assert_payload_sharing(&first, &second, Path::new("strings.txt"), true);
+        assert_payload_sharing(&first, &second, Path::new("sub/nested.txt"), true);
+        assert_eq!(
+            manager.storage_usage().unwrap(),
+            BackupStorageUsage {
+                logical_bytes: first.size_bytes + second.size_bytes,
+                on_disk_bytes: first.size_bytes + b"one-line revision".len() as u64,
+            }
+        );
+        manager
+            .with_pristine_tree(&second.id, game.path(), |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn backup_dedupe_corrupt_candidate_is_copied_even_at_same_size() {
+        for corrupt in [b"corrupt!".as_slice(), b"short", b"longer corrupted file"] {
+            let game = tempdir();
+            let root = tempdir();
+            fs::write(game.path().join("a"), b"original").unwrap();
+            let manager = BackupManager::new(root.path().to_owned());
+            let first = manager.create_backup(game.path()).unwrap();
+            fs::write(first.path.join("payload/a"), corrupt).unwrap();
+            let second = manager.create_backup(game.path()).unwrap();
+            assert_payload_sharing(&first, &second, Path::new("a"), false);
+            assert_eq!(
+                fs::read(second.path.join("payload/a")).unwrap(),
+                b"original"
+            );
+            manager
+                .with_pristine_tree(&second.id, game.path(), |_| Ok(()))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn backup_dedupe_delete_and_retention_preserve_shared_payload() {
+        for retention in [false, true] {
+            let game = create_game_dir();
+            let root = tempdir();
+            let manager = BackupManager::new(root.path().to_owned());
+            let first = manager.create_backup(game.path()).unwrap();
+            let second = manager.create_backup(game.path()).unwrap();
+            assert_payload_sharing(&first, &second, Path::new("strings.txt"), true);
+            let expected = scan_source(game.path()).unwrap();
+            if retention {
+                assert_eq!(manager.delete_old_backups(1).unwrap(), 1);
+            } else {
+                manager.delete_backup(&first.id).unwrap();
+            }
+            assert!(!first.path.exists());
+            assert_eq!(scan(&second.path.join("payload"), false).unwrap(), expected);
+            manager
+                .with_pristine_tree(&second.id, game.path(), |_| Ok(()))
+                .unwrap();
+            assert_eq!(
+                manager.storage_usage().unwrap(),
+                BackupStorageUsage {
+                    logical_bytes: second.size_bytes,
+                    on_disk_bytes: second.size_bytes,
+                }
+            );
+            #[cfg(any(unix, windows))]
+            assert_eq!(
+                crate::file_identity::link_count(
+                    &fs::File::open(second.path.join("payload/strings.txt")).unwrap()
+                )
+                .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn backup_dedupe_deleted_older_backup_newer_restores_exactly() {
+        let game = create_game_dir();
+        let root = tempdir();
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(game.path()).unwrap();
+        let second = manager.create_backup(game.path()).unwrap();
+        let expected = scan_source(game.path()).unwrap();
+        manager.delete_backup(&first.id).unwrap();
+        fs::write(game.path().join("strings.txt"), "modified").unwrap();
+        manager.restore(&second.id).unwrap();
+        manager.verify_restore(&second.id).unwrap();
+        assert_eq!(scan_source(game.path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn backup_dedupe_restore_then_modify_does_not_mutate_shared_payloads() {
+        let game = create_game_dir();
+        let root = tempdir();
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(game.path()).unwrap();
+        let second = manager.create_backup(game.path()).unwrap();
+        assert_payload_sharing(&first, &second, Path::new("strings.txt"), true);
+        let expected = scan_source(game.path()).unwrap();
+        // Exercise both replacement and recreation during restore.
+        fs::write(game.path().join("data.json"), "changed").unwrap();
+        fs::remove_file(game.path().join("strings.txt")).unwrap();
+        manager.restore(&second.id).unwrap();
+        for backup in [&first, &second] {
+            assert!(!crate::file_identity::same_file(
+                &fs::File::open(game.path().join("strings.txt")).unwrap(),
+                &fs::File::open(backup.path.join("payload/strings.txt")).unwrap(),
+            ));
+        }
+        fs::write(game.path().join("strings.txt"), "user edit after restore").unwrap();
+        fs::write(game.path().join("data.json"), "another edit").unwrap();
+        for backup in [&first, &second] {
+            assert_eq!(scan(&backup.path.join("payload"), false).unwrap(), expected);
+            manager
+                .with_pristine_tree(&backup.id, game.path(), |_| Ok(()))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn backup_dedupe_link_failure_falls_back_to_copy() {
+        let game = create_game_dir();
+        let root = tempdir();
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(game.path()).unwrap();
+        let mut attempts = 0;
+        let second = manager
+            .create_backup_with_linker(game.path(), |_, _| {
+                attempts += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected hard-link failure",
+                ))
+            })
+            .unwrap();
+        assert_eq!(attempts, first.file_count);
+        for (rel, entry) in scan_source(game.path()).unwrap() {
+            if matches!(entry, InventoryEntry::File { .. }) {
+                assert_payload_sharing(&first, &second, &rel, false);
+            }
+        }
+        assert_eq!(
+            manager.storage_usage().unwrap(),
+            BackupStorageUsage {
+                logical_bytes: first.size_bytes * 2,
+                on_disk_bytes: first.size_bytes * 2,
+            }
+        );
+        manager
+            .with_pristine_tree(&second.id, game.path(), |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn backup_dedupe_changed_candidate_after_check_is_unlinked_before_copy() {
+        let game = tempdir();
+        let root = tempdir();
+        fs::write(game.path().join("a"), b"original").unwrap();
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(game.path()).unwrap();
+        let mut attempts = 0;
+        let second = manager
+            .create_backup_with_linker(game.path(), |from, to| {
+                attempts += 1;
+                fs::write(from, b"corrupt!")?;
+                fs::hard_link(from, to)
+            })
+            .unwrap();
+        assert_eq!(attempts, 1);
+        assert_payload_sharing(&first, &second, Path::new("a"), false);
+        assert_eq!(fs::read(first.path.join("payload/a")).unwrap(), b"corrupt!");
+        assert_eq!(
+            fs::read(second.path.join("payload/a")).unwrap(),
+            b"original"
+        );
+        manager
+            .with_pristine_tree(&second.id, game.path(), |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn backup_dedupe_skips_damaged_manifests_and_missing_candidates() {
+        for damage in ["json", "version", "totals", "traversal", "missing"] {
+            let game = create_game_dir();
+            let root = tempdir();
+            let manager = BackupManager::new(root.path().to_owned());
+            let first = manager.create_backup(game.path()).unwrap();
+            let bad = root.path().join("damaged");
+            fs::create_dir(&bad).unwrap();
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(first.path.join("manifest.json")).unwrap())
+                    .unwrap();
+            match damage {
+                "version" => manifest["version"] = serde_json::json!(999),
+                "totals" => manifest["size_bytes"] = serde_json::json!(999),
+                "traversal" => {
+                    let file = manifest["inventory"]["data.json"].clone();
+                    manifest["inventory"]["../escape"] = file;
+                }
+                _ => {}
+            }
+            fs::write(
+                bad.join("manifest.json"),
+                if damage == "json" {
+                    b"{".to_vec()
+                } else {
+                    serde_json::to_vec(&manifest).unwrap()
+                },
+            )
+            .unwrap();
+            let second = manager.create_backup(game.path()).unwrap();
+            assert_payload_sharing(&first, &second, Path::new("data.json"), true);
+            manager
+                .with_pristine_tree(&second.id, game.path(), |_| Ok(()))
+                .unwrap();
+            assert!(!root.path().join("escape").exists());
+        }
+    }
+
+    #[test]
+    fn backup_dedupe_matches_content_across_names_and_single_file_backups() {
+        let game = tempdir();
+        let root = tempdir();
+        let file = game.path().join("original-name");
+        fs::write(&file, b"original").unwrap();
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(&file).unwrap();
+        fs::rename(&file, game.path().join("new-name")).unwrap();
+        let second = manager.create_backup(game.path()).unwrap();
+        assert!(crate::file_identity::same_file(
+            &fs::File::open(first.path.join("payload/file")).unwrap(),
+            &fs::File::open(second.path.join("payload/new-name")).unwrap(),
+        ));
+        manager
+            .with_pristine_tree(&second.id, game.path(), |_| Ok(()))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_dedupe_permission_difference_uses_independent_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let game = tempdir();
+        let root = tempdir();
+        let file = game.path().join("runner");
+        fs::write(&file, b"original").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let manager = BackupManager::new(root.path().to_owned());
+        let first = manager.create_backup(game.path()).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        let second = manager.create_backup(game.path()).unwrap();
+        assert_payload_sharing(&first, &second, Path::new("runner"), false);
+        assert_eq!(
+            fs::metadata(first.path.join("payload/runner"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        manager.restore(&second.id).unwrap();
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 
     #[test]

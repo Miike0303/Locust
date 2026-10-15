@@ -649,7 +649,8 @@ fn locust_backup_root() -> PathBuf {
 }
 
 fn cmd_backups() -> anyhow::Result<()> {
-    let report = BackupManager::new(locust_backup_root()).list_backups_report()?;
+    let manager = BackupManager::new(locust_backup_root());
+    let report = manager.list_backups_report()?;
     for backup in &report.entries {
         println!(
             "{}\t{}\t{} file(s), {} bytes\t{}",
@@ -669,6 +670,11 @@ fn cmd_backups() -> anyhow::Result<()> {
         }
         println!("No injection backups found.");
     }
+    let usage = manager.storage_usage()?;
+    println!(
+        "Total: {} logical bytes, {} on-disk bytes",
+        usage.logical_bytes, usage.on_disk_bytes
+    );
     Ok(())
 }
 

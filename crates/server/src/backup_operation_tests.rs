@@ -71,6 +71,49 @@ fn fixture() -> (tempfile::TempDir, Arc<AppState>, BackupEntry, PathBuf) {
 }
 
 #[tokio::test]
+async fn backup_http_delete_preserves_other_shared_backup() {
+    let (_temp, state, older, file) = fixture();
+    std::fs::write(&file, "Original").unwrap();
+    let newer = state
+        .backup_manager
+        .create_backup(file.parent().unwrap())
+        .unwrap();
+    let old_payload = older.path.join("payload/story.html");
+    let new_payload = newer.path.join("payload/story.html");
+    // Storage accounting uses native file IDs on Windows and Unix.
+    assert_eq!(
+        state.backup_manager.storage_usage().unwrap().logical_bytes,
+        16
+    );
+    assert_eq!(
+        state.backup_manager.storage_usage().unwrap().on_disk_bytes,
+        8
+    );
+    let (url, server) = start_test_server(state.clone()).await;
+    let response = reqwest::Client::new()
+        .delete(format!("{url}/api/backups/{}", older.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(!old_payload.exists());
+    assert_eq!(std::fs::read(new_payload).unwrap(), b"Original");
+    state
+        .backup_manager
+        .with_pristine_tree(&newer.id, file.parent().unwrap(), |_| Ok(()))
+        .unwrap();
+    assert_eq!(
+        state.backup_manager.storage_usage().unwrap().logical_bytes,
+        8
+    );
+    assert_eq!(
+        state.backup_manager.storage_usage().unwrap().on_disk_bytes,
+        8
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn backup_handlers_refuse_project_conflicts_before_mutation() {
     let (_temp, state, backup, file) = fixture();
     let exclusive = try_project_operation(&state).unwrap();

@@ -1,54 +1,93 @@
-use std::fs::File;
+use std::{fs::File, io};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FileIdentity {
+    volume: u64,
+    index: u64,
+}
 
 // Keep the original file handle alive so its identifier cannot be reused if
 // another process moves/deletes it and installs an unrelated file at its name.
 pub(crate) fn same_file(left: &File, right: &File) -> bool {
+    identity(left)
+        .ok()
+        .zip(identity(right).ok())
+        .is_some_and(|(a, b)| a == b)
+}
+
+pub(crate) fn identity(file: &File) -> io::Result<FileIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        left.metadata()
-            .ok()
-            .zip(right.metadata().ok())
-            .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
+        let metadata = file.metadata()?;
+        Ok(FileIdentity {
+            volume: metadata.dev(),
+            index: metadata.ino(),
+        })
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle;
-        #[repr(C)]
-        #[derive(Default)]
-        struct FileInformation {
-            attributes: u32,
-            creation: [u32; 2],
-            access: [u32; 2],
-            write: [u32; 2],
-            volume: u32,
-            size_high: u32,
-            size_low: u32,
-            links: u32,
-            index_high: u32,
-            index_low: u32,
-        }
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetFileInformationByHandle(
-                handle: *mut std::ffi::c_void,
-                info: *mut FileInformation,
-            ) -> i32;
-        }
-        let mut a = FileInformation::default();
-        let mut b = FileInformation::default();
-        // SAFETY: both handles remain open; output structs match Win32
-        // BY_HANDLE_FILE_INFORMATION and are initialized and exclusively borrowed.
-        let ok = unsafe {
-            GetFileInformationByHandle(left.as_raw_handle(), &mut a) != 0
-                && GetFileInformationByHandle(right.as_raw_handle(), &mut b) != 0
-        };
-        ok && (a.volume, a.index_high, a.index_low) == (b.volume, b.index_high, b.index_low)
+        let info = information(file)?;
+        Ok(FileIdentity {
+            volume: u64::from(info.volume),
+            index: (u64::from(info.index_high) << 32) | u64::from(info.index_low),
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (left, right);
-        false
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file identity is unavailable",
+        ))
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct FileInformation {
+    attributes: u32,
+    creation: [u32; 2],
+    access: [u32; 2],
+    write: [u32; 2],
+    volume: u32,
+    size_high: u32,
+    size_low: u32,
+    links: u32,
+    index_high: u32,
+    index_low: u32,
+}
+
+#[cfg(windows)]
+fn information(file: &File) -> io::Result<FileInformation> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            info: *mut FileInformation,
+        ) -> i32;
+    }
+    let mut info = FileInformation::default();
+    // SAFETY: the handle remains open; the initialized, exclusively borrowed
+    // output struct matches Win32 BY_HANDLE_FILE_INFORMATION.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn link_count(file: &File) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(file.metadata()?.nlink())
+    }
+    #[cfg(windows)]
+    {
+        Ok(u64::from(information(file)?.links))
     }
 }
 
