@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Search, Trash2, Database, ChevronLeft, ChevronRight } from "lucide-react";
 import { getTranslationMemory, getTranslationMemoryStats, getTranslationMemoryLangPairs, deleteTranslationMemoryEntry, clearTranslationMemory } from "../lib/api";
@@ -9,7 +9,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { ApiError } from "../lib/apiError";
 import { useT } from "../lib/i18n";
 
-const PAGE_SIZE = 50;
+import { memoryPageOffset, MEMORY_PAGE_SIZE as PAGE_SIZE } from "../lib/memoryPagination";
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback;
@@ -49,6 +49,14 @@ function ProjectTranslationMemory({ projectScope }: { projectScope: string | nul
     staleTime: 10_000,
     refetchOnMount: "always",
   });
+
+  // Deleting the final row of a later page must not strand the user on an
+  // empty offset with no pagination controls. Keep valid pages unchanged.
+  useEffect(() => {
+    if (data && !isError) {
+      setOffset((current) => memoryPageOffset(current, data.total));
+    }
+  }, [data, isError]);
 
   const entries = data?.entries ?? [];
   const total = data?.total ?? 0;

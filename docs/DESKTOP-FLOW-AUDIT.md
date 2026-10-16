@@ -9,7 +9,7 @@ Current audit: 2026-10-16, baseline `af3bc33`. This is a coverage report, not a 
 | Home | Open game folder/file/database, recent projects, format selection, patch and recovery entry points | Rendered with and without a synthetic project. Inspect lower format cards and file-picker behavior separately. |
 | Editor | Source/translation table, filters, editing, translation, validation, injection, export/import, replacement, pivot | Two extracted RenPy rows rendered at 1280/14px, 900/18px and 640/18px. Mock translation, review navigation and validation passed. Narrow layout is cramped; manual-edit conflicts and destructive workflows are not certified by this audit. |
 | Review | Translation review, editing and approval | Populated two-row Mock result rendered; both approval PATCH responses succeeded and the public API reports two approved rows. Completion and populated screenshots inspected. Editing an approved translation remains a separate case. |
-| Translation Memory | Project-scoped language pairs, search and deletion | Empty and opened-project states captured. Populated memory operations pending. |
+| Translation Memory | Project-scoped language pairs, search and deletion | Populated UI search/filter/pagination and confirmation cancellation tested with explicit synthetic API responses; real backend memory HTTP contracts tested separately. Last-page deletion recovery fixed locally; hosted delivery pending. |
 | Settings: Providers | Provider configuration and connection tests | Rendered; no external provider calls or credentials used. |
 | Settings: Translation defaults | Provider, source/target languages, batch size and cost limit | Rendered; persistence acceptance pending. |
 | Settings: Appearance | Theme, font size, source-column visibility, row height and interface language | Rendered; preference persistence acceptance pending. |
@@ -26,7 +26,7 @@ Queue, Activity Log, Keyboard Help, Resume Project, Game Source, Translation, In
 | Queue | Second synthetic project added through browser prompt, translated with Mock, marked Ready, then returned to Editor | Actual recorded pair was ja→en (UI defaults); this was transport/workflow acceptance, not language detection or translation quality |
 | Inject, Patch Apply, Export, Search/Replace, Pivot | Five panels captured and inspected at 1280px/14px/light and 900px/18px/dark; all ten panel rectangles fit the viewport | Buttons were not submitted; scrollable content, alternate tabs, safety refusal/result states and full operations are separate checks |
 | Injection Recovery / Keyboard Help | Initial dialogs opened and inspected; Escape closed Recovery | No interrupted-injection repair performed |
-| Memory, Glossary, Backups | Empty/project-entry surfaces rendered | Populated memory/glossary and restore/delete operations not exercised |
+| Memory, Glossary, Backups | Empty/project-entry surfaces rendered; populated Memory UI checked with explicit API fixtures | Memory backend tested separately; no end-to-end Mock memory population. Populated glossary and real backup restore/delete remain untested |
 | Resume Project, Game Source, Font Patch, update prompts | Source inventory only | Not rendered in this audit; not claimed missing or broken |
 
 ## Confirmed navigation defect and recovery
@@ -63,7 +63,8 @@ This is an evidence-ranked backlog, not a claim that all optimization work was i
 | Delivered | Recover unknown URLs without losing navigation | Reproduced blank app; localized recovery and sidebar navigation now tested and delivered |
 | Delivered: usability | Associate visible translation/queue form labels with controls | Sixteen label/control associations passed accessible-name, label-click focus and Mock request checks; 488cbea delivered after Linux/Windows CI 38950561797 |
 | Audited: navigation | Preserve the existing compact-window minimum | Tauri already defines 900×600. Five routes, sidebar hit targets, Queue/Help dismissal and Home scrolling passed at that size in light/14px and dark/18px. No reachability defect was reproduced; no collapsible sidebar or minimum-size change was made |
-| Next: systems | Exercise failure and continuity states | Real-backend fixtures for job cancellation/reconnect, save conflict, populated memory/glossary, resume/recovery and patch refusal. Current happy paths do not certify these |
+| Candidate: memory | Recover after deleting the only entry on a later page | Reproduced 51→50 rows leaving an empty offset with no pagination; UI offset correction and explicit API-fixture browser regression pass locally, real memory HTTP tests pass separately; hosted gate pending |
+| Next: systems | Exercise failure and continuity states | Job cancellation/reconnect, save conflict, populated glossary, resume/recovery and patch refusal remain separate checks. Memory UI fixtures and backend HTTP tests do not certify a full provider-to-memory workflow |
 | Next: performance | Measure initial bundle and large-project rendering | Entry chunk is 507.66 kB. Profile load and Editor with a large fixture before splitting imports; do not hide the warning by raising the threshold |
 | Missing proof, not missing screen | Native desktop and engine runtime QA | Tauri window/IPC/file pickers, actual game/font rendering and translation quality remain unverified here |
 | Separate deferred product scope | Static web hosting/distribution and experimental-engine capability gaps | Existing ledger defers hosting. Do not build a new site or imply universal engine support from a RenPy fixture |
@@ -96,6 +97,19 @@ Tauri already sets `minWidth: 900` and `minHeight: 600` in `apps/desktop/src-tau
 - `run-1792178314360692800/`: sidebar clicks reached each route; sidebar target centers were unobscured. Empty Queue opened and closed, Keyboard Help opened and closed with Escape, and Home scrolled to the bottom in both appearances. Six additional overlay/scroll screenshots inspected. Help content is scrollable; this check does not certify every shortcut or populated dialog.
 - A Home capture retained the Settings visual highlight. Targeted probe `run-1792178388415516700/` confirmed exactly one `aria-current="page"` link for Settings and then Home, with matching URL. The remaining visual highlight is hover/focus, not an incorrect active route; no speculative routing patch was made.
 
-This is browser evidence using simulated DOM font/theme state and an isolated synthetic project, not native Tauri acceptance or Settings persistence proof. No application code or configured window minimum changed. The documentation candidate still requires its own exact-SHA hosted gate before delivery.
+This is browser evidence using simulated DOM font/theme state and an isolated synthetic project, not native Tauri acceptance or Settings persistence proof. No application code or configured window minimum changed. Documentation candidate `3558a1cab1e80b442b28e266c17ce056ce1f3ea5` passed [CI 38954269317](https://github.com/Miike0303/Locust/actions/runs/38954269317) on Linux/Windows and reached remote/local `main` by non-force fast-forward.
+
+## Populated memory and last-page recovery candidate
+
+Mock translations intentionally do not write translation memory, even when memory lookup is enabled. The first attempt to seed 51 rows through Mock therefore had an invalid test precondition and timed out before pagination; this was not a product failure. No external provider was introduced and the cache policy was not changed.
+
+Using explicitly synthetic memory API responses, the browser then reproduced a UI defect: deleting the single entry on page 2 of a 51-row list left offset 50 with total 50, displaying “No hay coincidencias” and no pagination controls. Successful query results now clamp only an out-of-range offset to the last valid page; existing valid pages, filters, confirmation handling and backend deletion requests are unchanged.
+
+- RED: `tmp/desktop-flow-audit/run-1792180229310973800/`, browser exit 1, failed to recover the remaining 50 rows after the one-entry deletion. Failure image inspected.
+- GREEN: `run-1792180370125935700/`, browser exit 0, no page exceptions. Search match/no-match/reset, language filter, page 2, both confirmation cancellations leaving all entries/counters unchanged, deleting exactly one synthetic entry, and returning to the remaining 50 rows passed. Corrected image inspected.
+- These populated-memory UI responses are fixtures, **not real backend memory writes**. Other endpoints use the isolated real backend; its public API confirmed zero Mock memory rows, preserving policy. Separately, real-server `memory_page_scope` HTTP integration tests passed 5/5, covering project scope, search/filter/stats, deletion and guards using their own isolated setup.
+- Offset helper regression: 3/3; full frontend: 538 passed, zero failed/skipped; TypeScript/Vite build passed. Cleanup removed 0 GB; checkout target 25.04 GB/shared target 3.89 GB remained below caps, 352.2 GB free. Existing 508.04 kB entry-chunk warning remains.
+
+The correction is locally verified; commit-specific Linux/Windows CI and `main` delivery are pending. No real memory or games were modified.
 
 Each delivery requires passing applicable checks and exact-candidate hosted CI before fast-forwarding `main`. Generated caches and owned scratch are cleaned around build/test batches; regression source tests and retained evidence are preserved.
