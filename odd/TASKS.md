@@ -1,0 +1,33 @@
+# Current task index
+
+Reconciled 2026-10-16 from all 14 task ledgers (13 prior ledgers plus reconciliation). Start here, then read the owning ledger's current summary and evidence. Historical Specs, Logs, failures and user quotes remain authoritative history, not a second backlog. This is a documentary reconciliation, not fresh product/runtime verification.
+
+## Evidence and state
+
+**Complete** means the bounded outcome is complete, not every possible follow-up. Delivery is recorded separately. **Recorded** confidence means the cited ledger/Done entry explicitly records the result; this worker has not rechecked hosted jobs, remote refs or runtime. **Parent-confirmed** means fresh independent proof supplied by the parent for the named candidate only. Missing per-SHA remote proof is not inferred from older CI or local ancestry.
+
+| Owning ledger | Current state / delivery | Evidence source and confidence | Real remaining outcome / limits |
+|---|---|---|---|
+| [Current verified documentation](tasks/current-verified-documentation.md) | Complete; delivered `0689be9` | DOC-1..3, CI37554976117; Recorded | No unit remainder; broader doc audit separate. No native/game certification. |
+| [Desktop flow audit](tasks/desktop-flow-audit.md) | T1..T10 complete; report delivered `52d5e1f` | L40: CI38970455848 exact `52d5e1f`, both jobs success, remote/local main job10exit0; Parent-confirmed | No bounded task remainder. Native Tauri, real games/providers, destructive workflows and universal visual correctness unverified; populated memory UI used explicit synthetic responses. |
+| [Desktop publish](tasks/desktop-publish.md) | PUB-1..3 complete; delivered `a8da027` | Verified evidence, CI37708121668; Recorded | Direct-reopen follow-up linked to completed Resume below, not open twice. Real upload/account deployment and native QA outside unit. |
+| [Direct project resume](tasks/direct-project-resume.md) | RES-1..3 complete; delivered `845b259` | Next step, CI37983908888; Recorded | No unit remainder; no reconstruction of overwritten sources or native-focus/real-game proof. |
+| [Godot/Dialogic native](tasks/godot-dialogic-native.md) | GD-0..6 complete; bounded Experimental support delivered | Current outcome, GD-6 owned-copy oracle/lifecycle; Recorded (no new per-source-SHA remote proof) | CRLF follow-up resolved by `7a77620`/CI38817861645, [product Done](../docs/IMPROVEMENT-GOAL.md). Runtime, fonts, layout, linguistic quality, installed addon identity and other profiles remain unverified. |
+| [JA→EN→ES pipeline](tasks/ja-en-es-pipeline.md) | Partial; F1 delivered `363c1ac`; F2/G deferred | Delivered units, resume record, CI38597761738; Recorded | F2 optional wrapper glossary/config/seed/full-CLI proof; G malformed original headers and final Lydia artifact remain unresolved. VN-1 is linked/superseded by Native VN/REL inventory, not duplicate open work; Spanish/runtime acceptance not closed. |
+| [Native Japanese VN](tasks/native-japanese-vn.md) | Partial; N1/N2/N4 and guards delivered through `9954d58`; N3 blocked | Next owner-visible boundary, CI38636015841, 22-row live proof; Recorded | Complete accented Spanish requires engine-compatible representation; English sample only is artifact-proven. Runtime precedence, native window, gameplay/fonts and human linguistic review unverified. Unicode work belongs to UNI below. |
+| [Pinned frontend runner](tasks/pinned-frontend-test-runner.md) | RUN-1..3 complete; delivered `e03c4be` | Evidence, CI37562413134; Recorded | No unit remainder; npm vulnerabilities not repaired. Supersedes shared-U16 runner follow-up. |
+| [PO import localization](tasks/po-import-error-localization.md) | PO-1..3 complete; delivered `530d705` | Acceptance, CI37551095569; Recorded | Owned PO family only; broader IO/parse localization separate. Browser proof used mocked backend, not live parser/native UI. |
+| [Reliable installed engines](tasks/reliable-installed-engines.md) | Partial: REL-4 Add confirmation open; other listed units complete | REL-4A `77e5c96`/CI38678826007; REL-5 links GD; Recorded | Structural-tier Add confirmation/install/rollback/reapply unverified; Replace replay passed, MZ/Unity retain historical identities. REL-5 is bounded Experimental, not unavailable or full-game certification. |
+| [Shared UTF-16 length](tasks/shared-utf16-byte-length.md) | U16-1..3 complete; delivered `65df314` | Evidence, CI37558334740; helper `4ec953c`/CI37994441064 in [product Done](../docs/IMPROVEMENT-GOAL.md); Recorded | No unit remainder; equivalent helper and runner follow-ups delivered, non-equivalent helpers intentionally separate. |
+| [Windows tag CI](tasks/windows-tag-ci.md) | WCI tasks complete; delivered `027b82e` | Acceptance, CI37547390292; Recorded | No CI unit remainder; ignored tests not run, native/game QA not implied. |
+| [YU-RIS Unicode runtime](tasks/yuris-unicode-runtime.md) | Partial/blocked: UNI-0/1 delivered; UNI-S blocked, UNI-2/3 pending | UNI-1 `4257bac`/CI38651084477; UNI-S independent exit1/error183; Recorded | Private-station/actual token/filesystem/registry/network containment unproved; bootstrap/measurement mismatch, atomic bundle, engine/live Spanish compatibility unresolved. No game launched or proxy installed; synthetic Unicode proof is not engine support. |
+| [Task-state reconciliation](tasks/task-state-reconciliation.md) | R1..R3 complete; R4 delivery pending | L3/L4: worker 14-owner/28-link structural check and parent full-diff readback; canonical Engram saved. Auxiliary ancestry check did not run; no fresh historical remote proof | Canonical state/memory/todo reconciliation complete; parent owns commit and exact-candidate delivery. Historical references remain documentary evidence, not reexecuted runtime checks. |
+
+## Canonical remaining work
+
+- **Deferred pipeline:** PIPE-4F2 and PIPE-4G stay in their owner ledger; VN-1 hands off by reference, not another inventory task.
+- **Spanish VN / Unicode:** VN-N3 owns the user outcome; UNI-S→UNI-2→UNI-3 owns the dependent safety/implementation proof. Neither ledger proves full Spanish/runtime completion.
+- **Installed resource policy:** REL-4 structural Add confirmation remains separate from successful Replace and Godot outcomes.
+- **Reconciliation:** R3 documentary state/memory checks are complete; R4 exact-candidate delivery remains parent-owned. Visible session todos must project these owners, not reopen historical follow-ups.
+
+Nine ledgers have completed bounded outcomes; four retain partial/deferred/blocked outcomes; reconciliation is active. Wider product backlog stays in [IMPROVEMENT-GOAL](../docs/IMPROVEMENT-GOAL.md); coverage limits above are not authorization for new work.

@@ -2,7 +2,7 @@
 
 ## Punto de entrada actual: ledger y checkpoint verificado
 
-Leer primero [docs/IMPROVEMENT-GOAL.md](docs/IMPROVEMENT-GOAL.md), especialmente la ultima entrada **Done** y el backlog; el mapa tecnico esta en [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Los HANDOFF y checkpoints fechados de abajo son historia, no la cola actual ni el estado de publicacion. Sus preferencias y restricciones explicitas del usuario siguen vigentes salvo autorizacion posterior.
+Leer primero [odd/TASKS.md](odd/TASKS.md), luego el ledger propietario de la tarea y su evidencia; consultar [docs/IMPROVEMENT-GOAL.md](docs/IMPROVEMENT-GOAL.md) para entregas y backlog del producto. El mapa tecnico esta en [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Los HANDOFF y checkpoints fechados de abajo son historia, no la cola actual ni el estado de publicacion. Sus preferencias y restricciones explicitas del usuario siguen vigentes salvo autorizacion posterior.
 
 Checkpoint observado por el padre (2026-10-12): `main` remoto y local con el codigo del candidato probado `f9bc58c` (el commit siguiente es solo documental). [GitHub Actions run 38316078151](https://github.com/Miike0303/Locust/actions/runs/38316078151):
 
@@ -14,6 +14,16 @@ Checkpoint observado por el padre (2026-10-12): `main` remoto y local con el cod
 Ambas plataformas pasaron `npm ci`, build frontend, fmt, Clippy estricto y tests del workspace, incluido el crate Tauri. Los tests ignorados no se ejecutaron. No verifica la UI Tauri nativa ni juegos reales; las capturas headless usaron el build de produccion con un backend real aislado y fixtures sinteticos. El 2026-10-09 se entregaron 30 unidades de codigo (ver las entradas Done del 2026-10-09 en el ledger). Los temporales de los tests van a `.test-tmp/` (ver Build); al final de cada sesion correr `tools/cleanup-scratch.ps1 -Apply`.
 
 Secuencia autorizada: una unidad acotada, checks completos, publicacion de la rama de trabajo y CI manual, luego fast-forward de `main` antes de empezar otra unidad. Este checkpoint registra una observacion; no garantiza que `main` permanezca limpio o verificado tras futuros cambios.
+
+## Reconciliacion y autorizacion vigentes
+
+- **Una tarea, un propietario:** `odd/TASKS.md` es el indice actual; cada ledger conserva alcance, estado y evidencia. Un handoff del mismo trabajo enlaza al propietario, no crea otro pendiente. El todo visible es una proyeccion de la sesion, no el backlog global.
+- **Precedencia:** evidencia observada y vinculada al candidato/alcance > resumen actual del ledger > indice/memoria/todo > notas historicas. Una resolucion posterior demostrada deja obsoleto el bloqueo anterior, sin borrar su Log ni citas. Si hay conflicto sin evidencia, registrar incertidumbre; no inventar prueba remota, runtime o juego completo.
+- **Tres estados distintos:** resultado completado, commit del informe y entrega/publicacion no son equivalentes. Registrar SHA, checks y destino por separado; CI cancelada o consulta fallida no prueba exito ni fallo de tests.
+- **Persistencia:** en cada transicion material (resultado, bloqueo, resolucion, commit o entrega), actualizar ledger e indice y mantener un resumen actual canonico de Engram enlazado al ledger; no guardar solo deltas fragmentados. El padre mantiene memoria/todo y acciones Git en trabajo delegado.
+- **Continuidad autorizada:** conservar las autorizaciones explicitas de lecturas, ediciones, checks, delegacion, commits locales y publicacion no forzada ordinarios dentro del alcance original de entrega del proyecto; no repetir preguntas genericas para lo ya autorizado. No inferir autorizacion nueva de una tarea pendiente, un fallo de test o una consulta de red fallida. Respetar los limites del harness de un intento/prueba agotada: continuar no concede reintentos silenciosos.
+- **Limites intactos:** esto no modifica instrucciones globales del harness ni concede permisos generales de red/OS. Acciones destructivas, consentimiento nativo, secretos, rutas ajenas al proyecto, contencion y publicacion fuera del alcance mantienen sus restricciones; una nueva frontera requiere autorizacion especifica. Delegar solo con rutas nombradas, verificaciones acotadas y toolchain existente, sin instalaciones implicitas.
+- **Limpieza clasificada:** la autorizacion de limpieza cubre solo scratch/cache generado, propio y clasificado; nunca tests fuente/regresion, pruebas retenidas, respaldos o datos desconocidos. Antes de aplicar herramientas de limpieza de abajo, comprobar sus efectos y limites; edad, nombre `tmp` o estar ignorado no prueban propiedad ni permiso. Si mezcla datos protegidos o excede el harness, preservar y reportar, no borrar para liberar espacio.
 
 ## Contexto historico (2026-10-04): /goal en `main`; escritores Codex otra vez
 

@@ -1,0 +1,26 @@
+# Reconcile task states and authorization boundaries
+Objective: reconcile all existing ODD task ledgers, visible tasks and memory against recorded evidence without losing history.
+Baseline: audit/populated-glossary-20261016 at 52d5e1f; desktop-flow tracker already modified. Documentation-only work, no runtime/game/credential changes.
+
+## Specs
+- S1: "limpia bien las tareas, que creo que hay alugnas que ya estan hechas, y asi, limpia las task, en odd tambien"
+- S2: "haz una verififacion de todas"
+- S3: "guardalo en emmoria"
+- S4: "corrige para que ya no pase nada similar, lo imsmo con persmisos y asu"
+
+## Tasks
+- R1 [S1,S2] done — Read-only inventory of all 13 existing task ledgers and cross-reference later repository delivery records. Route: delegated explorer due evidence budget; evidence: mvbkngsk-4-gq2a, 61 entries/52 complete/9 open recorded, not independent remote/runtime proof; commit: pending.
+- R2 [S1,S2,S4] done — Reconciled stale current summaries, linked overlapping handoffs, added the 14-ledger index and CLAUDE.md precedence/authorization guidance. Route: bounded doc worker; observed structural check passed (L3); commit: pending. R3/R4 remain parent-owned.
+- R3 [S2,S3,S4] done — Reviewed the complete diff and canonical index against all-ledger worker evidence; canonical Engram odd/current-task-state saved, visible tasks reconciled. Historical references remain Recorded, not fresh ancestry/runtime/remote proof. Supplementary parent ancestry command failed before execution (L4), not passed. Route: parent readback; commit: pending.
+- R4 [S1,S2,S3] in_progress — Commit a reviewable reconciliation unit and follow existing exact-SHA delivery policy; no main advancement without required hosted proof. Route: parent delivery; commit: pending.
+
+## Log
+L1, owner request verbatim:
+> ▎ limpia bien las tareas, que creo que hay alugnas que ya estan hechas, y asi, limpia las task, en odd tambien, haz una verififacion
+> ▎ de todas, y guardalo en emmoria y corrige para que ya no pase nada similar, lo imsmo con persmisos y asu
+
+L2: Explorer read all 13 ledgers fully. Likely stale statements: Direct-reopen follow-up (desktop-publish), CRLF follow-up (Godot), Godot unavailable claim (reliable-installed-engines), helper/runner follow-ups (shared-utf16). Preserve real open scopes: F2 optional-wrapper glossary, G malformed-source copy, VN-N3 accented Spanish/runtime, REL-4 structural Add, UNI containment/bundle/live compatibility, desktop report proof. VN-1 overlaps later native inventory but broad runtime/full Spanish remains incomplete; de-duplicate by reference rather than mark whole requirement done. Authorization carry-forward must not weaken harness one-check rules, consent, containment or destructive-action restrictions. User authorizes ordinary task cleanup, not deletion of history/evidence or global permissions. No source/runtime retests implied by documentary reconciliation.
+
+L3 (2026-10-16): R2 worker read all 13 prior ledgers and this document through Log, plus relevant IMPROVEMENT-GOAL evidence. Parent supplied fresh exact52d5e1f CI38970455848 both-job success and remote/local main delivery job10exit0; recorded as desktop-flow L40, preserving L1-L39 and pre-existing tracker edits. Read-only Python structural audit passed: 14 unique index owners, 28 local Markdown links resolved, allowed paths only, tracked Specs/Logs retained as prefixes, existing completed checkboxes preserved, L1-L40 contiguous, T10 done, VN-1 linked, F2/G deferred and genuine N3/REL-4/UNI blockers retained. git diff --check passed; LF/CRLF advisories only. Passive docs have no meaningful RED/GREEN; no builds, network, runtime tests, Git delivery or memory writes. R2 closes on this observed check, not on R3 independent verification or R4 delivery.
+
+L4: Parent reviewed full changed-document diff, index and feature file. Worker structural evidence passes14owners/28links/LogsSpecs preservation. Auxiliary parent Python ancestry-check command failed SyntaxError in shell-escaped string before any checks ran; overall shell0 came from later gitdiffcheck, not Python success. No retry, ancestry success or fresh historical CI/runtime verification claimed. Native assess unavailable because new untracked index/feature are undeclared; no review approval claimed. Docs-only, no behavior change or product RED applicable. Canonical memory odd/current-task-state saved with all owners/evidenceconfidence/open outcomes and permission boundaries; visible prior tasks closed after fresh52d5e1f delivery. R3 closes on documentary readback+worker checks, not auxiliary ancestry proof. R4 exactcandidate delivery remains open. Risk:none(passive documentation; no harness/OS permission changes).
