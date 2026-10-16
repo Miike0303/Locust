@@ -1,6 +1,7 @@
 import { lazy, useEffect } from "react";
 import { Routes, Route } from "react-router-dom";
 import Layout from "./components/Layout";
+import NotFound from "./pages/NotFound";
 import UpdateChecker from "./components/UpdateChecker";
 import GameSourceDialog from "./components/GameSourceDialog";
 import { ResumeProjectDialogHost } from "./components/ResumeProjectDialog";
@@ -41,6 +42,7 @@ export default function App() {
           <Route path="/review" element={<Review />} />
           <Route path="/memory" element={<TranslationMemory />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="*" element={<NotFound />} />
         </Route>
       </Routes>
       <UpdateChecker />
