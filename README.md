@@ -35,8 +35,8 @@ Stability matches `locust formats` / the desktop Welcome screen
 
 | Engine                    | Extensions            | Notes |
 | ------------------------- | --------------------- | ----- |
-| **RPG Maker MV / MZ**     | `.json`               | Maps, events, system, plugins; shared `rpgmaker-mv` plugin |
-| **RPG Maker XP / VX Ace** | `.rvdata2`, `.rxdata` | Ruby Marshal data |
+| **RPG Maker MV / MZ**     | `.json`, `.jsono`      | Maps, events, system, plugins; shared `rpgmaker-mv` plugin |
+| **RPG Maker XP / VX / VX Ace** | `.rxdata`, `.rvdata`, `.rvdata2` | Ruby Marshal data |
 | **Ren'Py**                | `.rpy`, `.rpa`        | Loose scripts + RPA; Add-mode `game/tl/<lang>/` language packs |
 
 ### Experimental (Phase-2 extract → inject → patch → apply proven on fixtures or sample games)
@@ -54,6 +54,7 @@ Stability matches `locust formats` / the desktop Welcome screen
 | **KiriKiri / KAG**        | `.ks`, `.xp3`    | Loose + XP3; FE FE 0/1/2 (zlib); patch.xp3 write; no cxdec |
 | **YU-RIS**                | `.ybn`, `.ypf`   | Loose YSTB + YPF unpack/repack (common versions); synthetic + real-game YSTB |
 | **NScripter / ONScripter**| `0.txt`, `nscr_sec.dat`, `nscript.dat` | Shift-JIS; rot5 / XOR 0x84; synthetic; no NSA / nscript.___ |
+| **Godot / Dialogic**      | `.pck`           | Selected standalone Godot 4.0-4.3 PCK v2 with supported stock Dialogic timelines; archive-only Replace. See [support limits](docs/GODOT-DIALOGIC.md). |
 
 Not seeing your engine? [Open an issue](https://github.com/Miike0303/Locust/issues).
 
@@ -70,6 +71,7 @@ Always registered (`locust providers`):
 
 When API keys are configured: **DeepL**, **OpenAI**, **Anthropic Claude**, **DeepSeek**, **Grok** (xAI), **Google Gemini**.
 **Grok SuperGrok** (`grok-sub`) appears after `locust auth grok`.
+**Antigravity** (`antigravity`) appears when an existing `agy` executable is found on PATH or through `providers.antigravity.extra.agy_path`. Authentication is managed by the Antigravity CLI.
 
 ---
 
@@ -108,6 +110,7 @@ without that API cannot build this version.
 git clone https://github.com/Miike0303/Locust.git
 cd Locust
 npm --prefix apps/desktop ci
+npm --prefix apps/desktop run build
 cargo build --release -p locust-desktop
 # Launch: target/release/locust-desktop(.exe)
 ```
@@ -125,7 +128,7 @@ cargo build --release -p locust-desktop
    - **Validate** (Ctrl+Shift+V) — placeholders + binary inject-slot length (Unity/Unreal/Wolf).
    - **Search & replace** (Ctrl+Shift+F) — bulk edit translations only (one DB batch).
    - **Export / Import** (Ctrl+E) — PO or XLIFF for external CAT tools (ids survive round-trip).
-7. Click **Inject**, pick language(s), and choose:
+7. Click **Inject**, select the single target language translated in this database, and choose:
    - **Add mode** *(where supported, e.g. Ren'Py)* — language packs beside the original tree.
    - **Replace mode** — writes into a work copy (always keep a pristine original).
 8. Package and apply a patch (recommended distribution path):
