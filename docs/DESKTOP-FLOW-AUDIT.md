@@ -61,7 +61,7 @@ This is an evidence-ranked backlog, not a claim that all optimization work was i
 | Priority | Work unit | Why / acceptance before delivery |
 |---|---|---|
 | Delivered | Recover unknown URLs without losing navigation | Reproduced blank app; localized recovery and sidebar navigation now tested and delivered |
-| Next: usability | Associate visible translation/queue form labels with controls | Source mapping found unassociated labels; verify accessible names through public UI, then add matching labels/IDs without changing payloads |
+| Candidate: usability | Associate visible translation/queue form labels with controls | Sixteen label/control associations now pass accessible-name, label-click focus and Mock request checks in isolated browsers; hosted delivery gate pending |
 | Next: navigation | Improve compact-window use | At 640px/18px sidebar consumes about 270px. Define supported desktop minimum; prove all actions reachable and table/detail scrolling usable before choosing collapsible navigation |
 | Next: systems | Exercise failure and continuity states | Real-backend fixtures for job cancellation/reconnect, save conflict, populated memory/glossary, resume/recovery and patch refusal. Current happy paths do not certify these |
 | Next: performance | Measure initial bundle and large-project rendering | Entry chunk is 507.66 kB. Profile load and Editor with a large fixture before splitting imports; do not hide the warning by raising the threshold |
@@ -74,6 +74,18 @@ No additional product failure was confirmed by the completed happy-path audit. I
 
 The report-only candidate `35ddef6` did **not** pass its hosted gate: [CI 38941104332](https://github.com/Miike0303/Locust/actions/runs/38941104332) passed Linux but failed Windows in `argos::tests::test_argos_health_check_down`. An earlier watcher network failure obscured the final outcome; it was not a test result.
 
-That test assumed `127.0.0.1:59999` had no listener. A controlled HTTP 503 responder on that port reproduced the exact failed installation-guidance assertion (zero passed, one failed). The test now owns an ephemeral TCP endpoint that deliberately closes without an HTTP response; a separate 503 test preserves status-error coverage. Production Argos behavior is unchanged. The corrected candidate must pass its own checks and hosted gate before the report and test correction reach `main`; task ledger records the outcome.
+That test assumed `127.0.0.1:59999` had no listener. A controlled HTTP 503 responder on that port reproduced the exact failed installation-guidance assertion (zero passed, one failed). The test now owns an ephemeral TCP endpoint that deliberately closes without an HTTP response; a separate 503 test preserves status-error coverage. Production Argos behavior is unchanged. Corrected candidate `911d895281882431b3053ab4cec94d00803bb850` passed [CI 38944911794](https://github.com/Miike0303/Locust/actions/runs/38944911794) on Linux and Windows and reached remote/local `main` by non-force fast-forward.
+
+## Translation and Queue form accessibility candidate
+
+Eight visible labels in each form now identify their select, input or textarea through matching `htmlFor`/`id` attributes. Control values, handlers and translation options were not changed. Clicking a label focuses its control, and assistive technology can use the localized visible name rather than an unnamed field.
+
+- Focused structural regression: 16 failures before the fix, then 16 passes. Full frontend suite: 535 passed, zero failed or skipped; TypeScript and production build passed.
+- Public browser acceptance: `tmp/desktop-flow-audit/run-1792176355147241000/` (Translation → Review → two approvals → clean Validation) and `run-1792176370670672000/` (Queue → Ready → Editor). All 16 controls were found by their exact visible label and checked for focus on label click; both forms' screenshots were inspected. No page exceptions occurred.
+- Both requests used only Mock, en→es and the entered synthetic game context. Queue history reports two translations at zero cost. No external providers or real games were used. These runs supplement, rather than replace, the earlier ja→en Queue evidence.
+- An auxiliary source-printer comparison failed because JSX whitespace formatting differed; it is not recorded as a passing check. Diff readback showed attribute additions and whitespace only; browser checks establish submitted options and completed workflows.
+- Existing build warnings remain, including a 508.04 kB minified entry chunk. Cleanup removed 0 GB; checkout target 23.23 GB and shared target 3.89 GB remained below their caps, with 362 GB free after the build batch. Retained captures and regression tests were not deleted.
+
+This is a locally verified candidate, not yet a hosted-CI or `main` delivery claim. Native Tauri and real-game limitations still apply.
 
 Each delivery requires passing applicable checks and exact-candidate hosted CI before fast-forwarding `main`. Generated caches and owned scratch are cleaned around build/test batches; regression source tests and retained evidence are preserved.

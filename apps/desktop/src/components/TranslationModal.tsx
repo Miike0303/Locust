@@ -326,7 +326,7 @@ export default function TranslationModal({
 					<div className="space-y-4">
 						<div>
 							<div className="flex items-end justify-between gap-2">
-								<label className="text-body font-medium">{t("translate.provider")}</label>
+								<label htmlFor="translation-provider" className="text-body font-medium">{t("translate.provider")}</label>
 								<button
 									type="button"
 									onClick={handleTestConnection}
@@ -336,7 +336,7 @@ export default function TranslationModal({
 									{testingHealth ? t("translate.testing") : t("translate.testConnection")}
 								</button>
 							</div>
-							<select
+							<select id="translation-provider"
 								value={providerId}
 								onChange={(e) => {
 									setProviderId(e.target.value);
@@ -385,14 +385,13 @@ export default function TranslationModal({
 							</button>
 						</div>
 						<div>
-							<label className="text-body font-medium">
-								{t("translate.fallbacks")}
+							<label htmlFor="translation-fallbacks" className="text-body font-medium">{t("translate.fallbacks")}
 							</label>
 							<p className="text-caption text-text-muted mt-0.5 mb-1">
 								{t("translate.fallbacksHint")}
 							</p>
 							<div className="flex gap-2">
-								<select
+								<select id="translation-fallbacks"
 									value={fallbackPick}
 									onChange={(e) => setFallbackPick(e.target.value)}
 									className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
@@ -446,8 +445,8 @@ export default function TranslationModal({
 						</div>
 						<div className="grid grid-cols-2 gap-3">
 							<div>
-								<label className="text-body font-medium">{t("translate.source")}</label>
-								<select
+								<label htmlFor="translation-source" className="text-body font-medium">{t("translate.source")}</label>
+								<select id="translation-source"
 									value={sourceLang}
 									onChange={(e) => setSourceLang(e.target.value)}
 									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
@@ -461,8 +460,8 @@ export default function TranslationModal({
 								</select>
 							</div>
 							<div>
-								<label className="text-body font-medium">{t("translate.target")}</label>
-								<select
+								<label htmlFor="translation-target" className="text-body font-medium">{t("translate.target")}</label>
+								<select id="translation-target"
 									value={targetLang}
 									onChange={(e) => setTargetLang(e.target.value)}
 									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
@@ -476,8 +475,8 @@ export default function TranslationModal({
 							</div>
 						</div>
 						<div>
-							<label className="text-body font-medium">{t("translate.gameContext")}</label>
-							<textarea
+							<label htmlFor="translation-gameContext" className="text-body font-medium">{t("translate.gameContext")}</label>
+							<textarea id="translation-gameContext"
 								value={gameContext}
 								onChange={(e) => setGameContext(e.target.value)}
 								rows={2}
@@ -518,8 +517,8 @@ export default function TranslationModal({
                         )}
 						<div className="grid grid-cols-3 gap-3">
 							<div>
-								<label className="text-body font-medium">{t("translate.batchSize")}</label>
-								<input
+								<label htmlFor="translation-batchSize" className="text-body font-medium">{t("translate.batchSize")}</label>
+								<input id="translation-batchSize"
 									type="number"
 									value={batchSize ?? ""}
 									placeholder={t("common.providerDefault")}
@@ -529,13 +528,12 @@ export default function TranslationModal({
 								/>
 							</div>
 							<div>
-								<label
+								<label htmlFor="translation-parallelRequests"
 									className="text-body font-medium"
 									title={t("translate.parallelTitle")}
-								>
-									{t("translate.parallelRequests")}
+								>{t("translate.parallelRequests")}
 								</label>
-								<select
+								<select id="translation-parallelRequests"
 									value={maxConcurrent ?? ""}
 									onChange={(e) => setMaxConcurrent(e.target.value ? +e.target.value : undefined)}
 									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
@@ -549,8 +547,8 @@ export default function TranslationModal({
 								</select>
 							</div>
 							<div>
-								<label className="text-body font-medium">{t("translate.costLimit")}</label>
-								<input
+								<label htmlFor="translation-costLimit" className="text-body font-medium">{t("translate.costLimit")}</label>
+								<input id="translation-costLimit"
 									value={costLimit}
 									onChange={(e) => setCostLimit(e.target.value)}
 									placeholder={t("translate.noLimit")}

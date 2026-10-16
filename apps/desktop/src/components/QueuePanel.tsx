@@ -386,8 +386,8 @@ export default function QueuePanel() {
 							</h3>
 							<div className="grid grid-cols-3 gap-3">
 								<div>
-									<label className={settingsLabelClass}>{t("queue.provider")}</label>
-									<select
+									<label htmlFor="queue-provider" className={settingsLabelClass}>{t("queue.provider")}</label>
+									<select id="queue-provider"
 										value={providerId}
 										onChange={(e) => setProviderId(e.target.value)}
 										className={settingsInputClass}
@@ -400,16 +400,16 @@ export default function QueuePanel() {
 									</select>
 								</div>
 								<div>
-									<label className={settingsLabelClass}>{t("queue.source")}</label>
-									<input
+									<label htmlFor="queue-source" className={settingsLabelClass}>{t("queue.source")}</label>
+									<input id="queue-source"
 										value={sourceLang}
 										onChange={(e) => setSourceLang(e.target.value)}
 										className={settingsInputClass}
 									/>
 								</div>
 								<div>
-									<label className={settingsLabelClass}>{t("queue.target")}</label>
-									<input
+									<label htmlFor="queue-target" className={settingsLabelClass}>{t("queue.target")}</label>
+									<input id="queue-target"
 										value={targetLang}
 										onChange={(e) => setTargetLang(e.target.value)}
 										className={settingsInputClass}
@@ -418,8 +418,8 @@ export default function QueuePanel() {
 							</div>
 							<div className="grid grid-cols-3 gap-3">
 								<div>
-									<label className={settingsLabelClass}>{t("queue.batchSize")}</label>
-									<input
+									<label htmlFor="queue-batchSize" className={settingsLabelClass}>{t("queue.batchSize")}</label>
+									<input id="queue-batchSize"
 										type="number"
 										value={batchSize ?? ""}
 										placeholder={t("common.providerDefault")}
@@ -429,8 +429,8 @@ export default function QueuePanel() {
 									/>
 								</div>
 								<div>
-									<label className={settingsLabelClass}>{t("queue.maxConcurrent")}</label>
-									<input
+									<label htmlFor="queue-maxConcurrent" className={settingsLabelClass}>{t("queue.maxConcurrent")}</label>
+									<input id="queue-maxConcurrent"
 										type="number"
 										value={maxConcurrent ?? ""}
 										placeholder={t("common.providerDefault")}
@@ -441,8 +441,8 @@ export default function QueuePanel() {
 									/>
 								</div>
 								<div>
-									<label className={settingsLabelClass}>{t("queue.costLimit")}</label>
-									<input
+									<label htmlFor="queue-costLimit" className={settingsLabelClass}>{t("queue.costLimit")}</label>
+									<input id="queue-costLimit"
 										type="number"
 										step="0.01"
 										value={costLimit}
@@ -453,8 +453,8 @@ export default function QueuePanel() {
 								</div>
 							</div>
 							<div>
-								<label className={settingsLabelClass}>{t("queue.gameContext")}</label>
-								<input
+								<label htmlFor="queue-gameContext" className={settingsLabelClass}>{t("queue.gameContext")}</label>
+								<input id="queue-gameContext"
 									value={gameContext}
 									onChange={(e) => setGameContext(e.target.value)}
 									placeholder={t("common.optional")}
@@ -462,12 +462,12 @@ export default function QueuePanel() {
 								/>
 							</div>
 							<div>
-								<label className={settingsLabelClass}>{t("queue.fallbacks")}</label>
+								<label htmlFor="queue-fallbacks" className={settingsLabelClass}>{t("queue.fallbacks")}</label>
 								<p className="text-caption text-text-muted mt-0.5">
 									{t("queue.fallbacksHint")}
 								</p>
 								<div className="mt-1 flex gap-2">
-									<select
+									<select id="queue-fallbacks"
 										value={fallbackPick}
 										onChange={(e) => setFallbackPick(e.target.value)}
 										className={settingsInputClass + " flex-1"}
