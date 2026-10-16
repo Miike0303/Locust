@@ -70,4 +70,10 @@ This is an evidence-ranked backlog, not a claim that all optimization work was i
 
 No additional product failure was confirmed by the completed happy-path audit. Initial History loading, an animated progress bar and broken audit WebSocket forwarding were investigated rather than patched as speculative application bugs.
 
+## Delivery gate follow-up
+
+The report-only candidate `35ddef6` did **not** pass its hosted gate: [CI 38941104332](https://github.com/Miike0303/Locust/actions/runs/38941104332) passed Linux but failed Windows in `argos::tests::test_argos_health_check_down`. An earlier watcher network failure obscured the final outcome; it was not a test result.
+
+That test assumed `127.0.0.1:59999` had no listener. A controlled HTTP 503 responder on that port reproduced the exact failed installation-guidance assertion (zero passed, one failed). The test now owns an ephemeral TCP endpoint that deliberately closes without an HTTP response; a separate 503 test preserves status-error coverage. Production Argos behavior is unchanged. The corrected candidate must pass its own checks and hosted gate before the report and test correction reach `main`; task ledger records the outcome.
+
 Each delivery requires passing applicable checks and exact-candidate hosted CI before fast-forwarding `main`. Generated caches and owned scratch are cleaned around build/test batches; regression source tests and retained evidence are preserved.

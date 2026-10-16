@@ -233,12 +233,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_argos_health_check_down() {
-        // Use a port that nothing listens on
-        let provider = ArgosProvider::new("http://127.0.0.1:59999".to_string());
-        let result = provider.health_check().await;
-        assert!(result.is_err());
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Own the endpoint instead of assuming a shared fixed port is unused.
+        // Accept the request, then close without an HTTP response: a transport
+        // failure, distinct from a running server returning an error status.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.shutdown().await.unwrap();
+        });
+        let provider = ArgosProvider::new(format!("http://{address}"));
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), provider.health_check())
+                .await
+                .expect("owned endpoint must close promptly");
+        server.await.unwrap();
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("argostranslate"));
+        assert!(err_msg.contains(&format!("Argos is not running at http://{address}")));
+        assert!(err_msg.contains("pip install argostranslate && argos-translate-server"));
+    }
+
+    #[tokio::test]
+    async fn test_argos_health_check_status_error() {
+        let server = MockServer::start();
+        let endpoint = server.mock(|when, then| {
+            when.method(GET).path("/languages");
+            then.status(503);
+        });
+        let provider = ArgosProvider::new(server.base_url());
+        let error = provider.health_check().await.unwrap_err().to_string();
+        endpoint.assert();
+        assert!(error.contains("Argos health check failed with status 503"));
+        assert!(!error.contains("argostranslate"));
     }
 
     #[tokio::test]
