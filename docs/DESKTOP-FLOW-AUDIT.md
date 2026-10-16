@@ -61,8 +61,8 @@ This is an evidence-ranked backlog, not a claim that all optimization work was i
 | Priority | Work unit | Why / acceptance before delivery |
 |---|---|---|
 | Delivered | Recover unknown URLs without losing navigation | Reproduced blank app; localized recovery and sidebar navigation now tested and delivered |
-| Candidate: usability | Associate visible translation/queue form labels with controls | Sixteen label/control associations now pass accessible-name, label-click focus and Mock request checks in isolated browsers; hosted delivery gate pending |
-| Next: navigation | Improve compact-window use | At 640px/18px sidebar consumes about 270px. Define supported desktop minimum; prove all actions reachable and table/detail scrolling usable before choosing collapsible navigation |
+| Delivered: usability | Associate visible translation/queue form labels with controls | Sixteen label/control associations passed accessible-name, label-click focus and Mock request checks; 488cbea delivered after Linux/Windows CI 38950561797 |
+| Audited: navigation | Preserve the existing compact-window minimum | Tauri already defines 900×600. Five routes, sidebar hit targets, Queue/Help dismissal and Home scrolling passed at that size in light/14px and dark/18px. No reachability defect was reproduced; no collapsible sidebar or minimum-size change was made |
 | Next: systems | Exercise failure and continuity states | Real-backend fixtures for job cancellation/reconnect, save conflict, populated memory/glossary, resume/recovery and patch refusal. Current happy paths do not certify these |
 | Next: performance | Measure initial bundle and large-project rendering | Entry chunk is 507.66 kB. Profile load and Editor with a large fixture before splitting imports; do not hide the warning by raising the threshold |
 | Missing proof, not missing screen | Native desktop and engine runtime QA | Tauri window/IPC/file pickers, actual game/font rendering and translation quality remain unverified here |
@@ -76,7 +76,7 @@ The report-only candidate `35ddef6` did **not** pass its hosted gate: [CI 389411
 
 That test assumed `127.0.0.1:59999` had no listener. A controlled HTTP 503 responder on that port reproduced the exact failed installation-guidance assertion (zero passed, one failed). The test now owns an ephemeral TCP endpoint that deliberately closes without an HTTP response; a separate 503 test preserves status-error coverage. Production Argos behavior is unchanged. Corrected candidate `911d895281882431b3053ab4cec94d00803bb850` passed [CI 38944911794](https://github.com/Miike0303/Locust/actions/runs/38944911794) on Linux and Windows and reached remote/local `main` by non-force fast-forward.
 
-## Translation and Queue form accessibility candidate
+## Delivered Translation and Queue form accessibility
 
 Eight visible labels in each form now identify their select, input or textarea through matching `htmlFor`/`id` attributes. Control values, handlers and translation options were not changed. Clicking a label focuses its control, and assistive technology can use the localized visible name rather than an unnamed field.
 
@@ -86,6 +86,16 @@ Eight visible labels in each form now identify their select, input or textarea t
 - An auxiliary source-printer comparison failed because JSX whitespace formatting differed; it is not recorded as a passing check. Diff readback showed attribute additions and whitespace only; browser checks establish submitted options and completed workflows.
 - Existing build warnings remain, including a 508.04 kB minified entry chunk. Cleanup removed 0 GB; checkout target 23.23 GB and shared target 3.89 GB remained below their caps, with 362 GB free after the build batch. Retained captures and regression tests were not deleted.
 
-This is a locally verified candidate, not yet a hosted-CI or `main` delivery claim. Native Tauri and real-game limitations still apply.
+Candidate `488cbea65a4e06661cb5abd78f1f98c637ccb7ad` passed [CI 38950561797](https://github.com/Miike0303/Locust/actions/runs/38950561797) (`check` and `check-windows`, exact SHA) and reached remote/local `main` by non-force fast-forward. Native Tauri and real-game limitations still apply.
+
+## Existing minimum-window navigation
+
+Tauri already sets `minWidth: 900` and `minHeight: 600` in `apps/desktop/src-tauri/tauri.conf.json`. The earlier cramped 640px browser sample is below the native minimum, not evidence that the desktop minimum needs changing.
+
+- `tmp/desktop-flow-audit/run-1792178223015306500/`: all five routes at 900×600 in light/14px and dark/18px, ten inspected screenshots. Measured sidebar links/buttons and visible main buttons stayed inside the viewport; no page exceptions or horizontal document overflow.
+- `run-1792178314360692800/`: sidebar clicks reached each route; sidebar target centers were unobscured. Empty Queue opened and closed, Keyboard Help opened and closed with Escape, and Home scrolled to the bottom in both appearances. Six additional overlay/scroll screenshots inspected. Help content is scrollable; this check does not certify every shortcut or populated dialog.
+- A Home capture retained the Settings visual highlight. Targeted probe `run-1792178388415516700/` confirmed exactly one `aria-current="page"` link for Settings and then Home, with matching URL. The remaining visual highlight is hover/focus, not an incorrect active route; no speculative routing patch was made.
+
+This is browser evidence using simulated DOM font/theme state and an isolated synthetic project, not native Tauri acceptance or Settings persistence proof. No application code or configured window minimum changed. The documentation candidate still requires its own exact-SHA hosted gate before delivery.
 
 Each delivery requires passing applicable checks and exact-candidate hosted CI before fast-forwarding `main`. Generated caches and owned scratch are cleaned around build/test batches; regression source tests and retained evidence are preserved.
