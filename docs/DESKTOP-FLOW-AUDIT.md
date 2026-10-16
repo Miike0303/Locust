@@ -9,11 +9,11 @@ Current audit: 2026-10-16, baseline `af3bc33`. This is a coverage report, not a 
 | Home | Open game folder/file/database, recent projects, format selection, patch and recovery entry points | Rendered with and without a synthetic project. Inspect lower format cards and file-picker behavior separately. |
 | Editor | Source/translation table, filters, editing, translation, validation, injection, export/import, replacement, pivot | Two extracted RenPy rows rendered at 1280/14px, 900/18px and 640/18px. Mock translation, review navigation and validation passed. Narrow layout is cramped; manual-edit conflicts and destructive workflows are not certified by this audit. |
 | Review | Translation review, editing and approval | Populated two-row Mock result rendered; both approval PATCH responses succeeded and the public API reports two approved rows. Completion and populated screenshots inspected. Editing an approved translation remains a separate case. |
-| Translation Memory | Project-scoped language pairs, search and deletion | Populated UI search/filter/pagination and confirmation cancellation tested with explicit synthetic API responses; real backend memory HTTP contracts tested separately. Last-page deletion recovery fixed locally; hosted delivery pending. |
+| Translation Memory | Project-scoped language pairs, search and deletion | Populated UI search/filter/pagination and confirmation cancellation tested with explicit synthetic API responses; real backend memory HTTP contracts tested separately. Last-page deletion recovery delivered as `619fc73` after exact Linux/Windows CI38962171469. |
 | Settings: Providers | Provider configuration and connection tests | Rendered; no external provider calls or credentials used. |
 | Settings: Translation defaults | Provider, source/target languages, batch size and cost limit | Rendered; persistence acceptance pending. |
 | Settings: Appearance | Theme, font size, source-column visibility, row height and interface language | Rendered; preference persistence acceptance pending. |
-| Settings: Glossary | Project terms and language pair | No-project state rendered; populated operations pending. |
+| Settings: Glossary | Project terms and language pair | Two synthetic terms passed real-backend add/readback, language-pair isolation, live filtering, Cancel/Escape, owned deletion and navigation return; see bounded glossary evidence below. |
 | Settings: History | Translation runs, costs/tokens/duration | Final no-project guidance awaited and inspected after query retry. Public run history confirms Mock en→es, two translated strings, zero cost. |
 | Settings: Data | Backups, restore and delete | Empty backup state rendered; no real backups modified. |
 
@@ -26,7 +26,7 @@ Queue, Activity Log, Keyboard Help, Resume Project, Game Source, Translation, In
 | Queue | Second synthetic project added through browser prompt, translated with Mock, marked Ready, then returned to Editor | Actual recorded pair was ja→en (UI defaults); this was transport/workflow acceptance, not language detection or translation quality |
 | Inject, Patch Apply, Export, Search/Replace, Pivot | Five panels captured and inspected at 1280px/14px/light and 900px/18px/dark; all ten panel rectangles fit the viewport | Buttons were not submitted; scrollable content, alternate tabs, safety refusal/result states and full operations are separate checks |
 | Injection Recovery / Keyboard Help | Initial dialogs opened and inspected; Escape closed Recovery | No interrupted-injection repair performed |
-| Memory, Glossary, Backups | Empty/project-entry surfaces rendered; populated Memory UI checked with explicit API fixtures | Memory backend tested separately; no end-to-end Mock memory population. Populated glossary and real backup restore/delete remain untested |
+| Memory, Glossary, Backups | Empty/project-entry surfaces rendered; populated Memory UI checked with explicit API fixtures | Memory backend tested separately; no end-to-end Mock memory population. Populated glossary now tested separately with a real isolated backend; real backup restore/delete remain untested |
 | Resume Project, Game Source, Font Patch, update prompts | Source inventory only | Not rendered in this audit; not claimed missing or broken |
 
 ## Confirmed navigation defect and recovery
@@ -63,8 +63,8 @@ This is an evidence-ranked backlog, not a claim that all optimization work was i
 | Delivered | Recover unknown URLs without losing navigation | Reproduced blank app; localized recovery and sidebar navigation now tested and delivered |
 | Delivered: usability | Associate visible translation/queue form labels with controls | Sixteen label/control associations passed accessible-name, label-click focus and Mock request checks; 488cbea delivered after Linux/Windows CI 38950561797 |
 | Audited: navigation | Preserve the existing compact-window minimum | Tauri already defines 900×600. Five routes, sidebar hit targets, Queue/Help dismissal and Home scrolling passed at that size in light/14px and dark/18px. No reachability defect was reproduced; no collapsible sidebar or minimum-size change was made |
-| Candidate: memory | Recover after deleting the only entry on a later page | Reproduced 51→50 rows leaving an empty offset with no pagination; UI offset correction and explicit API-fixture browser regression pass locally, real memory HTTP tests pass separately; hosted gate pending |
-| Next: systems | Exercise failure and continuity states | Job cancellation/reconnect, save conflict, populated glossary, resume/recovery and patch refusal remain separate checks. Memory UI fixtures and backend HTTP tests do not certify a full provider-to-memory workflow |
+| Delivered: memory | Recover after deleting the only entry on a later page | Reproduced 51→50 rows leaving an empty offset with no pagination; UI fixture regression and separate real HTTP tests passed; `619fc73` delivered after exact Linux/Windows CI38962171469 |
+| Next: systems | Exercise failure and continuity states | Job cancellation/reconnect, save conflict, resume/recovery and patch refusal remain separate checks. Populated glossary passed its bounded two-term audit; settled Settings highlight remains unmeasured. Memory UI fixtures and backend HTTP tests do not certify a full provider-to-memory workflow |
 | Next: performance | Measure initial bundle and large-project rendering | Entry chunk is 507.66 kB. Profile load and Editor with a large fixture before splitting imports; do not hide the warning by raising the threshold |
 | Missing proof, not missing screen | Native desktop and engine runtime QA | Tauri window/IPC/file pickers, actual game/font rendering and translation quality remain unverified here |
 | Separate deferred product scope | Static web hosting/distribution and experimental-engine capability gaps | Existing ledger defers hosting. Do not build a new site or imply universal engine support from a RenPy fixture |
@@ -110,6 +110,24 @@ Using explicitly synthetic memory API responses, the browser then reproduced a U
 - These populated-memory UI responses are fixtures, **not real backend memory writes**. Other endpoints use the isolated real backend; its public API confirmed zero Mock memory rows, preserving policy. Separately, real-server `memory_page_scope` HTTP integration tests passed 5/5, covering project scope, search/filter/stats, deletion and guards using their own isolated setup.
 - Offset helper regression: 3/3; full frontend: 538 passed, zero failed/skipped; TypeScript/Vite build passed. Cleanup removed 0 GB; checkout target 25.04 GB/shared target 3.89 GB remained below caps, 352.2 GB free. Existing 508.04 kB entry-chunk warning remains.
 
-The correction is locally verified; commit-specific Linux/Windows CI and `main` delivery are pending. No real memory or games were modified.
+The correction `619fc73e8e5e14f462374c3812b54d20cc8bad92` passed [CI38962171469](https://github.com/Miike0303/Locust/actions/runs/38962171469) on Linux/Windows and reached remote/local `main` by non-force fast-forward. Earlier CI38958357549 was cancelled during Rust tests, not a passing gate. No real memory or games were modified.
+
+## Populated glossary: bounded public acceptance
+
+The existing production frontend and a real isolated backend passed 13 check groups with two fresh synthetic terms. No application change was needed. The run used English/light at 1280×900; it does not certify native Tauri, large glossaries, other appearances, duplicate/update semantics, invalid input, non-null context filtering or concurrent project changes.
+
+| Operation | Observed effect |
+|---|---|
+| Add and readback | Two UI additions returned HTTP201; independent GET responses matched exact terms/translations in en-es and en-fr. Form fields cleared. |
+| Pair isolation | Each language pair showed only its term. Deleting the Spanish term left the French API object unchanged. |
+| Live filter | Mixed-case term and uppercase accented translation matched; no-match showed zero/filter guidance; clearing restored the row. |
+| Cancel and Escape | Neither sent DELETE; both preserved exact snapshots of both pairs and the visible count. |
+| Navigation and deletion | Editor → Settings → Glossary retained the term. Two confirmed owned DELETEs returned204; final independent reads showed both pairs empty. |
+
+Evidence: `tmp/desktop-flow-audit/glossary-run-1792186340309980700/report.json` and 13 individually inspected PNGs in its `screenshots/` directory. Audit and independent cleanup exited0; stderr was empty, page exceptions were absent and document width stayed1280. Owned backend, Playwright driver and harness PIDs were independently absent after cleanup; static thread/ports closed. Existing builds were reused, retaining roughly5.5MB evidence without a global cleanup sweep.
+
+Two earlier attempts failed in the harness, not the product: urllib method logging, then a synthetic config-path/default-pair mismatch. They remain preserved in `glossary-report.md` and `glossary-attempt2-report.md`. Owner-authorized corrections aligned config with `LOCUST_DATA_DIR/config.json` and kept capture/closure inside the live Playwright manager; the third attempt was not retried.
+
+**Visual qualification:** screenshot11 immediately after navigation shows Providers highlighted while Glossary content and URL are present; later screenshots highlight Glossary correctly. The parent inspected that image. Settled-state styling was not measured, so neither a persistent defect nor a fully verified active-highlight state is claimed. Other inspected controls/rows/confirmation were legible and unclipped. No speculative product patch was made.
 
 Each delivery requires passing applicable checks and exact-candidate hosted CI before fast-forwarding `main`. Generated caches and owned scratch are cleaned around build/test batches; regression source tests and retained evidence are preserved.
