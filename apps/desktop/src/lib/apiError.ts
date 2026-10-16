@@ -77,9 +77,31 @@ const SINGLE_LINE_EXACT: Record<string, MessageKey> = {
 	"provider returned mismatched or duplicate entry IDs": "api.error.providerMalformedResponse",
 };
 
-type PrefixRule = { prefix: string; key: MessageKey; detail?: boolean; singleLine?: boolean };
+// New guidance leaves the existing English diagnostic/HTTP fallback unchanged.
+// Match the original body exactly so extra lines cannot become fixed guidance.
+const SPANISH_ONLY_EXACT: Record<string, MessageKey> = {
+	"unsupported format: format not detected": "api.error.gameFormatUndetected",
+	"patch error: selected backup does not match the recorded injection; reopen Pack to use its original backup":
+		"api.error.packBackupMismatch",
+	"parse error in xliff: XLIFF parse error: empty or incomplete XLIFF document":
+		"api.error.xliffIncomplete",
+	"patch error: pristine hashes required but no --pristine path and no valid .locust/backup found":
+		"api.error.packPristineRequired",
+	"backup error: backup inventory/hash mismatch; restore refused": "api.error.backupRestoreHashMismatch",
+	"parse error in xliff: XLIFF parse error: only XLIFF 1.2 is supported": "api.error.xliffVersionUnsupported",
+	"patch error: source and existing target must have the same .ttf or .otf extension; web fonts, collections and Unity SDF assets cannot be replaced":
+		"api.error.fontExtensionMismatch",
+	"output_path must be outside the selected game directory": "api.error.fontPatchOutputInsideGame",
+};
+
+type PrefixRule = { prefix: string; key: MessageKey; detail?: boolean; singleLine?: boolean; spanishOnly?: boolean };
 
 const PREFIXES: PrefixRule[] = [
+	// Batch 3: opaque paths/parser diagnostics stay in the existing raw logs.
+	{ prefix: "IO error: refusing to overwrite existing file: ", key: "api.error.pivotOutputExists", singleLine: true, spanishOnly: true },
+	{ prefix: "IO error: not a Locust project database: ", key: "api.error.invalidProjectDatabase", singleLine: true, spanishOnly: true },
+	{ prefix: "patch error: corrupt locust-patch.json: ", key: "api.error.patchManifestCorrupt", singleLine: true, spanishOnly: true },
+	{ prefix: "unsafe zip entry: ", key: "api.error.patchUnsafeEntry", singleLine: true, spanishOnly: true },
 	// Verified provider Display prefixes. Opaque response bodies belong only in logs.
 	...[
 		"provider error: OpenAI connection failed: ",
@@ -220,6 +242,11 @@ function mapBody(body: string, originalBody: string): string | null {
 	const provider = mapProviderFailure(originalBody);
 	if (provider) return provider;
 
+	if (getLocale() === "es") {
+		const guidance = SPANISH_ONLY_EXACT[originalBody];
+		if (guidance) return t(guidance);
+	}
+
 	const exact = EXACT[body];
 	if (exact) return t(exact);
 
@@ -227,6 +254,7 @@ function mapBody(body: string, originalBody: string): string | null {
 	if (recovery) return recovery;
 
 	for (const rule of PREFIXES) {
+		if (rule.spanishOnly && getLocale() !== "es") continue;
 		const candidate = rule.singleLine ? originalBody : body;
 		if (rule.singleLine && /[\r\n\u2028\u2029]/.test(candidate)) continue;
 		if (candidate.startsWith(rule.prefix)) {
@@ -273,6 +301,9 @@ export class ApiError extends Error {
 	constructor(raw: string) {
 		super(localizeApiError(raw));
 		this.name = "ApiError";
-		this.key = SINGLE_LINE_EXACT[raw.replace(/^\d{3}: /, "")] ?? EXACT[parseApiError(raw.trim()).body];
+		const originalBody = raw.replace(/^\d{3}: /, "");
+		this.key = SINGLE_LINE_EXACT[originalBody]
+			?? SPANISH_ONLY_EXACT[originalBody]
+			?? EXACT[parseApiError(raw.trim()).body];
 	}
 }

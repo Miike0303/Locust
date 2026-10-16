@@ -453,6 +453,133 @@ test("second-batch extra prefixes, incomplete shapes and multiline diagnostics s
 	}
 });
 
+// Batch 3 keeps the existing English fallback and localizes only owned Spanish guidance.
+const batch3Errors: readonly {
+	name: string; body: string; es: string; nearMiss: string; prefix?: string;
+}[] = [
+	{
+		name: "Tauri format detection failure",
+		body: "unsupported format: format not detected",
+		es: "No se pudo detectar el formato del juego. Compruebe la carpeta o el archivo seleccionado, o seleccione el formato manualmente.",
+		nearMiss: "unsupported format: format not detected for this file",
+	},
+	{
+		name: "existing pivot output",
+		body: String.raw`IO error: refusing to overwrite existing file: C:\private\pivot.locust.db`,
+		prefix: "IO error: refusing to overwrite existing file: ",
+		es: "Ya existe un archivo en el destino del proyecto intermedio. Elija otro nombre o ubicación para guardar la nueva base de datos.",
+		nearMiss: "IO error: refusing to overwrite existing directory: private",
+	},
+	{
+		name: "invalid project database",
+		body: String.raw`IO error: not a Locust project database: C:\private\other.locust.db`,
+		prefix: "IO error: not a Locust project database: ",
+		es: "El archivo seleccionado no es una base de datos de proyecto de Locust válida. Seleccione el archivo .locust.db del proyecto.",
+		nearMiss: "IO error: not a Locust project database backup: private",
+	},
+	{
+		name: "corrupt patch manifest",
+		body: "patch error: corrupt locust-patch.json: expected value at line 1 column 1",
+		prefix: "patch error: corrupt locust-patch.json: ",
+		es: "El manifiesto del parche está dañado o no es válido. Vuelva a descargar el parche o solicite una copia válida a su autor.",
+		nearMiss: "patch error: corrupt other.json: opaque",
+	},
+	{
+		name: "unsafe patch entry",
+		body: "unsafe zip entry: ../private/file.txt",
+		prefix: "unsafe zip entry: ",
+		es: "El parche contiene una ruta de archivo no segura y se ha rechazado. Solicite un parche válido a su autor.",
+		nearMiss: "unsafe zip entries: ../private/file.txt",
+	},
+	{
+		name: "pack backup selection mismatch",
+		body: "patch error: selected backup does not match the recorded injection; reopen Pack to use its original backup",
+		es: "La copia de seguridad seleccionada no corresponde a la inyección registrada. Cierre y vuelva a abrir Parche → Empaquetar para usar la copia de seguridad original de esa inyección.",
+		nearMiss: "patch error: selected backup does not match the recorded injection; reopen Apply to use its original backup",
+	},
+	{
+		name: "incomplete XLIFF document",
+		body: "parse error in xliff: XLIFF parse error: empty or incomplete XLIFF document",
+		es: "El archivo XLIFF está vacío o incompleto. Exporte un archivo XLIFF 1.2 completo y vuelva a importarlo.",
+		nearMiss: "parse error in xliff: XLIFF parse error: empty or complete XLIFF document",
+	},
+	{
+		name: "missing pristine files for packing",
+		body: "patch error: pristine hashes required but no --pristine path and no valid .locust/backup found",
+		es: "No se encontraron archivos originales válidos para calcular los hashes del parche. Seleccione una copia limpia del juego o una copia de seguridad válida en Parche → Empaquetar.",
+		nearMiss: "patch error: pristine hashes required but no --pristine path and no valid .locust/backup found yet",
+	},
+	{
+		name: "backup restore hash mismatch",
+		body: "backup error: backup inventory/hash mismatch; restore refused",
+		es: "Los archivos de la copia de seguridad no coinciden con su inventario o sus hashes. Se rechazó la restauración. Use otra copia de seguridad o una copia limpia del juego.",
+		nearMiss: "backup error: backup inventory/hash mismatch; packing refused",
+	},
+	{
+		name: "unsupported XLIFF version",
+		body: "parse error in xliff: XLIFF parse error: only XLIFF 1.2 is supported",
+		es: "La versión del archivo XLIFF no es compatible. Exporte el archivo como XLIFF 1.2 y vuelva a importarlo.",
+		nearMiss: "parse error in xliff: XLIFF parse error: only XLIFF 2.0 is supported",
+	},
+	{
+		name: "font extension mismatch",
+		body: "patch error: source and existing target must have the same .ttf or .otf extension; web fonts, collections and Unity SDF assets cannot be replaced",
+		es: "La fuente de reemplazo y la del juego deben tener la misma extensión .ttf u .otf. Seleccione una fuente compatible; no se admiten fuentes web, colecciones ni recursos SDF de Unity.",
+		nearMiss: "patch error: source and existing target must have different .ttf or .otf extensions; web fonts, collections and Unity SDF assets cannot be replaced",
+	},
+	{
+		name: "font patch output inside game",
+		body: "output_path must be outside the selected game directory",
+		es: "El destino del parche de fuentes está dentro de la carpeta del juego. Elija una ubicación fuera de esa carpeta para guardar el ZIP.",
+		nearMiss: "output_path must be inside the selected game directory",
+	},
+];
+
+for (const mapping of batch3Errors) {
+	test(`batch 3 ${mapping.name}: Spanish guidance, unchanged English and near-miss fallback`, () => {
+		for (const locale of ["es", "en"] as const) {
+			setLocale(locale);
+			for (const frame of ["", "400: ", "409: ", "500: "]) {
+				const fallback = (body: string) => frame
+					? `${locale === "es" ? "Error del servidor" : "Server error"} ${frame}${body}`
+					: body;
+				const raw = frame + mapping.body;
+				const expected = locale === "es" ? mapping.es : fallback(mapping.body);
+				assert.equal(localizeApiError(raw), expected);
+				assert.equal(new ApiError(raw).message, expected);
+				assert.equal(localizeApiError(frame + mapping.nearMiss), fallback(mapping.nearMiss));
+				assert.equal(new ApiError(frame + mapping.nearMiss).key, undefined);
+				if (!mapping.prefix) {
+					assert.equal(localizeApiError(`${raw} extra`), fallback(`${mapping.body} extra`));
+				}
+			}
+		}
+	});
+}
+
+test("batch 3 prefixes hide opaque suffixes only in Spanish and reject every line separator", () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const mapping of batch3Errors) {
+			if (!mapping.prefix) continue;
+			for (const suffix of [String.raw`C:\private\日本語\$&\{detail}`, "hash; ".repeat(200), "$' $$ $`"]) {
+				const body: string = mapping.prefix + suffix;
+				assert.equal(localizeApiError(body), locale === "es" ? mapping.es : body.trim());
+				assert.equal(localizeApiError(`400: ${body}`), locale === "es" ? mapping.es : `Server error 400: ${body.trim()}`);
+			}
+		}
+		for (const mapping of batch3Errors) {
+			for (const line of ["\n", "\r", "\r\n", "\u2028", "\u2029"]) {
+				for (const body of [mapping.body + line, line + mapping.body, mapping.body + line + "opaque"]) {
+					assert.equal(localizeApiError(body), body.trim());
+					assert.equal(localizeApiError(`400: ${body}`),
+						`${locale === "es" ? "Error del servidor" : "Server error"} 400: ${body.trim()}`);
+				}
+			}
+		}
+	}
+});
+
 // Verified Display templates: providers/{openai,claude,deepl,ollama,google,argos}.rs,
 // xai_oauth.rs:346, core/error.rs:20 and core/translation.rs:527,1394-1419,1562,2333.
 const providerGuidance = {
@@ -822,12 +949,54 @@ test("HTTP second-batch guidance preserves raw diagnostic activity-log details w
 	}
 });
 
+test("HTTP batch 3 guidance preserves raw activity-log detail and English fallback", async () => {
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const mapping of batch3Errors) {
+			rawFailure = mapping.body;
+			useLogStore.getState().clear();
+			await assert.rejects(api.patchPack({ game_path: "fixture", output_path: "fixture.zip" }), {
+				message: locale === "es" ? mapping.es : `Server error 400: ${mapping.body}`,
+			});
+			const entries = useLogStore.getState().entries;
+			assert.equal(entries.length, 1);
+			assert.deepEqual([entries[0].level, entries[0].message, entries[0].detail, entries[0].source],
+				["error", "API 400: /patch/pack", mapping.body, "api"]);
+		}
+	}
+});
+
+test("batch 3 leaves unstable sentences and unowned diagnostics unchanged", () => {
+	const bodies = [
+		"game busy: another patch operation is using C:\\private; wait for it to finish and retry",
+		"patch error: game busy: another patch operation is using C:\\private; wait for it to finish and retry",
+		"incomplete pivot: entry 'private-id' has a missing or blank translation",
+		"stale translation for entry 'private-id': source changed after translation; translate again or explicitly mark Reviewed/Approved after checking the current source",
+		"backup error: backup private-id source no longer exists or has wrong type (C:\\private)",
+		"backup private-id is needed to pack the injection recorded for es; inject again or open another project before deleting it",
+		"patch error: replacement lacks 3 required character(s): ['a', 'b', 'c']",
+		"parse error in C:\\private: invalid language code: private",
+		"database error: database is locked",
+		"IO error: Access is denied. (os error 5)",
+	];
+	for (const locale of ["es", "en"] as const) {
+		setLocale(locale);
+		for (const body of bodies) {
+			assert.equal(localizeApiError(body), body);
+			assert.equal(localizeApiError(`400: ${body}`),
+				`${locale === "es" ? "Error del servidor" : "Server error"} 400: ${body}`);
+			assert.equal(new ApiError(body).key, undefined);
+		}
+	}
+});
+
 test("detection failure recognition is unchanged in both locales", async () => {
 	const { isDetectionFailure } = await import("./openProjectFlow");
 	for (const locale of ["es", "en"] as const) {
 		setLocale(locale);
 		assert.ok(isDetectionFailure(localizeApiError("format not detected")));
 		assert.ok(isDetectionFailure(localizeApiError("422: Could not detect game format")));
+		assert.ok(isDetectionFailure(localizeApiError("unsupported format: format not detected")));
 		assert.equal(isDetectionFailure(localizeApiError(poError("27", "quote"))), false);
 	}
 });
