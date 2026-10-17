@@ -1,4 +1,5 @@
 import { IS_TAURI } from "../lib/runtime";
+import { ApiError } from "../lib/apiError";
 import { useEffect, useMemo, useState } from "react";
 import { X, FolderOpen, FileCheck, AlertCircle, Package } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -356,7 +357,10 @@ export default function InjectModal({
 			}
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
-			addLog("error", t("activity.inject.failed"), msg, "inject");
+			// Keep this newly localized refusal's diagnostic raw without changing other families.
+			const detail = err instanceof ApiError && err.key === "api.error.yurisEncodingRefused"
+				? err.raw : msg;
+			addLog("error", t("activity.inject.failed"), detail, "inject");
 			addToast("error", t("inject.toast.failed", { error: msg }));
 		} finally {
 			setLoading(false);

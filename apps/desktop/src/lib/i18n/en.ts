@@ -1204,6 +1204,8 @@ export const en = {
     "Backup {id} is damaged and cannot be restored. It is listed in Settings → Data.",
   "api.error.exportDestinationProtected":
     "The chosen export file is the project database or one of its companion files. Choose a different file name.",
+  "api.error.yurisEncodingRefused":
+    "The translation cannot be represented in Shift-JIS for the declared YU-RIS quoted literal. Injection was refused before backup or output creation; the original game and saved translation remain unchanged. Run Validate and review encoding issues. Use a supported target language; do not remove accents to force injection. This does not enable Unicode in the game.",
   "api.error.binarySlotCapacity":
     "{count} translation(s) exceed known binary slot capacity. The translated copy was refused before backup or output creation. Run Validate and resolve the capacity issues.",
   "api.error.directFormatIncompatible":

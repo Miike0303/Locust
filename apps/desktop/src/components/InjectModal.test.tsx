@@ -4,6 +4,8 @@ import { registerHooks } from "node:module";
 import { renderToStaticMarkup } from "react-dom/server";
 import { setLocale, t } from "../lib/i18n/index.ts";
 import * as a11y from "../lib/modalA11y.ts";
+import { queryClient } from "../lib/queryClient.ts";
+import { useLogStore } from "../stores/logStore.ts";
 
 // Follow the existing modal tests: run real callbacks and SSR with a small
 // hook harness. Keep the API client real and capture its Tauri commands.
@@ -99,6 +101,7 @@ await (await import("../lib/api")).getCurrentProject();
 globalThis.fetch = originalFetch;
 after(() => {
   hooks.deregister();
+  useLogStore.getState().clear();
   globalThis.fetch = originalFetch;
   setLocale("en");
   if (windowDescriptor) Object.defineProperty(globalThis, "window", windowDescriptor);
@@ -269,11 +272,79 @@ for (const locale of ["en", "es"] as const) {
         ? "2 translation(s) exceed known binary slot capacity. The translated copy was refused before backup or output creation. Run Validate and resolve the capacity issues."
         : "2 traducción(es) superan la capacidad conocida de los espacios binarios. Se rechazó la copia traducida antes de crear copias de seguridad o archivos de salida. Ejecute Validar y resuelva los problemas de capacidad.";
       assert.deepEqual(h.toasts, [["error", t("inject.toast.failed", { error: expected })]]);
+      assert.deepEqual(h.logs, [["error", t("activity.inject.failed"), expected, "inject"]], "existing capacity family keeps localized activity detail");
       assert.ok(!text(render()).includes(t("inject.injectionComplete")));
       assert.equal(calls.find(call => call.command === "run_inject")?.params.require_binary_slot_fit, true);
       assert.ok(!JSON.stringify(h.toasts).includes("injection error:"));
     });
   }
+}
+
+const yurisEncodingRefusal = "injection error: translation cannot be encoded as Shift-JIS for the declared YU-RIS quoted literal; injection is refused before backup or output; the original game and saved translation remain unchanged";
+for (const locale of ["en", "es"] as const) {
+  for (const shape of ["string", "Error", "HTTP"] as const) {
+    test(`${locale} encoding refusal (${shape}) preserves raw activity and localized toast without success`, async () => {
+      reset(locale, "replace");
+      replaceOnly();
+      useLogStore.getState().clear();
+      injectFailure = shape === "Error" ? new Error(yurisEncodingRefusal) : yurisEncodingRefusal;
+      if (shape === "HTTP") {
+        h.setTauri(false);
+        globalThis.fetch = async (url, init) => {
+          if (String(url).endsWith("/validate")) return new Response(JSON.stringify({ validation: { by_kind: {} } }));
+          assert.equal(String(url), "http://localhost:7842/api/inject");
+          calls.push({ command: "run_inject", params: JSON.parse(String(init?.body)) });
+          return new Response(yurisEncodingRefusal, { status: 500 });
+        };
+      }
+      setOutput("/output");
+      const projectBefore = structuredClone(h.project);
+      await button(t("inject.copyAction")).props.onClick();
+      const raw = shape === "HTTP" ? `500: ${yurisEncodingRefusal}` : yurisEncodingRefusal;
+      const expected = locale === "es" ? t("api.error.yurisEncodingRefused")
+        : shape === "HTTP" ? `Server error ${raw}` : raw;
+      assert.deepEqual(h.logs, [["error", t("activity.inject.failed"), raw, "inject"]]);
+      assert.deepEqual(h.toasts, [["error", t("inject.toast.failed", { error: expected })]]);
+      assert.ok(!text(render()).includes(t("inject.injectionComplete")));
+      assert.ok(!text(render()).includes("/returned/actual-copy-es"));
+      assert.deepEqual(h.project, projectBefore);
+      assert.deepEqual(calls.filter(call => call.command === "run_inject"), [{ command: "run_inject", params: {
+        project_path: "/game", format_id: "yuris", languages: ["es"], output_dir: "/output",
+        direct: false, mode: "replace", require_binary_slot_fit: true,
+      } }]);
+      assert.equal(registerCalls().length, 0);
+      const apiLogs = useLogStore.getState().entries;
+      assert.equal(apiLogs.length, shape === "HTTP" ? 1 : 0, "no duplicate API-layer diagnostics");
+      if (shape === "HTTP") assert.deepEqual([apiLogs[0].message, apiLogs[0].detail, apiLogs[0].source],
+        ["API 500: /inject", yurisEncodingRefusal, "api"]);
+    });
+  }
+
+  test(`${locale} unowned encoding diagnostic retains existing activity and toast fallback`, async () => {
+    for (const raw of ["unknown synthetic diagnostic", yurisEncodingRefusal + " extra", yurisEncodingRefusal + "\nopaque"]) {
+      reset(locale, "replace");
+      injectFailure = new Error(raw);
+      setOutput("/output");
+      await button(t("inject.copyAction")).props.onClick();
+      assert.deepEqual(h.logs, [["error", t("activity.inject.failed"), raw, "inject"]]);
+      assert.deepEqual(h.toasts, [["error", t("inject.toast.failed", { error: raw })]]);
+    }
+  });
+
+  test(`${locale} non-ApiError failures retain Error and unknown-value behavior`, async () => {
+    const invalidateQueries = queryClient.invalidateQueries;
+    try {
+      for (const failure of [new Error("synthetic refresh failure"), "synthetic non-Error failure"]) {
+        reset(locale, "replace");
+        queryClient.invalidateQueries = () => { throw failure; };
+        setOutput("/output");
+        await button(t("inject.copyAction")).props.onClick();
+        const expected = failure instanceof Error ? failure.message : String(failure);
+        assert.deepEqual(h.logs, [["error", t("activity.inject.failed"), expected, "inject"]]);
+        assert.deepEqual(h.toasts, [["error", t("inject.toast.failed", { error: expected })]]);
+      }
+    } finally { queryClient.invalidateQueries = invalidateQueries; }
+  });
 }
 
 // Exercise the real inject client at both mocked transport boundaries, including legacy callers.

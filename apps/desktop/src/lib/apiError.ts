@@ -80,6 +80,9 @@ const SINGLE_LINE_EXACT: Record<string, MessageKey> = {
 // New guidance leaves the existing English diagnostic/HTTP fallback unchanged.
 // Match the original body exactly so extra lines cannot become fixed guidance.
 const SPANISH_ONLY_EXACT: Record<string, MessageKey> = {
+	// core/validation.rs quoted-literal refusal + core/error.rs InjectionError Display.
+	"injection error: translation cannot be encoded as Shift-JIS for the declared YU-RIS quoted literal; injection is refused before backup or output; the original game and saved translation remain unchanged":
+		"api.error.yurisEncodingRefused",
 	"unsupported format: format not detected": "api.error.gameFormatUndetected",
 	"patch error: selected backup does not match the recorded injection; reopen Pack to use its original backup":
 		"api.error.packBackupMismatch",
@@ -297,10 +300,13 @@ export function localizeApiError(raw: string): string {
 /** Keep the existing backend message identity when localizing an error for the UI. */
 export class ApiError extends Error {
 	readonly key: MessageKey | undefined;
+	/** Original transport diagnostic, including any HTTP status frame. */
+	readonly raw: string;
 
 	constructor(raw: string) {
 		super(localizeApiError(raw));
 		this.name = "ApiError";
+		this.raw = raw;
 		const originalBody = raw.replace(/^\d{3}: /, "");
 		this.key = SINGLE_LINE_EXACT[originalBody]
 			?? SPANISH_ONLY_EXACT[originalBody]

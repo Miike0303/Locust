@@ -1175,6 +1175,8 @@ export const es: Record<keyof typeof en, string> = {
     "La copia de seguridad {id} está dañada y no se puede restaurar. Figura en Ajustes → Datos.",
   "api.error.exportDestinationProtected":
     "El archivo elegido para exportar es la base de datos del proyecto o uno de sus archivos auxiliares. Elija otro nombre de archivo.",
+  "api.error.yurisEncodingRefused":
+    "La traducción no se puede representar en Shift-JIS para el literal entre comillas de YU-RIS declarado. Se rechazó la inyección antes de crear copias de seguridad o archivos de salida; el juego original y la traducción guardada permanecen intactos. Ejecute Validar y revise los problemas de codificación. Use un idioma de destino compatible; no elimine los acentos para forzar la inyección. Esto no habilita Unicode en el juego.",
   "api.error.binarySlotCapacity":
     "{count} traducción(es) superan la capacidad conocida de los espacios binarios. Se rechazó la copia traducida antes de crear copias de seguridad o archivos de salida. Ejecute Validar y resuelva los problemas de capacidad.",
   "api.error.directFormatIncompatible":

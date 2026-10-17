@@ -10,7 +10,76 @@ import {
 	PROJECT_BUSY_EN,
 	TRANSLATION_IN_FLIGHT_EN,
 } from "./apiError";
-import { setLocale } from "./i18n";
+import { getLocale, setLocale, t } from "./i18n";
+
+// core/validation.rs's fixed refusal (no source/target prose) + core/error.rs Display.
+const yurisEncodingRefusal = "injection error: translation cannot be encoded as Shift-JIS for the declared YU-RIS quoted literal; injection is refused before backup or output; the original game and saved translation remain unchanged";
+const yurisEncodingGuidance = {
+	en: "The translation cannot be represented in Shift-JIS for the declared YU-RIS quoted literal. Injection was refused before backup or output creation; the original game and saved translation remain unchanged. Run Validate and review encoding issues. Use a supported target language; do not remove accents to force injection. This does not enable Unicode in the game.",
+	es: "La traducción no se puede representar en Shift-JIS para el literal entre comillas de YU-RIS declarado. Se rechazó la inyección antes de crear copias de seguridad o archivos de salida; el juego original y la traducción guardada permanecen intactos. Ejecute Validar y revise los problemas de codificación. Use un idioma de destino compatible; no elimine los acentos para forzar la inyección. Esto no habilita Unicode en el juego.",
+};
+
+test("YU-RIS encoding refusal gives exact Spanish guidance for bare Tauri and HTTP messages", () => {
+	setLocale("es");
+	for (const frame of ["", "500: "]) {
+		assert.equal(localizeApiError(frame + yurisEncodingRefusal), yurisEncodingGuidance.es);
+		const error = new ApiError(frame + yurisEncodingRefusal);
+		assert.equal(error.message, yurisEncodingGuidance.es);
+		assert.equal(error.key, "api.error.yurisEncodingRefused");
+	}
+});
+
+test("ApiError retains the original diagnostic additively across existing message and key semantics", () => {
+	for (const locale of ["en", "es"] as const) {
+		setLocale(locale);
+		for (const raw of [yurisEncodingRefusal, `500: ${yurisEncodingRefusal}`, "404: no project open", "unknown diagnostic  \n", "500: unknown diagnostic  \n"]) {
+			const error = new ApiError(raw);
+			assert.equal(error.raw, raw);
+			assert.equal(error.name, "ApiError");
+			assert.equal(error.message, localizeApiError(raw));
+			assert.equal(error.key, raw.includes(yurisEncodingRefusal)
+				? "api.error.yurisEncodingRefused" : raw === "404: no project open" ? "api.error.noProjectOpen" : undefined);
+		}
+	}
+});
+
+test("YU-RIS encoding guidance retains English fallback and has matching EN/ES catalog copy", () => {
+	for (const locale of ["en", "es"] as const) {
+		setLocale(locale);
+		// Lookup also checks copy parity without extending the English mapping policy.
+		assert.equal(t("api.error.yurisEncodingRefused"), yurisEncodingGuidance[locale]);
+	}
+	setLocale("en");
+	assert.equal(localizeApiError(yurisEncodingRefusal), yurisEncodingRefusal);
+	assert.equal(localizeApiError(`500: ${yurisEncodingRefusal}`), `Server error 500: ${yurisEncodingRefusal}`);
+});
+
+test("YU-RIS encoding near-misses, whitespace and multiline messages preserve shared fallback without side effects", () => {
+	const bodies = [
+		yurisEncodingRefusal + " extra", "prefix: " + yurisEncodingRefusal,
+		yurisEncodingRefusal.replace("injection error: ", ""),
+		yurisEncodingRefusal.replace("Shift-JIS", "UTF-8"),
+		yurisEncodingRefusal.replace("YU-RIS quoted literal", "YU-RIS caption"),
+		yurisEncodingRefusal.replace("remain unchanged", "were changed"),
+		"encoding error: unknown synthetic diagnostic",
+		" " + yurisEncodingRefusal, yurisEncodingRefusal + " ",
+		...["\n", "\r", "\r\n", "\u2028", "\u2029"].flatMap(line => [
+			yurisEncodingRefusal + line, line + yurisEncodingRefusal, yurisEncodingRefusal + line + "opaque",
+		]),
+	];
+	for (const locale of ["en", "es"] as const) {
+		setLocale(locale);
+		const state = useLogStore.getState();
+		for (const body of bodies) {
+			assert.equal(localizeApiError(body), body.trim());
+			assert.equal(localizeApiError(`500: ${body}`), `${locale === "es" ? "Error del servidor" : "Server error"} 500: ${body.trim()}`);
+			assert.equal(new ApiError(body).key, undefined);
+			assert.equal(new ApiError(`500: ${body}`).key, undefined);
+		}
+		assert.equal(getLocale(), locale);
+		assert.equal(useLogStore.getState(), state, "localization must not write activity state");
+	}
+});
 
 const manifestlessOverlayError = "patch error: a Locust patch is already installed; roll it back before applying a patch without a manifest";
 for (const locale of ["en", "es"] as const) {
@@ -794,6 +863,7 @@ test("unowned parse/IO errors, prefixes, invalid lines and multiline diagnostics
 let api: typeof import("./api");
 let rawFailure = "";
 let rejectWithError = false;
+let httpFailureStatus = 400;
 const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
 const originalFetch = globalThis.fetch;
 const tauriCommands: string[] = [];
@@ -805,7 +875,7 @@ before(async () => {
 			throw rejectWithError ? new Error(rawFailure) : rawFailure;
 		} },
 	} });
-	globalThis.fetch = async () => new Response(rawFailure, { status: 400 });
+	globalThis.fetch = async () => new Response(rawFailure, { status: httpFailureStatus });
 	api = await import("./api");
 });
 after(() => {
@@ -814,6 +884,51 @@ after(() => {
 	else Reflect.deleteProperty(globalThis, "window");
 	useLogStore.getState().clear();
 	setLocale("en");
+});
+
+test("YU-RIS encoding refusal through public Tauri inject rejects once without new logs or parameter mutation", async () => {
+	for (const locale of ["en", "es"] as const) {
+		setLocale(locale);
+		for (const asError of [false, true]) {
+			rejectWithError = asError;
+			rawFailure = yurisEncodingRefusal;
+			const params = { project_path: "synthetic-game", format_id: "yuris", languages: ["es"], mode: "replace" as const, output_dir: "synthetic-output" };
+			const beforeParams = structuredClone(params);
+			const commandsBefore = tauriCommands.length;
+			useLogStore.getState().clear();
+			await assert.rejects(api.inject(params), (error: unknown) => {
+				assert.ok(error instanceof ApiError);
+				assert.equal(error.message, locale === "es" ? yurisEncodingGuidance.es : rawFailure);
+				return true;
+			});
+			assert.deepEqual(tauriCommands.slice(commandsBefore), ["run_inject"]);
+			assert.deepEqual(params, beforeParams);
+			assert.equal(useLogStore.getState().entries.length, 0, "preserve existing non-PO Tauri logging behavior");
+		}
+	}
+});
+
+test("YU-RIS encoding HTTP guidance preserves raw 500 activity detail and unmatched multiline fallback", async () => {
+	// patchPack shares request() with HTTP inject, even when this test process uses Tauri.
+	httpFailureStatus = 500;
+	try {
+		for (const locale of ["en", "es"] as const) {
+			setLocale(locale);
+			for (const body of [yurisEncodingRefusal, yurisEncodingRefusal + "\nopaque   "]) {
+				rawFailure = body;
+				useLogStore.getState().clear();
+				await assert.rejects(api.patchPack({ game_path: "synthetic-game", output_path: "synthetic.zip" }), {
+					message: locale === "es" && body === yurisEncodingRefusal
+						? yurisEncodingGuidance.es
+						: `${locale === "es" ? "Error del servidor" : "Server error"} 500: ${body.trim()}`,
+				});
+				const entries = useLogStore.getState().entries;
+				assert.equal(entries.length, 1);
+				assert.deepEqual([entries[0].level, entries[0].message, entries[0].detail, entries[0].source],
+					["error", "API 500: /patch/pack", body, "api"]);
+			}
+		}
+	} finally { httpFailureStatus = 400; }
 });
 
 test("real Tauri import localizes the message and logs the original string/Error detail exactly once", async () => {
