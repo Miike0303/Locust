@@ -259,6 +259,53 @@ class Options:
     fallback_provider: str = None
     english_seed: str = None
     test_fallback_endpoint: str = None
+    glossary_json: str = None
+
+
+def canonical_glossary(value):
+    """Small visible-text interface; matching remains entirely in Locust core."""
+    fields(value, {"version", "ja-en", "en-es"})
+    require(type(value["version"]) is int and value["version"] == 1, "Unsupported glossary version")
+    result = {"version": 1}
+    for pair in ("ja-en", "en-es"):
+        entries = value[pair]
+        require(isinstance(entries, list) and len(entries) <= 200, "Glossary phase must be an array of at most 200 terms")
+        seen = set()
+        for entry in entries:
+            fields(entry, {"term", "translation"})
+            for text in entry.values():
+                require(nonblank(text) and text == text.strip() and len(text) <= 500
+                        and not any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF
+                                    or c in "\\{}[]<>" for c in text),
+                        "Glossary requires bounded plain visible text without controls or edge whitespace")
+            key = entry["term"].casefold()
+            require(key not in seen, "Duplicate/ambiguous glossary term")
+            seen.add(key)
+        result[pair] = sorted(entries, key=lambda e: e["term"])
+    return result
+
+
+def glossary_entries(settings, database):
+    pair = "ja-en" if database == "english.db" else "en-es"
+    return settings.get("glossary", {}).get(pair, [])
+
+
+def glossary_exact(settings, database, row):
+    # Attribution check only, NOT the visible-span matcher. Accept the narrow
+    # full-source exact shortcut, never infer glossary applicability by substring.
+    source = row["source"].strip()
+    return any(e["term"].lower() == source.lower() and e["translation"] == row["translation"]
+               for e in glossary_entries(settings, database))
+
+
+def policy_fingerprint(settings, config):
+    return digest({"glossary": settings["glossary"], "config": config})
+
+
+def accepted_provider(settings, stage, provider):
+    return provider == stage_provider(settings, stage) or (
+        provider == "glossary" and stage in {"ja-en", "en-es", "ja-en-fallback-google", "en-es-fallback-google"}
+        and bool(glossary_entries(settings, "english.db" if stage.startswith("ja-en") else "spanish.db")))
 
 
 def preflight(options):
@@ -409,7 +456,9 @@ def validate_resume_manifest(value, seed_legacy=False):
     setting_keys = {"cli", "game", "output", "format", "provider", "test_endpoint", "batch_size", "concurrency", "timeout"}
     if not legacy:
         setting_keys |= {"fallback_provider", "english_seed", "test_fallback_endpoint"}
-    fields(settings, setting_keys)
+    fields(settings, setting_keys, {"glossary"} if not legacy else ())
+    if "glossary" in settings:
+        require(canonical_glossary(settings["glossary"]) == settings["glossary"], "Noncanonical resume glossary")
     if not legacy:
         require(settings["fallback_provider"] is None or
                 (settings["fallback_provider"] == "google" and settings["provider"] == "antigravity"),
@@ -474,7 +523,7 @@ def validate_resume_manifest(value, seed_legacy=False):
     }
     if not legacy:
         successors["extract-japanese"] |= {"seed-export-english", "ja-en"}
-        successors["seed-export-english"] = {"seed-import-english"}
+        successors["seed-export-english"] = {"seed-import-english", "ja-en"}
         successors["seed-import-english"] = {"validate-seed-english"}
         successors["validate-seed-english"] = {"ja-en"}
         for translation, validation, language in (("ja-en", "validate-english", "english"),
@@ -486,13 +535,29 @@ def validate_resume_manifest(value, seed_legacy=False):
             successors[fallback] = {validation, translation, "validate-english-current"}
         successors["en-es"].add("en-es")
         successors["validate-spanish"].add("en-es")
+    glossary_stages = set()
+    for database, start, phase_name in (("english.db", "extract-japanese", "english"),
+                                         ("spanish.db", "strict-pivot", "spanish")):
+        entries = glossary_entries(settings, database)
+        if entries:
+            following = successors[start]
+            names = ["glossary-" + phase_name + "-" + str(i) for i in range(len(entries))]
+            successors[start] = {names[0]}
+            for i, name in enumerate(names):
+                successors[name] = {names[i + 1]} if i + 1 < len(names) else following
+            glossary_stages.update(names)
     stages = value["stages"]
     require(isinstance(stages, list) and len(stages) >= 2, "Malformed resume stage history")
     previous, checkpoint, pivot_seen = None, "copying", False
     prior = None
     for stage in stages:
         fields(stage, {"stage", "exit_code", "seconds", "stdout_sha256", "stderr_sha256"},
-               {"classified_identical_resources"})
+               {"classified_identical_resources", "policy_sha256"})
+        if "glossary" in settings:
+            require(stage.get("policy_sha256") == policy_fingerprint(settings, permitted_config(Options(**{
+                k: v for k, v in settings.items() if k != "glossary"}))), "Unbound resume glossary/config stage")
+        else:
+            require("policy_sha256" not in stage, "Unexpected glossary stage proof")
         name, code = stage["stage"], stage["exit_code"]
         require(isinstance(name, str) and name in successors[previous], "Unordered/unknown resume stage")
         require(type(code) is int and -255 <= code <= 4294967295
@@ -504,7 +569,7 @@ def validate_resume_manifest(value, seed_legacy=False):
             identical = stage["classified_identical_resources"]
             require(name.startswith("validate-") and integer(identical) and identical <= count
                     and code == (1 if identical else 0), "Malformed resume classified validation count/code")
-        if name in {"cli-capability", "extract-japanese", "strict-pivot", "seed-export-english", "seed-import-english"}:
+        if name in {"cli-capability", "extract-japanese", "strict-pivot", "seed-export-english", "seed-import-english"} | glossary_stages:
             require(code == 0, "Failed resume prerequisite stage")
         if name == "extract-japanese":
             checkpoint = "english-pending"
@@ -522,7 +587,7 @@ def validate_resume_manifest(value, seed_legacy=False):
             checkpoint, pivot_seen = "spanish-pending", True
         elif name in {"en-es", "en-es-fallback-google"}:
             require(checkpoint == "spanish-pending" and pivot_seen
-                    and (previous in {"strict-pivot", "en-es", "en-es-fallback-google"}
+                    and (previous in {"strict-pivot", "en-es", "en-es-fallback-google"} | glossary_stages
                          or "classified_identical_resources" in prior),
                     "Premature Spanish translation stage")
         elif name == "validate-spanish":
@@ -566,7 +631,15 @@ def validate_accepted_manifest(value, count):
     successful = {s["stage"] for s in value["stages"] if s["exit_code"] == 0}
     seed = value.get("seed")
     if seed is not None:
-        fields(seed, {"run_id", "database", "manifest_sha256", "snapshot", "snapshot_logical_sha256", "catalog", "targets"})
+        fields(seed, {"run_id", "database", "manifest_sha256", "snapshot", "snapshot_logical_sha256", "catalog", "targets"},
+               {"filtered_catalog", "filter_policy", "source_glossary"})
+        if "source_glossary" in seed:
+            require(canonical_glossary(seed["source_glossary"]) == seed["source_glossary"], "Malformed seed source glossary")
+        if "glossary" in value["settings"]:
+            require(seed.get("filter_policy") == "exclude-all-if-ja-en-glossary-v1", "Unbound seed filter policy")
+            hash_identity(seed.get("filtered_catalog"))
+        else:
+            require("filtered_catalog" not in seed and "filter_policy" not in seed, "Unexpected seed filtering proof")
         require(isinstance(seed["run_id"], str)
                 and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", seed["run_id"])
                 and sha256_value(seed["manifest_sha256"]), "Malformed seed ownership evidence")
@@ -574,16 +647,17 @@ def validate_accepted_manifest(value, count):
         hash_identity(seed["snapshot"])
         require(sha256_value(seed["snapshot_logical_sha256"]), "Malformed seed snapshot hash")
         hash_identity(seed["catalog"])
-        require(isinstance(seed["targets"], dict) and seed["targets"] and len(seed["targets"]) <= count,
+        require(isinstance(seed["targets"], dict) and len(seed["targets"]) <= count,
                 "Malformed seed targets")
         for identifier, target in seed["targets"].items():
             require(nonblank(identifier), "Malformed seed ID")
             fields(target, {"source_sha256", "target_sha256", "provider", "status"})
             require(sha256_value(target["source_sha256"]) and sha256_value(target["target_sha256"])
                     and isinstance(target["provider"], str)
-                    and target["provider"] in {"antigravity", "google", PROVIDER, FALLBACK_TEST_PROVIDER}
+                    and target["provider"] in {"antigravity", "google", PROVIDER, FALLBACK_TEST_PROVIDER, "glossary"}
                     and isinstance(target["status"], str) and target["status"] in READY, "Malformed seed target")
-    require(("seed-import-english" in successful) == (seed is not None)
+    require(("seed-export-english" in successful) == (seed is not None)
+            and ("seed-import-english" in successful) == (seed is not None and bool(seed["targets"]))
             and (value["settings"]["english_seed"] is not None) == (seed is not None), "Unbound/incomplete seed history")
     if value["phase"] != "english-pending":
         require(len(accepted["english.db"]) == count, "Incomplete English readiness attribution")
@@ -596,7 +670,7 @@ def validate_accepted_manifest(value, count):
             fields(evidence, {"row_sha256", "stage", "provider"})
             require(sha256_value(evidence["row_sha256"]) and isinstance(evidence["stage"], str)
                     and evidence["stage"] in permitted & successful
-                    and evidence["provider"] == stage_provider(value["settings"], evidence["stage"]),
+                    and accepted_provider(value["settings"], evidence["stage"], evidence["provider"]),
                     "Unproven accepted row attribution")
             if evidence["provider"] == "import":
                 require(seed is not None and identifier in seed["targets"], "Unbound imported row")
@@ -659,6 +733,26 @@ def read_database(path):
         raise PipelineError("Owned database cannot be read/validated") from error
     finally:
         if connection:
+            connection.close()
+
+
+def read_glossary(path):
+    """Independent complete-table proof, including other pairs and CLI defaults."""
+    path = plain(path)
+    for suffix in ("-wal", "-shm", "-journal"):
+        plain(str(path) + suffix, missing=True)
+    connection = None
+    try:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        require(connection.execute("SELECT type FROM sqlite_master WHERE name='glossary'").fetchone() == ("table",),
+                "Unexpected glossary schema")
+        return list(connection.execute("SELECT term,translation,lang_pair,context,case_sensitive FROM glossary ORDER BY term"))
+    except sqlite3.Error as error:
+        raise PipelineError("Owned glossary cannot be read/validated") from error
+    finally:
+        if connection is not None:
             connection.close()
 
 
@@ -1135,6 +1229,38 @@ def verify_seed_catalog(path, targets):
     return file_hash(path)
 
 
+def seed_logical(snapshot, rows, metadata, settings):
+    entries = glossary_entries(settings, "english.db")
+    actual = read_glossary(snapshot)
+    require(actual == [(e["term"], e["translation"], "ja-en", None, 0) for e in entries],
+            "Seed owned glossary drift")
+    logical = [rows, metadata]
+    if "glossary" in settings:
+        logical.append(actual)
+    return digest(logical)
+
+
+def seed_subset(settings, targets):
+    # Core masks controls, anchors speaker syntax, performs Unicode boundary
+    # checks and resolves leftmost-longest spans. There is no public applicability
+    # oracle. Do not approximate it: with any JA glossary, all ready seed rows
+    # are uncertain and must be translated by production core instead of reused.
+    return {} if glossary_entries(settings, "english.db") else targets
+
+
+def derive_seed_catalog(original, destination, complete, subset):
+    identity = verify_seed_catalog(original, complete)
+    xml = ET.fromstring(plain(original).read_bytes())
+    body = xml[0][0]
+    for unit in list(body):
+        if unit.attrib["id"] not in subset:
+            body.remove(unit)
+    with destination.open("xb") as stream:
+        stream.write(ET.tostring(xml, encoding="utf-8", xml_declaration=True))
+    require(verify_seed_catalog(original, complete) == identity, "Original seed export changed")
+    return verify_seed_catalog(destination, subset)
+
+
 class Pipeline:
     def __init__(self, options):
         self.options = options
@@ -1151,6 +1277,15 @@ class Pipeline:
         self.binary = file_hash(self.cli)
         self.settings = asdict(options)
         self.settings.pop("resume")
+        self.settings.pop("glossary_json")
+        self.glossary_input = None
+        if options.glossary_json is not None:
+            path = plain(options.glossary_json)
+            require(path.is_file() and path.stat().st_nlink == 1 and not under(path, self.root), "Unsafe glossary input")
+            identity = file_hash(path)
+            self.settings["glossary"] = canonical_glossary(read_json_file(path))
+            require(file_hash(path) == identity, "Glossary changed during preflight")
+            self.glossary_input = (path, identity)
         self.settings.update(cli=str(self.cli), game=str(self.game), output=str(self.root))
         self.work, self.pristine, self.install = (self.root / name for name in ("work-game", "pristine", "install-game"))
         self.en, self.es = self.root / "english.db", self.root / "spanish.db"
@@ -1240,9 +1375,14 @@ class Pipeline:
     def invariants(self, before_injection=False):
         require(scan(self.game, source=True) == self.original, "Original source changed")
         require(file_hash(self.cli) == self.binary, "CLI binary changed")
+        if "glossary" in self.settings and (self.root / "profile/config.json").exists():
+            require(plain(self.root / "profile/config.json").read_bytes() == encoded(permitted_config(self.options)),
+                    "Glossary-bound config drift")
         require(scan(self.pristine) == self.original, "Pristine copy changed")
         if before_injection:
             require(scan(self.work) == self.original and scan(self.install) == self.original, "Pre-injection copy drift")
+        if self.glossary_input is not None:
+            require(file_hash(self.glossary_input[0]) == self.glossary_input[1], "External glossary input changed")
         if self.seed_input is not None:
             path, identity, owner_path, owner_identity, _ = self.seed_input
             publication_file(path, identity)
@@ -1261,6 +1401,26 @@ class Pipeline:
         inventory(rows, expected_root, self.options.format)
         return rows
 
+    def verify_glossary(self, path, entries=None):
+        entries = glossary_entries(self.settings, path.name) if entries is None else entries
+        pair = "ja-en" if path == self.en else "en-es"
+        expected = [(e["term"], e["translation"], pair, None, 0) for e in entries]
+        require(read_glossary(path) == expected, "Exact owned phase glossary drift")
+
+    def install_glossary(self, path):
+        if "glossary" not in self.settings:
+            return
+        self.verify_glossary(path, [])
+        before = read_database(path)
+        entries = glossary_entries(self.settings, path.name)
+        language, pair = ("english", "ja-en") if path == self.en else ("spanish", "en-es")
+        for i, entry in enumerate(entries):
+            self.command("glossary-" + language + "-" + str(i), ["glossary", "add", path,
+                         "--term=" + entry["term"], "--translation=" + entry["translation"], "--lang-pair", pair])
+            self.verify_glossary(path, entries[:i + 1])
+            require(read_database(path) == before, "Glossary CLI changed resource rows/metadata")
+        self.verify_glossary(path)
+
     def snapshot(self, path):
         rows, metadata = read_database(path)
         physical = {}
@@ -1268,13 +1428,20 @@ class Pipeline:
             item = Path(str(path) + suffix)
             if item.exists():
                 physical[suffix] = file_hash(item)
-        return {"rows": len(rows), "logical_sha256": digest([rows, metadata]), "files": physical}
+        logical = [rows, metadata]
+        if "glossary" in self.settings:
+            logical.append(read_glossary(path))
+        return {"rows": len(rows), "logical_sha256": digest(logical), "files": physical}
 
     def checkpoints(self):
         return {path.name: self.snapshot(path) for path in (self.en, self.es) if path.exists()}
 
     def command(self, stage, args, structured=False, accepted_codes=(0,)):
         self.invariants(before_injection=not self.manifest["injection_started"])
+        if not stage.startswith("glossary-"):
+            for path in (self.en, self.es):
+                if path.exists():
+                    self.verify_glossary(path)
         self.manifest["active_command"] = stage
         self.save()
         start = time.monotonic()
@@ -1297,6 +1464,8 @@ class Pipeline:
                                        "seconds": round(time.monotonic() - start, 3),
                                        "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
                                        "stderr_sha256": hashlib.sha256(result.stderr).hexdigest()})
+        if "glossary" in self.settings:
+            self.manifest["stages"][-1]["policy_sha256"] = policy_fingerprint(self.settings, permitted_config(self.options))
         self.save()
         require(result.returncode in accepted_codes, "Child command failed: " + stage)
         return strict_json(result.stdout) if structured else None
@@ -1316,15 +1485,18 @@ class Pipeline:
         return rows
 
     def proven_rows(self, path, rows):
+        self.verify_glossary(path)
         evidence = self.manifest["accepted_rows"][path.name]
         ready = {r["id"]: r for r in rows if r["status"] in READY}
         require(ready.keys() == evidence.keys(), "Unproven ready row inventory")
         for identifier, r in ready.items():
             proof = evidence[identifier]
             require(proof["row_sha256"] == digest(r) and proof["provider"] == r["provider_used"]
-                    and proof["provider"] == stage_provider(self.settings, proof["stage"])
+                    and accepted_provider(self.settings, proof["stage"], proof["provider"])
                     and any(s["stage"] == proof["stage"] and s["exit_code"] == 0 for s in self.manifest["stages"]),
                     "Unexpected translation provider/row attribution")
+            if proof["provider"] == "glossary":
+                require(glossary_exact(self.settings, path.name, r), "Unbound exact glossary target")
             if proof["provider"] == "import":
                 target = self.manifest["seed"]["targets"].get(identifier)
                 require(target is not None and target["source_sha256"] == digest(r["source"])
@@ -1334,7 +1506,7 @@ class Pipeline:
         after = self.db_rows(path)
         gate_rows(after, baseline, self.work, self.options.format)
         prior = {r["id"]: r for r in before}
-        provider = stage_provider(self.settings, stage)
+        stage_provider(self.settings, stage)  # Refuse unknown/unauthorized attribution stages.
         accepted = dict(self.manifest["accepted_rows"][path.name])
         for r in after:
             old = prior[r["id"]]
@@ -1342,7 +1514,9 @@ class Pipeline:
                 require(r == old, "Translation changed previously accepted/nonpending row columns")
             elif r["status"] in READY:
                 require(nonblank(r["translation"]) and nonblank(r["translated_at"])
-                        and r["provider_used"] == provider, "Unproven stage translation attribution")
+                        and accepted_provider(self.settings, stage, r["provider_used"]), "Unproven stage translation attribution")
+                if r["provider_used"] == "glossary":
+                    require(glossary_exact(self.settings, path.name, r), "Unbound exact glossary target")
                 # Static inventory excludes creation/review timestamps; they too
                 # are immutable for pending-only translation/import.
                 require(r["created_at"] == old["created_at"] and r["reviewed_at"] == old["reviewed_at"],
@@ -1350,7 +1524,7 @@ class Pipeline:
                 if targets is not None:
                     require(r["id"] in targets and r["translation"] == targets[r["id"]]["translation"],
                             "Unbound seed import")
-                accepted[r["id"]] = {"row_sha256": digest(r), "stage": stage, "provider": provider}
+                accepted[r["id"]] = {"row_sha256": digest(r), "stage": stage, "provider": r["provider_used"]}
             else:
                 require(r == old, "Unaccepted pending row changed")
         if targets is not None:
@@ -1401,7 +1575,7 @@ class Pipeline:
                 and norm(metadata["game_root"]) == norm(old_root), "Seed root/metadata/pivot mismatch")
         require(remapped_inventory(rows, old_root, self.work, self.options.format) == self.manifest["japanese_inventory"]
                 and inventory(rows, old_root, self.options.format) == owner["japanese_inventory"]
-                and digest([rows, metadata]) == owner["databases"]["english.db"]["logical_sha256"]
+                and seed_logical(snapshot, rows, metadata, owner["settings"]) == owner["databases"]["english.db"]["logical_sha256"]
                 and len(rows) == owner["databases"]["english.db"]["rows"], "Seed complete Japanese inventory/snapshot drift")
         successful = {s["stage"] for s in owner["stages"] if s["exit_code"] == 0}
         providers = {stage_provider(owner["settings"], s) for s in successful
@@ -1416,7 +1590,9 @@ class Pipeline:
                             for i, r in targets.items()), "Seed accepted row binding mismatch")
         for r in targets.values():
             gate_rows([r], inventory([r], old_root, self.options.format), old_root, self.options.format, ready=True)
-            require(r["provider_used"] in run_providers and "locust_injection_source" not in r["metadata"],
+            require((r["provider_used"] in run_providers or (r["provider_used"] == "glossary"
+                     and glossary_exact(owner["settings"], "english.db", r)))
+                    and "locust_injection_source" not in r["metadata"],
                     "Seed row language/provider/pivot evidence mismatch")
         catalog = self.root / "seed-english.xliff"
         self.command("seed-export-english", ["export", snapshot, "-f", "xliff", "-l", "en", "-o", catalog,
@@ -1425,18 +1601,35 @@ class Pipeline:
         # Export may migrate only the owned copy. Compare all row columns after
         # export, not just catalog text.
         require(read_database(snapshot) == (rows, metadata), "Seed snapshot rows changed during export")
+        complete = targets
+        filtered_hash = None
+        import_catalog = catalog
+        if "glossary" in self.settings:
+            targets = seed_subset(self.settings, complete)
+            import_catalog = self.root / "seed-english-filtered.xliff"
+            filtered_hash = derive_seed_catalog(catalog, import_catalog, complete, targets)
         before = self.db_rows(self.en)
-        self.command("seed-import-english", ["import", self.en, "-f", "xliff", "-l", "en", "-i", catalog, "--keep-existing"])
-        require(file_hash(catalog) == catalog_hash, "Seed catalog changed during import")
-        # The fresh DB has only catalog targets and untouched pending rows;
-        # invalid retained translations of pending seed rows are never imported.
-        self.validate(self.en, "validate-seed-english")
+        if targets:
+            self.command("seed-import-english", ["import", self.en, "-f", "xliff", "-l", "en", "-i", import_catalog, "--keep-existing"])
+            require(file_hash(import_catalog) == (filtered_hash or catalog_hash), "Seed import catalog changed")
+            self.validate(self.en, "validate-seed-english")
+        else:
+            require(self.db_rows(self.en) == before, "All-excluded seed changed fresh rows")
+        require(file_hash(catalog) == catalog_hash, "Complete seed catalog changed")
         self.manifest["seed"] = {"run_id": owner["run_id"], "database": {k: identity[k] for k in ("sha256", "size")},
                                  "manifest_sha256": owner_identity["sha256"], "snapshot": file_hash(snapshot),
-                                 "snapshot_logical_sha256": digest([rows, metadata]), "catalog": catalog_hash,
+                                 "snapshot_logical_sha256": seed_logical(snapshot, rows, metadata, owner["settings"]), "catalog": catalog_hash,
                                  "targets": {i: {"source_sha256": digest(r["source"]), "target_sha256": digest(r["translation"]),
                                                    "provider": r["provider_used"], "status": r["status"]} for i, r in targets.items()}}
-        self.accept_changes(self.en, before, "seed-import-english", self.manifest["japanese_inventory"], targets)
+        if "glossary" in owner["settings"]:
+            self.manifest["seed"]["source_glossary"] = owner["settings"]["glossary"]
+        if filtered_hash is not None:
+            self.manifest["seed"].update(filtered_catalog=filtered_hash, filter_policy="exclude-all-if-ja-en-glossary-v1")
+        if targets:
+            self.accept_changes(self.en, before, "seed-import-english", self.manifest["japanese_inventory"], targets)
+        else:
+            self.manifest["databases"] = self.checkpoints()
+            self.save()
         self.invariants(before_injection=True)
 
     def verify_seed_resume(self, candidate):
@@ -1449,7 +1642,8 @@ class Pipeline:
         require(file_hash(snapshot) == evidence["snapshot"] and file_hash(catalog) == evidence["catalog"],
                 "Resume seed artifact hash drift")
         rows, metadata = read_database(snapshot)
-        require(digest([rows, metadata]) == evidence["snapshot_logical_sha256"]
+        source_settings = {"glossary": evidence["source_glossary"]} if "source_glossary" in evidence else {}
+        require(seed_logical(snapshot, rows, metadata, source_settings) == evidence["snapshot_logical_sha256"]
                 and set(metadata) == {"game_root", "extraction_warnings"}, "Resume seed snapshot drift")
         # Historical seed path is only a root-normalization datum. Never open
         # the old input/manifest/config/executable or re-export/re-import it.
@@ -1457,15 +1651,21 @@ class Pipeline:
         require(norm(metadata["game_root"]) == norm(old_root)
                 and remapped_inventory(rows, old_root, self.work, self.options.format) == candidate["japanese_inventory"],
                 "Resume seed full Japanese inventory drift")
-        targets = {r["id"]: r for r in rows if r["status"] in READY}
+        complete = {r["id"]: r for r in rows if r["status"] in READY}
+        require(verify_seed_catalog(catalog, complete) == evidence["catalog"], "Resume complete seed catalog drift")
+        targets = seed_subset(self.settings, complete)
+        if "glossary" in self.settings:
+            filtered = self.root / "seed-english-filtered.xliff"
+            require(verify_seed_catalog(filtered, targets) == evidence["filtered_catalog"], "Resume filtered seed catalog drift")
         require(targets.keys() == evidence["targets"].keys(), "Resume seed target inventory drift")
         for i, r in targets.items():
             expected = evidence["targets"][i]
             require(expected == {"source_sha256": digest(r["source"]), "target_sha256": digest(r["translation"]),
                                  "provider": r["provider_used"], "status": r["status"]}, "Resume seed target provenance drift")
-        require(verify_seed_catalog(catalog, targets) == evidence["catalog"], "Resume seed catalog drift")
         providers = seed_database_evidence(snapshot, {"antigravity", "google", PROVIDER, FALLBACK_TEST_PROVIDER})
-        require({r["provider_used"] for r in targets.values()} <= providers, "Resume seed run attribution drift")
+        require(all(r["provider_used"] in providers or (r["provider_used"] == "glossary"
+                    and glossary_exact(source_settings, "english.db", r)) for r in complete.values()),
+                "Resume seed run attribution drift")
 
     def change_phase(self, phase):
         self.manifest["phase"] = phase
@@ -1499,6 +1699,9 @@ class Pipeline:
             self.verify_seed_resume(candidate)
             self.settings = expected_settings
             require(candidate["databases"] == self.checkpoints(), "Resume database hashes/inventory drift")
+            for path in (self.en, self.es):
+                if path.exists():
+                    self.verify_glossary(path)
             require(not self.es.exists() or candidate["phase"] in {"spanish-pending", "spanish-ready"}, "Ambiguous pivot; " + RECOVERY)
             # Invalid data is never assigned to the live manifest or republished.
             self.manifest = candidate
@@ -1535,6 +1738,7 @@ class Pipeline:
                         and "locust_injection_source" not in value["metadata"] for value in rows), "Fresh extraction is not pristine pending")
             self.manifest["japanese_inventory"] = inventory(rows, self.work, self.options.format)
             self.change_phase("english-pending")
+            self.install_glossary(self.en)
 
     def execute(self):
         self.initialize()
@@ -1559,6 +1763,7 @@ class Pipeline:
             require(all(value["translation"] is None and value["status"] == "pending" and value["provider_used"] is None for value in rows), "Pivot is not a fresh semantic project")
             self.manifest["spanish_inventory"] = spanish_inventory
             self.change_phase("spanish-pending")
+            self.install_glossary(self.es)
         require(self.manifest.get("spanish_inventory") == spanish_inventory, "Pivot provenance drift")
         gate_rows(self.db_rows(self.es), spanish_inventory, self.work, self.options.format)
         if self.manifest["phase"] == "spanish-pending":
@@ -1686,6 +1891,7 @@ def main(argv=None):
     parser.add_argument("--format", required=True, choices=("renpy", "rpgmaker-mv", "kirikiri"))
     parser.add_argument("--provider", required=True, choices=("google", "antigravity"))
     parser.add_argument("--fallback-provider", choices=("google",), help="Explicit pending-only Google fallback after orderly Antigravity success")
+    parser.add_argument("--glossary-json", help="Optional closed phase-local JSON glossary; case-insensitive visible text only")
     parser.add_argument("--english-seed", help="Fresh-run-only closed owned English DB; copy/export/import verified ready targets")
     parser.add_argument("--test-fallback-endpoint", help="Test-only separate literal-loopback fallback route; requires scripted primary and explicit Google fallback")
     parser.add_argument("--test-endpoint", help="Dummy-key OpenAI-compatible literal-loopback HTTP endpoint only")

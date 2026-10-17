@@ -51,6 +51,67 @@ class PipelineCase(unittest.TestCase):
         return pipeline.Options(**values)
 
 
+class GlossaryRules(PipelineCase):
+    def glossary(self, value=None):
+        path = self.root / "terms.json"
+        path.write_text(json.dumps(value if value is not None else {
+            "version": 1, "ja-en": [{"term": "こんにちは", "translation": "Hello"}],
+            "en-es": [{"term": "Hello", "translation": "Hola"}]}), encoding="utf-8")
+        return path
+
+    def test_closed_public_input_rejects_before_output_or_child(self):
+        valid = {"version": 1, "ja-en": [], "en-es": []}
+        invalid = ["[]", '{"version":1,"version":1,"ja-en":[],"en-es":[]}',
+                   json.dumps(dict(valid, unknown=True)), json.dumps(dict(valid, version=True)),
+                   json.dumps(dict(valid, **{"ja-en": {}}))]
+        for entry in ({"term": " ", "translation": "Hello"},
+                      {"term": "Hi", "translation": ""},
+                      {"term": 1, "translation": "Hello"},
+                      {"term": "Hi", "translation": "Hola", "case_sensitive": True},
+                      {"term": "Hi", "translation": "Bad\\\\C[2]"},
+                      {"term": " Hi", "translation": "Hello"}):
+            invalid.append(json.dumps(dict(valid, **{"ja-en": [entry]})))
+        invalid.append(json.dumps(dict(valid, **{"en-es": [
+            {"term": "Hello", "translation": "Hola"}, {"term": "HELLO", "translation": "Otro"}]})))
+        path = self.glossary(valid)
+        for text in invalid:
+            with self.subTest(text=text):
+                path.write_text(text, encoding="utf-8")
+                before = pipeline.scan(self.game)
+                stdout, stderr = StringIO(), StringIO()
+                args = ["--cli", str(self.cli), "--game", str(self.game), "--output", str(self.root / "run"),
+                        "--format", "renpy", "--provider", "google", "--glossary-json", str(path)]
+                with patch("sys.stdout", stdout), patch("sys.stderr", stderr), patch.object(pipeline.subprocess, "run") as child:
+                    self.assertEqual(pipeline.main(args), 1)
+                self.assertEqual(stderr.getvalue(), "")
+                result = json.loads(stdout.getvalue())
+                self.assertEqual(set(result), {"status", "diagnostic"})
+                self.assertEqual(result["status"], "failed")
+                self.assertIn(result["diagnostic"], {
+                    "Malformed/unknown resume manifest fields", "Duplicate JSON key", "Unsupported glossary version",
+                    "Glossary phase must be an array of at most 200 terms", "Duplicate/ambiguous glossary term",
+                    "Glossary requires bounded plain visible text without controls or edge whitespace"})
+                self.assertEqual(stdout.getvalue(), json.dumps(result, sort_keys=True) + "\n")
+                self.assertEqual(path.read_text(encoding="utf-8"), text)
+                self.assertEqual(pipeline.scan(self.game), before)
+                self.assertFalse((self.root / "run").exists())
+                child.assert_not_called()
+
+    def test_canonical_policy_content_not_filename_or_array_order(self):
+        path = self.glossary({"version": 1, "ja-en": [
+            {"term": "進む", "translation": "Proceed"}, {"term": "こんにちは", "translation": "Hello"}], "en-es": []})
+        first = pipeline.Pipeline(self.options(glossary_json=str(path)))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["ja-en"].reverse()
+        alias = self.root / "same-terms.json"
+        alias.write_text(json.dumps(value, indent=2), encoding="utf-8")
+        second = pipeline.Pipeline(self.options(glossary_json=str(alias)))
+        self.assertEqual(first.settings, second.settings)
+        self.assertIn("glossary", first.settings)
+        self.assertNotIn("glossary_json", first.settings)
+        self.assertNotIn("glossary", pipeline.Pipeline(self.options()).settings)
+
+
 class SafetyTests(PipelineCase):
     def test_overlap_both_directions_and_occupied_root(self):
         for output in (self.game, self.game / "nested", self.root):
@@ -282,6 +343,16 @@ class MockCli:
         self.timeout_stage = None
         self.inject_called_after_marker = False
 
+    def database(self, path):
+        # Metadata-only SQLite fixture for the independent glossary reader.
+        # Resource/translation rows remain virtual; Python never seeds them.
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("CREATE TABLE glossary (term TEXT, translation TEXT, lang_pair TEXT, context TEXT, case_sensitive INTEGER)")
+            connection.commit()
+        finally:
+            connection.close()
+
     def read(self, path):
         return copy.deepcopy(self.rows[Path(path)]), {"extraction_warnings": [], "game_root": str(self.case.root / "run/work-game")}
 
@@ -298,7 +369,7 @@ class MockCli:
         stdout, returncode = b"", 0
         if args[0] == "extract":
             db = Path(args[-1])
-            db.write_bytes(b"virtual database, not sqlite")
+            self.database(db)
             self.rows[db] = [row(Path(args[1]), translation=None, status="pending", provider_used=None, translated_at=None)]
         elif args[0] == "translate":
             db = Path(args[1])
@@ -314,7 +385,7 @@ class MockCli:
         elif args[0] == "pivot":
             source, target = Path(args[1]), Path(args[3])
             self.rows[target] = copy.deepcopy(self.rows[source])
-            target.write_bytes(b"virtual pivot")
+            self.database(target)
             for value in self.rows[target]:
                 value["metadata"]["locust_injection_source"] = value["source"]
                 value.update(source=value["translation"], translation=None, status="pending", provider_used=None, translated_at=None)
@@ -323,6 +394,129 @@ class MockCli:
             self.inject_called_after_marker = manifest["injection_started"] is True
             returncode = 1
         return subprocess.CompletedProcess(argv, returncode, stdout, b"do not log source/credentials")
+
+
+class GlossaryOrchestration(GlossaryRules):
+    def session(self, options, fault=None):
+        cli = MockCli(self)
+        cli.missing = False
+        glossaries = {}
+        actual = cli.run
+        def run(argv, **kwargs):
+            args = argv[3:]
+            result = actual(argv, **kwargs)
+            if args[0] in {"extract", "pivot"}:
+                glossaries[Path(args[-1] if args[0] == "extract" else args[3])] = []
+            if args[:2] == ["glossary", "add"]:
+                entry = tuple(a.split("=", 1)[1] for a in args if a.startswith(("--term=", "--translation=")))
+                glossaries[Path(args[2])].append((*entry, args[-1], None, 0))
+                glossaries[Path(args[2])].sort()
+                if fault == "wrong-case":
+                    value = glossaries[Path(args[2])][-1]
+                    glossaries[Path(args[2])][-1] = (*value[:-1], 1)
+            if args[0] == "translate":
+                db = Path(args[1])
+                for r in cli.rows[db]:
+                    if r["source"] == ("こんにちは" if db.name == "english.db" else "Hello"):
+                        r["provider_used"] = "glossary"
+                        if fault == "unbound-target":
+                            r["translation"] = "Unexpected"
+            return result
+        cli.glossary_run = run
+        return cli, glossaries, patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(
+            pipeline, "read_glossary", side_effect=lambda path: list(glossaries[Path(path)])), patch.object(
+            pipeline.subprocess, "run", side_effect=run)
+
+    def test_phase_isolation_and_exact_glossary_provider_proofs(self):
+        path = self.glossary()
+        options = self.options(glossary_json=str(path))
+        cli, glossaries, reader, glossary_reader, runner = self.session(options)
+        with reader, glossary_reader, runner:
+            with self.assertRaisesRegex(pipeline.PipelineError, "inject-spanish"):
+                pipeline.Pipeline(options).run()
+        self.assertEqual(glossaries[self.root / "run/english.db"], [("こんにちは", "Hello", "ja-en", None, 0)])
+        self.assertEqual(glossaries[self.root / "run/spanish.db"], [("Hello", "Hola", "en-es", None, 0)])
+        manifest = pipeline.read_json_file(self.root / "run/pipeline-manifest.json")
+        for database in ("english.db", "spanish.db"):
+            self.assertEqual({v["provider"] for v in manifest["accepted_rows"][database].values()}, {"glossary"})
+        self.assertTrue(all("policy_sha256" in stage for stage in manifest["stages"]))
+        self.assertEqual(sum(c[:2] == ["glossary", "add"] for c in cli.calls), 2)
+
+    def test_wrong_db_case_policy_and_forged_glossary_attribution_refuse(self):
+        original_root = self.root
+        for fault, message in (("wrong-case", "phase glossary drift"), ("unbound-target", "Unbound exact glossary")):
+            with self.subTest(fault=fault):
+                self.root = original_root / fault
+                self.root.mkdir()
+                options = self.options(glossary_json=str(self.glossary()))
+                cli, _, reader, glossary_reader, runner = self.session(options, fault)
+                with reader, glossary_reader, runner:
+                    with self.assertRaisesRegex(pipeline.PipelineError, message):
+                        pipeline.Pipeline(options).run()
+                self.assertFalse(any(c[0] == "pivot" for c in cli.calls))
+        self.root = original_root
+
+    def test_absent_glossary_still_requires_independent_empty_db_table(self):
+        cli = MockCli(self)
+        options = self.options()
+        with patch.object(pipeline, "read_database", side_effect=cli.read), patch.object(pipeline.subprocess, "run", side_effect=cli.run):
+            with self.assertRaisesRegex(pipeline.PipelineError, "Missing/blank/pending"):
+                pipeline.Pipeline(options).run()
+            before = pipeline.scan(self.root / "run")
+            with patch.object(pipeline, "read_glossary", return_value=[("Unexpected", "Otro", "en-es", None, 0)]), patch.object(pipeline.subprocess, "run") as child:
+                with self.assertRaisesRegex(pipeline.PipelineError, "phase glossary drift"):
+                    pipeline.Pipeline(replace(options, resume=True)).run()
+                child.assert_not_called()
+            self.assertEqual(pipeline.scan(self.root / "run"), before)
+
+    def test_coordinated_db_manifest_policy_forgery_refuses_without_publication(self):
+        options = self.options(glossary_json=str(self.glossary()))
+        cli, glossaries, reader, glossary_reader, runner = self.session(options)
+        # Leave a resumable pending checkpoint, with complete CLI glossary setup.
+        def pending(argv, **kwargs):
+            if argv[3] == "translate":
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            return cli.glossary_run(argv, **kwargs)
+        with reader, glossary_reader, patch.object(pipeline.subprocess, "run", side_effect=pending):
+            with self.assertRaisesRegex(pipeline.PipelineError, "Missing/blank/pending"):
+                pipeline.Pipeline(options).run()
+            path = self.root / "run/pipeline-manifest.json"
+            original = pipeline.read_json_file(path)
+            pipeline.validate_resume_manifest(original)
+            for fault in ("db-target", "db-case", "db-context", "db-pair", "db-extra", "db-missing", "policy", "stage", "config"):
+                changed = copy.deepcopy(original)
+                glossaries[self.root / "run/english.db"] = [("こんにちは", "Hello", "ja-en", None, 0)]
+                if fault.startswith("db-"):
+                    variants = {
+                        "db-target": [("こんにちは", "Untrusted", "ja-en", None, 0)],
+                        "db-case": [("こんにちは", "Hello", "ja-en", None, 1)],
+                        "db-context": [("こんにちは", "Hello", "ja-en", "unexpected", 0)],
+                        "db-pair": [("こんにちは", "Hello", "en-es", None, 0)],
+                        "db-extra": [("こんにちは", "Hello", "ja-en", None, 0), ("Other", "Otro", "en-es", None, 0)],
+                        "db-missing": [],
+                    }
+                    glossaries[self.root / "run/english.db"] = variants[fault]
+                    probe = pipeline.Pipeline(replace(options, resume=True))
+                    changed["databases"]["english.db"] = probe.snapshot(probe.en)
+                elif fault == "policy":
+                    changed["settings"]["glossary"]["ja-en"][0]["translation"] = "Untrusted"
+                    fingerprint = pipeline.policy_fingerprint(changed["settings"], pipeline.permitted_config(options))
+                    for stage in changed["stages"]:
+                        stage["policy_sha256"] = fingerprint
+                elif fault == "stage":
+                    changed["stages"][-1]["policy_sha256"] = "0" * 64
+                else:
+                    config = self.root / "run/profile/config.json"
+                    config.write_bytes(pipeline.encoded({"providers": {}, "unknown": True}))
+                    changed["config"] = pipeline.file_hash(config)
+                path.write_bytes(pipeline.encoded(changed))
+                before = pipeline.scan(self.root / "run")
+                with patch.object(pipeline.subprocess, "run") as child:
+                    with self.assertRaises(pipeline.PipelineError):
+                        pipeline.Pipeline(replace(options, resume=True)).run()
+                    child.assert_not_called()
+                self.assertEqual(pipeline.scan(self.root / "run"), before)
+                (self.root / "run/profile/config.json").write_bytes(pipeline.encoded(pipeline.permitted_config(options)))
 
 
 class FallbackTests(PipelineCase):
@@ -1260,6 +1454,111 @@ class ProductionTransportTests(unittest.TestCase):
         self.assertNotIn("こんにちは", report_text)
         self.assertFalse(summary["runtime_verified"])
 
+    def glossary_options(self, options, entries=None):
+        path = self.root / "terms.json"
+        policy = entries or {"version": 1, "ja-en": [
+            {"term": "錬金術師", "translation": "Alchemist"}, {"term": "旅人", "translation": "traveler"}],
+            "en-es": [{"term": "Alchemist", "translation": "Alquimista"}, {"term": "traveler", "translation": "viajero"}]}
+        path.write_text(json.dumps(policy, ensure_ascii=False), encoding="utf-8")
+        return replace(options, glossary_json=str(path))
+
+    def test_glossary_actual_cli_exact_partial_fallback_and_install(self):
+        options, primary, _, _ = self.scenario("renpy", "partial-both")
+        fallback = ScriptedEndpoint({})
+        self.addCleanup(fallback.close)
+        options = self.glossary_options(replace(options, provider="antigravity", fallback_provider="google",
+                                               test_fallback_endpoint=fallback.url))
+        ja = "こんにちは {PL_0} {PL_1}{G_0_0}{PL_2}！"
+        en = "Hello {PL_0} {PL_1}{G_0_0}{PL_2}!"
+        es = "Hola {PL_0} {PL_1}{G_0_0}{PL_2}!"
+        primary.answers.update({("ja", "en", ja): en, ("en", "es", en): es})
+        fallback.answers = dict(primary.answers)
+        input_hash = pipeline.file_hash(Path(options.glossary_json))
+        original = pipeline.scan(Path(options.game))
+        summary = pipeline.Pipeline(options).run()
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(pipeline.file_hash(Path(options.glossary_json)), input_hash)
+        self.assertEqual(pipeline.scan(Path(options.game)), original)
+        manifest = pipeline.read_json_file(Path(options.output) / "pipeline-manifest.json")
+        self.assertEqual(manifest["final_install"]["verification"], "strict")
+        self.assertTrue(manifest["rollback_verified"])
+        self.assertEqual(primary.errors + fallback.errors, [])
+        for database, pair in (("english.db", "ja-en"), ("spanish.db", "en-es")):
+            terms = pipeline.read_glossary(Path(options.output) / database)
+            self.assertEqual({v[2] for v in terms}, {pair})
+            accepted = manifest["accepted_rows"][database]
+            self.assertEqual({v["provider"] for v in accepted.values()},
+                             {"glossary", pipeline.PROVIDER, pipeline.FALLBACK_TEST_PROVIDER})
+        self.assertIn(("ja", "en", ja), fallback.requests)
+        self.assertIn(("en", "es", en), fallback.requests)
+        self.assertTrue(all("policy_sha256" in stage for stage in manifest["stages"]))
+
+    def test_glossary_seed_all_excluded_and_resume_rederives_empty_subset(self):
+        options, primary, seed, before, _, accepted = self.closed_seed()
+        policy = {"version": 1, "ja-en": [{"term": "錬金術師", "translation": "Scholar"}],
+                  "en-es": [{"term": "Scholar", "translation": "Erudito"}]}
+        fresh = self.glossary_options(replace(options, output=str(self.root / "fresh"), english_seed=str(seed)), policy)
+        with self.assertRaisesRegex(pipeline.PipelineError, "Missing/blank/pending"):
+            pipeline.Pipeline(fresh).run()
+        root = Path(fresh.output)
+        manifest_path = root / "pipeline-manifest.json"
+        manifest = pipeline.read_json_file(manifest_path)
+        pipeline.validate_resume_manifest(manifest)
+        self.assertTrue(accepted)
+        self.assertEqual(manifest["seed"]["targets"], {})
+        self.assertFalse(any(s["stage"] == "seed-import-english" for s in manifest["stages"]))
+        snapshot, _ = pipeline.read_database(root / "seed-snapshot.db")
+        complete = {r["id"]: r for r in snapshot if r["status"] in pipeline.READY}
+        pipeline.verify_seed_catalog(root / "seed-english.xliff", complete)
+        pipeline.verify_seed_catalog(root / "seed-english-filtered.xliff", {})
+        rows, _ = pipeline.read_database(root / "english.db")
+        self.assertTrue(any(r["translation"] == "Scholar" and r["provider_used"] == "glossary" for r in rows))
+        self.assertFalse(any(r["provider_used"] == "import" for r in rows))
+        # Forge a contradictory filtered unit AND its recorded hash. Resume
+        # derives the permitted subset independently, before acquiring a lock.
+        filtered = root / "seed-english-filtered.xliff"
+        original_bytes = filtered.read_bytes()
+        filtered.write_bytes((root / "seed-english.xliff").read_bytes())
+        forged = copy.deepcopy(manifest)
+        forged["seed"]["filtered_catalog"] = pipeline.file_hash(filtered)
+        manifest_path.write_bytes(pipeline.encoded(forged))
+        retained = pipeline.scan(root)
+        with patch.object(pipeline.subprocess, "run") as child:
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.Pipeline(replace(fresh, english_seed=None, resume=True)).run()
+            child.assert_not_called()
+        self.assertEqual(pipeline.scan(root), retained)
+        filtered.write_bytes(original_bytes)
+        manifest_path.write_bytes(pipeline.encoded(manifest))
+        primary.fault = None
+        summary = pipeline.Pipeline(replace(fresh, english_seed=None, resume=True)).run()
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(pipeline.file_hash(seed), before)
+        final = pipeline.read_json_file(manifest_path)
+        self.assertEqual(sum(s["stage"] == "seed-export-english" for s in final["stages"]), 1)
+        self.assertFalse(any(s["stage"] == "seed-import-english" for s in final["stages"]))
+        self.assertEqual(primary.errors, [])
+
+    def test_glossary_spanish_only_seed_uses_separate_complete_derived_catalog(self):
+        options, primary, seed, before, _, accepted = self.closed_seed()
+        primary.fault = None
+        fresh = self.glossary_options(replace(options, output=str(self.root / "fresh"), english_seed=str(seed)),
+                                     {"version": 1, "ja-en": [], "en-es": [{"term": "Alchemist", "translation": "Alquimista"}]})
+        actual, imports = subprocess.run, []
+        def run(argv, **kwargs):
+            if argv[3] == "import":
+                imports.append(argv[argv.index("-i") + 1])
+            return actual(argv, **kwargs)
+        with patch.object(pipeline.subprocess, "run", side_effect=run):
+            summary = pipeline.Pipeline(fresh).run()
+        self.assertEqual(summary["status"], "completed")
+        root = Path(fresh.output)
+        self.assertEqual(imports, [str(root / "seed-english-filtered.xliff")])
+        manifest = pipeline.read_json_file(root / "pipeline-manifest.json")
+        self.assertEqual(set(manifest["seed"]["targets"]), set(accepted))
+        self.assertEqual(pipeline.file_hash(seed), before)
+        self.assertEqual(primary.errors, [])
+
     def test_production_cli_layouts_use_immutable_ja_after_semantic_pivot(self):
         source = self.root / "source"
         answers, _, _ = fixture(source, "rpgmaker-mv", layouts=True)
@@ -1288,8 +1587,11 @@ class ProductionTransportTests(unittest.TestCase):
         self.assertEqual(summary["resources_verified"], 14)
         self.assertEqual(server.errors, [])
 
-    def closed_seed(self):
+    def closed_seed(self, glossary=False):
         options, primary, _, _ = self.scenario("renpy", "missing")
+        if glossary:
+            options = self.glossary_options(options, {"version": 1, "ja-en": [
+                {"term": "錬金術師", "translation": "Alchemist"}], "en-es": []})
         with self.assertRaises(pipeline.PipelineError):
             pipeline.Pipeline(options).run()
         seed = Path(options.output) / "english.db"
@@ -1305,6 +1607,26 @@ class ProductionTransportTests(unittest.TestCase):
         self.assertEqual(closed.returncode, 0)
         self.assertEqual(pipeline.file_hash(seed), before)
         return options, primary, seed, before, seed_rows, accepted
+
+    def test_glossary_seed_owner_exact_hit_provenance_survives_borrow_and_resume(self):
+        options, primary, seed, before, _, accepted = self.closed_seed(glossary=True)
+        # A new run without active terms can borrow the historical canonical
+        # targets; its original phase policy is retained as provenance, not
+        # current matching or config authority.
+        fresh = replace(options, output=str(self.root / "fresh"), glossary_json=None, english_seed=str(seed))
+        with self.assertRaisesRegex(pipeline.PipelineError, "Missing/blank/pending"):
+            pipeline.Pipeline(fresh).run()
+        root = Path(fresh.output)
+        manifest = pipeline.read_json_file(root / "pipeline-manifest.json")
+        pipeline.validate_resume_manifest(manifest)
+        self.assertIn("source_glossary", manifest["seed"])
+        self.assertEqual(set(manifest["seed"]["targets"]), set(accepted))
+        self.assertIn("glossary", {r["provider"] for r in manifest["seed"]["targets"].values()})
+        primary.fault = None
+        summary = pipeline.Pipeline(replace(fresh, english_seed=None, resume=True)).run()
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(pipeline.file_hash(seed), before)
+        self.assertEqual(primary.errors, [])
 
     def test_closed_partial_seed_actual_export_import_and_fallback_install(self):
         options, primary, seed, before, seed_rows, accepted = self.closed_seed()

@@ -1,4 +1,4 @@
-# Safe JA → EN → ES patch pipeline (PIPE-4E)
+# Safe JA → EN → ES patch pipeline (PIPE-4F2)
 
 `ja_en_es_pipeline.py` is a Python standard-library CLI orchestrator for an
 owner-authorized game. It never injects into the source folder. A successful run
@@ -57,6 +57,62 @@ is not an executable or network sandbox. **Untrusted resume data cannot grant
 new executable or network destinations**: config is reconstructed from the
 validated current invocation, not authorized by a manifest hash.
 
+## Optional phase-local glossary
+
+Add `--glossary-json /absolute/owned-input/terms.json` to a fresh invocation, or
+repeat it on resume. Omit it to keep the existing no-glossary behavior. This is
+a closed JSON **data** interface, not a provider/config override:
+
+```json
+{
+  "version": 1,
+  "ja-en": [{"term": "錬金術師", "translation": "Alchemist"}],
+  "en-es": [{"term": "Alchemist", "translation": "Alquimista"}]
+}
+```
+
+Both phase arrays and integer `version: 1` are required; empty arrays are valid.
+Each entry has exactly `term` and `translation`. The policy deliberately supports
+only the existing CLI's **case-insensitive**, context-free default; case/context
+fields, other language pairs and unknown fields refuse. Text must be nonblank,
+without edge whitespace, at most 500 Unicode characters, and contain no ASCII
+controls/DEL, surrogate characters, backslash or `{ } [ ] < >` syntax. Each phase
+allows at most 200 entries. Duplicate JSON keys, wrong types (including boolean
+versions), and duplicate case-fold-equivalent terms refuse before output creation
+or any child. Conflicting aliases are rejected even if their translations agree.
+The interface is intentionally narrower than the core's glossary API.
+
+| Boundary | Enforced contract |
+| --- | --- |
+| Input | Plain single-link JSON outside the output; never rewritten, byte-hashed and rechecked during the run |
+| Canonical settings | Exact term content, sorted by source term within each phase; filename, JSON formatting and array order are not resume authority |
+| Installation | `glossary add` through the production CLI only; no SQL writes or target replacement |
+| Phase isolation | EN DB contains only JA→EN terms; fresh ES pivot contains only EN→ES terms; other pairs, context, case flags, extra/missing terms refuse |
+| Attribution | Exact full-source shortcuts may retain production `provider_used=glossary`; other accepted rows retain their dispatched primary/fallback provider |
+| Stage binding | Every glossary-enabled stage binds canonical policy **and** reconstructed provider config with `policy_sha256`; ordered, indexed successful CLI-add stages are required |
+| Resume | Reconstruct settings/config from the current invocation, independently read the complete owned DB glossary tables, and verify logical/physical snapshots before any lock/publication/child |
+
+Primary and fallback consume the **same installed phase glossary** and keep memory
+disabled. Core owns visible-span matching, Unicode word boundaries,
+leftmost-longest overlap, protected controls and speaker syntax. The wrapper does
+not imitate that matcher with substring tests. It checks only canonical exact
+whole-source hits for `glossary` attribution; partial-span results remain bound
+to their successful provider stage. There is no Python text repair, accent
+stripping or target find/replace. Missing/malformed controls still fail the
+existing production validation and artifact gates.
+
+The generated provider config stays unchanged: terms live in phase databases,
+not an invented Locust config key. The joint stage fingerprint binds that exact
+permitted config to the canonical glossary. Changing DB entries, config and
+recorded manifest hashes together cannot authorize a policy different from the
+current invocation. Without a glossary option, independently checked DB glossary
+tables must be empty. An incomplete glossary installation is conservatively
+nonresumable; retain it and use a fresh root.
+
+**Privacy:** canonical terms and targets are now present in manifest settings.
+Treat the manifest as private game-text data alongside DBs and catalogs. Only
+sanitized diagnostics and hashes of child stdout/stderr appear in public output.
+
 ## Ownership, isolation and safety
 
 The fresh output root contains:
@@ -68,7 +124,8 @@ The fresh output root contains:
 | `install-game/` | Owned strict patch installation; Spanish-labelled when completed |
 | `proof-game/` | Resource-only post-injection copy for independent re-extraction |
 | `english.db`, `spanish.db` | CLI-generated Japanese-source EN project and semantic EN-source ES pivot |
-| `seed-snapshot.db`, `seed-english.xliff` | Optional exclusive seed copy and hash/ID/source/target-verified CLI catalog |
+| `seed-snapshot.db`, `seed-english.xliff` | Optional exclusive seed copy and complete hash/ID/source/target-verified CLI export |
+| `seed-english-filtered.xliff` | Glossary-enabled seed's separate verified import subset; original export is never edited |
 | `work-proof.db`, `install-proof.db`, `final-install-proof.db` | Separate re-extraction evidence; never semantic pivots |
 | `spanish-patch.zip` | Verified patch artifact |
 | `profile/`, `backups/`, `temp/` | Operation-local Locust profile, backups and temporary files |
@@ -365,6 +422,36 @@ controls in that fresh DB, and the wrapper proves exactly the verified targets
 were filled, other pending rows remained unchanged, and fresh JA physical metadata
 and immutable timestamps survived. No Python SQL translation writes occur.
 
+### Glossary-safe seed subsets
+
+With a glossary option, the CLI first exports the **complete** ready seed into
+`seed-english.xliff`, which is verified against all original snapshot targets.
+Only then does Python create a separate `seed-english-filtered.xliff`, dropping
+whole units without changing source or target text. Its exact unique IDs,
+source/target values, subset and hash are checked before CLI import. The original
+seed DB, snapshot rows and complete export are never rewritten to repair terms.
+
+The conservative v1 filter excludes **all ready seed rows whenever JA→EN has any
+terms**. Core's control-aware matcher has no public applicability oracle, so all
+those rows are treated as potentially conflicting rather than approximating
+matching in Python. This sacrifices seed reuse, including apparently unrelated
+rows, but never imports a contradictory seed target. With only EN→ES terms (or
+explicit empty arrays), the separate subset retains all verified ready targets;
+English imports cannot bypass the later Spanish phase glossary.
+
+An empty subset is valid evidence, **not an import**: no import child, no
+`seed-import-english` stage, no invented imported rows, and no partial-validation
+claim are recorded. Every fresh English row remains pending for normal production
+translation, which may itself resolve exact glossary hits without a provider call.
+Complete-export and filtered-export fingerprints, the closed filter-policy name,
+and exactly the imported target bindings are recorded. On resume the wrapper
+rederives the subset from the complete retained snapshot and current canonical
+policy, verifies both catalogs and original provider provenance, and never
+reopens/reexports the external seed. A forged subset plus a forged matching hash
+still refuses before any child or publication. Historical glossary-enabled seed
+owners retain their independently verified source policy and exact-hit provenance;
+that policy is data only and never installed as the new phase's policy.
+
 Imported rows retain the CLI's `provider_used=import` / translated status (not
 an invented Google/Antigravity or review attribution). `seed.targets` separately
 records original provider/status and hash/ID-bound source/target provenance;
@@ -384,7 +471,9 @@ any resumed child, the entire pre-injection manifest is checked against a closed
 schema: exact required/optional keys at every level, typed status/phase/run ID,
 canonical resource identities, SHA-256/size and DB row counts, and an ordered
 known-stage graph with typed exit codes/durations and classified validation
-counts. Unknown fields (including premature installation proofs), malformed
+counts. Glossary-enabled runs additionally require canonical policy and typed
+policy/config stage fingerprints, exact CLI-add ordering, and independently
+verified phase DB glossary tables. Unknown fields (including premature installation proofs), malformed
 histories and all nonresumable states refuse without republishing the input.
 Only the known pending-only retry paths are allowed; extraction/pivot cannot
 repeat. This is structural/drift validation, not manifest authentication.
@@ -475,6 +564,14 @@ recording/language evidence, forged catalogs and invented ready controls. Actual
 CLI export/import (no SQL translation seeding), legacy seed-data-only authority,
 owned-snapshot-only inspection, seed before/after hashes, seeded resume and
 loopback pending completion all reach strict Spanish patch/install/rollback.
+PIPE-4F2 tests cover closed public JSON rejection before output/child, canonical
+content equivalence, phase isolation, exact glossary-hit attribution, production
+partial-span masking with primary/fallback, and strict final artifact/install
+proof. Coordinated glossary target/case/context/pair/missing/extra mutations,
+policy/config/stage forgery, all-excluded seed catalogs and forged subset hashes
+refuse. Production CLI checks cover separate complete derived imports, empty
+subset non-imports, source-glossary seed provenance and pre-injection resume.
+No live provider request or game runtime is needed for these checks.
 PIPE-4E neutral literal fixtures additionally cover single-line message wrapping,
 provider line breaks, name-box spacing/embedded color controls, source lists and
 blank lines, profiles/descriptions, CRLF, Unicode scalar/word boundaries,
