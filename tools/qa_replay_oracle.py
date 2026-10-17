@@ -6,6 +6,7 @@ file. All other fixture resources retain their extraction identity. This is an
 oracle for these fixtures, not a universal engine identity migration algorithm.
 """
 from collections import defaultdict
+from html import entities, unescape
 import re
 
 
@@ -34,7 +35,10 @@ def slots(engine, entries, root):
             identifier = identifier[len(prefix) + 1:]
         if engine == "html-game":
             metadata = entry["metadata"]
-            ordered[(path, "html")].append((metadata["html_start"], metadata["html_kind"], entry))
+            start, kind = metadata.get("html_start"), metadata.get("html_kind")
+            if type(start) is not int or start < 0 or not _html_kind(kind):
+                raise AssertionError("invalid HTML structural slot")
+            ordered[(path, "html")].append((start, kind, entry))
             continue
         command = re.fullmatch(r"(.*)#cmd_(\d+)#(.*)", identifier) if engine == "rpgmaker-mv" else None
         if command:
@@ -55,6 +59,72 @@ def slots(engine, entries, root):
                 raise AssertionError(f"duplicate normalized resource: {key}")
             result[key] = entry
     return result
+
+
+def _html_kind(kind):
+    return isinstance(kind, str) and (re.fullmatch(r"text:[a-z0-9:-]+", kind) is not None or kind in {
+        "attr:alt", "attr:title", "attr:placeholder", "attr:aria-label", "attr:label"})
+
+
+def html_slot(entry):
+    """Typed physical byte locator; pivot source is semantic, not writable bytes."""
+    metadata = entry["metadata"]
+    start, end, kind, raw = (metadata.get(key) for key in ("html_start", "html_end", "html_kind", "html_raw"))
+    if (type(start) is not int or type(end) is not int or not 0 <= start < end
+            or not isinstance(raw, str) or len(raw.encode("utf-8")) != end - start
+            or not _html_kind(kind)):
+        raise AssertionError("invalid HTML physical slot")
+    return start, end, kind, raw
+
+
+def _html_decode(raw, attribute):
+    # HTML5 longest named match, including the attribute-only ambiguous-ampersand
+    # rule. Numeric decoding retains scalars the Python document parser drops.
+    pattern = re.compile(r"&(?:#[xX][0-9a-fA-F]+;?|#[0-9]+;?|[a-zA-Z0-9]{1,32};?)")
+    def decode(match):
+        token = match[0][1:]
+        if token.startswith("#"):
+            digits = token[1:].rstrip(";")
+            number = int(digits[1:], 16) if digits.startswith(("x", "X")) else int(digits)
+            if number == 0 or number > 0x10ffff or 0xd800 <= number <= 0xdfff:
+                return "\ufffd"
+            return unescape("&#" + str(number) + ";") if 0x80 <= number <= 0x9f else chr(number)
+        for length in range(len(token), 0, -1):
+            name = token[:length]
+            if name in entities.html5:
+                following = raw[match.start() + 1 + length:match.start() + 2 + length]
+                if attribute and not name.endswith(";") and following and (following.isascii() and following.isalnum() or following == "="):
+                    return match[0]
+                return entities.html5[name] + token[length:]
+        return match[0]
+    return pattern.sub(decode, raw)
+
+
+def html_document(entries, original, translated=True):
+    """One exact UTF-8 writer result, spliced into immutable original bytes.
+
+    No HTML parsing/reserialization or observed-output normalization. The caller
+    proves complete extraction inventory separately; even whitespace outside its
+    selected ranges remains byte-exact. Unchanged targets preserve entity spelling.
+    """
+    patches, prior_end = [], 0
+    for entry in sorted(entries, key=lambda entry: html_slot(entry)[0]):
+        start, end, kind, raw = html_slot(entry)
+        physical = entry["metadata"].get("locust_injection_source", entry["source"])
+        if (start < prior_end or original[start:end] != raw.encode("utf-8")
+                or _html_decode(raw, kind.startswith("attr:")) != physical):
+            raise AssertionError("HTML physical source/range differs")
+        target = entry["translation"] if translated else physical
+        if not isinstance(target, str) or not target.strip():
+            raise AssertionError("invalid HTML target")
+        encoded = raw
+        if target != physical:
+            encoded = target.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            if kind.startswith("attr:"):
+                encoded = encoded.replace('"', "&quot;").replace("'", "&#39;")
+        patches.extend((original[prior_end:start], encoded.encode("utf-8")))
+        prior_end = end
+    return b"".join([*patches, original[prior_end:]])
 
 
 # Pure, bounded mirror of crates/formats/src/rpgmaker_mv.rs:

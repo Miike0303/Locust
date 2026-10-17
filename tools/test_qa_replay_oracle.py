@@ -1,4 +1,5 @@
 import unittest
+import qa_replay_oracle as oracle
 from qa_replay_oracle import assert_reextracted
 
 
@@ -92,6 +93,48 @@ class OracleTests(unittest.TestCase):
         extracted[1]["source"] = "Hola"
         with self.assertRaises(AssertionError):
             self.check(original, extracted, "html-game")
+
+    def test_html_slot_normalization_keeps_typed_offset_kind_and_duplicate_identity(self):
+        entries = [row("a#html:10", "Hola", "a.html", html_start=10, html_kind="text:p"),
+                   row("a#html:20", "Hola", "a.html", html_start=20, html_kind="text:p")]
+        shifted = [dict(r, metadata=dict(r["metadata"], html_start=100 + i * 100)) for i, r in enumerate(entries)]
+        self.assertEqual(self.check(entries, shifted, "html-game")["resources_verified"], 2)
+        for actual in (shifted[:1], shifted + shifted[:1],
+                       [shifted[0], dict(shifted[1], metadata={"html_start": 200, "html_kind": "attr:title"})]):
+            with self.subTest(actual=actual), self.assertRaises(AssertionError):
+                self.check(entries, actual, "html-game")
+        for start in (True, 1.0, -1, "10"):
+            with self.subTest(start=start), self.assertRaises(AssertionError):
+                self.check([dict(entries[0], metadata={"html_start": start, "html_kind": "text:p"})],
+                           [dict(entries[0], metadata={"html_start": start, "html_kind": "text:p"})], "html-game")
+
+    def test_html_byte_writer_preserves_every_unselected_byte(self):
+        original = b'<p onclick="keep()">  Stars &amp; light  </p><!--keep-->'
+        start = original.index(b'Stars')
+        entry = row("a.html#html:" + str(start), "Different English pivot", "a.html",
+                    html_start=start, html_end=start + len(b'Stars &amp; light'), html_kind="text:p",
+                    html_raw="Stars &amp; light", locust_injection_source="Stars & light")
+        entry["translation"] = 'Luz & "sol" <amigos>'
+        self.assertEqual(oracle.html_document([entry], original),
+                         b'<p onclick="keep()">  Luz &amp; "sol" &lt;amigos&gt;  </p><!--keep-->')
+        unchanged = dict(entry, translation="Stars & light")
+        self.assertEqual(oracle.html_document([unchanged], original), original)
+        for metadata in ({"html_start": True}, {"html_end": start + 1}, {"html_raw": "forged"},
+                         {"html_kind": "attr:onclick"}, {"locust_injection_source": "forged"}):
+            with self.subTest(metadata=metadata), self.assertRaises(AssertionError):
+                oracle.html_document([dict(entry, metadata=dict(entry["metadata"], **metadata))], original)
+        with self.assertRaises(AssertionError):
+            oracle.html_document([entry, entry], original)
+
+    def test_html_attribute_entities_quotes_and_unselected_bytes(self):
+        original = b"<input title='Use &ampere &copycat &amp= &#128; &amp; next' data-x='keep'>"
+        raw = original.split(b"'")[1]
+        start = original.index(raw)
+        entry = row("a.html#html:" + str(start), "Use &ampere &copycat &amp= € & next", "a.html",
+                    html_start=start, html_end=start + len(raw), html_kind="attr:title", html_raw=raw.decode())
+        entry["translation"] = 'Luz & "sol" \'amigos\''
+        self.assertEqual(oracle.html_document([entry], original),
+                         b"<input title='Luz &amp; &quot;sol&quot; &#39;amigos&#39;' data-x='keep'>")
 
     def test_rpg_growth_changes_offsets_but_not_dialogue_identity(self):
         original = [layout_row("msg", "森へ進む", LAYOUT_CASES[0][3]), row("Map#event_1#page_0#cmd_2#msg", "Goodbye")]

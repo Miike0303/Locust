@@ -1,4 +1,4 @@
-# Safe JA → EN → ES patch pipeline (PIPE-4F2)
+# Safe JA → EN → ES patch pipeline
 
 `ja_en_es_pipeline.py` is a Python standard-library CLI orchestrator for an
 owner-authorized game. It never injects into the source folder. A successful run
@@ -28,7 +28,8 @@ python tools/ja_en_es_pipeline.py `
 ```
 
 The same flags work on POSIX with an absolute executable path. Supported formats
-are `renpy`, `rpgmaker-mv`, and `kirikiri`. Providers are `google` (free) and
+are `renpy`, `rpgmaker-mv`, `kirikiri`, and `html-game` (generic HTML,
+Experimental). Providers are `google` (free) and
 `antigravity` (the existing logged-in `agy` executable on PATH). There is no
 API-key argument, paid-provider option, implicit fallback, or login operation.
 `--fallback-provider google` is optional and valid **only** with primary
@@ -338,6 +339,43 @@ migration, language correction or saved-row repair is performed. Consequently a
 historical full-size dataset may still refuse for pre-existing malformed rows;
 matching its writer layout alone is not a release.
 
+### Generic HTML: exact bytes plus ordered slots
+
+Use `--format html-game` for the existing generic HTML plugin, not the separate
+SugarCube engine. Its UTF-8 `.html`/`.htm` extractor selects visible text and
+quoted `alt`, `title`, `placeholder`, `aria-label`, and `label` values; adjacent
+inline markup is a separate slot. Script/style/comment/template/SVG and other
+suppressed content, unquoted attributes and nontranslatable values are not new
+translation targets. Discovery depth, skipped directories, SugarCube exclusions
+and text filtering remain the plugin's existing bounded behavior. Successful
+proof covers **all extracted slots**, not every possible visible runtime string.
+
+| Proof | HTML contract |
+| --- | --- |
+| Physical provenance | Typed UTF-8 start/end ranges, exact raw bytes, decoded original source, ID/file/offset agreement, kind-derived tags/context; pivot retains immutable Japanese ranges and source |
+| Re-extraction identity | Shared `qa_replay_oracle.slots`: relative file plus ordinal in `(html_start, html_kind)` order; no matching by text or absolute offsets after length changes |
+| Exact text | Every extracted Spanish source equals its literal saved target; duplicate texts remain separate, attribute/text kinds cannot interchange, tags/context must match their kinds |
+| Full bytes | Independent `html_document` splices one precisely encoded target per original selected range; every gap and every other resource must remain byte-exact before packaging |
+| Resume | Physical ranges/raw source and static inventories checked against pristine before acquiring a lock, publication or any resumed child; existing stage/provider/config/glossary proofs remain mandatory |
+
+The byte oracle mirrors only the known writer's escaping (`&`, `<`, `>`, plus
+both quote characters for attributes). HTML5 entities are decoded for original
+provenance, never globally normalized; unchanged targets preserve the original
+entity spelling. No document reserialization, whitespace folding, target repair,
+source relocation outside these ordered slots or plugin/core change is involved.
+Strict installed-file hashes carry the byte proof through apply, rollback and
+final reapply; fresh extraction separately proves complete slot/target identity.
+The accepted extraction inventory and manifest remain drift evidence, not
+cryptographic authentication against an actor rewriting an entire owned run.
+
+**HTML English seeds remain conservatively refused:** the plugin embeds its
+absolute physical file path in row IDs. Existing seed proofs remap only the
+known `file_path` root, never IDs or catalogs. A different owned run therefore
+fails locator/inventory checks before seed export/import. This slice does not
+weaken that proof or invent a new ID/catalog migration. Fresh HTML runs, phase
+local glossaries, explicit pending-only fallback and pre-injection resume work
+without seeds. Existing three-format seed behavior is unchanged.
+
 **Known conservative KiriKiri refusal:** a modified loose file containing both
 changed and unchanged rows currently omits an unchanged row from CLI written/
 skipped counters. This pipeline refuses that incomplete report even if text
@@ -572,6 +610,17 @@ policy/config/stage forgery, all-excluded seed catalogs and forged subset hashes
 refuse. Production CLI checks cover separate complete derived imports, empty
 subset non-imports, source-glossary seed provenance and pre-injection resume.
 No live provider request or game runtime is needed for these checks.
+H1 HTML tests additionally cover actual dummy-key loopback JA→EN→ES, unequal
+UTF-8 lengths, duplicate texts, entities in attributes versus text, immutable
+Japanese pivot provenance, phase-local glossary/fallback and EN-/ES-pending
+resume. Full public-interface failures assert exit code, structured stdout,
+empty stderr, retained failed state and unchanged originals/install copies.
+Truthfully recorded faulty-writer bytes (scripts, handlers, comments, attributes,
+embedded data, binary resources, whitespace gaps and wrong targets) cannot be
+packaged. Missing/duplicate/wrong-kind/wrong-target re-extraction, coordinated
+locator/raw-byte forgery, copy drift and root-dependent seeds refuse. The shared
+oracle also rejects boolean/float/negative/string HTML offsets and overlapping
+ranges. No live provider request or original game is used.
 PIPE-4E neutral literal fixtures additionally cover single-line message wrapping,
 provider line breaks, name-box spacing/embedded color controls, source lists and
 blank lines, profiles/descriptions, CRLF, Unicode scalar/word boundaries,

@@ -1326,6 +1326,22 @@ def fixture(root, engine, mixed_kirikiri=False, layouts=False):
                             f'    e "{duplicate[0]}"', '    menu:', f'        "{next_line[0]}":', '            jump next',
                             f'        "{back[0]}":', '            return', 'label next:', '    return', ''])
         files = {"game/script.rpy": script.encode()}
+    elif engine == "html-game":
+        control = ("こんにちは {player} ようこそ旅人！", "Hello {player} welcome traveler!", "Hola {player} bienvenido viajero!")
+        masked = tuple(part.replace("{player}", "{PL_0}") for part in control)
+        entity = ('星 & 光 © "明るい"', 'Stars & light © "bright"', 'Luz & estrellas © "brillantes"')
+        lines.append(entity)
+        document = '''<!doctype html>\r\n<html lang="ja"><head><title>錬金術師</title>
+<script>const untouched = "日本語のコード &amp;";</script><style>.keep { color: red; }</style></head>
+<body data-label="翻訳しない" onclick="keep('日本語')"><!-- 日本語のコメント -->
+<p>  こんにちは  </p><button onclick="continueGame()">こんにちは</button>
+<input placeholder="進む" aria-label="戻る" title='星 &amp; 光 &#169; &quot;明るい&quot;'>
+<p>こんにちは {player} ようこそ旅人！</p><span>Alice</span>
+<p>星 &amp; 光 &#169; &quot;明るい&quot;</p>
+<img src="data:image/png;base64,AAECAwQ=" data-note="日本語" alt="123">
+<template>翻訳しない</template><svg><text>翻訳しない</text></svg>
+</body></html>\r\n'''
+        files = {"index.html": document.encode()}
     elif engine == "rpgmaker-mv":
         control = (r"\n<錬金術師>こんにちは \V[1]！", r"\n<Alchemist>Hello \V[1]!", r"\n<Alquimista>Hola \V[1]!")
         masked = ("{PL_0}<錬金術師>こんにちは {PL_1}！", "{PL_0}<Alchemist>Hello {PL_1}!", "{PL_0}<Alquimista>Hola {PL_1}!")
@@ -1937,6 +1953,269 @@ class ProductionTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(pipeline.PipelineError, "bytes changed"):
                 pipeline.Pipeline(fresh).run()
         self.assertEqual(pipeline.file_hash(seed), before)
+
+    def html_public(self, options):
+        argv = []
+        for name, value in vars(options).items():
+            if value is not None and value is not False:
+                argv.append("--" + name.replace("_", "-"))
+                if value is not True:
+                    argv.append(str(value))
+        stdout, stderr = StringIO(), StringIO()
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            code = pipeline.main(argv)
+        return code, json.loads(stdout.getvalue()), stderr.getvalue()
+
+    def test_html_public_lifecycle_exact_bytes_and_ordinals(self):
+        options, server, files, _ = self.scenario("html-game")
+        code, result, stderr = self.html_public(options)
+        self.assertEqual((code, result["status"], stderr), (0, "completed", ""), result)
+        output = Path(options.output)
+        manifest = pipeline.read_json_file(output / "pipeline-manifest.json")
+        self.assertTrue(manifest["rollback_verified"])
+        self.assertEqual(manifest["final_install"]["verification"], "strict")
+        self.assertEqual(manifest["final_install"]["baseline"], "pristine")
+        self.assertEqual(sum(s["stage"] == "final-reapply" for s in manifest["stages"]), 1)
+        english, _ = pipeline.read_database(output / "english.db")
+        spanish, _ = pipeline.read_database(output / "spanish.db")
+        final, _ = pipeline.read_database(output / "final-install-proof.db")
+        self.assertEqual(len(spanish), 9)
+        self.assertEqual(result["resources_verified"], 9)
+        self.assertEqual(sum(r["translation"] == "Hola" for r in spanish), 2)
+        self.assertNotEqual([r["metadata"]["html_start"] for r in spanish], [r["metadata"]["html_start"] for r in final])
+        self.assertEqual({r["metadata"]["html_kind"] for r in spanish},
+                         {"text:title", "text:p", "text:button", "text:span", "attr:placeholder", "attr:aria-label", "attr:title"})
+        en = {r["id"]: r for r in english}
+        for r in spanish:
+            self.assertEqual(r["source"], en[r["id"]]["translation"])
+            self.assertEqual(r["metadata"]["locust_injection_source"], en[r["id"]]["source"])
+        expected = files["index.html"].decode().replace("錬金術師", "Alquimista").replace("こんにちは {player} ようこそ旅人！", "Hola {player} bienvenido viajero!")
+        expected = expected.replace("こんにちは", "Hola").replace('placeholder="進む"', 'placeholder="Continuar"').replace('aria-label="戻る"', 'aria-label="Volver"')
+        # Attribute quotes are encoded; the text slot retains literal quotes.
+        expected = expected.replace('星 &amp; 光 &#169; &quot;明るい&quot;', 'Luz &amp; estrellas © &quot;brillantes&quot;', 1)
+        expected = expected.replace('星 &amp; 光 &#169; &quot;明るい&quot;', 'Luz &amp; estrellas © "brillantes"')
+        for copy_name in ("work-game", "install-game"):
+            self.assertEqual((output / copy_name / "index.html").read_bytes(), expected.encode())
+            for path in ("assets/NON_TEXT_SENTINEL.png", ".locust-not-metadata.bin"):
+                self.assertEqual((output / copy_name / path).read_bytes(), files[path])
+        self.assertEqual(pipeline.scan(Path(options.game)), pipeline.scan(output / "pristine"))
+        self.assertEqual(server.errors, [])
+        self.assertFalse(result["runtime_verified"])
+
+    def test_html_glossary_pending_fallback_and_resume(self):
+        options, primary, _, _ = self.scenario("html-game", "partial-both")
+        fallback = ScriptedEndpoint({})
+        self.addCleanup(fallback.close)
+        options = self.glossary_options(replace(options, provider="antigravity", fallback_provider="google",
+                                               test_fallback_endpoint=fallback.url))
+        ja = "こんにちは {PL_0} ようこそ{G_0_0}！"
+        en = "Hello {PL_0} welcome {G_0_0}!"
+        es = "Hola {PL_0} bienvenido {G_0_0}!"
+        primary.answers.update({("ja", "en", ja): en, ("en", "es", en): es})
+        fallback.answers = dict(primary.answers)
+        # Orderly primary+fallback omission retains a complete, resumable JA DB.
+        fallback.fault = "partial-both"
+        code, result, stderr = self.html_public(options)
+        self.assertEqual((code, result, stderr), (1, {"status": "failed", "diagnostic": "Missing/blank/pending translation"}, ""))
+        output = Path(options.output)
+        pending = pipeline.read_json_file(output / "pipeline-manifest.json")
+        self.assertEqual(pending["phase"], "english-pending")
+        self.assertFalse(pending["injection_started"])
+        original = pipeline.scan(Path(options.game))
+        fallback.fault = None
+        before = len(primary.requests)
+        code, result, stderr = self.html_public(replace(options, resume=True))
+        self.assertEqual((code, result["status"], stderr), (0, "completed", ""), result)
+        self.assertTrue(all("{PL_0}" in key[2] for key in primary.requests[before:] if key[0] == "ja"))
+        self.assertEqual(primary.errors + fallback.errors, [])
+        self.assertEqual(pipeline.scan(Path(options.game)), original)
+        manifest = pipeline.read_json_file(output / "pipeline-manifest.json")
+        self.assertTrue(manifest["rollback_verified"])
+        for database in ("english.db", "spanish.db"):
+            self.assertEqual({proof["provider"] for proof in manifest["accepted_rows"][database].values()},
+                             {"glossary", pipeline.PROVIDER, pipeline.FALLBACK_TEST_PROVIDER})
+        self.assertEqual({v[2] for v in pipeline.read_glossary(output / "english.db")}, {"ja-en"})
+        self.assertEqual({v[2] for v in pipeline.read_glossary(output / "spanish.db")}, {"en-es"})
+
+    def test_html_spanish_control_refusal_and_pending_resume_keep_physical_ja(self):
+        options, server, _, _ = self.scenario("html-game", "placeholder")
+        original = pipeline.scan(Path(options.game))
+        code, result, stderr = self.html_public(options)
+        self.assertEqual((code, result, stderr), (1, {"status": "failed", "diagnostic": "Missing/blank/pending translation"}, ""))
+        output = Path(options.output)
+        manifest = pipeline.read_json_file(output / "pipeline-manifest.json")
+        self.assertEqual(manifest["phase"], "spanish-pending")
+        self.assertFalse(manifest["injection_started"])
+        self.assertFalse((output / "spanish-patch.zip").exists())
+        for name in ("pristine", "work-game", "install-game"):
+            self.assertEqual(pipeline.scan(output / name), original)
+        english = pipeline.read_database(output / "english.db")
+        accepted = manifest["accepted_rows"]["english.db"]
+        server.fault = None
+        code, result, stderr = self.html_public(replace(options, resume=True))
+        self.assertEqual((code, result["status"], stderr), (0, "completed", ""), result)
+        self.assertEqual(pipeline.read_database(output / "english.db"), english)
+        final = pipeline.read_json_file(output / "pipeline-manifest.json")
+        self.assertEqual(final["accepted_rows"]["english.db"], accepted)
+        self.assertEqual(sum(s["stage"] == "strict-pivot" for s in final["stages"]), 1)
+        self.assertEqual(pipeline.scan(Path(options.game)), original)
+        self.assertEqual(server.errors, [])
+
+    def test_html_reextraction_rejects_missing_swapped_kind_and_wrong_target(self):
+        base = self.root
+        read = pipeline.read_database
+        for fault, diagnostic in (("missing", "Reextraction resource identities differ"),
+                                  ("duplicate", "Duplicate resource identity"),
+                                  ("kind", "Reextraction resource identities differ"),
+                                  ("target", "HTML physical source/range differs")):
+            with self.subTest(fault=fault):
+                self.root = base / fault
+                self.root.mkdir()
+                options, _, _, _ = self.scenario("html-game")
+                output = Path(options.output)
+                def forged(path):
+                    rows, metadata = read(path)
+                    if path.name == "work-proof.db":
+                        rows = copy.deepcopy(rows)
+                        if fault == "missing":
+                            rows.pop()
+                        elif fault == "duplicate":
+                            rows.append(rows[0])
+                        elif fault == "kind":
+                            r = next(r for r in rows if r["metadata"]["html_kind"] == "text:p")
+                            r["metadata"]["html_kind"] = "attr:title"
+                            r["tags"] = ["html-attr"]
+                            r["context"] = "HTML attr:title (preserve variables; adjacent inline markup is separate)"
+                        else:
+                            rows[0]["source"] += "wrong"
+                    return rows, metadata
+                with patch.object(pipeline, "read_database", side_effect=forged):
+                    code, result, stderr = self.html_public(options)
+                self.assertEqual((code, result, stderr), (1, {"status": "failed", "diagnostic": diagnostic}, ""))
+                self.assertFalse((output / "spanish-patch.zip").exists())
+                self.assertEqual(pipeline.scan(Path(options.game)), pipeline.scan(output / "pristine"))
+                self.assertEqual(pipeline.scan(output / "install-game"), pipeline.scan(output / "pristine"))
+        self.root = base
+
+    def test_html_root_dependent_seed_ids_remain_conservatively_refused(self):
+        options, _, _, _ = self.scenario("html-game", "missing")
+        self.assertEqual(self.html_public(options)[0], 1)
+        output = Path(options.output)
+        seed = output / "english.db"
+        closed = subprocess.run([str(CLI), "--config", str(output / "profile/config.json"),
+                                 "export", str(seed), "-f", "xliff", "-l", "en", "-o", str(self.root / "owner-close.xliff")],
+                                env=pipeline.child_environment(output, options, subscription_login=False),
+                                cwd=output, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        self.assertEqual(closed.returncode, 0)
+        before, original = pipeline.scan(output), pipeline.scan(Path(options.game))
+        fresh = replace(options, output=str(self.root / "fresh"), english_seed=str(seed))
+        code, result, stderr = self.html_public(fresh)
+        self.assertEqual((code, result, stderr), (1, {"status": "failed", "diagnostic": "Malformed HTML locator/kind provenance"}, ""))
+        manifest = pipeline.read_json_file(Path(fresh.output) / "pipeline-manifest.json")
+        self.assertFalse(any(s["stage"].startswith("seed-") for s in manifest["stages"]))
+        self.assertFalse(manifest["injection_started"])
+        self.assertFalse(Path(fresh.output, "spanish-patch.zip").exists())
+        self.assertEqual(pipeline.scan(output), before)
+        self.assertEqual(pipeline.scan(Path(options.game)), original)
+
+    def test_html_coordinated_locator_forgery_refuses_before_any_write_or_child(self):
+        options, server, _, _ = self.scenario("html-game", "missing")
+        code, _, stderr = self.html_public(options)
+        self.assertEqual((code, stderr), (1, ""))
+        output = Path(options.output)
+        rows, _ = pipeline.read_database(output / "english.db")
+        pending = next(r for r in rows if r["status"] == "pending")
+        pending["metadata"]["html_raw"] = "x" * len(pending["metadata"]["html_raw"].encode())
+        connection = sqlite3.connect(output / "english.db")
+        try:
+            connection.execute("UPDATE strings SET metadata=? WHERE id=?", (json.dumps(pending["metadata"]), pending["id"]))
+            connection.commit()
+        finally:
+            connection.close()
+        manifest_path = output / "pipeline-manifest.json"
+        manifest = pipeline.read_json_file(manifest_path)
+        session = pipeline.Pipeline(replace(options, resume=True))
+        manifest["databases"] = session.checkpoints()
+        key = pipeline.encoded([pipeline.relative(pending["file_path"], session.work), pending["id"]]).decode()
+        manifest["japanese_inventory"][key] = pipeline.digest({field: pending[field] for field in pipeline.STATIC_FIELDS})
+        manifest_path.write_bytes(pipeline.encoded(manifest) + b"\n")
+        before = pipeline.scan(output)
+        original = pipeline.scan(Path(options.game))
+        with patch.object(pipeline.subprocess, "run") as child:
+            code, result, stderr = self.html_public(replace(options, resume=True))
+        self.assertEqual((code, result, stderr), (1, {"status": "failed", "diagnostic": "HTML physical source/range differs"}, ""))
+        child.assert_not_called()
+        self.assertEqual(pipeline.scan(output), before)
+        self.assertEqual(pipeline.scan(Path(options.game)), original)
+
+    def test_html_resume_rejects_copy_drift_without_mutation(self):
+        options, _, _, _ = self.scenario("html-game", "missing")
+        self.assertEqual(self.html_public(options)[0], 1)
+        output = Path(options.output)
+        path = output / "work-game/index.html"
+        path.write_bytes(path.read_bytes().replace(b"<!--", b"<!-- drift ", 1))
+        before, original = pipeline.scan(output), pipeline.scan(Path(options.game))
+        with patch.object(pipeline.subprocess, "run") as child:
+            code, result, stderr = self.html_public(replace(options, resume=True))
+        self.assertEqual((code, result, stderr), (1, {"status": "failed", "diagnostic": "Pre-injection copy drift"}, ""))
+        child.assert_not_called()
+        self.assertEqual(pipeline.scan(output), before)
+        self.assertEqual(pipeline.scan(Path(options.game)), original)
+
+    def test_html_full_byte_oracle_rejects_recorded_nontext_corruption(self):
+        base = self.root
+        real_run = subprocess.run
+        for label, before, after in (
+            ("script", b'const untouched', b'const changedXX'),
+            ("handler", b'continueGame()', b'differentRun()'),
+            ("comment", "日本語のコメント".encode(), b'changed comment'),
+            ("attribute", 'data-label="翻訳しない"'.encode(), b'data-label="changed"'),
+            ("embedded", b'base64,AAECAwQ=', b'base64,BAECAwQ='),
+            ("binary", b'KEEP', b'LOST'),
+            ("gap-whitespace", b'<p>  Hola  </p>', b'<p> Hola  </p>'),
+            ("target", b'Hola {player}', b'Adios {player}'),
+        ):
+            with self.subTest(label=label):
+                self.root = base / label
+                self.root.mkdir()
+                options, _, _, _ = self.scenario("html-game")
+                output = Path(options.output)
+                def run(argv, **kwargs):
+                    result = real_run(argv, **kwargs)
+                    if argv[3] == "inject" and "--help" not in argv:
+                        work = output / "work-game"
+                        target = work / (".locust-not-metadata.bin" if label == "binary" else "index.html")
+                        data = target.read_bytes()
+                        self.assertIn(before, data)
+                        target.write_bytes(data.replace(before, after, 1))
+                        # Model a faulty writer whose transaction truthfully
+                        # records its wrong bytes, not an unrecorded hash drift.
+                        active = pipeline.read_json_file(work / ".locust-injections/active.json")
+                        plan_path = work / ".locust-injections/operations" / active["transaction_id"] / "plan.json"
+                        plan = pipeline.read_json_file(plan_path)
+                        if label != "binary":
+                            for change in plan["files"]:
+                                if change["path"] == "index.html":
+                                    change["result"].update(pipeline.file_hash(target))
+                            plan_path.write_bytes(pipeline.encoded(plan))
+                    return result
+                with patch.object(pipeline.subprocess, "run", side_effect=run):
+                    code, result, stderr = self.html_public(options)
+                self.assertEqual((code, result, stderr), (1, {"status": "failed", "diagnostic": "HTML bytes outside selected targets or exact writer output differ"}, ""))
+                manifest = pipeline.read_json_file(output / "pipeline-manifest.json")
+                self.assertEqual(manifest["status"], "failed")
+                self.assertFalse(any(s["stage"] == "pack-spanish" for s in manifest["stages"]))
+                self.assertFalse((output / "spanish-patch.zip").exists())
+                self.assertEqual(pipeline.scan(Path(options.game)), pipeline.scan(output / "pristine"))
+                self.assertEqual(pipeline.scan(output / "install-game"), pipeline.scan(output / "pristine"))
+                retained = pipeline.scan(output)
+                with patch.object(pipeline.subprocess, "run") as child:
+                    resume_code, resume_result, resume_stderr = self.html_public(replace(options, resume=True))
+                self.assertEqual((resume_code, resume_stderr), (1, ""))
+                self.assertIn("Resume refused", resume_result["diagnostic"])
+                child.assert_not_called()
+                self.assertEqual(pipeline.scan(output), retained)
+        self.root = base
 
     def test_renpy_final_install_is_spanish(self):
         self.positive("renpy")

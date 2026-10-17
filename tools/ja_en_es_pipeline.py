@@ -25,7 +25,7 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 
-from qa_replay_oracle import expected_layout
+from qa_replay_oracle import expected_layout, html_document, html_slot, slots
 
 VERSION = 2
 OWNER = "locust-ja-en-es-pipeline"
@@ -309,7 +309,7 @@ def accepted_provider(settings, stage, provider):
 
 
 def preflight(options):
-    require(options.format in {"renpy", "rpgmaker-mv", "kirikiri"}, "Unsupported format")
+    require(options.format in {"renpy", "rpgmaker-mv", "kirikiri", "html-game"}, "Unsupported format")
     require(options.provider in {"google", "antigravity"}, "Unsupported provider")
     require(options.fallback_provider is None or
             (options.fallback_provider == "google" and options.provider == "antigravity"),
@@ -472,7 +472,7 @@ def validate_resume_manifest(value, seed_legacy=False):
         require(not (settings["fallback_provider"] and settings["test_endpoint"]) or
                 settings["test_fallback_endpoint"] is not None, "Missing resume test fallback")
     require(all(nonblank(settings[key]) for key in ("cli", "game", "output", "format", "provider"))
-            and settings["format"] in {"renpy", "rpgmaker-mv", "kirikiri"}
+            and settings["format"] in {"renpy", "rpgmaker-mv", "kirikiri", "html-game"}
             and settings["provider"] in {"google", "antigravity"}
             and (settings["test_endpoint"] is None or nonblank(settings["test_endpoint"]))
             and type(settings["batch_size"]) is int and 1 <= settings["batch_size"] <= 200
@@ -766,6 +766,16 @@ def inventory(rows, root, format_id):
         require(isinstance(value["tags"], list) and all(isinstance(tag, str) for tag in value["tags"]), "Malformed tags")
         metadata = value["metadata"]
         require(isinstance(metadata, dict) and all(isinstance(key, str) for key in metadata), "Malformed format metadata")
+        if format_id == "html-game":
+            try:
+                start, _, kind, _ = html_slot(value)
+            except (AssertionError, UnicodeError) as error:
+                raise PipelineError("Malformed HTML physical slot") from error
+            require(path.endswith((".html", ".htm"))
+                    and norm(value["id"]) == norm(value["file_path"]) + "#html:" + str(start)
+                    and value["tags"] == ["html-attr" if kind.startswith("attr:") else "html-text"]
+                    and value["context"] == f"HTML {kind} (preserve variables; adjacent inline markup is separate)",
+                    "Malformed HTML locator/kind provenance")
         if "format_id" in metadata:
             require(metadata["format_id"] == format_id, "Malformed/mismatched format metadata")
         else:
@@ -773,7 +783,7 @@ def inventory(rows, root, format_id):
             # Accept absence ONLY for their unambiguous physical locators.
             legacy = ((format_id == "renpy" and path.endswith(".rpy") and re.search(r"#\d+$", value["id"]))
                       or (format_id == "kirikiri" and path.endswith(".ks") and re.search(r"#kag:\d+(?::attr:\d+:[\w]+)?$", value["id"])))
-            require(legacy, "Missing recognized format provenance")
+            require(legacy or format_id == "html-game", "Missing recognized format provenance")
         require("locust_stale_translation" not in metadata, "Stale/malformed translation provenance")
         require(not any("warning" in key.lower() or key == "iostore_unread_containers" for key in metadata), "Unexpected row extraction warning metadata")
         if "locust_injection_source" in metadata:
@@ -996,6 +1006,14 @@ def tool_fingerprint():
 
 def resource_slots(rows, root, format_id):
     """Bounded qa_replay_oracle pattern, not a general identity migration."""
+    if format_id == "html-game":
+        try:
+            for value in rows:
+                relative(value["file_path"], root)
+                html_slot(value)
+            return slots(format_id, rows, root)
+        except (AssertionError, UnicodeError) as error:
+            raise PipelineError("Malformed/duplicate HTML structural slot") from error
     result, groups = {}, defaultdict(list)
     for value in rows:
         path = relative(value["file_path"], root)
@@ -1399,6 +1417,18 @@ class Pipeline:
         expected_root = root or self.work
         require(norm(metadata.get("game_root")) == norm(expected_root), "Database root provenance mismatch")
         inventory(rows, expected_root, self.options.format)
+        if self.options.format == "html-game":
+            # Semantic EN/ES databases keep JA physical ranges throughout pivot.
+            # Re-extraction databases instead describe their own current bytes.
+            physical_root = self.pristine if root is None else expected_root
+            groups = defaultdict(list)
+            for row in rows:
+                groups[relative(row["file_path"], expected_root)].append(row)
+            for rel, entries in groups.items():
+                try:
+                    html_document(entries, plain(physical_root / rel).read_bytes(), translated=False)
+                except (AssertionError, UnicodeError) as error:
+                    raise PipelineError("HTML physical source/range differs") from error
         return rows
 
     def verify_glossary(self, path, entries=None):
@@ -1699,6 +1729,10 @@ class Pipeline:
             self.verify_seed_resume(candidate)
             self.settings = expected_settings
             require(candidate["databases"] == self.checkpoints(), "Resume database hashes/inventory drift")
+            if self.options.format == "html-game":
+                for path, key in ((self.en, "japanese_inventory"), (self.es, "spanish_inventory")):
+                    if path.exists():
+                        gate_rows(self.db_rows(path), candidate[key], self.work, self.options.format)
             for path in (self.en, self.es):
                 if path.exists():
                     self.verify_glossary(path)
@@ -1779,6 +1813,8 @@ class Pipeline:
         report = self.command("inject-spanish", ["inject", self.work, "-P", self.es, "--direct", "-l", "es", "--json"], structured=True)
         notice, evidence = verify_injection_evidence(report, self.work, self.root / "backups", self.original, self.options.format)
         reported = gate_injection(report, spanish, self.work, self.root / "backups", informational_notice=notice)
+        if self.options.format == "html-game":
+            self.verify_html_bytes(spanish)
         self.manifest["injection"] = {"strings_written": report["strings_written"], "strings_skipped": report["strings_skipped"],
                                       "files_modified": report["files_modified"], "skip_reasons": report["reports"]["es"]["skip_reasons"],
                                       "outcome": "Recorded", "backup_id": report["backup_id"], **evidence}
@@ -1834,6 +1870,25 @@ class Pipeline:
                 "resources_verified": len(spanish), "rollback_verified": True,
                 "report": str(self.root / "pipeline-manifest.json"), "runtime_verified": False}
 
+    def verify_html_bytes(self, rows):
+        # Ordinals only identify extracted slots. Full byte replay independently
+        # pins every gap, handler, script, comment, attribute and binary resource.
+        wanted = dict(self.original["files"])
+        groups = defaultdict(list)
+        for row in rows:
+            groups[relative(row["file_path"], self.work)].append(row)
+        for rel, entries in groups.items():
+            try:
+                data = html_document(entries, plain(self.pristine / rel).read_bytes())
+            except (AssertionError, UnicodeError) as error:
+                raise PipelineError("HTML byte replay provenance differs") from error
+            wanted[rel] = {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+        tree = scan(self.work)
+        clean = {"files": {p: value for p, value in tree["files"].items() if p.split("/")[0] not in RESERVED},
+                 "directories": [p for p in tree["directories"] if p.split("/")[0] not in RESERVED]}
+        require(clean == {"files": wanted, "directories": self.original["directories"]},
+                "HTML bytes outside selected targets or exact writer output differ")
+
     def copy_proof(self, proof, inventory_value):
         proof.mkdir()
         for rel in inventory_value["directories"]:
@@ -1888,7 +1943,7 @@ def main(argv=None):
     parser.add_argument("--cli", required=True)
     parser.add_argument("--game", required=True)
     parser.add_argument("--output", required=True, help="Fresh, absent directory (or an owned pre-injection run with --resume)")
-    parser.add_argument("--format", required=True, choices=("renpy", "rpgmaker-mv", "kirikiri"))
+    parser.add_argument("--format", required=True, choices=("renpy", "rpgmaker-mv", "kirikiri", "html-game"))
     parser.add_argument("--provider", required=True, choices=("google", "antigravity"))
     parser.add_argument("--fallback-provider", choices=("google",), help="Explicit pending-only Google fallback after orderly Antigravity success")
     parser.add_argument("--glossary-json", help="Optional closed phase-local JSON glossary; case-insensitive visible text only")
