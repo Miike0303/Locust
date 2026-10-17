@@ -32,7 +32,7 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 
 ## In flight
 
-Other-engine continuation: HTML safe wrapper locally complete at `ee352ca`, not published; [owner/evidence](../odd/tasks/engine-pipeline-expansion.md). Parent wrapper83pass/1 Windows skip, oracle13pass and independent verification; no runtime/live-provider claim. RGSS next requires independent Marshal fixture-wire proof before wrapper admission, not a label-only expansion.
+Other-engine continuation: HTML safe wrapper locally complete at `ee352ca`, not published; [owner/evidence](../odd/tasks/engine-pipeline-expansion.md). Parent wrapper83pass/1 Windows skip, oracle13pass and independent verification; no runtime/live-provider claim. RGSS bounded independent Marshal fixture-wire proof is now local at `6d1e68f`: parent8pass, separate verifier; EN/ES full injected artifacts and ES patch/install/rollback/reapply only. Generic XP/VX/Ace wrapper still needs selected-alias/continuation/shrink/encoding proof or hard exclusions; no label-only admission.
 
 Local-only safe queue: `f4716c2` (phase glossaries/seed safety) and `df91f00` (YU-RIS encoding guidance), verified locally but **not published or delivered to main**. Owner evidence: [queue](../odd/tasks/autonomous-safe-queue.md), [pipeline](../odd/tasks/ja-en-es-pipeline.md), [native VN](../odd/tasks/native-japanese-vn.md). Wrapper75pass/1 Windows skip, oracle10; frontend554pass, TypeScript/build; independent verifiers passed. No live-provider or native/game/runtime acceptance. These local outcomes do not close malformed Lydia headers, structural Add confirmation or Unicode containment.
 
