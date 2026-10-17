@@ -3,12 +3,14 @@ import contextlib
 import io
 from pathlib import Path
 import unittest
+from unittest import mock
 import tempfile
 import json
 import hashlib
 import os
 import shutil
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 from ja_en_es_pipeline import read_database
@@ -141,11 +143,37 @@ class WireTests(unittest.TestCase):
             self.assertIn("error:", err.getvalue())
 
 
+def checkout_cli():
+    name = "locust.exe" if sys.platform == "win32" else "locust"
+    cli = Path(__file__).resolve().parents[1] / "target/debug" / name
+    if not cli.is_file():
+        if os.environ.get("CI"):
+            raise AssertionError("required CI CLI unavailable: " + str(cli))
+        raise unittest.SkipTest("existing checkout " + str(cli) + " unavailable; no build allowed")
+    return cli
+
+
+class CliSelectionTests(unittest.TestCase):
+    def test_platform_binary_in_normal_checkout_target(self):
+        root = Path(__file__).resolve().parents[1]
+        for platform, name in (("win32", "locust.exe"), ("linux", "locust"), ("darwin", "locust")):
+            with self.subTest(platform=platform), mock.patch("sys.platform", platform), \
+                    mock.patch.object(Path, "is_file", return_value=True):
+                self.assertEqual(checkout_cli(), root / "target/debug" / name)
+
+    def test_ci_missing_binary_fails_local_missing_explicitly_skips(self):
+        with mock.patch.object(Path, "is_file", return_value=False):
+            with mock.patch.dict(os.environ, {"CI": "true"}):
+                with self.assertRaisesRegex(AssertionError, "required CI CLI unavailable"):
+                    checkout_cli()
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(unittest.SkipTest, "existing checkout.*unavailable"):
+                    checkout_cli()
+
+
 class PublicCliTests(unittest.TestCase):
     def test_owned_public_lifecycle(self):
-        cli = q.BASE.parents[2] / "target/debug/locust.exe"
-        if not cli.is_file():
-            self.skipTest("existing checkout target/debug/locust.exe unavailable; no build allowed")
+        cli = checkout_cli()
         q.BASE.mkdir(parents=True, exist_ok=True)
         root = Path(tempfile.mkdtemp(dir=q.BASE, prefix="public-"))
         print("Retained public CLI evidence:", root)

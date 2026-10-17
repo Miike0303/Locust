@@ -19,26 +19,43 @@ The app checks this URL on launch (`UpdateChecker`). Tauri compares `latest.json
 
 On each `v*` tag (and `workflow_dispatch`), `.github/workflows/release.yml`:
 
-1. **Desktop job** — builds Windows / macOS (arm64 + x64) / Linux bundles with
-   `tauri-apps/tauri-action`, signs them with `TAURI_SIGNING_PRIVATE_KEY`, and
-   uploads the installers to the GitHub release.
+1. **Desktop job** — builds Windows (x64 + ARM64), macOS (arm64 + x64) and Linux
+   x64 bundles with `tauri-apps/tauri-action`. `bundle.createUpdaterArtifacts: true`
+   explicitly requests updater artifacts signed through the existing
+   `TAURI_SIGNING_PRIVATE_KEY` configuration, alongside the release installers.
 2. **CLI job** — builds and uploads `locust` binaries (not part of the updater
    manifest). See [USAGE.md](../USAGE.md#7-applying-a-patch).
 3. **`update-manifest` job** — runs `scripts/generate-updater-manifest.sh <tag>`.
-   The script uses `gh` + `curl` + `jq` to read that release's assets, fetch each
-   matching `.sig`, and write `latest.json`. It then `gh release upload … latest.json --clobber`.
+   The shell entrypoint delegates to Python 3 stdlib, using `gh` to read release
+   assets and `curl --fail --silent --show-error --location` to fetch signatures.
+   Python is explicitly provisioned in this job. After success the workflow runs
+   `gh release upload … latest.json --clobber`.
 
-The script maps assets as follows (first match wins):
+Each artifact must have its **own exact filename plus `.sig`**. Asset ordering
+never selects a signature, and duplicate names or multiple artifacts for a target
+are refused rather than guessed:
 
 | Updater platform key | Asset match |
 | -------------------- | ----------- |
-| `windows-x86_64`     | `*_x64_en-US.msi` + `.msi.sig` |
-| `darwin-aarch64`     | `aarch64*.app.tar.gz` + `.sig` |
-| `darwin-x86_64`      | `x64*.app.tar.gz` + `.sig` |
-| `linux-x86_64`       | `*_amd64.AppImage` + `.AppImage.sig` |
+| `windows-x86_64`     | `*_x64_en-US.msi` + exact `.sig` |
+| `windows-aarch64`    | `*_arm64_en-US.msi` (or `*_aarch64_en-US.msi`) + exact `.sig` |
+| `darwin-aarch64`     | `*_aarch64.app.tar.gz` + exact `.sig` |
+| `darwin-x86_64`      | `*_x64.app.tar.gz` + exact `.sig` |
+| `linux-x86_64`       | `*_amd64.AppImage` + exact `.sig` |
 
-Platforms that failed to upload are omitted; the job is `if: always()` so a
-single OS failure does not block a manifest for the rest.
+Platforms with no complete pair are omitted; the job is `if: always()` so a
+single OS failure does not block a manifest for the rest. **Zero complete pairs
+is a failure**, not an empty successful manifest. A manifest with fewer than five
+platforms is intentionally supported and is not proof of a complete release.
+
+HTTP/download failures, empty/HTML/invalid signatures and ambiguous metadata fail
+closed without retries. Signatures must be base64-encoded minisign documents
+with the expected four-line structure and packet lengths. This is a shape check,
+not cryptographic verification against the app's public key. All downloads and
+validation finish before atomic replacement of local `latest.json`; a refusal
+preserves the old file, leaves no scratch file and emits no manifest/raw network
+response. The repository is `GITHUB_REPOSITORY` (default `Miike0303/Locust`); no
+alternate endpoint or output destination is introduced.
 
 `tauri-action` is also invoked with `includeUpdaterJson: true`; the dedicated
 script is the source of truth because it overwrites `latest.json` on the release.
@@ -54,8 +71,12 @@ Tauri updater JSON (example — URLs and signatures come from the release assets
   "pub_date": "2026-08-14T00:00:00Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "<minisign from the .msi.sig asset>",
+      "signature": "<base64-encoded minisign document from this exact .msi.sig>",
       "url": "https://github.com/Miike0303/Locust/releases/download/v0.2.0/Project.Locust_0.2.0_x64_en-US.msi"
+    },
+    "windows-aarch64": {
+      "signature": "…",
+      "url": "https://github.com/Miike0303/Locust/releases/download/v0.2.0/Project.Locust_0.2.0_arm64_en-US.msi"
     },
     "darwin-aarch64": {
       "signature": "…",
@@ -84,9 +105,11 @@ running version is already current, the Tauri plugin simply does not prompt.
 **Tauri updater signatures** (minisign): configured. The public key lives in
 `tauri.conf.json` → `plugins.updater.pubkey`. The private key is the GitHub
 secret `TAURI_SIGNING_PRIVATE_KEY` (optional password:
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`). Generate a keypair with
-`cargo tauri signer generate` / `tauri signer generate` as described in
-[RELEASE.md](../RELEASE.md).
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`). Configuration alone does not prove that
+secrets are available or correspond to the configured public key. Inspect actual
+signed assets and verify key correspondence before claiming updater acceptance;
+ordinary release preparation must not read secrets or rotate keys. Follow the
+[release checklist](../RELEASE.md).
 
 **OS code-signing is not configured.** In `tauri.conf.json`:
 

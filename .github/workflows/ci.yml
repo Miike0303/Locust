@@ -68,6 +68,16 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python tools/test_qa_replay_oracle.py
 
+      - name: Python RGSS oracle tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python tools/test_qa_rgss_oracle.py
+
+      - name: Offline updater manifest tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python tools/test_updater_manifest.py
+
       # tauri-build reads tauri.conf.json > frontendDist (apps/desktop/dist),
       # so the frontend must be built before any cargo command touches the
       # desktop crate. This also type-checks the frontend (build runs tsc).
@@ -137,6 +147,16 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python tools/test_qa_replay_oracle.py
+
+      - name: Python RGSS oracle tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python tools/test_qa_rgss_oracle.py
+
+      - name: Offline updater manifest tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python tools/test_updater_manifest.py
 
       # tauri-build requires apps/desktop/dist before workspace Rust checks.
       - name: Build frontend

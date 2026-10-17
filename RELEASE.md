@@ -1,103 +1,87 @@
 # Releasing Project Locust
 
-This document describes how to cut a new release that users will receive via
-auto-update.
+Release only the exact candidate that passed Windows and Ubuntu CI. A successful
+manifest job is **not** proof that every desktop or CLI platform shipped.
 
-## One-time setup
+## Prerequisites
 
-### 1. Generate signing keys
+- Use the existing Node/Rust/Python toolchains and release workflow. Manifest
+  generation needs Python 3, `gh` and `curl`; no `jq` dependency is required.
+- Tauri `bundle.createUpdaterArtifacts` must be `true`. Updater signing uses the
+  existing `TAURI_SIGNING_PRIVATE_KEY` and optional
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` GitHub Actions secrets, with the public key
+  configured in `tauri.conf.json`. Do not print/read secrets or rotate keys as
+  part of an ordinary release. Missing signing configuration is a release issue,
+  not permission to publish unsigned updater bundles.
+- OS signing is separate: Apple notarization and Windows Authenticode signing
+  are not configured. Unknown-publisher warnings may still appear.
 
-Tauri updates must be cryptographically signed. Generate a keypair:
+## Candidate checklist
 
-```bash
-cd apps/desktop
-npm install -g @tauri-apps/cli
-tauri signer generate -w ~/.tauri/locust.key
-```
+- [ ] Synchronize the version in all release metadata:
+  - `Cargo.toml` → `[workspace.package].version`.
+  - `Cargo.lock` → the six inherited `locust-*` workspace packages only.
+  - `apps/desktop/package.json` → root version.
+  - `apps/desktop/package-lock.json` → root and `packages[""].version` only.
+  - `apps/desktop/src-tauri/tauri.conf.json` → root version.
+- [ ] Leave dependency requirements, resolved versions/checksums and the
+  independent plugin-example version unchanged. No install/update is needed for
+  a version-only lockfile edit.
+- [ ] Keep `CHANGELOG.md`'s Unreleased heading; add the dated release with honest
+  user-facing changes and unresolved support/verification limits. Exclude private
+  game contents, local game paths, credentials and internal raw logs.
+- [ ] Review the complete diff and stage **only explicitly reviewed paths**.
+  Keep unrelated work and private evidence out of the release commit.
+- [ ] Record the candidate commit SHA, publish the work branch non-forcibly and
+  manually run `.github/workflows/ci.yml` on that exact SHA/ref. Confirm both
+  `check` and `check-windows` succeeded and correspond to that SHA; cancellation,
+  old green runs and successful local tests are not substitutes.
 
-This outputs:
-- **Private key**: `~/.tauri/locust.key` (KEEP SECRET)
-- **Public key**: printed to stdout (copy it)
+## Delivery checklist
 
-### 2. Configure the public key in the app
+The release owner performs these steps after candidate verification:
 
-Edit `apps/desktop/src-tauri/tauri.conf.json` and paste the pubkey:
+1. Confirm remote `main` is an ancestor of the tested candidate. Advance `main`
+   by fast-forward only and push normally, without force. Stop on divergence.
+2. Confirm the intended version tag does not already exist remotely. Create and
+   push `v0.2.0` at the **same tested SHA**, never by moving an existing tag.
+3. Observe `.github/workflows/release.yml` for that tag/SHA:
+   - Desktop matrix: Windows x64/ARM64, macOS ARM64/x64, Linux x64.
+   - CLI matrix: Windows x64, macOS ARM64/x64, Linux x64.
+   - Updater manifest: runs after desktop jobs even if some failed; uploads only
+     when at least one complete, valid artifact/signature pair exists.
+4. Inspect the actual release body and assets, not just job summaries. Check
+   versions, expected installers/CLI binaries, exact `.sig` companions and
+   `latest.json` URLs/platform keys against the uploaded files. Ensure notes
+   describe actual support limits and any missing platforms honestly.
+5. Verify signatures against the configured public key using supported updater
+   tooling before claiming signing-key correspondence. Offline shape tests do
+   not prove cryptographic validity or that installed apps can update.
+6. Record source SHA, CI runs, release runs and observed assets separately. A
+   partial manifest may be useful, but never call it a complete five-platform
+   desktop/four-platform CLI release when required builds/assets are missing.
 
-```json
-"updater": {
-  "pubkey": "YOUR_PUBLIC_KEY_HERE",
-  ...
-}
-```
+## Updater contract
 
-Commit this.
-
-### 3. Store private key as GitHub secret
-
-In the GitHub repo settings → Secrets and variables → Actions, add:
-
-- `TAURI_SIGNING_PRIVATE_KEY` — contents of `~/.tauri/locust.key`
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — the password you set when generating the key (or empty)
-
-## Cutting a release
-
-1. Bump the version in:
-   - `apps/desktop/src-tauri/tauri.conf.json` (`"version"`)
-   - `Cargo.toml` (workspace `[workspace.package]` → `version`, if used)
-   - `apps/desktop/package.json`
-
-2. Commit and push:
-   ```bash
-   git add -A
-   git commit -m "Bump version to 0.2.0"
-   git push
-   ```
-
-3. Tag the release:
-   ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
-   ```
-
-4. GitHub Actions (`.github/workflows/release.yml`) will:
-   - Build the app for Windows, macOS (both arches), Linux
-   - Sign each bundle with your private key
-   - Upload bundles to a new GitHub release
-   - Generate `latest.json` with signatures and upload it to the release
-
-5. Users with the app will automatically see the update notification next time
-   they start the app.
-
-## Manual testing
-
-To test the updater locally without publishing:
-
-```bash
-cd apps/desktop
-npm run tauri dev
-```
-
-In-app, the UpdateChecker component runs a silent check on mount. The floating
-update notification appears in the bottom-right when a newer version is found
-on the configured endpoint.
-
-To force a check: use `triggerUpdateCheck()` from `components/UpdateChecker.tsx`.
-
-## Endpoint
-
-The updater checks:
+The endpoint remains:
 
 ```
 https://github.com/Miike0303/Locust/releases/latest/download/latest.json
 ```
 
-This URL always points to the latest released `latest.json`, which contains
-the signed URLs of the platform-specific bundles.
+`scripts/generate-updater-manifest.sh <tag>` writes `latest.json` in the current
+directory and prints that JSON on success. It uses `GITHUB_REPOSITORY`, defaulting
+to `Miike0303/Locust`. A refusal exits nonzero, prints a sanitized reason to
+stderr, prints no manifest to stdout and preserves an existing file. There are
+no automatic network retries. See [updater details](docs/update-server.md) for
+pairing rules and the intentionally partial-platform policy.
 
-## Rollback
+## Manual updater acceptance
 
-To roll back a bad release:
-
-1. Delete or mark as prerelease the bad GitHub release.
-2. The "latest" tag on GitHub will point to the previous stable release.
-3. Users who already updated must manually download the previous version.
+On an isolated supported installation of an older version, verify the launch
+check, download, signature verification and installation with the published
+assets. Record the platform and actual outcome; neither a headless frontend test
+nor a generated manifest establishes native updater acceptance. The current
+version should not prompt for an update to itself. Users already on a bad newer
+version may need to install an older known-good release manually; hiding a bad
+release does not downgrade installed applications.
