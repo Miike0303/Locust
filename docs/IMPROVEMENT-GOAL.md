@@ -32,7 +32,7 @@ Added by `/fleet-explore` 2026-09-25, ranked. Format: [category · area · size]
 
 ## In flight
 
-None.
+Local-only safe queue: `f4716c2` (phase glossaries/seed safety) and `df91f00` (YU-RIS encoding guidance), verified locally but **not published or delivered to main**. Owner evidence: [queue](../odd/tasks/autonomous-safe-queue.md), [pipeline](../odd/tasks/ja-en-es-pipeline.md), [native VN](../odd/tasks/native-japanese-vn.md). Wrapper75pass/1 Windows skip, oracle10; frontend554pass, TypeScript/build; independent verifiers passed. No live-provider or native/game/runtime acceptance. These local outcomes do not close malformed Lydia headers, structural Add confirmation or Unicode containment.
 
 ## Done
 
