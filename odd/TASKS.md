@@ -25,6 +25,8 @@ Reconciled 2026-10-16 from all 14 task ledgers (13 prior ledgers plus reconcilia
 
 ## Canonical remaining work
 
+- **Other engine pipelines:** [Engine pipeline expansion](tasks/engine-pipeline-expansion.md) owns the newly authorized continuation. HTML safe wrapper complete locally at ee352ca (wrapper83pass/1 Windows skip, oracle13pass, independent verifier); not published. RGSS next requires independent Marshal fixture-wire proof before admission. Other engine/runtime blockers keep their existing owners.
+
 - **Pipeline:** PIPE-4F2 local synthetic outcome is complete at f4716c2 under [the authorized safe queue](tasks/autonomous-safe-queue.md), Q1; no publication, real games or live-provider consumption/proof. PIPE-4G remains deferred/blocked in its owner ledger; VN-1 hands off by reference, not another inventory task.
 - **Spanish VN / Unicode:** VN-N3 owns the user outcome; UNI-S→UNI-2→UNI-3 owns the dependent safety/implementation proof. Neither ledger proves full Spanish/runtime completion.
 - **Installed resource policy:** REL-4 structural Add confirmation remains separate from successful Replace and Godot outcomes.
