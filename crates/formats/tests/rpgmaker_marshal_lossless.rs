@@ -97,7 +97,11 @@ impl Wire {
 
 fn roundtrip(bytes: &[u8]) {
     let parsed = MarshalValue::parse(bytes).expect("fixture must parse completely");
-    assert_eq!(parsed.serialize(), bytes, "Marshal wire data changed");
+    assert_eq!(
+        parsed.try_serialize().unwrap(),
+        bytes,
+        "Marshal wire data changed"
+    );
 }
 
 macro_rules! wire_test {
@@ -459,10 +463,10 @@ fn directory_roundtrip_probe() {
         total_bytes += bytes.len() as u64;
         match MarshalValue::parse(&bytes) {
             Ok(value) => {
-                if value.serialize() == bytes {
+                if value.try_serialize().unwrap() == bytes {
                     identical += 1;
                 } else {
-                    let output = value.serialize();
+                    let output = value.try_serialize().unwrap();
                     if different.len() < 3 {
                         let offset = bytes
                             .iter()

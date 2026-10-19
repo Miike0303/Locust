@@ -122,7 +122,7 @@ impl Fixture {
             .into_iter()
             .map(|(name, value)| {
                 let path = data.join(format!("{name}.{ext}"));
-                let bytes = value.serialize();
+                let bytes = value.try_serialize().unwrap();
                 fs::write(&path, &bytes).unwrap();
                 (path, bytes)
             })
@@ -349,7 +349,7 @@ fn direct_revision_reader_checks_consumed_original() {
     let path = f.files[0].0.clone();
     let reader = RevisionOriginal::capture(&path).unwrap();
     // Keep it valid Marshal so an implementation ignoring the reader succeeds.
-    fs::write(&path, V::Array(vec![V::Nil]).serialize()).unwrap();
+    fs::write(&path, V::Array(vec![V::Nil]).try_serialize().unwrap()).unwrap();
     let error = RpgMakerVxaPlugin::new()
         .inject_revision(&f.game, &mut f.rows, &HashMap::from([(path, reader)]))
         .unwrap_err()

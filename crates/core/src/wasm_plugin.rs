@@ -2,6 +2,14 @@
 //!
 //! Requires the `wasm-plugins` feature flag.
 
+#[cfg(any(feature = "wasm-plugins", test))]
+fn log_range(ptr: i32, len: i32, mem_len: usize) -> Option<std::ops::Range<usize>> {
+    let start = usize::try_from(ptr).ok()?;
+    let len = usize::try_from(len).ok()?;
+    let end = start.checked_add(len)?;
+    (end <= mem_len).then_some(start..end)
+}
+
 #[cfg(feature = "wasm-plugins")]
 mod inner {
     use std::path::{Path, PathBuf};
@@ -47,10 +55,8 @@ mod inner {
                             caller.get_export("memory").and_then(|e| e.into_memory())
                         {
                             let data = memory.data(&caller);
-                            let start = ptr as usize;
-                            let end = start + len as usize;
-                            if end <= data.len() {
-                                if let Ok(msg) = std::str::from_utf8(&data[start..end]) {
+                            if let Some(range) = super::log_range(ptr, len, data.len()) {
+                                if let Ok(msg) = std::str::from_utf8(&data[range]) {
                                     tracing::info!("[wasm-plugin] {}", msg);
                                 }
                             }
@@ -304,6 +310,39 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn wasm_log_range_rejects_negative_values() {
+        for (ptr, len) in [(-1, 1), (0, -1), (-1, -1), (1, -1)] {
+            assert_eq!(log_range(ptr, len, 16), None, "({ptr}, {len})");
+        }
+    }
+
+    #[test]
+    fn wasm_log_range_bounds_large_sums() {
+        assert_eq!(log_range(i32::MAX, i32::MAX, 16), None);
+        // The sum overflows i32 but fits usize, even on a 32-bit host.
+        let start = i32::MAX as usize;
+        assert_eq!(
+            log_range(i32::MAX, i32::MAX, usize::MAX),
+            Some(start..start * 2)
+        );
+    }
+
+    #[test]
+    fn wasm_log_range_rejects_out_of_bounds() {
+        for (ptr, len) in [(4, 13), (17, 0), (i32::MAX, 0)] {
+            assert_eq!(log_range(ptr, len, 16), None, "({ptr}, {len})");
+        }
+    }
+
+    #[test]
+    fn wasm_log_range_accepts_valid_and_empty_ranges() {
+        assert_eq!(log_range(2, 4, 16), Some(2..6));
+        assert_eq!(log_range(0, 16, 16), Some(0..16));
+        assert_eq!(log_range(16, 0, 16), Some(16..16));
+        assert_eq!(log_range(0, 0, 0), Some(0..0));
+    }
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::Builder::new()

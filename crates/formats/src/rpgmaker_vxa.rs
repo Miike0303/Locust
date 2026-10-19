@@ -207,11 +207,6 @@ impl MarshalValue {
         Ok(writer.buf)
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
-        self.try_serialize()
-            .expect("unrepresentable Ruby Marshal graph")
-    }
-
     fn children<'v>(&'v self, visit: &mut impl FnMut(&'v Self)) {
         match self {
             Self::Document { root, .. } => visit(root),
@@ -1788,7 +1783,7 @@ pub fn build_test_fixture() -> Vec<u8> {
             },
         },
     ]);
-    actors.serialize()
+    actors.try_serialize().unwrap()
 }
 
 #[cfg(test)]
@@ -1901,7 +1896,7 @@ mod tests {
                 m
             },
         };
-        fs::write(data_dir.join("Map001.rxdata"), map.serialize()).unwrap();
+        fs::write(data_dir.join("Map001.rxdata"), map.try_serialize().unwrap()).unwrap();
         dir_guard
     }
 
@@ -1977,7 +1972,7 @@ mod tests {
             MarshalValue::Str("alpha".to_string()),
             MarshalValue::Str("beta".to_string()),
         ]);
-        let bytes = arr.serialize();
+        let bytes = arr.try_serialize().unwrap();
         let parsed = MarshalValue::parse(&bytes).unwrap();
         let items = parsed.as_array().unwrap();
         assert_eq!(items.len(), 2);

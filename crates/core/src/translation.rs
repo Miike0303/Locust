@@ -944,7 +944,7 @@ impl RateLimiter {
     pub async fn acquire(&self) {
         loop {
             let should_wait = {
-                let mut requests = self.last_requests.lock().unwrap();
+                let mut requests = self.last_requests.lock().unwrap_or_else(|e| e.into_inner());
                 let now = tokio::time::Instant::now();
                 let window = Duration::from_secs(60);
 
@@ -1012,7 +1012,7 @@ pub fn requests_per_minute_for(provider_id: &str, extra: Option<&HashMap<String,
 pub fn rate_limiter_for(provider_id: &str) -> Arc<RateLimiter> {
     static LIMITERS: OnceLock<Mutex<HashMap<String, Arc<RateLimiter>>>> = OnceLock::new();
     let map = LIMITERS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap();
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
     guard
         .entry(provider_id.to_string())
         .or_insert_with(|| {
@@ -1610,7 +1610,7 @@ impl TranslationManager {
         let matcher = VisibleGlossary::compile(&glossary_entries, &lang_pair);
         let mut glossary_plans = HashMap::new();
         let mut eligible = Vec::with_capacity(translatable.len());
-        for entry in translatable {
+        'entries: for entry in translatable {
             if !glossary_entries.is_empty()
                 && !crate::textasset_group::is_grouped_entry(&entry)
                 && crate::validation::binary_slot_budget(&entry)?.is_none()
@@ -1628,9 +1628,18 @@ impl TranslationManager {
                                 )
                                 .2;
                             for (offset, token) in &mut nameboxes {
-                                *offset = source
-                                    .find(token.as_str())
-                                    .expect("control token preserved");
+                                let Some(position) = source.find(token.as_str()) else {
+                                    tracing::warn!(
+                                        entry_id = %entry.id,
+                                        "Control token missing after glossary masking; entry remains pending"
+                                    );
+                                    let _ = tx.send(ProgressEvent::BatchFailed {
+                                        entry_id: Some(entry.id.clone()),
+                                        error: "glossary masking lost a control token; entry remains pending".into(),
+                                    }).await;
+                                    continue 'entries;
+                                };
+                                *offset = position;
                             }
                             let recognized = if has_mv_mz_provenance(&entry) {
                                 nameboxes.as_slice()
@@ -3143,6 +3152,30 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn rate_limiter_acquire_recovers_poisoned_mutex() {
+        let limiter = Arc::new(RateLimiter::new(2));
+        limiter.acquire().await;
+        let poisoned = limiter.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.last_requests.lock().unwrap();
+            panic!("poison the request window");
+        })
+        .join()
+        .is_err());
+        assert!(limiter.last_requests.is_poisoned());
+
+        limiter.acquire().await;
+        assert_eq!(
+            limiter
+                .last_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn google_rate_limit_is_finite_and_local_is_unlimited() {
