@@ -11,7 +11,8 @@
   The checkout's target is deleted when it exceeds -RepoTargetCapGB (default 30 GB).
   Direct target-* folders with CACHEDIR.TAG are removed after -MinAgeHours; links
   are skipped. All cargo target cleanup is skipped while cargo or rustc is running.
-  Dry run by default; pass -Apply to delete. Always ends with `git worktree prune`.
+  Dry run by default; pass -Apply to delete. Ends with `git worktree prune --dry-run --verbose`
+  in preview mode, or `git worktree prune` with -Apply.
 
 .EXAMPLE
   powershell -NoProfile -File tools/cleanup-scratch.ps1            # report only
@@ -127,5 +128,12 @@ if (Get-Process -Name cargo, rustc -ErrorAction SilentlyContinue) {
     ForEach-Object { Remove-TestEntry $_ $repoPath -CargoTarget }
 }
 
-if (Test-Path -LiteralPath (Join-Path $Repo '.git')) { git -C $Repo worktree prune }
+if (Test-Path -LiteralPath (Join-Path $Repo '.git')) {
+  if ($Apply) {
+    git -C $Repo worktree prune
+  } else {
+    'preview: git worktree prune --dry-run --verbose'
+    git -C $Repo worktree prune --dry-run --verbose
+  }
+}
 "freed GB: $([math]::Round($freed, 2)) | free on C: $([math]::Round((Get-PSDrive C).Free / 1GB, 1)) GB"
