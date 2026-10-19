@@ -42,6 +42,7 @@ const ACTION_LABEL: Record<HotkeyActionId, MessageKey> = {
 	navReview: "hotkeys.navReview",
 	navMemory: "hotkeys.navMemory",
 	navSettings: "hotkeys.navSettings",
+	navDashboard: "hotkeys.navDashboard",
 };
 
 export default function HotkeyHelp({ open, onClose }: Props) {

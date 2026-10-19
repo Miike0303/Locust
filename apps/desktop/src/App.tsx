@@ -10,6 +10,7 @@ import { applyAppearance } from "./lib/appearance";
 import { useProjectStore } from "./stores/projectStore";
 
 const Welcome = lazy(() => import("./pages/Welcome"));
+const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Editor = lazy(() => import("./pages/Editor"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Review = lazy(() => import("./pages/Review"));
@@ -38,6 +39,7 @@ export default function App() {
       <Routes>
         <Route element={<Layout />}>
           <Route path="/" element={<Welcome />} />
+          <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/editor" element={<Editor />} />
           <Route path="/review" element={<Review />} />
           <Route path="/memory" element={<TranslationMemory />} />

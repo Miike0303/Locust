@@ -61,6 +61,7 @@ const wiredHelpActions = [
   "navReview",
   "navMemory",
   "navSettings",
+  "navDashboard",
 ].sort();
 
 assert.deepEqual(

@@ -27,6 +27,7 @@ export const HELP_ACTIONS: readonly string[] = [
   "navReview",
   "navMemory",
   "navSettings",
+  "navDashboard",
 ];
 
 export function isEditableKeyboardTarget(target: KeyboardTargetLike | null): boolean {

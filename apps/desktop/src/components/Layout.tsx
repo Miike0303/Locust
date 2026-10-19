@@ -2,6 +2,7 @@ import { Suspense, useState } from "react";
 import { Outlet, NavLink, useLocation } from "react-router-dom";
 import {
 	Home,
+	LayoutDashboard,
 	FileText,
 	Settings,
 	Github,
@@ -28,6 +29,7 @@ import { getConfig } from "../lib/api";
 
 const navItems = [
 	{ to: "/", icon: Home, labelKey: "nav.home", shortcut: "Alt+1" },
+	{ to: "/dashboard", icon: LayoutDashboard, labelKey: "nav.dashboard", shortcut: "Alt+6" },
 	{ to: "/editor", icon: FileText, labelKey: "nav.editor", shortcut: "Alt+2" },
 	{ to: "/review", icon: BookCheck, labelKey: "nav.review", shortcut: "Alt+3" },
 	{ to: "/memory", icon: Database, labelKey: "nav.memory", shortcut: "Alt+4" },

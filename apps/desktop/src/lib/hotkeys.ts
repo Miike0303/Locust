@@ -52,6 +52,7 @@ export const HOTKEY_MAP = {
   navReview:      { key: "3", alt: true, description: "Go to Review", group: "Navigation" },
   navMemory:      { key: "4", alt: true, description: "Go to Memory", group: "Navigation" },
   navSettings:    { key: "5", alt: true, description: "Go to Settings", group: "Navigation" },
+  navDashboard:   { key: "6", alt: true, description: "Go to Dashboard", group: "Navigation" },
 } as const satisfies Record<string, HotkeyBinding>;
 
 export type HotkeyActionId = keyof typeof HOTKEY_MAP;
@@ -164,6 +165,7 @@ export function useGlobalHotkeys(onShowHelp: () => void) {
   useHotkey("navReview", () => navigate("/review"));
   useHotkey("navMemory", () => navigate("/memory"));
   useHotkey("navSettings", () => navigate("/settings"));
+  useHotkey("navDashboard", () => navigate("/dashboard"));
   useHotkey("reviewMode", () => navigate("/review"));
   useHotkey("settings", () => navigate("/settings"));
   useHotkey("memory", () => navigate("/memory"));

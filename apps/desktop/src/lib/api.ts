@@ -169,6 +169,12 @@ export interface ProjectStats {
   total_cost_usd: number;
 }
 
+export interface FileStats {
+  file_path: string;
+  total: number; pending: number; translated: number;
+  reviewed: number; approved: number; error: number;
+}
+
 export interface GlossaryEntry {
   term: string; translation: string; lang_pair: string;
   context: string | null; case_sensitive: boolean;
@@ -538,6 +544,10 @@ export const batchPatchStrings = (
 
 export const getStats = (): Promise<ProjectStats> =>
   IS_TAURI ? tauriInvoke("get_stats") : request("/stats");
+
+/** No IPC command: use the embedded server, as run history and memory do. */
+export const getFileStats = (): Promise<FileStats[]> =>
+  request<{ files: FileStats[] }>("/stats/files").then(response => response.files);
 
 export const startTranslation = (params: TranslationStartParams): Promise<{ job_id: string }> =>
   IS_TAURI
