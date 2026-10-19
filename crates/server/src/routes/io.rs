@@ -1,4 +1,4 @@
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use locust_core::database::EntryFilter;
@@ -8,12 +8,69 @@ use locust_core::font_validation::{
     FONT_COVERAGE_LIMITATION,
 };
 use locust_core::models::StringEntry;
-use locust_core::validation::Validator;
+use locust_core::validation::{
+    ValidationIssueFilter, ValidationIssueUpdateError, ValidationIssuesPage, ValidationSummary,
+    Validator,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{err, run_owned_project_operation, try_project_operation, ApiError, AppState};
+
+pub(crate) async fn list_validation_issues(
+    State(state): State<Arc<AppState>>,
+    Query(filter): Query<ValidationIssueFilter>,
+) -> Result<Json<ValidationIssuesPage>, ApiError> {
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
+    state
+        .db
+        .list_validation_issues(&filter)
+        .map(Json)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+pub(crate) async fn validation_summary(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ValidationSummary>, ApiError> {
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
+    state
+        .db
+        .validation_summary()
+        .map(Json)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct IgnoreValidationIssueRequest {
+    ignored: bool,
+}
+
+pub(crate) async fn set_validation_issue_ignored(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<i64>,
+    Json(request): Json<IgnoreValidationIssueRequest>,
+) -> Result<StatusCode, ApiError> {
+    // Synchronous DB update: keep ownership until it returns.
+    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
+    state
+        .db
+        .set_validation_issue_ignored(id, request.ignored)
+        .map_err(|e| match e {
+            ValidationIssueUpdateError::NotFound => err(StatusCode::NOT_FOUND, e),
+            ValidationIssueUpdateError::Database(_) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 pub(crate) async fn validate(
     State(state): State<Arc<AppState>>,
@@ -254,7 +311,368 @@ async fn import_xliff_owned(
 mod tests {
     use super::*;
     use crate::routes::test_support::*;
+    use locust_core::models::{ValidationIssue, ValidationKind};
     use std::sync::atomic::Ordering;
+
+    fn qa_issue(entry_id: &str, kind: ValidationKind) -> ValidationIssue {
+        ValidationIssue {
+            entry_id: entry_id.into(),
+            kind,
+            message: "validation message".into(),
+            source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_dashboard_requires_an_open_project() {
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .save_validation_issues(&[qa_issue("leftover", ValidationKind::EmptyTranslation)])
+            .await
+            .unwrap();
+        for (method, path) in [
+            (reqwest::Method::GET, "/api/validation/issues"),
+            (reqwest::Method::GET, "/api/validation/summary"),
+            (reqwest::Method::PATCH, "/api/validation/issues/1"),
+        ] {
+            let response = client()
+                .request(method, format!("{url}{path}"))
+                .json(&serde_json::json!({ "ignored": true }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400, "{path}");
+            assert_eq!(response.text().await.unwrap(), "no project open");
+        }
+        let page = state
+            .db
+            .list_validation_issues(&Default::default())
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert!(!page.issues[0].ignored);
+    }
+
+    #[tokio::test]
+    async fn validation_dashboard_lists_filters_pages_and_joins_entries() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[translated("a", "Hello {0}", "data/a.json", "Hola")])
+            .unwrap();
+        state
+            .db
+            .save_validation_issues(&[
+                qa_issue(
+                    "a",
+                    ValidationKind::MissingPlaceholder {
+                        placeholder: "{0}".into(),
+                    },
+                ),
+                qa_issue(
+                    "orphan",
+                    ValidationKind::MissingPlaceholder {
+                        placeholder: "{1}".into(),
+                    },
+                ),
+                qa_issue("b", ValidationKind::EmptyTranslation),
+            ])
+            .await
+            .unwrap();
+        let response = client()
+            .get(format!(
+                "{url}/api/validation/issues?kind=MissingPlaceholder&limit=1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let first: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["limit"], 1);
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["issues"].as_array().unwrap().len(), 1);
+        assert_eq!(first["issues"][0]["kind"], "MissingPlaceholder");
+        assert_eq!(first["issues"][0]["source"], "Hello {0}");
+        assert_eq!(first["issues"][0]["translation"], "Hola");
+        assert_eq!(first["issues"][0]["file_path"], "data/a.json");
+        assert_eq!(first["issues"][0]["ignored"], false);
+        let second: serde_json::Value = client()
+            .get(format!(
+                "{url}/api/validation/issues?kind=MissingPlaceholder&limit=1&offset=1"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(second["total"], 2);
+        assert_eq!(second["offset"], 1);
+        assert_eq!(second["issues"][0]["entry_id"], "orphan");
+        assert!(second["issues"][0]["source"].is_null());
+        assert!(second["issues"][0]["translation"].is_null());
+        assert!(second["issues"][0]["file_path"].is_null());
+        let summary: serde_json::Value = client()
+            .get(format!("{url}/api/validation/summary"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            summary,
+            serde_json::json!({
+                "MissingPlaceholder": { "open": 2, "ignored": 0 },
+                "EmptyTranslation": { "open": 1, "ignored": 0 },
+            })
+        );
+        let unknown: ValidationIssuesPage = client()
+            .get(format!("{url}/api/validation/issues?kind=Unknown"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(unknown.total, 0);
+        assert!(unknown.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validation_dashboard_caps_pages_and_rejects_invalid_queries() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let issues: Vec<_> = (0..503)
+            .map(|i| qa_issue(&format!("e{i}"), ValidationKind::EmptyTranslation))
+            .collect();
+        state.db.save_validation_issues(&issues).await.unwrap();
+        let page: ValidationIssuesPage = client()
+            .get(format!("{url}/api/validation/issues?limit=9999"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page.limit, 500);
+        assert_eq!(page.issues.len(), 500);
+        assert_eq!(page.total, 503);
+        let past: ValidationIssuesPage = client()
+            .get(format!("{url}/api/validation/issues?offset=900"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(past.total, 503);
+        assert!(past.issues.is_empty());
+        for query in ["offset=-1", "limit=oops", "include_ignored=oops"] {
+            assert_eq!(
+                client()
+                    .get(format!("{url}/api/validation/issues?{query}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                400
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_dashboard_ignore_restore_survives_runs_and_removes_fixed_issues() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[translated("a", "Hello", "data/a.json", "Hello")])
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                client()
+                    .post(format!("{url}/api/validate"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        let page: ValidationIssuesPage = client()
+            .get(format!("{url}/api/validation/issues"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        let id = page.issues[0].id;
+        for ignored in [true, true, false, true] {
+            assert_eq!(
+                client()
+                    .patch(format!("{url}/api/validation/issues/{id}"))
+                    .json(&serde_json::json!({ "ignored": ignored }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                204
+            );
+            let open: ValidationIssuesPage = client()
+                .get(format!("{url}/api/validation/issues"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(open.total, usize::from(!ignored));
+            let all: ValidationIssuesPage = client()
+                .get(format!(
+                    "{url}/api/validation/issues?include_ignored=true&kind=IdenticalToSource"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(all.total, 1);
+            assert_eq!(all.issues[0].ignored, ignored);
+            let summary: serde_json::Value = client()
+                .get(format!("{url}/api/validation/summary"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(
+                summary["IdenticalToSource"],
+                serde_json::json!({ "open": usize::from(!ignored), "ignored": usize::from(ignored) })
+            );
+        }
+        assert_eq!(
+            client()
+                .post(format!("{url}/api/validate"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let all: ValidationIssuesPage = client()
+            .get(format!("{url}/api/validation/issues?include_ignored=true"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all.total, 1);
+        assert!(all.issues[0].ignored);
+        state
+            .db
+            .save_entries(&[translated("a", "Hello", "data/a.json", "Hola")])
+            .unwrap();
+        assert_eq!(
+            client()
+                .post(format!("{url}/api/validate"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let cleared: ValidationIssuesPage = client()
+            .get(format!("{url}/api/validation/issues?include_ignored=true"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cleared.total, 0);
+        assert!(cleared.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validation_dashboard_unknown_issue_returns_404_and_requires_boolean() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let response = client()
+            .patch(format!("{url}/api/validation/issues/999999"))
+            .json(&serde_json::json!({ "ignored": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+        assert_eq!(response.text().await.unwrap(), "validation issue not found");
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "ignored": "true" }),
+        ] {
+            assert_eq!(
+                client()
+                    .patch(format!("{url}/api/validation/issues/1"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                422
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_dashboard_refuses_project_conflicts_and_releases_guard() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        for translation in [false, true] {
+            let guard = if translation {
+                park_job(&state, "qa-job", crate::JobKind::Translate, None);
+                None
+            } else {
+                Some(crate::ProjectExclusiveGuard::enter(
+                    &state.project_exclusive,
+                ))
+            };
+            for (method, path) in [
+                (reqwest::Method::GET, "/api/validation/issues"),
+                (reqwest::Method::GET, "/api/validation/summary"),
+                (reqwest::Method::PATCH, "/api/validation/issues/1"),
+            ] {
+                assert_eq!(
+                    client()
+                        .request(method, format!("{url}{path}"))
+                        .json(&serde_json::json!({ "ignored": true }))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    409
+                );
+            }
+            drop(guard);
+            state.active_jobs.remove("qa-job");
+            assert_eq!(state.project_exclusive.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                client()
+                    .get(format!("{url}/api/validation/issues"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+    }
 
     #[tokio::test]
     async fn validation_requires_an_open_project() {

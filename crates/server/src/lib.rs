@@ -41,7 +41,10 @@ use routes::glossary_memory::{
 };
 use routes::inject::{inject, register_lang};
 pub use routes::io::audit_project_fonts;
-use routes::io::{export_po, export_xliff, import_po, import_xliff, validate};
+use routes::io::{
+    export_po, export_xliff, import_po, import_xliff, list_validation_issues,
+    set_validation_issue_ignored, validate, validation_summary,
+};
 use routes::patch::{
     patch_apply, patch_cancel, patch_identity, patch_pack, patch_recordings, patch_rollback,
     patch_status, patch_verify, patch_ws,
@@ -525,6 +528,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/patch/font", post(font_patch::generate))
         .route("/api/patch/recordings", get(patch_recordings))
         .route("/api/validate", post(validate))
+        .route("/api/validation/issues", get(list_validation_issues))
+        .route("/api/validation/summary", get(validation_summary))
+        .route(
+            "/api/validation/issues/:id",
+            axum::routing::patch(set_validation_issue_ignored),
+        )
         .route("/api/glossary", get(get_glossary).post(add_glossary))
         .route("/api/glossary/:term", delete(delete_glossary))
         .route("/api/export/po", get(export_po))

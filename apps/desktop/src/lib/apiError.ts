@@ -37,6 +37,7 @@ const EXACT: Record<string, MessageKey> = {
 	"no project open": "api.error.noProjectOpen",
 	"path not found": "api.error.pathNotFound",
 	"entry not found": "api.error.entryNotFound",
+	"validation issue not found": "qa.issueNotFound",
 	"job not found": "api.error.jobNotFound",
 	"provider not found": "api.error.providerNotFound",
 	"patch backup incomplete: no backup found — factory pristine is unrecoverable":

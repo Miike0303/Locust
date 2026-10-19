@@ -1,12 +1,70 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::database::Database;
 use crate::error::Result;
 use crate::models::{StringEntry, StringStatus, ValidationIssue, ValidationKind};
 
 pub struct Validator;
+
+/// Filters for persisted QA issues. `resolved` in SQLite means user-ignored.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct ValidationIssueFilter {
+    pub kind: Option<String>,
+    pub include_ignored: bool,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for ValidationIssueFilter {
+    fn default() -> Self {
+        Self {
+            kind: None,
+            include_ignored: false,
+            offset: 0,
+            limit: 50,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StoredValidationIssue {
+    pub id: i64,
+    pub entry_id: String,
+    /// The enum discriminant, shared by summary chips and kind filters.
+    pub kind: String,
+    pub message: String,
+    pub ignored: bool,
+    pub source: Option<String>,
+    pub translation: Option<String>,
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ValidationIssuesPage {
+    pub issues: Vec<StoredValidationIssue>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidationKindCounts {
+    pub open: usize,
+    pub ignored: usize,
+}
+
+pub type ValidationSummary = BTreeMap<String, ValidationKindCounts>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ValidationIssueUpdateError {
+    #[error("validation issue not found")]
+    NotFound,
+    #[error(transparent)]
+    Database(#[from] rusqlite::Error),
+}
 
 /// UTF-16 byte length of `text`, with no implicit BOM or terminator.
 pub fn utf16_byte_len(text: &str) -> usize {

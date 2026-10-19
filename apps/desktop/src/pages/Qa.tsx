@@ -1,0 +1,113 @@
+import { useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronLeft, ChevronRight, ShieldCheck } from "lucide-react";
+import { getValidationIssues, getValidationSummary, setValidationIssueIgnored, validate, type ProjectInfo } from "../lib/api";
+import { ApiError } from "../lib/apiError";
+import { useT } from "../lib/i18n";
+import { buildQaSummary, qaPagination, qaRelativePath, QA_PAGE_SIZE } from "../lib/qaDashboard";
+import { validationBadgeLabel } from "../lib/validationLabels";
+import { draftProjectKey } from "../stores/draftStore";
+import { useProjectStore } from "../stores/projectStore";
+import { useEditorStore } from "../stores/editorStore";
+import EmptyState from "../components/EmptyState";
+
+const ACTION = "inline-flex items-center justify-center gap-1 rounded-md bg-accent-muted px-3 py-2 text-body font-medium text-accent-fg hover:bg-accent-muted/80 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg";
+
+export default function Qa() {
+  const project = useProjectStore(s => s.project);
+  const projectKey = project ? draftProjectKey(project) : "";
+  return <ProjectQa key={projectKey} project={project} projectKey={projectKey} />;
+}
+
+function ProjectQa({ project, projectKey }: { project: ProjectInfo | null; projectKey: string }) {
+  const t = useT();
+  const navigate = useNavigate();
+  const qc = useQueryClient();
+  const startValidationWorklist = useEditorStore(s => s.startValidationWorklist);
+  const [kind, setKind] = useState<string | undefined>();
+  const [includeIgnored, setIncludeIgnored] = useState(false);
+  const [offset, setOffset] = useState(0);
+  const issuesQuery = useQuery({
+    queryKey: ["validation-issues", projectKey, kind, includeIgnored, offset],
+    queryFn: ({ signal }) => getValidationIssues({ kind, include_ignored: includeIgnored, offset, limit: QA_PAGE_SIZE }, signal),
+    enabled: !!project,
+    refetchOnMount: "always",
+  });
+  const summaryQuery = useQuery({
+    queryKey: ["validation-summary", projectKey],
+    queryFn: ({ signal }) => getValidationSummary(signal),
+    enabled: !!project,
+    refetchOnMount: "always",
+  });
+  const refresh = async () => {
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["validation-issues", projectKey] }),
+      qc.invalidateQueries({ queryKey: ["validation-summary", projectKey] }),
+    ]);
+  };
+  const run = useMutation({ mutationFn: validate, onSuccess: async () => { setOffset(0); await refresh(); } });
+  const ignore = useMutation({
+    mutationFn: ({ id, ignored }: { id: number; ignored: boolean }) => setValidationIssueIgnored(id, ignored),
+    onSuccess: refresh,
+  });
+  const data = issuesQuery.data;
+  const pagination = qaPagination(offset, data?.total ?? 0);
+  useEffect(() => {
+    if (data && !issuesQuery.isError) setOffset(qaPagination(offset, data.total).offset);
+  }, [data, offset, issuesQuery.isError]);
+
+  const queries = [issuesQuery, summaryQuery];
+  const noProject = !project || queries.some(q => q.error instanceof ApiError && q.error.key === "api.error.noProjectOpen");
+  const failed = queries.find(q => q.isError);
+  const actionError = run.error ?? ignore.error;
+  const busy = run.isPending || ignore.isPending;
+  const summary = buildQaSummary(summaryQuery.data ?? {}, kind);
+  const chipClass = (active: boolean) => `rounded-full border px-3 py-1 text-body focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg ${active ? "border-accent-fg bg-accent-muted text-accent-fg" : "border-border bg-surface text-text-muted hover:bg-surface-muted"}`;
+
+  return (
+    <div className="flex h-full flex-col bg-surface text-text">
+      <header className="space-y-4 border-b border-border px-6 py-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2"><ShieldCheck size={20} className="text-accent-fg" /><h1 className="text-page font-bold">{t("qa.title")}</h1></div>
+          <button type="button" className={ACTION} disabled={noProject || busy} onClick={() => { ignore.reset(); run.mutate(); }}>{t(run.isPending ? "qa.running" : "qa.run")}</button>
+        </div>
+        {!noProject && <div className="flex flex-wrap items-center gap-2" role="group" aria-label={t("qa.filterKind")}>
+          <button type="button" className={chipClass(kind === undefined)} aria-pressed={kind === undefined} onClick={() => { setKind(undefined); setOffset(0); }}>{t("qa.all")} ({summary.open})</button>
+          {summary.kinds.map(counts => <button key={counts.kind} type="button" className={chipClass(kind === counts.kind)} aria-pressed={kind === counts.kind} onClick={() => { setKind(counts.kind); setOffset(0); }}>{validationBadgeLabel(counts.kind, t)} ({counts.open})</button>)}
+          <label className="ml-2 inline-flex items-center gap-2 text-body"><input type="checkbox" checked={includeIgnored} onChange={e => { setIncludeIgnored(e.target.checked); setOffset(0); }} />{t("qa.showIgnored")}</label>
+        </div>}
+      </header>
+      {actionError && <div role="alert" className="px-6 py-3 text-body text-danger">{t("qa.actionError")} {actionError.message}</div>}
+      <div className="flex-1 overflow-auto">
+        {noProject ? <div className="flex flex-col items-center gap-3 p-6"><EmptyState title={t("qa.noProject.title")} description={t("qa.noProject.description")} /><Link to="/" className="text-body text-accent-fg underline">{t("qa.home")}</Link></div>
+          : failed ? <div role="alert" className="m-6 space-y-3 rounded-lg border border-border bg-surface p-4 text-center"><p className="text-danger">{t("qa.loadError")}</p><p className="text-body text-text-muted">{failed.error?.message}</p><button type="button" className={ACTION} onClick={() => { void refresh(); }}>{t("common.retry")}</button></div>
+          : queries.some(q => q.isPending) ? <p role="status" className="p-6 text-body text-text-muted">{t("common.loading")}</p>
+          : !data?.issues.length ? <EmptyState title={t(includeIgnored ? "qa.emptyAll" : "qa.empty")} description={t("qa.emptyDescription")} />
+          : <table className="w-full text-body">
+            <thead className="sticky top-0 border-b border-border bg-surface-muted"><tr className="text-left text-caption uppercase text-text-muted">
+              <th scope="col" className="px-4 py-2">{t("qa.col.kind")}</th><th scope="col" className="px-4 py-2">{t("qa.col.file")}</th><th scope="col" className="px-4 py-2">{t("qa.col.source")}</th><th scope="col" className="px-4 py-2">{t("qa.col.message")}</th><th scope="col" className="px-4 py-2">{t("qa.col.actions")}</th>
+            </tr></thead>
+            <tbody>{data.issues.map(issue => <tr key={issue.id} className="border-b border-border hover:bg-surface-muted">
+              <td className="px-4 py-2"><span className="rounded bg-accent-muted px-2 py-1 text-caption text-accent-fg">{validationBadgeLabel(issue.kind, t)}</span>{issue.ignored && <span className="ml-2 text-caption text-text-muted">{t("qa.ignored")}</span>}</td>
+              <td className="max-w-48 truncate px-4 py-2" title={issue.file_path ?? undefined}>{issue.file_path ? qaRelativePath(issue.file_path, project!.path) : t("qa.unavailable")}</td>
+              <td className="max-w-xs truncate px-4 py-2" title={issue.source ?? undefined}>{issue.source ?? t("qa.unavailable")}</td>
+              <td className="px-4 py-2">{issue.message}</td>
+              <td className="px-4 py-2"><div className="flex flex-wrap gap-2">
+                <button type="button" className={ACTION} disabled={issue.source === null} onClick={() => { startValidationWorklist([issue.entry_id]); navigate("/editor"); }}>{t("qa.openEditor")}</button>
+                <button type="button" className={ACTION} disabled={busy || issuesQuery.isFetching} onClick={() => { run.reset(); ignore.mutate({ id: issue.id, ignored: !issue.ignored }); }}>{t(issue.ignored ? "qa.restore" : "qa.ignore")}</button>
+              </div></td>
+            </tr>)}</tbody>
+          </table>}
+      </div>
+      {!noProject && !failed && data && pagination.pages > 1 && <div className="flex items-center justify-between border-t border-border bg-surface px-6 py-3">
+        <span className="text-body text-text-muted">{t("qa.showing", { from: pagination.from, to: pagination.to, total: data.total })}</span>
+        <div className="flex gap-2">
+          <button type="button" className={ACTION} disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - QA_PAGE_SIZE))}><ChevronLeft size={14} />{t("common.prev")}</button>
+          <span className="px-3 py-2 text-body text-text-muted">{pagination.page} / {pagination.pages}</span>
+          <button type="button" className={ACTION} disabled={offset + QA_PAGE_SIZE >= data.total} onClick={() => setOffset(offset + QA_PAGE_SIZE)}>{t("common.next")}<ChevronRight size={14} /></button>
+        </div>
+      </div>}
+    </div>
+  );
+}

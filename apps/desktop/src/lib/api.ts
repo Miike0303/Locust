@@ -301,6 +301,34 @@ export interface ValidationReport {
   issues: ValidationIssue[];
 }
 
+/** Persisted QA rows; ignored maps to the existing resolved column. */
+export interface StoredValidationIssue {
+  id: number;
+  entry_id: string;
+  kind: string;
+  message: string;
+  ignored: boolean;
+  source: string | null;
+  translation: string | null;
+  file_path: string | null;
+}
+
+export interface ValidationIssueFilter {
+  kind?: string;
+  include_ignored?: boolean;
+  offset?: number;
+  limit?: number;
+}
+
+export interface ValidationIssuesPage {
+  issues: StoredValidationIssue[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export type ValidationSummary = Record<string, { open: number; ignored: number }>;
+
 /** Mirrors core::font_validation::FontCoverageReport */
 export interface FontCoverageReport {
   font_path: string;
@@ -548,6 +576,22 @@ export const getStats = (): Promise<ProjectStats> =>
 /** No IPC command: use the embedded server, as run history and memory do. */
 export const getFileStats = (): Promise<FileStats[]> =>
   request<{ files: FileStats[] }>("/stats/files").then(response => response.files);
+
+/** QA uses the embedded HTTP server in desktop mode too. */
+export const getValidationIssues = (filter: ValidationIssueFilter = {}, signal?: AbortSignal): Promise<ValidationIssuesPage> => {
+  const params = new URLSearchParams();
+  if (filter.kind !== undefined) params.set("kind", filter.kind);
+  if (filter.include_ignored !== undefined) params.set("include_ignored", String(filter.include_ignored));
+  if (filter.offset !== undefined) params.set("offset", String(filter.offset));
+  if (filter.limit !== undefined) params.set("limit", String(filter.limit));
+  return request(`/validation/issues?${params}`, { signal });
+};
+
+export const getValidationSummary = (signal?: AbortSignal): Promise<ValidationSummary> =>
+  request("/validation/summary", { signal });
+
+export const setValidationIssueIgnored = (id: number, ignored: boolean): Promise<void> =>
+  request(`/validation/issues/${id}`, { method: "PATCH", body: JSON.stringify({ ignored }) });
 
 export const startTranslation = (params: TranslationStartParams): Promise<{ job_id: string }> =>
   IS_TAURI

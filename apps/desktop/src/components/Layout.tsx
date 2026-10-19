@@ -8,6 +8,7 @@ import {
 	Github,
 	Database,
 	BookCheck,
+	ShieldCheck,
 	Keyboard,
 	ScrollText,
 	ListOrdered,
@@ -32,6 +33,7 @@ const navItems = [
 	{ to: "/dashboard", icon: LayoutDashboard, labelKey: "nav.dashboard", shortcut: "Alt+6" },
 	{ to: "/editor", icon: FileText, labelKey: "nav.editor", shortcut: "Alt+2" },
 	{ to: "/review", icon: BookCheck, labelKey: "nav.review", shortcut: "Alt+3" },
+	{ to: "/qa", icon: ShieldCheck, labelKey: "nav.qa", shortcut: null },
 	{ to: "/memory", icon: Database, labelKey: "nav.memory", shortcut: "Alt+4" },
 	{ to: "/settings", icon: Settings, labelKey: "nav.settings", shortcut: "Alt+5" },
 ] as const;
@@ -84,9 +86,11 @@ export default function Layout() {
 						>
 							<Icon size={18} />
 							<span className="flex-1">{t(labelKey)}</span>
-							<kbd className="text-caption text-text-muted opacity-0 group-hover:opacity-100 transition-opacity">
-								{shortcut}
-							</kbd>
+							{shortcut && (
+								<kbd className="text-caption text-text-muted opacity-0 group-hover:opacity-100 transition-opacity">
+									{shortcut}
+								</kbd>
+							)}
 						</NavLink>
 					))}
 				</nav>
