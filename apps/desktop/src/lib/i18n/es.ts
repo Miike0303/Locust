@@ -651,6 +651,13 @@ export const es: Record<keyof typeof en, string> = {
   "log.timeHours": "hace {count}h",
 
   "queue.title": "Cola de proyectos",
+  "queue.interrupted": "Se interrumpió al cerrar la aplicación. Reintente para continuar.",
+  "queue.retry": "Reintentar",
+  "queue.retryItem": "Reintentar {name}",
+  "queue.retryFailed": "Reintentar fallidos ({count})",
+  "queue.recentBatches": "Lotes recientes",
+  "queue.clearHistory": "Borrar historial",
+  "queue.historyEmpty": "No hay lotes recientes.",
   "queue.closeAria": "Cerrar el panel de la cola",
   "queue.clearCompleted": "Quitar completados ({count})",
   "queue.empty.title": "La cola está vacía",

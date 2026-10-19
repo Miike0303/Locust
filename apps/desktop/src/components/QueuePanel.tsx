@@ -18,6 +18,7 @@ import {
 	Clock,
 	FolderOpen,
 	File,
+	RotateCcw,
 } from "lucide-react";
 import clsx from "clsx";
 import type { MessageKey } from "../lib/i18n";
@@ -48,7 +49,8 @@ import {
 import { buildSettingsPath } from "../lib/settingsNav";
 import { gameFileExtensions } from "../lib/gameSource";
 import EmptyState from "./EmptyState";
-import { useT } from "../lib/i18n";
+import { useT, useLocale } from "../lib/i18n";
+import { formatUsdCost } from "../lib/translationCost";
 
 const statusIcons: Record<string, typeof Clock> = {
 	pending: Clock,
@@ -97,6 +99,7 @@ const settingsLabelClass =
 
 export default function QueuePanel() {
 	const t = useT();
+	const { locale } = useLocale();
 	const navigate = useNavigate();
 	const {
 		items,
@@ -108,6 +111,10 @@ export default function QueuePanel() {
 		removeItem,
 		moveItem,
 		clearCompleted,
+		retryItem,
+		retryFailed,
+		history,
+		clearHistory,
 		setParams,
 		startQueue,
 		cancelQueue,
@@ -279,6 +286,7 @@ export default function QueuePanel() {
 
 	const pendingCount = items.filter((i) => i.status === "pending").length;
 	const doneCount = items.filter((i) => i.status === "done").length;
+	const failedCount = items.filter((i) => i.status === "error" || i.status === "cancelled").length;
 	const activeCount = items.filter((i) =>
 		["extracting", "translating", "validating"].includes(i.status),
 	).length;
@@ -297,6 +305,16 @@ export default function QueuePanel() {
 						{t("queue.title")}
 					</h2>
 					<div className="flex items-center gap-2">
+						{failedCount > 0 && (
+							<button
+								type="button"
+								onClick={retryFailed}
+								disabled={isRunning}
+								className="text-caption text-text-muted hover:text-text disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded px-1"
+							>
+								{t("queue.retryFailed", { count: failedCount })}
+							</button>
+						)}
 						{doneCount > 0 && (
 							<button
 								type="button"
@@ -333,6 +351,7 @@ export default function QueuePanel() {
 									index={idx}
 									total={items.length}
 									onRemove={() => removeItem(item.id)}
+									onRetry={() => retryItem(item.id)}
 									onMoveUp={() => moveItem(item.id, "up")}
 									onMoveDown={() => moveItem(item.id, "down")}
 									disabled={isRunning}
@@ -340,6 +359,43 @@ export default function QueuePanel() {
 							))}
 						</div>
 					)}
+
+					<details className="p-4 border-b border-border">
+						<summary className="cursor-pointer text-body font-medium text-text focus:outline-none focus:ring-2 focus:ring-accent-fg rounded">
+							{t("queue.recentBatches")}
+						</summary>
+						{history.length === 0 ? (
+							<p className="mt-2 text-caption text-text-muted">{t("queue.historyEmpty")}</p>
+						) : (
+							<>
+								<ul className="mt-2 divide-y divide-border">
+									{history.map(entry => {
+										const Icon = statusIcons[entry.status];
+										return (
+											<li key={entry.id} className="py-2 text-caption">
+												<div className="flex items-center gap-2">
+													<Icon size={14} className={statusIconColors[entry.status]} aria-hidden="true" />
+													<span className="text-text-muted">{t(STATUS_LABEL_KEYS[entry.status])}</span>
+													<span className="font-medium text-text truncate" title={entry.projectPath}>{entry.projectName}</span>
+												</div>
+												<div className="mt-1 flex flex-wrap gap-x-3 text-text-muted tabular-nums">
+													<time dateTime={entry.finishedAt}>{new Date(entry.finishedAt).toLocaleString(locale)}</time>
+													<span>{entry.completed}/{entry.total}</span>
+													<span>{entry.costIsComplete ? `$${formatUsdCost(entry.costSoFar)}` : t("cost.unknown")}</span>
+													{entry.validationIssues !== null && <span>{entry.validationIssues > 0
+														? t("queue.validation.issues", { count: entry.validationIssues }) : t("queue.validation.clean")}</span>}
+												</div>
+											</li>
+										);
+									})}
+								</ul>
+								<button type="button" onClick={clearHistory}
+									className="mt-2 text-caption text-text-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent-fg rounded px-1">
+									{t("queue.clearHistory")}
+								</button>
+							</>
+						)}
+					</details>
 
 					{/* Add buttons */}
 					{!isRunning && (
@@ -570,6 +626,7 @@ function QueueItemRow({
 	index,
 	total,
 	onRemove,
+	onRetry,
 	onMoveUp,
 	onMoveDown,
 	disabled,
@@ -578,6 +635,7 @@ function QueueItemRow({
 	index: number;
 	total: number;
 	onRemove: () => void;
+	onRetry: () => void;
 	onMoveUp: () => void;
 	onMoveDown: () => void;
 	disabled: boolean;
@@ -594,6 +652,7 @@ function QueueItemRow({
 		item.status === "validating";
 	const showProgress = isActive || item.status === "done";
 	const canDismiss = ["done", "error", "cancelled"].includes(item.status);
+	const error = item.error === "queue.interrupted" ? t("queue.interrupted") : item.error;
 
 	return (
 		<div
@@ -673,12 +732,12 @@ function QueueItemRow({
 								: t("queue.validation.clean")}
 						</div>
 					)}
-				{item.error && (
+				{error && (
 					<div
 						className="text-caption text-danger mt-0.5 truncate"
-						title={item.error}
+						title={error}
 					>
-						{item.error}
+						{error}
 					</div>
 				)}
 			</div>
@@ -711,6 +770,13 @@ function QueueItemRow({
 						<Trash2 size={14} />
 					</button>
 				</div>
+			)}
+			{(item.status === "error" || item.status === "cancelled") && (
+				<button type="button" onClick={onRetry} disabled={disabled}
+					aria-label={t("queue.retryItem", { name: item.projectName })} title={t("queue.retry")}
+					className="shrink-0 p-1 text-text-muted hover:text-text disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded">
+					<RotateCcw size={14} aria-hidden="true" />
+				</button>
 			)}
 			{canDismiss && !disabled && (
 				<button

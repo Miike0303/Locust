@@ -12,6 +12,7 @@ import { addToast } from "./toastStore";
 import { t } from "../lib/i18n";
 import { localizeApiError } from "../lib/apiError";
 import { JOB_STREAM_LOST_MESSAGE } from "../lib/ws";
+import { MAX_QUEUE_HISTORY, readQueue, writeQueue, type QueueHistoryEntry } from "../lib/queuePersistence";
 import {
   queueItemPatchAfterValidation,
   validationIssueCount,
@@ -50,6 +51,7 @@ export interface GlobalProgress {
 
 interface QueueStore {
   items: QueueItem[];
+  history: QueueHistoryEntry[];
   isRunning: boolean;
   isPanelOpen: boolean;
   globalProgress: GlobalProgress | null;
@@ -60,6 +62,9 @@ interface QueueStore {
   removeItem: (id: string) => void;
   moveItem: (id: string, direction: "up" | "down") => void;
   clearCompleted: () => void;
+  retryItem: (id: string) => void;
+  retryFailed: () => void;
+  clearHistory: () => void;
   setParams: (p: TranslationStartParams) => void;
   setPanelOpen: (v: boolean) => void;
   setGlobalProgress: (p: GlobalProgress | null) => void;
@@ -67,12 +72,17 @@ interface QueueStore {
   cancelQueue: () => void;
 }
 
+const retryable = (item: QueueItem) => item.status === "error" || item.status === "cancelled";
+const resetForRetry = (item: QueueItem): QueueItem => ({
+  ...item, status: "pending", error: null, validationIssues: null, validationError: null,
+  progress: { completed: 0, total: 0, costSoFar: 0, costIsComplete: false, startedAt: null },
+});
+
 export const useQueueStore = create<QueueStore>((set, get) => ({
-  items: [],
+  ...readQueue(),
   isRunning: false,
   isPanelOpen: false,
   globalProgress: null,
-  translationParams: null,
   cancelRequested: false,
 
   addItem: (path) => {
@@ -104,6 +114,16 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   }),
 
   clearCompleted: () => set((s) => ({ items: s.items.filter((i) => i.status !== "done") })),
+
+  retryItem: (id) => set((s) => {
+    if (s.isRunning || !s.items.some(i => i.id === id && retryable(i))) return s;
+    return { items: s.items.map(i => i.id === id && retryable(i) ? resetForRetry(i) : i) };
+  }),
+  retryFailed: () => set((s) => {
+    if (s.isRunning || !s.items.some(retryable)) return s;
+    return { items: s.items.map(i => retryable(i) ? resetForRetry(i) : i) };
+  }),
+  clearHistory: () => set({ history: [] }),
 
   setParams: (translationParams) => set({ translationParams }),
   setPanelOpen: (isPanelOpen) => set({ isPanelOpen }),
@@ -142,9 +162,23 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
       const item = pending[idx];
       const updateItem = (patch: Partial<QueueItem>) =>
-        set((s) => ({
-          items: s.items.map((i) => (i.id === item.id ? { ...i, ...patch } : i)),
-        }));
+        set((s) => {
+          const current = s.items.find(i => i.id === item.id);
+          if (!current) return s;
+          const updated = { ...current, ...patch };
+          const status = updated.status;
+          const terminal = status === "done" || status === "error" || status === "cancelled";
+          const entry: QueueHistoryEntry | null = s.isRunning && terminal && current.status !== status ? {
+            id: crypto.randomUUID(), projectName: updated.projectName, projectPath: updated.projectPath,
+            status, finishedAt: new Date().toISOString(), completed: updated.progress.completed,
+            total: updated.progress.total, costSoFar: updated.progress.costSoFar,
+            costIsComplete: updated.progress.costIsComplete === true, validationIssues: updated.validationIssues,
+          } : null;
+          return {
+            items: s.items.map(i => i.id === item.id ? updated : i),
+            history: entry ? [entry, ...s.history].slice(0, MAX_QUEUE_HISTORY) : s.history,
+          };
+        });
       const markCancelled = () => {
         const name = get().items.find((i) => i.id === item.id)?.projectName ?? item.projectName;
         updateItem({ status: "cancelled", error: null });
@@ -351,3 +385,9 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     }
   },
 }));
+
+useQueueStore.subscribe((state, previous) => {
+  if (state.items !== previous.items || state.translationParams !== previous.translationParams || state.history !== previous.history) {
+    writeQueue(state);
+  }
+});

@@ -668,6 +668,13 @@ export const en = {
 
   // ── queue ───────────────────────────────────────────────────────────────
   "queue.title": "Project Queue",
+  "queue.interrupted": "Interrupted when the app closed. Retry to continue.",
+  "queue.retry": "Retry",
+  "queue.retryItem": "Retry {name}",
+  "queue.retryFailed": "Retry failed ({count})",
+  "queue.recentBatches": "Recent batches",
+  "queue.clearHistory": "Clear history",
+  "queue.historyEmpty": "No recent batches.",
   "queue.closeAria": "Close queue panel",
   "queue.clearCompleted": "Clear completed ({count})",
   "queue.empty.title": "Queue is empty",
