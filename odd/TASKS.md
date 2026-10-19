@@ -27,6 +27,8 @@ Reconciled 2026-10-16 from all 14 task ledgers (13 prior ledgers plus reconcilia
 
 ## Canonical remaining work
 
+- **Day plan 2026-10-19:** [multi-session queue](tasks/day-plan-2026-10-19.md) derived from the [project report](../docs/PROJECT-REPORT-2026-10-19.md); phases A–F are agent-doable local work, phase G links the blocked owners below.
+
 - **v0.2.0 signed release:** [Release owner](tasks/release-v0.2.0.md) R3/R4 blocked on existing signing credentials; main/tag source delivery complete. Public error: "incorrect updater private key password: Missing comment in secret key". Owner must restore valid existing private key/password corresponding to configured public key; no secret access or signing bypass authorized. Prior v0.1.0 remains latest observed release.
 
 - **Other engine pipelines:** [Engine pipeline expansion](tasks/engine-pipeline-expansion.md) owns the newly authorized continuation. HTML safe wrapper ee352ca delivered through tested main eddbab8/CI39074936843 (prior local wrapper83pass/1 Windows skip, oracle13pass and verifier retained). RGSS bounded independent Marshal fixture-wire proof completed locally at6d1e68f (6rows,8tests, EN/ES artifact bytes, ES lifecycle); generic admission still requires broader alias/layout/encoding proof or explicit hard exclusions. Other engine/runtime blockers keep their existing owners.
