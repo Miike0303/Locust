@@ -1,3 +1,4 @@
+import { useTranslationSettings } from "../lib/useTranslationSettings";
 import { IS_TAURI } from "../lib/runtime";
 import { addToast } from "../stores/toastStore";
 import { localizeApiError } from "../lib/apiError";
@@ -42,7 +43,6 @@ import {
 	modalPanelClass,
 } from "../lib/modalA11y";
 import {
-	resolveProviderReadiness,
 	formatProviderOptionLabel,
 } from "../lib/providerReadiness";
 import { buildSettingsPath } from "../lib/settingsNav";
@@ -155,12 +155,6 @@ export default function QueuePanel() {
 		}
 		return initialDefaults.costLimit;
 	});
-	const [fallbackIds, setFallbackIds] = useState<string[]>(() =>
-		translationParams?.fallback_provider_ids?.length
-			? [...translationParams.fallback_provider_ids]
-			: readTranslationFallbacks(),
-	);
-	const [fallbackPick, setFallbackPick] = useState("");
 	const [gameContext, setGameContext] = useState(
 		translationParams?.options.game_context ?? "",
 	);
@@ -202,11 +196,16 @@ export default function QueuePanel() {
 		translationParams,
 	]);
 
-	// Keep the provider <select> on a listed, ready id when possible.
-	useEffect(() => {
-		if (!providers || providers.length === 0) return;
-		setProviderId((prev) => coerceProviderId(prev, providers, config));
-	}, [providers, config]);
+	const {
+		fallbackIds, setFallbackIds, fallbackPick, setFallbackPick,
+		addFallback, providerReadiness,
+	} = useTranslationSettings({
+		providerId, setProviderId, providers, config,
+		initialFallbackIds: () =>
+			translationParams?.fallback_provider_ids?.length
+				? [...translationParams.fallback_provider_ids]
+				: readTranslationFallbacks(),
+	});
 
 	if (!isPanelOpen) return null;
 
@@ -278,28 +277,12 @@ export default function QueuePanel() {
 		startQueue();
 	};
 
-	const addFallback = () => {
-		if (
-			!fallbackPick ||
-			fallbackPick === providerId ||
-			fallbackIds.includes(fallbackPick)
-		)
-			return;
-		setFallbackIds((prev) => [...prev, fallbackPick]);
-		setFallbackPick("");
-	};
-
 	const pendingCount = items.filter((i) => i.status === "pending").length;
 	const doneCount = items.filter((i) => i.status === "done").length;
 	const activeCount = items.filter((i) =>
 		["extracting", "translating", "validating"].includes(i.status),
 	).length;
 	const totalCount = items.length;
-	const providerReadiness = resolveProviderReadiness(
-		providerId,
-		providers,
-		config,
-	);
 
 	return (
 		<div className={MODAL_BACKDROP_CLASS}>

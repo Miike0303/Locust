@@ -1,25 +1,14 @@
-import { IS_TAURI } from "../lib/runtime";
+import { AlertCircle, FolderOpen, Package, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
-	X,
-	FolderOpen,
-	FileArchive,
-	Package,
-	RotateCcw,
-	AlertCircle,
-	ShieldCheck,
-	Archive,
-	Loader2,
-} from "lucide-react";
-import {
-	getConfig,
 	cancelPatchApply,
+	getConfig,
+	getPatchRecordings,
 	patchApply,
-	patchPack,
 	patchIdentity,
+	patchPack,
 	patchRollback,
 	patchStatus,
-	getPatchRecordings,
 	patchVerify,
 	type PatchApplyResult,
 	type PatchPackResult,
@@ -27,13 +16,10 @@ import {
 	type PatchStatusResult,
 	type PatchVerifyResult,
 } from "../lib/api";
-import {
-	canPackFromRecordings,
-	isPackLangSelected,
-	packLangFromRecording,
-	preferredPackLang,
-	type RecordedLang,
-} from "../lib/patchRecordings";
+import { useT } from "../lib/i18n";
+import { MODAL_BACKDROP_CLASS, modalPanelClass, useModalA11y } from "../lib/modalA11y";
+import { defaultEntryPath, patchPublishFields, publishCommand } from "../lib/patchPublish";
+import { canPackFromRecordings, preferredPackLang, type RecordedLang } from "../lib/patchRecordings";
 import {
 	isHttpPatchUrl,
 	loadRememberedPatchSource,
@@ -42,16 +28,12 @@ import {
 	rememberPatchSource,
 	resolvePatchSource,
 } from "../lib/patchSource";
-import { defaultEntryPath, patchPublishFields, publishCommand } from "../lib/patchPublish";
+import { IS_TAURI } from "../lib/runtime";
 import { subscribeToJob } from "../lib/ws";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import {
-	useModalA11y,
-	MODAL_BACKDROP_CLASS,
-	modalPanelClass,
-} from "../lib/modalA11y";
-import { useT } from "../lib/i18n";
+import PatchApplyTab from "./patch/PatchApplyTab";
+import PatchPackTab from "./patch/PatchPackTab";
 
 type Tab = "apply" | "pack";
 
@@ -797,581 +779,81 @@ export default function PatchModal({
 					</div>
 
 					{tab === "apply" && (
-						<>
-							<div>
-								<label className="text-body font-medium">{t("patch.zipLocal")}</label>
-								<div className="flex gap-2 mt-1">
-									<input
-										value={zipPath}
-										onChange={(e) => {
-											setZipPath(e.target.value);
-											if (e.target.value.trim()) setZipUrl("");
-										}}
-										placeholder={t("patch.zipPlaceholder")}
-										className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-									/>
-									<button
-										onClick={pickZip}
-										className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"
-										title={t("common.browse")}
-									>
-										<FileArchive size={16} />
-									</button>
-								</div>
-							</div>
-
-							<div>
-								<label className="text-body font-medium">{t("patch.orUrl")}</label>
-								<input
-									value={zipUrl}
-									onChange={(e) => {
-										setZipUrl(e.target.value);
-										if (e.target.value.trim()) setZipPath("");
-									}}
-									placeholder={t("patch.urlPlaceholder")}
-									className={`w-full mt-1 p-2 border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg ${
-										urlFieldError
-											? "border-danger"
-											: zipUrl.trim() && isHttpPatchUrl(zipUrl)
-												? "border-success"
-												: "border-border"
-									}`}
-								/>
-								{urlFieldError ? (
-									<p className="text-caption text-danger mt-1">
-										{urlFieldError}
-									</p>
-								) : urlZipHint ? (
-									<p className="text-caption text-warning mt-1">
-										{urlZipHint}
-									</p>
-								) : (
-									<p className="text-caption text-text-muted mt-1">
-										{t("patch.urlHelp")}
-									</p>
-								)}
-								{patchSourceReady(resolvedSource) && (
-									<p className="text-caption text-success mt-0.5">
-										{"zip_url" in resolvedSource
-											? t("patch.activeUrl", {
-													url: `${resolvedSource.zip_url.slice(0, 48)}${
-														resolvedSource.zip_url.length > 48 ? "…" : ""
-													}`,
-												})
-											: t("patch.activeLocal")}
-									</p>
-								)}
-							</div>
-
-							<div className="space-y-2 text-body">
-								<label className="flex items-start gap-2 cursor-pointer">
-									<input
-										type="checkbox"
-										className="mt-0.5 border border-border bg-surface text-text accent-accent focus:outline-none focus:ring-2 focus:ring-accent-fg"
-										checked={force}
-										onChange={(e) => setForce(e.target.checked)}
-									/>
-									<span>
-										<span className="font-medium">{t("patch.force")}</span>
-										<span className="block text-caption text-text-muted mt-0.5">
-											{t("patch.forceHint")}
-										</span>
-									</span>
-								</label>
-								<label className="flex items-start gap-2 cursor-pointer">
-									<input
-										type="checkbox"
-										className="mt-0.5 border border-border bg-surface text-text accent-accent focus:outline-none focus:ring-2 focus:ring-accent-fg"
-										checked={confirmLegacy}
-										onChange={(e) => setConfirmLegacy(e.target.checked)}
-									/>
-									<span>
-										<span className="font-medium">{t("patch.legacy")}</span>
-										<span className="block text-caption text-text-muted mt-0.5">
-											{t("patch.legacyHint")}
-										</span>
-									</span>
-								</label>
-								<label className="flex items-start gap-2 cursor-pointer">
-									<input
-										type="checkbox"
-										className="mt-0.5 border border-border bg-surface text-text accent-accent focus:outline-none focus:ring-2 focus:ring-accent-fg"
-										checked={dryRun}
-										onChange={(e) => setDryRun(e.target.checked)}
-									/>
-									<span>
-										<span className="font-medium">{t("patch.dryRun")}</span>
-										<span className="block text-caption text-text-muted mt-0.5">
-											{t("patch.dryRunHint")}
-										</span>
-									</span>
-								</label>
-							</div>
-
-							<div className="flex flex-wrap gap-2">
-								<button
-									onClick={handleVerify}
-									disabled={loading || applying || !canVerifyApply}
-									title={
-										!gamePath.trim()
-											? t("patch.selectGame")
-											: !sourceOk
-												? t("patch.selectSource")
-												: undefined
-									}
-									className="flex items-center gap-1.5 px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body font-medium disabled:opacity-50"
-								>
-									<ShieldCheck size={16} /> {t("patch.verify")}
-								</button>
-								<button
-									onClick={handleApply}
-									disabled={loading || applying || !canVerifyApply}
-									title={
-										!gamePath.trim()
-											? t("patch.selectGame")
-											: !sourceOk
-												? t("patch.selectSource")
-												: undefined
-									}
-									className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50"
-								>
-									{applying ? (
-										<Loader2 size={16} className="animate-spin" />
-									) : (
-										<Package size={16} />
-									)}{" "}
-									{dryRun ? t("patch.planApply") : t("patch.applyBtn")}
-								</button>
-								<button
-									type="button"
-									onClick={handlePreviewRollback}
-									disabled={loading || applying || !gamePath.trim()}
-									className="flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-surface hover:bg-warning-muted rounded text-body font-medium disabled:opacity-50"
-								>
-									<RotateCcw size={16} /> {t("patch.rollbackPreview")}
-								</button>
-								<button
-									onClick={handleRollback}
-									disabled={loading || applying}
-									className={
-										showPartialWarning
-											? "flex items-center gap-1.5 px-3 py-2 bg-amber-700 hover:bg-amber-800 text-white rounded text-body font-medium disabled:opacity-50 ring-2 ring-warning ring-offset-1 ring-offset-surface"
-											: "flex items-center gap-1.5 px-3 py-2 bg-warning-muted hover:bg-warning-muted/80 text-warning rounded text-body font-medium disabled:opacity-50"
-									}
-								>
-									<RotateCcw size={16} /> {t("patch.rollback")}
-								</button>
-								<button
-									onClick={refreshStatus}
-									disabled={loading || applying || !gamePath.trim()}
-									className="px-3 py-2 text-body text-text-muted hover:underline disabled:opacity-50"
-								>
-									{t("patch.refreshStatus")}
-								</button>
-							</div>
-
-							{applying && (
-								<div className="p-3 border border-success bg-success-muted rounded text-body space-y-2">
-									<div className="flex items-center gap-2 font-medium">
-										<Loader2
-											size={16}
-											className="animate-spin text-accent-fg"
-										/>
-										{t("patch.applying")}
-									</div>
-									{applyProgress && (
-										<>
-											{applyProgress.phase && (
-												<div className="text-caption text-text-muted">
-													{t("patch.progress.phase", {
-														phase: applyProgress.phase,
-													})}
-												</div>
-											)}
-											<div className="w-full bg-border rounded-full h-2">
-												<div
-													className="bg-accent h-2 rounded-full transition-all"
-													style={{
-														width: `${
-															applyProgress.total > 0
-																? Math.min(
-																		100,
-																		(applyProgress.current /
-																			applyProgress.total) *
-																			100,
-																	)
-																: 0
-														}%`,
-													}}
-												/>
-											</div>
-											<div className="text-caption tabular-nums">
-												{t("patch.progress.counts", {
-													current: applyProgress.current,
-													total: applyProgress.total,
-												})}
-											</div>
-											{applyProgress.path && (
-												<div className="text-caption text-text-muted truncate" title={applyProgress.path}>
-													{t("patch.progress.file", {
-														path: applyProgress.path,
-													})}
-												</div>
-											)}
-										</>
-									)}
-									<button
-										type="button"
-										onClick={handleCancelApply}
-										disabled={cancellingApply}
-										className="w-full py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded text-body font-medium"
-									>
-										{cancellingApply
-											? t("patch.cancelling")
-											: t("patch.cancelApply")}
-									</button>
-								</div>
-							)}
-
-							{!applying && showPartialWarning && (
-								<div className="p-3 border border-warning bg-warning-muted rounded text-body space-y-2">
-									<div className="flex gap-2 text-warning">
-										<AlertCircle size={16} className="shrink-0 mt-0.5" />
-										<span>{t("patch.partialWarning")}</span>
-									</div>
-									<button
-										type="button"
-										onClick={handlePreviewRollback}
-										disabled={loading || !gamePath.trim()}
-										className="w-full flex items-center justify-center gap-1.5 py-2 border border-warning text-warning bg-surface hover:bg-warning-muted rounded text-body font-medium disabled:opacity-50"
-									>
-										<RotateCcw size={16} /> {t("patch.rollbackPreview")}
-									</button>
-									<button
-										type="button"
-										onClick={handleRollback}
-										disabled={loading}
-										className="w-full flex items-center justify-center gap-1.5 py-2 bg-amber-700 hover:bg-amber-800 disabled:opacity-50 text-white rounded text-body font-medium"
-									>
-										<RotateCcw size={16} /> {t("patch.rollbackNow")}
-									</button>
-								</div>
-							)}
-
-							{preview && (
-								<div role="status" className="p-3 border border-warning rounded text-body space-y-2">
-									<h3 className="font-medium">{t("patch.rollbackPreview.title")}</h3>
-									<p className="text-caption">{t("patch.rollbackPreview.hint")}</p>
-									<p>{t("patch.rollbackPreview.counts", { restored: preview.restored, deleted: preview.deleted })}</p>
-									{preview.messages?.map((message, index) => (
-										<p key={index} className="text-caption break-words">{message}</p>
-									))}
-									{preview.aborted_edited?.length > 0 && (
-										<div className="text-warning">
-											<p>{t("patch.rollbackPreview.blocked")}</p>
-											<ul className="list-disc pl-5 text-caption break-all">
-												{preview.aborted_edited.map((path) => <li key={path}>{path}</li>)}
-											</ul>
-										</div>
-									)}
-									{preview.torn_deleted?.length > 0 && (
-										<div className="text-warning">
-											<p>{t("patch.rollbackPreview.forcedDeletes")}</p>
-											<ul className="list-disc pl-5 text-caption break-all">
-												{preview.torn_deleted.map((path) => <li key={path}>{path}</li>)}
-											</ul>
-										</div>
-									)}
-								</div>
-							)}
-
-							{status && (
-								<div className="p-3 bg-surface-muted rounded text-body space-y-1">
-									<div className="font-medium">{t("patch.status", { status: patchValue(status.status) })}</div>
-									{status.status === "patched" && (
-										<div className="text-caption text-text-muted">
-											{t("patch.statusDetail", {
-												id: status.patch_id ?? "",
-												version: status.patch_version ?? "",
-												engine: status.engine ?? "",
-												language: status.language ?? "",
-												baseline: patchValue(status.baseline ?? ""),
-												replaced: status.replaced ?? 0,
-												added: status.added ?? 0,
-											})}
-										</div>
-									)}
-									{status.status === "interrupted" && (
-										<div className="text-caption text-warning">
-											{t("patch.interrupted", { id: status.patch_id ?? "" })}
-										</div>
-									)}
-								</div>
-							)}
-
-							{verify && (
-								<div className="p-3 border border-border rounded text-body space-y-1">
-									<div className="font-medium">{t("patch.verifyLine", { outcome: patchValue(verify.outcome) })}</div>
-									{verify.tier && (
-										<div className="text-caption">{t("patch.tier", { tier: patchValue(verify.tier) })}</div>
-									)}
-									<div className="text-caption text-text-muted">
-										{t("patch.plan", {
-											replace: verify.replaced?.length ?? 0,
-											add: verify.added?.length ?? 0,
-										})}
-										{(verify.conflicts?.length ?? 0) > 0 &&
-											t("patch.conflicts", { count: verify.conflicts.length })}
-									</div>
-									{verify.backup_compromised && (
-										<div className="text-caption text-warning">
-											{t("patch.backupCompromised")}
-										</div>
-									)}
-									{verify.messages?.map((m, i) => (
-										<div key={i} className="text-caption text-text-muted">
-											{m}
-										</div>
-									))}
-								</div>
-							)}
-
-							{applyResult && (
-								<div className="p-3 border border-success bg-success-muted rounded text-body space-y-1">
-									<div className="font-medium">
-										{t(
-											applyResult.dry_run ? "patch.planned" : "patch.applied",
-											{
-												id: applyResult.patch_id,
-												version: applyResult.patch_version,
-											},
-										)}
-									</div>
-									<div className="text-caption">
-										{t("patch.applyDetail", {
-											replaced: applyResult.replaced,
-											added: applyResult.added,
-											baseline: patchValue(applyResult.baseline),
-										})}
-									</div>
-									{applyResult.user_edits_overwritten?.length > 0 && (
-										<div className="text-caption text-warning">
-											{t("patch.overwrote", {
-												files: applyResult.user_edits_overwritten.join(", "),
-											})}
-										</div>
-									)}
-								</div>
-							)}
-
-							<p className="text-caption text-text-muted">
-								{t("patch.applyHelp")}
-							</p>
-						</>
+						<PatchApplyTab
+							t={t}
+							zipPath={zipPath}
+							setZipPath={setZipPath}
+							setZipUrl={setZipUrl}
+							pickZip={pickZip}
+							zipUrl={zipUrl}
+							urlFieldError={urlFieldError}
+							urlZipHint={urlZipHint}
+							resolvedSource={resolvedSource}
+							force={force}
+							setForce={setForce}
+							confirmLegacy={confirmLegacy}
+							setConfirmLegacy={setConfirmLegacy}
+							dryRun={dryRun}
+							setDryRun={setDryRun}
+							handleVerify={handleVerify}
+							loading={loading}
+							applying={applying}
+							canVerifyApply={canVerifyApply}
+							gamePath={gamePath}
+							sourceOk={sourceOk}
+							handleApply={handleApply}
+							handlePreviewRollback={handlePreviewRollback}
+							handleRollback={handleRollback}
+							showPartialWarning={showPartialWarning}
+							refreshStatus={refreshStatus}
+							applyProgress={applyProgress}
+							handleCancelApply={handleCancelApply}
+							cancellingApply={cancellingApply}
+							preview={preview}
+							status={status}
+							patchValue={patchValue}
+							verify={verify}
+							applyResult={applyResult}
+						/>
 					)}
 
 					{tab === "pack" && (
-						<>
-							<div>
-								<label className="text-body font-medium">{t("patch.outputZip")}</label>
-								<div className="flex gap-2 mt-1">
-									<input
-										value={outputPath}
-										onChange={(e) => setOutputPath(e.target.value)}
-										placeholder={t("patch.outputPlaceholder")}
-										className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-									/>
-									<button
-										onClick={pickOutputZip}
-										className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"
-										title={t("common.saveAs")}
-									>
-										<FileArchive size={16} />
-									</button>
-								</div>
-							</div>
-
-							<div>
-								<label className="text-body font-medium">{t("patch.languages")}</label>
-								<input
-									value={languages}
-									onChange={(e) => setLanguages(e.target.value)}
-									placeholder={t("patch.languagesPlaceholder")}
-									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-								/>
-								<p className="text-caption font-medium text-text-muted mt-2">
-									{t("patch.recordedLangs")}
-								</p>
-								{recordings.length === 0 ? (
-									<p className="text-caption text-warning mt-1">
-										{t("patch.recordedLangsEmpty")}
-									</p>
-								) : (
-									<div className="flex flex-wrap gap-1.5 mt-1">
-										{recordings.map((lang) => {
-											const key = lang ?? "(unspecified)";
-											const selected = isPackLangSelected(languages, lang);
-											return (
-												<button
-													key={key}
-													type="button"
-													onClick={() =>
-														setLanguages(packLangFromRecording(lang))
-													}
-													className={`px-2 py-0.5 rounded text-caption font-medium border ${
-														selected
-															? "border-accent-fg bg-accent-muted text-accent-fg"
-															: "border-border text-text hover:bg-surface-muted"
-													}`}
-												>
-													{lang ?? t("patch.recordedUnspecified")}
-												</button>
-											);
-										})}
-									</div>
-								)}
-								<p className="text-caption text-text-muted mt-1">
-									{t("patch.languagesHint")}
-								</p>
-							</div>
-
-							<label className="flex items-start gap-2 text-body cursor-pointer">
-								<input
-									type="checkbox"
-									className="mt-0.5 border border-border bg-surface text-text accent-accent focus:outline-none focus:ring-2 focus:ring-accent-fg"
-									checked={pristine}
-									onChange={(e) => setPristine(e.target.checked)}
-								/>
-								<span>
-									<span className="font-medium">{t("patch.pristine")}</span>
-									<span className="block text-caption text-text-muted mt-0.5">
-										{t("patch.pristineHint")}
-									</span>
-								</span>
-							</label>
-
-							<div>
-							<label className="text-body font-medium">{t("patch.pristinePath")}</label>
-							{pristine && (pristineRecordings.some(lang => isPackLangSelected(languages, lang)) || (initialBackupId && gamePath.trim() === defaultGamePath?.trim())) && !pristinePath.trim() && <p className="mt-1 text-caption text-success">{t("patch.injectionBackup")}</p>}
-								<div className="flex gap-2 mt-1">
-									<input
-										value={pristinePath}
-										onChange={(e) => {
-											const value = e.target.value;
-											setPristinePath(value);
-											if (value.trim()) setPristine(true);
-										}}
-										placeholder={t("patch.pristinePathPlaceholder")}
-										className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-									/>
-									<button
-										type="button"
-										onClick={() => {
-											void pickPristineFolder();
-										}}
-										className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"
-										title={t("common.browse")}
-									>
-										<FolderOpen size={16} />
-									</button>
-								</div>
-								<p className="text-caption text-text-muted mt-1">
-									{t("patch.pristinePathHint")}
-								</p>
-							</div>
-
-							<details className="border border-border rounded p-3">
-								<summary className="text-body font-medium cursor-pointer">{t("patch.publish.title")}</summary>
-								<div className="mt-3 space-y-3">
-									<label className="block text-body">
-										{t("patch.publish.rjCode")}
-										<input value={rjCode} onChange={(e) => { rjEdited.current = true; setRjCode(e.target.value); }} className="block w-full mt-1 p-2 border border-border rounded bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg" />
-									</label>
-									<label className="flex items-center gap-2 text-body cursor-pointer">
-										<input type="checkbox" checked={!detectId} onChange={(e) => setDetectId(!e.target.checked)} />
-										{t("patch.publish.noDetect")}
-									</label>
-									<label className="block text-body">
-										{t("patch.publish.gameVersion")}
-										<input value={gameVersion} onChange={(e) => setGameVersion(e.target.value)} className="block w-full mt-1 p-2 border border-border rounded bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg" />
-									</label>
-									<label className="flex items-center gap-2 text-body cursor-pointer">
-										<input type="checkbox" checked={createEntry} onChange={(e) => setCreateEntry(e.target.checked)} />
-										{t("patch.publish.createEntry")}
-									</label>
-									{createEntry && <div className="flex items-end gap-2">
-										<label className="flex-1 min-w-0 text-body">
-											{t("patch.publish.entryPath")}
-											<input value={entryPath} onChange={(e) => setEntryPathOverride(e.target.value)} className="block w-full mt-1 p-2 border border-border rounded bg-surface text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg" />
-										</label>
-										<button type="button" onClick={() => { void pickEntry(); }} title={t("common.browse")} aria-label={t("patch.publish.saveEntry")} className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded"><FolderOpen size={16} /></button>
-									</div>}
-								</div>
-							</details>
-
-							<button
-								onClick={handlePack}
-								disabled={
-									loading ||
-									applying ||
-									!canPackFromRecordings(recordings, languages)
-								}
-								className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50"
-							>
-								<Archive size={16} /> {t("patch.packBtn")}
-							</button>
-
-							{packResult && (
-								<div className="p-3 border border-success bg-success-muted rounded text-body space-y-1">
-									<div className="font-medium">
-										{t("patch.packed", {
-											id: packResult.patch_id,
-											version: packResult.patch_version,
-										})}
-									</div>
-									<div className="text-caption text-text-muted space-y-0.5">
-										<div>
-											{t("patch.packedStats", {
-												files: packResult.files_packed,
-												bytes: packResult.size_bytes,
-												tier: patchValue(packResult.tier),
-											})}
-										</div>
-										<div>
-											{t("patch.packedMeta", {
-												engine: packResult.engine,
-												language: packResult.language,
-											})}
-											{packResult.translated_strings != null &&
-												t("patch.packedStrings", {
-													count: packResult.translated_strings,
-												})}
-										</div>
-										<div className="break-all">{packResult.output_path}</div>
-									</div>
-									<div className="text-caption">
-										{t("patch.publish.identity", { code: packResult.game?.store_ids.dlsite ?? t("patch.publish.noCode"), count: packResult.game?.fingerprint_count ?? 0 })}
-									</div>
-									{packResult.entry_path && <div className="pt-2 space-y-2">
-										<p className="text-caption">{t("patch.publish.commandHint")}</p>
-										<pre className="text-caption whitespace-pre-wrap break-all select-text">{publishCommand(packResult.output_path, packResult.entry_path)}</pre>
-										<button type="button" onClick={() => { void copyPublishCommand(); }} className="px-3 py-1 bg-surface-muted text-text hover:bg-surface rounded text-caption">{t("common.copy")}</button>
-									</div>}
-									{packResult.messages?.map((m, i) => (
-										<div
-											key={i}
-											className="text-caption text-warning"
-										>
-											{m}
-										</div>
-									))}
-								</div>
-							)}
-
-							<p className="text-caption text-text-muted">
-								{t("patch.packHelp")}
-							</p>
-						</>
+						<PatchPackTab
+							t={t}
+							outputPath={outputPath}
+							setOutputPath={setOutputPath}
+							pickOutputZip={pickOutputZip}
+							languages={languages}
+							setLanguages={setLanguages}
+							recordings={recordings}
+							pristine={pristine}
+							setPristine={setPristine}
+							pristineRecordings={pristineRecordings}
+							initialBackupId={initialBackupId}
+							gamePath={gamePath}
+							defaultGamePath={defaultGamePath}
+							pristinePath={pristinePath}
+							setPristinePath={setPristinePath}
+							pickPristineFolder={pickPristineFolder}
+							rjCode={rjCode}
+							rjEdited={rjEdited}
+							setRjCode={setRjCode}
+							detectId={detectId}
+							setDetectId={setDetectId}
+							gameVersion={gameVersion}
+							setGameVersion={setGameVersion}
+							createEntry={createEntry}
+							setCreateEntry={setCreateEntry}
+							entryPath={entryPath}
+							setEntryPathOverride={setEntryPathOverride}
+							pickEntry={pickEntry}
+							handlePack={handlePack}
+							loading={loading}
+							applying={applying}
+							packResult={packResult}
+							patchValue={patchValue}
+							copyPublishCommand={copyPublishCommand}
+						/>
 					)}
 
 					{error && (

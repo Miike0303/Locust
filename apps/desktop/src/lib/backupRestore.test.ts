@@ -45,7 +45,11 @@ const hooks = registerHooks({
     return nextLoad(url, context);
   },
   resolve(specifier, context, nextResolve) {
-    if (context.parentURL?.endsWith("/pages/Settings.tsx")) {
+    const settingsSection = context.parentURL?.includes("/pages/settings/");
+    if (context.parentURL?.endsWith("/pages/Settings.tsx") || settingsSection) {
+      // Moved section dependencies retain the same lifecycle and API seams.
+      const stubSpecifier = settingsSection && specifier.startsWith("../../")
+        ? specifier.slice(3) : specifier;
       const stubs: Record<string, string> = {
         react: `const h=globalThis.__backupRestore;export const useState=initial=>h.state(initial);export const useMemo=fn=>fn();export const useEffect=()=>{};`,
         "@tanstack/react-query": `export const useQuery=()=>({data:globalThis.__backupRestore.listing,isPending:false,isError:false,refetch:()=>{}});export const useQueryClient=()=>({});`,
@@ -54,7 +58,7 @@ const hooks = registerHooks({
         "../stores/toastStore": `export const addToast=(...args)=>globalThis.__backupRestore.toasts.push(args);`,
         "../components/ConfirmDialog": `export default function ConfirmDialog(){return null;}`,
       };
-      if (stubs[specifier]) return { url: `data:text/javascript,${encodeURIComponent(stubs[specifier])}`, shortCircuit: true };
+      if (stubs[stubSpecifier]) return { url: `data:text/javascript,${encodeURIComponent(stubs[stubSpecifier])}`, shortCircuit: true };
     }
     return nextResolve(specifier, context);
   },

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import PatchApplyTab from "./patch/PatchApplyTab";
+import PatchPackTab from "./patch/PatchPackTab";
 import { after, test } from "node:test";
 import { registerHooks } from "node:module";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -106,6 +108,7 @@ after(() => {
 function nodes(node: any): any[] {
   if (!node || typeof node !== "object") return [];
   if (Array.isArray(node)) return node.flatMap(nodes);
+  if (node.type === PatchApplyTab || node.type === PatchPackTab) return nodes(node.type(node.props));
   return [node, ...nodes(node.props?.children)];
 }
 function text(node: any): string {

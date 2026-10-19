@@ -14,7 +14,8 @@ const h = {
 (globalThis as any).__queueExecution = h;
 registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (context.parentURL?.endsWith("/components/TranslationModal.tsx")) {
+    if (context.parentURL?.endsWith("/components/TranslationModal.tsx") ||
+        context.parentURL?.endsWith("/lib/useTranslationSettings.ts")) {
       const stubs: Record<string, string> = {
         react: `export const useState=x=>[typeof x==='function'?x():x,()=>{}]; export const useEffect=()=>{}; export const useRef=x=>({current:x});`,
         "@tanstack/react-query": `export const useQuery=()=>({});`,

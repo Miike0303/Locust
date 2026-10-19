@@ -1,3 +1,4 @@
+import { useTranslationSettings } from "../lib/useTranslationSettings";
 import { localizeApiError } from "../lib/apiError";
 import { formatObservedCost } from "../lib/translationCost";
 import { useState, useEffect, useRef } from "react";
@@ -41,7 +42,7 @@ import {
 	operationalShortcutTarget,
 	type OperationalShortcut,
 } from "../lib/settingsNav";
-import { resolveProviderReadiness, formatProviderOptionLabel } from "../lib/providerReadiness";
+import { formatProviderOptionLabel } from "../lib/providerReadiness";
 import { useLocale, useT } from "../lib/i18n";
 
 interface TranslationModalProps {
@@ -88,10 +89,6 @@ export default function TranslationModal({
 	const [providerId, setProviderId] = useState("");
 	const [sourceLang, setSourceLang] = useState("auto");
 	const [targetLang, setTargetLang] = useState("es");
-	const [fallbackIds, setFallbackIds] = useState<string[]>(() =>
-		readTranslationFallbacks(),
-	);
-	const [fallbackPick, setFallbackPick] = useState("");
 	const [batchSize, setBatchSize] = useState<number | undefined>(undefined);
 	const [maxConcurrent, setMaxConcurrent] = useState<number | undefined>(undefined);
 	const [costLimit, setCostLimit] = useState("");
@@ -135,11 +132,12 @@ export default function TranslationModal({
 		setFallbackIds(readTranslationFallbacks());
 	}, [open, config, configFetched, configError, providers, sampleSources, locale]);
 
-	// If the current provider id is missing or not ready, fall back to the first ready one.
-	useEffect(() => {
-		if (!providers || providers.length === 0) return;
-		setProviderId((prev) => coerceProviderId(prev, providers, config));
-	}, [providers, config]);
+	const {
+		fallbackIds, setFallbackIds, fallbackPick, setFallbackPick,
+		addFallback, removeFallback, providerReadiness,
+	} = useTranslationSettings({
+		providerId, setProviderId, providers, config,
+	});
 
 	useEffect(() => {
 		setHealthResult(null);
@@ -159,21 +157,6 @@ export default function TranslationModal({
 		},
 		[],
 	);
-
-	const addFallback = () => {
-		if (
-			!fallbackPick ||
-			fallbackPick === providerId ||
-			fallbackIds.includes(fallbackPick)
-		)
-			return;
-		setFallbackIds((prev) => [...prev, fallbackPick]);
-		setFallbackPick("");
-	};
-
-	const removeFallback = (id: string) => {
-		setFallbackIds((prev) => prev.filter((x) => x !== id));
-	};
 
 	const handleStart = async () => {
 		// Persist last-used selection for next time
@@ -253,11 +236,6 @@ export default function TranslationModal({
 		navigate(operationalShortcutTarget(shortcut).path);
 	};
 
-	const providerReadiness = resolveProviderReadiness(
-		providerId,
-		providers,
-		config,
-	);
 
 	const handleTestConnection = async () => {
 		if (!providerId || testingHealth) return;

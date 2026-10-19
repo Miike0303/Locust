@@ -23,7 +23,11 @@ const files = [
 ] as const;
 
 for (const file of files) {
-  const source = readFileSync(new URL(file, import.meta.url), "utf8");
+  const sources: string[] = [file];
+  if (file === "../components/PatchModal.tsx") {
+    sources.push("../components/patch/PatchApplyTab.tsx", "../components/patch/PatchPackTab.tsx");
+  }
+  const source = sources.map(path => readFileSync(new URL(path, import.meta.url), "utf8")).join("\n");
 
   test(`${file} has no loose gray palette utilities`, () => {
     const literals = source.match(/[\w:/-]*gray-[\w/.-]+/g) ?? [];
