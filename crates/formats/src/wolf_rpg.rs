@@ -27,15 +27,10 @@ impl WolfRpgPlugin {
         file_path: &Path,
     ) -> Vec<StringEntry> {
         let mut entries = Vec::new();
-        let mut seen = std::collections::HashSet::new();
         let regions = find_sjis_string_regions(bytes);
 
         for (idx, (offset, text)) in regions.into_iter().enumerate() {
             if text.chars().count() < MIN_STRING_LEN {
-                continue;
-            }
-            // Skip duplicates
-            if !seen.insert(text.clone()) {
                 continue;
             }
             // Skip strings that look like binary artifacts
@@ -239,7 +234,7 @@ impl FormatPlugin for WolfRpgPlugin {
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
         // Same resilience/perf posture as Unity/Unreal: identity skip, oversize
-        // skip (not hard fail), first-byte scan, capped pad/length noise.
+        // skip (not hard fail), source-slot validation, capped pad/length noise.
         let mut report = InjectionReport {
             skip_reasons: Default::default(),
             files_modified: 0,
@@ -250,7 +245,7 @@ impl FormatPlugin for WolfRpgPlugin {
         };
         let mut length_skipped = 0usize;
         let mut pad_noted = 0usize;
-        let mut find_missed = 0usize;
+        let mut target_missed = 0usize;
 
         // Group by file
         let mut by_file: HashMap<PathBuf, Vec<&StringEntry>> = HashMap::new();
@@ -316,7 +311,7 @@ impl FormatPlugin for WolfRpgPlugin {
                     continue;
                 }
 
-                // Identity: nothing to rewrite; skip the multi-MB scan.
+                // Identity: nothing to rewrite.
                 if trans_bytes.as_ref() == orig_bytes.as_ref() {
                     report.skip("unchanged", 1);
                     continue;
@@ -336,8 +331,17 @@ impl FormatPlugin for WolfRpgPlugin {
                     continue;
                 }
 
-                // Find original bytes in file and replace
-                if let Some(pos) = find_bytes(&bytes, &orig_bytes) {
+                // Only rewrite the recorded slot if it still contains the source.
+                let target = entry
+                    .metadata
+                    .get("byte_offset")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .and_then(|pos| {
+                        let end = pos.checked_add(orig_bytes.len())?;
+                        (bytes.get(pos..end)? == orig_bytes.as_ref()).then_some(pos)
+                    });
+                if let Some(pos) = target {
                     // Write translation bytes
                     bytes[pos..pos + trans_bytes.len()].copy_from_slice(&trans_bytes);
                     // Pad remaining with null bytes
@@ -357,13 +361,13 @@ impl FormatPlugin for WolfRpgPlugin {
                     report.strings_written += 1;
                     modified = true;
                 } else {
-                    if find_missed < 5 {
+                    if target_missed < 5 {
                         report.warnings.push(format!(
                             "could not find original bytes for '{}' in file",
                             entry.id
                         ));
                     }
-                    find_missed += 1;
+                    target_missed += 1;
                     report.skip("target_missing", 1);
                 }
             }
@@ -385,30 +389,6 @@ impl FormatPlugin for WolfRpgPlugin {
 
         Ok(report)
     }
-}
-
-/// Locate `needle` in `haystack`. Prefer scanning for the first byte before
-/// full compares — Wolf data files can be multi‑MB; naive windows() over every
-/// offset dominates inject the same way it did for Unity/Unreal.
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    let first = needle[0];
-    let nlen = needle.len();
-    let mut i = 0;
-    let end = haystack.len() - nlen + 1;
-    while i < end {
-        if haystack[i] != first {
-            i += 1;
-            continue;
-        }
-        if &haystack[i..i + nlen] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Build a minimal test fixture: a binary blob with embedded Shift-JIS strings
@@ -450,6 +430,161 @@ pub fn build_test_fixture() -> Vec<u8> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn build_null_separated_sjis_fixture(strings: &[&str]) -> Vec<u8> {
+        let mut bytes = vec![0; 16];
+        for text in strings {
+            let (encoded, _, had_errors) = encoding_rs::SHIFT_JIS.encode(text);
+            assert!(!had_errors);
+            bytes.extend_from_slice(&encoded);
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a3_wolf_repeated_slots_extract_and_inject() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("BasicData.wolf");
+        let bytes = build_null_separated_sjis_fixture(&["はい", "はい"]);
+        fs::write(&path, &bytes).unwrap();
+        let plugin = WolfRpgPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.source == "はい"));
+        assert_eq!(entries[0].metadata["byte_offset"].as_u64(), Some(16));
+        assert_eq!(entries[1].metadata["byte_offset"].as_u64(), Some(21));
+        assert_eq!(entries[0].id, "BasicData.wolf#offset_16#0");
+        assert_eq!(entries[1].id, "BasicData.wolf#offset_21#1");
+
+        entries[0].translation = Some("ええ".to_string());
+        entries[1].translation = Some("うん".to_string());
+        // Injection order must not decide which physical slot is rewritten.
+        entries.reverse();
+        let report = plugin.inject(&path, &entries).unwrap();
+
+        assert_eq!(report.strings_written, 2);
+        assert_eq!(report.strings_skipped, 0);
+        assert_eq!(report.files_modified, 1);
+        assert_eq!(report.files_written, vec![path.clone()]);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            build_null_separated_sjis_fixture(&["ええ", "うん"])
+        );
+    }
+
+    #[test]
+    fn a3_wolf_inject_substring_collision_preserves_earlier_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("BasicData.wolf");
+        let bytes = build_null_separated_sjis_fixture(&["はいいいえ", "はい"]);
+        fs::write(&path, &bytes).unwrap();
+        let plugin = WolfRpgPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        let mut entry = entries.pop().unwrap();
+        assert_eq!(entry.source, "はい");
+        assert_eq!(entry.metadata["byte_offset"].as_u64(), Some(27));
+        entry.translation = Some("否".to_string());
+
+        let report = plugin.inject(&path, &[entry]).unwrap();
+
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(report.strings_skipped, 0);
+        assert_eq!(report.files_modified, 1);
+        let injected = fs::read(&path).unwrap();
+        assert_eq!(&injected[..27], &bytes[..27]);
+        let (translation, _, had_errors) = encoding_rs::SHIFT_JIS.encode("否");
+        assert!(!had_errors);
+        assert_eq!(&injected[27..29], translation.as_ref());
+        assert_eq!(&injected[29..], &[0, 0, 0]);
+        assert_eq!(injected.len(), bytes.len());
+    }
+
+    #[test]
+    fn a3_wolf_inject_offset_mismatch_skips_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("BasicData.wolf");
+        let bytes = build_null_separated_sjis_fixture(&["うん", "はい"]);
+        fs::write(&path, &bytes).unwrap();
+        let plugin = WolfRpgPlugin::new();
+        let mut entry = plugin.extract(&path).unwrap().pop().unwrap();
+        assert_eq!(entry.source, "はい");
+        entry.translation = Some("ええ".to_string());
+        entry
+            .metadata
+            .insert("byte_offset".to_string(), serde_json::json!(16));
+
+        let report = plugin.inject(&path, &[entry]).unwrap();
+
+        assert_eq!(report.strings_written, 0);
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(report.skip_reasons, [("target_missing".into(), 1)].into());
+        assert_eq!(report.files_modified, 0);
+        assert!(report.files_written.is_empty());
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a3_wolf_inject_missing_or_invalid_offsets_skip_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("BasicData.wolf");
+        let bytes = build_null_separated_sjis_fixture(&["はい"]);
+        fs::write(&path, &bytes).unwrap();
+        let plugin = WolfRpgPlugin::new();
+        let mut entry = plugin.extract(&path).unwrap().pop().unwrap();
+        entry.translation = Some("ええ".to_string());
+
+        for offset in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("16")),
+            Some(serde_json::json!(-1)),
+            Some(serde_json::json!(20)), // Original would extend past EOF.
+            Some(serde_json::json!(21)), // Exactly at EOF.
+            Some(serde_json::json!(22)), // Beyond EOF.
+            Some(serde_json::json!(u64::MAX)), // Conversion/addition must not overflow.
+        ] {
+            entry.metadata.remove("byte_offset");
+            if let Some(offset) = &offset {
+                entry.metadata.insert("byte_offset".into(), offset.clone());
+            }
+            let report = plugin.inject(&path, std::slice::from_ref(&entry)).unwrap();
+
+            assert_eq!(report.strings_written, 0, "offset: {offset:?}");
+            assert_eq!(report.strings_skipped, 1, "offset: {offset:?}");
+            assert_eq!(report.skip_reasons, [("target_missing".into(), 1)].into());
+            assert_eq!(report.files_modified, 0);
+            assert!(report.files_written.is_empty());
+            assert_eq!(report.warnings.len(), 1);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn a3_wolf_extract_unique_regions_keep_existing_ids() {
+        // Include rejected regions so the IDs retain the original enumeration.
+        let bytes = build_null_separated_sjis_fixture(&["あ", "はい", "123!", "勇者", "Magic"]);
+        let entries = WolfRpgPlugin::extract_strings_heuristic(
+            &bytes,
+            "BasicData.wolf",
+            Path::new("BasicData.wolf"),
+        );
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "BasicData.wolf#offset_19#0",
+                "BasicData.wolf#offset_29#1",
+                "BasicData.wolf#offset_34#2",
+            ]
+        );
+    }
 
     #[test]
     fn c123_named_skips_cover_all_wolf_rejections() {
