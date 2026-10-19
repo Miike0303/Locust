@@ -1,6 +1,6 @@
 # Current task index
 
-Reconciled 2026-10-16 from all 14 task ledgers (13 prior ledgers plus reconciliation). Start here, then read the owning ledger's current summary and evidence. Historical Specs, Logs, failures and user quotes remain authoritative history, not a second backlog. This is a documentary reconciliation, not fresh product/runtime verification.
+Reconciled 2026-10-16 from the 14 task ledgers then present; updated 2026-10-19 to the 18 tracked ledgers listed below (one private operation ledger is excluded from Git and intentionally not listed). Start here, then read the owning ledger's current summary and evidence. Historical Specs, Logs, failures and user quotes remain authoritative history, not a second backlog. This is a documentary reconciliation, not fresh product/runtime verification.
 
 ## Evidence and state
 
@@ -23,6 +23,8 @@ Reconciled 2026-10-16 from all 14 task ledgers (13 prior ledgers plus reconcilia
 | [Shared UTF-16 length](tasks/shared-utf16-byte-length.md) | U16-1..3 complete; delivered `65df314` | Evidence, CI37558334740; helper `4ec953c`/CI37994441064 in [product Done](../docs/IMPROVEMENT-GOAL.md); Recorded | No unit remainder; equivalent helper and runner follow-ups delivered, non-equivalent helpers intentionally separate. |
 | [Windows tag CI](tasks/windows-tag-ci.md) | WCI tasks complete; delivered `027b82e` | Acceptance, CI37547390292; Recorded | No CI unit remainder; ignored tests not run, native/game QA not implied. |
 | [YU-RIS Unicode runtime](tasks/yuris-unicode-runtime.md) | Partial/blocked: UNI-0/1 delivered; UNI-S blocked, UNI-2/3 pending | UNI-1 `4257bac`/CI38651084477; UNI-S independent exit1/error183; Recorded | Private-station/actual token/filesystem/registry/network containment unproved; bootstrap/measurement mismatch, atomic bundle, engine/live Spanish compatibility unresolved. No game launched or proxy installed; synthetic Unicode proof is not engine support. |
+| [Autonomous safe queue](tasks/autonomous-safe-queue.md) | Q1..Q3 complete; sources delivered through main `eddbab8` | Q1 `f4716c2`, Q2 `df91f00`, Q3 `05a6985`; Recorded | No queue remainder; owners stay the pipeline and native-VN ledgers. |
+| [Day plan 2026-10-19](tasks/day-plan-2026-10-19.md) | Active local queue: A1..A4 committed locally (`043bd4d`, `d74cdb4`, `61a57ef`, `a90d6be`), not delivered | Parent reruns: formats/core/server/cli 2462/0/23 after A3; Recorded in L4..L8 | Phases B..F pending; phase G links blocked owners. No push or PR yet. |
 | [Task-state reconciliation](tasks/task-state-reconciliation.md) | R1..R4 complete; delivered `248554f` | L3/L4: worker 14-owner/28-link structural check and parent full-diff readback; canonical Engram saved. Auxiliary ancestry check did not run; no fresh historical remote proof | CI38979914822 exact `248554f` passed check/check-windows; parent confirmed and delivered remote/local main (L6, job14exit0). Historical references remain documentary evidence, not reexecuted runtime checks. |
 
 ## Canonical remaining work
@@ -38,4 +40,4 @@ Reconciled 2026-10-16 from all 14 task ledgers (13 prior ledgers plus reconcilia
 - **Installed resource policy:** REL-4 structural Add confirmation remains separate from successful Replace and Godot outcomes.
 - **Reconciliation:** R1..R4 complete, including exact-candidate delivery; no remaining task in this work unit. Visible session todos must project these owners, not reopen historical follow-ups.
 
-Ten ledgers have completed bounded outcomes (including reconciliation); four retain partial/deferred/blocked outcomes. Wider product backlog stays in [IMPROVEMENT-GOAL](../docs/IMPROVEMENT-GOAL.md); coverage limits above are not authorization for new work.
+Twelve ledgers have completed bounded outcomes (including reconciliation and the autonomous safe queue); five retain partial/deferred/blocked outcomes; the day plan is an active local queue. Wider product backlog stays in [IMPROVEMENT-GOAL](../docs/IMPROVEMENT-GOAL.md); coverage limits above are not authorization for new work.

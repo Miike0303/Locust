@@ -1,6 +1,6 @@
 # Architecture
 
-Map at the observed `main` checkpoint `fe9d7b0`, a documentation-only closeout of hosted-tested source `530d705`. Start with the [improvement ledger](IMPROVEMENT-GOAL.md), especially its latest **Done** entry and backlog; dated handoffs are historical evidence, not the current queue. Code is authoritative when this map disagrees; this snapshot is not a promise about later changes.
+Map at the observed `main` checkpoint `fe9d7b0`, a documentation-only closeout of hosted-tested source `530d705`. Start with the [improvement ledger](IMPROVEMENT-GOAL.md), especially its latest **Done** entry and backlog; dated handoffs are historical evidence, not the current queue. Code is authoritative when this map disagrees; this snapshot is not a promise about later changes. Later state: v0.2.0 source is on `main` at `eddbab8` ([release ledger](../odd/tasks/release-v0.2.0.md)); the 2026-10-19 [project report](PROJECT-REPORT-2026-10-19.md) has current counts.
 
 ## What it is
 
@@ -8,7 +8,7 @@ A game-translation tool: **extract** strings from a game into a per-game SQLite 
 
 ## Workspace
 
-Six Cargo members (`Cargo.toml:2-9`), workspace package version **0.1.0** (`Cargo.toml:13`):
+Six Cargo members (`Cargo.toml:2-9`), workspace package version **0.2.0** (`Cargo.toml:13`):
 
 | Crate | Role | Entry |
 |---|---|---|

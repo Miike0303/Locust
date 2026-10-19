@@ -39,7 +39,7 @@ BATCH13: 1439 Rust tests passed, 17 ignored; fmt, strict Clippy, release CLI/des
 
 ## Latest continuation (2026-09-17)
 
-User explicitly resumed work. Session drafts now survive DetailPanel unmount, row changes and route navigation, scoped by project database/game/format/entry. Shared pending writes/errors survive remount; server acknowledgment cannot clear newer text. Editor query keys include project scope; queue preserves database_path and extraction warnings. See `docs/CONTINUATION-2026-09-17.md` and `tmp/continuation-20260917/` for current evidence: 29 frontend test files, production build and real-backend headless UI flows pass. Drafts are in memory only, not persisted across app reload/exit. Prior Rust/matrix totals below were not rerun for this frontend change. Do not revive the old timed goal.
+User explicitly resumed work. Session drafts now survive DetailPanel unmount, row changes and route navigation, scoped by project database/game/format/entry. Shared pending writes/errors survive remount; server acknowledgment cannot clear newer text. Editor query keys include project scope; queue preserves database_path and extraction warnings. See `docs/CONTINUATION-2026-09-17.md` and `tmp/continuation-20260917/` for current evidence: 29 frontend test files, production build and real-backend headless UI flows pass. Drafts were in memory only at that date; current code persists them in localStorage (`apps/desktop/src/lib/draftPersistence.ts`). Prior Rust/matrix totals below were not rerun for this frontend change. Do not revive the old timed goal.
 
 ## Latest engine verification (2026-09-12, Astra continuation)
 
