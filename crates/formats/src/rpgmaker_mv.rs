@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use locust_core::backup::RevisionOriginal;
 use locust_core::encoding::EncodingDetector;
 use locust_core::error::{LocustError, Result};
-use locust_core::extraction::{FormatPlugin, InjectionReport};
+use locust_core::extraction::{Extraction, FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 const ARRAY_FILES: &[&str] = &[
@@ -1519,7 +1519,10 @@ impl RpgMakerMvPlugin {
     }
 
     /// Extract all Iavra multi-packs for the preferred source language.
-    fn extract_iavra_packs(data_dir: &Path) -> Result<Vec<StringEntry>> {
+    fn extract_iavra_packs(
+        data_dir: &Path,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<StringEntry>> {
         let packs = Self::list_iavra_packs(data_dir)?;
         if packs.is_empty() {
             return Ok(Vec::new());
@@ -1549,6 +1552,10 @@ impl RpgMakerMvPlugin {
                 }
                 Err(e) => {
                     tracing::warn!("Failed Iavra pack {}: {}", path.display(), e);
+                    warnings.push(format!(
+                        "skipped Iavra pack {}: {e}",
+                        path.strip_prefix(data_dir).unwrap_or(&path).display()
+                    ));
                 }
             }
         }
@@ -1880,15 +1887,25 @@ impl FormatPlugin for RpgMakerMvPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        Ok(self.extract_with_diagnostics(path)?.entries)
+    }
+
+    fn extract_with_diagnostics(&self, path: &Path) -> Result<Extraction> {
         if path.is_file() {
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            if Self::is_iavra_lang_pack_name(name) {
-                return Self::extract_iavra_pack_file(path);
-            }
-            return Self::extract_file(path);
+            let entries = if Self::is_iavra_lang_pack_name(name) {
+                Self::extract_iavra_pack_file(path)?
+            } else {
+                Self::extract_file(path)?
+            };
+            return Ok(Extraction {
+                complete: true,
+                entries,
+                warnings: Vec::new(),
+            });
         }
 
         let data_dir = Self::find_data_dir(path).ok_or_else(|| LocustError::ParseError {
@@ -1909,13 +1926,18 @@ impl FormatPlugin for RpgMakerMvPlugin {
         }
 
         let mut all_entries = Vec::new();
+        let mut warnings = Vec::new();
 
         // Iavra multi-pack first: these hold the real player-facing strings when
         // maps only store {{keys}}. Prefer source lang `en`, else first available.
-        match Self::extract_iavra_packs(&data_dir) {
+        match Self::extract_iavra_packs(&data_dir, &mut warnings) {
             Ok(entries) => all_entries.extend(entries),
             Err(e) => {
                 tracing::warn!("Iavra pack extract skipped: {}", e);
+                warnings.push(format!(
+                    "skipped Iavra packs in {}: {e}",
+                    data_dir.strip_prefix(path).unwrap_or(&data_dir).display()
+                ));
             }
         }
 
@@ -1928,13 +1950,21 @@ impl FormatPlugin for RpgMakerMvPlugin {
                         Ok(entries) => all_entries.extend(entries),
                         Err(e) => {
                             tracing::warn!("Failed to extract {}: {}", file_path.display(), e);
+                            warnings.push(format!(
+                                "skipped database file {}: {e}",
+                                file_path.strip_prefix(path).unwrap_or(&file_path).display()
+                            ));
                         }
                     }
                 }
             }
         }
 
-        Ok(all_entries)
+        Ok(Extraction {
+            complete: warnings.is_empty(),
+            entries: all_entries,
+            warnings,
+        })
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
@@ -3907,6 +3937,66 @@ mod tests {
         assert_eq!(dialogue.source, "Hello hero.");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_diagnostics_warns_on_iavra_and_database_failures() {
+        let dir = temp_game_dir();
+        let data = dir.path().join("data");
+        write_jsono(&data.join("lang_g_en.jsono"), r#"{"yes":"Yes"}"#);
+        // Unknown databases and non-source languages are intentionally skipped.
+        fs::write(data.join("Unknown.json"), "not JSON").unwrap();
+        fs::write(data.join("lang_g_jp.jsono"), "not a pack").unwrap();
+        let plugin = RpgMakerMvPlugin::new();
+        let clean = plugin.extract_with_diagnostics(dir.path()).unwrap();
+        assert!(clean.complete);
+        assert!(clean.warnings.is_empty());
+        assert!(clean
+            .entries
+            .iter()
+            .any(|e| e.id.starts_with("Actors.json#")));
+        assert!(clean.entries.iter().any(|e| e.id == "lang_g_en.jsono#yes"));
+
+        let corrupt_pack = data.join("lang_h_en.jsono");
+        write_jsono(&corrupt_pack, "[");
+        assert!(plugin.extract_with_diagnostics(&corrupt_pack).is_err());
+        let partial = plugin.extract_with_diagnostics(dir.path()).unwrap();
+        assert_eq!(
+            partial
+                .entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>(),
+            clean
+                .entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
+        );
+        assert!(!partial.complete);
+        assert_eq!(partial.warnings.len(), 1);
+        assert!(partial.warnings[0].contains("lang_h_en.jsono"));
+
+        fs::write(data.join("Map999.json"), "not JSON").unwrap();
+        fs::create_dir(data.join("Map998.json")).unwrap();
+        let partial = plugin.extract_with_diagnostics(dir.path()).unwrap();
+        assert_eq!(
+            partial
+                .entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>(),
+            clean
+                .entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
+        );
+        assert!(!partial.complete);
+        assert_eq!(partial.warnings.len(), 3);
+        for name in ["lang_h_en.jsono", "Map999.json", "Map998.json"] {
+            assert!(partial.warnings.iter().any(|w| w.contains(name)), "{name}");
+        }
     }
 
     #[test]

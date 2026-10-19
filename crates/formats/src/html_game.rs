@@ -6,7 +6,7 @@ mod slots;
 use std::path::{Path, PathBuf};
 
 use locust_core::error::{LocustError, Result};
-use locust_core::extraction::{FormatPlugin, InjectionReport};
+use locust_core::extraction::{Extraction, FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 /// Plugin for generic HTML-based games (non-SugarCube).
@@ -158,6 +158,10 @@ impl FormatPlugin for HtmlGamePlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        Ok(self.extract_with_diagnostics(path)?.entries)
+    }
+
+    fn extract_with_diagnostics(&self, path: &Path) -> Result<Extraction> {
         let files = Self::find_html_files(path);
         if files.is_empty() {
             return Err(LocustError::ParseError {
@@ -167,17 +171,35 @@ impl FormatPlugin for HtmlGamePlugin {
         }
 
         let mut all_entries = Vec::new();
+        let mut warnings = Vec::new();
         for file in &files {
-            if let Ok(content) = std::fs::read_to_string(file) {
-                if Self::is_sugarcube(&content) {
-                    continue;
+            match std::fs::read_to_string(file) {
+                Ok(content) => {
+                    if Self::is_sugarcube(&content) {
+                        continue;
+                    }
+                    let entries = Self::extract_from_html(&content, file);
+                    all_entries.extend(entries);
                 }
-                let entries = Self::extract_from_html(&content, file);
-                all_entries.extend(entries);
+                Err(e) => {
+                    let base = if path.is_dir() {
+                        path
+                    } else {
+                        path.parent().unwrap_or(path)
+                    };
+                    warnings.push(format!(
+                        "skipped unreadable HTML file {}: {e}",
+                        file.strip_prefix(base).unwrap_or(file).display()
+                    ));
+                }
             }
         }
 
-        Ok(all_entries)
+        Ok(Extraction {
+            complete: warnings.is_empty(),
+            entries: all_entries,
+            warnings,
+        })
     }
 
     fn prepare_revision_entries(
@@ -524,6 +546,36 @@ fn html_encode_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_extract_diagnostics_warns_on_invalid_utf8_html() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("game.html"), "<p>Hello traveler</p>").unwrap();
+        let plugin = HtmlGamePlugin::new();
+        let clean = plugin.extract_with_diagnostics(dir.path()).unwrap();
+        assert!(clean.complete);
+        assert!(clean.warnings.is_empty());
+        assert!(clean.entries.iter().any(|e| e.source == "Hello traveler"));
+
+        fs::write(dir.path().join("broken.html"), [0xff, 0xfe]).unwrap();
+        let partial = plugin.extract_with_diagnostics(dir.path()).unwrap();
+        assert_eq!(
+            partial
+                .entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>(),
+            clean
+                .entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
+        );
+        assert!(!partial.complete);
+        assert_eq!(partial.warnings.len(), 1);
+        assert!(partial.warnings[0].contains("broken.html"));
+        assert!(partial.warnings[0].contains("UTF-8"));
+    }
+
     #[test]
     fn revision_refuses_mutated_original_before_retargeting_html() {
         let dir = tempfile::tempdir().unwrap();

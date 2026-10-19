@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use locust_core::backup::RevisionOriginal;
 use locust_core::error::{LocustError, Result};
-use locust_core::extraction::{FormatPlugin, InjectionReport};
+use locust_core::extraction::{Extraction, FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 use crate::discovery::find_capital_data_dir;
@@ -1553,6 +1553,10 @@ impl FormatPlugin for RpgMakerVxaPlugin {
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        Ok(self.extract_with_diagnostics(path)?.entries)
+    }
+
+    fn extract_with_diagnostics(&self, path: &Path) -> Result<Extraction> {
         if path.is_file() {
             let bytes = std::fs::read(path)?;
             let root = MarshalValue::parse(&bytes)?;
@@ -1561,7 +1565,11 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            return Ok(Self::extract_root(&filename, &root, path));
+            return Ok(Extraction {
+                complete: true,
+                entries: Self::extract_root(&filename, &root, path),
+                warnings: Vec::new(),
+            });
         }
 
         let data_dir = find_capital_data_dir(path).ok_or_else(|| LocustError::ParseError {
@@ -1570,6 +1578,7 @@ impl FormatPlugin for RpgMakerVxaPlugin {
         })?;
 
         let mut all = Vec::new();
+        let mut warnings = Vec::new();
         for entry in std::fs::read_dir(&data_dir)? {
             let entry = entry?;
             let fpath = entry.path();
@@ -1586,11 +1595,19 @@ impl FormatPlugin for RpgMakerVxaPlugin {
                     }
                     Err(e) => {
                         tracing::warn!("Failed to parse {}: {}", fpath.display(), e);
+                        warnings.push(format!(
+                            "skipped invalid Marshal file {}: {e}",
+                            fpath.strip_prefix(path).unwrap_or(&fpath).display()
+                        ));
                     }
                 }
             }
         }
-        Ok(all)
+        Ok(Extraction {
+            complete: warnings.is_empty(),
+            entries: all,
+            warnings,
+        })
     }
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
@@ -1794,6 +1811,36 @@ mod tests {
         let bytes = build_test_fixture();
         fs::write(data_dir.join("Actors.rvdata2"), &bytes).unwrap();
         dir_guard
+    }
+
+    #[test]
+    fn test_extract_diagnostics_warns_on_corrupt_marshal() {
+        let dir = create_vxa_fixture();
+        let plugin = RpgMakerVxaPlugin::new();
+        let clean = plugin.extract_with_diagnostics(dir.path()).unwrap();
+        assert!(clean.complete);
+        assert!(clean.warnings.is_empty());
+        assert!(clean.entries.iter().any(|e| e.source == "TestHero"));
+
+        let corrupt = dir.path().join("Data").join("Map999.rvdata2");
+        fs::write(&corrupt, b"not Marshal").unwrap();
+        assert!(plugin.extract_with_diagnostics(&corrupt).is_err());
+        let partial = plugin.extract_with_diagnostics(dir.path()).unwrap();
+        assert_eq!(
+            partial
+                .entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>(),
+            clean
+                .entries
+                .iter()
+                .map(|e| (&e.id, &e.source))
+                .collect::<Vec<_>>()
+        );
+        assert!(!partial.complete);
+        assert_eq!(partial.warnings.len(), 1);
+        assert!(partial.warnings[0].contains("Map999.rvdata2"));
     }
 
     fn make_cmd(code: i64, params: Vec<MarshalValue>) -> MarshalValue {
