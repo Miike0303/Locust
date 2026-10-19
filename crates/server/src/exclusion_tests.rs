@@ -1,4 +1,5 @@
 use super::*;
+use locust_core::models::StringEntry;
 
 #[test]
 fn terminal_publication_is_final_for_broadcast_and_replay() {

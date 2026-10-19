@@ -1,4 +1,8 @@
 use super::*;
+use crate::{create_test_state, start_test_server};
+use locust_core::backup::BackupManager;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 #[tokio::test]
 async fn c127_http_restore_returns_removed_and_kept_paths() {

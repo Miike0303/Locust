@@ -1,6 +1,11 @@
 //! HTTP entry points for recovery after interrupted translation insertion.
 use super::*;
+use crate::routes::patch::map_patch_err;
+use axum::extract::State;
+use axum::Json;
 use locust_core::injection_transaction::{self, InjectionRecoveryOptions};
+use serde::Deserialize;
+use std::path::PathBuf;
 
 fn map_recovery_error(error: locust_core::LocustError) -> ApiError {
     use locust_core::LocustError;
@@ -73,6 +78,7 @@ pub(super) async fn recover(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn recovery_refuses_project_conflict_before_accessing_path() {

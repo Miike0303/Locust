@@ -1,4 +1,5 @@
 use super::*;
+use locust_core::project::ProjectOpenOutcome;
 
 pub fn load_startup_config(path: &std::path::Path) -> (AppConfig, bool) {
     match AppConfig::load(path) {
@@ -72,6 +73,8 @@ pub async fn update_app_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::project::OpenProjectRequest;
+    use axum::{extract::State, Json};
 
     #[tokio::test]
     async fn unreadable_startup_config_stays_protected_after_repair_until_restart() {
