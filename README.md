@@ -181,6 +181,12 @@ cargo build --release -p locust-desktop
    - Desktop: Editor → **Patch** (Ctrl+Shift+P), or CLI below.
 9. Play your translated game.
 
+### Speaker workspace
+
+Open **Speakers** in the sidebar to see character names and row counts. Select a character to save or clear a project-specific note, or open their rows in the existing editor worklist. **Unassigned rows** also open in the editor; compiled dialogue without supported speaker evidence stays unassigned rather than guessing a character.
+
+Saved notes apply to the **next translation snapshot**, not an active job, and may be sent to the selected provider as character context. Providers may ignore context. Notes belong to the current project database, game and format; they do not rename characters or alter extracted speaker metadata.
+
 ### CLI sketch
 
 ```bash

@@ -12,6 +12,7 @@ import {
   pivotOpenDbTauriArgs,
 } from "./pivot";
 import { projectOpenHttpBody, projectOpenTauriArgs } from "./openProjectFlow";
+import type { SpeakerOwner, SpeakerGroups } from "./speakers";
 
 /** Tauri invoke that localizes stable English error bodies for UI toasts. */
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -591,6 +592,13 @@ export const getStats = (): Promise<ProjectStats> =>
 /** No IPC command: use the embedded server, as run history and memory do. */
 export const getFileStats = (): Promise<FileStats[]> =>
   request<{ files: FileStats[] }>("/stats/files").then(response => response.files);
+
+/** Speaker ownership guards are shared by the browser and embedded HTTP server. */
+export const getSpeakers = (owner: SpeakerOwner, signal?: AbortSignal): Promise<SpeakerGroups> =>
+  request(`/speakers?${new URLSearchParams({ ...owner })}`, { signal });
+
+export const saveSpeakerNote = (payload: SpeakerOwner & { speaker_id: string; note: string }): Promise<{ speaker_id: string; note: string }> =>
+  request("/speakers/note", { method: "PUT", body: JSON.stringify(payload) });
 
 /** QA uses the embedded HTTP server in desktop mode too. */
 export const getValidationIssues = (filter: ValidationIssueFilter = {}, signal?: AbortSignal): Promise<ValidationIssuesPage> => {

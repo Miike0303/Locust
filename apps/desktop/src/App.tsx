@@ -15,6 +15,7 @@ const Editor = lazy(() => import("./pages/Editor"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Review = lazy(() => import("./pages/Review"));
 const Qa = lazy(() => import("./pages/Qa"));
+const Speakers = lazy(() => import("./pages/Speakers"));
 const TranslationMemory = lazy(() => import("./pages/TranslationMemory"));
 
 export default function App() {
@@ -44,6 +45,7 @@ export default function App() {
           <Route path="/editor" element={<Editor />} />
           <Route path="/review" element={<Review />} />
           <Route path="/qa" element={<Qa />} />
+          <Route path="/speakers" element={<Speakers />} />
           <Route path="/memory" element={<TranslationMemory />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<NotFound />} />

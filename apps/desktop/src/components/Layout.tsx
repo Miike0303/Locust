@@ -9,6 +9,7 @@ import {
 	Database,
 	BookCheck,
 	ShieldCheck,
+	Users,
 	Keyboard,
 	ScrollText,
 	ListOrdered,
@@ -34,6 +35,7 @@ const navItems = [
 	{ to: "/editor", icon: FileText, labelKey: "nav.editor", shortcut: "Alt+2" },
 	{ to: "/review", icon: BookCheck, labelKey: "nav.review", shortcut: "Alt+3" },
 	{ to: "/qa", icon: ShieldCheck, labelKey: "nav.qa", shortcut: null },
+	{ to: "/speakers", icon: Users, labelKey: "nav.speakers", shortcut: null },
 	{ to: "/memory", icon: Database, labelKey: "nav.memory", shortcut: "Alt+4" },
 	{ to: "/settings", icon: Settings, labelKey: "nav.settings", shortcut: "Alt+5" },
 ] as const;
