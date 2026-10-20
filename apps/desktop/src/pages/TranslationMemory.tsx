@@ -115,7 +115,7 @@ function ProjectTranslationMemory({ projectScope }: { projectScope: string | nul
     return (
       <div className="flex flex-col h-full bg-surface text-text">
         <h1 className="px-6 py-4 border-b border-border text-page font-bold">{t("memory.title")}</h1>
-        <EmptyState title={t("memory.noProject.title")} description={t("memory.noProject.description")} />
+        <EmptyState title={t("memory.noProject.title")} description={t("memory.noProject.description")} actionLabel={t("common.goHome")} actionTo="/" />
       </div>
     );
   }

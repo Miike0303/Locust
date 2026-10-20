@@ -3,6 +3,7 @@ import { registerHooks } from "node:module";
 import { after, beforeEach, test } from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ProjectInfo } from "../lib/api.ts";
 import { setLocale, t } from "../lib/i18n/index.ts";
@@ -37,7 +38,7 @@ beforeEach(() => { client.clear(); h.project = null; setLocale("en"); });
 after(() => { client.clear(); hooks.deregister(); Reflect.deleteProperty(globalThis, "__memoryPageTest"); setLocale("en"); });
 
 function render() {
-  return renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(TranslationMemory)));
+  return renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(MemoryRouter, {}, createElement(TranslationMemory))));
 }
 function memoryQueries() {
   return client.getQueryCache().getAll().filter(query => String(query.queryKey[0]).startsWith("tm-"));

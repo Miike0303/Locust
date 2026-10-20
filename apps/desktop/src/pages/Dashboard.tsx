@@ -50,8 +50,7 @@ function ProjectDashboard({ projectKey, gamePath }: { projectKey: string; gamePa
     <div className="flex h-full flex-col bg-surface text-text">
       <header className="border-b border-border px-6 py-4">{heading}</header>
       <div className="flex flex-1 flex-col items-center gap-3 p-6">
-        <EmptyState title={t("dashboard.noProject.title")} description={t("dashboard.noProject.description")} />
-        <Link to="/" className="rounded text-body text-accent-fg underline focus-visible:ring-2 focus-visible:ring-accent-fg">{t("dashboard.home")}</Link>
+        <EmptyState title={t("dashboard.noProject.title")} description={t("dashboard.noProject.description")} actionLabel={t("common.goHome")} actionTo="/" />
       </div>
     </div>
   );

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, ShieldCheck } from "lucide-react";
 import { getValidationIssues, getValidationSummary, setValidationIssueIgnored, validate, type ProjectInfo } from "../lib/api";
@@ -70,7 +70,7 @@ function ProjectQa({ project, projectKey }: { project: ProjectInfo | null; proje
       <header className="space-y-4 border-b border-border px-6 py-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2"><ShieldCheck size={20} className="text-accent-fg" /><h1 className="text-page font-bold">{t("qa.title")}</h1></div>
-          <button type="button" className={ACTION} disabled={noProject || busy} onClick={() => { ignore.reset(); run.mutate(); }}>{t(run.isPending ? "qa.running" : "qa.run")}</button>
+          <button type="button" className={`${ACTION} disabled:cursor-not-allowed`} disabled={noProject || busy} onClick={() => { ignore.reset(); run.mutate(); }}>{t(run.isPending ? "qa.running" : "qa.run")}</button>
         </div>
         {!noProject && <div className="flex flex-wrap items-center gap-2" role="group" aria-label={t("qa.filterKind")}>
           <button type="button" className={chipClass(kind === undefined)} aria-pressed={kind === undefined} onClick={() => { setKind(undefined); setOffset(0); }}>{t("qa.all")} ({summary.open})</button>
@@ -80,7 +80,7 @@ function ProjectQa({ project, projectKey }: { project: ProjectInfo | null; proje
       </header>
       {actionError && <div role="alert" className="px-6 py-3 text-body text-danger">{t("qa.actionError")} {actionError.message}</div>}
       <div className="flex-1 overflow-auto">
-        {noProject ? <div className="flex flex-col items-center gap-3 p-6"><EmptyState title={t("qa.noProject.title")} description={t("qa.noProject.description")} /><Link to="/" className="text-body text-accent-fg underline">{t("qa.home")}</Link></div>
+        {noProject ? <EmptyState title={t("qa.noProject.title")} description={t("qa.noProject.description")} actionLabel={t("common.goHome")} actionTo="/" />
           : failed ? <div role="alert" className="m-6 space-y-3 rounded-lg border border-border bg-surface p-4 text-center"><p className="text-danger">{t("qa.loadError")}</p><p className="text-body text-text-muted">{failed.error?.message}</p><button type="button" className={ACTION} onClick={() => { void refresh(); }}>{t("common.retry")}</button></div>
           : queries.some(q => q.isPending) ? <p role="status" className="p-6 text-body text-text-muted">{t("common.loading")}</p>
           : !data?.issues.length ? <EmptyState title={t(includeIgnored ? "qa.emptyAll" : "qa.empty")} description={t("qa.emptyDescription")} />

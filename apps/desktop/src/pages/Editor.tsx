@@ -542,8 +542,8 @@ export default function Editor() {
 					<EmptyState
 						title={t("editor.empty.title")}
 						description={t("editor.empty.description")}
-						actionLabel={t("editor.empty.action")}
-						onAction={() => navigate("/")}
+						actionLabel={t("common.goHome")}
+						actionTo="/"
 					/>
 				) : stringsLoading ? (
 					<div className="flex flex-1 items-center justify-center text-text-muted">

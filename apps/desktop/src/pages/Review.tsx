@@ -230,12 +230,17 @@ export default function Review() {
 
   if (!project) {
     return (
-      <EmptyState
-        title={t("editor.empty.title")}
-        description={t("editor.empty.description")}
-        actionLabel={t("editor.empty.action")}
-        onAction={() => navigate("/")}
-      />
+      <div className="flex h-full flex-col bg-surface text-text">
+        <header className="border-b border-border px-6 py-4">
+          <h1 className="text-page font-bold">{t("nav.review")}</h1>
+        </header>
+        <EmptyState
+          title={t("editor.empty.title")}
+          description={t("editor.empty.description")}
+          actionLabel={t("common.goHome")}
+          actionTo="/"
+        />
+      </div>
     );
   }
 

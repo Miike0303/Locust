@@ -110,7 +110,7 @@ for (const locale of ["en", "es"] as const) {
   });
   test(`${locale}: no project, missing ownership, empty and loading states`, () => {
     setLocale(locale); h.project = null;
-    assert.ok(html().includes(t("speakers.noProject")));
+    assert.ok(html().includes(t("editor.empty.title")));
     assert.equal(h.queries[h.queries.length - 1].enabled, false);
     h.project = { ...project, database_path: undefined };
     assert.ok(html().includes(t("speakers.reopen")));

@@ -106,6 +106,12 @@ function ProjectSpeakers({ project, projectKey }: { project: ProjectInfo | null;
   const group = query.data?.groups.find(g => g.id === selected);
   const note = group ? reconcileNote(group.note, notes[group.id]) : null;
   const unassigned = query.data?.unassigned_entry_ids ?? [];
+  if (!project) return <div className="flex h-full flex-col bg-surface text-text">
+    <header className="border-b border-border px-6 py-4">
+      <h1 className="text-page font-bold">{t("speakers.title")}</h1>
+    </header>
+    <EmptyState title={t("editor.empty.title")} description={t("speakers.openProject")} actionLabel={t("common.goHome")} actionTo="/" />
+  </div>;
   return <div className="flex h-full flex-col bg-surface text-text">
     <header className="space-y-2 border-b border-border px-6 py-4">
       <h1 className="text-page font-bold">{t("speakers.title")}</h1>
