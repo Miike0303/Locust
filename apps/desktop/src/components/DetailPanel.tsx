@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import clsx from "clsx";
+import { useQueryClient } from "@tanstack/react-query";
 import type { StringEntry, StringStatus } from "../lib/api";
 import { encodedByteLen, getString, patchString } from "../lib/api";
 import { binaryBudgetHint } from "../lib/binaryBudget";
 import { useT } from "../lib/i18n";
-import { acknowledgeDraft, draftAlternatives, selectDraftAlternative, draftEntryKey, draftProjectKey, editDraft, loadLatestDraft, saveDraft, useDraftStore } from "../stores/draftStore";
+import { acknowledgeDraft, draftAlternatives, selectDraftAlternative, draftEntryKey, draftProjectKey, editDraft, loadLatestDraft, restoreDraft, saveDraft, useDraftStore } from "../stores/draftStore";
 import { useProjectStore } from "../stores/projectStore";
+import StringHistory from "./StringHistory";
 
 import type { MessageKey } from "../lib/i18n";
 
@@ -44,6 +46,7 @@ export default function DetailPanel({
 	onClose,
 }: DetailPanelProps) {
 	const t = useT();
+	const queryClient = useQueryClient();
 	const draftKey = draftEntryKey(projectKey, entry.id);
 	const draft = useDraftStore((state) => state.drafts[draftKey]);
 	const records = useDraftStore((state) => state.records);
@@ -66,15 +69,23 @@ export default function DetailPanel({
 	}, [draftKey, entry.translation, saving]);
 	useEffect(() => { setActionError(null); }, [entry.id]);
 
-	const handleSave = (overwrite = false): Promise<boolean> => {
+	const handleSave = (overwrite = false, force = false): Promise<boolean> => {
 		if (!isCurrentProject()) return Promise.resolve(false);
 		const id = entry.id;
 		setActionError(null);
 		return saveDraft(draftKey, entry.translation || "", async (text, expectedTranslation) => {
 			if (!isCurrentProject()) throw new Error(t("detail.projectChanged"));
 			await patchString(id, { translation: text, ...(expectedTranslation === undefined ? {} : { expected_translation: expectedTranslation }) });
+			void queryClient.invalidateQueries({ queryKey: ["string-history", projectKey, id] });
 			if (isCurrentProject()) onRefetch();
-		}, overwrite);
+		}, overwrite, force);
+	};
+
+	const handleRestore = (text: string) => {
+		if (!isCurrentProject() || saving || changingStatus) return Promise.resolve(false);
+		restoreDraft(draftKey, text, entry.translation);
+		// An empty history version still needs a guarded write over a null translation.
+		return handleSave(false, true);
 	};
 
 	const handleLoadLatest = () => loadLatestDraft(draftKey, async () => {
@@ -91,6 +102,7 @@ export default function DetailPanel({
 		try {
 			if (!(await handleSave()) || currentEntryId.current !== id || !isCurrentProject()) return;
 			await patchString(id, { status });
+			void queryClient.invalidateQueries({ queryKey: ["string-history", projectKey, id] });
 			setActionError(null); onRefetch();
 		} catch (error) {
 			if (currentEntryId.current === id) setActionError(error instanceof Error ? error.message : String(error));
@@ -241,6 +253,9 @@ export default function DetailPanel({
 						})}
 					</div>
 				)}
+
+				<StringHistory key={draftKey} projectKey={projectKey} entryId={entry.id}
+					translation={entry.translation} busy={saving || changingStatus} onRestore={handleRestore} />
 
 				{/* Metadata */}
 				<div>

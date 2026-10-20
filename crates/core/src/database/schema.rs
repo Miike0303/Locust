@@ -163,6 +163,44 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // Additive history migration: also runs when opening an existing project.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS string_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id TEXT NOT NULL,
+            old_translation TEXT,
+            new_translation TEXT,
+            old_status TEXT,
+            new_status TEXT,
+            provider TEXT,
+            changed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_string_revisions_entry_id
+            ON string_revisions(entry_id, id);
+
+        CREATE TRIGGER IF NOT EXISTS strings_record_revision
+        AFTER UPDATE OF translation, status ON strings
+        WHEN old.translation IS NOT new.translation OR old.status IS NOT new.status
+        BEGIN
+            INSERT INTO string_revisions
+                (entry_id, old_translation, new_translation, old_status, new_status,
+                 provider, changed_at)
+            VALUES
+                (new.id, old.translation, new.translation, old.status, new.status,
+                 new.provider_used, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+            DELETE FROM string_revisions
+            WHERE entry_id = new.id AND id NOT IN (
+                SELECT id FROM string_revisions WHERE entry_id = new.id
+                ORDER BY id DESC LIMIT 50
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS strings_delete_revisions
+        AFTER DELETE ON strings
+        BEGIN
+            DELETE FROM string_revisions WHERE entry_id = old.id;
+        END;",
+    )?;
     Ok(())
 }
 

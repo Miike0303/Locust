@@ -546,6 +546,21 @@ export const runPivot = (outputPath: string, requireComplete?: boolean): Promise
 export const getString = (id: string) =>
   request<StringEntry>(`/strings/${encodeURIComponent(id)}`);
 
+export interface StringRevision {
+  id: number;
+  entry_id: string;
+  old_translation: string | null;
+  new_translation: string | null;
+  old_status: string | null;
+  new_status: string | null;
+  provider: string | null;
+  changed_at: string;
+}
+
+/** History uses the embedded HTTP server in desktop mode too. */
+export const getStringHistory = (id: string): Promise<StringRevision[]> =>
+  request(`/strings/${encodeURIComponent(id)}/history`);
+
 export const patchString = (id: string, data: Partial<Pick<StringEntry, "translation" | "status">> & { expected_translation?: string | null }): Promise<StringEntry> =>
   IS_TAURI
     ? tauriInvoke("patch_string", { id, data })

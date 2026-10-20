@@ -39,7 +39,7 @@ registerHooks({
         "../stores/draftStore": `export const useDraftStore=Object.assign(selector=>selector(h.drafts.useDraftStore.getState()),{getState:h.drafts.useDraftStore.getState});${Object.keys(drafts).filter(k => k !== "useDraftStore").map(k => `export const ${k}=h.drafts.${k};`).join("")}`,
         "../stores/projectStore": "export const useProjectStore=Object.assign(selector=>selector(h.useProjectStore.getState()),{getState:h.useProjectStore.getState});",
         "../stores/editorStore": "export const useEditorStore=selector=>selector?selector(h.useEditorStore.getState()):h.useEditorStore.getState();",
-        "@tanstack/react-query": "export const useQuery=()=>({data:undefined});",
+        "@tanstack/react-query": "export const useQuery=()=>({data:undefined});export const useQueryClient=()=>({invalidateQueries:async()=>{}});",
         "@tanstack/react-table": "export const useReactTable=options=>{h.columns=options.columns;return {getHeaderGroups:()=>[],getRowModel:()=>({rows:[]})};};export const getCoreRowModel=()=>{};export const getSortedRowModel=()=>{};export const flexRender=()=>null;",
       };
       if (stubs[specifier]) return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent(preamble + stubs[specifier])}` };
@@ -143,4 +143,40 @@ test("inline: cancelling a further edit does not disable explicit Overwrite", as
   nodes(render("inline")).find(n => n.type === "textarea").props.onKeyDown({ key: "Escape", preventDefault() {}, stopPropagation() {} });
   await nodes(render("inline")).find(n => n.type === "button" && n.props.children === t("detail.overwrite")).props.onClick();
   assert.equal(h.server, "A draft");
+});
+
+for (const translation of ["V0", null, ""] as const) {
+  test(`history restore guards against the current translation (${JSON.stringify(translation)})`, async () => {
+    reset(); h.server = translation;
+    // An existing draft must not supply an obsolete baseline to restore.
+    drafts.editDraft(key, "Unsaved", "obsolete");
+    const tree = render("detail", { ...entry, translation });
+    const history = nodes(tree).find(n => typeof n.type === "function" && n.type.name === "StringHistory");
+    assert.ok(history);
+    await history.props.onRestore("Historic version");
+    assert.deepEqual(h.calls, [{ translation: "Historic version", expected_translation: translation }]);
+    assert.equal(h.server, "Historic version");
+  });
+}
+
+test("history restore preserves the selected version on conflict and reuses explicit Overwrite", async () => {
+  reset();
+  const history = nodes(render("detail")).find(n => typeof n.type === "function" && n.type.name === "StringHistory");
+  h.server = "Changed elsewhere";
+  await history.props.onRestore("Historic version");
+  assert.equal(h.server, "Changed elsewhere");
+  assert.equal(drafts.useDraftStore.getState().drafts[key].text, "Historic version");
+  const overwrite = nodes(render("detail")).find(n => n.type === "button" && n.props.children === t("detail.overwrite"));
+  assert.ok(overwrite);
+  await overwrite.props.onClick();
+  assert.equal(h.server, "Historic version");
+  assert.equal(h.calls[1].expected_translation, undefined);
+});
+
+test("history can restore an empty translation over a null current translation", async () => {
+  reset(); h.server = null;
+  const history = nodes(render("detail", { ...entry, translation: null })).find(n => typeof n.type === "function" && n.type.name === "StringHistory");
+  await history.props.onRestore("");
+  assert.deepEqual(h.calls, [{ translation: "", expected_translation: null }]);
+  assert.equal(h.server, "");
 });

@@ -7,6 +7,7 @@ mod connection;
 mod files;
 mod global_memory;
 mod glossary;
+mod history;
 mod memory;
 mod provenance;
 mod runs;
@@ -20,6 +21,7 @@ pub use files::{
     sha256_path,
 };
 pub use global_memory::GlobalMemoryDb;
+pub use history::StringRevision;
 pub use types::{
     deserialize_expected_translation, EntryFilter, FileStats, GlossaryEntry, GlossaryMergeReport,
     ImportApplyReport, ImportChange, ImportPreview, InjectionRecording, MemoryEntry, MergeStats,

@@ -95,6 +95,15 @@ export function editDraft(key: string, text: string, baseline?: string | null): 
   // Synchronous persistence covers abrupt reload/exit without an unload handler.
   persistDraft(key);
 }
+/** Select history text with the loaded translation as its optimistic save guard. */
+export function restoreDraft(key: string, text: string, baseline: string | null): void {
+  if (pending.has(key)) return;
+  useDraftStore.setState(({ drafts }) => ({ drafts: {
+    ...drafts, [key]: { text, baseline, error: null, saving: false, revision: drafts[key]?.revision },
+  } }));
+  persistDraft(key);
+}
+
 export function acknowledgeDraft(key: string, serverText: string): void {
   const draft = useDraftStore.getState().drafts[key];
   if (!draft || draft.saving || draft.conflict || draft.text !== serverText) return;
@@ -124,12 +133,13 @@ export function saveDraft(
   serverText: string,
   write: (text: string, expectedTranslation?: string | null) => Promise<unknown>,
   overwrite = false,
+  force = false,
 ): Promise<boolean> {
   const active = pending.get(key);
   if (active) return active;
   const draft = useDraftStore.getState().drafts[key];
   if (draft?.conflict && !overwrite) return Promise.resolve(false);
-  if (!draft || (!overwrite && draft.text === serverText)) {
+  if (!draft || (!overwrite && !force && draft.text === serverText)) {
     acknowledgeDraft(key, serverText);
     return Promise.resolve(true);
   }

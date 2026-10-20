@@ -1,7 +1,9 @@
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use locust_core::database::{EntryFilter, FileStats, ProjectStats, StringFacets, TranslationRun};
+use locust_core::database::{
+    EntryFilter, FileStats, ProjectStats, StringFacets, StringRevision, TranslationRun,
+};
 use locust_core::models::{StringEntry, StringStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -94,6 +96,25 @@ pub(crate) async fn get_string(
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .map(Json)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "entry not found"))
+}
+
+pub(crate) async fn get_string_history(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<StringRevision>>, ApiError> {
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "entry not found"));
+    }
+    state
+        .db
+        .get_entry(&id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "entry not found"))?;
+    state
+        .db
+        .get_string_history(&id, 50)
+        .map(Json)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 #[derive(Deserialize)]
@@ -256,6 +277,90 @@ mod tests {
     use super::*;
     use crate::routes::test_support::*;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn string_history_returns_newest_first_and_empty_for_unchanged_entry() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[
+                StringEntry::new("history", "Hello", PathBuf::from("f.json")),
+                StringEntry::new("empty", "World", PathBuf::from("f.json")),
+            ])
+            .unwrap();
+        for text in ["Hola", "Saludos"] {
+            state
+                .db
+                .save_translation("history", text, "manual")
+                .await
+                .unwrap();
+        }
+        let response = client()
+            .get(format!("{url}/api/strings/history/history"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        let rows = body.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0]["id"].as_i64().unwrap() > rows[1]["id"].as_i64().unwrap());
+        assert_eq!(rows[0]["new_translation"], "Saludos");
+        assert_eq!(rows[0]["old_translation"], "Hola");
+        assert_eq!(rows[0]["provider"], "manual");
+        assert_eq!(rows[1]["old_translation"], serde_json::Value::Null);
+        assert_eq!(rows[1]["old_status"], "pending");
+        assert_eq!(rows[1]["new_status"], "translated");
+        let response = client()
+            .get(format!("{url}/api/strings/empty/history"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn string_history_unknown_entry_is_not_found() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let response = client()
+            .get(format!("{url}/api/strings/missing/history"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+        assert_eq!(response.text().await.unwrap(), "entry not found");
+    }
+
+    #[tokio::test]
+    async fn string_history_requires_an_open_project() {
+        let (url, _h, state) = setup_with_state().await;
+        state
+            .db
+            .save_entries(&[StringEntry::new(
+                "leftover",
+                "Hello",
+                PathBuf::from("f.json"),
+            )])
+            .unwrap();
+        state
+            .db
+            .save_translation("leftover", "Hola", "manual")
+            .await
+            .unwrap();
+        let response = client()
+            .get(format!("{url}/api/strings/leftover/history"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+        assert_eq!(response.text().await.unwrap(), "entry not found");
+    }
 
     #[tokio::test]
     async fn test_get_strings_before_project_returns_empty() {

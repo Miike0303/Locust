@@ -54,8 +54,8 @@ use routes::project::{
     project_resume,
 };
 use routes::strings::{
-    batch_patch_strings, get_file_stats, get_stats, get_string, get_string_facets, get_strings,
-    list_translation_runs, patch_string,
+    batch_patch_strings, get_file_stats, get_stats, get_string, get_string_facets,
+    get_string_history, get_strings, list_translation_runs, patch_string,
 };
 pub use routes::translate::{cancel_translation_job, spawn_translation_job};
 use routes::translate::{translate_cancel, translate_start, translate_ws};
@@ -507,6 +507,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/strings/batch", post(batch_patch_strings))
         .route("/api/strings/facets", get(get_string_facets))
         .route("/api/strings/:id", get(get_string).patch(patch_string))
+        .route("/api/strings/:id/history", get(get_string_history))
         .route("/api/stats", get(get_stats))
         .route("/api/stats/files", get(get_file_stats))
         .route("/api/runs", get(list_translation_runs))
