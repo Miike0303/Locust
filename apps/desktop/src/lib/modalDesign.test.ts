@@ -40,6 +40,14 @@ for (const file of files) {
   });
 }
 
+test("Inject language grid delegates scrolling to the modal without a mid-row height cap", () => {
+  const source = readFileSync(new URL("../components/InjectModal.tsx", import.meta.url), "utf8");
+  const grid = source.match(/className="([^"]*grid-cols-3[^"]*)"/);
+  assert.ok(grid);
+  assert.ok(!/\bmax-h-|\boverflow-y-/.test(grid[1]), "all language rows must fit inside the grid");
+  assert.match(source, /modalPanelClass\("[^"]*max-h-\[90vh\][^"]*overflow-y-auto/);
+});
+
 test("shared panel adds only semantic chrome and preserves caller layout extras", () => {
   const base = modalPanelClass();
   assert.deepEqual(new Set(base.split(/\s+/)), new Set([

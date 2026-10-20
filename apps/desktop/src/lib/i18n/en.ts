@@ -879,6 +879,7 @@ export const en = {
   "inject.recordingKey": "(recording key)",
   "inject.selected": "Selected: {langs}",
   "inject.selectedNone": "none",
+  "inject.noTranslations": "The last loaded project counts show no translated or approved strings. Check your translations before injecting.",
   "inject.multiRecording": "Choose the language translated in this project. For another language, create and translate a separate pivot project.",
   "inject.outputFolder": "Output folder",
   "inject.outputPlaceholder": "Choose where to save translated copies...",

@@ -1,6 +1,8 @@
 import { IS_TAURI } from "../lib/runtime";
 import { ApiError } from "../lib/apiError";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { queryClient } from "../lib/queryClient";
+import { draftProjectKey } from "../stores/draftStore";
 import { X, FolderOpen, FileCheck, AlertCircle, Package } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -8,6 +10,7 @@ import {
 	registerLang,
 	validate,
 	type MultiLangReport,
+	type ProjectStats,
 	type RegisterLangReport,
 } from "../lib/api";
 import {
@@ -70,6 +73,14 @@ export default function InjectModal({
 	const t = useT();
 	const navigate = useNavigate();
 	const { project } = useProjectStore();
+	// Read the Editor's cached counts without fetching or changing query options.
+	const statsKey = ["stats", project ? draftProjectKey(project) : ""];
+	const readStats = () => queryClient.getQueryData<ProjectStats>(statsKey);
+	const stats = useSyncExternalStore(
+		(onChange) => queryClient.getQueryCache().subscribe(onChange),
+		readStats,
+		readStats,
+	);
 	const { dialogRef, dialogProps, titleProps } = useModalA11y({
 		open: open && !!project,
 		ownEscape: false,
@@ -472,7 +483,7 @@ export default function InjectModal({
 									</span>
 								)}
 							</label>
-							<div className="mt-1 grid grid-cols-3 gap-2 p-2 border border-border rounded bg-surface-muted max-h-40 overflow-y-auto">
+							<div className="mt-1 grid grid-cols-3 gap-2 p-2 border border-border rounded bg-surface-muted">
 								{LANGUAGES.map((l) => (
 									<label
 										key={l.code}
@@ -493,7 +504,7 @@ export default function InjectModal({
 									langs:
 										selectedLangs.length === 0
 											? t("inject.selectedNone")
-											: selectedLangs.join(", "),
+											: selectedLangs.map(languageLabel).join(", "),
 								})}
 								<span className="block mt-0.5">
 									{t("inject.multiRecording")}
@@ -543,6 +554,12 @@ export default function InjectModal({
 								{t("inject.source", { name: project.name, format: project.format_id })}
 							</span>
 						</div>
+
+						{stats?.translated === 0 && stats.approved === 0 && stats.reviewed === 0 && (
+							<p role="status" className="p-3 bg-warning-muted border border-warning rounded text-body text-warning">
+								{t("inject.noTranslations")}
+							</p>
+						)}
 
 						<button
 							onClick={handleInject}

@@ -241,8 +241,8 @@ export default function PatchApplyTab({
 					disabled={loading || applying}
 					className={
 						showPartialWarning
-							? "flex items-center gap-1.5 px-3 py-2 bg-amber-700 hover:bg-amber-800 text-white rounded text-body font-medium disabled:opacity-50 ring-2 ring-warning ring-offset-1 ring-offset-surface"
-							: "flex items-center gap-1.5 px-3 py-2 bg-warning-muted hover:bg-warning-muted/80 text-warning rounded text-body font-medium disabled:opacity-50"
+							? "flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-transparent hover:underline rounded text-body font-medium disabled:opacity-50 ring-2 ring-warning ring-offset-1 ring-offset-surface"
+							: "flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-transparent hover:underline rounded text-body font-medium disabled:opacity-50"
 					}
 				>
 					<RotateCcw size={16} /> {t("patch.rollback")}

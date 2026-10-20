@@ -270,6 +270,42 @@ for (const recovery of [false, true]) test(`${recovery ? "recovery" : "regular"}
 });
 
 
+for (const locale of ["en", "es"] as const) test(`${locale} Rollback is outlined in normal and recovery states with unchanged action guards`, () => {
+  reset(locale);
+  const applyTab = (node: any): any => {
+    if (!node || typeof node !== "object") return undefined;
+    if (Array.isArray(node)) return node.map(applyTab).find(Boolean);
+    return node.type === PatchApplyTab ? node : applyTab(node.props?.children);
+  };
+  const props = applyTab(render()).props;
+  for (const loading of [false, true]) for (const applying of [false, true]) {
+    for (const gamePath of ["", " /game "]) for (const sourceOk of [false, true]) {
+      for (const showPartialWarning of [false, true]) {
+        const tree = PatchApplyTab({ ...props, loading, applying, gamePath, sourceOk,
+          canVerifyApply: Boolean(gamePath.trim()) && sourceOk, showPartialWarning });
+        const action = (key: Parameters<typeof t>[0]) => nodes(tree).find(node => node.type === "button" && text(node).trim() === t(key));
+        const rollback = action("patch.rollback");
+        assert.equal(rollback.props.disabled, loading || applying);
+        assert.equal(rollback.props.onClick, props.handleRollback);
+        assert.match(rollback.props.className, /\bborder-warning\b/);
+        assert.match(rollback.props.className, /\btext-warning\b/);
+        assert.ok(!/(?:^|\s)(?:hover:)?bg-(?:warning|amber|red)/.test(rollback.props.className));
+        for (const key of ["patch.applyBtn", "patch.verify"] as const) {
+          assert.equal(action(key).props.disabled, loading || applying || !gamePath.trim() || !sourceOk);
+        }
+        assert.match(action("patch.applyBtn").props.className, /\bbg-accent\b/);
+        assert.equal(action("patch.rollbackPreview").props.disabled, loading || applying || !gamePath.trim());
+        const recovery = action("patch.rollbackNow");
+        assert.equal(Boolean(recovery), !applying && showPartialWarning);
+        if (recovery) {
+          assert.equal(recovery.props.disabled, loading);
+          assert.equal(recovery.props.onClick, props.handleRollback);
+        }
+      }
+    }
+  }
+});
+
 async function flushEffects() {
   for (let i = 0; i < 8; i++) {
     render();

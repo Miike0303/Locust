@@ -47,7 +47,7 @@ const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
     if (context.parentURL?.endsWith("/components/InjectModal.tsx")) {
       const stubs: Record<string, string> = {
-        react: `const h=globalThis.__injectModal;export const useState=initial=>h.state(initial);export const useMemo=fn=>fn();export const useEffect=(fn,deps)=>h.effect(fn,deps);`,
+        react: `const h=globalThis.__injectModal;export const useState=initial=>h.state(initial);export const useMemo=fn=>fn();export const useEffect=(fn,deps)=>h.effect(fn,deps);export const useSyncExternalStore=(_subscribe,read)=>read();`,
         "react-router-dom": `export const useNavigate=()=>()=>{};`,
         "../lib/i18n": `export const useT=()=>globalThis.__injectModal.t;`,
         "../stores/projectStore": `export const useProjectStore=()=>({project:globalThis.__injectModal.project});`,
@@ -71,6 +71,7 @@ let stringsWritten = 3;
 let injectFailure: string | Error | undefined;
 const originalFetch = globalThis.fetch;
 Object.defineProperty(globalThis, "window", { configurable: true, value: {
+  addEventListener() {},
   __TAURI_INTERNALS__: { invoke: async (command: string, args: any) => {
     calls.push({ command, params: args?.params });
     if (command === "run_validation") return { validation: { by_kind: {} } };
@@ -181,6 +182,45 @@ const directHint = {
   en: "Registering a language would change files recorded by Direct injection and block packing or re-injection. Use Add mode to register a selectable language.",
   es: "Registrar un idioma modificaría archivos registrados por la inyección directa e impediría empaquetar o volver a inyectar. Use el modo Añadir para registrar un idioma seleccionable.",
 };
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale} Inject selection summary uses the language name, not the selected code`, () => {
+    reset(locale, "add");
+    const summary = () => nodes(render()).find(node => node.type === "p" && text(node).startsWith(t("inject.selected", { langs: "" })));
+    assert.ok(text(summary()).startsWith(t("inject.selected", { langs: "Español" })));
+    const french = nodes(render()).find(node => node.type === "label" && text(node) === "Français");
+    nodes(french).find(node => node.type === "input").props.onChange();
+    assert.ok(text(summary()).startsWith(t("inject.selected", { langs: "Français" })));
+    assert.equal(calls.length, 0);
+  });
+
+  test(`${locale} Inject warns only for known empty translation counts without gating injection`, () => {
+    reset(locale, "add");
+    queryClient.clear();
+    const key = ["stats", JSON.stringify([null, h.project.path, h.project.format_id])];
+    const warningText = locale === "en"
+      ? "The last loaded project counts show no translated or approved strings. Check your translations before injecting."
+      : "Los últimos conteos cargados no muestran textos traducidos ni aprobados. Revise las traducciones antes de inyectar.";
+    const warning = () => nodes(render()).find(node => node.props?.role === "status" && text(node) === warningText);
+    try {
+      assert.equal(warning(), undefined, "unknown counts are not zero");
+      queryClient.setQueryData(["stats", "another-project"], { translated: 0, approved: 0, reviewed: 0 });
+      assert.equal(warning(), undefined, "counts must belong to this project");
+      for (const [translated, approved, reviewed] of [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]]) {
+        queryClient.setQueryData(key, { translated, approved, reviewed });
+        const cached = queryClient.getQueryCache().find({ queryKey: key })!;
+        const options = cached.options;
+        const empty = translated + approved + reviewed === 0;
+        assert.equal(Boolean(warning()), empty);
+        if (empty) assert.match(warning().props.className, /\btext-warning\b/);
+        assert.equal(button(t("inject.injectAction")).props.disabled, false);
+        assert.equal(cached.options, options, "presentation must not change the Editor's query options");
+        assert.equal(cached.getObserversCount(), 0, "presentation must not register another query observer");
+      }
+      assert.equal(calls.length, 0, "displaying counts must not call the backend");
+    } finally { queryClient.clear(); }
+  });
+}
 
 test("Replace-only mounts in copy mode and coerces Add after project changes", () => {
   reset("en", "add");

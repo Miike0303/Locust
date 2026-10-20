@@ -859,6 +859,7 @@ export const es: Record<keyof typeof en, string> = {
   "inject.recordingKey": "(clave de registro)",
   "inject.selected": "Seleccionados: {langs}",
   "inject.selectedNone": "ninguno",
+  "inject.noTranslations": "Los últimos conteos cargados no muestran textos traducidos ni aprobados. Revise las traducciones antes de inyectar.",
   "inject.multiRecording": "Elige el idioma traducido en este proyecto. Para otro idioma, crea y traduce un proyecto intermedio independiente.",
   "inject.outputFolder": "Carpeta de salida",
   "inject.outputPlaceholder": "Elija dónde guardar las copias traducidas...",
