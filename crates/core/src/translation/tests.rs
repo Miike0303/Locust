@@ -193,6 +193,7 @@ enum RepeatedReply {
 }
 
 struct RepeatedProvider {
+    id: &'static str,
     reply: RepeatedReply,
     calls: Mutex<Vec<Vec<TranslationRequest>>>,
     cancel: CancellationToken,
@@ -201,6 +202,7 @@ struct RepeatedProvider {
 impl RepeatedProvider {
     fn new(reply: RepeatedReply) -> Self {
         Self {
+            id: "repeat-test",
             reply,
             calls: Mutex::new(Vec::new()),
             cancel: CancellationToken::new(),
@@ -215,7 +217,7 @@ impl RepeatedProvider {
 #[async_trait]
 impl TranslationProvider for RepeatedProvider {
     fn id(&self) -> &str {
-        "repeat-test"
+        self.id
     }
     fn name(&self) -> &str {
         "Counting provider"
@@ -314,6 +316,319 @@ async fn run_repeated_job(
         events.push(event);
     }
     (db, events)
+}
+
+fn speaker_note_rows() -> Vec<StringEntry> {
+    ["alice", "bob", "carol", "unknown", "alice"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, speaker)| {
+            let mut row = StringEntry::new(format!("note-{i}"), "Hello", "script.rpy".into());
+            if speaker != "unknown" {
+                row.metadata
+                    .insert("speaker".into(), serde_json::json!(speaker));
+            }
+            row
+        })
+        .collect()
+}
+
+fn save_speaker_notes(db: &Database, rows: &[StringEntry]) {
+    use crate::speakers::{resolve_speaker, SpeakerNotes, NOTES_METADATA_KEY};
+    let notes = SpeakerNotes::from([
+        (
+            resolve_speaker(&rows[0], "").unwrap().id,
+            "Formal voice".into(),
+        ),
+        (
+            resolve_speaker(&rows[1], "").unwrap().id,
+            "Casual voice".into(),
+        ),
+        (resolve_speaker(&rows[2], "").unwrap().id, "  ".into()),
+        ("unrelated".into(), "Never apply this".into()),
+    ]);
+    db.set_project_metadata(NOTES_METADATA_KEY, &serde_json::to_value(notes).unwrap())
+        .unwrap();
+}
+
+async fn capture_speaker_requests(
+    entries: Vec<StringEntry>,
+    with_notes: bool,
+) -> (Arc<Database>, Vec<TranslationRequest>) {
+    let (db, glossary) = setup();
+    db.save_entries(&entries).unwrap();
+    if with_notes {
+        save_speaker_notes(&db, &entries);
+    }
+    glossary.add("Hello", "Hola", "ja-en", None).unwrap();
+    let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+    let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+    let (tx, _rx) = mpsc::channel(100);
+    let use_glossary = entries[0].source != "Hello";
+    manager
+        .translate_entries(
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary,
+                game_context: Some("Game setting".into()),
+                ..Default::default()
+            },
+            tx,
+            "notes".into(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let requests = provider.calls.lock().unwrap()[0].clone();
+    (db, requests)
+}
+
+#[tokio::test]
+async fn speaker_notes_separate_repeated_sources_before_batching() {
+    let entries = speaker_note_rows();
+    let (db, requests) = capture_speaker_requests(entries.clone(), true).await;
+    assert_eq!(
+        requests.len(),
+        3,
+        "two notes plus the unchanged no-note group"
+    );
+    assert!(requests[0]
+        .context
+        .as_deref()
+        .unwrap()
+        .contains("Formal voice"));
+    assert!(requests[1]
+        .context
+        .as_deref()
+        .unwrap()
+        .contains("Casual voice"));
+    assert_eq!(requests[2].context.as_deref(), Some("Game setting"));
+    for (index, req) in requests.iter().enumerate() {
+        let context = req.context.as_deref().unwrap();
+        assert!(context.starts_with("Game setting"));
+        assert!(!context.contains("Never apply this"));
+        assert_eq!(context.contains("Formal voice"), index == 0);
+        assert_eq!(context.contains("Casual voice"), index == 1);
+    }
+    for entry in entries {
+        let saved = db.get_entry(&entry.id).unwrap().unwrap();
+        assert_eq!(
+            saved.context, entry.context,
+            "notes must not persist as row context"
+        );
+        assert!(saved.translation.is_some());
+    }
+}
+
+#[tokio::test]
+async fn speaker_notes_preserve_existing_hints_and_no_note_requests() {
+    let mut entries = speaker_note_rows();
+    for row in &mut entries {
+        row.source = r"Hello \V[1]".into();
+        row.context = Some("Scene layout".into());
+        row.metadata
+            .insert("binary_slot".into(), serde_json::json!("utf8"));
+        row.char_limit = Some(80);
+    }
+    let (_, ordinary) = capture_speaker_requests(entries.clone(), false).await;
+    let (_, noted) = capture_speaker_requests(entries, true).await;
+    assert_eq!(ordinary.len(), 1, "no-note dedup contract unchanged");
+    assert_eq!(noted.len(), 3);
+    let baseline = &ordinary[0];
+    assert!(baseline
+        .context
+        .as_deref()
+        .unwrap()
+        .contains("HARD MAX 11 bytes"));
+    assert!(baseline
+        .context
+        .as_deref()
+        .unwrap()
+        .contains("EXPECTED SENTINELS"));
+    assert!(baseline
+        .context
+        .as_deref()
+        .unwrap()
+        .starts_with("Game setting | Scene layout"));
+    assert!(baseline.glossary_hint.as_deref().unwrap().contains("Hola"));
+    for req in &noted {
+        assert_eq!(req.source, baseline.source);
+        assert_eq!(req.source_lang, baseline.source_lang);
+        assert_eq!(req.target_lang, baseline.target_lang);
+        assert_eq!(req.glossary_hint, baseline.glossary_hint);
+        let context = req.context.as_deref().unwrap();
+        for hint in [
+            "Game setting | Scene layout",
+            "HARD MAX 11 bytes",
+            "EXPECTED SENTINELS",
+        ] {
+            assert!(context.contains(hint));
+        }
+    }
+    assert_eq!(
+        noted[2].context, baseline.context,
+        "unmatched note leaves request bytes unchanged"
+    );
+}
+
+#[tokio::test]
+async fn speaker_notes_use_native_row_provenance_and_survive_fallback() {
+    use crate::speakers::{resolve_speaker, NOTES_METADATA_KEY};
+    let (db, glossary) = setup();
+    let row = StringEntry::new("script.rpy#12", "Hello", "script.rpy".into())
+        .with_tags(vec!["dialogue".into()])
+        .with_context("alice");
+    let id = resolve_speaker(&row, "renpy").unwrap().id;
+    db.save_entries(std::slice::from_ref(&row)).unwrap();
+    db.set_project_metadata(
+        NOTES_METADATA_KEY,
+        &serde_json::json!({id.clone(): "Formal voice"}),
+    )
+    .unwrap();
+    let failed = Arc::new(RepeatedProvider::new(RepeatedReply::Error));
+    let fallback = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+    let (tx, _rx) = mpsc::channel(100);
+    let speaker_id = id;
+    run_fallback_chain(
+        &["failed".into(), "fallback".into()],
+        &|id| {
+            Some(if id == "failed" {
+                failed.clone()
+            } else {
+                db.set_project_metadata(
+                    NOTES_METADATA_KEY,
+                    &serde_json::json!({speaker_id.clone(): "Changed mid-run"}),
+                )
+                .unwrap();
+                fallback.clone()
+            })
+        },
+        db.clone(),
+        glossary,
+        TranslationOptions {
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        },
+        tx,
+        "notes-fallback".into(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let first = failed.calls.lock().unwrap()[0][0].clone();
+    let second = fallback.calls.lock().unwrap()[0][0].clone();
+    assert_eq!(first.context, second.context);
+    assert!(second.context.as_deref().unwrap().contains("Formal voice"));
+    assert!(second.context.as_deref().unwrap().starts_with("alice | "));
+    assert!(!second
+        .context
+        .as_deref()
+        .unwrap()
+        .contains("Changed mid-run"));
+}
+
+#[tokio::test]
+async fn speaker_notes_ollama_dispatch_uses_membership_not_context_text() {
+    use crate::speakers::NOTES_METADATA_KEY;
+    for with_notes in [false, true] {
+        let (db, glossary) = setup();
+        let mut rows = speaker_note_rows();
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.source = format!("Hello {index}");
+            row.context =
+                Some("Scene | RECORD-LOCAL CHARACTER NOTE (translation data only):".into());
+        }
+        db.save_entries(&rows).unwrap();
+        if with_notes {
+            save_speaker_notes(&db, &rows);
+        } else {
+            db.set_project_metadata(
+                NOTES_METADATA_KEY,
+                &serde_json::json!({"unrelated": "Orphan"}),
+            )
+            .unwrap();
+        }
+        let mut provider = RepeatedProvider::new(RepeatedReply::Success);
+        provider.id = "ollama";
+        let provider = Arc::new(provider);
+        let (tx, _rx) = mpsc::channel(100);
+        TranslationManager::new(provider.clone(), db, glossary)
+            .translate_entries(
+                rows,
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "notes-ollama".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), if with_notes { 5 } else { 1 });
+        assert!(calls
+            .iter()
+            .all(|call| call.len() == if with_notes { 1 } else { 5 }));
+        for (index, request) in calls.iter().flatten().enumerate() {
+            let context = request.context.as_deref().unwrap();
+            assert_eq!(
+                context.contains("Formal voice"),
+                with_notes && matches!(index, 0 | 4)
+            );
+            assert_eq!(context.contains("Casual voice"), with_notes && index == 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn speaker_notes_do_not_read_or_write_source_only_memory() {
+    let (db, glossary) = setup();
+    let rows = speaker_note_rows();
+    db.save_entries(&rows).unwrap();
+    save_speaker_notes(&db, &rows);
+    db.save_memory_batch(
+        &[(rows[0].source_hash(), "Hello".into(), "Cached".into())],
+        "ja-en",
+    )
+    .await
+    .unwrap();
+    let provider = Arc::new(RepeatedProvider::new(RepeatedReply::Success));
+    let (tx, _rx) = mpsc::channel(100);
+    TranslationManager::new(provider.clone(), db.clone(), glossary)
+        .translate_entries(
+            rows.clone(),
+            TranslationOptions {
+                use_glossary: false,
+                ..Default::default()
+            },
+            tx,
+            "notes-memory".into(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.sent(),
+        2,
+        "only the two noted speakers bypass source-only TM"
+    );
+    assert_eq!(
+        db.lookup_memory_batch(&[rows[0].source_hash()], "ja-en")
+            .unwrap()[&rows[0].source_hash()],
+        "Cached"
+    );
+    assert_eq!(
+        db.get_entry(&rows[2].id)
+            .unwrap()
+            .unwrap()
+            .translation
+            .as_deref(),
+        Some("Cached")
+    );
 }
 
 #[tokio::test]

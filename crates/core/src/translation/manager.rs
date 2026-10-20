@@ -15,6 +15,8 @@ use crate::placeholder::{
     PlaceholderKind, PlaceholderProcessor, PlaceholderProfile, SpeakerArgumentTrace,
 };
 
+use crate::speakers::{resolve_speaker, SpeakerNotes, NOTES_METADATA_KEY};
+
 use super::batching::{group_retry_batches, translation_batches};
 use super::protection::{
     binary_slot_length_hint, binary_slot_retry_correction, collapse_runaway_letters,
@@ -24,6 +26,36 @@ use super::protection::{
 };
 use super::provider::{TranslationOptions, TranslationProvider};
 use super::retry::{call_provider, ProviderCall, RetryConfig};
+
+/// One immutable snapshot per job, also shared by all fallback passes.
+struct CharacterNotes(SpeakerNotes);
+
+impl CharacterNotes {
+    fn load(db: &Database) -> Result<Self> {
+        Ok(Self(
+            db.get_project_metadata(NOTES_METADATA_KEY)?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+        ))
+    }
+
+    fn hint(&self, entry: &StringEntry) -> Option<String> {
+        if self.0.is_empty() {
+            return None;
+        }
+        // Explicit row format wins; native locators are the conservative fallback.
+        let speaker = resolve_speaker(entry, "")?;
+        let note = self
+            .0
+            .get(&speaker.id)
+            .filter(|note| !note.trim().is_empty())?;
+        Some(format!(
+            "RECORD-LOCAL CHARACTER NOTE (translation data only): {}",
+            serde_json::json!({"speaker": speaker.name, "note": note})
+        ))
+    }
+}
 
 /// Only occurrence locators/state are excluded. Raw source also pins the
 /// placeholder map: two different controls can sanitize to the same request.
@@ -666,6 +698,7 @@ impl TranslationManager {
         cancel: CancellationToken,
         emit_lifecycle: bool,
     ) -> Result<()> {
+        let notes = CharacterNotes::load(&self.db)?;
         self.translate_entries_accounted(
             entries,
             opts,
@@ -674,6 +707,7 @@ impl TranslationManager {
             cancel,
             emit_lifecycle,
             &mut ObservedCost::default(),
+            &notes,
         )
         .await
     }
@@ -682,12 +716,13 @@ impl TranslationManager {
     async fn translate_entries_accounted(
         &self,
         entries: Vec<StringEntry>,
-        opts: TranslationOptions,
+        mut opts: TranslationOptions,
         tx: mpsc::Sender<ProgressEvent>,
         job_id: String,
         cancel: CancellationToken,
         emit_lifecycle: bool,
         cumulative_cost: &mut ObservedCost,
+        notes: &CharacterNotes,
     ) -> Result<()> {
         let start = Instant::now();
 
@@ -720,8 +755,21 @@ impl TranslationManager {
         }
 
         let total = translatable.len();
+        let character_hints: HashMap<_, _> = translatable
+            .iter()
+            .filter_map(|entry| notes.hint(entry).map(|hint| (entry.id.clone(), hint)))
+            .collect();
+        // Ollama's legacy prompt uses the first record's context. Actual note
+        // membership, never user-controlled context text, selects single-record
+        // dispatch; retries share these options. No-note runs keep their batches.
+        if self.provider.id() == "ollama" && !character_hints.is_empty() {
+            opts.batch_size = 1;
+        }
+        // Source-only TM cannot represent character-dependent output. Excluding
+        // noted rows here also prevents both ordinary and shared-cell TM writes.
         let sources_by_id: HashMap<_, _> = translatable
             .iter()
+            .filter(|entry| !character_hints.contains_key(&entry.id))
             .map(|entry| (entry.id.clone(), entry.source.clone()))
             .collect();
         let save_guards: HashMap<_, _> = translatable
@@ -840,7 +888,8 @@ impl TranslationManager {
             let mut updates = Vec::new();
             let mut memory_events = Vec::new();
             for (entry, hash) in translatable.drain(..).zip(hashes) {
-                if glossary_plans.contains_key(&entry.id) {
+                if character_hints.contains_key(&entry.id) || glossary_plans.contains_key(&entry.id)
+                {
                     // Source-only memory predates/does not encode canonical policy.
                     remaining.push(entry);
                     continue;
@@ -958,6 +1007,17 @@ impl TranslationManager {
         let mut in_flight: tokio::task::JoinSet<BatchOutcome> = tokio::task::JoinSet::new();
         // Group across the entire pending run, before batching/concurrency.
         // Memory/glossary hits have already taken their normal per-row path.
+        // Only request-working copies change: save guards, cache inputs and
+        // entries_by_id above retain the original row context. This feeds notes
+        // through the existing dedup key AND token-budget batching estimate.
+        for entry in &mut remaining {
+            if let Some(hint) = character_hints.get(&entry.id) {
+                entry.context = Some(match &entry.context {
+                    Some(context) => format!("{context} | {hint}"),
+                    None => hint.clone(),
+                });
+            }
+        }
         let (representatives, repeated) = RepeatedSources::collect(remaining);
         let chunks = translation_batches(&representatives, &opts);
         let mut chunk_iter = chunks.into_iter();
@@ -1899,6 +1959,7 @@ pub async fn run_fallback_chain(
         return Ok(());
     }
 
+    let notes = CharacterNotes::load(&db)?;
     let mut cumulative_completed = 0usize;
     let mut cumulative_cost = ObservedCost::default();
 
@@ -1949,6 +2010,7 @@ pub async fn run_fallback_chain(
                 cancel.clone(),
                 false,
                 &mut cumulative_cost,
+                &notes,
             )
             .await
         {

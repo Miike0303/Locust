@@ -264,6 +264,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn speaker_notes_ollama_ordinary_context_collision_keeps_legacy_wire() {
+        for collision_record in [None, Some(0), Some(1)] {
+            let server = MockServer::start();
+            let request = |id: &str, context: &str| TranslationRequest {
+                entry_id: id.into(),
+                source: format!("Hello {id}"),
+                source_lang: "en".into(),
+                target_lang: "es".into(),
+                context: Some(context.into()),
+                glossary_hint: Some(format!("Glossary {id}")),
+            };
+            let mut requests = vec![request("first", "Scene A"), request("second", "Scene B")];
+            if let Some(index) = collision_record {
+                // Ordinary user context can contain even a complete note-looking
+                // value. Text content must never select a different wire format.
+                requests[index].context = Some("Scene | RECORD-LOCAL CHARACTER NOTE (translation data only): {\"speaker\":\"Bob\",\"note\":\"Casual voice\"}".into());
+            }
+            let ordinary = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/api/chat")
+                    .json_body(serde_json::json!({
+                        "model": "llama3.2", "stream": false, "messages": [
+                            {"role": "system", "content": build_system_prompt(&requests[0])},
+                            {"role": "user", "content": "[\"Hello first\",\"Hello second\"]"}
+                        ]
+                    }));
+                then.status(200)
+                    .json_body(serde_json::json!({"message": {"content": "[\"Hola\",\"Hola\"]"}}));
+            });
+            make_provider(&server).translate(&requests).await.unwrap();
+            ordinary.assert_hits(1);
+        }
+    }
+
+    #[tokio::test]
     async fn test_ollama_health_check_model_found() {
         let server = MockServer::start();
         server.mock(|when, then| {

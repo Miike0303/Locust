@@ -278,13 +278,15 @@ Every project is saved as a `<game-name>.locust.db` file next to your game folde
 
 You can close Locust and reopen the same project later — your progress persists. Reopening a game merges newly extracted strings; existing translations stay. If the original text for a line changed, Locust keeps the translation but marks it pending so a stale line cannot ship as approved. Use the **Review** tab to audit translations before finalizing.
 
-### Speaker notes API (storage slice)
+### Speaker notes API and translation context
 
 `GET /api/speakers` accepts `database_path`, `project_path` and `format_id` query parameters matching the current project's exact identity (`project_path` is `path` in `/api/project/current`). It returns `{ groups: [{ id, name, count, entry_ids, note }], unassigned_entry_ids }` from current rows. IDs are opaque, case-sensitive JSON tuple strings; clients must echo them unchanged.
 
 `PUT /api/speakers/note` accepts those same ownership fields plus `speaker_id` and `note`, and returns `{ speaker_id, note }`. An empty note clears it. No open project returns 400; stale identity or a busy project returns 409; an unknown current speaker returns 404. Notes persist in the project database under `locust.speakers.notes.v1`; unrelated metadata is preserved. Notes for removed speakers remain saved but do not create groups.
 
-Recognized identities are explicit `speaker` / `speaker_name` / `character` string metadata (conflicts remain unassigned), Ren'Py `.rpy` dialogue context with Ren'Py format evidence, and version-1 Godot/Dialogic structured text locators. Names/layout tags and arbitrary context are not inferred as speakers. This slice adds no UI or provider-context behavior.
+Recognized identities are explicit `speaker` / `speaker_name` / `character` string metadata (conflicts remain unassigned), Ren'Py `.rpy` dialogue context with Ren'Py format evidence, and version-1 Godot/Dialogic structured text locators. Names/layout tags and arbitrary context are not inferred as speakers. Translation runs prefer explicit row `format_id`; without it, only native `.rpy` dialogue line locators or version-1 Godot/Dialogic text locators qualify. No game files are read to resolve notes.
+
+Translation jobs snapshot notes once (including across fallback providers). A matching nonblank note is appended as record-local translation data without replacing scene/game context, glossary, placeholder or fit hints. Identical sources with different effective contexts remain separate provider records; stored row context is unchanged. Noted rows bypass source-only translation memory reads and writes to avoid cross-character reuse; exact glossary matches still take precedence. OpenAI-compatible, Claude and Antigravity prompts already scope metadata per record. For Ollama, a job with matching nonblank notes uses single-record calls so each note stays with its own source, including during retries and fallback. Ollama's prompt and ordered-source-array wire format are unchanged; jobs without matching notes keep their previous batching even if ordinary context contains note-like text. Providers that do not consume context cannot apply character notes. The speaker workspace UI is a separate follow-up.
 
 ### Where Locust keeps data
 

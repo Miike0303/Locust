@@ -42,10 +42,27 @@ pub fn resolve_speaker(entry: &StringEntry, project_format: &str) -> Option<Spea
         return explicit;
     }
     // Row provenance overrides project format, including malformed values.
-    let format = entry
-        .metadata
-        .get("format_id")
-        .map_or(Some(project_format), |v| v.as_str())?;
+    let format = entry.metadata.get("format_id").map_or_else(
+        || {
+            if !project_format.is_empty() {
+                return Some(project_format);
+            }
+            // Translation runs have no project-format field in the database.
+            // Accept only native extractor locators when that hint is absent.
+            if entry.metadata.contains_key("godot_dialogic") {
+                Some("godot-dialogic")
+            } else if entry.id.rsplit_once('#').is_some_and(|(file, line)| {
+                entry.file_path.file_name().and_then(|s| s.to_str()) == Some(file)
+                    && !line.is_empty()
+                    && line.bytes().all(|b| b.is_ascii_digit())
+            }) {
+                Some("renpy") // Still requires .rpy + dialogue + identifier below.
+            } else {
+                None
+            }
+        },
+        |v| v.as_str(),
+    )?;
     match format {
         "renpy"
             if entry.tags.iter().any(|tag| tag == "dialogue")
@@ -135,8 +152,10 @@ mod tests {
         assert_eq!(resolve_speaker(&row, "unknown"), None);
         let renpy = resolve_speaker(&row, "renpy").expect("Ren'Py say speaker");
         assert_eq!(renpy.name, "alice");
+        assert_eq!(resolve_speaker(&row, ""), Some(renpy.clone()));
         row.metadata.insert("format_id".into(), json!("html"));
         assert_eq!(resolve_speaker(&row, "renpy"), None);
+        assert_eq!(resolve_speaker(&row, ""), None);
         row.metadata.insert("speaker".into(), json!("Alice"));
         let explicit = resolve_speaker(&row, "html").unwrap();
         assert_eq!(explicit.name, "Alice");
@@ -161,6 +180,8 @@ mod tests {
             resolve_speaker(&row, "godot-dialogic").unwrap().name,
             "Alice"
         );
+        row.metadata.remove("format_id");
+        assert_eq!(resolve_speaker(&row, "").unwrap().name, "Alice");
         row.metadata.get_mut("godot_dialogic").unwrap()["locator_version"] = json!(2);
         assert_eq!(resolve_speaker(&row, "godot-dialogic"), None);
         row.metadata.clear();
