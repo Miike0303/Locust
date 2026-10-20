@@ -979,6 +979,20 @@ export interface MemoryEntry {
   last_used: string;
 }
 
+export interface MemorySuggestion {
+  source: string;
+  translation: string;
+  score: number;
+  origin: "project" | "global";
+  uses: number;
+}
+
+/** Suggestions use embedded HTTP in desktop mode, just like string history. */
+export const getMemorySuggestions = (entryId: string, langPair: string, signal?: AbortSignal): Promise<{ suggestions: MemorySuggestion[] }> => {
+  const params = new URLSearchParams({ entry_id: entryId, lang_pair: langPair });
+  return request(`/memory/suggestions?${params}`, { signal });
+};
+
 export interface MemoryListResponse {
   entries: MemoryEntry[];
   total: number;

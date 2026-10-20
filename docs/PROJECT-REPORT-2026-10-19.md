@@ -33,7 +33,7 @@ Full-state analysis of the repository at branch `docs/release-v0.2.0-blocker` (m
 |---|---|---|---|
 | rpgmaker-mv | Stable | JSON, POR `.jsono`, Iavra packs | Rejects encrypted wrappers |
 | rpgmaker-vxa | Stable | Ruby Marshal XP/VX/Ace | No RGSS archive reader |
-| renpy | Stable | `.rpy`, `.rpa` | Compiled-only `.rpyc` not established |
+| renpy | Stable | `.rpy`, `.rpa` (including orphan `.rpyc` inside `.rpa`) | Loose compiled-only `.rpyc` games not detected (corrected by F1, day plan L23) |
 | godot-dialogic | Exp. | PCK v2 `.dtl` | No PCK v3/encrypted |
 | wolf-rpg | Exp. | `.wolf` heuristic SJIS scan | Not schema-aware; no commercial proof |
 | sugarcube | Exp. | HTML passages | Joined inline markup rejected |

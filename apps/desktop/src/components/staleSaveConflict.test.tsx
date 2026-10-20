@@ -72,6 +72,22 @@ function reset() {
   useProjectStore.setState({ project });
   setLocale("en");
 }
+
+test("memory Use edits the existing draft without saving and ignores stale project callbacks", () => {
+  reset();
+  const suggestionBlock = nodes(render("detail")).find(n => n.props.onUse && n.props.entry?.id === entry.id);
+  assert.ok(suggestionBlock);
+  suggestionBlock.props.onUse("Suggested translation");
+  assert.equal(drafts.useDraftStore.getState().drafts[key].text, "Suggested translation");
+  assert.equal(drafts.useDraftStore.getState().drafts[key].baseline, "V0");
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.server, "V0");
+  useProjectStore.setState({ project: { ...project, path: "C:/other" } });
+  suggestionBlock.props.onUse("Stale suggestion");
+  assert.equal(drafts.useDraftStore.getState().drafts[key].text, "Suggested translation");
+  assert.equal(h.calls.length, 0);
+});
+
 async function editAndSave(kind: string) {
   let tree = render(kind);
   if (kind === "inline") {

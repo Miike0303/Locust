@@ -578,6 +578,7 @@ export default function Editor() {
 						key={draftEntryKey(projectKey, selectedEntry.id)}
 						projectKey={projectKey}
 						entry={selectedEntry}
+						sampleSources={sampleSources}
 						onRefetch={handleRefetch}
 						onClose={() => setSelected(null)}
 					/>

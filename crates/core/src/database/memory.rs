@@ -10,6 +10,42 @@ use super::{lock_connection, Database, MemoryEntry};
 use super::{MEMORY_LOOKUP_QUERIES, MEMORY_TRANSACTIONS};
 
 impl Database {
+    /// Bounded, length-prefiltered candidates for fuzzy TM suggestions. SQLite
+    /// length(TEXT) and source_len both count Unicode characters, not bytes.
+    pub fn memory_candidates(
+        &self,
+        lang_pair: &str,
+        source_len: usize,
+        max_rows: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let radius = source_len.saturating_mul(2).div_ceil(5).max(3);
+        let lower = source_len.saturating_sub(radius).min(i64::MAX as usize) as i64;
+        let upper = source_len.saturating_add(radius).min(i64::MAX as usize) as i64;
+        let conn = lock_connection(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT source_hash, lang_pair, source, translation, uses, last_used
+             FROM translation_memory
+             WHERE lang_pair = ?1 AND length(source) BETWEEN ?2 AND ?3
+             ORDER BY uses DESC, last_used DESC LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![lang_pair, lower, upper, max_rows.min(3000)],
+                |row| {
+                    Ok(MemoryEntry {
+                        source_hash: row.get(0)?,
+                        lang_pair: row.get(1)?,
+                        source: row.get(2)?,
+                        translation: row.get(3)?,
+                        uses: row.get(4)?,
+                        last_used: row.get(5)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn lookup_memory(&self, source_hash: &str, lang_pair: &str) -> Result<Option<String>> {
         let conn = lock_connection(&self.conn);
         #[cfg(test)]
@@ -229,6 +265,59 @@ impl Database {
 mod tests {
     use super::*;
     use chrono::DateTime;
+
+    #[test]
+    fn memory_candidates_filter_character_lengths_languages_and_order() {
+        let db = Database::open_in_memory().unwrap();
+        {
+            let conn = lock_connection(&db.conn);
+            for (hash, source, pair, uses, last_used) in [
+                ("lower", "界".repeat(6), "en-es", 2, "2026-01-01"),
+                ("upper", "é".repeat(14), "en-es", 2, "2026-02-01"),
+                ("popular", "a".repeat(10), "en-es", 3, "2025-01-01"),
+                ("short", "a".repeat(5), "en-es", 99, "2026-01-01"),
+                ("long", "a".repeat(15), "en-es", 99, "2026-01-01"),
+                ("other", "a".repeat(10), "en-fr", 99, "2026-01-01"),
+                ("empty", String::new(), "en-es", 1, "2026-01-01"),
+                ("tiny", "界".repeat(4), "en-es", 1, "2026-01-01"),
+            ] {
+                conn.execute(
+                    "INSERT INTO translation_memory VALUES (?1, ?2, ?3, 'translation', ?4, ?5)",
+                    params![hash, pair, source, uses, last_used],
+                )
+                .unwrap();
+            }
+        }
+        let hashes = |len, limit| {
+            db.memory_candidates("en-es", len, limit)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.source_hash)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hashes(10, 50), ["popular", "upper", "lower"]);
+        assert_eq!(hashes(10, 2), ["popular", "upper"]);
+        assert!(hashes(10, 0).is_empty());
+        assert_eq!(hashes(1, 50), ["empty", "tiny"]);
+        assert_eq!(hashes(0, 50), ["empty"]);
+        assert!(db
+            .memory_candidates("' OR 1=1 --", 10, 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_candidates_cap_at_three_thousand() {
+        let db = Database::open_in_memory().unwrap();
+        let items = (0..3001)
+            .map(|i| (format!("hash{i}"), "Hello".into(), "Hola".into()))
+            .collect::<Vec<_>>();
+        db.save_memory_batch(&items, "en-es").await.unwrap();
+        assert_eq!(
+            db.memory_candidates("en-es", 5, usize::MAX).unwrap().len(),
+            3000
+        );
+    }
 
     #[test]
     fn test_translation_memory_roundtrip() {

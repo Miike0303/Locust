@@ -9,6 +9,7 @@ import { useT } from "../lib/i18n";
 import { acknowledgeDraft, draftAlternatives, selectDraftAlternative, draftEntryKey, draftProjectKey, editDraft, loadLatestDraft, restoreDraft, saveDraft, useDraftStore } from "../stores/draftStore";
 import { useProjectStore } from "../stores/projectStore";
 import StringHistory from "./StringHistory";
+import MemorySuggestions from "./MemorySuggestions";
 
 import type { MessageKey } from "../lib/i18n";
 
@@ -35,6 +36,7 @@ const statusButtons: { value: StringStatus; labelKey: MessageKey; color: string 
 interface DetailPanelProps {
 	projectKey: string;
 	entry: StringEntry;
+	sampleSources?: readonly string[];
 	onRefetch: () => void;
 	onClose: () => void;
 }
@@ -42,6 +44,7 @@ interface DetailPanelProps {
 export default function DetailPanel({
 	projectKey,
 	entry,
+	sampleSources,
 	onRefetch,
 	onClose,
 }: DetailPanelProps) {
@@ -211,6 +214,11 @@ export default function DetailPanel({
 						{budgetHint.expandable && !budgetHint.grouped && <p className="mt-1">{t("detail.expandableBudget")}</p>}
 					</div>
 				</div>
+
+				<MemorySuggestions projectKey={projectKey} entry={entry} sampleSources={sampleSources}
+					busy={saving || changingStatus} onUse={text => {
+						if (isCurrentProject() && !saving && !changingStatus) editDraft(draftKey, text, entry.translation);
+					}} />
 
 				{/* Status */}
 				<div>

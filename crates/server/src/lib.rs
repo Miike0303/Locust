@@ -37,7 +37,7 @@ pub use routes::config_auth::{
 };
 use routes::glossary_memory::{
     add_glossary, clear_memory, delete_glossary, delete_memory_entry, get_glossary, list_memory,
-    memory_lang_pairs, memory_stats,
+    memory_lang_pairs, memory_stats, memory_suggestions,
 };
 use routes::inject::{inject, register_lang};
 pub use routes::io::audit_project_fonts;
@@ -548,6 +548,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/memory", get(list_memory).delete(clear_memory))
         .route("/api/memory/:hash/:lang_pair", delete(delete_memory_entry))
         .route("/api/memory/lang-pairs", get(memory_lang_pairs))
+        .route("/api/memory/suggestions", get(memory_suggestions))
         .route("/api/backups", get(list_backups))
         .route("/api/backups/:id/restore", post(restore_backup))
         .route("/api/backups/:id", delete(delete_backup))

@@ -8,6 +8,7 @@ pub mod extraction;
 mod file_identity;
 pub mod font_patch;
 pub mod font_validation;
+pub mod fuzzy;
 pub mod glossary;
 pub mod injection_transaction;
 pub mod models;
