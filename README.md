@@ -37,7 +37,7 @@ Stability matches `locust formats` / the desktop Welcome screen
 | ------------------------- | --------------------- | ----- |
 | **RPG Maker MV / MZ**     | `.json`, `.jsono`      | Maps, events, system, plugins; shared `rpgmaker-mv` plugin |
 | **RPG Maker XP / VX / VX Ace** | `.rxdata`, `.rvdata`, `.rvdata2` | Ruby Marshal data |
-| **Ren'Py**                | `.rpy`, `.rpa`        | Loose scripts + RPA; Add-mode `game/tl/<lang>/` language packs |
+| **Ren'Py**                | `.rpy`, `.rpyc`, `.rpa` | Loose scripts + RPA; orphan compiled scripts use a runtime filter in Replace mode; Add-mode `game/tl/<lang>/` language packs |
 
 ### Experimental (Phase-2 extract → inject → patch → apply proven on fixtures or sample games)
 

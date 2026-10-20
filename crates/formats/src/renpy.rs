@@ -4,7 +4,7 @@ use std::io::{Read as IoRead, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
 use locust_core::error::Result;
-use locust_core::extraction::{FormatPlugin, InjectionReport};
+use locust_core::extraction::{Extraction, FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 pub struct RenPyPlugin;
@@ -64,17 +64,96 @@ impl RenPyPlugin {
         None
     }
 
-    fn has_rpy_files(dir: &Path) -> bool {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .any(|e| e.path().extension().is_some_and(|ext| ext == "rpy"))
+    fn ignored_script(relative: &Path) -> bool {
+        relative.starts_with("tl")
+            || relative.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("zzz_locust")
+                    || matches!(
+                        name.as_ref(),
+                        "locust_languages.rpy"
+                            | "locust_languages.rpyc"
+                            | "locust_language.rpy"
+                            | "locust_language.rpyc"
+                    )
             })
-            .unwrap_or(false)
     }
 
-    fn extract_rpa_archive(&self, rpa_path: &Path) -> Result<Vec<StringEntry>> {
+    fn loose_scripts(game_dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+        walkdir::WalkDir::new(game_dir)
+            .follow_links(false)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(crate::discovery::is_game_entry)
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.into_path())
+            .filter(move |path| {
+                path.extension()
+                    .is_some_and(|ext| ext == "rpy" || ext == "rpyc")
+                    && !Self::ignored_script(path.strip_prefix(game_dir).unwrap_or(path))
+            })
+    }
+
+    // Direct nested compiled scripts use game/ for IDs and the runtime filter,
+    // just as extraction/injection through the game root does.
+    fn compiled_game_dir(path: &Path) -> &Path {
+        let parent = path.parent().unwrap_or(path);
+        parent
+            .ancestors()
+            .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "game"))
+            .unwrap_or(parent)
+    }
+
+    fn read_rpyc_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(MAX_RPA_MEMBER_SIZE as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_RPA_MEMBER_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compiled script exceeds 64 MiB",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn extract_rpyc(
+        file: &Path,
+        original: &Path,
+        id_prefix: &str,
+        warnings: &mut Vec<String>,
+    ) -> Vec<StringEntry> {
+        let (strings, warning) = match Self::read_rpyc_bytes(file) {
+            Ok(bytes) => harvest_rpyc_strings_with_diagnostics(&bytes),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("failed to read compiled script: {error}")),
+            ),
+        };
+        if let Some(reason) = warning {
+            let warning = format!("{} ({id_prefix}): {reason}", original.display());
+            tracing::warn!("{warning}");
+            warnings.push(warning);
+        }
+        strings
+            .into_iter()
+            .enumerate()
+            .map(|(n, text)| {
+                let mut entry =
+                    StringEntry::new(format!("{id_prefix}#s{n}"), text, original.to_path_buf());
+                entry.tags = vec!["dialogue".into(), "rpyc".into()];
+                entry
+            })
+            .collect()
+    }
+
+    fn extract_rpa_archive(
+        &self,
+        rpa_path: &Path,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<StringEntry>> {
         let temp_dir = std::env::temp_dir().join(format!("locust_rpa_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir)?;
         // Dropped on every exit path below, including the `?` on extract_rpa.
@@ -93,7 +172,7 @@ impl RenPyPlugin {
                 .strip_prefix(&temp_dir)
                 .map(|r| r.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
-            if rel_str.starts_with("tl/") {
+            if Self::ignored_script(Path::new(&rel_str)) {
                 continue;
             }
             considered += 1;
@@ -101,22 +180,11 @@ impl RenPyPlugin {
             // Compiled scripts: mine the pickled AST for display strings.
             // These are injected via a runtime text filter, not file edits.
             if file.extension().is_some_and(|e| e == "rpyc") {
-                match std::fs::read(file) {
-                    Ok(bytes) => {
-                        for (n, text) in harvest_rpyc_strings(&bytes).into_iter().enumerate() {
-                            let id = format!(
-                                "{}#{}#s{}",
-                                rpa_path.file_name().unwrap_or_default().to_string_lossy(),
-                                rel_str,
-                                n
-                            );
-                            let mut entry = StringEntry::new(id, &text, rpa_path.to_path_buf());
-                            entry.tags = vec!["dialogue".to_string(), "rpyc".to_string()];
-                            all.push(entry);
-                        }
-                    }
-                    Err(e) => tracing::warn!("Failed to read {}: {}", file.display(), e),
-                }
+                let prefix = format!(
+                    "{}#{rel_str}",
+                    rpa_path.file_name().unwrap_or_default().to_string_lossy()
+                );
+                all.extend(Self::extract_rpyc(file, rpa_path, &prefix, warnings));
                 continue;
             }
 
@@ -159,6 +227,8 @@ impl RenPyPlugin {
     fn inject_rpyc_filter(path: &Path, entries: &[&StringEntry]) -> Result<InjectionReport> {
         let game_dir = if path.is_dir() {
             Self::find_game_dir(path).unwrap_or_else(|| path.join("game"))
+        } else if path.extension().is_some_and(|ext| ext == "rpyc") {
+            Self::compiled_game_dir(path).to_path_buf()
         } else {
             path.parent().unwrap_or(path).to_path_buf()
         };
@@ -641,6 +711,25 @@ impl RenPyPlugin {
 
     fn has_rpy_twin(names: &HashSet<&str>, rpyc: &str) -> bool {
         rpyc.ends_with(".rpyc") && names.contains(&rpyc[..rpyc.len() - 1])
+    }
+
+    fn has_loose_rpy_twin(file: &Path) -> bool {
+        // Enumerate actual names instead of probing with_extension("rpy"):
+        // a case-insensitive host must still apply the archive's exact rule.
+        let names: Vec<String> = file
+            .parent()
+            .and_then(|parent| std::fs::read_dir(parent).ok())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let names = names.iter().map(String::as_str).collect();
+        Self::has_rpy_twin(
+            &names,
+            &file.file_name().unwrap_or_default().to_string_lossy(),
+        )
     }
 
     fn extract_file(file_path: &Path) -> Result<Vec<StringEntry>> {
@@ -1769,16 +1858,21 @@ fn is_gui_non_translatable(var: &str) -> bool {
         || prop.starts_with("namebox_")
 }
 
-/// Read typed display strings out of a compiled Ren'Py script (.rpyc).
-///
-/// Layout: "RENPY RPC2" magic + slot table; slot 1 is a zlib-compressed
-/// Python pickle of the script AST. The inert reader selects visible AST
-/// fields, preserving their exact runtime strings for the injection filter.
-/// Unsupported/malformed pickles use a conservative per-file fallback.
-fn harvest_rpyc_strings(bytes: &[u8]) -> Vec<String> {
+/// Locate RPC2 slot 1, or a legacy bare-zlib pickle, without interpreting it.
+fn rpyc_payload(bytes: &[u8]) -> std::result::Result<&[u8], String> {
     const MAGIC: &[u8] = b"RENPY RPC2";
-    if bytes.len() < MAGIC.len() + 12 || &bytes[..MAGIC.len()] != MAGIC {
-        return Vec::new();
+    if !bytes.starts_with(MAGIC) {
+        // RFC 1950: deflate, a supported window, valid header check bits and
+        // no preset dictionary (which the bounded inflater cannot provide).
+        if bytes.len() >= 2
+            && bytes[0] & 0x0f == 8
+            && bytes[0] >> 4 <= 7
+            && (u16::from(bytes[0]) * 256 + u16::from(bytes[1])) % 31 == 0
+            && bytes[1] & 0x20 == 0
+        {
+            return Ok(bytes);
+        }
+        return Err("not an RPC2 or legacy zlib compiled script".into());
     }
 
     // Slot table: (u32 slot, u32 offset, u32 length) LE triplets, 0-terminated
@@ -1790,17 +1884,27 @@ fn harvest_rpyc_strings(bytes: &[u8]) -> Vec<String> {
         let len = u32::from_le_bytes(bytes[i + 8..i + 12].try_into().unwrap()) as usize;
         i += 12;
         if slot == 0 {
-            break;
+            let (start, len) = slot1.ok_or("RPC2 has no slot 1")?;
+            let end = start
+                .checked_add(len)
+                .filter(|&end| start >= i && end <= bytes.len())
+                .ok_or("RPC2 slot 1 is outside the payload bounds")?;
+            return Ok(&bytes[start..end]);
         }
         if slot == 1 {
             slot1 = Some((start, len));
         }
     }
-    let Some((start, len)) = slot1 else {
-        return Vec::new();
-    };
-    let Some(end) = start.checked_add(len).filter(|&end| end <= bytes.len()) else {
-        return Vec::new();
+    Err("truncated RPC2 slot table (missing terminator)".into())
+}
+
+/// The same bounded, inert AST reader serves loose and archived scripts.
+/// Unsupported/malformed pickles retain conservative fallback text, but the
+/// diagnostic makes extraction incomplete even when fallback yields rows.
+fn harvest_rpyc_strings_with_diagnostics(bytes: &[u8]) -> (Vec<String>, Option<String>) {
+    let payload = match rpyc_payload(bytes) {
+        Ok(payload) => payload,
+        Err(reason) => return (Vec::new(), Some(reason)),
     };
 
     // ponytail: bounded single-shot inflate, ceiling 64 MiB of decompressed pickle.
@@ -1810,40 +1914,45 @@ fn harvest_rpyc_strings(bytes: &[u8]) -> Vec<String> {
     // stream through `flate2` if legitimate scripts ever need more.
     const MAX_PICKLE_SIZE: usize = 64 * 1024 * 1024;
     let pickle = match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
-        &bytes[start..end],
+        payload,
         MAX_PICKLE_SIZE,
     ) {
         Ok(p) => p,
         Err(e) => {
-            if e.status == miniz_oxide::inflate::TINFLStatus::HasMoreOutput {
-                tracing::warn!(
-                    "rpyc string table exceeds {} bytes decompressed, skipping (possible decompression bomb)",
-                    MAX_PICKLE_SIZE
-                );
+            let reason = if e.status == miniz_oxide::inflate::TINFLStatus::HasMoreOutput {
+                format!(
+                    "rpyc string table exceeds {MAX_PICKLE_SIZE} bytes decompressed, skipping (possible decompression bomb)"
+                )
             } else {
-                tracing::warn!("failed to decompress rpyc string table: {:?}", e.status);
-            }
-            return Vec::new();
+                format!("failed to decompress rpyc string table: {:?}", e.status)
+            };
+            return (Vec::new(), Some(reason));
         }
     };
 
     let mut seen = std::collections::HashSet::new();
-    let strings = match crate::renpy_pickle::visible_text(&pickle) {
-        Ok(strings) => strings,
-        Err(reason) => {
-            tracing::warn!(
-                "typed rpyc reader failed ({reason}); using conservative string fallback"
-            );
+    let (strings, warning) = match crate::renpy_pickle::visible_text(&pickle) {
+        Ok(strings) => (strings, None),
+        Err(reason) => (
             scan_pickle_strings(&pickle)
                 .into_iter()
                 .filter(|s| is_renpy_fallback_text(s))
-                .collect()
-        }
+                .collect(),
+            Some(format!(
+                "typed rpyc reader failed ({reason}); using conservative string fallback"
+            )),
+        ),
     };
-    strings
+    let strings = strings
         .into_iter()
         .filter(|s| seen.insert(s.clone()))
-        .collect()
+        .collect();
+    (strings, warning)
+}
+
+#[cfg(test)]
+fn harvest_rpyc_strings(bytes: &[u8]) -> Vec<String> {
+    harvest_rpyc_strings_with_diagnostics(bytes).0
 }
 
 /// On an unreadable AST, require prose evidence as well as the old guard.
@@ -2500,11 +2609,11 @@ impl FormatPlugin for RenPyPlugin {
     }
 
     fn description(&self) -> &str {
-        "Ren'Py visual novel .rpy script files"
+        "Ren'Py visual novel .rpy, .rpyc and .rpa scripts"
     }
 
     fn supported_extensions(&self) -> &[&str] {
-        &[".rpy"]
+        &[".rpy", ".rpyc", ".rpa"]
     }
 
     fn supported_modes(&self) -> Vec<OutputMode> {
@@ -2514,22 +2623,53 @@ impl FormatPlugin for RenPyPlugin {
     fn detect(&self, path: &Path) -> bool {
         if path.is_file() {
             let ext = path.extension().unwrap_or_default();
-            return ext == "rpy" || ext == "rpa";
+            return ext == "rpy"
+                || ext == "rpa"
+                || (ext == "rpyc"
+                    && Self::read_rpyc_bytes(path)
+                        .is_ok_and(|bytes| rpyc_payload(&bytes).is_ok()));
         }
         if path.is_dir() {
             if let Some(game_dir) = Self::find_game_dir(path) {
-                return Self::has_rpy_files(&game_dir) || Self::has_rpa_files(&game_dir);
+                return Self::loose_scripts(&game_dir).any(|file| {
+                    file.extension().is_some_and(|ext| ext == "rpyc")
+                        || file.parent() == Some(game_dir.as_path())
+                }) || Self::has_rpa_files(&game_dir);
             }
         }
         false
     }
 
     fn extract(&self, path: &Path) -> Result<Vec<StringEntry>> {
+        Ok(self.extract_with_diagnostics(path)?.entries)
+    }
+
+    fn extract_with_diagnostics(&self, path: &Path) -> Result<Extraction> {
+        let mut warnings = Vec::new();
         if path.is_file() {
-            if path.extension().is_some_and(|e| e == "rpa") {
-                return self.extract_rpa_archive(path);
-            }
-            return Self::extract_file(path);
+            let entries = if path.extension().is_some_and(|e| e == "rpa") {
+                self.extract_rpa_archive(path, &mut warnings)?
+            } else if path.extension().is_some_and(|e| e == "rpyc") {
+                let game_dir = Self::compiled_game_dir(path);
+                let relative = path.strip_prefix(game_dir).unwrap_or(path);
+                if Self::ignored_script(relative) || Self::has_loose_rpy_twin(path) {
+                    Vec::new()
+                } else {
+                    Self::extract_rpyc(
+                        path,
+                        path,
+                        &relative.to_string_lossy().replace('\\', "/"),
+                        &mut warnings,
+                    )
+                }
+            } else {
+                Self::extract_file(path)?
+            };
+            return Ok(Extraction {
+                complete: warnings.is_empty(),
+                entries,
+                warnings,
+            });
         }
 
         let game_dir = Self::find_game_dir(path).ok_or_else(|| {
@@ -2539,44 +2679,34 @@ impl FormatPlugin for RenPyPlugin {
             }
         })?;
 
-        // Loose .rpy files (often just patches/mods living next to the packed
-        // game) — extract them, but never let them stop the .rpa scan below:
-        // the real scripts of a shipped game live inside scripts.rpa.
+        // Use actual relative names for exact twins on every filesystem.
+        let files: Vec<_> = Self::loose_scripts(&game_dir).collect();
+        let relative_names: Vec<_> = files
+            .iter()
+            .map(|file| {
+                file.strip_prefix(&game_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        let names: HashSet<_> = relative_names.iter().map(String::as_str).collect();
         let mut all = Vec::new();
-        for entry in walkdir::WalkDir::new(&game_dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(crate::discovery::is_game_entry)
-            .filter_map(|e| e.ok())
-        {
-            let fpath = entry.path();
-            if fpath.extension().is_some_and(|e| e == "rpy") {
-                // Skip tl/ directory and renpy/ engine dir
-                if let Ok(rel) = fpath.strip_prefix(&game_dir) {
-                    if rel.starts_with("tl") {
-                        continue;
-                    }
-                }
-                // Skip the renpy engine directory
-                if let Some(parent_root) = game_dir.parent() {
-                    if fpath.starts_with(parent_root.join("renpy")) {
-                        continue;
-                    }
-                }
-                // Skip files Locust generates itself: the runtime filter and the
-                // Add-mode language picker (plus its pre-rename spelling).
-                if fpath.file_name().is_some_and(|n| {
-                    let n = n.to_string_lossy();
-                    n.starts_with("zzz_locust")
-                        || n == "locust_languages.rpy"
-                        || n == "locust_language.rpy"
-                }) {
+        for (file, relative) in files.iter().zip(&relative_names) {
+            if file.extension().is_some_and(|ext| ext == "rpyc") {
+                if Self::has_rpy_twin(&names, relative) {
                     continue;
                 }
-                match Self::extract_file(fpath) {
+                // Loose IDs: <relative path>#sN. Archived IDs retain the
+                // existing <archive filename>#<relative path>#sN prefix.
+                all.extend(Self::extract_rpyc(file, file, relative, &mut warnings));
+            } else {
+                match Self::extract_file(file) {
                     Ok(entries) => all.extend(entries),
                     Err(e) => {
-                        tracing::warn!("Failed to extract {}: {}", fpath.display(), e);
+                        let warning = format!("Failed to extract {}: {e}", file.display());
+                        tracing::warn!("{warning}");
+                        warnings.push(warning);
                     }
                 }
             }
@@ -2592,10 +2722,11 @@ impl FormatPlugin for RenPyPlugin {
                     name.contains("script") || name == "archive.rpa"
                 })
             {
-                match self.extract_rpa_archive(&fpath) {
+                match self.extract_rpa_archive(&fpath, &mut warnings) {
                     Ok(entries) => all.extend(entries),
                     Err(e) => {
                         tracing::warn!("Failed to extract RPA {}: {}", fpath.display(), e);
+                        warnings.push(format!("Failed to extract RPA {}: {e}", fpath.display()));
                     }
                 }
             }
@@ -2612,10 +2743,12 @@ impl FormatPlugin for RenPyPlugin {
                     }) {
                         continue; // already tried above
                     }
-                    match self.extract_rpa_archive(&fpath) {
+                    match self.extract_rpa_archive(&fpath, &mut warnings) {
                         Ok(entries) => all.extend(entries),
                         Err(e) => {
                             tracing::warn!("Failed to extract RPA {}: {}", fpath.display(), e);
+                            warnings
+                                .push(format!("Failed to extract RPA {}: {e}", fpath.display()));
                         }
                     }
                 }
@@ -2627,7 +2760,11 @@ impl FormatPlugin for RenPyPlugin {
         // Database extraction uses upsert-by-ID, just as Ren'Py gives a loose
         // file priority over the archived member of the same path.
         all.sort_by_key(|entry| entry.file_path.extension().is_none_or(|ext| ext != "rpa"));
-        Ok(all)
+        Ok(Extraction {
+            complete: warnings.is_empty(),
+            entries: all,
+            warnings,
+        })
     }
 
     fn prepare_revision_entries(
@@ -2929,6 +3066,8 @@ impl FormatPlugin for RenPyPlugin {
 
         let game_dir = if path.is_dir() {
             Self::find_game_dir(path).unwrap_or_else(|| path.join("game"))
+        } else if path.extension().is_some_and(|ext| ext == "rpyc") {
+            Self::compiled_game_dir(path).to_path_buf()
         } else {
             path.parent().unwrap_or(path).to_path_buf()
         };
@@ -3524,6 +3663,482 @@ mod tests {
                 ),
             ],
         )
+    }
+
+    fn say_menu_pickle(say: &str, choice: &str) -> Vec<u8> {
+        let mut pickle = vec![0x80, 2];
+        pickle.extend(ast_seq(
+            vec![
+                vec![b'}'],
+                ast_seq(
+                    vec![
+                        ast_say(say),
+                        ast_object(
+                            "renpy.ast",
+                            "Menu",
+                            vec![(
+                                "items",
+                                ast_seq(
+                                    vec![ast_seq(
+                                        vec![ast_text(choice), vec![b'N'], vec![b'N']],
+                                        true,
+                                    )],
+                                    false,
+                                ),
+                            )],
+                        ),
+                    ],
+                    false,
+                ),
+            ],
+            true,
+        ));
+        pickle.push(b'.');
+        pickle
+    }
+
+    #[test]
+    fn loose_rpyc_detects_compiled_only_game() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(
+            game.join("script.rpyc"),
+            wrap_pickle_as_rpyc(&say_menu_pickle("Hello!", "Continue")),
+        )
+        .unwrap();
+        assert!(RenPyPlugin::new().detect(root.path()));
+    }
+
+    #[test]
+    fn loose_rpyc_direct_detection_checks_rpc2_and_legacy_headers() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("script.rpyc");
+        let pickle = say_menu_pickle("Hello!", "Continue");
+        for bytes in [
+            wrap_pickle_as_rpyc(&pickle),
+            miniz_oxide::deflate::compress_to_vec_zlib(&pickle, 6),
+        ] {
+            fs::write(&file, bytes).unwrap();
+            assert!(RenPyPlugin::new().detect(&file));
+        }
+        for bytes in [
+            b"unrelated bytes".as_slice(),
+            b"RENPY RPC2",
+            b"RENPY RPC2\0",
+        ] {
+            fs::write(&file, bytes).unwrap();
+            assert!(!RenPyPlugin::new().detect(&file));
+        }
+    }
+
+    #[test]
+    fn loose_rpyc_discovers_nested_scripts() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("game/sub/deeper");
+        fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("story.rpyc");
+        fs::write(
+            &file,
+            wrap_pickle_as_rpyc(&say_menu_pickle("¡Hola, viajero!", "Go")),
+        )
+        .unwrap();
+        let plugin = RenPyPlugin::new();
+        assert!(plugin.detect(root.path()));
+        let result = plugin.extract_with_diagnostics(root.path()).unwrap();
+        assert!(result.complete, "{:?}", result.warnings);
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.entries[0].id, "sub/deeper/story.rpyc#s0");
+        assert_eq!(result.entries[0].file_path, file);
+        assert_eq!(result.entries[0].source, "¡Hola, viajero!");
+        assert_eq!(result.entries[1].source, "Go");
+    }
+
+    #[test]
+    fn loose_rpyc_prefers_only_exact_relative_source_twins() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game");
+        for name in ["sub", "other"] {
+            fs::create_dir_all(game.join(name)).unwrap();
+        }
+        for (name, text) in [
+            ("sub/exact.rpyc", "Skip exact twin!"),
+            ("sub/café.rpyc", "Skip Unicode twin!"),
+            ("sub/Case.rpyc", "Keep case mismatch!"),
+            ("sub/path.rpyc", "Keep path mismatch!"),
+            ("sub/extension.rpyc", "Keep extension mismatch!"),
+        ] {
+            fs::write(
+                game.join(name),
+                wrap_pickle_as_rpyc(&say_menu_pickle(text, "Continue")),
+            )
+            .unwrap();
+        }
+        for name in [
+            "sub/exact.rpy",
+            "sub/café.rpy",
+            "sub/case.rpy",
+            "other/path.rpy",
+            "sub/extension.RPY",
+        ] {
+            fs::write(game.join(name), "\"Source preferred!\"\n").unwrap();
+        }
+        let plugin = RenPyPlugin::new();
+        for path in [root.path(), &game.join("sub/exact.rpyc")] {
+            let entries = plugin.extract(path).unwrap();
+            assert!(!entries.iter().any(|e| e.source.starts_with("Skip")));
+        }
+        let entries = plugin.extract(root.path()).unwrap();
+        for text in [
+            "Source preferred!",
+            "Keep case mismatch!",
+            "Keep path mismatch!",
+            "Keep extension mismatch!",
+        ] {
+            assert!(entries.iter().any(|e| e.source == text), "{text}");
+        }
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.tags.contains(&"rpyc".into()))
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn loose_rpyc_excludes_translations_generated_and_recovery_files() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game");
+        let compiled = wrap_pickle_as_rpyc(&say_menu_pickle("Excluded!", "Continue"));
+        let names = [
+            "tl/es/story.rpyc",
+            "zzz_locust_translate.rpyc",
+            "sub/zzz_locust_translate.rpyc",
+            "locust_languages.rpyc",
+            "locust_language.rpyc",
+            ".locust/files/story.rpyc",
+            ".locust-injections/files/story.rpyc",
+        ];
+        for name in names {
+            let file = game.join(name);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, &compiled).unwrap();
+        }
+        fs::write(
+            game.join("zzz_locust_translate.rpy"),
+            "\"Excluded source!\"\n",
+        )
+        .unwrap();
+        // A directory with a script extension is not a script.
+        fs::create_dir(game.join("directory.rpyc")).unwrap();
+        let plugin = RenPyPlugin::new();
+        assert!(!plugin.detect(root.path()));
+        let result = plugin.extract_with_diagnostics(root.path()).unwrap();
+        assert!(result.complete && result.warnings.is_empty());
+        assert!(result.entries.is_empty());
+        assert!(plugin
+            .extract(&game.join("zzz_locust_translate.rpyc"))
+            .unwrap()
+            .is_empty());
+        assert!(plugin
+            .extract(&game.join("tl/es/story.rpyc"))
+            .unwrap()
+            .is_empty());
+
+        let archive = game.join("scripts.rpa");
+        fs::write(
+            &archive,
+            build_rpa(&[
+                ("tl/es/story.rpyc", compiled.clone()),
+                ("zzz_locust_translate.rpyc", compiled.clone()),
+                (
+                    "sub/zzz_locust_translate.rpy",
+                    b"\"Excluded source!\"\n".to_vec(),
+                ),
+                ("story.rpyc", compiled),
+            ]),
+        )
+        .unwrap();
+        let entries = plugin.extract(&archive).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|e| e.id.starts_with("scripts.rpa#story.rpyc#s")));
+    }
+
+    #[test]
+    fn loose_rpyc_matches_archived_text_tags_and_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game");
+        fs::create_dir_all(game.join("sub")).unwrap();
+        let (pickle, expected) = typed_ast_fixture();
+        let bytes = wrap_pickle_as_rpyc(&pickle);
+        fs::write(game.join("sub/story.rpyc"), &bytes).unwrap();
+        let archive = game.join("scripts.rpa");
+        fs::write(&archive, build_rpa(&[("sub/story.rpyc", bytes)])).unwrap();
+        let plugin = RenPyPlugin::new();
+        let loose = plugin.extract(&game.join("sub/story.rpyc")).unwrap();
+        let archived = plugin.extract(&archive).unwrap();
+        assert_eq!(
+            loose.iter().map(|e| e.source.as_str()).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(loose.len(), archived.len());
+        for (loose, archived) in loose.iter().zip(&archived) {
+            assert_eq!(loose.source, archived.source);
+            assert_eq!(loose.tags, ["dialogue", "rpyc"]);
+            assert_eq!(loose.tags, archived.tags);
+            assert_eq!(loose.metadata, archived.metadata);
+            assert_eq!(loose.context, archived.context);
+            assert_eq!(archived.id, format!("scripts.rpa#{}", loose.id));
+        }
+    }
+
+    #[test]
+    fn loose_rpyc_direct_file_extracts_rpc2_and_legacy() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("story.rpyc");
+        let pickle = say_menu_pickle("  Hello \\\"friend\\\"!\n", "Sí");
+        for bytes in [
+            wrap_pickle_as_rpyc(&pickle),
+            miniz_oxide::deflate::compress_to_vec_zlib(&pickle, 6),
+        ] {
+            fs::write(&file, bytes).unwrap();
+            let result = RenPyPlugin::new().extract_with_diagnostics(&file).unwrap();
+            assert!(result.complete, "{:?}", result.warnings);
+            assert!(result.warnings.is_empty());
+            assert_eq!(result.entries.len(), 2);
+            assert_eq!(result.entries[0].source, "  Hello \\\"friend\\\"!\n");
+            assert_eq!(result.entries[1].source, "Sí");
+            assert_eq!(result.entries[0].id, "story.rpyc#s0");
+            assert_eq!(result.entries[0].file_path, file);
+        }
+    }
+
+    #[test]
+    fn loose_rpyc_malformed_and_unsupported_files_warn_and_are_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let bad = game.join("broken.rpyc");
+        let plugin = RenPyPlugin::new();
+        let mut out_of_bounds = wrap_pickle_as_rpyc(&say_menu_pickle("Hello!", "Continue"));
+        out_of_bounds[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        for bytes in [
+            b"garbage".to_vec(),
+            b"RENPY RPC2".to_vec(),
+            out_of_bounds,
+            wrap_pickle_as_rpyc(&[0x80, 5, b'N', b'.']),
+            wrap_pickle_as_rpyc(&[0x80, 2, 0xff]),
+        ] {
+            fs::write(&bad, bytes).unwrap();
+            for path in [root.path(), bad.as_path()] {
+                let result = plugin.extract_with_diagnostics(path).unwrap();
+                assert!(!result.complete);
+                assert!(result.entries.is_empty());
+                assert!(result.warnings.iter().any(|w| w.contains("broken.rpyc")));
+            }
+        }
+        // Fallback text may be kept, but a failed typed parse is still incomplete.
+        let mut unsupported = tiny_pickle(&["Recovered dialogue!"]);
+        unsupported[1] = 5;
+        fs::write(&bad, wrap_pickle_as_rpyc(&unsupported)).unwrap();
+        let good = game.join("good.rpyc");
+        fs::write(
+            &good,
+            wrap_pickle_as_rpyc(&say_menu_pickle("Valid sibling!", "Go")),
+        )
+        .unwrap();
+        let result = plugin.extract_with_diagnostics(root.path()).unwrap();
+        assert!(!result.complete && !result.warnings.is_empty());
+        assert!(result
+            .entries
+            .iter()
+            .any(|e| e.source == "Recovered dialogue!"));
+        assert!(result.entries.iter().any(|e| e.source == "Valid sibling!"));
+    }
+
+    #[test]
+    fn loose_rpyc_valid_empty_ast_is_complete() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("code.rpyc");
+        fs::write(&file, wrap_pickle_as_rpyc(&[0x80, 2, b']', b'.'])).unwrap();
+        let result = RenPyPlugin::new().extract_with_diagnostics(&file).unwrap();
+        assert!(result.complete && result.warnings.is_empty());
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn loose_rpyc_ids_are_deterministic_and_include_relative_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = wrap_pickle_as_rpyc(&say_menu_pickle("Hello!", "Continue"));
+        for dir in ["game/a", "game/b"] {
+            fs::create_dir_all(root.path().join(dir)).unwrap();
+            fs::write(root.path().join(dir).join("story.rpyc"), &bytes).unwrap();
+        }
+        let plugin = RenPyPlugin::new();
+        let ids = || {
+            plugin
+                .extract(root.path())
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>()
+        };
+        let first = ids();
+        assert_eq!(first, ids());
+        assert_eq!(
+            first,
+            [
+                "a/story.rpyc#s0",
+                "a/story.rpyc#s1",
+                "b/story.rpyc#s0",
+                "b/story.rpyc#s1"
+            ]
+        );
+    }
+
+    #[test]
+    fn loose_rpyc_replace_and_add_match_archived_semantics_and_preserve_bytes() {
+        for add in [false, true] {
+            let mut outputs = Vec::new();
+            for archived in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let game = root.path().join("game");
+                fs::create_dir(&game).unwrap();
+                let compiled = wrap_pickle_as_rpyc(&say_menu_pickle("Hello!", "Continue"));
+                let (file, bytes) = if archived {
+                    (
+                        game.join("scripts.rpa"),
+                        build_rpa(&[("story.rpyc", compiled)]),
+                    )
+                } else {
+                    (game.join("story.rpyc"), compiled)
+                };
+                fs::write(&file, &bytes).unwrap();
+                let plugin = RenPyPlugin::new();
+                let mut entries = plugin.extract(root.path()).unwrap();
+                assert_eq!(entries.len(), 2);
+                for e in &mut entries {
+                    e.translation = Some(format!("Traducido: {} \\\"sí\\\"\n", e.source));
+                }
+                let report = if add {
+                    plugin.inject_add(root.path(), "es", &entries)
+                } else {
+                    plugin.inject(root.path(), &entries)
+                }
+                .unwrap();
+                assert_eq!(report.strings_written, 2);
+                assert_eq!(report.strings_skipped, 0);
+                assert_eq!(fs::read(&file).unwrap(), bytes);
+                let output = game.join(if add {
+                    "tl/es/locust_strings.rpy"
+                } else {
+                    "zzz_locust_translate.rpy"
+                });
+                assert!(report.files_written.contains(&output));
+                let text = fs::read_to_string(output).unwrap();
+                assert!(text.contains("Traducido:"));
+                if !add {
+                    assert_eq!(report.files_modified, 1);
+                    assert!(text.contains("locust_previous_filter = config.say_menu_text_filter"));
+                    assert!(text.contains("text = locust_previous_filter(text)"));
+                    assert!(
+                        text.contains(&python_escape(entries[0].translation.as_deref().unwrap()))
+                    );
+                }
+                outputs.push(text);
+            }
+            assert_eq!(outputs[0], outputs[1]);
+        }
+    }
+
+    #[test]
+    fn loose_rpyc_mixed_game_writes_one_filter_for_loose_and_archived_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game");
+        fs::create_dir_all(game.join("sub")).unwrap();
+        let loose = game.join("sub/story.rpyc");
+        let compiled = wrap_pickle_as_rpyc(&say_menu_pickle("Loose compiled!", "Loose choice"));
+        fs::write(&loose, &compiled).unwrap();
+        let archive = game.join("scripts.rpa");
+        let archive_bytes = build_rpa(&[
+            (
+                "compiled.rpyc",
+                wrap_pickle_as_rpyc(&say_menu_pickle("Packed compiled!", "Packed choice")),
+            ),
+            ("packed.rpy", b"\"Packed source!\"\n".to_vec()),
+        ]);
+        fs::write(&archive, &archive_bytes).unwrap();
+        fs::write(game.join("source.rpy"), "\"Loose source!\"\n").unwrap();
+        let plugin = RenPyPlugin::new();
+        let mut entries = plugin.extract(root.path()).unwrap();
+        assert_eq!(entries.len(), 6);
+        for e in &mut entries {
+            e.translation = Some(format!("Traducción: {}", e.source));
+        }
+        let report = plugin.inject(root.path(), &entries).unwrap();
+        assert_eq!(report.strings_written, 6);
+        assert_eq!(report.strings_skipped, 0);
+        let overlay = game.join("zzz_locust_translate.rpy");
+        assert_eq!(
+            report
+                .files_written
+                .iter()
+                .filter(|p| **p == overlay)
+                .count(),
+            1
+        );
+        let filter = fs::read_to_string(&overlay).unwrap();
+        for text in [
+            "Loose compiled!",
+            "Loose choice",
+            "Packed compiled!",
+            "Packed choice",
+        ] {
+            assert!(filter.contains(&format!("\"{text}\": \"Traducción: {text}\"")));
+        }
+        assert_eq!(
+            filter
+                .matches("config.say_menu_text_filter = locust_text_filter")
+                .count(),
+            1
+        );
+        assert_eq!(fs::read(&loose).unwrap(), compiled);
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+        assert!(fs::read_to_string(game.join("source.rpy"))
+            .unwrap()
+            .contains("Traducción:"));
+        assert!(fs::read_to_string(game.join("packed.rpy"))
+            .unwrap()
+            .contains("Traducción:"));
+    }
+
+    #[test]
+    fn loose_rpyc_direct_nested_injection_places_outputs_in_game() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game");
+        fs::create_dir_all(game.join("sub")).unwrap();
+        let file = game.join("sub/story.rpyc");
+        let bytes = wrap_pickle_as_rpyc(&say_menu_pickle("Hello!", "Continue"));
+        fs::write(&file, &bytes).unwrap();
+        let plugin = RenPyPlugin::new();
+        let mut entries = plugin.extract(&file).unwrap();
+        for e in &mut entries {
+            e.translation = Some(format!("Traducción: {}", e.source));
+        }
+        let report = plugin.inject(&file, &entries).unwrap();
+        assert_eq!(
+            report.files_written,
+            [game.join("zzz_locust_translate.rpy")]
+        );
+        let report = plugin.inject_add(&file, "es", &entries).unwrap();
+        assert_eq!(report.strings_written, 2);
+        assert!(report
+            .files_written
+            .contains(&game.join("tl/es/locust_strings.rpy")));
+        assert_eq!(fs::read(&file).unwrap(), bytes);
     }
 
     fn typed_ast_fixture() -> (Vec<u8>, Vec<&'static str>) {
