@@ -14,6 +14,8 @@ type Error = &'static str;
 enum Value<'a> {
     Scalar,
     Text(&'a str),
+    // Lists, tuples and sets are inert sequences in pickle encounter order.
+    // Sets do not hash, compare or deduplicate children (which could run code).
     Seq(Vec<Id>),
     Dict(Vec<Id>), // alternating keys/values; memo aliases retain identity
     Global(&'a str, &'a str),
@@ -31,6 +33,7 @@ struct Reader<'a> {
     arena: Vec<Value<'a>>,
     stack: Vec<Option<Id>>, // None is MARK, never a Python None
     memo: HashMap<usize, Id>,
+    sets: HashSet<Id>, // mutable set identities; bounded by the arena node cap
     strings: usize,
     edges: usize,
 }
@@ -48,6 +51,13 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<usize, Error> {
         let b = self.take(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    }
+    fn u64(&mut self) -> Result<usize, Error> {
+        let b = self.take(8)?;
+        usize::try_from(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+        .map_err(|_| "length overflow")
     }
     fn line(&mut self) -> Result<&'a str, Error> {
         let n = self.data[self.pos..]
@@ -184,9 +194,16 @@ impl<'a> Reader<'a> {
             let op = self.byte()?;
             match op {
                 0x80 => {
-                    if self.byte()? > 4 {
+                    if self.byte()? > 5 {
                         return Err("unsupported protocol");
                     }
+                }
+                0x95 => {
+                    let n = self.u64()?;
+                    if n > self.data.len() - self.pos {
+                        return Err("FRAME length exceeds remaining input");
+                    }
+                    // FRAME is a buffering hint, not a separate opcode stream.
                 }
                 b'.' => {
                     let root = self.pop()?;
@@ -235,6 +252,10 @@ impl<'a> Reader<'a> {
                     let n = self.u32()?;
                     self.text(n, op == b'X')?;
                 }
+                0x8d | 0x8e | 0x96 => {
+                    let n = self.u64()?;
+                    self.text(n, op == 0x8d)?;
+                }
                 b'U' | b'C' | 0x8c => {
                     let n = self.byte()? as usize;
                     self.text(n, op == 0x8c)?;
@@ -260,6 +281,18 @@ impl<'a> Reader<'a> {
                     self.memo_get(n)?;
                 }
                 0x94 => self.memo_put(self.memo.len())?,
+                0x8f => {
+                    self.sequence(Some(0), false)?;
+                    self.sets.insert(self.top()?);
+                }
+                0x90 => {
+                    let ids = self.marked()?;
+                    if !self.sets.contains(&self.top()?) {
+                        return Err("ADDITEMS on non-set");
+                    }
+                    self.extend(ids, false)?;
+                }
+                0x91 => self.sequence(None, false)?,
                 b')' | b']' => self.sequence(Some(0), false)?,
                 b'}' => self.sequence(Some(0), true)?,
                 0x85..=0x87 => self.sequence(Some((op - 0x84) as usize), false)?,
@@ -292,10 +325,19 @@ impl<'a> Reader<'a> {
                     };
                     self.add(Value::Global(m, n))?;
                 }
-                0x81 | b'R' => {
+                0x81 | 0x92 | b'R' => {
+                    if op == 0x92 {
+                        // Keep (args, kwargs) as an inert args graph, preserving
+                        // memo aliases and charging both wrapper edges.
+                        self.sequence(Some(2), false)?;
+                    }
                     let args = self.pop()?;
                     let class = self.pop()?;
                     self.object(class, args)?;
+                }
+                0x97 => return Err("out-of-band buffers unavailable"),
+                0x98 => {
+                    self.top()?; // READONLY_BUFFER only changes mutability.
                 }
                 b'b' => {
                     let state = self.pop()?;
@@ -409,6 +451,7 @@ pub(crate) fn visible_text(data: &[u8]) -> Result<Vec<String>, Error> {
         arena: Vec::new(),
         stack: Vec::new(),
         memo: HashMap::new(),
+        sets: HashSet::new(),
         strings: 0,
         edges: 0,
     };
@@ -738,7 +781,7 @@ fn literal(s: &str, at: usize) -> Option<(String, usize)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn reader(data: &[u8]) -> Reader<'_> {
@@ -748,8 +791,271 @@ mod tests {
             arena: Vec::new(),
             stack: Vec::new(),
             memo: HashMap::new(),
+            sets: HashSet::new(),
             strings: 0,
             edges: 0,
+        }
+    }
+
+    // Handwritten CPython protocol-5 layout for ({}, [Say(), Menu()]), with
+    // instance __dict__ state and a memo-shared renpy.ast module name. The
+    // single frame contains 96 bytes, including STOP; no Python build step.
+    pub(crate) fn protocol5_say_menu_pickle() -> &'static [u8] {
+        b"\x80\x05\x95\x60\0\0\0\0\0\0\0\
+          }\x94]\x94(\
+          \x8c\x09renpy.ast\x94\x8c\x03Say\x94\x93\x94)\x81\x94}\x94\
+          \x8c\x04what\x94\x8c\x06Hello!\x94sb\
+          h\x02\x8c\x04Menu\x94\x93\x94)\x81\x94}\x94\
+          \x8c\x05items\x94]\x94\x8c\x08Continue\x94NN\x87\x94asbe\x86\x94."
+    }
+
+    fn wide_string(op: u8, n: u64, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![op];
+        p.extend_from_slice(&n.to_le_bytes());
+        p.extend_from_slice(payload);
+        p.extend_from_slice(&[0x85, b'.']);
+        p
+    }
+
+    #[test]
+    fn protocol_headers_accept_zero_through_five_and_reject_six() {
+        for protocol in 0..=5 {
+            assert_eq!(visible_text(&[0x80, protocol, b']', b'.']), Ok(vec![]));
+        }
+        assert_eq!(
+            visible_text(&[0x80, 6, b']', b'.']),
+            Err("unsupported protocol")
+        );
+        assert_eq!(visible_text(&[0x80]), Err("truncated argument"));
+    }
+
+    #[test]
+    fn frames_are_buffering_hints() {
+        for n in [0u64, 1, 2] {
+            let mut p = vec![0x95];
+            p.extend_from_slice(&n.to_le_bytes());
+            p.extend_from_slice(b"].");
+            assert_eq!(visible_text(&p), Ok(vec![]));
+        }
+        // Consecutive frames can split the pickle between opcodes.
+        let p = b"\x95\x01\0\0\0\0\0\0\0]\x95\x01\0\0\0\0\0\0\0.";
+        assert_eq!(visible_text(p), Ok(vec![]));
+    }
+
+    #[test]
+    fn frames_reject_truncated_lengths_and_lengths_past_input() {
+        for n in 0..8 {
+            let mut p = vec![0x95];
+            p.extend_from_slice(&[0; 8][..n]);
+            assert_eq!(visible_text(&p), Err("truncated argument"));
+        }
+        let mut p = vec![0x95];
+        p.extend_from_slice(&3u64.to_le_bytes());
+        p.extend_from_slice(b"].");
+        assert_eq!(
+            visible_text(&p),
+            Err("FRAME length exceeds remaining input")
+        );
+        p[1..9].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(visible_text(&p).is_err());
+    }
+
+    #[test]
+    fn unicode8_bytes8_and_bytearray8_reuse_text_handling() {
+        for op in [0x8d, 0x8e, 0x96] {
+            for text in ["", "Hello!", "¡Hola! 🙂"] {
+                let p = wide_string(op, text.len() as u64, text.as_bytes());
+                let (values, root) = reader(&p).read().unwrap();
+                let graph = Graph { values };
+                assert_eq!(graph.seq(root).len(), 1);
+                assert_eq!(graph.text(graph.seq(root)[0]), Some(text));
+            }
+            let p = wide_string(op, 1, &[0xff]);
+            if op == 0x8d {
+                assert_eq!(visible_text(&p), Err("invalid UTF-8 Unicode"));
+            } else {
+                let (values, root) = reader(&p).read().unwrap();
+                let Value::Seq(ids) = &values[root] else {
+                    panic!("expected sequence");
+                };
+                assert!(matches!(values[ids[0]], Value::Scalar));
+            }
+        }
+    }
+
+    #[test]
+    fn wide_strings_reject_truncated_lengths_and_payloads() {
+        for op in [0x8d, 0x8e, 0x96] {
+            for n in 0..8 {
+                let mut p = vec![op];
+                p.extend_from_slice(&[0; 8][..n]);
+                assert_eq!(visible_text(&p), Err("truncated argument"));
+            }
+            let mut p = vec![op];
+            p.extend_from_slice(&2u64.to_le_bytes());
+            p.push(b'x');
+            assert_eq!(visible_text(&p), Err("truncated argument"));
+        }
+    }
+
+    #[test]
+    fn wide_strings_reject_oversize_and_charge_cumulative_bytes() {
+        for op in [0x8d, 0x8e, 0x96] {
+            for n in [MAX_STRING_BYTES as u64 + 1, u64::MAX] {
+                let p = wide_string(op, n, &[]);
+                let expected = if usize::try_from(n).is_ok() {
+                    "string byte limit"
+                } else {
+                    "length overflow"
+                };
+                assert_eq!(visible_text(&p), Err(expected));
+            }
+            let p = wide_string(op, 2, b"ab");
+            let mut r = reader(&p);
+            r.strings = MAX_STRING_BYTES - 2;
+            assert!(r.read().is_ok());
+            let mut r = reader(&p);
+            r.strings = MAX_STRING_BYTES - 1;
+            assert!(matches!(r.read(), Err("string byte limit")));
+        }
+    }
+
+    #[test]
+    fn empty_set_is_an_inert_sequence() {
+        let (values, root) = reader(b"\x8f.").read().unwrap();
+        assert!(matches!(&values[root], Value::Seq(ids) if ids.is_empty()));
+        assert_eq!(visible_text(b"\x8f"), Err("truncated argument"));
+    }
+
+    #[test]
+    fn additems_preserves_items_and_memo_identity() {
+        let p = b"\x8f\x94(NK\x01\x90(\x8c\x01x\x90h\x00\x86.";
+        let (values, root) = reader(p).read().unwrap();
+        let Value::Seq(pair) = &values[root] else {
+            panic!("expected tuple");
+        };
+        assert_eq!(pair[0], pair[1]);
+        let Value::Seq(items) = &values[pair[0]] else {
+            panic!("expected set sequence");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(values[items[2]], Value::Text("x")));
+        assert_eq!(visible_text(b"\x8f(\x90."), Ok(vec![]));
+    }
+
+    #[test]
+    fn additems_rejects_missing_mark_or_set() {
+        for p in [
+            &b"\x90."[..],
+            &b"(N\x90."[..],
+            &b"N(N\x90."[..],
+            &b"](N\x90."[..],
+            &b"}(N\x90."[..],
+            &b"(\x91(N\x90."[..],
+            &b"cbuiltins\nset\n)\x81(N\x90."[..],
+        ] {
+            assert!(visible_text(p).is_err(), "accepted {p:?}");
+        }
+    }
+
+    #[test]
+    fn frozenset_is_an_inert_sequence_and_requires_mark() {
+        for (p, count) in [(&b"(\x91."[..], 0), (&b"(NK\x01\x91."[..], 2)] {
+            let (values, root) = reader(p).read().unwrap();
+            assert!(matches!(&values[root], Value::Seq(ids) if ids.len() == count));
+        }
+        assert_eq!(visible_text(b"N\x91."), Err("missing MARK"));
+        assert_eq!(visible_text(b"(N\x91"), Err("truncated argument"));
+    }
+
+    #[test]
+    fn sets_charge_the_same_edges_as_lists() {
+        for p in [&b"\x8f(NN\x90."[..], &b"(NN\x91."[..]] {
+            let mut r = reader(p);
+            r.edges = MAX_EDGES - 2;
+            assert!(r.read().is_ok());
+            let mut r = reader(p);
+            r.edges = MAX_EDGES - 1;
+            assert!(matches!(r.read(), Err("edge limit")));
+        }
+    }
+
+    #[test]
+    fn newobj_ex_retains_positional_and_keyword_graphs_without_execution() {
+        let p = b"cos\nsystem\n\x8c\x03arg\x85}\x8c\x03key\x8c\x05childs\x92.";
+        let (values, root) = reader(p).read().unwrap();
+        let Value::Object { class, args, .. } = &values[root] else {
+            panic!("expected inert object");
+        };
+        assert!(matches!(values[*class], Value::Global("os", "system")));
+        let args = *args;
+        let graph = Graph { values };
+        let args = graph.seq(args);
+        assert_eq!(args.len(), 2);
+        assert_eq!(graph.text(graph.seq(args[0])[0]), Some("arg"));
+        let Value::Dict(kwargs) = &graph.values[args[1]] else {
+            panic!("kwargs were dropped");
+        };
+        assert_eq!(graph.text(kwargs[0]), Some("key"));
+        assert_eq!(graph.text(kwargs[1]), Some("child"));
+    }
+
+    #[test]
+    fn newobj_ex_rejects_missing_arguments_and_invalid_class() {
+        for p in [
+            &b"\x92."[..],
+            &b"cos\nsystem\n\x92."[..],
+            &b"cos\nsystem\n)\x92."[..],
+            &b"N)}\x92."[..],
+        ] {
+            assert!(visible_text(p).is_err());
+        }
+    }
+
+    #[test]
+    fn newobj_ex_charges_wrapper_and_object_edges() {
+        let p = b"crenpy.ast\nSay\n)}\x92.";
+        let mut r = reader(p);
+        r.edges = MAX_EDGES - 4;
+        assert!(r.read().is_ok());
+        let mut r = reader(p);
+        r.edges = MAX_EDGES - 3;
+        assert!(matches!(r.read(), Err("edge limit")));
+    }
+
+    #[test]
+    fn next_buffer_clearly_rejects_unavailable_external_data() {
+        for p in [&b"\x97."[..], &b"]\x97\x98."[..]] {
+            assert_eq!(visible_text(p), Err("out-of-band buffers unavailable"));
+        }
+    }
+
+    #[test]
+    fn readonly_buffer_is_a_noop_requiring_a_top_value() {
+        let p = b"]\x94\x98h\x00a.";
+        let (values, root) = reader(p).read().unwrap();
+        assert!(matches!(&values[root], Value::Seq(ids) if ids == &[root]));
+        assert_eq!(visible_text(b"\x98."), Err("missing stack value"));
+        assert_eq!(visible_text(b"(\x98."), Err("missing stack value"));
+    }
+
+    #[test]
+    fn protocol5_cpython_layout_harvests_say_and_menu() {
+        let p = protocol5_say_menu_pickle();
+        assert_eq!(p.len() - 11, 96);
+        assert_eq!(
+            visible_text(p),
+            Ok(vec!["Hello!".into(), "Continue".into()])
+        );
+        for n in 0..p.len() {
+            assert!(visible_text(&p[..n]).is_err(), "accepted prefix {n}");
+        }
+    }
+
+    #[test]
+    fn persistent_ids_and_extensions_remain_rejected() {
+        for op in [b'P', b'Q', 0x82, 0x83, 0x84] {
+            assert_eq!(visible_text(&[op]), Err("unknown/unsupported opcode"));
         }
     }
 

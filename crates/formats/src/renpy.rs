@@ -3917,6 +3917,32 @@ mod tests {
     }
 
     #[test]
+    fn loose_rpyc_protocol5_say_menu_matches_protocol2_fixture() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("story.rpyc");
+        let protocol5 = crate::renpy_pickle::tests::protocol5_say_menu_pickle();
+        let protocol2 = say_menu_pickle("Hello!", "Continue");
+        for pickle in [protocol2.as_slice(), protocol5] {
+            fs::write(&file, wrap_pickle_as_rpyc(pickle)).unwrap();
+            let result = RenPyPlugin::new().extract_with_diagnostics(&file).unwrap();
+            assert!(result.complete, "{:?}", result.warnings);
+            assert!(result.warnings.is_empty());
+            assert_eq!(result.entries.len(), 2);
+            for (i, (entry, expected)) in result
+                .entries
+                .iter()
+                .zip(["Hello!", "Continue"])
+                .enumerate()
+            {
+                assert_eq!(entry.source, expected);
+                assert_eq!(entry.id, format!("story.rpyc#s{i}"));
+                assert_eq!(entry.tags, ["dialogue", "rpyc"]);
+                assert_eq!(entry.file_path, file);
+            }
+        }
+    }
+
+    #[test]
     fn loose_rpyc_malformed_and_unsupported_files_warn_and_are_incomplete() {
         let root = tempfile::tempdir().unwrap();
         let game = root.path().join("game");
@@ -3929,7 +3955,7 @@ mod tests {
             b"garbage".to_vec(),
             b"RENPY RPC2".to_vec(),
             out_of_bounds,
-            wrap_pickle_as_rpyc(&[0x80, 5, b'N', b'.']),
+            wrap_pickle_as_rpyc(&[0x80, 6, b'N', b'.']),
             wrap_pickle_as_rpyc(&[0x80, 2, 0xff]),
         ] {
             fs::write(&bad, bytes).unwrap();
@@ -3942,7 +3968,7 @@ mod tests {
         }
         // Fallback text may be kept, but a failed typed parse is still incomplete.
         let mut unsupported = tiny_pickle(&["Recovered dialogue!"]);
-        unsupported[1] = 5;
+        unsupported[1] = 6;
         fs::write(&bad, wrap_pickle_as_rpyc(&unsupported)).unwrap();
         let good = game.join("good.rpyc");
         fs::write(

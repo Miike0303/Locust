@@ -39,6 +39,12 @@ Stability matches `locust formats` / the desktop Welcome screen
 | **RPG Maker XP / VX / VX Ace** | `.rxdata`, `.rvdata`, `.rvdata2` | Ruby Marshal data |
 | **Ren'Py**                | `.rpy`, `.rpyc`, `.rpa` | Loose scripts + RPA; orphan compiled scripts use a runtime filter in Replace mode; Add-mode `game/tl/<lang>/` language packs |
 
+Compiled Ren'Py scripts are read with a bounded, non-executing pickle reader,
+including supported protocol-4/5 opcodes. Python globals and constructors are
+never executed; protocol-5 out-of-band buffers are not supported. Unsupported or
+malformed compiled scripts produce partial-extraction warnings rather than
+claiming complete extraction.
+
 ### Experimental (Phase-2 extract → inject → patch → apply proven on fixtures or sample games)
 
 | Engine                    | Extensions       | Notes |
