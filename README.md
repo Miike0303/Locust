@@ -43,7 +43,10 @@ Compiled Ren'Py scripts are read with a bounded, non-executing pickle reader,
 including supported protocol-4/5 opcodes. Python globals and constructors are
 never executed; protocol-5 out-of-band buffers are not supported. Unsupported or
 malformed compiled scripts produce partial-extraction warnings rather than
-claiming complete extraction.
+claiming complete extraction. Rejected RPA member paths, out-of-bounds or
+oversized scripts, and unreadable script members also produce partial-extraction
+warnings; valid siblings are still extracted, and reopening a project preserves
+saved rows absent from that incomplete extraction.
 
 ### Experimental (Phase-2 extract → inject → patch → apply proven on fixtures or sample games)
 

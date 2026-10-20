@@ -159,7 +159,7 @@ impl RenPyPlugin {
         // Dropped on every exit path below, including the `?` on extract_rpa.
         let _temp_guard = TempDirGuard(temp_dir.clone());
 
-        let extracted_files = Self::extract_rpa(rpa_path, &temp_dir)?;
+        let extracted_files = Self::extract_rpa(rpa_path, &temp_dir, warnings)?;
 
         let mut all = Vec::new();
         // Members the harvest loop actually considers — tl/ members are
@@ -197,7 +197,12 @@ impl RenPyPlugin {
                     all.extend(entries);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to extract {}: {}", file.display(), e);
+                    let warning = format!(
+                        "Failed to extract {} ({rel_str:?}): {e}",
+                        rpa_path.display()
+                    );
+                    tracing::warn!("{warning}");
+                    warnings.push(warning);
                 }
             }
         }
@@ -381,8 +386,9 @@ impl RenPyPlugin {
         entries: &[StringEntry],
         loose_dest_paths: &std::collections::HashSet<String>,
     ) -> locust_core::error::Result<InjectionReport> {
+        let mut warnings = Vec::new();
         for rpa_path in rpa_files {
-            if let Err(error) = Self::extract_rpa(rpa_path, temp_dir) {
+            if let Err(error) = Self::extract_rpa(rpa_path, temp_dir, &mut warnings) {
                 tracing::warn!("Failed to extract {}: {}", rpa_path.display(), error);
             }
         }
@@ -527,7 +533,6 @@ impl RenPyPlugin {
             }
         }
 
-        let mut warnings = Vec::new();
         if collision_skipped > 0 {
             warnings.push(format!(
                 "{collision_skipped} archive-sourced translation(s) skipped: their destination \
@@ -582,7 +587,11 @@ impl RenPyPlugin {
     /// Extract .rpy files from a .rpa archive (Ren'Py Archive format).
     /// RPA-3.0 header: `RPA-3.0 <hex_offset> <hex_key>\n`
     /// At offset: zlib-compressed pickle with a dict of filename -> [(offset, length, prefix)]
-    fn extract_rpa(rpa_path: &Path, temp_dir: &Path) -> Result<Vec<PathBuf>> {
+    fn extract_rpa(
+        rpa_path: &Path,
+        temp_dir: &Path,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<PathBuf>> {
         let mut file = std::fs::File::open(rpa_path)?;
         let archive_len = file.metadata()?.len();
         let mut header_buf = [0u8; 256];
@@ -661,7 +670,12 @@ impl RenPyPlugin {
         let mut extracted_files = Vec::new();
         for (name, offset, length) in &index {
             let Some(rel_path) = safe_member_relative_path(name) else {
-                tracing::warn!("Skipping unsafe RPA member path {name:?}");
+                let warning = format!(
+                    "{}: Skipping unsafe RPA member path {name:?}",
+                    rpa_path.display()
+                );
+                tracing::warn!("{warning}");
+                warnings.push(warning);
                 continue;
             };
             // Only extract script files
@@ -680,15 +694,21 @@ impl RenPyPlugin {
                 .checked_add(member_len)
                 .is_none_or(|end| end > archive_len)
             {
-                tracing::warn!(
-                    "Skipping RPA member {name:?}: offset {offset} + length {length} exceeds archive size {archive_len}"
+                let warning = format!(
+                    "{}: Skipping RPA member {name:?}: offset {offset} + length {length} exceeds archive size {archive_len}",
+                    rpa_path.display()
                 );
+                tracing::warn!("{warning}");
+                warnings.push(warning);
                 continue;
             }
             if *length > MAX_RPA_MEMBER_SIZE {
-                tracing::warn!(
-                    "Skipping RPA member {name:?}: length {length} exceeds 64 MiB ({MAX_RPA_MEMBER_SIZE} bytes)"
+                let warning = format!(
+                    "{}: Skipping RPA member {name:?}: length {length} exceeds 64 MiB ({MAX_RPA_MEMBER_SIZE} bytes)",
+                    rpa_path.display()
                 );
+                tracing::warn!("{warning}");
+                warnings.push(warning);
                 continue;
             }
             file.seek(SeekFrom::Start(*offset))?;
@@ -4533,6 +4553,142 @@ mod tests {
             .unwrap();
     }
 
+    /// Exercise the public boundary for both a selected archive and a game root.
+    /// Extraction must never modify the source archive or install loose scripts.
+    fn assert_rpa_diagnostics(archive: &Path, reason: Option<(&str, &str)>) {
+        let before = fs::read(archive).unwrap();
+        let root = archive.parent().unwrap().parent().unwrap();
+        for path in [archive, root] {
+            let result = RenPyPlugin::new().extract_with_diagnostics(path).unwrap();
+            assert_eq!(fs::read(archive).unwrap(), before);
+            assert_eq!(fs::read_dir(archive.parent().unwrap()).unwrap().count(), 1);
+            assert_eq!(result.entries.len(), 1);
+            assert_eq!(result.entries[0].source, "Valid sibling");
+            assert_eq!(result.entries[0].file_path, archive);
+            match reason {
+                Some((member, reason)) => {
+                    assert!(
+                        !result.complete,
+                        "rejected member authorized a complete merge"
+                    );
+                    assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+                    let warning = &result.warnings[0];
+                    assert!(
+                        warning.contains(&archive.display().to_string()),
+                        "{warning}"
+                    );
+                    assert!(
+                        warning.contains(member) && warning.contains(reason),
+                        "{warning}"
+                    );
+                }
+                None => assert!(result.complete && result.warnings.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn rpa_diagnostics_rejected_paths_are_partial_with_valid_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let archive = game.join("scripts.rpa");
+        let escaped = format!("locust-rejected-{}.rpy", uuid::Uuid::new_v4());
+        let traversal = format!("../{escaped}");
+        let absolute = dir.path().join("absolute.rpy");
+        for name in [traversal.as_str(), absolute.to_str().unwrap()] {
+            fs::write(
+                &archive,
+                build_rpa(&[
+                    (name, b"\"Unsafe member\"\n".to_vec()),
+                    ("valid.rpy", b"\"Valid sibling\"\n".to_vec()),
+                ]),
+            )
+            .unwrap();
+            assert_rpa_diagnostics(
+                &archive,
+                Some((&format!("{name:?}"), "unsafe RPA member path")),
+            );
+            assert!(!std::env::temp_dir().join(&escaped).exists());
+            assert!(!absolute.exists());
+        }
+    }
+
+    #[test]
+    fn rpa_diagnostics_rejected_ranges_and_sizes_are_partial_with_valid_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let archive = game.join("scripts.rpa");
+        let header_len = format!("RPA-3.0 {:016x} 00000000\n", 64).len() as i64;
+        for (offset, length, index_offset, reason) in [
+            (64, 1024 * 1024, 64, "archive size"),
+            (-1, 2, 64, "archive size"),
+            (64, 64 * 1024 * 1024 + 1, 64 * 1024 * 1024 + 65, "64 MiB"),
+        ] {
+            let index =
+                rpa_range_index(&[("bad.rpy", offset, length), ("valid.rpy", header_len, 16)]);
+            write_rpa_index_at(&archive, index_offset, &index);
+            assert_rpa_diagnostics(&archive, Some(("bad.rpy", reason)));
+        }
+    }
+
+    #[test]
+    fn rpa_diagnostics_invalid_source_is_partial_with_valid_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let archive = game.join("scripts.rpa");
+        fs::write(
+            &archive,
+            build_rpa(&[
+                ("broken.rpy", vec![0xff, 0xfe]),
+                ("valid.rpy", b"\"Valid sibling\"\n".to_vec()),
+            ]),
+        )
+        .unwrap();
+        assert_rpa_diagnostics(&archive, Some(("broken.rpy", "Failed to extract")));
+    }
+
+    #[test]
+    fn rpa_diagnostics_all_rejected_members_are_partial_without_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let archive = game.join("scripts.rpa");
+        let bytes = build_rpa(&[("bad.rpy", vec![0xff])]);
+        fs::write(&archive, &bytes).unwrap();
+        for path in [archive.as_path(), dir.path()] {
+            let result = RenPyPlugin::new().extract_with_diagnostics(path).unwrap();
+            assert!(result.entries.is_empty());
+            assert!(!result.complete && result.warnings.len() == 1);
+            assert!(result.warnings[0].contains("bad.rpy"));
+            assert_eq!(fs::read(&archive).unwrap(), bytes);
+            assert_eq!(fs::read_dir(&game).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn rpa_diagnostics_intentional_skips_remain_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let archive = game.join("scripts.rpa");
+        for files in [
+            vec![("valid.rpy", b"\"Valid sibling\"\n".to_vec())],
+            vec![
+                ("valid.rpy", b"\"Valid sibling\"\n".to_vec()),
+                ("valid.rpyc", vec![0xff]), // source twin wins, not a failed harvest
+                ("tl/es/translated.rpy", b"\"Traduccion\"\n".to_vec()),
+                ("zzz_locust_translate.rpy", b"\"Generated\"\n".to_vec()),
+                ("image.png", vec![0xff]), // non-script member
+            ],
+        ] {
+            fs::write(&archive, build_rpa(&files)).unwrap();
+            assert_rpa_diagnostics(&archive, None);
+        }
+    }
+
     #[test]
     fn rpa_security_rejects_unsafe_member_paths_and_keeps_valid_siblings() {
         for name in [
@@ -4565,8 +4721,9 @@ mod tests {
                 ]),
             )
             .unwrap();
-            let (result, warnings) =
-                capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+            let (result, warnings) = capture_rpa_warnings(|| {
+                RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new())
+            });
             assert!(!dir.path().join("escape.rpy").exists(), "escaped: {name:?}");
             assert!(
                 !dir.path().join("escape.rpyc").exists(),
@@ -4607,7 +4764,7 @@ mod tests {
         )
         .unwrap();
         let (result, warnings) =
-            capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+            capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new()));
         assert_eq!(
             result.unwrap(),
             vec![
@@ -4643,8 +4800,9 @@ mod tests {
             let index =
                 rpa_range_index(&[("bad.rpy", offset, length), ("valid.rpy", header_len, 16)]);
             write_rpa_index_at(&archive, 64, &index);
-            let (result, warnings) =
-                capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+            let (result, warnings) = capture_rpa_warnings(|| {
+                RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new())
+            });
             assert_eq!(result.unwrap(), vec![output.join("valid.rpy")]);
             assert!(!output.join("bad.rpy").exists());
             assert_eq!(
@@ -4668,7 +4826,7 @@ mod tests {
         // Sparse padding makes the declared range fit without a large fixture allocation.
         write_rpa_index_at(&archive, 64 + length as u64, &index);
         let (result, warnings) =
-            capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+            capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new()));
         assert!(result.unwrap().is_empty());
         assert!(!output.join("oversized.rpy").exists());
         assert!(
@@ -4692,8 +4850,9 @@ mod tests {
                 index[end] = b's';
             }
             write_rpa_index_at(&archive, 64, &index);
-            let (result, warnings) =
-                capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+            let (result, warnings) = capture_rpa_warnings(|| {
+                RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new())
+            });
             assert!(result.unwrap().is_empty());
             assert!(!output.join("prefixed.rpy").exists());
             assert!(
@@ -4711,7 +4870,8 @@ mod tests {
         // Trailing bytes after STOP leave the index valid to the old parser.
         index.resize(64 * 1024 * 1024 + 1, b'0');
         write_rpa_index_at(&archive, 64, &index);
-        let error = RenPyPlugin::extract_rpa(&archive, &dir.path().join("extracted")).unwrap_err();
+        let output = dir.path().join("extracted");
+        let error = RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new()).unwrap_err();
         assert!(
             matches!(error, locust_core::error::LocustError::ParseError { ref message, .. } if message.contains("RPA index exceeds 64 MiB")),
             "{error}"
@@ -4727,7 +4887,7 @@ mod tests {
         index.resize(64 * 1024 * 1024, b'0');
         write_rpa_index_at(&archive, 64, &index);
         assert_eq!(
-            RenPyPlugin::extract_rpa(&archive, &output).unwrap(),
+            RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new()).unwrap(),
             [output.join("valid.rpy")]
         );
         assert_eq!(
@@ -4741,7 +4901,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("scripts.rpa");
         fs::write(&archive, b"RPA-3.0 ffffffffffffffff 00000000\n").unwrap();
-        let error = RenPyPlugin::extract_rpa(&archive, &dir.path().join("extracted")).unwrap_err();
+        let output = dir.path().join("extracted");
+        let error = RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new()).unwrap_err();
         assert!(
             matches!(error, locust_core::error::LocustError::ParseError { ref message, .. } if message.contains("index offset") && message.contains("archive size")),
             "{error}"
@@ -4791,6 +4952,10 @@ mod tests {
             "\"Hermano válido\"\n"
         );
         assert!(warnings.contains("../escape.rpy"), "{warnings}");
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("../escape.rpy")));
     }
 
     #[test]
@@ -4854,7 +5019,7 @@ mod tests {
             let output = dir.path().join("extracted");
             fs::write(&archive, build_rpa(&files)).unwrap();
 
-            let extracted = RenPyPlugin::extract_rpa(&archive, &output).unwrap();
+            let extracted = RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new()).unwrap();
             assert_eq!(
                 extracted,
                 expected

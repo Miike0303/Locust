@@ -140,6 +140,69 @@ fn build_rpa(files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 #[test]
+fn test_rpa_partial_open_preserves_absent_saved_translation() {
+    use locust_core::{
+        database::{Database, EntryFilter},
+        extraction::FormatRegistry,
+        models::StringStatus,
+        project::{open_project, saved_extraction_warnings},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let game = dir.path().join("game");
+    fs::create_dir(&game).unwrap();
+    let archive = game.join("scripts.rpa");
+    let valid = b"\"Valid sibling\"\n";
+    fs::write(
+        &archive,
+        build_rpa(&[("valid.rpy", valid), ("lost.rpy", b"\"Saved source\"\n")]),
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let mut registry = FormatRegistry::new();
+    registry.register(Box::new(RenPyPlugin::new()));
+    let first = open_project(&db, &registry, dir.path(), Some("renpy")).unwrap();
+    assert_eq!(first.total_strings, 2);
+    assert!(first.extraction_warnings.is_empty());
+    let mut saved = db
+        .get_entries(&EntryFilter::default())
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.source == "Saved source")
+        .unwrap();
+    saved.translation = Some("Traducción guardada".into());
+    saved.status = StringStatus::Approved;
+    saved.provider_used = Some("manual".into());
+    db.save_entries(&[saved.clone()]).unwrap();
+
+    let partial_bytes = build_rpa(&[("valid.rpy", valid), ("lost.rpy", &[0xff])]);
+    fs::write(&archive, &partial_bytes).unwrap();
+    let partial = open_project(&db, &registry, dir.path(), Some("renpy")).unwrap();
+    assert_eq!(partial.total_strings, 2);
+    assert_eq!(partial.removed, 0);
+    assert_eq!(partial.extraction_warnings.len(), 1);
+    assert!(partial.extraction_warnings[0].contains("lost.rpy"));
+    assert_eq!(
+        saved_extraction_warnings(&db).unwrap(),
+        partial.extraction_warnings
+    );
+    assert_eq!(
+        serde_json::to_value(db.get_entry(&saved.id).unwrap().unwrap()).unwrap(),
+        serde_json::to_value(saved).unwrap()
+    );
+    assert_eq!(fs::read(&archive).unwrap(), partial_bytes);
+    assert_eq!(fs::read_dir(&game).unwrap().count(), 1);
+
+    // A later authoritative complete extraction may remove the now-absent row.
+    fs::write(&archive, build_rpa(&[("valid.rpy", valid)])).unwrap();
+    let complete = open_project(&db, &registry, dir.path(), Some("renpy")).unwrap();
+    assert_eq!(complete.total_strings, 1);
+    assert_eq!(complete.removed, 1);
+    assert!(complete.extraction_warnings.is_empty());
+    assert!(saved_extraction_warnings(&db).unwrap().is_empty());
+}
+
+#[test]
 fn test_loose_rpy_translation_survives_inject_alongside_rpa() {
     let dir_guard = tempfile::Builder::new()
         .prefix("locust_renpy_mixed_")
