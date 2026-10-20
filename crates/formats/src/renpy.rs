@@ -1,13 +1,39 @@
 use locust_core::backup::RevisionOriginal;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as IoRead, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use locust_core::error::Result;
 use locust_core::extraction::{FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
 pub struct RenPyPlugin;
+
+const MAX_RPA_MEMBER_SIZE: usize = 64 * 1024 * 1024;
+const MAX_RPA_INDEX_SIZE: usize = 64 * 1024 * 1024;
+
+/// Treat both archive separators identically on every host. Check the raw
+/// components before Path can normalize away `.` or repeated separators.
+fn safe_member_relative_path(name: &str) -> Option<PathBuf> {
+    // Colons can introduce Windows drive prefixes or alternate data streams.
+    if name.is_empty() || name.contains(['\0', ':']) {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for part in name.split(['/', '\\']) {
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || !Path::new(part)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return None;
+        }
+        relative.push(part);
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
+}
 
 /// Removes the RPA extraction temp directory on EVERY exit path — including
 /// each `?` between creating the directory and finishing the harvest, which
@@ -286,7 +312,9 @@ impl RenPyPlugin {
         loose_dest_paths: &std::collections::HashSet<String>,
     ) -> locust_core::error::Result<InjectionReport> {
         for rpa_path in rpa_files {
-            let _ = Self::extract_rpa(rpa_path, temp_dir);
+            if let Err(error) = Self::extract_rpa(rpa_path, temp_dir) {
+                tracing::warn!("Failed to extract {}: {}", rpa_path.display(), error);
+            }
         }
 
         // Build a lookup: (filename, line_number) -> (source, translation).
@@ -323,12 +351,20 @@ impl RenPyPlugin {
             if fpath.extension().is_none_or(|e| e != "rpy") {
                 continue;
             }
+            // Revalidate the member-relative destination before using it for a
+            // loose override. Never fall back to an absolute filesystem path.
+            let Some(rel_path) = fpath
+                .strip_prefix(temp_dir)
+                .ok()
+                .and_then(Path::to_str)
+                .and_then(safe_member_relative_path)
+            else {
+                tracing::warn!("Skipping unsafe RPA member path {:?}", fpath);
+                continue;
+            };
             // Skip tl/ directory
-            if let Ok(rel) = fpath.strip_prefix(temp_dir) {
-                let rel_str = rel.to_string_lossy();
-                if rel_str.starts_with("tl/") || rel_str.starts_with("tl\\") {
-                    continue;
-                }
+            if rel_path.starts_with("tl") {
+                continue;
             }
 
             let content = match std::fs::read_to_string(fpath) {
@@ -337,7 +373,6 @@ impl RenPyPlugin {
             };
 
             // Get the filename (with subdirectory path from temp_dir)
-            let rel_path = fpath.strip_prefix(temp_dir).unwrap_or(fpath);
             let filename = rel_path
                 .file_name()
                 .unwrap_or_default()
@@ -388,8 +423,7 @@ impl RenPyPlugin {
 
             if modified {
                 // Write translated .rpy to game/ dir (preserving subdirectory structure)
-                let rel = fpath.strip_prefix(temp_dir).unwrap_or(fpath);
-                let dest = game_dir.join(rel);
+                let dest = game_dir.join(&rel_path);
 
                 // Destination-collision guard: Ren'Py always loads a loose
                 // game/<rel>.rpy with priority over an archive member written to
@@ -480,6 +514,7 @@ impl RenPyPlugin {
     /// At offset: zlib-compressed pickle with a dict of filename -> [(offset, length, prefix)]
     fn extract_rpa(rpa_path: &Path, temp_dir: &Path) -> Result<Vec<PathBuf>> {
         let mut file = std::fs::File::open(rpa_path)?;
+        let archive_len = file.metadata()?.len();
         let mut header_buf = [0u8; 256];
         let n = file.read(&mut header_buf)?;
         let header = String::from_utf8_lossy(&header_buf[..n]);
@@ -504,18 +539,33 @@ impl RenPyPlugin {
         let key = i64::from_str_radix(parts[2], 16).unwrap_or(0);
 
         // Read the index (zlib-compressed pickle)
+        let compressed_len = archive_len.checked_sub(index_offset).ok_or_else(|| {
+            locust_core::error::LocustError::ParseError {
+                file: rpa_path.display().to_string(),
+                message: format!(
+                    "RPA index offset {index_offset} exceeds archive size {archive_len}"
+                ),
+            }
+        })?;
         file.seek(SeekFrom::Start(index_offset))?;
         let mut compressed = Vec::new();
-        file.read_to_end(&mut compressed)?;
+        (&mut file)
+            .take(compressed_len)
+            .read_to_end(&mut compressed)?;
 
         // Decompress with zlib (raw deflate with zlib wrapper)
-        let decompressed =
-            miniz_oxide::inflate::decompress_to_vec_zlib(&compressed).map_err(|e| {
-                locust_core::error::LocustError::ParseError {
-                    file: rpa_path.display().to_string(),
-                    message: format!("failed to decompress RPA index: {:?}", e),
-                }
-            })?;
+        let decompressed = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+            &compressed,
+            MAX_RPA_INDEX_SIZE,
+        )
+        .map_err(|error| locust_core::error::LocustError::ParseError {
+            file: rpa_path.display().to_string(),
+            message: if error.status == miniz_oxide::inflate::TINFLStatus::HasMoreOutput {
+                format!("RPA index exceeds 64 MiB ({MAX_RPA_INDEX_SIZE} bytes) decompressed")
+            } else {
+                format!("failed to decompress RPA index: {:?}", error.status)
+            },
+        })?;
 
         // Parse the Python pickle to extract file entries
         // We use a simplified pickle parser that handles the common RPA format
@@ -540,6 +590,10 @@ impl RenPyPlugin {
         let names: HashSet<&str> = index.iter().map(|(name, _, _)| name.as_str()).collect();
         let mut extracted_files = Vec::new();
         for (name, offset, length) in &index {
+            let Some(rel_path) = safe_member_relative_path(name) else {
+                tracing::warn!("Skipping unsafe RPA member path {name:?}");
+                continue;
+            };
             // Only extract script files
             if !name.ends_with(".rpy") && !name.ends_with(".rpyc") {
                 continue;
@@ -551,11 +605,29 @@ impl RenPyPlugin {
                 continue;
             }
 
+            let member_len = *length as u64;
+            if offset
+                .checked_add(member_len)
+                .is_none_or(|end| end > archive_len)
+            {
+                tracing::warn!(
+                    "Skipping RPA member {name:?}: offset {offset} + length {length} exceeds archive size {archive_len}"
+                );
+                continue;
+            }
+            if *length > MAX_RPA_MEMBER_SIZE {
+                tracing::warn!(
+                    "Skipping RPA member {name:?}: length {length} exceeds 64 MiB ({MAX_RPA_MEMBER_SIZE} bytes)"
+                );
+                continue;
+            }
             file.seek(SeekFrom::Start(*offset))?;
-            let mut data = vec![0u8; *length];
-            file.read_exact(&mut data)?;
+            let mut data = Vec::new();
+            (&mut file).take(member_len).read_to_end(&mut data)?;
+            if data.len() != *length {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
 
-            let rel_path = Path::new(name);
             let out_path = temp_dir.join(rel_path);
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -2312,7 +2384,9 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                                 };
                                 result.push((
                                     filename.clone(),
-                                    (offset as u64) + prefix_len as u64,
+                                    // Preserve an invalid range for the extraction
+                                    // bounds check instead of wrapping into the file.
+                                    (offset as u64).saturating_add(prefix_len as u64),
                                     (length as usize).saturating_sub(prefix_len),
                                 ));
                             }
@@ -2348,7 +2422,7 @@ fn parse_rpa_pickle(data: &[u8], key: i64, file: &str) -> Result<Vec<(String, u6
                                         };
                                         result.push((
                                             filename.clone(),
-                                            (offset as u64) + prefix_len as u64,
+                                            (offset as u64).saturating_add(prefix_len as u64),
                                             (length as usize).saturating_sub(prefix_len),
                                         ));
                                     }
@@ -3761,6 +3835,321 @@ mod tests {
         archive[..header.len()].copy_from_slice(header.as_bytes());
         archive.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(&pickle, 6));
         archive
+    }
+
+    #[derive(Clone, Default)]
+    struct RpaWarningBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for RpaWarningBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_rpa_warnings<T>(action: impl FnOnce() -> T) -> (T, String) {
+        let buffer = RpaWarningBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, action);
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
+    /// A key-zero index lets bounds tests declare ranges independently of data.
+    fn rpa_range_index(members: &[(&str, i64, i64)]) -> Vec<u8> {
+        let mut pickle = vec![0x80, 2, b'}', b'('];
+        for (name, offset, length) in members {
+            pickle.extend(ast_text(name));
+            pickle.push(b']');
+            for value in [offset, length] {
+                pickle.extend_from_slice(&[0x8a, 8]); // LONG1, signed i64
+                pickle.extend_from_slice(&value.to_le_bytes());
+            }
+            pickle.extend_from_slice(&[0x86, b'a']); // TUPLE2, APPEND
+        }
+        pickle.extend_from_slice(b"u.");
+        pickle
+    }
+
+    fn write_rpa_index_at(path: &Path, index_offset: u64, pickle: &[u8]) {
+        use std::io::Write;
+        let mut file = fs::File::create(path).unwrap();
+        let header = format!("RPA-3.0 {index_offset:016x} 00000000\n");
+        file.write_all(header.as_bytes()).unwrap();
+        file.write_all(b"\"Valid sibling\"\n").unwrap();
+        file.seek(SeekFrom::Start(index_offset)).unwrap();
+        file.write_all(&miniz_oxide::deflate::compress_to_vec_zlib(pickle, 6))
+            .unwrap();
+    }
+
+    #[test]
+    fn rpa_security_rejects_unsafe_member_paths_and_keeps_valid_siblings() {
+        for name in [
+            "../escape.rpy",
+            "..\\escape.rpy",
+            "/abs.rpy",
+            "\\abs.rpy",
+            "C:\\abs.rpy",
+            "sub/../../escape.rpy",
+            "../escape.rpyc",
+            "\\\\server\\share\\escape.rpy",
+            "C:escape.rpy",
+            "sub/C:escape.rpy",
+            "./escape.rpy",
+            "sub//escape.rpy",
+            "sub\\.\\escape.rpy",
+            "bad\0name.rpy",
+            "",
+            ".",
+            "..",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("scripts.rpa");
+            let output = dir.path().join("extracted");
+            fs::write(
+                &archive,
+                build_rpa(&[
+                    (name, b"\"Unsafe member\"\n".to_vec()),
+                    ("scripts/valid.rpy", b"\"Valid sibling\"\n".to_vec()),
+                ]),
+            )
+            .unwrap();
+            let (result, warnings) =
+                capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+            assert!(!dir.path().join("escape.rpy").exists(), "escaped: {name:?}");
+            assert!(
+                !dir.path().join("escape.rpyc").exists(),
+                "escaped: {name:?}"
+            );
+            if name.starts_with('/') || name.starts_with("C:") || name.starts_with('\\') {
+                assert!(!output.join(name).exists(), "escaped: {name:?}");
+            }
+            assert_eq!(
+                result.unwrap(),
+                vec![output.join("scripts/valid.rpy")],
+                "{name:?}"
+            );
+            assert_eq!(
+                fs::read(output.join("scripts/valid.rpy")).unwrap(),
+                b"\"Valid sibling\"\n"
+            );
+            assert!(
+                warnings.contains("unsafe RPA member path"),
+                "{name:?}: {warnings}"
+            );
+            // Debug formatting keeps NUL and backslashes visible in diagnostics.
+            assert!(warnings.contains(&format!("{name:?}")), "{warnings}");
+        }
+    }
+
+    #[test]
+    fn rpa_security_accepts_nested_paths_with_either_separator_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("scripts.rpa");
+        let output = dir.path().join("extracted");
+        fs::write(
+            &archive,
+            build_rpa(&[
+                ("scripts/first.rpy", b"\"First\"\n".to_vec()),
+                ("scripts\\nested\\second.rpy", b"\"Second\"\n".to_vec()),
+            ]),
+        )
+        .unwrap();
+        let (result, warnings) =
+            capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                output.join("scripts/first.rpy"),
+                output.join("scripts/nested/second.rpy")
+            ]
+        );
+        assert!(warnings.is_empty(), "{warnings}");
+        assert_eq!(
+            RenPyPlugin::new()
+                .extract(&archive)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.source.as_str())
+                .collect::<Vec<_>>(),
+            ["First", "Second"]
+        );
+    }
+
+    #[test]
+    fn rpa_security_skips_out_of_archive_ranges_and_keeps_valid_siblings() {
+        for (offset, length) in [
+            (64, 1024 * 1024),
+            (1024 * 1024, 1),
+            (-1, 2),
+            (64, i64::MAX),
+            (64, -1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("scripts.rpa");
+            let output = dir.path().join("extracted");
+            let header_len = format!("RPA-3.0 {:016x} 00000000\n", 64).len() as i64;
+            let index =
+                rpa_range_index(&[("bad.rpy", offset, length), ("valid.rpy", header_len, 16)]);
+            write_rpa_index_at(&archive, 64, &index);
+            let (result, warnings) =
+                capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+            assert_eq!(result.unwrap(), vec![output.join("valid.rpy")]);
+            assert!(!output.join("bad.rpy").exists());
+            assert_eq!(
+                fs::read(output.join("valid.rpy")).unwrap(),
+                b"\"Valid sibling\"\n"
+            );
+            assert!(
+                warnings.contains("bad.rpy") && warnings.contains("archive size"),
+                "{warnings}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpa_security_caps_members_even_when_the_range_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("scripts.rpa");
+        let output = dir.path().join("extracted");
+        let length = 64 * 1024 * 1024 + 1;
+        let index = rpa_range_index(&[("oversized.rpy", 64, length)]);
+        // Sparse padding makes the declared range fit without a large fixture allocation.
+        write_rpa_index_at(&archive, 64 + length as u64, &index);
+        let (result, warnings) =
+            capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+        assert!(result.unwrap().is_empty());
+        assert!(!output.join("oversized.rpy").exists());
+        assert!(
+            warnings.contains("oversized.rpy") && warnings.contains("64 MiB"),
+            "{warnings}"
+        );
+    }
+
+    #[test]
+    fn rpa_security_skips_overflowing_prefixed_offsets() {
+        for setitems in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("scripts.rpa");
+            let output = dir.path().join("extracted");
+            let mut index = rpa_range_index(&[("prefixed.rpy", -1, 2)]);
+            let tuple = index.iter().position(|&byte| byte == 0x86).unwrap();
+            index.splice(tuple..tuple + 1, [b'U', 1, b'x', 0x87]);
+            if !setitems {
+                index.remove(3); // Remove MARK and use SETITEM instead of SETITEMS.
+                let end = index.len() - 2;
+                index[end] = b's';
+            }
+            write_rpa_index_at(&archive, 64, &index);
+            let (result, warnings) =
+                capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output));
+            assert!(result.unwrap().is_empty());
+            assert!(!output.join("prefixed.rpy").exists());
+            assert!(
+                warnings.contains("prefixed.rpy") && warnings.contains("archive size"),
+                "{warnings}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpa_security_rejects_index_inflation_over_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("scripts.rpa");
+        let mut index = rpa_range_index(&[("valid.rpy", 34, 16)]);
+        // Trailing bytes after STOP leave the index valid to the old parser.
+        index.resize(64 * 1024 * 1024 + 1, b'0');
+        write_rpa_index_at(&archive, 64, &index);
+        let error = RenPyPlugin::extract_rpa(&archive, &dir.path().join("extracted")).unwrap_err();
+        assert!(
+            matches!(error, locust_core::error::LocustError::ParseError { ref message, .. } if message.contains("RPA index exceeds 64 MiB")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rpa_security_accepts_index_at_inflation_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("scripts.rpa");
+        let output = dir.path().join("extracted");
+        let mut index = rpa_range_index(&[("valid.rpy", 34, 16)]);
+        index.resize(64 * 1024 * 1024, b'0');
+        write_rpa_index_at(&archive, 64, &index);
+        assert_eq!(
+            RenPyPlugin::extract_rpa(&archive, &output).unwrap(),
+            [output.join("valid.rpy")]
+        );
+        assert_eq!(
+            fs::read(output.join("valid.rpy")).unwrap(),
+            b"\"Valid sibling\"\n"
+        );
+    }
+
+    #[test]
+    fn rpa_security_rejects_index_offset_past_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("scripts.rpa");
+        fs::write(&archive, b"RPA-3.0 ffffffffffffffff 00000000\n").unwrap();
+        let error = RenPyPlugin::extract_rpa(&archive, &dir.path().join("extracted")).unwrap_err();
+        assert!(
+            matches!(error, locust_core::error::LocustError::ParseError { ref message, .. } if message.contains("index offset") && message.contains("archive size")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rpa_security_injection_never_writes_traversal_members_outside_game() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("scripts.rpa");
+        let game = dir.path().join("game");
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(
+            &archive,
+            build_rpa(&[
+                ("../escape.rpy", b"\"Unsafe member\"\n".to_vec()),
+                ("scripts/valid.rpy", b"\"Valid sibling\"\n".to_vec()),
+            ]),
+        )
+        .unwrap();
+        let mut valid =
+            StringEntry::new("scripts.rpa#valid.rpy#1", "Valid sibling", archive.clone());
+        valid.translation = Some("Hermano válido".into());
+        let mut malicious = StringEntry::new(
+            "scripts.rpa#../escape.rpy#1",
+            "Unsafe member",
+            archive.clone(),
+        );
+        malicious.translation = Some("No escribir".into());
+        let (result, warnings) = capture_rpa_warnings(|| {
+            RenPyPlugin::inject_rpa_inner(
+                &game,
+                &staging,
+                &HashSet::from([archive]),
+                &[valid, malicious],
+                &HashSet::new(),
+            )
+        });
+        assert!(!dir.path().join("escape.rpy").exists());
+        let report = result.unwrap();
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(report.strings_skipped, 1);
+        assert_eq!(report.files_written, [game.join("scripts/valid.rpy")]);
+        assert_eq!(
+            fs::read_to_string(game.join("scripts/valid.rpy")).unwrap(),
+            "\"Hermano válido\"\n"
+        );
+        assert!(warnings.contains("../escape.rpy"), "{warnings}");
     }
 
     #[test]
