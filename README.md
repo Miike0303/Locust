@@ -73,6 +73,39 @@ When API keys are configured: **DeepL**, **OpenAI**, **Anthropic Claude**, **Dee
 **Grok SuperGrok** (`grok-sub`) appears after `locust auth grok`.
 **Antigravity** (`antigravity`) appears when an existing `agy` executable is found on PATH or through `providers.antigravity.extra.agy_path`. Authentication is managed by the Antigravity CLI.
 
+### Providers and credentials
+
+Configure provider credentials in Settings or in `config.json` under the [config directory](#where-locust-keeps-data). Keys are stored as JSON in `providers.<id>.api_key`; the settings API masks stored keys in its responses.
+
+| Provider IDs | Credentials |
+| ------------ | ----------- |
+| `deepl`, `openai`, `claude`, `deepseek`, `grok`, `gemini` | API key required |
+| `google`, `argos`, `lmstudio`, `ollama`, `mock` | No user API key required |
+| `grok-sub` | OAuth subscription login below |
+| `antigravity` | Existing Antigravity CLI login; no API key |
+
+For **Grok subscription** access, run `locust auth grok`, open the printed URL in your browser, enter the displayed code and approve access. Locust polls for approval and saves access/refresh tokens in `xai-oauth.json` in the config directory. Tokens refresh automatically; if the session expires, run the command again. xAI may refuse access for some subscription tiers.
+
+For **Antigravity**, log in through its CLI and make an existing `agy` executable available on PATH, or set `providers.antigravity.extra.agy_path` to its path. Finding the executable makes the provider available; Antigravity manages authentication.
+
+Local providers connect to a separately running service. Their defaults are:
+
+| Provider | Default base URL | Translation endpoint / default model |
+| -------- | ---------------- | ------------------------------------ |
+| Argos (`argos`) | `http://localhost:5000` | `/translate`; source/target language pair |
+| LM Studio (`lmstudio`) | `http://localhost:1234` | `/v1/chat/completions`; `qwen/qwen3-14b` |
+| Ollama (`ollama`) | `http://localhost:11434` | `/api/chat`; `llama3.2` |
+
+Set `providers.<id>.base_url` to change the service address; LM Studio and Ollama also accept `providers.<id>.model`. Start the service and make the requested model/language pair available before translating.
+
+### Privacy and cost
+
+Translation sends source text to the selected provider, including remote services such as free Google Translate. LLM requests can also include game context and glossary hints. Argos, LM Studio and Ollama keep translation requests on your machine **when their services run locally**; a remote `base_url` sends text to that server instead. Antigravity uses an external CLI and cloud service, not a local translation model.
+
+`cost_limit_usd` is an optional per-run USD limit (`locust translate ... --cost-limit <USD>` in the CLI). With a limit, provider calls run sequentially: Locust checks accumulated observed cost plus the next batch's estimate before sending it and refuses a batch that would exceed the limit. Additional translation/correction calls share the run's budget. It also stops further calls if reported cost exceeds the limit or becomes unknown. These checks depend on provider estimates and reported usage; they cannot guarantee the provider's final bill.
+
+A paid provider without a cost estimate is refused when a limit is set; unknown cost is not treated as zero. Without a limit, translation can proceed with incomplete cost reporting. To retain a limit, choose a provider with usable estimates (or a free provider). Removing the limit allows unknown-cost calls and gives up that guard.
+
 ---
 
 ## Install
@@ -86,6 +119,10 @@ Download the latest release for your OS from the [Releases page](https://github.
 - **Linux**: `project-locust_<ver>_amd64.AppImage` — `chmod +x` then run
 
 The app checks for updates on launch and offers to install them one-click.
+
+### Installing unsigned builds
+
+Windows Authenticode signing and Apple signing/notarization are not configured, so OS unknown-publisher warnings may appear. See [release requirements](RELEASE.md#prerequisites). Tauri **updater signatures are separate**: updater artifacts use a signing key and the public key configured in the app. An updater signature does not make an installer OS code-signed or notarized.
 
 ### CLI (apply a patch without the desktop app)
 
@@ -231,6 +268,50 @@ Every project is saved as a `<game-name>.locust.db` file next to your game folde
 - Glossary (for consistent terminology)
 
 You can close Locust and reopen the same project later — your progress persists. Reopening a game merges newly extracted strings; existing translations stay. If the original text for a line changed, Locust keeps the translation but marks it pending so a stale line cannot ship as approved. Use the **Review** tab to audit translations before finalizing.
+
+### Where Locust keeps data
+
+Saved translations live in the project database described [above](#saving-progress). The desktop/HTTP project opener uses the game folder's parent when writable, with a config-directory `projects/` fallback. CLI `extract` without `-o` instead writes `<game-folder-name>.locust.db` in the current working directory; pass `-o` to choose the database explicitly.
+
+The config directory contains `config.json` (including API keys), `xai-oauth.json` after Grok login, and the default `backups/` store:
+
+| OS | Default config directory |
+| -- | ------------------------ |
+| Windows | `%LOCALAPPDATA%\project-locust` |
+| macOS | `~/Library/Application Support/project-locust` |
+| Linux | `$XDG_CONFIG_HOME/project-locust`, or `~/.config/project-locust` |
+
+A nonempty `LOCUST_DATA_DIR` overrides this directory. If the OS directory cannot be resolved, Locust falls back to `.project-locust` relative to the working directory. The CLI also accepts `LOCUST_BACKUP_ROOT` to override its backup store.
+
+Injection backups preserve the selected game's files **before injection**, not just the translations. New backups store metadata in `<backup-id>/manifest.json` and original content in `<backup-id>/payload/`. Plan disk space for a full backup, an independent working copy and transaction originals/results; forced recovery may need conflict copies too. Verified identical backup payloads can share disk storage, but this is not a fixed-size guarantee. See [insertion recovery and disk costs](docs/INJECTION-RECOVERY.md).
+
+Desktop drafts are **unsaved edits**, separate from database translations. They use browser `localStorage` keys beginning with `locust.editor.draft.v1.` (one key per revision). The batch queue uses `locust.queue.v1` for items, translation settings and recent history. Interrupted queue work requires an explicit retry after restart. Clearing this browser storage removes those drafts and queue snapshots; it does not save drafts into the project database.
+
+---
+
+## After injection: QA checklist
+
+1. Run the translated **game copy** and play through representative scenes.
+2. Check fonts and missing glyphs. For a font-coverage audit against a UTF-8 text file containing the actual target text, run `locust font-check "<game-copy>" --text-file "<target-text.txt>"`. Coverage alone does not prove the game selects that font or renders it correctly; see [font checks and patches](docs/FONT-PATCH.md).
+3. Look for clipped/overflowing text, broken line wrapping, menus and choices that no longer fit or work.
+4. Test saving and loading, then continue playing from the loaded save.
+5. Keep the original copy and backup until satisfied. Artifact validation does not certify gameplay, fonts or layout.
+
+For a ZIP installed with `apply`, use `locust patch-rollback "<game-copy>"` to restore its `.locust/backup`. For an injection backup, list IDs with `locust backups`, preview with `locust restore-backup <id> --dry-run`, then restore with `locust restore-backup <id>` to its recorded game location. These are separate workflows; handle interrupted Direct/Add operations with the [insertion recovery commands](docs/INJECTION-RECOVERY.md) first.
+
+---
+
+## Troubleshooting
+
+Messages below are literal diagnostics (the desktop may show localized guidance).
+
+| Message | What to do |
+| ------- | ---------- |
+| `no project open` | Open a game or saved project database before editing/translating. |
+| `translation changed since it was loaded` | Your save used an older version. Keep your draft, load the latest translation and compare; choose **Overwrite** only if you intend to replace it. |
+| `cannot enforce a cost limit: this provider has no cost estimate` | Choose a provider with estimates or a free provider; remove the limit only if you accept unknown cost. |
+| `cannot enforce a cost limit: observed calls have unknown cost` | The run stopped because usage is incomplete. Check provider usage before retrying; choose a provider with known cost to retain enforcement. |
+| `Interrupted when the app closed. Retry to continue.` (batch queue) | Retry the interrupted queue item explicitly; restored work does not auto-start. |
 
 ---
 
