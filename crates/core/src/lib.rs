@@ -15,6 +15,7 @@ pub mod models;
 pub mod patch;
 pub mod placeholder;
 pub mod project;
+pub mod speakers;
 pub mod textasset_group;
 pub mod translation;
 pub mod validation;

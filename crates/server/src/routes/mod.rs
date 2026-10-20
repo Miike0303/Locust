@@ -8,6 +8,7 @@ pub(crate) mod io;
 pub(crate) mod jobs;
 pub(crate) mod patch;
 pub(crate) mod project;
+pub(crate) mod speakers;
 pub(crate) mod strings;
 pub(crate) mod translate;
 

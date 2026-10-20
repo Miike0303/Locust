@@ -53,6 +53,7 @@ use routes::project::{
     pivot_project, project_current, project_open, project_open_db, project_preflight,
     project_resume,
 };
+use routes::speakers::{list_speakers, save_speaker_note};
 use routes::strings::{
     batch_patch_strings, get_file_stats, get_stats, get_string, get_string_facets,
     get_string_history, get_strings, list_translation_runs, patch_string,
@@ -501,6 +502,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/project/open", post(project_open))
         .route("/api/project/open-db", post(project_open_db))
         .route("/api/project/current", get(project_current))
+        .route("/api/speakers", get(list_speakers))
+        .route("/api/speakers/note", axum::routing::put(save_speaker_note))
         .route("/api/pivot", post(pivot_project))
         .route("/api/strings", get(get_strings))
         // Static paths before `:id` so "batch" / "facets" are never captured as ids.
