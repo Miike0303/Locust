@@ -75,7 +75,9 @@ export function formatProviderOptionLabel(meta: {
 	configured?: boolean;
 }): string {
 	let label = meta.name;
-	if (meta.is_free) label += ` (${t("provider.free")})`;
+	if (meta.is_free && !/\((?:free|gratuito)\)/i.test(label)) {
+		label += ` (${t("provider.free")})`;
+	}
 	if (meta.configured === false) label += ` (${t("provider.needsApiKeySuffix")})`;
 	return label;
 }

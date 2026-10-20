@@ -2,7 +2,10 @@
  * Lightweight asserts for providerReadiness (run: npx --yes tsx src/lib/providerReadiness.test.ts).
  */
 import assert from "node:assert/strict";
+import { test } from "node:test";
+import { getLocale, setLocale, t } from "./i18n";
 import {
+	formatProviderOptionLabel,
 	hasAnyReadyProvider,
 	readProviderSetupHintDismissed,
 	resolveProviderReadiness,
@@ -126,5 +129,35 @@ saveProviderSetupHintDismissed(true, memStorage);
 assert.equal(readProviderSetupHintDismissed(memStorage), true);
 saveProviderSetupHintDismissed(false, memStorage);
 assert.equal(readProviderSetupHintDismissed(memStorage), false);
+
+for (const locale of ["en", "es"] as const) {
+	for (const suffix of ["", " (free)", " (FREE)", " (gratuito)", " (GrAtUiTo)"]) {
+		test(`provider label adds free suffix only when absent (${locale}, ${suffix || "no suffix"})`, () => {
+			const previous = getLocale();
+			try {
+				setLocale(locale);
+				const name = `Google Translate${suffix}`;
+				assert.equal(
+					formatProviderOptionLabel({ name, is_free: true }),
+					suffix ? name : `${name} (${t("provider.free")})`,
+				);
+			} finally {
+				setLocale(previous);
+			}
+		});
+	}
+	test(`provider label preserves non-free names and API-key guidance (${locale})`, () => {
+		const previous = getLocale();
+		try {
+			setLocale(locale);
+			assert.equal(formatProviderOptionLabel({ name: "DeepL", is_free: false }), "DeepL");
+			assert.equal(formatProviderOptionLabel({ name: "OpenAI", configured: false }), `OpenAI (${t("provider.needsApiKeySuffix")})`);
+			assert.equal(formatProviderOptionLabel({ name: "Google (FREE)", is_free: true, configured: false }), `Google (FREE) (${t("provider.needsApiKeySuffix")})`);
+			assert.equal(formatProviderOptionLabel({ name: "Carefree (free tier)", is_free: true }), `Carefree (free tier) (${t("provider.free")})`);
+		} finally {
+			setLocale(previous);
+		}
+	});
+}
 
 console.log("providerReadiness.test.ts: ok");

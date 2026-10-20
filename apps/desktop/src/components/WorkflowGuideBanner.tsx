@@ -99,7 +99,7 @@ export default function WorkflowGuideBanner({
         <button
           type="button"
           onClick={onPrimaryAction}
-          className="rounded bg-accent px-2.5 py-1 text-caption font-medium text-white transition-colors hover:bg-accent-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
+          className="rounded border border-accent-fg px-2.5 py-1 text-caption font-medium text-accent-fg transition-colors hover:bg-accent-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
         >
           {content.action}
         </button>

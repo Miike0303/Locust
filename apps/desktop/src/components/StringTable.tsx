@@ -27,20 +27,20 @@ const statusLabel: Record<string, MessageKey> = {
 	error: "detail.status.error",
 };
 
-/** Calm status marker: a colored dot plus a sentence-case label (never color alone). */
+/** Status markers keep labels; translated is hollow and approved is filled. */
 const statusDot: Record<string, string> = {
 	pending: "bg-transparent ring-1 ring-inset ring-text-muted",
-	translated: "bg-blue-500 dark:bg-blue-400",
+	translated: "bg-transparent ring-1 ring-inset ring-accent",
 	reviewed: "bg-warning",
-	approved: "bg-success",
+	approved: "bg-accent",
 	error: "bg-danger",
 };
 
 const statusText: Record<string, string> = {
 	pending: "text-text-muted",
-	translated: "text-blue-700 dark:text-blue-300",
+	translated: "text-accent-fg",
 	reviewed: "text-warning",
-	approved: "text-success",
+	approved: "text-accent-fg",
 	error: "text-danger",
 };
 
