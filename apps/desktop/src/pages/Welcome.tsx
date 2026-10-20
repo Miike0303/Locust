@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { lazy, Suspense, useState, useEffect } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -31,8 +31,6 @@ import { useProjectStore } from "../stores/projectStore";
 import { useQueueStore } from "../stores/queueStore";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import PatchModal from "../components/PatchModal";
-import InjectionRecoveryModal from "../components/InjectionRecoveryModal";
 import {
 	completeOpenProject,
 	completeOpenProjectDb,
@@ -64,6 +62,9 @@ import {
 import { buildSettingsPath } from "../lib/settingsNav";
 import { useT } from "../lib/i18n";
 import { formatDescriptionKey } from "../lib/formatDescriptions";
+
+const PatchModal = lazy(() => import("../components/PatchModal"));
+const InjectionRecoveryModal = lazy(() => import("../components/InjectionRecoveryModal"));
 
 const FORMAT_ICONS: Record<string, typeof Globe> = {
 	"rpgmaker-mv": Swords,
@@ -744,12 +745,20 @@ export default function Welcome() {
 				</span>
 			</div>
 
-			<PatchModal
-				open={showPatchModal}
-				onClose={() => setShowPatchModal(false)}
-				allowPack={false}
-			/>
-			{recoveryPath !== null && <InjectionRecoveryModal defaultGamePath={recoveryPath} onClose={() => setRecoveryPath(null)} />}
+			{showPatchModal && (
+				<Suspense fallback={null}>
+					<PatchModal
+						open={showPatchModal}
+						onClose={() => setShowPatchModal(false)}
+						allowPack={false}
+					/>
+				</Suspense>
+			)}
+			{recoveryPath !== null && (
+				<Suspense fallback={null}>
+					<InjectionRecoveryModal defaultGamePath={recoveryPath} onClose={() => setRecoveryPath(null)} />
+				</Suspense>
+			)}
 		</div>
 	);
 }

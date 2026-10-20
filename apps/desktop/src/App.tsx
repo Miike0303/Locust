@@ -6,7 +6,7 @@ import UpdateChecker from "./components/UpdateChecker";
 import GameSourceDialog from "./components/GameSourceDialog";
 import { ResumeProjectDialogHost } from "./components/ResumeProjectDialog";
 import { getConfig, getCurrentProject } from "./lib/api";
-import { applyAppearance } from "./lib/appearance";
+import { restoreBootAppearance } from "./lib/appBoot";
 import { useProjectStore } from "./stores/projectStore";
 
 const Welcome = lazy(() => import("./pages/Welcome"));
@@ -22,9 +22,7 @@ export default function App() {
   // Boot-time restore: apply persisted appearance and reattach the project
   // still open on the server. Both fail silently when the backend is down.
   useEffect(() => {
-    getConfig()
-      .then((cfg) => applyAppearance(cfg.ui))
-      .catch(() => { /* backend unreachable — keep defaults */ });
+    void restoreBootAppearance(getConfig);
     if (!useProjectStore.getState().project) {
       getCurrentProject()
         .then((p) => {
