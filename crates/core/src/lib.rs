@@ -11,6 +11,7 @@ pub mod font_validation;
 pub mod fuzzy;
 pub mod glossary;
 pub mod injection_transaction;
+pub mod model_policy;
 pub mod models;
 pub mod patch;
 pub mod placeholder;

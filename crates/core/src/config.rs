@@ -5,11 +5,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::model_policy::ModelOverrides;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    /// Optional policies keyed by provider ID, then exact effective model name.
+    #[serde(default)]
+    pub model_overrides: ModelOverrides,
     #[serde(default)]
     pub default_provider: Option<String>,
     #[serde(default = "default_source_lang")]
@@ -48,6 +52,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             providers: HashMap::new(),
+            model_overrides: ModelOverrides::new(),
             default_provider: None,
             default_source_lang: "ja".to_string(),
             default_target_lang: "en".to_string(),
@@ -77,6 +82,13 @@ impl AppConfig {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         use std::io::Write;
+        for policy in self
+            .model_overrides
+            .values()
+            .flat_map(|models| models.values())
+        {
+            policy.validate()?;
+        }
         let json = serde_json::to_vec_pretty(self)?;
         let parent = path
             .parent()
@@ -325,6 +337,7 @@ impl PartialEq for AppConfig {
             && self.default_provider == other.default_provider
             && self.ui.theme == other.ui.theme
             && self.ui.font_size == other.ui.font_size
+            && self.model_overrides == other.model_overrides
             && self.providers.len() == other.providers.len()
             && self.recent_projects.len() == other.recent_projects.len()
     }
@@ -333,6 +346,208 @@ impl PartialEq for AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy_update(policy: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"model_overrides": {"fixture-provider": {"exact-model": policy}}})
+    }
+
+    #[test]
+    fn model_policy_rejects_invalid_json_before_config_mutation() {
+        let directory = tempdir();
+        let path = directory.path().join("config.json");
+        let config = AppConfig::default().patched(serde_json::json!({
+            "providers": {"fixture-provider": {"api_key": "fixture-key", "extra": {"counter": "7"}}}
+        })).unwrap();
+        config.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let snapshot = serde_json::to_value(&config).unwrap();
+        let invalid_path = directory.path().join("invalid.json");
+        std::fs::write(&invalid_path, "{}").unwrap();
+        for invalid in [
+            serde_json::json!({"context_window": 0}),
+            serde_json::json!({"context_window": -1}),
+            serde_json::json!({"context_window": 1.5}),
+            serde_json::json!({"context_window": 1.0}),
+            serde_json::json!({"context_window": 18446744073709551616.0}),
+            serde_json::json!({"context_window": "100"}),
+            serde_json::json!({"input_usd_per_million": 1}),
+            serde_json::json!({"output_usd_per_million": 1}),
+            serde_json::json!({"input_usd_per_million": -1, "output_usd_per_million": 0}),
+            serde_json::json!({"input_usd_per_million": 0, "output_usd_per_million": -1}),
+            serde_json::json!({"input_usd_per_million": "NaN", "output_usd_per_million": 0}),
+            serde_json::json!({"input_usd_per_million": 0, "output_usd_per_million": null}),
+        ] {
+            let mut update = policy_update(invalid.clone());
+            update["providers"] = serde_json::json!({"fixture-provider": {
+                "api_key": "replacement-fixture-key", "extra": {"counter": "8"}
+            }});
+            let result = config.patched(update).and_then(|next| next.save(&path));
+            assert!(result.is_err(), "accepted invalid policy: {invalid}");
+            assert_eq!(serde_json::to_value(&config).unwrap(), snapshot);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+
+            std::fs::write(&invalid_path, policy_update(invalid).to_string()).unwrap();
+            assert!(AppConfig::load(&invalid_path).is_err());
+        }
+    }
+
+    #[test]
+    fn model_policy_roundtrip_partial_merge_and_null_reset() {
+        let directory = tempdir();
+        let path = directory.path().join("config.json");
+        let policy = serde_json::json!({
+            "context_window": 1, "input_usd_per_million": 0.0, "output_usd_per_million": 2.5
+        });
+        let config = AppConfig::default().patched(serde_json::json!({
+            "providers": {"fixture-provider": {"api_key": "fixture-key", "model": "exact-model", "extra": {"counter": "7"}}},
+            "model_overrides": {"fixture-provider": {"exact-model": policy, "other": {"context_window": 2}}},
+            "default_batch_size": 40, "unknown_setting": true
+        })).unwrap();
+        config.save(&path).unwrap();
+        let loaded = AppConfig::load(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap()["model_overrides"]["fixture-provider"]
+                ["exact-model"],
+            policy
+        );
+        let public = loaded.redacted_json();
+        assert_eq!(public["providers"]["fixture-provider"]["api_key"], "***");
+        let next = loaded.patched(serde_json::json!({
+            "providers": public["providers"],
+            "model_overrides": {"fixture-provider": {"exact-model": {"context_window": null, "input_usd_per_million": 3}}}
+        })).unwrap();
+        let saved = serde_json::to_value(&next).unwrap();
+        let updated = &saved["model_overrides"]["fixture-provider"]["exact-model"];
+        assert!(updated["context_window"].is_null());
+        assert_eq!(updated["input_usd_per_million"], 3.0);
+        assert_eq!(updated["output_usd_per_million"], 2.5);
+        assert_eq!(
+            saved["model_overrides"]["fixture-provider"]["other"]["context_window"],
+            2
+        );
+        assert_eq!(
+            next.providers["fixture-provider"].api_key.as_deref(),
+            Some("fixture-key")
+        );
+        assert_eq!(next.providers["fixture-provider"].extra["counter"], "7");
+        assert_eq!(next.default_batch_size, None);
+        assert!(next
+            .patched(policy_update(
+                serde_json::json!({"input_usd_per_million": null})
+            ))
+            .is_err());
+        let reset = next
+            .patched(policy_update(serde_json::json!({
+                "input_usd_per_million": null, "output_usd_per_million": null
+            })))
+            .unwrap();
+        reset.save(&path).unwrap();
+        let reloaded = AppConfig::load(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reset).unwrap(),
+            serde_json::to_value(reloaded).unwrap()
+        );
+    }
+
+    #[test]
+    fn model_policy_programmatic_invalid_save_leaves_no_mutation() {
+        use crate::model_policy::{lookup_model_policy, ModelPolicy};
+
+        let directory = tempdir();
+        let path = directory.path().join("config.json");
+        let mut config = AppConfig::default().patched(serde_json::json!({
+            "providers": {"fixture-provider": {"api_key": "fixture-key", "extra": {"counter": "7"}}}
+        })).unwrap();
+        config.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        for policy in [
+            ModelPolicy {
+                context_window: Some(0),
+                ..Default::default()
+            },
+            ModelPolicy {
+                input_usd_per_million: Some(1.0),
+                ..Default::default()
+            },
+            ModelPolicy {
+                input_usd_per_million: Some(f64::NAN),
+                output_usd_per_million: Some(0.0),
+                ..Default::default()
+            },
+            ModelPolicy {
+                input_usd_per_million: Some(0.0),
+                output_usd_per_million: Some(f64::INFINITY),
+                ..Default::default()
+            },
+            ModelPolicy {
+                input_usd_per_million: Some(f64::NEG_INFINITY),
+                output_usd_per_million: Some(0.0),
+                ..Default::default()
+            },
+        ] {
+            config.model_overrides.insert(
+                "fixture-provider".into(),
+                HashMap::from([("exact-model".into(), policy)]),
+            );
+            assert!(lookup_model_policy(
+                &config.model_overrides,
+                "fixture-provider",
+                "exact-model"
+            )
+            .is_none());
+            assert!(config.save(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+            let missing = directory.path().join("not-created/config.json");
+            assert!(config.save(&missing).is_err());
+            assert!(!missing.parent().unwrap().exists());
+        }
+    }
+
+    #[test]
+    fn model_policy_empty_defaults_and_integer_boundary_roundtrip() {
+        use crate::model_policy::lookup_model_policy;
+
+        let directory = tempdir();
+        let path = directory.path().join("config.json");
+        for policy in [
+            serde_json::json!({}),
+            serde_json::json!({"context_window": null}),
+        ] {
+            let config = AppConfig::default().patched(policy_update(policy)).unwrap();
+            assert!(lookup_model_policy(
+                &config.model_overrides,
+                "fixture-provider",
+                "exact-model"
+            )
+            .is_none());
+        }
+        assert!(lookup_model_policy(
+            &AppConfig::default().model_overrides,
+            "fixture-provider",
+            "exact-model"
+        )
+        .is_none());
+        let config = AppConfig::default()
+            .patched(policy_update(
+                serde_json::json!({"context_window": u64::MAX}),
+            ))
+            .unwrap();
+        config.save(&path).unwrap();
+        assert_eq!(
+            AppConfig::load(&path).unwrap().model_overrides["fixture-provider"]["exact-model"]
+                .context_window,
+            Some(u64::MAX)
+        );
+        // Unrelated unknown settings and provider fields retain serde's legacy ignore behavior.
+        let config = config
+            .patched(
+                serde_json::json!({"unknown": true, "providers": {"other": {"unknown": true}}}),
+            )
+            .unwrap();
+        assert!(config.providers.contains_key("other"));
+    }
 
     #[test]
     fn provider_translation_defaults_migrate_legacy_batch_size() {

@@ -115,6 +115,26 @@ Translation sends source text to the selected provider, including remote service
 
 A paid provider without a cost estimate is refused when a limit is set; unknown cost is not treated as zero. Without a limit, translation can proceed with incomplete cost reporting. To retain a limit, choose a provider with usable estimates (or a free provider). Removing the limit allows unknown-cost calls and gives up that guard.
 
+#### Model policy configuration (foundation only)
+
+`config.json` accepts an optional top-level `model_overrides` map keyed by provider ID, then **exact effective model name** (case-sensitive, no aliases or default-model inference):
+
+```json
+{
+  "model_overrides": {
+    "example-provider": {
+      "example-model": { "context_window": 8192 }
+    }
+  }
+}
+```
+
+Each policy may contain `context_window` (integer from 1 through 18446744073709551615) and `input_usd_per_million` / `output_usd_per_million` (both finite nonnegative numbers, or both absent). Zero prices are allowed. Prices are user-supplied USD per million tokens; Locust does not seed a current-market price catalog.
+
+Partial settings updates preserve omitted fields and other model/provider entries. Set `context_window` to JSON `null` to reset it; reset prices by setting **both** price fields to `null` in the same update. Clearing just one price while the other remains configured is rejected. An absent or empty policy means legacy behavior. Invalid policies are rejected on load, partial update and save before replacing saved configuration; unrelated provider fields and masked API-key preservation keep their existing behavior.
+
+This foundation stores and validates policies and exposes a shared backend lookup. It does **not yet** change adapters, batching, cost estimates or Settings UI; a configured context window is not proof of tokenizer or prompt fit.
+
 ---
 
 ## Install
