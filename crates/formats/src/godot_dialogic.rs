@@ -377,7 +377,7 @@ impl FormatPlugin for GodotDialogicPlugin {
         "Godot / Dialogic (standalone PCK)"
     }
     fn description(&self) -> &str {
-        "Experimental stock Dialogic timelines in a selected standalone Godot 4.0–4.3 PCK v2; archive-only Replace."
+        "Experimental stock Dialogic timelines in a selected standalone Godot 4.0–4.4 PCK v2; archive-only Replace."
     }
     fn supported_extensions(&self) -> &[&str] {
         &["pck"]

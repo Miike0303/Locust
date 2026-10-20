@@ -6,13 +6,15 @@ archive; review warnings and translations before installing it.
 
 ## Supported input
 
-- A **standalone `.pck` file**, PCK v2, for **Godot 4.0–4.3**.
+- A **standalone `.pck` file**, **Godot 4.0–4.4 PCK v2**.
 - Dialogic `.dtl` timelines using the supported stock syntax.
 - `.dch` file stems identify speakers; character display names are not translated.
 
 Select the **`.pck` file**, not its folder or the game executable. Folder selection
 is refused before backup or copying; this format never adopts the parent folder.
 Embedded packs in executables and encrypted packs are unsupported.
+
+Godot 4.4 support is proven on synthetic fixtures only; no real 4.4 game has been verified.
 
 The compatible Dialogic reference is **2.0-alpha-16**. This does not identify the
 installed addon version.

@@ -16,11 +16,15 @@ fn put64(bytes: &mut [u8], at: usize, value: u64) {
 // Independent literal layout: header 100, two 48-byte records, base 208.
 // Paths are eight bytes (no terminator needed); each record has 36 trailing bytes.
 fn two_members() -> Vec<u8> {
+    two_members_for_engine(3)
+}
+
+fn two_members_for_engine(minor: u32) -> Vec<u8> {
     let mut bytes = vec![0; 224];
     bytes[..4].copy_from_slice(b"GDPC");
     put32(&mut bytes, 4, 2);
     put32(&mut bytes, 8, 4);
-    put32(&mut bytes, 12, 3);
+    put32(&mut bytes, 12, minor);
     put64(&mut bytes, 24, 208);
     put32(&mut bytes, 96, 2);
     put32(&mut bytes, 100, 8);
@@ -41,7 +45,11 @@ fn two_members() -> Vec<u8> {
 // Extend GD-1's independent fixture with real hashes, opaque header words and a
 // redundant, padded spelling whose bytes a rebuild must retain verbatim.
 fn authenticated_members(second: &[u8]) -> Vec<u8> {
-    let mut bytes = two_members();
+    authenticated_members_for_engine(second, 3)
+}
+
+fn authenticated_members_for_engine(second: &[u8], minor: u32) -> Vec<u8> {
+    let mut bytes = two_members_for_engine(minor);
     bytes.splice(152..160, b"res://./b/b\0".iter().copied());
     put32(&mut bytes, 148, 12);
     put64(&mut bytes, 24, 212);
@@ -152,12 +160,21 @@ fn selected_truncation_is_io_error_and_empty_member_hash_is_checked() {
 
 #[test]
 fn rebuild_replaces_shorter_longer_and_empty_and_appends_in_requested_order() {
+    check_rebuild_replacements_and_additions(3);
+}
+
+#[test]
+fn godot_4_4_rebuild_preserves_engine_bytes_and_verifies_replacements_and_additions() {
+    check_rebuild_replacements_and_additions(4);
+}
+
+fn check_rebuild_replacements_and_additions(minor: u32) {
     for replacement in [
         b"x".as_slice(),
         b"a much longer replacement".as_slice(),
         b"".as_slice(),
     ] {
-        let bytes = authenticated_members(b"second!!");
+        let bytes = authenticated_members_for_engine(b"second!!", minor);
         let mut source = Cursor::new(&bytes);
         let original = read_index(&mut source).unwrap();
         let mut output = Vec::new();
@@ -174,6 +191,7 @@ fn rebuild_replaces_shorter_longer_and_empty_and_appends_in_requested_order() {
         .unwrap();
         let mut generated = Cursor::new(&output);
         verify_rebuild(&mut generated, &plan).unwrap();
+        assert_eq!(&output[8..20], &bytes[8..20]);
         let index = read_index(&mut generated).unwrap();
         assert_eq!(
             index
@@ -558,12 +576,17 @@ fn reads_multiple_members_with_independent_field_positions() {
 }
 
 #[test]
-fn refuses_unsupported_pack_version() {
-    let mut bytes = two_members();
-    put32(&mut bytes, 4, 3);
-    let error = read_index(&mut Cursor::new(bytes)).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert!(error.to_string().contains("format version"));
+fn godot_refuses_unsupported_pack_version() {
+    for minor in [3, 4, 5] {
+        let mut bytes = two_members_for_engine(minor);
+        put32(&mut bytes, 4, 3);
+        let error = read_index(&mut Cursor::new(bytes)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "PCK format version unsupported (requires v2)"
+        );
+    }
 }
 
 fn reject(bytes: Vec<u8>, diagnostic: &str) {
@@ -614,16 +637,20 @@ fn refuses_executable_embedded_and_wrong_endian_headers() {
 }
 
 #[test]
-fn bounds_engine_versions_but_does_not_invent_a_patch_limit() {
-    for (major, minor) in [(0, 0), (3, 6), (4, 4), (4, u32::MAX), (5, 0)] {
+fn godot_bounds_engine_versions_but_does_not_invent_a_patch_limit() {
+    for (major, minor) in [(0, 0), (3, 6), (4, 5), (4, u32::MAX), (5, 0)] {
         let mut bytes = two_members();
         put32(&mut bytes, 8, major);
         put32(&mut bytes, 12, minor);
-        reject(bytes, "engine version");
+        let error = read_index(&mut Cursor::new(bytes)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "PCK engine version unsupported (requires Godot 4.0–4.4)"
+        );
     }
-    for minor in 0..=3 {
-        let mut bytes = two_members();
-        put32(&mut bytes, 12, minor);
+    for minor in 0..=4 {
+        let mut bytes = two_members_for_engine(minor);
         put32(&mut bytes, 16, u32::MAX);
         let index = read_index(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(index.engine_version, [4, minor, u32::MAX]);

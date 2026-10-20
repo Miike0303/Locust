@@ -54,7 +54,7 @@ Stability matches `locust formats` / the desktop Welcome screen
 | **KiriKiri / KAG**        | `.ks`, `.xp3`    | Loose + XP3; FE FE 0/1/2 (zlib); patch.xp3 write; no cxdec |
 | **YU-RIS**                | `.ybn`, `.ypf`   | Loose YSTB + YPF unpack/repack (common versions); synthetic + real-game YSTB |
 | **NScripter / ONScripter**| `0.txt`, `nscr_sec.dat`, `nscript.dat` | Shift-JIS; rot5 / XOR 0x84; synthetic; no NSA / nscript.___ |
-| **Godot / Dialogic**      | `.pck`           | Selected standalone Godot 4.0-4.3 PCK v2 with supported stock Dialogic timelines; archive-only Replace. See [support limits](docs/GODOT-DIALOGIC.md). |
+| **Godot / Dialogic**      | `.pck`           | Selected standalone Godot 4.0–4.4 PCK v2 with supported stock Dialogic timelines; archive-only Replace. Godot 4.4 support is proven on synthetic fixtures only; no real 4.4 game has been verified. See [support limits](docs/GODOT-DIALOGIC.md). |
 
 Not seeing your engine? [Open an issue](https://github.com/Miike0303/Locust/issues).
 

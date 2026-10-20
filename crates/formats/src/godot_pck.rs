@@ -13,7 +13,7 @@
 //! `PCKPacker::{pck_start,flush}` in `pck_packer.cpp` at that same commit.
 //!
 //! Only an offset-zero `GDPC`, little-endian v2 header is accepted. Engine versions
-//! 4.0 through 4.3 inclusive are the deliberately bounded profile, with any patch
+//! 4.0 through 4.4 inclusive are the deliberately bounded profile, with any patch
 //! number (the primary reader ignores patch). Older majors and later minors are
 //! unsupported, not assertions that their archives are necessarily malformed.
 //! Header bytes: magic/version/major/minor/patch/flags (six u32s), file base (u64),
@@ -208,9 +208,9 @@ pub fn read_index<R: Read + Seek>(reader: &mut R) -> io::Result<PckIndex> {
         return Err(invalid("PCK format version unsupported (requires v2)"));
     }
     let engine_version = [u32_at(&header, 8), u32_at(&header, 12), u32_at(&header, 16)];
-    if engine_version[0] != 4 || engine_version[1] > 3 {
+    if engine_version[0] != 4 || engine_version[1] > 4 {
         return Err(invalid(
-            "PCK engine version unsupported (requires Godot 4.0–4.3)",
+            "PCK engine version unsupported (requires Godot 4.0–4.4)",
         ));
     }
     let flags = u32_at(&header, 20);

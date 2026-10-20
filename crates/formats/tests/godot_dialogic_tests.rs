@@ -11,13 +11,18 @@ use locust_core::extraction::{
 use locust_core::models::OutputMode;
 use locust_core::patch::GameLock;
 use locust_formats::{dialogic, godot_dialogic::GodotDialogicPlugin, godot_pck};
+use md5::{Digest, Md5};
 
 fn pack(members: &[(&str, &[u8])]) -> Vec<u8> {
+    pack_for_engine(members, 3)
+}
+
+fn pack_for_engine(members: &[(&str, &[u8])], minor: u32) -> Vec<u8> {
     let mut header = vec![0; 100];
     header[..4].copy_from_slice(b"GDPC");
     header[4..8].copy_from_slice(&2u32.to_le_bytes());
     header[8..12].copy_from_slice(&4u32.to_le_bytes());
-    header[12..16].copy_from_slice(&3u32.to_le_bytes());
+    header[12..16].copy_from_slice(&minor.to_le_bytes());
     let mut seed = Cursor::new(header);
     let index = godot_pck::read_index(&mut seed).unwrap();
     let mut output = Vec::new();
@@ -26,15 +31,22 @@ fn pack(members: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn fixture(path: &Path) -> Vec<u8> {
-    let bytes = pack(&[
-        (
-            "res://story/main.dtl",
-            b"hero: Hello [b]{player}[/b]! #id:greeting\n- Yes\n",
-        ),
-        ("res://characters/hero.dch", br#"{"display_name":"Hero"}"#),
-        ("res://assets/raw.bin", &[0, 255, 17, 33]),
-        ("res://other.dtl", b"Untouched text\n"),
-    ]);
+    fixture_for_engine(path, 3)
+}
+
+fn fixture_for_engine(path: &Path, minor: u32) -> Vec<u8> {
+    let bytes = pack_for_engine(
+        &[
+            (
+                "res://story/main.dtl",
+                b"hero: Hello [b]{player}[/b]! #id:greeting\n- Yes\n",
+            ),
+            ("res://characters/hero.dch", br#"{"display_name":"Hero"}"#),
+            ("res://assets/raw.bin", &[0, 255, 17, 33]),
+            ("res://other.dtl", b"Untouched text\n"),
+        ],
+        minor,
+    );
     std::fs::write(path, &bytes).unwrap();
     bytes
 }
@@ -75,12 +87,32 @@ fn godot_dialogic_detection_and_source_matrix() {
     assert!(plugin
         .validate_source(&temp.path().join("missing.pck"))
         .is_err());
-    for (offset, value) in [(4, 1u32), (4, 3), (8, 3), (12, 4), (20, 1), (20, 4)] {
+    for (offset, value, message) in [
+        (4, 1u32, "PCK format version unsupported (requires v2)"),
+        (4, 3, "PCK format version unsupported (requires v2)"),
+        (
+            8,
+            3,
+            "PCK engine version unsupported (requires Godot 4.0–4.4)",
+        ),
+        (
+            12,
+            5,
+            "PCK engine version unsupported (requires Godot 4.0–4.4)",
+        ),
+        (20, 1, "PCK encrypted directory is unsupported"),
+        (20, 4, "PCK unknown header flags are unsupported"),
+    ] {
         let mut bad = good.clone();
         bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         std::fs::write(&path, bad).unwrap();
         assert!(!plugin.detect(&path));
-        assert!(plugin.validate_source(&path).is_err());
+        for error in [
+            plugin.validate_source(&path).unwrap_err(),
+            plugin.extract(&path).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains(message), "{error}");
+        }
     }
     std::fs::write(&path, pack(&[("res://plain.txt", b"hi")])).unwrap();
     assert!(!plugin.detect(&path));
@@ -106,6 +138,27 @@ fn godot_dialogic_detection_and_source_matrix() {
     assert!(locust_formats::default_registry()
         .get("godot-dialogic")
         .is_some());
+}
+
+#[test]
+fn godot_dialogic_4_4_detection_and_extraction() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("game.pck");
+    let bytes = fixture_for_engine(&path, 4);
+    let plugin = GodotDialogicPlugin;
+    assert!(plugin.detect(&path));
+    plugin.validate_source(&path).unwrap();
+    let extraction = plugin.extract_with_diagnostics(&path).unwrap();
+    assert!(extraction.complete);
+    assert!(extraction.warnings.is_empty());
+    assert_eq!(extraction.entries.len(), 3);
+    assert_eq!(extraction.entries[0].source, "Hello [b]{player}[/b]!");
+    assert_eq!(
+        godot_pck::read_index(&mut Cursor::new(bytes))
+            .unwrap()
+            .engine_version,
+        [4, 4, 0]
+    );
 }
 
 #[test]
@@ -482,11 +535,50 @@ async fn godot_dialogic_real_plugin_source_scope_refuses_before_core_writes() {
 
 #[tokio::test]
 async fn godot_dialogic_selected_file_replace_and_first_direct_keep_siblings() {
+    selected_file_replace_and_first_direct_keep_siblings(3).await;
+}
+
+#[tokio::test]
+async fn godot_dialogic_4_4_selected_file_replace_and_first_direct_keep_siblings() {
+    selected_file_replace_and_first_direct_keep_siblings(4).await;
+}
+
+// Literal v2 byte oracle, independent of the production reader/rebuild verifier.
+fn independently_verified_members(bytes: &[u8]) -> HashMap<String, Vec<u8>> {
+    let u32_at = |at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+    assert_eq!(&bytes[..4], b"GDPC");
+    assert_eq!(u32_at(4), 2);
+    let base = u64_at(24);
+    let mut position = 100;
+    let mut members = HashMap::new();
+    for _ in 0..u32_at(96) {
+        let length = u32_at(position) as usize;
+        let path = std::str::from_utf8(&bytes[position + 4..position + 4 + length])
+            .unwrap()
+            .trim_end_matches('\0');
+        position += 4 + length;
+        let offset = base + u64_at(position);
+        let size = u64_at(position + 8);
+        let payload = &bytes[offset..offset + size];
+        assert_eq!(
+            &bytes[position + 16..position + 32],
+            Md5::digest(payload).as_slice()
+        );
+        assert_eq!(u32_at(position + 32), 0);
+        assert!(members.insert(path.to_owned(), payload.to_vec()).is_none());
+        position += 36;
+    }
+    assert!(position <= base);
+    members
+}
+
+async fn selected_file_replace_and_first_direct_keep_siblings(minor: u32) {
     let temp = tempfile::tempdir().unwrap();
     let game = temp.path().join("category");
     std::fs::create_dir(&game).unwrap();
     let path = game.join("game.pck");
-    let before = fixture(&path);
+    let before = fixture_for_engine(&path, minor);
     std::fs::write(game.join("foreign.exe"), "foreign").unwrap();
     std::fs::create_dir(game.join("other-game")).unwrap();
     std::fs::write(game.join("other-game/private"), "private").unwrap();
@@ -529,10 +621,20 @@ async fn godot_dialogic_selected_file_replace_and_first_direct_keep_siblings() {
         vec!["game.pck"]
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    let replaced = std::fs::read(dest.join("game.pck")).unwrap();
+    assert_eq!(&replaced[8..20], &before[8..20]);
+    let mut expected = independently_verified_members(&before);
+    expected.insert(
+        "res://story/main.dtl".into(),
+        b"hero: Hola [b]{player}[/b]! #id:greeting\n- Yes\n".to_vec(),
+    );
+    assert_eq!(independently_verified_members(&replaced), expected);
     let report = inject_direct(&registry, &db, &manager, &path, "godot-dialogic", &[]).unwrap();
     assert_eq!(report.files_written, vec![path.clone()]);
     assert_eq!(report.strings_written, 1);
     let after = std::fs::read(&path).unwrap();
+    assert_eq!(&after[8..20], &before[8..20]);
+    assert_eq!(independently_verified_members(&after), expected);
     let second = inject_direct(&registry, &db, &manager, &path, "godot-dialogic", &[]).unwrap();
     assert_eq!(second.strings_written, 0);
     assert_eq!(std::fs::read(&path).unwrap(), after);

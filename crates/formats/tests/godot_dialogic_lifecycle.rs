@@ -19,10 +19,15 @@ use locust_core::patch::{self, ApplyOptions, PackOptions, RollbackOptions, Verif
 use locust_formats::{godot_dialogic::GodotDialogicPlugin, godot_pck};
 
 fn pack(members: &[(&str, &[u8])]) -> Vec<u8> {
+    pack_for_engine(members, 0)
+}
+
+fn pack_for_engine(members: &[(&str, &[u8])], minor: u32) -> Vec<u8> {
     let mut header = vec![0; 100];
     header[..4].copy_from_slice(b"GDPC");
     header[4..8].copy_from_slice(&2u32.to_le_bytes());
     header[8..12].copy_from_slice(&4u32.to_le_bytes());
+    header[12..16].copy_from_slice(&minor.to_le_bytes());
     let mut source = Cursor::new(header);
     let index = godot_pck::read_index(&mut source).unwrap();
     let mut output = Vec::new();
@@ -30,16 +35,19 @@ fn pack(members: &[(&str, &[u8])]) -> Vec<u8> {
     output
 }
 
-fn pristine() -> Vec<u8> {
-    pack(&[
-        (
-            "res://main.dtl",
-            b"hero: Hello [b]{player}[/b]! #id:greet\n- Yes\n",
-        ),
-        ("res://hero.dch", b"{}"),
-        ("res://raw.bin", &[0, 255, 17]),
-        ("res://other.dtl", b"Other words\n"),
-    ])
+fn pristine_for_engine(minor: u32) -> Vec<u8> {
+    pack_for_engine(
+        &[
+            (
+                "res://main.dtl",
+                b"hero: Hello [b]{player}[/b]! #id:greet\n- Yes\n",
+            ),
+            ("res://hero.dch", b"{}"),
+            ("res://raw.bin", &[0, 255, 17]),
+            ("res://other.dtl", b"Other words\n"),
+        ],
+        minor,
+    )
 }
 
 fn members(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
@@ -69,11 +77,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::for_engine(0)
+    }
+
+    fn for_engine(minor: u32) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("shared");
         fs::create_dir(&root).unwrap();
         let game = root.join("game.pck");
-        let original = pristine();
+        let original = pristine_for_engine(minor);
         fs::write(&game, &original).unwrap();
         fs::write(root.join("sibling.exe"), b"foreign executable").unwrap();
         fs::write(root.join("sibling.pck"), b"foreign pack").unwrap();
@@ -491,10 +503,20 @@ async fn replace_before_direct_succeeds_after_direct_refuses_before_copy_and_aft
 
 #[test]
 fn strict_recorded_pck_pack_apply_already_applied_rollback_and_reapply() {
-    let mut f = Fixture::new();
+    check_strict_pack_apply_rollback_and_reapply(0);
+}
+
+#[test]
+fn godot_4_4_strict_recorded_pck_pack_apply_already_applied_rollback_and_reapply() {
+    check_strict_pack_apply_rollback_and_reapply(4);
+}
+
+fn check_strict_pack_apply_rollback_and_reapply(minor: u32) {
+    let mut f = Fixture::for_engine(minor);
     f.translate(&[Some("Traducido [b]{player}[/b]!"), None, None]);
     let direct = f.direct().unwrap();
     let translated = fs::read(&f.game).unwrap();
+    assert_eq!(&translated[8..20], &f.original[8..20]);
     let recording = f.recording();
     assert_eq!(direct.files_written.len(), 1);
     assert!(
