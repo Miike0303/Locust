@@ -82,7 +82,7 @@ function EditorProgress({ stats }: { stats: ProjectStats }) {
 			>
 				<span className="h-full bg-success" style={{ width: width(stats.approved) }} />
 				<span className="h-full bg-warning" style={{ width: width(stats.reviewed) }} />
-				<span className="h-full bg-blue-500 dark:bg-blue-400" style={{ width: width(stats.translated) }} />
+				<span className="h-full bg-accent/50" style={{ width: width(stats.translated) }} />
 			</div>
 			<span className="text-caption font-semibold tabular-nums text-text">
 				{t("editor.progressPercent", { percent })}

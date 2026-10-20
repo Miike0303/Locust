@@ -75,36 +75,3 @@ export function saveSkipReviewPreference(
 ): void {
 	writeStorageFlag(SKIP_REVIEW_KEY, skipReview, storage);
 }
-
-const WELCOME_GUIDE_DISMISSED_KEY = "locust.welcomeGuide.dismissed";
-
-export const WELCOME_WORKFLOW_STEPS = [
-	{
-		id: "open",
-		labelKey: "welcome.guide.open.label",
-		descriptionKey: "welcome.guide.open.description",
-	},
-	{
-		id: "translate",
-		labelKey: "welcome.guide.translate.label",
-		descriptionKey: "welcome.guide.translate.description",
-	},
-	{
-		id: "inject",
-		labelKey: "welcome.guide.inject.label",
-		descriptionKey: "welcome.guide.inject.description",
-	},
-] as const;
-
-export function readWelcomeGuideDismissed(
-	storage?: WorkflowGuideStorage | null,
-): boolean {
-	return readStorageFlag(WELCOME_GUIDE_DISMISSED_KEY, storage);
-}
-
-export function saveWelcomeGuideDismissed(
-	dismissed: boolean,
-	storage?: WorkflowGuideStorage | null,
-): void {
-	writeStorageFlag(WELCOME_GUIDE_DISMISSED_KEY, dismissed, storage);
-}

@@ -86,16 +86,7 @@ for (const locale of ["en", "es"] as const) {
         "welcome.openDb", "welcome.applyPatch", "recovery.action", "welcome.chooseFormat",
       ];
       for (const key of controls) assert.ok(hasText(html, t(key)), `localized content: ${key}`);
-      const showGuide = false;
       const showHint = scenario === "first-run";
-      assert.equal(hasText(html, t("welcome.guide.title")), showGuide);
-      assert.equal(html.includes(`aria-label="${t("welcome.guide.aria")}"`), showGuide);
-      if (showGuide) {
-        for (const key of ["welcome.guide.open.label", "welcome.guide.translate.label", "welcome.guide.inject.label",
-          "welcome.guide.open.description", "welcome.guide.translate.description", "welcome.guide.inject.description"] as const) {
-          assert.ok(hasText(html, t(key)), `localized guide: ${key}`);
-        }
-      }
       assert.equal(hasText(html, t("welcome.providerHintLink")), showHint);
       assert.equal(html.includes(`aria-label="${t("welcome.providerHintDismiss")}"`), showHint);
       assert.equal(hasText(html, t("welcome.recent")), scenario === "recent");

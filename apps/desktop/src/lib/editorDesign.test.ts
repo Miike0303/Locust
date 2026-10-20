@@ -77,3 +77,17 @@ test("translated and approved status use accent tokens with hollow versus filled
   assert.match(text, /approved: "text-accent-fg"/);
   assert.match(source, /statusLabel\[status\] \? t\(statusLabel\[status\]\) : status/);
 });
+
+test("translated progress uses accent without changing its count width", () => {
+  const source = readFileSync(new URL("../pages/Editor.tsx", import.meta.url), "utf8");
+  assert.match(source, /className="h-full bg-accent\/50" style=\{\{ width: width\(stats.translated\) \}\}/);
+});
+
+test("removed welcome guide has no runtime exports or catalog keys", () => {
+  const guide = readFileSync(new URL("./workflowGuide.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(guide, /WELCOME_WORKFLOW_STEPS|WelcomeGuideDismissed/);
+  for (const locale of ["en", "es"]) {
+    const catalog = readFileSync(new URL(`./i18n/${locale}.ts`, import.meta.url), "utf8");
+    assert.doesNotMatch(catalog, /"welcome\.guide\./);
+  }
+});
