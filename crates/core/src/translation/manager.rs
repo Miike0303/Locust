@@ -304,6 +304,26 @@ impl TranslationManager {
         }
     }
 
+    /// Validate complete logical requests with the same estimator/splitter used
+    /// for grouped repairs. Legacy oversized singles remain legal without opt-in.
+    fn context_request_error(
+        &self,
+        requests: &[TranslationRequest],
+        opts: &TranslationOptions,
+    ) -> Result<()> {
+        if self
+            .provider
+            .model_policy()
+            .and_then(|p| p.context_window)
+            .is_some()
+        {
+            group_retry_batches(requests, opts).map_err(|message| {
+                LocustError::ProviderError(format!("model context input allowance: {message}"))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Additional logical calls share the run's prepaid budget, including all
     /// source/context/glossary bytes and costs from previously rejected answers.
     async fn additional_request_budget_error(
@@ -312,6 +332,9 @@ impl TranslationManager {
         opts: &TranslationOptions,
         observed_cost: ObservedCost,
     ) -> Option<LocustError> {
+        if let Err(error) = self.context_request_error(std::slice::from_ref(request), opts) {
+            return Some(error);
+        }
         let limit = opts.cost_limit_usd?;
         if !observed_cost.complete {
             return Some(LocustError::ProviderError(
@@ -496,6 +519,19 @@ impl TranslationManager {
                             )
                             .await;
                             break;
+                        }
+                        if let Err(error) = self.context_request_error(&retry_reqs, opts) {
+                            refuse_group(
+                                tx,
+                                &selected_ids,
+                                oversize_after_retry,
+                                &error.to_string(),
+                            )
+                            .await;
+                            // Stop this pass through its receipt-drain path, not
+                            // the caller's abort path for finalization failures.
+                            *budget_error = Some(error);
+                            return Ok(());
                         }
                         let retry_batches = match group_retry_batches(&retry_reqs, opts) {
                             Ok(batches) => batches,
@@ -738,6 +774,21 @@ impl TranslationManager {
             return Err(LocustError::ProviderError(
                 "cost limit must be finite and non-negative".into(),
             ));
+        }
+
+        // Resolve separately for each provider pass; explicit null disables only
+        // the legacy cap. Never mutate the options reused by the fallback chain.
+        let model_allowance = self
+            .provider
+            .model_policy()
+            .and_then(|policy| policy.approximate_input_allowance());
+        if let Some(allowance) = model_allowance {
+            if allowance == 0 {
+                return Err(LocustError::ProviderError(
+                    "model context input allowance has no room for a request".into(),
+                ));
+            }
+            opts.max_batch_tokens = Some(opts.max_batch_tokens.unwrap_or(allowance).min(allowance));
         }
 
         // 1. Filter translatable entries
@@ -1020,57 +1071,22 @@ impl TranslationManager {
         }
         let (representatives, repeated) = RepeatedSources::collect(remaining);
         let chunks = translation_batches(&representatives, &opts);
-        let mut chunk_iter = chunks.into_iter();
+        let mut chunk_iter: std::collections::VecDeque<_> = chunks.into();
         let mut cancelled = false;
         let mut budget_error = None;
+        let mut context_error = None;
 
         loop {
             // 5a. Fill the in-flight window
-            while in_flight.len() < concurrency && !cancelled {
+            while in_flight.len() < concurrency && !cancelled && context_error.is_none() {
                 if cancel.is_cancelled() {
                     cancelled = true;
                     break;
                 }
 
-                let Some(chunk) = chunk_iter.next() else {
+                let Some(mut chunk) = chunk_iter.pop_front() else {
                     break;
                 };
-
-                // 5b. Check cost limit
-                if let Some(limit) = opts.cost_limit_usd {
-                    if !observed_cost.complete {
-                        budget_error = Some(LocustError::ProviderError(
-                            "cannot enforce a cost limit: preceding calls have unknown cost".into(),
-                        ));
-                        break;
-                    }
-                    let char_count: usize = chunk.iter().map(|e| e.source.len()).sum();
-                    if let Some(estimated) = self
-                        .provider
-                        .estimate_cost(char_count, &opts.target_lang)
-                        .await
-                    {
-                        if !estimated.is_finite() || estimated < 0.0 {
-                            budget_error = Some(LocustError::ProviderError(
-                                "cannot enforce a cost limit: this provider has no valid cost estimate".into(),
-                            ));
-                            break;
-                        }
-                        if observed_cost.amount + estimated > limit {
-                            budget_error = Some(LocustError::CostLimitExceeded {
-                                estimated: observed_cost.amount + estimated,
-                                limit,
-                            });
-                            break;
-                        }
-                    } else if !self.provider.is_free() {
-                        budget_error = Some(LocustError::ProviderError(
-                            "cannot enforce a cost limit: this provider has no cost estimate"
-                                .into(),
-                        ));
-                        break;
-                    }
-                }
 
                 // 5c. Build TranslationRequests — sanitize placeholders so the translator
                 // doesn't translate variable names like [player_name] or Ren'Py tags {i}{/i}
@@ -1078,7 +1094,7 @@ impl TranslationManager {
                     std::collections::HashMap::new();
                 let mut budgets_by_id: std::collections::HashMap<String, SlotBudget> =
                     std::collections::HashMap::new();
-                let requests: Vec<TranslationRequest> = chunk
+                let mut requests: Vec<TranslationRequest> = chunk
                     .iter()
                     .map(|entry| {
                         let mut context = match (&entry.context, &opts.game_context) {
@@ -1187,6 +1203,68 @@ impl TranslationManager {
                         }
                     })
                     .collect();
+
+                // Complete hints can outgrow source-only batches. Requeue entry
+                // slices through the existing builder, preserving order and the
+                // in-flight window rather than spawning extra unbounded calls.
+                if model_allowance.is_some() {
+                    let batches = match group_retry_batches(&requests, &opts) {
+                        Ok(batches) => batches,
+                        Err(message) => {
+                            context_error = Some(LocustError::ProviderError(format!(
+                                "model context input allowance: {message}"
+                            )));
+                            break;
+                        }
+                    };
+                    let first_len = batches[0].len();
+                    let mut offset = chunk.len();
+                    for batch in batches.iter().skip(1).rev() {
+                        let start = offset - batch.len();
+                        chunk_iter.push_front(&chunk[start..offset]);
+                        offset = start;
+                    }
+                    chunk = &chunk[..first_len];
+                    requests.truncate(first_len);
+                    placeholders_by_id.retain(|id, _| requests.iter().any(|r| &r.entry_id == id));
+                    budgets_by_id.retain(|id, _| requests.iter().any(|r| &r.entry_id == id));
+                }
+
+                // 5b. Check the cost of the actual dispatch slice, not unsent splits.
+                if let Some(limit) = opts.cost_limit_usd {
+                    if !observed_cost.complete {
+                        budget_error = Some(LocustError::ProviderError(
+                            "cannot enforce a cost limit: preceding calls have unknown cost".into(),
+                        ));
+                        break;
+                    }
+                    let char_count: usize = chunk.iter().map(|e| e.source.len()).sum();
+                    if let Some(estimated) = self
+                        .provider
+                        .estimate_cost(char_count, &opts.target_lang)
+                        .await
+                    {
+                        if !estimated.is_finite() || estimated < 0.0 {
+                            budget_error = Some(LocustError::ProviderError(
+                                "cannot enforce a cost limit: this provider has no valid cost estimate".into(),
+                            ));
+                            break;
+                        }
+                        if observed_cost.amount + estimated > limit {
+                            budget_error = Some(LocustError::CostLimitExceeded {
+                                estimated: observed_cost.amount + estimated,
+                                limit,
+                            });
+                            break;
+                        }
+                    } else if !self.provider.is_free() {
+                        budget_error = Some(LocustError::ProviderError(
+                            "cannot enforce a cost limit: this provider has no cost estimate"
+                                .into(),
+                        ));
+                        break;
+                    }
+                }
 
                 // 5d. Dispatch provider call to the in-flight window
                 let provider = self.provider.clone();
@@ -1424,6 +1502,15 @@ impl TranslationManager {
                             // Length corrections are paid calls too. Stop before
                             // dispatch when the same run budget cannot cover them.
                             if budget_error.is_some() {
+                                break;
+                            }
+                            // A rejected correction cannot authorize saving a lossy
+                            // first answer. Fan-out must preserve these rows too.
+                            if let Err(error) =
+                                self.context_request_error(std::slice::from_ref(&retry_req), &opts)
+                            {
+                                invalid_controls.extend(repeated.members[&result.entry_id].clone());
+                                budget_error = Some(error);
                                 break;
                             }
                             budget_error = self
@@ -1780,6 +1867,33 @@ impl TranslationManager {
             }
         }
 
+        // Model refusal can happen during a repair while other paid calls are
+        // in flight. Drain their receipts before returning; do not abort/drop
+        // them and silently omit usage. Their unaccepted rows stay unchanged.
+        if model_allowance.is_some() {
+            while let Some(joined) = in_flight.join_next().await {
+                match joined {
+                    Ok((_, _, _, Ok(call))) => {
+                        observed_cost.observe_batch(
+                            call.results.iter().map(|r| r.cost_usd),
+                            self.provider.is_free(),
+                        );
+                        if call.attempts > 1 && !self.provider.is_free() {
+                            observed_cost.complete = false;
+                        }
+                        for result in &call.results {
+                            total_tokens += result.tokens_used.unwrap_or(0) as u64;
+                            total_input_tokens += result.input_tokens.unwrap_or(0) as u64;
+                            total_output_tokens += result.output_tokens.unwrap_or(0) as u64;
+                        }
+                    }
+                    _ => observed_cost.complete &= self.provider.is_free(),
+                }
+            }
+            budget_error =
+                observed_budget_error(observed_cost, opts.cost_limit_usd).or(budget_error);
+        }
+        budget_error = budget_error.or(context_error);
         group_acc.abandon_missing();
         if budget_error.is_none() {
             if let Err(error) = self

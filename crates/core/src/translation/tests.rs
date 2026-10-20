@@ -193,6 +193,7 @@ enum RepeatedReply {
 }
 
 struct RepeatedProvider {
+    policy: Option<crate::model_policy::ModelPolicy>,
     id: &'static str,
     reply: RepeatedReply,
     calls: Mutex<Vec<Vec<TranslationRequest>>>,
@@ -202,6 +203,7 @@ struct RepeatedProvider {
 impl RepeatedProvider {
     fn new(reply: RepeatedReply) -> Self {
         Self {
+            policy: None,
             id: "repeat-test",
             reply,
             calls: Mutex::new(Vec::new()),
@@ -216,6 +218,9 @@ impl RepeatedProvider {
 
 #[async_trait]
 impl TranslationProvider for RepeatedProvider {
+    fn model_policy(&self) -> Option<&crate::model_policy::ModelPolicy> {
+        self.policy.as_ref()
+    }
     fn id(&self) -> &str {
         self.id
     }
@@ -277,6 +282,584 @@ impl TranslationProvider for RepeatedProvider {
     async fn health_check(&self) -> Result<()> {
         Ok(())
     }
+}
+
+fn context_provider(window: Option<u64>) -> Arc<RepeatedProvider> {
+    let mut provider = RepeatedProvider::new(RepeatedReply::Success);
+    provider.policy = window.map(|window| crate::model_policy::ModelPolicy {
+        context_window: Some(window),
+        ..Default::default()
+    });
+    Arc::new(provider)
+}
+
+#[tokio::test]
+async fn model_context_batches_clamp_legacy_cap_and_null_independently() {
+    for (window, cap, sizes) in [
+        (None, None, vec![4]),
+        (None, Some(1), vec![1, 1, 1, 1]), // Legacy oversized singles still dispatch.
+        (Some(u64::MAX), None, vec![4]),
+        (Some(800), None, vec![4]), // allowance 600, four ordinary requests fit.
+        (Some(800), Some(270), vec![2, 2]),
+        (Some(400), None, vec![2, 2]), // null disables only the legacy cap.
+    ] {
+        let provider = context_provider(window);
+        run_repeated_job(
+            make_entries(4),
+            provider.clone(),
+            TranslationOptions {
+                max_batch_tokens: cap,
+                ..Default::default()
+            },
+        )
+        .await;
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().map(Vec::len).collect::<Vec<_>>(),
+            sizes,
+            "{window:?}/{cap:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .flatten()
+                .map(|r| r.entry_id.clone())
+                .collect::<Vec<_>>(),
+            make_entries(4)
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
+async fn model_context_rejects_final_hints_without_dispatch_or_mutation() {
+    for case in ["no-room", "source", "binary", "glossary"] {
+        let (db, glossary) = setup();
+        let mut entry = make_entries(1).remove(0);
+        if case == "source" {
+            entry.source = "x".repeat(100);
+        }
+        if case == "binary" {
+            entry
+                .metadata
+                .insert("binary_slot".into(), serde_json::json!("utf8"));
+        }
+        if case == "glossary" {
+            glossary
+                .add("Source", &"y".repeat(300), "ja-en", None)
+                .unwrap();
+        }
+        entry.translation = Some("Saved text".into());
+        entry.provider_used = Some("previous".into());
+        db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let provider = context_provider(Some(if case == "no-room" { 1 } else { 180 }));
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+        let (tx, mut rx) = mpsc::channel(100);
+        let error = manager
+            .translate_entries(
+                vec![entry.clone()],
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: case == "glossary",
+                    max_batch_tokens: None,
+                    ..Default::default()
+                },
+                tx,
+                "context".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, LocustError::ProviderError(_)),
+            "{case}: {error}"
+        );
+        assert!(error.to_string().contains("model context"), "{error}");
+        assert!(provider.calls.lock().unwrap().is_empty(), "{case}");
+        let saved = db.get_entry(&entry.id).unwrap().unwrap();
+        assert_eq!(
+            (saved.translation, saved.status, saved.provider_used),
+            (entry.translation, entry.status, entry.provider_used)
+        );
+        assert!(db.get_translation_runs().unwrap().is_empty());
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(
+                event,
+                ProgressEvent::StringTranslated { .. } | ProgressEvent::BatchCompleted { .. }
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_context_final_binary_hints_split_existing_batches() {
+    let mut entries = make_entries(3);
+    for entry in &mut entries {
+        entry
+            .metadata
+            .insert("binary_slot".into(), serde_json::json!("utf8"));
+    }
+    let provider = context_provider(Some(700));
+    let (db, glossary) = setup();
+    db.save_entries(&entries).unwrap();
+    let manager = TranslationManager::new(provider.clone(), db, glossary);
+    let (tx, _rx) = mpsc::channel(100);
+    // A later length-repair rejection is allowed; inspect every actual dispatch.
+    let _ = manager
+        .translate_entries(
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                max_batch_tokens: None,
+                ..Default::default()
+            },
+            tx,
+            "split".into(),
+            CancellationToken::new(),
+        )
+        .await;
+    let calls = provider.calls.lock().unwrap();
+    // Source-only estimates fit together, complete LENGTH LIMIT hints do not.
+    assert!(calls[0].len() < 3);
+    assert!(calls
+        .iter()
+        .all(|batch| batch.iter().map(request_tokens).sum::<usize>() <= 525));
+}
+
+fn request_tokens(request: &TranslationRequest) -> usize {
+    (request.source.len()
+        + request.context.as_ref().map_or(0, String::len)
+        + request.glossary_hint.as_ref().map_or(0, String::len))
+    .div_ceil(3)
+        + 128
+}
+
+#[tokio::test]
+async fn model_context_rejected_repairs_preserve_rows_and_account_paid_initial_calls() {
+    for case in ["controls", "length", "group"] {
+        let (mut entries, reply) = match case {
+            "group" => (
+                grouped_loc_entries("Menu.A: Hi\n", &[("a", "Menu.A", "Hi")]),
+                RepeatedReply::Success,
+            ),
+            "length" => {
+                let mut rows = make_entries(1);
+                rows[0]
+                    .metadata
+                    .insert("binary_slot".into(), serde_json::json!("utf8"));
+                (rows, RepeatedReply::LengthRetry)
+            }
+            _ => {
+                let mut rows = make_entries(3);
+                for row in &mut rows {
+                    row.source.push_str(r" \V[1]");
+                }
+                (rows, RepeatedReply::Empty)
+            }
+        };
+        let baseline = Arc::new(RepeatedProvider::new(reply));
+        run_repeated_job(
+            entries.clone(),
+            baseline.clone(),
+            TranslationOptions::default(),
+        )
+        .await;
+        let initial = request_tokens(&baseline.calls.lock().unwrap()[0][0]);
+        let repair = request_tokens(&baseline.calls.lock().unwrap()[1][0]);
+        assert!(repair > initial, "{case}: fixture must grow on repair");
+        let window = (initial as u64 * 4).div_ceil(3);
+        let mut provider = RepeatedProvider::new(reply);
+        provider.policy = context_provider(Some(window)).policy.clone();
+        let provider = Arc::new(provider);
+        let (db, glossary) = setup();
+        entries[0].translation = Some("Previous".into());
+        entries[0].provider_used = Some("previous".into());
+        db.save_entries(&entries).unwrap();
+        let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+        let (tx, _rx) = mpsc::channel(100);
+        let error = manager
+            .translate_entries(
+                entries.clone(),
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    max_batch_tokens: None,
+                    allow_lossy_binary_fit: true,
+                    batch_size: 1,
+                    max_concurrent: 3,
+                    ..Default::default()
+                },
+                tx,
+                "repair".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("model context"),
+            "{case}: {error}"
+        );
+        assert_eq!(
+            provider.calls.lock().unwrap().len(),
+            entries.len(),
+            "{case}"
+        );
+        let saved = db.get_entry(&entries[0].id).unwrap().unwrap();
+        assert_eq!(
+            (saved.translation, saved.status, saved.provider_used),
+            (
+                entries[0].translation.clone(),
+                entries[0].status.clone(),
+                entries[0].provider_used.clone()
+            )
+        );
+        let runs = db.get_translation_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (
+                runs[0].tokens_used,
+                runs[0].input_tokens,
+                runs[0].output_tokens,
+                runs[0].strings_translated
+            ),
+            (
+                7 * entries.len() as u64,
+                4 * entries.len() as u64,
+                3 * entries.len() as u64,
+                0
+            )
+        );
+        assert_eq!(runs[0].cost_usd, 0.002 * entries.len() as f64);
+        assert!(runs[0].cost_is_complete);
+    }
+}
+
+// Both paid calls enter translate before the grouped answer becomes ready.
+struct GroupRefusalProvider {
+    policy: crate::model_policy::ModelPolicy,
+    dispatched: tokio::sync::Barrier,
+    release_sibling: tokio::sync::Notify,
+    sibling_state: AtomicUsize,
+    calls: Mutex<Vec<TranslationRequest>>,
+}
+
+struct PendingPaidSibling<'a>(&'a AtomicUsize);
+
+impl Drop for PendingPaidSibling<'_> {
+    fn drop(&mut self) {
+        // 1 = dispatched, 2 = returned receipt, 3 = dropped before receipt.
+        let _ = self
+            .0
+            .compare_exchange(1, 3, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl TranslationProvider for GroupRefusalProvider {
+    fn id(&self) -> &str {
+        "group-refusal-test"
+    }
+    fn name(&self) -> &str {
+        "Gated paid group provider"
+    }
+    fn model_policy(&self) -> Option<&crate::model_policy::ModelPolicy> {
+        Some(&self.policy)
+    }
+    fn is_free(&self) -> bool {
+        false
+    }
+    fn requires_api_key(&self) -> bool {
+        false
+    }
+    async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        self.calls.lock().unwrap().push(request.clone());
+        let sibling = request.entry_id == "r-0";
+        let _pending = sibling.then(|| {
+            self.sibling_state.store(1, Ordering::SeqCst);
+            PendingPaidSibling(&self.sibling_state)
+        });
+        self.dispatched.wait().await;
+        if sibling {
+            self.release_sibling.notified().await;
+            self.sibling_state.store(2, Ordering::SeqCst);
+        } else {
+            assert_eq!(request.entry_id, "a");
+        }
+        Ok(vec![TranslationResult {
+            entry_id: request.entry_id.clone(),
+            translation: if sibling {
+                "Receipt only"
+            } else {
+                "Much too long"
+            }
+            .into(),
+            detected_source_lang: None,
+            provider: self.id().into(),
+            tokens_used: Some(if sibling { 11 } else { 7 }),
+            input_tokens: Some(if sibling { 6 } else { 4 }),
+            output_tokens: Some(if sibling { 5 } else { 3 }),
+            cost_usd: Some(if sibling { 0.004 } else { 0.002 }),
+        }])
+    }
+    async fn estimate_cost(&self, _chars: usize, _lang: &str) -> Option<f64> {
+        Some(0.002)
+    }
+    async fn health_check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+async fn check_group_refusal_drain(cancel_drain: bool) {
+    let (db, glossary) = setup();
+    let mut entries = grouped_loc_entries("Menu.A: Hi\n", &[("a", "Menu.A", "Hi")]);
+    // One independent paid call fans out to two rows; a distinct row stays queued.
+    entries.extend(repeated_entries(2, "Separate source"));
+    entries.extend(make_entries(1));
+    db.save_entries(&entries).unwrap();
+    for entry in &mut entries {
+        db.save_translation(&entry.id, "Previous", "previous")
+            .await
+            .unwrap();
+        db.update_entry_status(&entry.id, StringStatus::Pending)
+            .await
+            .unwrap();
+        *entry = db.get_entry(&entry.id).unwrap().unwrap();
+    }
+    let before: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            (
+                serde_json::to_value(db.get_entry(&entry.id).unwrap()).unwrap(),
+                serde_json::to_value(db.get_string_history(&entry.id, 50).unwrap()).unwrap(),
+            )
+        })
+        .collect();
+    let provider = Arc::new(GroupRefusalProvider {
+        policy: crate::model_policy::ModelPolicy {
+            context_window: Some(400), // Initial fits 300 input tokens; correction does not.
+            ..Default::default()
+        },
+        dispatched: tokio::sync::Barrier::new(2),
+        release_sibling: tokio::sync::Notify::new(),
+        sibling_state: AtomicUsize::new(0),
+        calls: Mutex::new(Vec::new()),
+    });
+    let manager = TranslationManager::new(provider.clone(), db.clone(), glossary)
+        .with_retry_config(RetryConfig {
+            max_attempts: 1,
+            overall_deadline: None, // Only job cancellation can end the gated wait.
+            ..Default::default()
+        });
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::channel(100);
+    let translate = manager.translate_entries(
+        entries.clone(),
+        TranslationOptions {
+            batch_size: 1,
+            max_concurrent: 2,
+            max_batch_tokens: None,
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        },
+        tx,
+        "group-refusal".into(),
+        cancel.clone(),
+    );
+    let observe_refusal = async {
+        let mut refused = false;
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(
+                event,
+                ProgressEvent::StringTranslated { .. } | ProgressEvent::Completed { .. }
+            ));
+            if let ProgressEvent::BatchFailed { entry_id, error } = event {
+                if error.contains("model context") {
+                    assert_eq!(entry_id.as_deref(), Some("a"));
+                    assert_eq!(provider.sibling_state.load(Ordering::SeqCst), 1);
+                    refused = true;
+                    if cancel_drain {
+                        cancel.cancel();
+                    } else {
+                        provider.release_sibling.notify_one();
+                    }
+                }
+            }
+        }
+        // The buggy path closes the channel after abort_all. Do not hang the
+        // harness waiting for a refusal event that was never sent.
+        provider.release_sibling.notify_one();
+        refused
+    };
+    let (result, refused) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(translate, observe_refusal)
+    })
+    .await
+    .expect("group refusal/drain must terminate, including cancellation");
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("model context"), "{error}");
+    let calls = provider.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|r| r.entry_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "r-0"],
+        "no correction or queued dispatch is allowed after refusal"
+    );
+    let initial = &calls[0];
+    assert!(request_tokens(initial) <= 300);
+    let mut correction = initial.clone();
+    correction.context = Some(format!(
+        "{} | {}",
+        initial.context.as_deref().unwrap(),
+        crate::textasset_group::retry_correction(11, 22, "Much too long")
+    ));
+    assert!(request_tokens(&correction) > 300);
+    for (entry, (row_before, history_before)) in entries.iter().zip(before) {
+        assert_eq!(
+            serde_json::to_value(db.get_entry(&entry.id).unwrap()).unwrap(),
+            row_before,
+            "row {} changed after refusal",
+            entry.id
+        );
+        assert_eq!(
+            serde_json::to_value(db.get_string_history(&entry.id, 50).unwrap()).unwrap(),
+            history_before,
+            "history {} changed after refusal",
+            entry.id
+        );
+    }
+    let runs = db.get_translation_runs().unwrap();
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run.provider, provider.id());
+    assert_eq!(run.strings_translated, 0);
+    assert_eq!(
+        (run.tokens_used, run.input_tokens, run.output_tokens),
+        if cancel_drain { (7, 4, 3) } else { (18, 10, 8) },
+        "every returned paid receipt must be counted exactly once"
+    );
+    assert_eq!(run.cost_usd, if cancel_drain { 0.002 } else { 0.006 });
+    assert_eq!(run.cost_is_complete, !cancel_drain);
+    assert_eq!(
+        provider.sibling_state.load(Ordering::SeqCst),
+        if cancel_drain { 3 } else { 2 }
+    );
+    assert!(
+        refused,
+        "must report refusal before draining the paid sibling"
+    );
+}
+
+#[tokio::test]
+async fn model_context_group_refusal_drains_paid_sibling() {
+    check_group_refusal_drain(false).await;
+}
+
+#[tokio::test]
+async fn model_context_group_refusal_drain_remains_cancellable() {
+    check_group_refusal_drain(true).await;
+}
+
+#[tokio::test]
+async fn model_context_fallback_resolves_each_policy_and_keeps_note_snapshot() {
+    use crate::speakers::NOTES_METADATA_KEY;
+    let (db, glossary) = setup();
+    let entries = speaker_note_rows();
+    db.save_entries(&entries).unwrap();
+    save_speaker_notes(&db, &entries);
+    let too_small = context_provider(Some(180));
+    let fallback = context_provider(Some(400));
+    let (tx, _rx) = mpsc::channel(100);
+    run_fallback_chain(
+        &["small".into(), "fallback".into()],
+        &|id| {
+            Some(if id == "small" {
+                too_small.clone()
+            } else {
+                db.set_project_metadata(NOTES_METADATA_KEY, &serde_json::json!({}))
+                    .unwrap();
+                fallback.clone()
+            })
+        },
+        db.clone(),
+        glossary,
+        TranslationOptions {
+            max_batch_tokens: None,
+            use_memory: false,
+            use_glossary: false,
+            ..Default::default()
+        },
+        tx,
+        "fallback".into(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(too_small.calls.lock().unwrap().is_empty());
+    let calls = fallback.calls.lock().unwrap();
+    assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 2]);
+    assert!(calls[0][0]
+        .context
+        .as_deref()
+        .unwrap()
+        .contains("Formal voice"));
+    assert!(calls[1][0]
+        .context
+        .as_deref()
+        .unwrap()
+        .contains("Casual voice"));
+    assert!(entries
+        .iter()
+        .all(|e| db.get_entry(&e.id).unwrap().unwrap().translation.is_some()));
+    assert_eq!(db.get_translation_runs().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn model_context_rejection_drains_in_flight_usage_without_dispatching_rejected_row() {
+    let (db, glossary) = setup();
+    let mut entries = make_entries(3);
+    entries[2]
+        .metadata
+        .insert("binary_slot".into(), serde_json::json!("utf8"));
+    db.save_entries(&entries).unwrap();
+    let provider = context_provider(Some(180));
+    let manager = TranslationManager::new(provider.clone(), db.clone(), glossary);
+    let (tx, _rx) = mpsc::channel(100);
+    let error = manager
+        .translate_entries(
+            entries,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                max_batch_tokens: None,
+                batch_size: 1,
+                max_concurrent: 3,
+                ..Default::default()
+            },
+            tx,
+            "concurrent".into(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("model context"));
+    let calls = provider.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().flatten().all(|r| r.entry_id != "e2"));
+    assert!(db.get_entry("e0").unwrap().unwrap().translation.is_some());
+    assert!(db.get_entry("e1").unwrap().unwrap().translation.is_some());
+    assert!(db.get_entry("e2").unwrap().unwrap().translation.is_none());
+    let runs = db.get_translation_runs().unwrap();
+    assert_eq!((runs[0].tokens_used, runs[0].strings_translated), (14, 2));
+    assert_eq!(runs[0].cost_usd, 0.004);
+    assert!(runs[0].cost_is_complete);
 }
 
 fn repeated_entries(count: usize, source: &str) -> Vec<StringEntry> {

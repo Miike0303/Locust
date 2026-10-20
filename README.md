@@ -135,7 +135,11 @@ Partial settings updates preserve omitted fields and other model/provider entrie
 
 At provider registration, policies match the adapter's constructor-resolved model (including its default), never a guessed alias. Paired prices override the existing approximate character-based estimate (1.3 input and 1.3 output tokens per character) and costs calculated from reported input/output usage for OpenAI, Claude, Grok subscription and paid OpenAI-compatible endpoints. Missing usage remains unknown, even with zero configured prices; batch usage/cost stays on the first result only. Prices are not applied to free or non-token adapters (including LM Studio, Ollama, Google, DeepL and Antigravity). Context-only policies preserve existing rates; absent, empty or unmatched policies preserve legacy behavior.
 
-Effective-model and matched-policy metadata are available internally for model-based adapters, including Ollama and Antigravity. Context windows do **not yet** affect batching, and no estimate endpoint or Settings editor is added here. A configured context window is not proof of tokenizer or prompt fit; configured prices are user assumptions, not verified service charges.
+Context windows opt each provider pass into an **approximate input allowance**: `window - max(1, window / 4)` (integer division), reserving space for output/prompt overhead. This clamps the existing batch token cap; an explicit `max_batch_tokens: null` disables only the legacy cap, not this model constraint. Each fallback resolves its own matched policy independently.
+
+Batching estimates UTF-8 source/context/glossary bytes divided by three (rounded up), plus 128 per record. Complete requests include character notes, protected-control, glossary and binary-capacity hints; they can split an initial batch further. Individually oversized requests, including correction requests, are refused before dispatch to that provider, preserving the rejected rows. Already-dispatched calls still contribute observed usage/cost. Without a context window, existing batching and ordinary oversized-single dispatch are unchanged.
+
+This reserve and byte estimator are **not an exact tokenizer or a guarantee of service prompt/output fit**. Configured windows and prices are user assumptions, not verified service limits or charges. Effective-model metadata is internal; no estimate endpoint or Settings editor is added here.
 
 ---
 

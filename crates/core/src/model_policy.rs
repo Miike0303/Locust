@@ -1,5 +1,5 @@
 //! User-supplied policy for an exact provider ID and effective model name.
-//! No model defaults, catalog, prices, or runtime budget behavior are inferred here.
+//! No model defaults, catalog, or prices are inferred here.
 
 use std::collections::HashMap;
 
@@ -39,6 +39,16 @@ impl TryFrom<UncheckedModelPolicy> for ModelPolicy {
 }
 
 impl ModelPolicy {
+    /// Approximate input allowance, not a tokenizer or exact service-fit guarantee.
+    /// Reserve one quarter (at least one token) for output/prompt space. Saturate
+    /// on narrower platforms rather than truncating a user-supplied u64 window.
+    pub fn approximate_input_allowance(&self) -> Option<usize> {
+        self.context_window.map(|window| {
+            let allowance = window.saturating_sub((window / 4).max(1));
+            usize::try_from(allowance).unwrap_or(usize::MAX)
+        })
+    }
+
     /// Also validate programmatically constructed policies before using or saving.
     pub fn validate(&self) -> Result<()> {
         if self.context_window == Some(0) {
@@ -75,6 +85,28 @@ pub fn lookup_model_policy<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_context_allowance_boundaries_are_safe() {
+        assert_eq!(ModelPolicy::default().approximate_input_allowance(), None);
+        for (window, expected) in [
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (4, 3),
+            (7, 6),
+            (u64::MAX, u64::MAX - u64::MAX / 4),
+        ] {
+            let policy = ModelPolicy {
+                context_window: Some(window),
+                ..Default::default()
+            };
+            assert_eq!(
+                policy.approximate_input_allowance(),
+                Some(usize::try_from(expected).unwrap_or(usize::MAX))
+            );
+        }
+    }
 
     #[test]
     fn model_policy_lookup_is_exact_and_empty_or_invalid_is_absent() {
