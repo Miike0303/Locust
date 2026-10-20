@@ -33,6 +33,20 @@ export default function AppearanceSection() {
     <div className="space-y-6 border border-border bg-surface rounded-xl p-5">
       <h2 className="text-page font-bold">{t("settings.appearance.title")}</h2>
       <div>
+        <label className="text-body font-medium" htmlFor="ui-language">
+          {t("settings.appearance.interfaceLanguage")}
+        </label>
+        <select
+          id="ui-language"
+          value={locale}
+          onChange={(e) => setLocale(e.target.value as Locale)}
+          className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
+        >
+          <option value="en">{t("settings.appearance.locale.en")}</option>
+          <option value="es">{t("settings.appearance.locale.es")}</option>
+        </select>
+      </div>
+      <div>
         <label className="text-body font-medium">{t("settings.appearance.theme")}</label>
         <div className="flex flex-wrap gap-4 mt-2">
           {(
@@ -69,20 +83,6 @@ export default function AppearanceSection() {
         <p className="text-caption text-text-muted mt-0.5">
           {t("settings.appearance.tableRowHeightHint")}
         </p>
-      </div>
-      <div>
-        <label className="text-body font-medium" htmlFor="ui-language">
-          {t("settings.appearance.interfaceLanguage")}
-        </label>
-        <select
-          id="ui-language"
-          value={locale}
-          onChange={(e) => setLocale(e.target.value as Locale)}
-          className={`mt-1 ${SETTINGS_INPUT_CLASS}`}
-        >
-          <option value="en">{t("settings.appearance.locale.en")}</option>
-          <option value="es">{t("settings.appearance.locale.es")}</option>
-        </select>
       </div>
     </div>
   );

@@ -508,6 +508,7 @@ export const es: Record<keyof typeof en, string> = {
   "settings.nav.data": "Datos",
 
   "settings.providers.title": "Proveedores",
+  "settings.providers.default": "Predeterminado",
   "settings.providers.free": "Gratuito",
   "settings.providers.paid": "De pago",
   "settings.providers.configured": "Configurado",

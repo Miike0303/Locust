@@ -515,6 +515,7 @@ export const en = {
 
   // ── settings.providers ──────────────────────────────────────────────────
   "settings.providers.title": "Providers",
+  "settings.providers.default": "Default",
   "settings.providers.free": "Free",
   "settings.providers.paid": "Paid",
   "settings.providers.configured": "Configured",

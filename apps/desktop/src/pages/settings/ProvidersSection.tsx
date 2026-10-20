@@ -38,6 +38,9 @@ export default function ProvidersSection() {
   return (
     <div className="space-y-6">
       <h2 className="text-page font-bold">{t("settings.providers.title")}</h2>
+      {grokSub && config?.default_provider === GROK_SUB_PROVIDER_ID && (
+        <p className="text-body text-text-muted">{t("settings.providers.default")}: {grokSub.name}</p>
+      )}
       <GrokSubCard provider={grokSub} model={config?.providers?.[GROK_SUB_PROVIDER_ID]?.model} onModelChange={(model) => void saveKey(GROK_SUB_PROVIDER_ID, "model", model)} onTest={() => handleTest(GROK_SUB_PROVIDER_ID)} testing={!!testing[GROK_SUB_PROVIDER_ID]} testResult={results[GROK_SUB_PROVIDER_ID]} />
       {providers?.filter((p) => p.id !== GROK_SUB_PROVIDER_ID).map((p) => {
         const readiness = resolveProviderReadiness(p.id, providers, config);
@@ -45,6 +48,11 @@ export default function ProvidersSection() {
         <div key={p.id} className="border border-border bg-surface rounded-xl p-5">
           <div className="flex flex-wrap items-center gap-2 mb-3">
             <h3 className="text-section font-semibold break-words">{p.name}</h3>
+            {config?.default_provider === p.id && (
+              <span className="px-2 py-0.5 rounded-full border border-border text-caption text-text">
+                {t("settings.providers.default")}
+              </span>
+            )}
             <span className={clsx("px-2 py-0.5 rounded-full text-caption", p.is_free ? "bg-success-muted text-success" : "bg-warning-muted text-warning")}>
               {p.is_free ? t("settings.providers.free") : t("settings.providers.paid")}
             </span>
