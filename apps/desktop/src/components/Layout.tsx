@@ -65,7 +65,7 @@ export default function Layout() {
 		<div className="flex h-screen">
 			<aside className="w-60 shrink-0 flex flex-col bg-surface-muted dark:bg-surface border-r border-border">
 				<div className="p-4">
-					<h1 className="text-page font-bold text-accent-fg">{t("nav.appName")}</h1>
+					<p className="text-page font-bold text-accent-fg">{t("nav.appName")}</p>
 					<p className="text-caption text-text-muted">
 						v{APP_VERSION}
 					</p>

@@ -16,8 +16,6 @@ import {
 	Wand2,
 	Loader,
 	Settings2,
-	Languages,
-	FileCheck,
 	Package,
 	BookOpen,
 	Sparkles,
@@ -64,11 +62,6 @@ import {
 	saveProviderSetupHintDismissed,
 } from "../lib/providerReadiness";
 import { buildSettingsPath } from "../lib/settingsNav";
-import {
-	readWelcomeGuideDismissed,
-	saveWelcomeGuideDismissed,
-	WELCOME_WORKFLOW_STEPS,
-} from "../lib/workflowGuide";
 import { useT } from "../lib/i18n";
 import { formatDescriptionKey } from "../lib/formatDescriptions";
 
@@ -89,29 +82,7 @@ const FORMAT_ICONS: Record<string, typeof Globe> = {
 	vntextpatch: Braces,
 };
 
-const FORMAT_COLORS: Record<string, string> = {
-	"rpgmaker-mv":
-		"bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300",
-	"rpgmaker-vxa":
-		"bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300",
-	renpy: "bg-pink-100 text-pink-700 dark:bg-pink-900/40 dark:text-pink-300",
-	unity:
-		"bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300",
-	"wolf-rpg":
-		"bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300",
-	sugarcube: "bg-accent-muted text-accent-fg",
-	"html-game":
-		"bg-cyan-100 text-cyan-700 dark:bg-cyan-900/40 dark:text-cyan-300",
-	unreal: "bg-danger-muted text-danger",
-	kirikiri: "bg-warning-muted text-warning",
-	yuris:
-		"bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300",
-	nscripter: "bg-surface-muted text-text-muted",
-	tyrano: "bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300",
-	qsp: "bg-teal-100 text-teal-700 dark:bg-teal-900/40 dark:text-teal-300",
-	vntextpatch:
-		"bg-lime-100 text-lime-800 dark:bg-lime-900/40 dark:text-lime-300",
-};
+const FORMAT_COLOR = "bg-surface-muted text-text-muted";
 
 export default function Welcome() {
 	const t = useT();
@@ -141,9 +112,6 @@ export default function Welcome() {
 
 	const [hintDismissed, setHintDismissed] = useState(() =>
 		readProviderSetupHintDismissed(),
-	);
-	const [welcomeGuideDismissed, setWelcomeGuideDismissed] = useState(() =>
-		readWelcomeGuideDismissed(),
 	);
 
 	const addToQueue = useQueueStore((s) => s.addItem);
@@ -348,17 +316,14 @@ export default function Welcome() {
 	};
 
 	const recentProjects = config?.recent_projects ?? [];
-	const showWelcomeGuide =
-		!welcomeGuideDismissed && recentProjects.length === 0 && !project;
+	const continueProject = project ?? recentProjects[0];
+	const availableFormats = formats?.filter((f) => f.stability !== "comingsoon") ?? [];
+	const stableFormats = availableFormats.filter((f) => f.stability !== "experimental");
+	const experimentalCount = availableFormats.length - stableFormats.length;
 	const showProviderHint =
 		providers !== undefined &&
 		!hasAnyReadyProvider(providers, config) &&
 		!hintDismissed;
-
-	const dismissWelcomeGuide = () => {
-		setWelcomeGuideDismissed(true);
-		saveWelcomeGuideDismissed(true);
-	};
 
 	const dismissProviderHint = () => {
 		setHintDismissed(true);
@@ -368,80 +333,30 @@ export default function Welcome() {
 	return (
 		<div className="flex flex-col min-h-full p-8 max-w-4xl mx-auto text-text text-body">
 			{/* Hero */}
-			<div className="text-center mb-8">
-				<Globe size={48} className="mx-auto mb-3 text-accent-fg" />
-				<h1 className="text-page font-bold mb-1">{t("nav.appName")}</h1>
+			<div className="mb-8">
+				<h1 className="text-page font-bold mb-1">{t("welcome.headline")}</h1>
 				<p className="text-section text-text-muted">
 					{t("welcome.tagline")}
 				</p>
 			</div>
 
-			{showWelcomeGuide && (
-				<section
-					aria-label={t("welcome.guide.aria")}
-					className="mb-8 rounded-lg border border-border bg-surface p-4"
-				>
-					<div className="flex items-start justify-between gap-3 mb-3">
-						<div>
-							<h2 className="text-body font-semibold text-accent-fg">
-								{t("welcome.guide.title")}
-							</h2>
-							<p className="text-caption text-text-muted mt-0.5">
-								{t("welcome.guide.subtitle")}
-							</p>
-						</div>
-						<button
-							type="button"
-							onClick={dismissWelcomeGuide}
-							aria-label={t("welcome.guide.dismiss")}
-							className="shrink-0 text-accent-fg hover:text-text focus:outline-none focus:ring-2 focus:ring-accent-fg rounded p-0.5"
-						>
-							<X size={16} />
-						</button>
-					</div>
-					<ol className="grid gap-2 sm:grid-cols-3">
-						{WELCOME_WORKFLOW_STEPS.map((step, index) => {
-							const StepIcon =
-								step.id === "open"
-									? FolderOpen
-									: step.id === "translate"
-										? Languages
-										: FileCheck;
-							return (
-								<li
-									key={step.id}
-									className="flex items-start gap-2 rounded-md border border-border bg-surface p-3"
-								>
-									<span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-accent text-caption font-bold text-white">
-										{index + 1}
-									</span>
-									<div className="min-w-0">
-										<div className="flex items-center gap-1.5 text-body font-medium text-text">
-											<StepIcon
-												size={14}
-												className="text-accent-fg"
-												aria-hidden="true"
-											/>
-											{t(step.labelKey)}
-										</div>
-										<p className="text-caption text-text-muted mt-0.5">
-											{t(step.descriptionKey)}
-										</p>
-									</div>
-								</li>
-							);
-						})}
-					</ol>
-				</section>
-			)}
-
 			{/* Open buttons */}
 			<div className="mb-10">
-				<div className="flex justify-center gap-4 flex-wrap">
+				<div className="flex gap-4 flex-wrap">
+					{continueProject && (
+						<button
+							onClick={() => project ? navigate("/editor") : openRecent(recentProjects[0])}
+							disabled={opening}
+							className="flex items-center gap-2 px-6 py-3 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-body font-medium transition-colors"
+						>
+							{opening && <Loader size={18} className="animate-spin" />}
+							{t("welcome.continue", { name: continueProject.name })}
+						</button>
+					)}
 					<button
 						onClick={handleOpenFolder}
 						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-body font-medium transition-colors"
+						className={`flex items-center gap-2 px-6 py-3 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors ${continueProject ? "border border-border bg-surface hover:bg-surface-muted" : "bg-accent hover:bg-accent-hover text-white"}`}
 					>
 						{opening ? (
 							<Loader size={18} className="animate-spin" />
@@ -462,6 +377,10 @@ export default function Welcome() {
 						)}
 						{opening ? t("welcome.opening") : t("welcome.openFile")}
 					</button>
+				</div>
+				<details className="mt-4">
+					<summary className="cursor-pointer text-body text-text-muted">{t("welcome.otherWays")}</summary>
+					<div className="flex gap-3 flex-wrap mt-3">
 					<button
 						type="button"
 						onClick={handleOpenProjectDb}
@@ -489,7 +408,7 @@ export default function Welcome() {
 						<RotateCcw size={18} />{t("recovery.action")}
 					</button>
 				</div>
-				<div className="flex justify-center mt-2">
+				<div className="flex mt-2">
 					<button
 						onClick={handleChooseFormatManually}
 						disabled={opening}
@@ -499,6 +418,7 @@ export default function Welcome() {
 						{t("welcome.chooseFormat")}
 					</button>
 				</div>
+				</details>
 				{opening && (
 					<p className="text-center text-caption text-text-muted mt-2">
 						{t("welcome.extracting")}
@@ -545,6 +465,7 @@ export default function Welcome() {
 								{t("welcome.format.title")}
 							</h2>
 							<button
+								aria-label={t("common.close")}
 								onClick={() => {
 									setPicker(null);
 									setOpenDbDraft(null);
@@ -612,9 +533,7 @@ export default function Welcome() {
 								?.filter((f) => f.stability !== "comingsoon")
 								.map((f) => {
 									const Icon = FORMAT_ICONS[f.id] ?? Globe;
-									const colorClass =
-										FORMAT_COLORS[f.id] ??
-										"bg-surface-muted text-text-muted";
+									const colorClass = FORMAT_COLOR;
 									const experimental = f.stability === "experimental";
 									return (
 										<button
@@ -633,7 +552,7 @@ export default function Welcome() {
 												<div className="text-body font-medium flex items-center gap-2">
 													<span className="truncate">{f.name}</span>
 													{experimental && (
-														<span className="shrink-0 text-caption uppercase tracking-wide px-1.5 py-0.5 rounded bg-warning-muted text-warning">
+														<span className="shrink-0 text-caption px-1.5 py-0.5 rounded bg-warning-muted text-warning">
 															{t("welcome.format.experimental")}
 														</span>
 													)}
@@ -676,15 +595,13 @@ export default function Welcome() {
 			{/* Recent Projects */}
 			{recentProjects.length > 0 && (
 				<div className="mb-10">
-					<h2 className="text-body font-semibold text-text-muted uppercase mb-3">
+					<h2 className="text-body font-semibold text-text-muted mb-3">
 						{t("welcome.recent")}
 					</h2>
 					<div className="space-y-2">
 						{recentProjects.map((p, i) => {
 							const Icon = FORMAT_ICONS[p.format_id] ?? Globe;
-							const colorClass =
-								FORMAT_COLORS[p.format_id] ??
-								"bg-surface-muted text-text-muted";
+							const colorClass = FORMAT_COLOR;
 							const isDbRecent = shouldOpenProjectDb(p.database_path);
 							return (
 								<div
@@ -703,7 +620,7 @@ export default function Welcome() {
 											<div className="text-section font-medium truncate flex items-center gap-2">
 												<span className="truncate">{p.name}</span>
 												{isDbRecent && (
-													<span className="shrink-0 text-caption uppercase tracking-wide px-1.5 py-0.5 rounded bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-200">
+													<span className="shrink-0 text-caption px-1.5 py-0.5 rounded bg-surface-muted text-text-muted">
 														{t("welcome.recentDbBadge")}
 													</span>
 												)}
@@ -750,17 +667,19 @@ export default function Welcome() {
 
 			{formats && formats.length > 0 && (
 				<div>
-					<h2 className="text-body font-semibold text-text-muted uppercase mb-3">
-						{t("welcome.availableFormats")}
-					</h2>
+					<p className="text-body text-text-muted mb-3">
+						{t("welcome.stableFormats", { names: stableFormats.map((f) => f.name).join(", ") })}
+					</p>
+					<details>
+					<summary className="cursor-pointer text-body text-text-muted mb-3">
+						{t("welcome.allFormats", { stable: stableFormats.length, experimental: experimentalCount })}
+					</summary>
 					<div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))] gap-3">
 						{formats
 							.filter((f) => f.stability !== "comingsoon")
 							.map((f) => {
 								const Icon = FORMAT_ICONS[f.id] ?? Globe;
-								const colorClass =
-									FORMAT_COLORS[f.id] ??
-									"bg-surface-muted text-text-muted";
+								const colorClass = FORMAT_COLOR;
 								const experimental = f.stability === "experimental";
 								return (
 									<div
@@ -776,7 +695,7 @@ export default function Welcome() {
 												{f.name}
 											</span>
 											{experimental && (
-												<span className="inline-block mt-1 text-caption uppercase tracking-wide px-1.5 py-0.5 rounded bg-warning-muted text-warning">
+												<span className="inline-block mt-1 text-caption px-1.5 py-0.5 rounded bg-warning-muted text-warning">
 													{t("welcome.format.experimental")}
 												</span>
 											)}
@@ -801,6 +720,7 @@ export default function Welcome() {
 								);
 							})}
 					</div>
+					</details>
 				</div>
 			)}
 
@@ -815,6 +735,8 @@ export default function Welcome() {
 				<span>
 					<a
 						href="https://github.com/Miike0303/Locust"
+						target="_blank"
+						rel="noopener noreferrer"
 						className="hover:underline"
 					>
 						GitHub

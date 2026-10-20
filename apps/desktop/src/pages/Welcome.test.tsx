@@ -6,6 +6,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { gameFileExtensions } from "../lib/gameSource.ts";
 import Welcome from "./Welcome.tsx";
+import { readFileSync } from "node:fs";
+import { useProjectStore } from "../stores/projectStore.ts";
 import { setLocale, t, type TranslateKey } from "../lib/i18n/index.ts";
 import type { AppConfig, PluginInfo, ProviderInfo } from "../lib/api.ts";
 
@@ -39,11 +41,15 @@ const readyProviders: ProviderInfo[] = [
   { id: "mock", name: "Mock", is_free: true, requires_api_key: false, configured: true },
 ];
 
-type Scenario = "first-run" | "recent" | "ready" | "loading";
+type Scenario = "first-run" | "recent" | "current" | "ready" | "loading";
 function renderWelcome(scenario: Scenario): string {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, retryOnMount: false, gcTime: Infinity } },
   });
+  const initialState = useProjectStore.getInitialState();
+  const previousProject = initialState.project;
+  initialState.project = scenario === "current"
+    ? { name: "Current Game", path: "/games/Current", format_id: "renpy" } : null;
   try {
     if (scenario !== "loading") {
       const config: AppConfig = {
@@ -59,6 +65,7 @@ function renderWelcome(scenario: Scenario): string {
     return renderToStaticMarkup(createElement(QueryClientProvider, { client },
       createElement(MemoryRouter, { initialEntries: ["/"] }, createElement(Welcome))));
   } finally {
+    initialState.project = previousProject;
     client.clear();
   }
 }
@@ -75,11 +82,11 @@ for (const locale of ["en", "es"] as const) {
       setLocale(locale);
       const html = renderWelcome(scenario);
       const controls: TranslateKey[] = [
-        "nav.appName", "welcome.tagline", "welcome.openFolder", "welcome.openFile",
+        "welcome.headline", "welcome.tagline", "welcome.openFolder", "welcome.openFile",
         "welcome.openDb", "welcome.applyPatch", "recovery.action", "welcome.chooseFormat",
       ];
       for (const key of controls) assert.ok(hasText(html, t(key)), `localized content: ${key}`);
-      const showGuide = scenario !== "recent";
+      const showGuide = false;
       const showHint = scenario === "first-run";
       assert.equal(hasText(html, t("welcome.guide.title")), showGuide);
       assert.equal(html.includes(`aria-label="${t("welcome.guide.aria")}"`), showGuide);
@@ -92,7 +99,7 @@ for (const locale of ["en", "es"] as const) {
       assert.equal(hasText(html, t("welcome.providerHintLink")), showHint);
       assert.equal(html.includes(`aria-label="${t("welcome.providerHintDismiss")}"`), showHint);
       assert.equal(hasText(html, t("welcome.recent")), scenario === "recent");
-      assert.equal(hasText(html, t("welcome.availableFormats")), scenario !== "loading");
+      assert.equal(hasText(html, t("welcome.allFormats", { stable: 2, experimental: 2 })), scenario !== "loading");
       assert.ok(hasText(html, t("welcome.formatsAvailable", { count: scenario === "loading" ? 0 : 4 })));
       assert.ok(hasText(html, t("welcome.recentCount", { count: scenario === "recent" ? 2 : 0 })));
       if (scenario === "recent") {
@@ -124,6 +131,49 @@ for (const locale of ["en", "es"] as const) {
   }
 }
 
+
+for (const locale of ["en", "es"] as const) {
+  for (const scenario of ["first-run", "recent", "current"] as const) {
+    test(`${locale} Home ${scenario}: one primary, useful headline and progressive disclosure`, () => {
+      setLocale(locale);
+      const html = renderWelcome(scenario);
+      const primaries = [...html.matchAll(/<button\b[^>]*class="[^"]*\bbg-accent [^"]*"[^>]*>([\s\S]*?)<\/button>/g)];
+      assert.equal(primaries.length, 1);
+      const name = scenario === "current" ? "Current Game" : "Demo Game";
+      const label = scenario === "first-run" ? t("welcome.openFolder") : t("welcome.continue", { name });
+      assert.ok(hasText(primaries[0][0], label), `primary is ${label}`);
+      assert.ok(hasText(html, locale === "en" ? "Translate a game's dialogue" : "Traduzca los diálogos de un juego"));
+      assert.ok(hasText(html, locale === "en" ? "Open a single file" : "Abrir un solo archivo"));
+      assert.equal((html.match(/<h1\b/g) ?? []).length, 1);
+      const rail = readFileSync(new URL("../components/Layout.tsx", import.meta.url), "utf8");
+      assert.doesNotMatch(rail, /<h1\b/);
+      const details = [...html.matchAll(/<details([^>]*)>([\s\S]*?)<\/details>/g)];
+      assert.equal(details.length, 2);
+      for (const disclosure of details) assert.doesNotMatch(disclosure[1], /\bopen\b/);
+      const other = details.find(d => hasText(d[2], t("welcome.otherWays")));
+      assert.ok(other, "native disclosure exposes the alternate entry points on expansion");
+      for (const key of ["welcome.openDb", "welcome.applyPatch", "recovery.action", "welcome.chooseFormat"] as const) {
+        assert.ok(hasText(other[2], t(key)), `reachable entry point ${key}`);
+      }
+      for (const key of ["welcome.openFolder", "welcome.openFile"] as const) assert.ok(hasText(html, t(key)));
+      const grid = details.find(d => hasText(d[2], t("welcome.allFormats", { stable: 2, experimental: 2 })));
+      assert.ok(grid);
+      const badges = [...grid[2].matchAll(/<span class="[^"]*bg-warning-muted text-warning[^>]*>([^<]+)<\/span>/g)];
+      assert.equal(badges.length, formats.filter(f => f.stability === "experimental").length);
+      assert.ok(badges.every(b => b[1] === t("welcome.format.experimental")));
+      assert.ok(hasText(html, t("welcome.stableFormats", { names: "RPG Maker MV/MZ, Unknown engine" })));
+      assert.match(html, /<a[^>]*href="https:\/\/github.com\/Miike0303\/Locust"[^>]*target="_blank"[^>]*rel="noopener noreferrer"/);
+      assert.doesNotMatch(html, /uppercase|bg-(?:pink|blue|indigo|purple|orange|cyan|violet|rose|teal|lime)-/);
+    });
+  }
+}
+
+test("Home retains existing Continue paths and accessible manual-picker safety", () => {
+  const source = readFileSync(new URL("./Welcome.tsx", import.meta.url), "utf8");
+  assert.match(source, /onClick=\{\(\) => project \? navigate\("\/editor"\) : openRecent\(recentProjects\[0\]\)\}/);
+  assert.match(source, /aria-label=\{t\("common.close"\)\}/);
+  assert.equal((source.match(/t\("welcome.format.experimental"\)/g) ?? []).length, 2, "picker and grid keep badges");
+});
 
 test("Welcome and Queue's shared native file filter includes registered PCKs and existing shortcuts", () => {
   const extensions = gameFileExtensions(formats);
