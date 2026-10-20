@@ -62,12 +62,15 @@ test("language selector retains its id, locale binding, options and persistence 
   for (const locale of ["en", "es"]) assert.ok(appearance.includes(`<option value="${locale}">{t("settings.appearance.locale.${locale}")}</option>`));
 });
 
-test("existing appearance saves and provider health/save payloads remain byte-identical", () => {
+test("existing appearance saves and provider health/save payloads remain identical across checkout line endings", () => {
   for (const [name, start, end, hash] of [
     ["AppearanceSection", "  const setTheme", "  if (!config)", "6a4cd5e5119c4786be679d7eaada69f843bcd21e5addc6e6ae129fdf99b0cbd6"],
     ["ProvidersSection", "  const handleTest", "  const grokSub", "a7eae738ad55bf1671f121f29323ac65bfc802bfa5ef5f79ef2b361668159812"],
   ]) {
-    const text = source(name);
-    assert.equal(createHash("sha256").update(text.slice(text.indexOf(start), text.indexOf(end))).digest("hex"), hash);
+    for (const newline of ["\n", "\r\n"]) {
+      const text = source(name).replace(/\r\n/g, "\n").replace(/\n/g, newline);
+      const handler = text.slice(text.indexOf(start), text.indexOf(end)).replace(/\r\n/g, "\n");
+      assert.equal(createHash("sha256").update(handler).digest("hex"), hash);
+    }
   }
 });
