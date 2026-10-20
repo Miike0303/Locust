@@ -74,6 +74,14 @@ impl TranslationProvider for ClaudeProvider {
         true
     }
 
+    fn effective_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn supports_token_pricing(&self) -> bool {
+        true
+    }
+
     async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
         if requests.is_empty() {
             return Ok(Vec::new());

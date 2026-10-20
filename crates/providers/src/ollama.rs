@@ -84,6 +84,10 @@ impl TranslationProvider for OllamaProvider {
         false
     }
 
+    fn effective_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
         if requests.is_empty() {
             return Ok(Vec::new());

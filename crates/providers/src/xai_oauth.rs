@@ -422,6 +422,14 @@ impl TranslationProvider for GrokSubscriptionProvider {
         false
     }
 
+    fn effective_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn supports_token_pricing(&self) -> bool {
+        true
+    }
+
     async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
         let mut results = self.delegate().await?.translate(requests).await?;
         for r in &mut results {

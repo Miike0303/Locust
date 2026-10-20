@@ -20,6 +20,18 @@ pub trait TranslationProvider: Send + Sync {
     fn name(&self) -> &str;
     fn is_free(&self) -> bool;
     fn requires_api_key(&self) -> bool;
+    /// Constructor-resolved model sent to the service, when applicable.
+    fn effective_model(&self) -> Option<&str> {
+        None
+    }
+    /// Matched user configuration; not a claim about service limits or prices.
+    fn model_policy(&self) -> Option<&crate::model_policy::ModelPolicy> {
+        None
+    }
+    /// Opt in only for adapters with input/output token accounting.
+    fn supports_token_pricing(&self) -> bool {
+        false
+    }
     fn supported_languages(&self) -> Vec<LangPair> {
         vec![]
     }

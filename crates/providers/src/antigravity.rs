@@ -391,6 +391,9 @@ impl TranslationProvider for AntigravityProvider {
     fn requires_api_key(&self) -> bool {
         false
     }
+    fn effective_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
     async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
         let chunks = self.chunks(requests)?;
         let mut pending = chunks.into_iter().enumerate();

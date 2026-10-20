@@ -212,6 +212,14 @@ impl TranslationProvider for OpenAiProvider {
         !self.free
     }
 
+    fn effective_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn supports_token_pricing(&self) -> bool {
+        !self.free
+    }
+
     async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
         if requests.is_empty() {
             return Ok(Vec::new());

@@ -4,6 +4,7 @@ pub mod claude;
 pub mod deepl;
 pub mod google;
 pub mod mock;
+mod model_policy;
 pub mod ollama;
 pub mod openai;
 pub mod retry;
@@ -109,12 +110,15 @@ pub fn list_providers_for_api(reg: &ProviderRegistry) -> Vec<DiscoverableProvide
 
 pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
     let mut reg = ProviderRegistry::new();
+    let mut register = |provider: Arc<dyn locust_core::translation::TranslationProvider>| {
+        reg.register(model_policy::configure(provider, &config.model_overrides));
+    };
 
     // Always register Google Translate (free, no API key needed)
-    reg.register(Arc::new(google::GoogleTranslateProvider::new()));
+    register(Arc::new(google::GoogleTranslateProvider::new()));
 
     // Mock provider for testing pipelines without hitting any service
-    reg.register(Arc::new(mock::MockProvider));
+    register(Arc::new(mock::MockProvider));
 
     // Register Argos if configured or use defaults
     if let Some(pc) = config.get_provider_config("argos") {
@@ -122,15 +126,15 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
             .base_url
             .clone()
             .unwrap_or_else(|| "http://localhost:5000".to_string());
-        reg.register(Arc::new(argos::ArgosProvider::new(base_url)));
+        register(Arc::new(argos::ArgosProvider::new(base_url)));
     } else {
-        reg.register(Arc::new(argos::ArgosProvider::default()));
+        register(Arc::new(argos::ArgosProvider::default()));
     }
 
     // Register DeepL if API key is configured
     if let Some(pc) = config.get_provider_config("deepl") {
         if let Some(ref api_key) = pc.api_key {
-            reg.register(Arc::new(deepl::DeepLProvider::new(
+            register(Arc::new(deepl::DeepLProvider::new(
                 api_key.clone(),
                 pc.free_tier,
             )));
@@ -140,7 +144,7 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
     // Register OpenAI if API key is configured
     if let Some(pc) = config.get_provider_config("openai") {
         if let Some(ref api_key) = pc.api_key {
-            reg.register(Arc::new(openai::OpenAiProvider::new(
+            register(Arc::new(openai::OpenAiProvider::new(
                 api_key.clone(),
                 pc.model.clone(),
                 pc.base_url.clone(),
@@ -151,7 +155,7 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
     // Register Claude if API key is configured
     if let Some(pc) = config.get_provider_config("claude") {
         if let Some(ref api_key) = pc.api_key {
-            reg.register(Arc::new(claude::ClaudeProvider::new(
+            register(Arc::new(claude::ClaudeProvider::new(
                 api_key.clone(),
                 pc.model.clone(),
                 pc.base_url.clone(),
@@ -166,7 +170,7 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
         };
         if let Some(pc) = config.get_provider_config(def.id) {
             if let Some(ref api_key) = pc.api_key {
-                reg.register(Arc::new(openai::OpenAiProvider::compatible(
+                register(Arc::new(openai::OpenAiProvider::compatible(
                     def.id.to_string(),
                     def.name.to_string(),
                     api_key.clone(),
@@ -187,13 +191,13 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
         let model = config
             .get_provider_config("grok-sub")
             .and_then(|pc| pc.model.clone());
-        reg.register(Arc::new(xai_oauth::GrokSubscriptionProvider::new(model)));
+        register(Arc::new(xai_oauth::GrokSubscriptionProvider::new(model)));
     }
 
     // The CLI owns subscription login; discovery never spawns it or reads tokens.
     let antigravity_config = config.get_provider_config("antigravity");
     if antigravity::find_executable(antigravity_config).is_some() {
-        reg.register(Arc::new(antigravity::AntigravityProvider::new(
+        register(Arc::new(antigravity::AntigravityProvider::new(
             antigravity_config,
         )));
     }
@@ -219,7 +223,7 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
             continue;
         }
         if let Some(ref base_url) = pc.base_url {
-            reg.register(Arc::new(openai::OpenAiProvider::compatible(
+            register(Arc::new(openai::OpenAiProvider::compatible(
                 id.clone(),
                 format!("{} (custom endpoint)", id),
                 pc.api_key.clone().unwrap_or_else(|| "none".to_string()),
@@ -231,22 +235,22 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
 
     // Register LM Studio if configured or use defaults (OpenAI-compatible local API)
     if let Some(pc) = config.get_provider_config("lmstudio") {
-        reg.register(Arc::new(openai::OpenAiProvider::lm_studio(
+        register(Arc::new(openai::OpenAiProvider::lm_studio(
             pc.base_url.clone(),
             pc.model.clone(),
         )));
     } else {
-        reg.register(Arc::new(openai::OpenAiProvider::lm_studio(None, None)));
+        register(Arc::new(openai::OpenAiProvider::lm_studio(None, None)));
     }
 
     // Register Ollama if configured or use defaults
     if let Some(pc) = config.get_provider_config("ollama") {
-        reg.register(Arc::new(ollama::OllamaProvider::new(
+        register(Arc::new(ollama::OllamaProvider::new(
             pc.base_url.clone(),
             pc.model.clone(),
         )));
     } else {
-        reg.register(Arc::new(ollama::OllamaProvider::default()));
+        register(Arc::new(ollama::OllamaProvider::default()));
     }
 
     reg
@@ -256,6 +260,29 @@ pub fn default_registry(config: &AppConfig) -> ProviderRegistry {
 mod tests {
     use super::*;
     use locust_core::config::ProviderConfig;
+
+    #[tokio::test]
+    async fn model_policy_registry_uses_resolved_models() {
+        let config = AppConfig::default().patched(serde_json::json!({
+            "providers": {
+                "openai": {"api_key": "fixture", "model": "fixture-model"},
+                "custom": {"base_url": "http://127.0.0.1:1", "model": "fixture-model"}
+            },
+            "model_overrides": {
+                "openai": {"fixture-model": {"input_usd_per_million": 2, "output_usd_per_million": 6}},
+                "custom": {"fixture-model": {"context_window": 1000}}
+            }
+        })).unwrap();
+        let reg = default_registry(&config);
+        let provider = reg.get("openai").unwrap();
+        assert_eq!(provider.effective_model(), Some("fixture-model"));
+        assert!(provider.model_policy().is_some());
+        assert_eq!(provider.estimate_cost(100, "es").await, Some(0.00104));
+        let custom = reg.get("custom").unwrap();
+        assert_eq!(custom.effective_model(), Some("fixture-model"));
+        assert_eq!(custom.model_policy().unwrap().context_window, Some(1000));
+        assert_eq!(custom.estimate_cost(100, "es").await, None);
+    }
 
     #[test]
     fn list_providers_for_api_includes_unconfigured_key_gated_catalog() {

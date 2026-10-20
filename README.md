@@ -115,7 +115,7 @@ Translation sends source text to the selected provider, including remote service
 
 A paid provider without a cost estimate is refused when a limit is set; unknown cost is not treated as zero. Without a limit, translation can proceed with incomplete cost reporting. To retain a limit, choose a provider with usable estimates (or a free provider). Removing the limit allows unknown-cost calls and gives up that guard.
 
-#### Model policy configuration (foundation only)
+#### Model policy configuration
 
 `config.json` accepts an optional top-level `model_overrides` map keyed by provider ID, then **exact effective model name** (case-sensitive, no aliases or default-model inference):
 
@@ -133,7 +133,9 @@ Each policy may contain `context_window` (integer from 1 through 184467440737095
 
 Partial settings updates preserve omitted fields and other model/provider entries. Set `context_window` to JSON `null` to reset it; reset prices by setting **both** price fields to `null` in the same update. Clearing just one price while the other remains configured is rejected. An absent or empty policy means legacy behavior. Invalid policies are rejected on load, partial update and save before replacing saved configuration; unrelated provider fields and masked API-key preservation keep their existing behavior.
 
-This foundation stores and validates policies and exposes a shared backend lookup. It does **not yet** change adapters, batching, cost estimates or Settings UI; a configured context window is not proof of tokenizer or prompt fit.
+At provider registration, policies match the adapter's constructor-resolved model (including its default), never a guessed alias. Paired prices override the existing approximate character-based estimate (1.3 input and 1.3 output tokens per character) and costs calculated from reported input/output usage for OpenAI, Claude, Grok subscription and paid OpenAI-compatible endpoints. Missing usage remains unknown, even with zero configured prices; batch usage/cost stays on the first result only. Prices are not applied to free or non-token adapters (including LM Studio, Ollama, Google, DeepL and Antigravity). Context-only policies preserve existing rates; absent, empty or unmatched policies preserve legacy behavior.
+
+Effective-model and matched-policy metadata are available internally for model-based adapters, including Ollama and Antigravity. Context windows do **not yet** affect batching, and no estimate endpoint or Settings editor is added here. A configured context window is not proof of tokenizer or prompt fit; configured prices are user assumptions, not verified service charges.
 
 ---
 
