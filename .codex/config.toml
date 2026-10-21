@@ -1,0 +1,10 @@
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+writable_roots = [
+  "C:/Users/Mike/AppData/Local/Temp",
+  "C:/Users/Mike/AppData/Local/locust-patch-locks-v1",
+  "C:/Users/Mike/AppData/Local/locust-shared-target",
+]
+network_access = true
