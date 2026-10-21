@@ -51,7 +51,8 @@ const hooks = registerHooks({
       const stubSpecifier = settingsSection && specifier.startsWith("../../")
         ? specifier.slice(3) : specifier;
       const stubs: Record<string, string> = {
-        react: `const h=globalThis.__backupRestore;export const useState=initial=>h.state(initial);export const useMemo=fn=>fn();export const useEffect=()=>{};`,
+        react: `const h=globalThis.__backupRestore;export const useState=initial=>h.state(initial);export const useMemo=fn=>fn();export const useEffect=()=>{};
+          export const useRef=initial=>h.state(()=>({current:initial}))[0];`,
         "@tanstack/react-query": `export const useQuery=()=>({data:globalThis.__backupRestore.listing,isPending:false,isError:false,refetch:()=>{}});export const useQueryClient=()=>({});`,
         "react-router-dom": `export const useLocation=()=>({search:'?section=data'});export const useNavigate=()=>()=>{};`,
         "../lib/i18n": `export const useT=()=>globalThis.__backupRestore.t;export const useLocale=()=> 'en';`,

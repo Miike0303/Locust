@@ -57,6 +57,7 @@ const hooks = registerHooks({
       const stubs: Record<string, string> = {
         react: `const h=globalThis.__glossaryTest;
           export const useState=x=>h.active?h.state(x):h.React.useState(x);
+          export const useRef=x=>h.active?h.state(()=>({current:x}))[0]:h.React.useRef(x);
           export const useEffect=(fn,deps)=>h.active?h.effect(fn,deps):h.React.useEffect(fn,deps);
           export const useMemo=(fn,deps)=>h.active?fn():h.React.useMemo(fn,deps);`,
         "@tanstack/react-query": `const h=globalThis.__glossaryTest;

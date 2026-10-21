@@ -8,6 +8,7 @@ import { useT } from "../../lib/i18n";
 import { resolveProviderReadiness } from "../../lib/providerReadiness";
 import { GROK_SUB_PROVIDER_ID } from "../../lib/xaiAuth";
 import GrokSubCard from "./GrokSubCard";
+import ModelPolicySettings from "./ModelPolicySettings";
 import useSettingsSave from "./useSettingsSave";
 
 export default function ProvidersSection() {
@@ -149,6 +150,7 @@ export default function ProvidersSection() {
         </div>
         );
       })}
+      <ModelPolicySettings providers={providers} config={config} onSave={saveSettings} />
     </div>
   );
 }

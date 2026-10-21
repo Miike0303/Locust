@@ -202,7 +202,20 @@ export interface BackupRestoreReport {
   kept: { path: string; reason: string }[];
 }
 
+/** Read values may include u64 context numbers outside JavaScript's exact range. */
+export interface ModelPolicy {
+  context_window?: number | null;
+  input_usd_per_million?: number | null;
+  output_usd_per_million?: number | null;
+}
+export interface ModelPolicyPatch {
+  context_window?: number | null;
+  input_usd_per_million?: number | null;
+  output_usd_per_million?: number | null;
+}
+
 export interface AppConfig {
+  model_overrides?: Record<string, Record<string, ModelPolicy>>;
   /** Protected startup fallback: original configuration could not be read. */
   load_warning?: string;
   providers: Record<string, any>;
@@ -809,7 +822,10 @@ export const getTranslationRuns = (): Promise<TranslationRun[]> =>
 export const getConfig = (): Promise<AppConfig> =>
   IS_TAURI ? tauriInvoke("get_config") : request("/config");
 
-export type ConfigUpdate = Omit<Partial<AppConfig>, "ui" | "load_warning"> & { ui?: Partial<AppConfig["ui"]> };
+export type ConfigUpdate = Omit<Partial<AppConfig>, "ui" | "load_warning" | "model_overrides"> & {
+  ui?: Partial<AppConfig["ui"]>;
+  model_overrides?: Record<string, Record<string, ModelPolicyPatch>>;
+};
 let configWriteTail: Promise<void> = Promise.resolve();
 /** Keep rapid edits ordered even if the user switches settings sections. */
 export const updateConfig = (partial: ConfigUpdate): Promise<AppConfig> => {
