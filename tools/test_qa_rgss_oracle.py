@@ -127,6 +127,78 @@ class WireTests(unittest.TestCase):
                              (1, "", "RGSS refused: artifact wire differs: Data/Actors.rvdata2\n"))
             self.assertEqual(actor.read_bytes(), wire)
 
+    def test_shrink_profile_wire_and_readonly_rejections(self):
+        profile = "ace-common-shrink"
+        documents = {phase: q.fixture(phase, profile) for phase in q.TEXT}
+        common = "Data/CommonEvents.rvdata2"
+        self.assertEqual(set(documents["ja"]), {common, *q.FILES[2:]})
+        for phase, files in documents.items():
+            event = q.decode(files[common])[1][1]
+            fields = dict(event[2])
+            commands = fields["@list"][1]
+            self.assertEqual(len(commands), 7 if phase == "ja" else 5)
+            self.assertEqual(fields["@opaque"], ("string", b"\x00\xff\x80physical", None))
+            self.assertEqual(fields["@ascii"], ("string", b"ASCII sentinel", False))
+            for name in q.FILES[2:]:
+                self.assertEqual(files[name], documents["ja"][name])
+        q.BASE.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(dir=q.BASE, prefix="f4-shrink-unit-")) / "game"
+        args = ["--profile", profile]
+        self.assertEqual(self.invoke(["fixture", str(root), *args]), (0, "RGSS fixture OK\n", ""))
+        self.assertEqual(self.invoke(["check", str(root), "--phase", "ja", *args]), (0, "RGSS check OK\n", ""))
+        path = root / common
+        original = path.read_bytes()
+        variants = [
+            (original.replace(b"physical", b"PHYSICAL"), "graph"),
+            (original.replace(b"i\x02\x91\x01", b"i\x02\x92\x01", 1), "graph"),
+            (original.replace(b"@indenti\x00", b"@indenti\x06", 1), "graph"),
+            (original[:-1] + b"T", "graph"),
+            (original.replace(b"[\x07", b"[\x01\x02", 1), "wire"),
+        ]
+        for wire, kind in variants:
+            with self.subTest(kind=kind, wire=wire[:32]):
+                self.assertNotEqual(wire, original)
+                path.write_bytes(wire)
+                before = {name: (root / name).read_bytes() for name in documents["ja"]}
+                self.assertEqual(self.invoke(["check", str(root), "--phase", "ja", *args]),
+                    (1, "", f"RGSS refused: artifact {kind} differs: {common}\n"))
+                self.assertEqual(before, {name: (root / name).read_bytes() for name in before})
+        path.write_bytes(original)
+
+    def test_shrink_profile_paths_and_invalid_profile_do_not_create(self):
+        q.BASE.mkdir(parents=True, exist_ok=True)
+        parent = Path(tempfile.mkdtemp(dir=q.BASE, prefix="f4-paths-"))
+        root = parent / "game"
+        args = ["--profile", "ace-common-shrink"]
+        self.assertEqual(self.invoke(["fixture", str(parent), *args]),
+                         (1, "", "RGSS refused: existing fixture refused\n"))
+        self.assertEqual(self.invoke(["fixture", "tools", *args]),
+                         (1, "", "RGSS refused: owned path refused\n"))
+        self.assertEqual(list(parent.iterdir()), [])
+        for command in (["fixture", str(root)], ["check", str(root), "--phase", "ja"]):
+            with mock.patch.object(sys, "argv", ["qa_rgss_oracle.py"]), \
+                    contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as caught:
+                    q.main([*command, "--profile", "bad"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertEqual(out.getvalue(), "")
+            usage = "[-h] root" if command[0] == "fixture" else "[-h] --phase {ja,en,es} root"
+            self.assertEqual(err.getvalue(), f"usage: qa_rgss_oracle.py {command[0]} {usage}\n"
+                f"qa_rgss_oracle.py {command[0]}: error: argument --profile: invalid choice: 'bad' "
+                "(choose from 'ace-v1', 'ace-common-shrink')\n")
+            self.assertEqual(list(parent.iterdir()), [])
+        # The test never falls back to a copy when symlinks are unavailable.
+        linked = parent / "link"
+        try:
+            linked.symlink_to(parent, target_is_directory=True)
+        except OSError as error:
+            self.fail("linked-root proof unavailable: " + str(error))
+        self.assertEqual(self.invoke(["fixture", str(linked / "game"), *args]),
+                         (1, "", "RGSS refused: linked path refused\n"))
+        self.assertEqual(self.invoke(["check", str(linked), "--phase", "ja", *args]),
+                         (1, "", "RGSS refused: linked path refused\n"))
+        self.assertEqual(set(p.name for p in parent.iterdir()), {"link"})
+
     def test_help_and_outside_refusal(self):
         for args in (["--help"], ["fixture", "--help"], ["check", "--help"]):
             with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as exit:
@@ -144,6 +216,12 @@ class WireTests(unittest.TestCase):
 
 
 def checkout_cli():
+    explicit = os.environ.get("LOCUST_QA_RGSS_CLI")
+    if explicit is not None:
+        cli = Path(explicit).absolute()
+        if not explicit or not cli.is_file():
+            raise AssertionError("explicit QA CLI unavailable: " + explicit)
+        return cli
     name = "locust.exe" if sys.platform == "win32" else "locust"
     cli = Path(__file__).resolve().parents[1] / "target/debug" / name
     if not cli.is_file():
@@ -154,6 +232,19 @@ def checkout_cli():
 
 
 class CliSelectionTests(unittest.TestCase):
+    def test_explicit_candidate_selected_and_missing_is_failure_not_skip(self):
+        candidate = str(Path(__file__).resolve())
+        with mock.patch.dict(os.environ, {"LOCUST_QA_RGSS_CLI": candidate}, clear=True), \
+                mock.patch.object(Path, "is_file", return_value=True):
+            self.assertEqual(checkout_cli(), Path(candidate))
+        for explicit in (candidate + ".missing", ""):
+            for ci in ("", "true"):
+                with self.subTest(explicit=explicit, ci=ci), \
+                        mock.patch.dict(os.environ, {"LOCUST_QA_RGSS_CLI": explicit, "CI": ci}, clear=True):
+                    with self.assertRaisesRegex(AssertionError, "explicit QA CLI unavailable"):
+                        checkout_cli()
+
+    @mock.patch.dict(os.environ, {}, clear=True)
     def test_platform_binary_in_normal_checkout_target(self):
         root = Path(__file__).resolve().parents[1]
         for platform, name in (("win32", "locust.exe"), ("linux", "locust"), ("darwin", "locust")):
@@ -161,6 +252,7 @@ class CliSelectionTests(unittest.TestCase):
                     mock.patch.object(Path, "is_file", return_value=True):
                 self.assertEqual(checkout_cli(), root / "target/debug" / name)
 
+    @mock.patch.dict(os.environ, {}, clear=True)
     def test_ci_missing_binary_fails_local_missing_explicitly_skips(self):
         with mock.patch.object(Path, "is_file", return_value=False):
             with mock.patch.dict(os.environ, {"CI": "true"}):
@@ -172,15 +264,23 @@ class CliSelectionTests(unittest.TestCase):
 
 
 class PublicCliTests(unittest.TestCase):
+    def test_shrink_public_lifecycle(self):
+        self.lifecycle("ace-common-shrink")
+
     def test_owned_public_lifecycle(self):
+        self.lifecycle()
+
+    def lifecycle(self, profile="ace-v1"):
         cli = checkout_cli()
         q.BASE.mkdir(parents=True, exist_ok=True)
         root = Path(tempfile.mkdtemp(dir=q.BASE, prefix="public-"))
         print("Retained public CLI evidence:", root)
         source, install = root / "source", root / "install"
-        q.create(source)
+        q.create(source, profile)
         shutil.copytree(source, install)
-        baseline = {name: (source / name).read_bytes() for name in q.FILES}
+        files = q.fixture("ja", profile)
+        baseline = {path.relative_to(source).as_posix(): path.read_bytes()
+                    for path in source.rglob("*") if path.is_file()}
         config = root / "config.json"
         config.write_text("{}", encoding="utf-8")
         env = {k: v for k, v in os.environ.items() if k.upper() in {
@@ -195,14 +295,25 @@ class PublicCliTests(unittest.TestCase):
         def run(*args, accepted=0):
             command = [str(cli), "--config", str(config), *map(str, args)]
             result = subprocess.run(command, env=env, cwd=root, capture_output=True, timeout=30)
-            record = {"command": command, "exit": result.returncode,
-                      "stdout": result.stdout.decode("utf-8", errors="replace"),
-                      "stderr": result.stderr.decode("utf-8", errors="replace")}
+            raw = {}
+            for stream in ("stdout", "stderr"):
+                path = root / f"cli-{len(records):02d}.{stream}"
+                path.write_bytes(getattr(result, stream))
+                raw[stream + "_path"] = str(path)
+            record = {"command": command, "exit": result.returncode, **raw,
+                      "stdout": result.stdout.decode("utf-8"),
+                      "stderr": result.stderr.decode("utf-8")}
             records.append(record)
             (root / "commands.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
             self.assertEqual(result.returncode, accepted, record)
+            if accepted == 0:
+                self.assertEqual(record["stderr"], "", record)
             return record["stdout"]
         def targets(phase):
+            if profile == "ace-common-shrink":
+                lines, later = q.SHRINK_TEXT[phase]
+                return dict(zip(["CommonEvents.rvdata2#1#cmd_1#msg",
+                                 "CommonEvents.rvdata2#1#cmd_5#msg"], ["\n".join(lines), later]))
             name, desc, lines, later, yes, no = q.TEXT[phase]
             return dict(zip(["Actors.rvdata2#1#@name", "Actors.rvdata2#1#@description",
                 "Map001.rvdata2#0#event_1#page_0#cmd_1#msg", "Map001.rvdata2#0#event_1#page_0#cmd_3#msg",
@@ -217,6 +328,9 @@ class PublicCliTests(unittest.TestCase):
             tree = ET.parse(catalog)
             units = [node for node in tree.iter() if node.tag.split("}")[-1] == "trans-unit"]
             self.assertEqual({node.attrib["id"] for node in units}, set(targets(phase)))
+            self.assertEqual({unit.attrib["id"]: next(node.text for node in unit
+                if node.tag.split("}")[-1] == "source") for unit in units},
+                targets("ja" if phase == "en" else "en"))
             for unit in units:
                 old = next((node for node in unit if node.tag.split("}")[-1] == "target"), None)
                 if old is not None:
@@ -225,7 +339,7 @@ class PublicCliTests(unittest.TestCase):
                 ET.SubElement(unit, prefix + "target").text = targets(phase)[unit.attrib["id"]]
             tree.write(catalog, encoding="utf-8", xml_declaration=True)
             run("import", db, "-f", "xliff", "-l", phase, "-i", catalog)
-            run("validate", db, "--json")
+            self.assertEqual(run("validate", db, "--json"), '{"count":0,"issues":[]}\n')
             self.assertEqual({key: row["translation"] for key, row in rows(db).items()}, targets(phase))
         english, spanish = root / "en.db", root / "es.db"
         run("extract", source, "-f", "rpgmaker-vxa", "-o", english)
@@ -234,16 +348,21 @@ class PublicCliTests(unittest.TestCase):
         rejected = root / "rejected-pivot.db"
         before = english.read_bytes()
         run("pivot", english, "-o", rejected, "--require-complete", accepted=1)
-        self.assertFalse(rejected.exists())
+        self.assertEqual(list(root.glob(rejected.name + "*")), [])
+        # A read-only SQLite connection can retire transient SHM/WAL files.
+        # Exact persistent DB bytes include counters; do not equate that housekeeping with a write.
         self.assertEqual(before, english.read_bytes())
         self.assertEqual(original_rows, rows(english))
         self.assertEqual(records[-1]["stdout"], "")
-        self.assertIn("incomplete", records[-1]["stderr"].lower())
+        self.assertEqual(records[-1]["stderr"], "Error: incomplete pivot: entry '" +
+                         sorted(targets("ja"))[0] + "' has a missing or blank translation\n")
         seed(english, "en")
         en_copy = root / "english-copy"
         english_report = json.loads(run("inject", source, "-P", english, "-l", "en", "-m", "replace", "-o", en_copy, "--json"))
         en_copy = q.owned(english_report["injected_roots"]["en"])
-        q.check(en_copy, "en")
+        q.check(en_copy, "en", profile)
+        self.assertEqual(english_report["reports"]["en"]["strings_written"], len(targets("en")))
+        self.assertEqual(english_report["reports"]["en"]["strings_skipped"], 0)
         run("pivot", english, "-o", spanish, "--require-complete")
         pivot_rows = rows(spanish)
         self.assertEqual({key: row["source"] for key, row in pivot_rows.items()}, targets("en"))
@@ -252,40 +371,46 @@ class PublicCliTests(unittest.TestCase):
         es_copy = root / "spanish-copy"
         report = json.loads(run("inject", source, "-P", spanish, "-l", "es", "-m", "replace", "-o", es_copy, "--json"))
         es_copy = q.owned(report["injected_roots"]["es"])
-        self.assertEqual(report["reports"]["es"]["strings_written"], 6)
+        self.assertEqual(report["reports"]["es"]["strings_written"], len(targets("es")))
         self.assertEqual(report["reports"]["es"]["strings_skipped"], 0)
-        q.check(es_copy, "es")
+        q.check(es_copy, "es", profile)
         # Re-extraction is corroboration only; graph proof above is independent.
         observed = root / "reextract.db"
         run("extract", es_copy, "-f", "rpgmaker-vxa", "-o", observed)
         physical = rows(observed)
-        self.assertIn("Map001.rvdata2#0#event_1#page_0#cmd_5#msg", physical)
-        self.assertIn("Map001.rvdata2#0#event_1#page_0#cmd_6#choice_0", physical)
+        if profile == "ace-common-shrink":
+            expected_physical = {key.replace("cmd_5", "cmd_3"): text for key, text in targets("es").items()}
+            self.assertEqual({key: row["source"] for key, row in physical.items()}, expected_physical)
+        else:
+            self.assertIn("Map001.rvdata2#0#event_1#page_0#cmd_5#msg", physical)
+            self.assertIn("Map001.rvdata2#0#event_1#page_0#cmd_6#choice_0", physical)
         patch = root / "patch.zip"
         run("patch", es_copy, "-P", spanish, "-l", "es", "-o", patch, "--pristine", source, "--no-detect-id")
         run("apply", install, patch)
-        q.check(install, "es")
+        q.check(install, "es", profile)
         run("patch-rollback", install)
-        q.check(install, "ja")
+        q.check(install, "ja", profile)
         run("apply", install, patch)
-        q.check(install, "es")
-        self.assertEqual(baseline, {name: (source / name).read_bytes() for name in q.FILES})
+        q.check(install, "es", profile)
+        self.assertEqual(baseline, {path.relative_to(source).as_posix(): path.read_bytes()
+                                   for path in source.rglob("*") if path.is_file()})
         wire_equal = {}
         for phase, actual_root in (("en", en_copy), ("es", es_copy)):
             expected_root = root / ("expected-" + phase)
-            for name, wire in q.fixture(phase).items():
+            for name, wire in q.fixture(phase, profile).items():
                 path = expected_root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(wire)
                 wire_equal[phase + "/" + name] = wire == (actual_root / name).read_bytes()
         with cli.open("rb") as stream:
             cli_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
-        (root / "proof.json").write_text(json.dumps({"result": "bounded graph/lifecycle pass", "selected": 6,
+        (root / "proof.json").write_text(json.dumps({"result": "bounded graph/lifecycle pass", "profile": profile, "selected": len(targets("ja")),
             "cli_sha256": cli_sha256, "wire_equal": wire_equal,
             "contract": "exact independent full document bytes plus bounded ordered graph",
             "original_source_unchanged": True,
             "original": original_rows, "pivot": pivot_rows, "reextracted": physical,
-            "injection": report}, ensure_ascii=False, indent=2), encoding="utf-8")
+            "injection": report, "english_injection": english_report,
+            "rejection_db_bytes_counters_unchanged": True}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

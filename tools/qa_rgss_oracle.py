@@ -163,7 +163,39 @@ FILES = ("Data/Actors.rvdata2", "Data/Map001.rvdata2", "Data/System.rvdata2", "G
 BASE = Path(__file__).resolve().parents[1] / "tmp/engine-pipeline-expansion/rgss"
 
 
-def fixture(phase):
+PROFILES = ("ace-v1", "ace-common-shrink")
+SHRINK_TEXT = {
+    "ja": (["静かな道を歩いています。", "町で仲間を待っています。", "明日また旅を続けましょう。"], "また会いましょう。"),
+    "en": (["A quiet road."], "Return tomorrow."),
+    "es": (["Un camino sereno."], "Vuelve mañana."),
+}
+
+
+def shrink_fixture(phase):
+    lines, later = SHRINK_TEXT[phase]
+    w = Wire()
+    def commands():
+        def header():
+            return w.command(101, [lambda: w.text("", False), lambda: b"i\x00",
+                                   lambda: b"i\x00", lambda: b"i\x07"])
+        builders = [header]
+        builders += [lambda line=line: w.command(401, [lambda: w.text(line)]) for line in lines]
+        builders += [header, lambda: w.command(401, [lambda: w.text(later)]), lambda: w.command(0, [])]
+        return w.array(builders)
+    common = w.array([lambda: b"0", lambda: w.obj("RPG::CommonEvent", [
+        ("@id", lambda: b"i\x06"), ("@trigger", lambda: b"i\x00"),
+        ("@switch_id", lambda: b"i\x0c"), ("@list", commands),
+        ("@opaque", lambda: w.text(b"\x00\xff\x80physical", None)),
+        ("@ascii", lambda: w.text("ASCII sentinel", False))])])
+    return {"Data/CommonEvents.rvdata2": b"\x04\x08" + common,
+            "Data/System.rvdata2": b'\x04\x08[\x07"\x0bSYSTEMi\x16',
+            "Graphics/sentinel.bin": b"\x00\xffRESOURCE\x80\x00"}
+
+
+def fixture(phase, profile="ace-v1"):
+    need(profile in PROFILES, "fixture profile refused")
+    if profile == "ace-common-shrink":
+        return shrink_fixture(phase)
     name, description, lines, later, yes, no = TEXT[phase]
     w = Wire()
     # IDs: array=0, actor=1, name=2, description=3, opaque=4.
@@ -199,22 +231,24 @@ def owned(path):
     return path
 
 
-def create(root):
+def create(root, profile="ace-v1"):
+    expected = fixture("ja", profile)
     root = owned(root)
     need(not root.exists(), "existing fixture refused")
-    for name, data in fixture("ja").items():
+    for name, data in expected.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
 
-def check(root, phase):
+def check(root, phase, profile="ace-v1"):
+    expected_files = fixture(phase, profile)
     root = owned(root)
-    for name, expected in fixture(phase).items():
+    for name, expected in expected_files.items():
         path = owned(root / name)
         need(path.is_file() and path.stat().st_size <= 65536, "fixture file/size refused")
         actual = path.read_bytes()
-        if name in FILES[:2]:
+        if name not in FILES[2:]:
             need(decode(actual) == decode(expected), "artifact graph differs: " + name)
             need(actual == expected, "artifact wire differs: " + name)
         else:
@@ -224,16 +258,22 @@ def check(root, phase):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("fixture", help="Create a new owned Japanese fixture").add_argument("root")
-    check_parser = sub.add_parser("check", help="Read-only exact bounded graph and wire/resource proof")
+    fixture_parser = sub.add_parser("fixture", help="Create a new owned Japanese fixture",
+                                    usage="%(prog)s [-h] root")
+    fixture_parser.add_argument("root")
+    check_parser = sub.add_parser("check", help="Read-only exact bounded graph and wire/resource proof",
+                                  usage="%(prog)s [-h] --phase {ja,en,es} root")
+    for command in (fixture_parser, check_parser):
+        command.add_argument("--profile", choices=PROFILES, default="ace-v1",
+                             help="Fixed QA fixture layout (default: ace-v1); not wrapper admission")
     check_parser.add_argument("root")
     check_parser.add_argument("--phase", choices=TEXT, required=True, help="Fixed expected physical language")
     args = parser.parse_args(argv)
     try:
         if args.command == "fixture":
-            create(args.root)
+            create(args.root, args.profile)
         else:
-            check(args.root, args.phase)
+            check(args.root, args.phase, args.profile)
         print("RGSS " + args.command + " OK")
         return 0
     except (Refused, OSError) as error:
