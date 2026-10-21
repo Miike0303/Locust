@@ -92,9 +92,9 @@ No final characterization/browser case was skipped or failed. The required full 
 
 # D2: scoped Typography/parser compatibility results
 
-**Current bounded result:** D2 implementation and delegated local verification pass. The only dependency change is the root-manifest override `@tailwindcss/typography` → `postcss-selector-parser` **exactly 7.1.6**, replacing installed 6.0.10. Typography remains **0.5.20** and both Router packages remain **7.18.4**. Fresh full and production npm audits now exit **0**, with zero findings at every severity. The preceding D1 report is preserved as historical provenance, including its then-valid residual audit failure.
+**Delegated local checkpoint (superseded by the final delivery section below):** D2 implementation and delegated local verification pass. The only dependency change is the root-manifest override `@tailwindcss/typography` → `postcss-selector-parser` **exactly 7.1.6**, replacing installed 6.0.10. Typography remains **0.5.20** and both Router packages remain **7.18.4**. Fresh full and production npm audits now exit **0**, with zero findings at every severity. The preceding D1 report is preserved as historical provenance, including its then-valid residual audit failure.
 
-Baseline: **`6d3d3b99a466973fa992e28e231513db09eba20a`** on `deps/b2-parser-compatibility`. The parent supplied D1 delivery to main after Windows/Ubuntu CI **39664242232**; this worker did not re-query that remote proof. D2 does **not** close all of B2: independent Risk5 verification, parent full gates, exact-source two-platform CI and delivery remain parent-owned; D3 Rust scanning remains blocked on approved scanner availability. No Rust scan, commit or publication is claimed.
+Baseline: **`6d3d3b99a466973fa992e28e231513db09eba20a`** on `deps/b2-parser-compatibility`. The parent supplied D1 delivery to main after Windows/Ubuntu CI **39664242232**; this worker did not re-query that remote proof. D2 does **not** close all of B2: at this delegated checkpoint, independent Risk5 verification, parent full gates, exact-source two-platform CI and delivery remained parent-owned; those subsequently passed as recorded below. D3 Rust scanning remains blocked on approved scanner availability. No Rust scan, commit or publication is claimed.
 
 ## Review path and exact scope
 
@@ -206,3 +206,17 @@ Parent job-17 completed with exit 0: frontend **779 passed / 0 failed**, product
 - A major parser iteration change warrants public selector-output characterization; Typography's copied-array/separate-container mutation pattern remained compatible here. This evidence is bounded to the admitted plugin/config/compiler surface, not every possible third-party selector.
 - The scoped manifest override is effective even though npm leaves the lock root record unchanged. Verify the actual plugin resolution after `npm ci` and compare whole graph records; no transitive closure expansion was required.
 - Preserve audit failures and evidence-harness errors separately from product compatibility. A clean npm candidate and a completed local D2 unit do not close scanner provisioning, independent review, CI or delivery.
+
+
+## Final npm delivery and remaining B2 blocker
+
+| Unit | Tested source | Exact two-platform CI | Delivery proof |
+|---|---|---|---|
+| Router compatibility | `6d3d3b99a466973fa992e28e231513db09eba20a` | [39664242232](https://github.com/Miike0303/Locust/actions/runs/39664242232) | Parent job-16 non-force main promotion and exact remote/local readback |
+| Scoped Typography/parser | `d91446900fed104d2023b07ec7b47ed6859443c3` | [39671059728](https://github.com/Miike0303/Locust/actions/runs/39671059728) | Parent job-19 non-force main promotion and exact remote/local readback |
+
+Parent validated each CI head SHA, both Windows/Ubuntu jobs and all ten required gates before promotion. CI metadata and delivery receipts are retained under the corresponding `router/` and `parser/` evidence roots. Subsequent ledger/index/report closure is documentation-only after tested source `d914469`, not a new tested binary.
+
+**npm repair outcome: complete and delivered.** Fresh D2 full and production npm audits exit 0, all severities zero; there were no unresolved final compatibility or integrated-test failures. Historical baseline audit and harness failures remain documented above; 25 Rust tests were ignored, not executed.
+
+**Overall B2: partial / needs an owner decision.** Neither `cargo-audit` nor `cargo-deny` is installed. Approved scanner provisioning is needed before a Rust advisory scan or the remaining report-only Rust audit infrastructure can be completed. No tool was installed implicitly, no Rust advisory scan ran, and passing Rust tests do not substitute for that missing proof. Native Tauri, real games/providers and broader human/runtime certification remain outside this dependency outcome.
