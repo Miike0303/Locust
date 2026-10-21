@@ -87,3 +87,122 @@ All commands ran sequentially in the foreground through `py -3.13 .test-tmp/b2-d
 Self-review: S1 is limited to the authorized Router migration; S2 preserves the actual route/navigation contracts with SSR plus browser evidence; S3 preserves the unrelated dependency graph and reports, rather than hides, residual audit failures. `verification-summary.json` indexes command/exit evidence, source-scope checks, script hashes and review size.
 
 No final characterization/browser case was skipped or failed. The required full npm audit remains exit 1 for the pre-existing, explicitly deferred D2 finding; this is not a fully clean dependency-audit handoff. Parent owns independent review, full delivery gates, exact-SHA Windows/Ubuntu CI, ledger/index/memory updates and Git actions.
+
+---
+
+# D2: scoped Typography/parser compatibility results
+
+**Current bounded result:** D2 implementation and delegated local verification pass. The only dependency change is the root-manifest override `@tailwindcss/typography` → `postcss-selector-parser` **exactly 7.1.6**, replacing installed 6.0.10. Typography remains **0.5.20** and both Router packages remain **7.18.4**. Fresh full and production npm audits now exit **0**, with zero findings at every severity. The preceding D1 report is preserved as historical provenance, including its then-valid residual audit failure.
+
+Baseline: **`6d3d3b99a466973fa992e28e231513db09eba20a`** on `deps/b2-parser-compatibility`. The parent supplied D1 delivery to main after Windows/Ubuntu CI **39664242232**; this worker did not re-query that remote proof. D2 does **not** close all of B2: independent Risk5 verification, parent full gates, exact-source two-platform CI and delivery remain parent-owned; D3 Rust scanning remains blocked on approved scanner availability. No Rust scan, commit or publication is claimed.
+
+## Review path and exact scope
+
+1. `apps/desktop/package.json`: one ancestor-scoped override, plus the explicit `typographyCompatibility.test.ts` unit-test allowlist entry. No global parser override or direct dependency addition.
+2. `apps/desktop/package-lock.json`: **six changed lines**, only parser version/resolved URL/integrity. No additional transitive closure, package addition/removal, Typography downgrade or unrelated refresh.
+3. `apps/desktop/src/lib/typographyCompatibility.test.ts`: five public-plugin/Tailwind generation tests. No Git/history lookup, fixed baseline SHA, new dependency or permanent golden fixture.
+4. This appended D2 report and retained **`.test-tmp/b2-dependencies-evidence/parser/`** evidence only. The pre-existing parent-owned ledger modification was not edited. No application styles/components/router, Tailwind configuration, CI or Rust source changed.
+
+## Public generation and CSS proof (S1–S2)
+
+The new tests actually compile the installed public Typography plugin through Tailwind's public `compile` API, loading the installed `tailwindcss/theme.css` and public plugin/config modules. **67 candidates** cover default prose, all five explicit sizes (`sm`, `base`, `lg`, `xl`, `2xl`), all 22 color modifiers, invert/dark invert, 33 element variants, responsive size and both hover/element-variant orders. A public theme extension additionally exercises:
+
+- Common and different pseudo-element tails, multi-pseudo chains and unequal pseudo presence.
+- Pseudo-classes, nested `:is`, attribute values containing commas and escaped class names.
+- Leading child selectors, low-specificity `:where`, and `not-prose` exclusions.
+- Public custom `className` and legacy `target` options, generated separately in full.
+
+The installed parser changelog documents **7.0.0: “make insertions during iteration safe (major)”**, and 7.1.6's flat-selector CPU-exhaustion fix. Inspection of the retained Typography utility shows it iterates copied/reversed child arrays and a separate pseudo matrix, removes common tails, and prepends into a separate selector; it does not rely on inserting into the same container being walked. The tests protect observable generated output, not parser 6's iteration implementation. Unequal pseudo presence deliberately characterizes existing plugin output; it is not a new selector-correctness guarantee.
+
+**Actual complete CSS files were compared with `read_bytes()` equality**, not just hashes, normalized text, snapshots or assertions that a test exists. No output was filtered or normalized. Both phases use the exact same retained input CSS/config/candidates/theme/test source and unchanged plugin source.
+
+| Complete generated output | Bytes per phase | Baseline/candidate SHA-256 (also directly byte-compared) |
+|---|---:|---|
+| Modern plugin | 75,819 | `831f342fe878fa2dae6c9a6763eab1c7c12376d74483cb883ad0d565d48fbf2d` |
+| Custom-class plugin | 77,697 | `f93fb042a17470e05d4e4df08c0340f1a71a1fa22df1c585b415850b2cf875f9` |
+| Legacy plugin | 48,712 | `33921f109643dc1919c1abcb0427fc925515dc4b7d73febc447df78904cf4e17` |
+| Production `assets/index-C4B2ybWW.css` | 40,767 | `604b51392733b925762a5f58999db295355e97af41a51845a103886ca53ac59f` |
+
+All **26** production files, including JavaScript and HTML, are byte-identical as well. The retained D1 production CSS was additionally compared directly to the D2 baseline: identical, so adding the characterization test did not alter shipped CSS. The application stylesheet currently does not activate Typography with `@plugin`; therefore production CSS equality alone would be insufficient. The separate real plugin compilation is essential evidence, not an inferred production exercise of the plugin.
+
+## Sequential checks and audit/graph evidence (S3)
+
+| Check | Baseline parser 6.0.10 | Candidate parser 7.1.6, after clean `npm ci` |
+|---|---|---|
+| Focused public generation tests | **5 passed / 0 failed / 0 skipped**, exit 0 | **5 / 0 / 0**, exit 0 |
+| Full frontend unit suite | **779 / 0 / 0**, exit 0 | **779 / 0 / 0**, exit 0 |
+| TypeScript + production Vite build | Exit 0; 1,930 modules | Exit 0; 1,930 modules |
+| Full npm audit JSON | Exit **1**; **2 moderate** package nodes, only Typography/parser | Exit **0**; **0 info/low/moderate/high/critical** |
+| Production npm audit JSON | Exit **0**; all severities zero | Exit **0**; all severities zero |
+| Installed dependency tree | Typography 0.5.20 → parser 6.0.10 | Typography 0.5.20 → parser **7.1.6**, `overridden: true` |
+| Full lock graph | 221 records including root | **220 records unchanged**, parser record only changed; no additions/removals |
+
+The baseline full audit retains GHSA-rj75-hqrm-r3gf and npm's unacceptable suggested Typography downgrade to 0.5.4; neither the finding nor exit 1 was hidden. Candidate full and production audits were freshly requested separately after `npm ci`, not inferred from install output. Registry integrity matches the new lock record. `cssesc` **3.0.0** and `util-deprecate` **1.0.2** remain unchanged; no extra parser transitive migration was necessary.
+
+`graph-before-ci.json` compares the saved post-install/pre-ci snapshot with baseline; only `graph-after-ci.json` and the actual byte differential establish clean-install lock preservation. Every field in the other 220 records is identical, not merely package versions. Of D1's original 216 unrelated records, **215 remain exact** and the one now-authorized exception is parser; the D1 Router closure is unchanged too. npm does not duplicate the manifest's scoped override into the lock's root record. Candidate lock SHA-256 before/after `npm ci`: **`a7a034ab8e4d71c1f68b64db5a50ed48cd769961a9bc79d6b4051422b1b66fec`** (baseline `acc5012e7211e0deed6eb0880142bb606d9c2b879d62a8a7c24398ff3765843a`).
+
+### Exact commands, retained streams and exits
+
+Every command below ran sequentially in the foreground through `py -3.13 .test-tmp/b2-dependencies-evidence/parser/run.py <phase> <command...>`. Each phase has its own `*.command.json` (exact argv, cwd, actual exit, duration, timeout status), `*.stdout.log` and `*.stderr.log`. Evidence is retained in the parent checkout, never solely child-runtime TEMP. Tool versions: Node **24.17.0**, npm **11.13.0**, Python **3.13.12**; Tailwind and its PostCSS integration **4.2.1**, PostCSS **8.5.31**, Vite **6.4.4**.
+
+| Exact child command | Phases / observed exits |
+|---|---|
+| `node apps/desktop/node_modules/tsx/dist/cli.mjs --tsconfig apps/desktop/tsconfig.json --test apps/desktop/src/lib/typographyCompatibility.test.ts` | `baseline-characterization-corrected`, `candidate-characterization`: **0**, 5 tests each |
+| `node apps/desktop/node_modules/tsx/dist/cli.mjs --tsconfig apps/desktop/tsconfig.json .test-tmp/b2-dependencies-evidence/parser/generate.mts baseline` | `baseline-plugin-generation`: **0**, complete files and 5 tests |
+| `node apps/desktop/node_modules/tsx/dist/cli.mjs --tsconfig apps/desktop/tsconfig.json .test-tmp/b2-dependencies-evidence/parser/generate.mts candidate` | `candidate-plugin-generation`: **0**, complete files and 5 tests |
+| `npm --prefix apps/desktop run test:unit` | `baseline-unit`, `candidate-unit`: **0**, 779 tests each |
+| `npm --prefix apps/desktop run build` | `baseline-build`, `candidate-build`: **0** |
+| `npm --prefix apps/desktop audit --json` | `baseline-audit-full`: **1**; `candidate-audit-full`: **0** |
+| `npm --prefix apps/desktop audit --omit=dev --json` | `baseline-audit-prod`, `candidate-audit-prod`: **0** |
+| `npm --prefix apps/desktop view postcss-selector-parser@7.1.6 version engines dependencies dist.integrity --json` | `parser-registry`: **0** |
+| `npm --prefix apps/desktop install --ignore-scripts` | `parser-install`: **0**, one package changed after manifest-scoped override |
+| `npm --prefix apps/desktop ci` | `candidate-ci`: **0**, lock unchanged |
+| `npm --prefix apps/desktop ls @tailwindcss/typography postcss-selector-parser react-router-dom react-router cssesc util-deprecate --json` | `baseline-tree`, `candidate-tree`: **0** |
+| `py -3.13 .test-tmp/b2-dependencies-evidence/parser/snapshot.py baseline` | `baseline-snapshot`: **0** |
+| `py -3.13 .test-tmp/b2-dependencies-evidence/parser/snapshot.py candidate-before-ci` | `candidate-before-ci-snapshot`: **0** |
+| `py -3.13 .test-tmp/b2-dependencies-evidence/parser/snapshot.py candidate` | `candidate-snapshot`: **0** |
+| `py -3.13 .test-tmp/b2-dependencies-evidence/parser/graph.py before-ci` | `graph-before-ci`: **0** |
+| `py -3.13 .test-tmp/b2-dependencies-evidence/parser/graph.py after-ci` | `graph-after-ci`: **0** |
+| `py -3.13 .test-tmp/b2-dependencies-evidence/parser/differential.py` | `css-and-audit-differential`: **0**, direct bytes and audit assertions |
+| `node .test-tmp/b2-dependencies-evidence/parser/installed-v2.mjs` | `installed-resolution-corrected`: **0**, parser resolved from actual Typography entry point |
+| `npm --version` / `py -3.13 --version` | `npm-version`, `python-version`: **0** |
+| `git worktree prune --dry-run` | `{baseline,candidate}-{pre,post}-prune`: **0**, all four previews empty |
+| `powershell -NoProfile -File tools/cleanup-scratch.ps1 -Apply -MinAgeHours 876000 -Prefix locust-owned-b2-20261021-` | `{baseline,candidate}-{pre,post}-cleanup`: **0**, all four freed **0 GB**; retained proof/backups preserved; repo/shared targets 5.97/0.91 GB, below caps |
+
+`git diff --check` (`final-diff-check-corrected`) and `py -3.13 .test-tmp/b2-dependencies-evidence/parser/selfcheck.py` (`selfcheck`) provide final whitespace/scope/provenance/evidence-index checks; their observed exits are retained beside all other commands. `verification-summary.json` indexes complete file hashes, command records, direct byte comparisons and graph evidence. The selfcheck archives the original D1 report from local HEAD and verifies it remains a prefix of this report (allowing documentary checkout line endings only, never normalizing CSS).
+
+Existing mixed static/dynamic API import and >500 kB chunk warnings remain in both build stderr streams. They were not repaired or suppressed.
+
+### Test-first exception, failures and limits
+
+This dependency-only compatibility repair has no meaningful new product RED: baseline passing preservation tests are required, not fabricated failures. The honest security signal is **full audit exit 1 → exit 0**, with baseline two moderate nodes → zero. Public generation tests pass before and after the override; negative/alternate selectors, exclusion, custom options and full byte equality triangulate compatibility.
+
+All failed harness checks remain visible:
+
+- `baseline-characterization` exited **1** (3 pass/2 fail): initial expectations incorrectly assumed every palette defines body color and that parser serialization removes comma spaces. The actual public output established links as the common palette property and preserved spaces. `baseline-diagnostic` ran the same generator with `baseline-diagnostic`, retained complete original test/output files, and likewise exited **1**. Corrected expectations then passed **before any dependency edit**; these are not product RED.
+- `node .test-tmp/b2-dependencies-evidence/parser/installed.mjs` (`installed-resolution`) exited **1** because `@tailwindcss/postcss` does not export its `package.json` subpath. The retained `installed-v2.mjs` reads known installed manifest files and independently resolves the parser from Typography; corrected exit **0**. No dependency/source accommodation was made for this evidence-harness mistake.
+
+- Initial `git diff --check` (`final-diff-check`) exited **2** for one newly added blank line at the report's EOF. That whitespace-only issue was removed; the corrected check is separately retained. Git also emitted the existing checkout LF→CRLF warnings for this report and the parent-owned ledger; no ledger edit was made.
+
+No command timed out or was automatically retried. No final focused/full-suite case failed, skipped or was cancelled. No browser/Playwright run was needed for the parser-only change with unchanged complete production artifacts; no new D2 browser/native/runtime certification is implied. No Cargo command, scanner install/scan, real game, provider, native UI, external profile or secret was accessed. Parent independent Risk5 verification, full delivery gates and exact-source Windows/Ubuntu CI remain **pending**, not skipped successes. Rust scanner availability remains the **D3 blocker**; overall B2 is **not closed**.
+
+## Independent D2 verification
+
+Independent Risk5 verifier returned **PASS for S1–S3**. It reran the five public-plugin tests (exit 0), independently compared all three complete plugin CSS outputs and all 26 production files directly as bytes, recomputed both hash manifests, checked identical generation inputs/plugin sources and the baseline lock against Git `6d3d3b9`, and confirmed 220 unrelated whole lock records unchanged. Read-only Node resolution from Typography's actual entry point confirmed parser 7.1.6 and unchanged Typography/Router versions; raw audit counts/exits were checked independently. Exact stdin assertion payloads/output are retained in verifier task `mvik93g6-f-25nu`'s conversation, not claimed as separate scratch files. The verifier did not reinstall/build, rerun Rust, query CI or certify native/game/provider behavior. Parent integrated gates and exact-source CI/delivery remain separate.
+
+## Parent integrated gates
+
+Parent job-17 completed with exit 0: frontend **779 passed / 0 failed**, production build/typecheck, Rust format, strict locked workspace Clippy, and workspace Rust tests **2747 passed / 0 failed / 25 ignored** across 114 summaries. The raw log is retained as `parser/parent-integrated.log`. Conservative pre/post cleanup both exited 0 and removed 0 GB, preserving evidence. Exact-source hosted CI and delivery follow this local result; ignored tests were not run. No Rust advisory scanner ran.
+
+## D2 self-review by specification
+
+- **S1:** The authorized non-downgrading parser repair is isolated from the already-delivered D1 Router migration. Existing imports, routes, styles and configuration remain untouched; no broad/force repair or unrelated upgrade was used.
+- **S2:** Actual complete plugin generation and production files are byte-identical, backed by public output assertions and 779 passing frontend tests per phase. This preserves the tested compatibility surface without asserting native/game/browser behavior that was not rerun.
+- **S3:** Baseline and candidate full/production audit JSON, exits, graph fields, scoped installed resolution and lock-preserving `npm ci` are retained. npm is clean for this candidate; no Rust audit or complete-B2/delivery claim is substituted for missing evidence.
+
+## Key Learnings
+
+- Production CSS alone cannot exercise an installed but inactive Typography plugin. Compile the real public plugin with explicit candidates as well as checking the actual application build.
+- A major parser iteration change warrants public selector-output characterization; Typography's copied-array/separate-container mutation pattern remained compatible here. This evidence is bounded to the admitted plugin/config/compiler surface, not every possible third-party selector.
+- The scoped manifest override is effective even though npm leaves the lock root record unchanged. Verify the actual plugin resolution after `npm ci` and compare whole graph records; no transitive closure expansion was required.
+- Preserve audit failures and evidence-harness errors separately from product compatibility. A clean npm candidate and a completed local D2 unit do not close scanner provisioning, independent review, CI or delivery.
