@@ -233,6 +233,22 @@ locust patch-rollback "<clean_copy>"   # restores .locust/backup
 
 After a new Direct injection, `patch` can omit `--pristine`: it retrieves the exact recorded backup and verifies its original hashes, including after restart or switching between CLI and desktop profiles. Repeating an injection that writes nothing keeps the previous association. A missing or modified recorded backup stops packaging; supply an intact `--pristine` copy to recover. Older records without backup provenance retain the legacy fallback behavior. The backup belongs to that injection generation, which may start from an already translated working copy.
 
+### CLI-only TMX project catalogs
+
+Export a restricted bilingual catalog, review it, then preview before importing:
+
+```bash
+locust export project.locust.db -f tmx --source-lang en -l es -o project-es.tmx
+locust import project.locust.db -f tmx --source-lang en -l es -i project-es.tmx --dry-run
+locust import project.locust.db -f tmx --source-lang en -l es -i project-es.tmx --keep-existing
+```
+
+TMX requires explicit, distinct source/target language tags and exact project IDs
+and source text. It supports only the [Locust plaintext TMX profile](docs/TMX-CATALOGS.md),
+not arbitrary CAT-tool files, global translation-memory import or desktop TMX UI.
+Stale/empty targets are skipped; imported text is not automatically approved.
+The existing PO/XLIFF workflows are unchanged.
+
 ### Machine-readable injection reports
 
 ```bash

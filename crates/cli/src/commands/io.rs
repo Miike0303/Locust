@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -73,6 +74,7 @@ pub(crate) fn cmd_export(
     format: String,
     lang: String,
     output: PathBuf,
+    source_lang: Option<String>,
     overwrite: bool,
     status: Vec<String>,
     file: Option<String>,
@@ -126,12 +128,20 @@ pub(crate) fn cmd_export(
     // Prefer the source language of the latest translation run for this
     // target — config.default_source_lang is a user preference default, not
     // what was actually used for the strings in this project.
-    let source_lang = db.resolve_export_source_lang(&lang, &config.default_source_lang)?;
+    let source_lang = if format == "tmx" {
+        source_lang.ok_or_else(|| anyhow::anyhow!("--source-lang is required for TMX"))?
+    } else {
+        db.resolve_export_source_lang(&lang, &config.default_source_lang)?
+    };
 
     let content = match format.as_str() {
         "po" => export::export_po(&entries, &source_lang, &lang),
         "xliff" => export::export_xliff(&entries, &source_lang, &lang),
-        _ => anyhow::bail!("unsupported export format: {}. Use 'po' or 'xliff'", format),
+        "tmx" => export::export_tmx(&entries, &source_lang, &lang)?,
+        _ => anyhow::bail!(
+            "unsupported export format: {}. Use 'po', 'xliff' or 'tmx'",
+            format
+        ),
     };
 
     std::fs::write(&output, &content)?;
@@ -148,13 +158,28 @@ pub(crate) fn cmd_export(
 pub(crate) async fn cmd_import(
     project: PathBuf,
     format: String,
-    _lang: String,
+    lang: String,
     input: PathBuf,
+    source_lang: Option<String>,
     keep_existing: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let db = open_existing_project(&project)?;
-    let content = std::fs::read_to_string(&input)?;
+    let content = if format == "tmx" {
+        // Cap the read itself, not just metadata or an already allocated string.
+        const MAX_TMX_BYTES: u64 = 32 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&input)?
+            .take(MAX_TMX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_TMX_BYTES,
+            "TMX input exceeds 32 MiB"
+        );
+        String::from_utf8(bytes)?
+    } else {
+        std::fs::read_to_string(&input)?
+    };
 
     let (updates, pre_skipped) = match format.as_str() {
         "po" => {
@@ -165,7 +190,16 @@ pub(crate) async fn cmd_import(
             let units = export::import_xliff(&content)?;
             export::xliff_units_for_batch(&units)
         }
-        _ => anyhow::bail!("unsupported import format: {}. Use 'po' or 'xliff'", format),
+        "tmx" => {
+            let source_lang =
+                source_lang.ok_or_else(|| anyhow::anyhow!("--source-lang is required for TMX"))?;
+            let units = export::import_tmx(&content, &source_lang, &lang)?;
+            export::tmx_units_for_batch(&units)
+        }
+        _ => anyhow::bail!(
+            "unsupported import format: {}. Use 'po', 'xliff' or 'tmx'",
+            format
+        ),
     };
     let attempted = updates.len();
     let report = if dry_run {

@@ -1,9 +1,69 @@
 # TMX project catalogs: the Locust plaintext profile
 
-The core codec supports a **restricted bilingual TMX 1.4b Level-1 project catalog**,
-not general translation-memory interchange. It preserves exact project identities,
-source text and review provenance without writing a database or global memory.
-CLI integration belongs to T2; this document describes T1 only.
+The CLI and core codec support a **restricted bilingual TMX 1.4b Level-1 project
+catalog**, not general translation-memory interchange. Catalogs preserve exact
+project identities, source text and review provenance. CLI import writes only the
+selected project through the existing transactional importer, never global memory.
+There is no TMX desktop/HTTP UI or generic CAT/Level-2 support.
+
+## CLI quick path
+
+```sh
+locust export project.locust.db -f tmx --source-lang en -l es -o project-es.tmx
+# Review/edit targets without changing encoded IDs, exact sources or languages.
+locust import project.locust.db -f tmx --source-lang en -l es -i project-es.tmx --dry-run
+locust import project.locust.db -f tmx --source-lang en -l es -i project-es.tmx --keep-existing
+```
+
+`--source-lang` and `-l`/`--lang` are explicit source and target tags for TMX.
+Neither project history nor config supplies a missing TMX source language.
+For PO/XLIFF, `--source-lang` is accepted but **ignored**, as the help states:
+export still resolves its source language from project run history/config, and
+import retains its existing language behavior. Omit that flag for PO/XLIFF.
+
+| Operation | Behavior |
+|---|---|
+| Export selection | `--status` repeats form an ordered union; `--file` matches the exact stored path and intersects statuses. Empty selection fails without creating/replacing a catalog. |
+| Export destination | Existing files require `--overwrite`; project DB, its SQLite sidecars and aliases remain protected, even with overwrite. Serialization/language errors do not replace an existing catalog. |
+| Import validation | UTF-8 file reads are capped at 32 MiB + one detection byte before decoding. All languages, units and the document tail validate before any project write. Invalid UTF-8, ambiguous/malformed XML and exceeded limits fail the whole import. |
+| Import matching | Decoded ID **and exact current source** must match. Unknown IDs and outdated sources are skipped/counted, never created or source-matched by fallback. No source trimming or Unicode normalization. |
+| Preview | `--dry-run` shows replacements/confirmations and fill counts, with no saved row or counter changes. |
+| Preserve local work | `--keep-existing` keeps differing nonblank saved translations; it still fills blank rows and permits explicit confirmation of identical pending text. |
+| Status/provenance | New/replaced/confirmed text becomes `translated`, provider `import`, not `approved`. Identical non-pending rows count as imported/unchanged and preserve approval, timestamps and metadata. Reimport is idempotent. |
+
+Successful imports print `Imported N translations from …`; N includes identical
+non-pending rows. Additional `Unchanged`, `Kept` and `Skipped` lines explain the
+result. `Skipped` separates outdated sources, unknown IDs and empty/missing/fuzzy
+entries (the shared label includes TMX review-marked targets). Empty targets never
+erase saved text. A whitespace-only target is nonempty and remains exact; this is
+not a completeness or linguistic-quality gate. Preview uses `Would replace` and
+`Would fill` instead of `Imported`, followed by `Dry run: nothing was saved.`
+
+A `x-locust-needs-review=true` property always skips that TU, even when its target
+was edited. After reviewing against the current source, remove the **whole
+property** to submit the text for ordinary exact-source matching. See the review
+contract below before editing catalogs with an external tool.
+
+## CLI verification scope
+
+Local integrated checks passed: 2,747 Rust tests (25 ignored), 759 frontend tests,
+production build/typecheck, format and strict workspace Clippy. Python gates ran
+84 pipeline cases (one Windows-only FIFO skip), 13 replay, 14 RGSS and 12 updater
+cases successfully. These counts describe local verification, not hosted CI.
+
+The independent CLI suite passed 11 tests. Retained same-path baseline/candidate
+PO/XLIFF comparisons passed 28 ordinary cases with exact stdout, stderr and exit
+codes (and matching export bytes), without normalization. Four additional cases
+verify the documented acceptance/ignore behavior of the new `--source-lang` flag.
+The independent evidence lives locally under
+`.test-tmp/tmx-cli-independent-evidence/`; it is not shipped in Git.
+
+The writer reported a failing pre-implementation CLI test (missing flag), followed
+by GREEN. Its original runtime-owned raw logs were removed at task teardown;
+that historical RED remains writer-attributed, not independently reproduced or
+claimed retained. The independently recreated compatibility evidence above has
+its own count and provenance. Native gameplay, providers and arbitrary external
+CAT round-trips are not certified by these checks.
 
 ## Public API and safe application order
 

@@ -284,7 +284,7 @@ enum Commands {
         #[command(subcommand)]
         action: GlossaryCommands,
     },
-    /// Export translations to PO or XLIFF
+    /// Export translations to PO, XLIFF or restricted bilingual TMX
     Export {
         project: PathBuf,
         #[arg(short, long)]
@@ -293,6 +293,9 @@ enum Commands {
         lang: String,
         #[arg(short, long)]
         output: PathBuf,
+        /// Explicit source language (required for TMX; ignored for PO/XLIFF)
+        #[arg(long)]
+        source_lang: Option<String>,
         /// Replace an existing catalog (never the project database or its sidecars)
         #[arg(long)]
         overwrite: bool,
@@ -305,7 +308,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         file: Option<String>,
     },
-    /// Import translations from PO or XLIFF
+    /// Import translations from PO, XLIFF or restricted bilingual TMX
     Import {
         project: PathBuf,
         #[arg(short, long)]
@@ -314,6 +317,9 @@ enum Commands {
         lang: String,
         #[arg(short, long)]
         input: PathBuf,
+        /// Explicit source language (required for TMX; ignored for PO/XLIFF)
+        #[arg(long)]
+        source_lang: Option<String>,
         /// Preserve existing nonblank translations
         #[arg(long)]
         keep_existing: bool,
@@ -523,20 +529,41 @@ async fn main() -> anyhow::Result<()> {
             format,
             lang,
             output,
+            source_lang,
             overwrite,
             status,
             file,
         } => io::cmd_export(
-            &config, project, format, lang, output, overwrite, status, file,
+            &config,
+            project,
+            format,
+            lang,
+            output,
+            source_lang,
+            overwrite,
+            status,
+            file,
         )?,
         Commands::Import {
             project,
             format,
             lang,
             input,
+            source_lang,
             keep_existing,
             dry_run,
-        } => io::cmd_import(project, format, lang, input, keep_existing, dry_run).await?,
+        } => {
+            io::cmd_import(
+                project,
+                format,
+                lang,
+                input,
+                source_lang,
+                keep_existing,
+                dry_run,
+            )
+            .await?
+        }
         Commands::Server { port } => server::cmd_server(port.unwrap_or(7842)).await?,
     }
 
