@@ -18,6 +18,7 @@ registerHooks({
     const modules: Record<string, string> = {
       "/src/lib/api.ts": `export async function cancelTranslation(id){globalThis.__sessionHarness.cancellations.push(id);}
         export async function startTranslation(){throw new Error('unexpected translation start');}
+        export async function estimateTranslation(){throw new Error('estimate was not explicitly requested');}
         export async function getProviders(){return [];}
         export async function getConfig(){return {};}
         export async function checkProviderHealth(){return {ok:true};}`,

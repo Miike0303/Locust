@@ -1,4 +1,6 @@
 import { useTranslationSettings } from "../lib/useTranslationSettings";
+import { useTranslationEstimate } from "../lib/useTranslationEstimate";
+import TranslationEstimate from "./TranslationEstimate";
 import { localizeApiError } from "../lib/apiError";
 import { formatObservedCost } from "../lib/translationCost";
 import { useState, useEffect, useRef } from "react";
@@ -158,7 +160,18 @@ export default function TranslationModal({
 		[],
 	);
 
+	const buildParams = () => {
+		const base = buildTranslationStartParams({
+			providerId, fallbackIds, sourceLang, targetLang, batchSize,
+			maxConcurrent, costLimit, gameContext,
+		});
+		return { ...base, options: { ...base.options, use_glossary: useGlossary, use_memory: useMemory } };
+	};
+	const step = translationModalStep({ isTranslating, snapshot: jobSnapshot });
+	const estimate = useTranslationEstimate({ enabled: open && step === "configure", config, buildParams });
+
 	const handleStart = async () => {
+		if (estimate.pending) return;
 		// Persist last-used selection for next time
 		saveLastUsedTranslationPrefs({
 			provider: providerId,
@@ -179,24 +192,7 @@ export default function TranslationModal({
 			"translation",
 		);
 		try {
-			const base = buildTranslationStartParams({
-				providerId,
-				fallbackIds,
-				sourceLang,
-				targetLang,
-				batchSize,
-				maxConcurrent,
-				costLimit,
-				gameContext,
-			});
-			const params = {
-				...base,
-				options: {
-					...base.options,
-					use_glossary: useGlossary,
-					use_memory: useMemory,
-				},
-			};
+			const params = buildParams();
 			const projectName =
 				useProjectStore.getState().project?.name ?? "Project";
 			const providerLabel =
@@ -260,10 +256,6 @@ export default function TranslationModal({
 
 	if (!open) return null;
 
-	const step = translationModalStep({
-		isTranslating,
-		snapshot: jobSnapshot,
-	});
 	const done = jobSnapshot?.done ?? false;
 	const batchFailures = jobSnapshot?.batchFailures;
 	const completedWithErrors = done && (batchFailures?.count ?? 0) > 0;
@@ -542,9 +534,11 @@ export default function TranslationModal({
 								{startError}
 							</div>
 						)}
+						<TranslationEstimate estimate={estimate} />
 						<button
 							onClick={handleStart}
-							className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium transition-colors"
+							disabled={estimate.pending}
+							className="w-full py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
 						>
 							{t("translate.start")}
 						</button>

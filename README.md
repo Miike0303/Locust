@@ -115,6 +115,8 @@ Translation sends source text to the selected provider, including remote service
 
 A paid provider without a cost estimate is refused when a limit is set; unknown cost is not treated as zero. Without a limit, translation can proceed with incomplete cost reporting. To retain a limit, choose a provider with usable estimates (or a free provider). Removing the limit allows unknown-cost calls and gives up that guard.
 
+In the translation dialog and batch queue, **Estimate / Refresh estimate** explicitly requests a prospective estimate for the server’s **currently open project**, never the queue total. It never opens queued games or refreshes automatically. It uses the primary provider and the same start options (including the dialog’s glossary/memory switches), but the source-only calculation ignores TM, glossary, character notes, fallbacks and retries. Unknown cost is not zero; this is not observed spend or an exact prompt-fit guarantee. Model and token limits come from the backend, with decimal token strings preserved losslessly. Changing project, provider, options or configuration, hiding the form or starting activity invalidates the display. Start is paused only during the form’s current estimate request; an estimate failure does not prevent starting. Client identity guards discard obsolete responses but cannot attest which project the server has open, because this endpoint does not return project identity.
+
 #### Model policy configuration
 
 `config.json` accepts an optional top-level `model_overrides` map keyed by provider ID, then **exact effective model name** (case-sensitive, no aliases or default-model inference):

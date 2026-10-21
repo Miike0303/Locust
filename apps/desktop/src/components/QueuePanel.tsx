@@ -1,4 +1,6 @@
 import { useTranslationSettings } from "../lib/useTranslationSettings";
+import { useTranslationEstimate } from "../lib/useTranslationEstimate";
+import TranslationEstimate from "./TranslationEstimate";
 import { IS_TAURI } from "../lib/runtime";
 import { addToast } from "../stores/toastStore";
 import { localizeApiError } from "../lib/apiError";
@@ -214,6 +216,19 @@ export default function QueuePanel() {
 				: readTranslationFallbacks(),
 	});
 
+	const buildParams = (): TranslationStartParams =>
+		buildTranslationStartParams({
+			providerId,
+			fallbackIds,
+			sourceLang,
+			targetLang,
+			batchSize,
+			maxConcurrent,
+			costLimit,
+			gameContext,
+		});
+	const estimate = useTranslationEstimate({ enabled: isPanelOpen && items.length > 0, config, buildParams });
+
 	if (!isPanelOpen) return null;
 
 	const handleAddFile = async () => {
@@ -252,19 +267,8 @@ export default function QueuePanel() {
 		}
 	};
 
-	const buildParams = (): TranslationStartParams =>
-		buildTranslationStartParams({
-			providerId,
-			fallbackIds,
-			sourceLang,
-			targetLang,
-			batchSize,
-			maxConcurrent,
-			costLimit,
-			gameContext,
-		});
-
 	const handleStart = () => {
+		if (estimate.pending) return;
         let params: TranslationStartParams;
         try { params = buildParams(); }
         catch (error) {
@@ -555,6 +559,7 @@ export default function QueuePanel() {
 									</ul>
 								)}
 							</div>
+							<TranslationEstimate estimate={estimate} queue />
 						</div>
 					)}
 				</div>
@@ -607,7 +612,7 @@ export default function QueuePanel() {
 							<button
 								type="button"
 								onClick={handleStart}
-								disabled={pendingCount === 0}
+								disabled={pendingCount === 0 || estimate.pending}
 								className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-body font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-accent-fg focus:ring-offset-2 focus:ring-offset-surface"
 							>
 								<Play size={14} aria-hidden="true" />

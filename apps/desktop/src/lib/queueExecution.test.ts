@@ -15,9 +15,10 @@ const h = {
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (context.parentURL?.endsWith("/components/TranslationModal.tsx") ||
-        context.parentURL?.endsWith("/lib/useTranslationSettings.ts")) {
+        context.parentURL?.endsWith("/lib/useTranslationSettings.ts") ||
+        context.parentURL?.endsWith("/lib/useTranslationEstimate.ts")) {
       const stubs: Record<string, string> = {
-        react: `export const useState=x=>[typeof x==='function'?x():x,()=>{}]; export const useEffect=()=>{}; export const useRef=x=>({current:x});`,
+        react: `export const useState=x=>[typeof x==='function'?x():x,()=>{}]; export const useEffect=()=>{}; export const useRef=x=>({current:x}); export const useSyncExternalStore=(_,snapshot)=>snapshot();`,
         "@tanstack/react-query": `export const useQuery=()=>({});`,
         "react-router-dom": `export const useNavigate=()=>()=>{};`,
         "../lib/i18n": `export const useT=()=>globalThis.__queueExecution.t; export const useLocale=()=>({locale:'en'});`,
@@ -32,6 +33,7 @@ registerHooks({
     const modules: Record<string, string> = {
       "/src/lib/api.ts": `const h=globalThis.__queueExecution;
         export const getProviders=()=>[]; export const getConfig=()=>({}); export const checkProviderHealth=()=>({});
+        export const estimateTranslation=async()=>{throw new Error('estimate was not explicitly requested');};
         export async function preflightProjectOpen(){return {kind:'extract'};}
         export async function resumeProject(){throw new Error('plain fixture must not resume');}
         export async function openProject(path){h.calls.push('open');h.onOpen();return {project_path:path,project_name:'Fixture',format_id:'test',total_strings:3,supported_modes:[],database_path:'fixture.db',extraction_warnings:[]};}

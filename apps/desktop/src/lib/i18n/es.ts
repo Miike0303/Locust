@@ -2,6 +2,23 @@ import type { en } from "./en";
 
 /** Spanish UI catalog. Missing keys are a compile error. Neutral professional Spanish. */
 export const es: Record<keyof typeof en, string> = {
+  "estimate.title": "Estimación previa",
+  "estimate.request": "Estimar",
+  "estimate.refresh": "Actualizar estimación",
+  "estimate.noProject": "Abre un proyecto para estimar su texto de origen pendiente.",
+  "estimate.notRequested": "Sin solicitar. Selecciona Estimar para calcular una aproximación.",
+  "estimate.loading": "Estimando… Iniciar queda pausado temporalmente mientras termina esta solicitud.",
+  "estimate.unavailable": "Estimación no disponible. Revisa las opciones y reintenta; aún puedes iniciar la traducción.",
+  "estimate.unknownCost": "Coste estimado desconocido",
+  "estimate.unspecified": "Sin especificar",
+  "estimate.model": "Modelo real",
+  "estimate.window": "Ventana de contexto (tokens)",
+  "estimate.allowance": "Margen aproximado de entrada",
+  "estimate.cap": "Límite efectivo de tokens por lote",
+  "estimate.rows": "{count} filas elegibles · {bytes} bytes de origen · tamaño de lote {batch}",
+  "estimate.scope": "Usa solo el proyecto abierto actualmente en el servidor. Las comprobaciones del cliente no pueden verificar qué proyecto tiene abierto el servidor.",
+  "estimate.queueScope": "No es el total de la cola. Estimar nunca abre los juegos de la cola.",
+  "estimate.disclaimer": "Aproximación basada solo en el origen, no es gasto observado ni garantiza el ajuste exacto del prompt. Ignora memoria de traducción, glosario, notas de personajes, proveedores alternativos y reintentos. Actualiza explícitamente tras los cambios.",
   "nav.speakers": "Personajes",
   "speakers.title": "Espacio de personajes",
   "speakers.contextHint": "Las notas guardadas se aplican a la siguiente instantánea de traducción, no a un trabajo activo. Los proveedores pueden ignorar el contexto.",
