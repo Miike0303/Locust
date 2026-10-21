@@ -59,7 +59,7 @@ use routes::strings::{
     get_string_history, get_strings, list_translation_runs, patch_string,
 };
 pub use routes::translate::{cancel_translation_job, spawn_translation_job};
-use routes::translate::{translate_cancel, translate_start, translate_ws};
+use routes::translate::{translate_cancel, translate_estimate, translate_start, translate_ws};
 
 type ApiError = (StatusCode, String);
 
@@ -515,6 +515,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/stats/files", get(get_file_stats))
         .route("/api/runs", get(list_translation_runs))
         .route("/api/translate/start", post(translate_start))
+        .route("/api/translate/estimate", post(translate_estimate))
         .route("/api/translate/cancel/:job_id", post(translate_cancel))
         .route("/api/translate/ws/:job_id", get(translate_ws))
         .route("/api/inject", post(inject))

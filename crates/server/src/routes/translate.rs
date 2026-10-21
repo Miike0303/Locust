@@ -2,9 +2,9 @@ use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use locust_core::models::ProgressEvent;
+use locust_core::models::{ProgressEvent, StringStatus};
 use locust_core::translation::{
-    run_fallback_chain, unique_provider_chain, TranslationOptionsRequest,
+    load_pending_entries, run_fallback_chain, unique_provider_chain, TranslationOptionsRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -23,6 +23,82 @@ pub(crate) struct TranslateStartRequest {
     #[serde(default)]
     fallback_provider_ids: Option<Vec<String>>,
     options: TranslationOptionsRequest,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct TranslateEstimateRequest {
+    provider_id: String,
+    options: TranslationOptionsRequest,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TranslateEstimateResponse {
+    provider_id: String,
+    effective_model: Option<String>,
+    context_window: Option<String>,
+    approximate_input_allowance: Option<String>,
+    max_batch_tokens: Option<String>,
+    batch_size: usize,
+    entry_count: usize,
+    source_bytes: usize,
+    estimated_cost_usd: Option<f64>,
+    cost_known: bool,
+    approximate: bool,
+}
+
+/// Read-only, source-only prospective estimate; not a dispatch or spend receipt.
+pub(crate) async fn translate_estimate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TranslateEstimateRequest>,
+) -> Result<Json<TranslateEstimateResponse>, ApiError> {
+    let _exclusive = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    if state.current_project.read().await.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "no project open"));
+    }
+    let options = req.options.resolve(
+        &req.provider_id,
+        state.config.read().await.default_batch_size,
+    );
+    // Registry::get clones the Arc. Never retain its read lock across provider awaits.
+    let provider = state
+        .provider_registry
+        .read()
+        .await
+        .get(&req.provider_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "provider not found"))?;
+    let policy = provider.model_policy();
+    let allowance = policy.and_then(|p| p.approximate_input_allowance());
+    let max_batch_tokens = match allowance {
+        Some(n) => Some(options.max_batch_tokens.unwrap_or(n).min(n)),
+        None => options.max_batch_tokens,
+    };
+    let entries =
+        load_pending_entries(&state.db).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let eligible = entries.iter().filter(|entry| {
+        entry.is_translatable()
+            && !(options.skip_approved && entry.status == StringStatus::Approved)
+    });
+    let (entry_count, source_bytes) = eligible.fold((0, 0), |(count, bytes), entry| {
+        (count + 1, bytes + entry.source.len())
+    });
+    // Match the manager's existing len()-based estimator input (UTF-8 bytes).
+    let estimated_cost_usd = provider
+        .estimate_cost(source_bytes, &options.target_lang)
+        .await
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
+    Ok(Json(TranslateEstimateResponse {
+        provider_id: req.provider_id,
+        effective_model: provider.effective_model().map(str::to_owned),
+        context_window: policy.and_then(|p| p.context_window).map(|n| n.to_string()),
+        approximate_input_allowance: allowance.map(|n| n.to_string()),
+        max_batch_tokens: max_batch_tokens.map(|n| n.to_string()),
+        batch_size: options.batch_size,
+        entry_count,
+        source_bytes,
+        estimated_cost_usd,
+        cost_known: estimated_cost_usd.is_some(),
+        approximate: true,
+    }))
 }
 
 #[derive(Serialize)]
@@ -205,6 +281,385 @@ mod tests {
     use locust_core::models::StringEntry;
     use locust_core::translation::TranslationOptions;
     use std::path::PathBuf;
+
+    struct EstimateProvider {
+        model: Option<String>,
+        policy: Option<locust_core::model_policy::ModelPolicy>,
+        cost: Option<f64>,
+        calls: std::sync::Mutex<Vec<(usize, String)>>,
+        gate: Option<(tokio::sync::Notify, tokio::sync::Notify)>,
+    }
+
+    #[async_trait::async_trait]
+    impl locust_core::translation::TranslationProvider for EstimateProvider {
+        fn id(&self) -> &str {
+            "estimate-fixture"
+        }
+        fn name(&self) -> &str {
+            "Estimate fixture"
+        }
+        fn is_free(&self) -> bool {
+            false
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        fn effective_model(&self) -> Option<&str> {
+            self.model.as_deref()
+        }
+        fn model_policy(&self) -> Option<&locust_core::model_policy::ModelPolicy> {
+            self.policy.as_ref()
+        }
+        async fn translate(
+            &self,
+            _: &[locust_core::models::TranslationRequest],
+        ) -> locust_core::Result<Vec<locust_core::models::TranslationResult>> {
+            panic!("estimate must not translate")
+        }
+        async fn health_check(&self) -> locust_core::Result<()> {
+            panic!("estimate must not check health")
+        }
+        async fn estimate_cost(&self, bytes: usize, target: &str) -> Option<f64> {
+            self.calls.lock().unwrap().push((bytes, target.into()));
+            if let Some((entered, release)) = &self.gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+            self.cost
+        }
+    }
+
+    fn estimate_options() -> serde_json::Value {
+        serde_json::json!({"source_lang":"ja", "target_lang":"es", "use_glossary":true,
+            "use_memory":true, "skip_approved":true})
+    }
+
+    async fn estimate_post(url: &str, options: serde_json::Value) -> reqwest::Response {
+        client()
+            .post(format!("{url}/api/translate/estimate"))
+            .json(&serde_json::json!({"provider_id":"estimate-fixture", "options":options}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn estimate_snapshot(url: &str, state: &AppState) -> Vec<serde_json::Value> {
+        let mut values = Vec::new();
+        for path in [
+            "/api/project/current",
+            "/api/strings",
+            "/api/runs",
+            "/api/stats",
+        ] {
+            let response = client().get(format!("{url}{path}")).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            values.push(response.json().await.unwrap());
+        }
+        assert!(state.active_jobs.is_empty());
+        assert!(crate::active_translation_job(state).is_none());
+        values
+    }
+
+    #[tokio::test]
+    async fn estimate_http_policy_cost_and_lossless_caps() {
+        use locust_core::model_policy::{lookup_model_policy, ModelOverrides, ModelPolicy};
+        use locust_core::models::StringStatus;
+        let (url, _server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let mut entries: Vec<_> = ["日本語", "é", "  ", "approved", "translated", "error"]
+            .iter()
+            .enumerate()
+            .map(|(i, source)| StringEntry::new(i.to_string(), *source, "f.json".into()))
+            .collect();
+        entries[3].status = StringStatus::Approved;
+        entries[4].status = StringStatus::Translated;
+        entries[5].status = StringStatus::Error;
+        state.db.save_entries(&entries).unwrap();
+        state.config.write().await.default_batch_size = Some(17);
+        let before = estimate_snapshot(&url, &state).await;
+        // Each case exercises the actual HTTP boundary; costs are the provider's existing estimate.
+        let mut missing = Vec::new();
+        for (label, model, window, matched, cost, cap, expected_cap, batch) in [
+            (
+                "absent",
+                None,
+                None,
+                true,
+                Some(0.25),
+                None,
+                Some("6000"),
+                17,
+            ),
+            (
+                "unmatched",
+                Some("other"),
+                Some(800),
+                false,
+                Some(0.25),
+                None,
+                Some("6000"),
+                17,
+            ),
+            (
+                "context-only",
+                Some("model"),
+                Some(800),
+                true,
+                Some(0.25),
+                None,
+                Some("600"),
+                17,
+            ),
+            (
+                "priced",
+                Some("model"),
+                None,
+                true,
+                Some(1.5),
+                None,
+                Some("6000"),
+                17,
+            ),
+            (
+                "unknown",
+                Some("model"),
+                None,
+                true,
+                None,
+                None,
+                Some("6000"),
+                17,
+            ),
+            (
+                "zero",
+                Some("model"),
+                None,
+                true,
+                Some(0.0),
+                None,
+                Some("6000"),
+                17,
+            ),
+            (
+                "nan",
+                None,
+                None,
+                true,
+                Some(f64::NAN),
+                None,
+                Some("6000"),
+                17,
+            ),
+            (
+                "infinity",
+                None,
+                None,
+                true,
+                Some(f64::INFINITY),
+                None,
+                Some("6000"),
+                17,
+            ),
+            (
+                "negative",
+                None,
+                None,
+                true,
+                Some(-1.0),
+                None,
+                Some("6000"),
+                17,
+            ),
+            (
+                "null",
+                Some("model"),
+                None,
+                true,
+                Some(0.25),
+                Some(serde_json::Value::Null),
+                None,
+                17,
+            ),
+            (
+                "null-model",
+                Some("model"),
+                Some(800),
+                true,
+                Some(0.25),
+                Some(serde_json::Value::Null),
+                Some("600"),
+                17,
+            ),
+            (
+                "clamp",
+                Some("model"),
+                Some(800),
+                true,
+                Some(0.25),
+                Some(300.into()),
+                Some("300"),
+                7,
+            ),
+            (
+                "no-room",
+                Some("model"),
+                Some(1),
+                true,
+                Some(0.25),
+                None,
+                Some("0"),
+                17,
+            ),
+            (
+                "u64-max",
+                Some("model"),
+                Some(u64::MAX),
+                true,
+                Some(0.25),
+                Some(serde_json::Value::Null),
+                Some("13835058055282163712"),
+                17,
+            ),
+        ] {
+            let policy = ModelPolicy {
+                context_window: window,
+                input_usd_per_million: (label == "priced").then_some(2.0),
+                output_usd_per_million: (label == "priced").then_some(6.0),
+            };
+            let overrides = ModelOverrides::from([(
+                "estimate-fixture".into(),
+                std::collections::HashMap::from([("model".into(), policy)]),
+            )]);
+            let provider = Arc::new(EstimateProvider {
+                model: model.map(str::to_owned),
+                policy: lookup_model_policy(
+                    &overrides,
+                    "estimate-fixture",
+                    if matched { "model" } else { "other" },
+                )
+                .cloned(),
+                cost,
+                calls: Default::default(),
+                gate: None,
+            });
+            let mut registry = locust_core::translation::ProviderRegistry::new();
+            registry.register(provider.clone());
+            *state.provider_registry.write().await = registry;
+            let mut options = estimate_options();
+            if let Some(cap) = cap {
+                options["max_batch_tokens"] = cap;
+            }
+            if batch == 7 {
+                options["batch_size"] = 7.into();
+            }
+            let response = estimate_post(&url, options).await;
+            if response.status() != StatusCode::OK {
+                missing.push(format!("{label}: expected 200, got {}", response.status()));
+                continue;
+            }
+            let body: serde_json::Value = response.json().await.unwrap();
+            let known = cost.filter(|c| c.is_finite() && *c >= 0.0);
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "provider_id":"estimate-fixture", "effective_model":model,
+                    "context_window": provider.policy.as_ref().and_then(|p| p.context_window).map(|n| n.to_string()),
+                    "approximate_input_allowance": provider.policy.as_ref().and_then(ModelPolicy::approximate_input_allowance).map(|n| n.to_string()),
+                    "max_batch_tokens":expected_cap, "batch_size":batch, "entry_count":2,
+                    "source_bytes":11, "estimated_cost_usd":known, "cost_known":known.is_some(), "approximate":true
+                }),
+                "{label}"
+            );
+            assert_eq!(
+                *provider.calls.lock().unwrap(),
+                [(11, "es".into())],
+                "{label}"
+            );
+            assert_eq!(estimate_snapshot(&url, &state).await, before, "{label}");
+            assert!(
+                try_project_operation(&state).is_ok(),
+                "reservation released: {label}"
+            );
+        }
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn estimate_http_errors_do_not_mutate() {
+        let (url, _server, state) = setup_with_state().await;
+        state
+            .db
+            .save_entries(&[StringEntry::new("stale", "Untouched", "f.json".into())])
+            .unwrap();
+        let absent = estimate_post(&url, estimate_options()).await.status();
+        mark_project_open(&state).await;
+        let before = estimate_snapshot(&url, &state).await;
+        assert_eq!(before[1]["entries"][0]["source"], "Untouched");
+        let unknown = estimate_post(&url, estimate_options()).await.status();
+        let guard = try_project_operation(&state).unwrap();
+        let busy = estimate_post(&url, estimate_options()).await.status();
+        drop(guard);
+        assert_eq!(estimate_snapshot(&url, &state).await, before);
+        assert_eq!(
+            (absent, unknown, busy),
+            (
+                StatusCode::BAD_REQUEST,
+                StatusCode::NOT_FOUND,
+                StatusCode::CONFLICT
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_http_temporary_reservation_and_empty_project() {
+        let (url, _server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let before = estimate_snapshot(&url, &state).await;
+        let provider = Arc::new(EstimateProvider {
+            model: None,
+            policy: None,
+            cost: None,
+            calls: Default::default(),
+            gate: Some(Default::default()),
+        });
+        state
+            .provider_registry
+            .write()
+            .await
+            .register(provider.clone());
+        let request_url = url.clone();
+        let request =
+            tokio::spawn(async move { estimate_post(&request_url, estimate_options()).await });
+        let (entered, release) = provider.gate.as_ref().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        // The async estimator holds only the project reservation, never the registry lock.
+        let registry = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.provider_registry.write(),
+        )
+        .await
+        .unwrap();
+        drop(registry);
+        let blocked = client()
+            .post(format!("{url}/api/translate/start"))
+            .json(&serde_json::json!({"provider_id":"mock", "options":estimate_options()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::CONFLICT);
+        assert_eq!(estimate_snapshot(&url, &state).await, before);
+        release.notify_one();
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["entry_count"], 0);
+        assert_eq!(body["source_bytes"], 0);
+        assert_eq!(*provider.calls.lock().unwrap(), [(0, "es".into())]);
+        assert_eq!(estimate_snapshot(&url, &state).await, before);
+        assert!(try_project_operation(&state).is_ok());
+    }
 
     #[tokio::test]
     async fn translation_start_without_project_keeps_stale_rows_untouched() {

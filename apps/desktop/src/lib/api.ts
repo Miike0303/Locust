@@ -234,6 +234,22 @@ export interface TranslationStartParams {
   };
 }
 
+/** Source-only approximation, not observed spend or a prompt-fit guarantee. */
+export interface TranslationEstimate {
+  provider_id: string;
+  effective_model: string | null;
+  /** Lossless decimal integers; do not coerce to JavaScript Number. */
+  context_window: string | null;
+  approximate_input_allowance: string | null;
+  max_batch_tokens: string | null;
+  batch_size: number;
+  entry_count: number;
+  source_bytes: number;
+  estimated_cost_usd: number | null;
+  cost_known: boolean;
+  approximate: true;
+}
+
 export interface InjectParams {
   project_path: string;
   format_id: string;
@@ -615,6 +631,12 @@ export const getValidationSummary = (signal?: AbortSignal): Promise<ValidationSu
 
 export const setValidationIssueIgnored = (id: number, ignored: boolean): Promise<void> =>
   request(`/validation/issues/${id}`, { method: "PATCH", body: JSON.stringify({ ignored }) });
+
+/** Embedded HTTP in desktop too; no translation IPC or background job. */
+export const estimateTranslation = (
+  params: Pick<TranslationStartParams, "provider_id" | "options">,
+): Promise<TranslationEstimate> =>
+  request("/translate/estimate", { method: "POST", body: JSON.stringify(params) });
 
 export const startTranslation = (params: TranslationStartParams): Promise<{ job_id: string }> =>
   IS_TAURI
