@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::Path;
 
+mod tmx;
+pub use tmx::{export_tmx, import_tmx, tmx_units_for_batch, TmxUnit};
+
 // Normalize physical file line endings before decoding XML references or PO escapes.
 // XML 1.0 §2.11 requires this for the entire document, including CDATA.
 fn normalize_line_endings(content: &str) -> Cow<'_, str> {
