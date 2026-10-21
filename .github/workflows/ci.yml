@@ -175,3 +175,61 @@ jobs:
 
       - name: Rust tests
         run: cargo test --locked --workspace
+
+  # Informational only: no needs relationship to the required platform gates.
+  dependency-audit:
+    continue-on-error: true
+    permissions:
+      contents: read
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Test report collection
+        run: python -m unittest discover -s tools -p test_dependency_audit_report.py
+      - name: Install pinned lockfile scanner
+        continue-on-error: true
+        run: |
+          mkdir -p audit-report/setup
+          set +e
+          cargo install cargo-audit --version 0.22.2 --locked --no-default-features --root .test-tmp/b2-audit-scanner > audit-report/setup/scanner.stdout.txt 2> audit-report/setup/scanner.stderr.txt
+          code=$?
+          echo "$code" > audit-report/setup/scanner.exit.txt
+          exit "$code"
+      - name: Rust advisory report
+        continue-on-error: true
+        run: python tools/dependency_audit_report.py --kind rust --output audit-report/rust -- .test-tmp/b2-audit-scanner/bin/cargo-audit audit --json --file Cargo.lock --db .test-tmp/b2-audit-db
+      - name: npm production advisory report
+        continue-on-error: true
+        run: python tools/dependency_audit_report.py --kind npm --output audit-report/npm -- npm --prefix apps/desktop audit --omit=dev --json
+      - name: Summarize actual audit outcomes
+        if: always()
+        shell: python
+        run: |
+          import json, os
+          from pathlib import Path
+          lines = ["## Informational dependency audit", "", "Not a required build gate. Read artifacts for raw output and exact exits.", ""]
+          for kind in ("rust", "npm"):
+              path = Path("audit-report") / kind / "result.json"
+              result = json.loads(path.read_text()) if path.exists() else {"status": "unavailable", "exit_code": None}
+              lines.append(f"- **{kind}**: {result['status']}; auditor exit={result['exit_code']}; vulnerabilities={result.get('vulnerability_count')}; warnings={result.get('warning_count')}")
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+      - name: Preserve reports including operational failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-report
+          path: audit-report/
+          if-no-files-found: error
+          retention-days: 14

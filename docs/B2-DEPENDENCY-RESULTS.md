@@ -220,3 +220,44 @@ Parent validated each CI head SHA, both Windows/Ubuntu jobs and all ten required
 **npm repair outcome: complete and delivered.** Fresh D2 full and production npm audits exit 0, all severities zero; there were no unresolved final compatibility or integrated-test failures. Historical baseline audit and harness failures remain documented above; 25 Rust tests were ignored, not executed.
 
 **Overall B2: partial / needs an owner decision.** Neither `cargo-audit` nor `cargo-deny` is installed. Approved scanner provisioning is needed before a Rust advisory scan or the remaining report-only Rust audit infrastructure can be completed. No tool was installed implicitly, no Rust advisory scan ran, and passing Rust tests do not substitute for that missing proof. Native Tauri, real games/providers and broader human/runtime certification remain outside this dependency outcome.
+
+
+## D3: explicitly approved Rust audit continuation
+
+User **"hazlo"** authorized scanner provisioning after the prior blocker. Pinned/locked `cargo-audit` **0.22.2**, with default binary-scanning features disabled, was installed in `.test-tmp/b2-dependencies-evidence/rust/scanner` using the existing checkout target. No global installation, product dependency change or lockfile rewrite occurred. Version/help and conservative pre/post cleanup passed; log: `rust/install.log`.
+
+The actual lockfile scan completed: auditor **exit 1**, **47 vulnerability records / 44 distinct advisory IDs**, plus **17 warnings** (11 unmaintained, 5 unsound, 1 yanked). Wrapper exit 0 means a successfully collected findings report, **not a clean audit**. Database commit `4b587f00996ebe5c05a73eaef105ef241e876414`: 1,348 advisories, updated `2026-10-21T08:20:38+02:00`. Raw streams/argv/exits and index: `rust/scan-2/`, `rust/findings-index.json`. Production npm returned child exit 0 / zero findings (`rust/npm-production-1/`).
+
+The full lockfile includes optional/platform-specific dependencies; this is **not** proof every record ships or is exploitable. Feature/reachability triage and Rust upgrades remain separate follow-up work. No advisory was ignored or automatically fixed.
+
+| Locked package/version | Records | Advisory IDs |
+|---|---:|---|
+| `crossbeam-epoch 0.9.18` | 1 | RUSTSEC-2026-0204 |
+| `h2 0.4.13` | 1 | RUSTSEC-2026-0258 |
+| `quick-xml 0.36.2` | 2 | RUSTSEC-2026-0194, RUSTSEC-2026-0195 |
+| `quinn-proto 0.11.16` | 5 | RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341, RUSTSEC-2026-0342 |
+| `rustls 0.23.37` | 4 | RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0348, RUSTSEC-2026-0349 |
+| `rustls-webpki 0.103.9` | 5 | RUSTSEC-2026-0049, RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104, RUSTSEC-2026-0382 |
+| `wasmtime 25.0.3` | 21 | RUSTSEC-2025-0046, RUSTSEC-2025-0118, RUSTSEC-2026-0020, RUSTSEC-2026-0021, RUSTSEC-2026-0085, RUSTSEC-2026-0086, RUSTSEC-2026-0087, RUSTSEC-2026-0088, RUSTSEC-2026-0089, RUSTSEC-2026-0091, RUSTSEC-2026-0092, RUSTSEC-2026-0093, RUSTSEC-2026-0094, RUSTSEC-2026-0095, RUSTSEC-2026-0096, RUSTSEC-2026-0222, RUSTSEC-2026-0269, RUSTSEC-2026-0316, RUSTSEC-2026-0363, RUSTSEC-2026-0379, RUSTSEC-2026-0380 |
+| `webpki-root-certs 1.0.7` | 1 | RUSTSEC-2026-0383 |
+| `webpki-roots 1.0.9` | 1 | RUSTSEC-2026-0381 |
+| `zip 2.4.2` | 3 | RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 |
+| `zip 4.6.1` | 3 | RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 |
+
+### Collector and informational CI
+
+`python tools/dependency_audit_report.py --help` describes `--kind rust|npm`, `--output <new-directory>` and the auditor argv after `--`. Linux examples after installing the pinned scanner:
+
+```bash
+python tools/dependency_audit_report.py --kind rust --output .test-tmp/dependency-audit/rust -- .test-tmp/b2-audit-scanner/bin/cargo-audit audit --json --file Cargo.lock --db .test-tmp/b2-audit-db
+python tools/dependency_audit_report.py --kind npm --output .test-tmp/dependency-audit/npm -- npm --prefix apps/desktop audit --omit=dev --json
+python -m unittest discover -s tools -p test_dependency_audit_report.py
+```
+
+Windows: use the scanner's resolved native absolute path (PowerShell `Resolve-Path`); invoke npm through `cmd.exe /d /c npm ...`. The collector adds no implicit shell or fix flags; use read-only audit commands as shown. Unmodified child streams go to `stdout.json` and `stderr.txt`; UTF-8 `result.json` and stdout carry command, actual `exit_code`, status, counts and operational error. Status: `clean`, `findings`, `warnings`, `error`. Wrapper exit 0 means collection succeeded (including findings/warnings); exit 2 means invalid/unavailable/failed collection. Malformed JSON, operational failure and the fixed 300-second timeout are never called clean. Existing output directories are rejected, never overwritten.
+
+The separate `dependency-audit` **job in the existing CI workflow** is informational (`continue-on-error`, no `needs` relationship), with read-only repository permission. The existing Windows/Ubuntu gates and tag/manual triggers are unchanged. The exact scanner is installed; Rust/npm production outcomes and raw setup exits are summarized and uploaded even after operational failures (14-day artifact retention). This makes the report job manually verifiable on the exact candidate before main delivery; no new default-branch workflow registration is needed.
+
+Public subprocess tests: RED exit 1 while collector absent, then GREEN **9 tests** covering clean/findings/warnings, exact child streams/exits, malformed/tool/unavailable failures, overwrite rejection, unchanged fixture lockfiles and existing gate/trigger policy. Tests use no network/scanner. First real scan launch failed before child creation (`WinError 2`, relative executable path); `rust/scan-1/` retains error/null exit. Resolving the installed executable to a native absolute path produced the completed scan. A report-append helper initially failed on Windows default text decoding before writing; explicit UTF-8 corrected it. No timeout/automatic timeout retry occurred.
+
+Initial independent Risk5 review confirmed scope, CI prefix, unchanged locks and actual scan, but found a collector defect: explicit falsey malformed Rust `warnings` values were coerced to an empty object and called clean (4/17 adversarial cases failed). Parent reproduced this through a new public regression test (five values including null): RED exit 1, then defaulted only the absent field instead of all falsey values. GREEN now has **10 passing tests**; raw `rust/warnings-{red,green}.*` records are retained. The initial nine-test pass was insufficient and is not hidden. The bounded independent correction check passed: **10 public tests and the same 17 adversarial cases**, all exit 0; all four formerly failing cases now report error/2. Evidence is retained in `rust/independent/verify-20261021-r3-correction/`; earlier failed runs were preserved. Exact-source hosted CI (both required platform jobs and informational report job) and delivery remain pending. The actual 300-second timeout path has not been exercised; its handler was inspected only.
