@@ -1,4 +1,5 @@
 """Focused wire tests; never read Git history or run a build/provider."""
+import argparse
 import contextlib
 import io
 from pathlib import Path
@@ -183,9 +184,16 @@ class WireTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 2)
             self.assertEqual(out.getvalue(), "")
             usage = "[-h] root" if command[0] == "fixture" else "[-h] --phase {ja,en,es} root"
-            self.assertEqual(err.getvalue(), f"usage: qa_rgss_oracle.py {command[0]} {usage}\n"
-                f"qa_rgss_oracle.py {command[0]}: error: argument --profile: invalid choice: 'bad' "
-                "(choose from 'ace-v1', 'ace-common-shrink')\n")
+            # argparse changed choice quoting between supported Python versions.
+            # Compare exact streams against an independent, fixed-choice parser.
+            reference = argparse.ArgumentParser(prog=f"qa_rgss_oracle.py {command[0]}",
+                                                usage=f"%(prog)s {usage}")
+            reference.add_argument("--profile", choices=["ace-v1", "ace-common-shrink"])
+            expected_error = io.StringIO()
+            with contextlib.redirect_stderr(expected_error), self.assertRaises(SystemExit) as expected_exit:
+                reference.parse_args(["--profile", "bad"])
+            self.assertEqual(expected_exit.exception.code, 2)
+            self.assertEqual(err.getvalue(), expected_error.getvalue())
             self.assertEqual(list(parent.iterdir()), [])
         # The test never falls back to a copy when symlinks are unavailable.
         linked = parent / "link"
