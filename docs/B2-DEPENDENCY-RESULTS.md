@@ -263,3 +263,30 @@ The separate `dependency-audit` **job in the existing CI workflow** is informati
 Public subprocess tests: RED exit 1 while collector absent, then GREEN **9 tests** covering clean/findings/warnings, exact child streams/exits, malformed/tool/unavailable failures, overwrite rejection, unchanged fixture lockfiles and existing gate/trigger policy. Tests use no network/scanner. First real scan launch failed before child creation (`WinError 2`, relative executable path); `rust/scan-1/` retains error/null exit. Resolving the installed executable to a native absolute path produced the completed scan. A report-append helper initially failed on Windows default text decoding before writing; explicit UTF-8 corrected it. No timeout/automatic timeout retry occurred.
 
 Initial independent Risk5 review confirmed scope, CI prefix, unchanged locks and actual scan, but found a collector defect: explicit falsey malformed Rust `warnings` values were coerced to an empty object and called clean (4/17 adversarial cases failed). Parent reproduced this through a new public regression test (five values including null): RED exit 1, then defaulted only the absent field instead of all falsey values. GREEN now has **10 passing tests**; raw `rust/warnings-{red,green}.*` records are retained. The initial nine-test pass was insufficient and is not hidden. The bounded independent correction check passed: **10 public tests and the same 17 adversarial cases**, all exit 0; all four formerly failing cases now report error/2. Evidence is retained in `rust/independent/verify-20261021-r3-correction/`; earlier failed runs were preserved. Exact-source hosted CI (both required platform jobs and informational report job) and delivery subsequently passed as recorded above; these were pending at the correction checkpoint. The actual 300-second timeout path has not been exercised; its handler was inspected only.
+
+## D6: compatible transport/TLS remediation continuation
+
+User **"subelo a main, continua con los pendientes para cerrar la sesion"** authorized this bounded continuation after main was reconfirmed at `48bd628`. The selected unit changes only six transport/TLS lock records, not manifests, features, application code or the Rust toolchain. Larger XML/ZIP/Wasmtime migrations and independent Crossbeam remediation are not mixed into this unit.
+
+| Package | Baseline | Candidate | Declared target MSRV | Target vulnerability records removed |
+|---|---|---|---|---:|
+| h2 | 0.4.13 | 0.4.16 | 1.63 | 1 |
+| quinn-proto | 0.11.16 | 0.11.18 | 1.85 | 5 |
+| rustls | 0.23.37 | 0.23.46 | 1.71 | 4 |
+| rustls-webpki | 0.103.9 | 0.103.16 | 1.71 | 5 |
+| webpki-root-certs | 1.0.7 | 1.0.10 | 1.71 | 1 |
+| webpki-roots | 1.0.9 | 1.0.10 | 1.71 | 1 |
+
+Precise Cargo updates initially also rebound 14 unrelated existing records' `windows-sys`/`socket2` edges. That draft was **rejected**, not silently accepted. The minimal candidate retains all **776 unrelated whole package records** from baseline and copies only the six complete target records produced by Cargo. All six registry checksums match and none of the targets is yanked. `cargo metadata --locked --offline --no-deps --format-version 1` exits 0; actual full locked-build compatibility and lock immutability are checked separately, not inferred from this metadata probe.
+
+Retained public-interface security differential: **47 → 30 vulnerability records**, **17 targeted → 0**, **27 distinct IDs remain**, with all other advisory/package/version tuples and **17 warnings unchanged**. Both audits use the same database with `--no-fetch`. Its Git HEAD is independently `4b587f00996ebe5c05a73eaef105ef241e876414`; cargo-audit's no-fetch JSON omits commit/update metadata (null), so that provenance is supplied by the Git probe, not invented JSON fields. The Rust auditor still exits **1** for the remaining findings; wrapper exit0 means successful collection. This is observed targeted security RED→GREEN, not a fabricated product-test RED.
+
+Remaining package families: `crossbeam-epoch`, `quick-xml`, `wasmtime`, `zip`. Full-lock optional/platform reachability caveats still apply: reqwest's HTTP/2 and Rustls paths are enabled in project manifests, while default HTTP/3/Quinn reachability and the wasm32-specific root-certificate parent are not generalized into shipped exploit claims.
+
+Evidence root: `.test-tmp/b2-dependencies-evidence/transport/`. `candidate-Cargo.lock` and `graph-diff.json` retain the rejected raw solver draft; **`minimal-Cargo.lock`** is the candidate actually under verification. `minimal-graph-validation.json` records checksums/MSRVs/776 unchanged records; `baseline-audit/`, `candidate-audit/` and `audit-differential.json` retain raw streams, exact child exits and comparisons. Each precise update has its own command/stdout/stderr record. `run.py candidate` only collects the candidate audit; do not rerun the baseline phase over retained evidence.
+
+Parent job31 passed with exit0: production build/typecheck, frontend779/0, fmt, strict locked workspace Clippy, Rust2747/0/25ignored across114 summaries, reporter10tests/OK and exact lock byte-immutability through all gates. Pre/post conservative cleanup exited0 and removed0GB; raw `parent-integrated.log` is retained. The25ignored tests were not run.
+
+Independent S5 verification **passed**: six whole Cargo-generated target records,776 unchanged records (parsed fields and complete normalized record text), candidate byte identity/checksums/MSRVs, full raw audit/settings/warnings equality outside targeted findings, clean same-DB Git HEAD, and an independent locked offline metadata exit0 with no lock mutation. Evidence: `transport/independent/verify-s5-r3/verification.json` plus metadata streams. Independent probe-only Windows encoding/cache-shard errors were corrected and disclosed in its conversation; no product defect or source fix was indicated. It did not independently rebuild or rescan.
+
+Exact-source hosted CI and main delivery of D6 remain **pending**. The previous audit/report unit remains delivered; no new hosted result is inferred from earlier CI.
