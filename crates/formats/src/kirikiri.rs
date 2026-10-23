@@ -41,7 +41,7 @@ use locust_core::models::{OutputMode, StringEntry};
 use tracing::warn;
 
 use crate::kirikiri_xp3::{self, Xp3Archive, Xp3Entry};
-use crate::util::parse_err;
+use crate::util::{inflate_zlib_bounded, parse_err, MAX_ENTRY_DECODED};
 
 // One increment per archive-entry name inspected by a lookup. `None` means this
 // thread is not measuring (production tests stay quiet under --test-threads>1).
@@ -299,11 +299,8 @@ fn decode_ks_bytes(bytes: &[u8], label: &str) -> Result<DecodedKs> {
                     .checked_add(size)
                     .filter(|end| *end <= bytes.len())
                     .ok_or_else(|| parse_err(label, "mode-2 truncated zlib stream"))?;
-                plain = miniz_oxide::inflate::decompress_to_vec_zlib(&bytes[21..end])
-                    .map_err(|e| parse_err(label, format!("mode-2 zlib inflate: {e:?}")))?;
-                if expected != 0 && plain.len() as u64 != expected {
-                    return Err(parse_err(label, "mode-2 inflated size mismatch"));
-                }
+                plain = inflate_zlib_bounded(&bytes[21..end], Some(expected), MAX_ENTRY_DECODED)
+                    .map_err(|e| parse_err(label, format!("mode-2 zlib inflate: {e}")))?;
                 tail.extend_from_slice(&bytes[end..]);
             }
             _ => return Err(parse_err(label, "unsupported FE FE cipher mode")),

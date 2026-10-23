@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
+pub use crate::util::adler32;
+use crate::util::{inflate_zlib_bounded, read_bounded, MAX_ENTRY_DECODED};
+
 /// Magic `YPF\0` as LE u32 `0x00465059`.
 pub const YPF_MAGIC: &[u8; 4] = b"YPF\0";
 const HEADER_SIZE: usize = 0x20;
@@ -67,18 +70,6 @@ fn err(file: &str, message: impl Into<String>) -> YpfError {
 }
 
 // ─── Checksums ─────────────────────────────────────────────────────────────
-
-/// RFC 1950 Adler-32 (GARbro uses this for entry payload checksums).
-pub fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65521;
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
-    for &byte in data {
-        a = (a + u32::from(byte)) % MOD;
-        b = (b + a) % MOD;
-    }
-    (b << 16) | a
-}
 
 /// IEEE CRC-32 (GARbro uses this for the plaintext name hash).
 pub fn crc32(data: &[u8]) -> u32 {
@@ -371,6 +362,9 @@ impl YpfArchive {
     /// Read entry payload; inflate zlib when packed. Adler mismatch → warn only.
     pub fn read_entry(&self, entry: &YpfEntry) -> Result<Vec<u8>, YpfError> {
         let label = self.path.display().to_string();
+        if u64::from(entry.unpacked_size) > MAX_ENTRY_DECODED {
+            return Err(err(&label, "entry exceeds decoded limit"));
+        }
         let start = entry.offset as usize;
         let end = start
             .checked_add(entry.packed_size as usize)
@@ -378,15 +372,19 @@ impl YpfArchive {
             .ok_or_else(|| err(&label, format!("payload OOB for {}", entry.name)))?;
         let slice = &self.data[start..end];
         let plain = if entry.is_packed {
-            miniz_oxide::inflate::decompress_to_vec_zlib(slice).map_err(|e| {
-                err(
-                    &label,
-                    format!("zlib inflate failed for {}: {e:?}", entry.name),
-                )
-            })?
+            inflate_zlib_bounded(
+                slice,
+                Some(u64::from(entry.unpacked_size)),
+                MAX_ENTRY_DECODED,
+            )
         } else {
-            slice.to_vec()
-        };
+            read_bounded(
+                slice,
+                Some(u64::from(entry.unpacked_size)),
+                MAX_ENTRY_DECODED,
+            )
+        }
+        .map_err(|e| err(&label, format!("decode {}: {e}", entry.name)))?;
         if entry.checksum != 0 {
             let got = adler32(&plain);
             // GARbro checksums the written stream (compressed when packed). Try both.

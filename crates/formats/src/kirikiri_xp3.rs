@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
+pub use crate::util::adler32;
+use crate::util::{inflate_zlib_bounded, read_bounded, MAX_ENTRY_DECODED};
+
 /// XP3 magic: `XP3\r\n \n\x1a\x8b\x67\x01`
 pub const XP3_MAGIC: &[u8; 11] = &[
     0x58, 0x50, 0x33, 0x0D, 0x0A, 0x20, 0x0A, 0x1A, 0x8B, 0x67, 0x01,
@@ -90,20 +93,6 @@ fn err(file: &str, message: impl Into<String>) -> Xp3Error {
         file: file.into(),
         message: message.into(),
     }
-}
-
-// ─── Adler-32 (zlib) ───────────────────────────────────────────────────────
-
-/// RFC 1950 Adler-32 (initial a=1, b=0).
-pub fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65521;
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
-    for &byte in data {
-        a = (a + u32::from(byte)) % MOD;
-        b = (b + a) % MOD;
-    }
-    (b << 16) | a
 }
 
 // ─── LE helpers ────────────────────────────────────────────────────────────
@@ -193,7 +182,11 @@ pub fn decode_index_blob(data: &[u8], index_offset: u64, label: &str) -> Result<
     match flag {
         0 => {
             // raw: u64 size + bytes
-            let size = read_u64(data, off + 1)? as usize;
+            let size = read_u64(data, off + 1)?;
+            if size > MAX_ENTRY_DECODED {
+                return Err(err(label, "raw index exceeds decoded limit"));
+            }
+            let size = usize::try_from(size).map_err(|_| err(label, "index size overflow"))?;
             let start = off + 1 + 8;
             let end = start
                 .checked_add(size)
@@ -204,15 +197,15 @@ pub fn decode_index_blob(data: &[u8], index_offset: u64, label: &str) -> Result<
         1 => {
             // zlib: u64 compressed + u64 uncompressed + stream
             let comp_size = read_u64(data, off + 1)? as usize;
-            let uncomp_size = read_u64(data, off + 1 + 8)? as usize;
+            let uncomp_size = read_u64(data, off + 1 + 8)?;
             let start = off + 1 + 16;
             if start.checked_add(comp_size).is_none_or(|e| e > data.len()) {
                 return Err(err(label, "zlib index size exceeds file"));
             }
             let compressed = &data[start..start + comp_size];
-            let plain = miniz_oxide::inflate::decompress_to_vec_zlib(compressed)
-                .map_err(|e| err(label, format!("failed to inflate zlib index: {e:?}")))?;
-            if uncomp_size != 0 && plain.len() != uncomp_size {
+            let plain = inflate_zlib_bounded(compressed, None, MAX_ENTRY_DECODED)
+                .map_err(|e| err(label, format!("failed to inflate zlib index: {e}")))?;
+            if uncomp_size != 0 && plain.len() as u64 != uncomp_size {
                 warn!(
                     file = label,
                     expected = uncomp_size,
@@ -360,9 +353,15 @@ impl Xp3Archive {
     /// Read and concatenate all segments for an entry. Adler mismatch → warn only.
     pub fn read_entry(&self, entry: &Xp3Entry) -> Result<Vec<u8>, Xp3Error> {
         let label = self.path.display().to_string();
-        // Cap pre-allocation at archive size: orig_size is untrusted input.
-        let cap = (entry.orig_size as usize).min(self.data.len());
-        let mut out = Vec::with_capacity(cap);
+        if entry.orig_size > MAX_ENTRY_DECODED
+            || entry
+                .segments
+                .iter()
+                .any(|seg| seg.orig_size > MAX_ENTRY_DECODED)
+        {
+            return Err(err(&label, "entry exceeds decoded limit"));
+        }
+        let mut out = Vec::new();
         for seg in &entry.segments {
             let start = seg.offset as usize;
             let packed = seg.packed_size as usize;
@@ -376,17 +375,32 @@ impl Xp3Archive {
                 ));
             }
             let slice = &self.data[start..start + packed];
-            if seg.is_zlib() {
-                let plain = miniz_oxide::inflate::decompress_to_vec_zlib(slice).map_err(|e| {
-                    err(
-                        &label,
-                        format!("zlib segment inflate failed for {}: {e:?}", entry.name),
-                    )
-                })?;
-                out.extend_from_slice(&plain);
+            let remaining = MAX_ENTRY_DECODED - out.len() as u64;
+            let plain = if seg.is_zlib() {
+                inflate_zlib_bounded(slice, None, remaining)
             } else {
-                out.extend_from_slice(slice);
+                read_bounded(slice, None, remaining)
             }
+            .map_err(|e| err(&label, format!("decode segment for {}: {e}", entry.name)))?;
+            if plain.len() as u64 != seg.orig_size {
+                warn!(
+                    archive = %self.path.display(),
+                    entry = %entry.name,
+                    expected = seg.orig_size,
+                    got = plain.len(),
+                    "XP3 segment uncompressed size mismatch; using decoded length"
+                );
+            }
+            out.extend_from_slice(&plain);
+        }
+        if out.len() as u64 != entry.orig_size {
+            warn!(
+                archive = %self.path.display(),
+                entry = %entry.name,
+                expected = entry.orig_size,
+                got = out.len(),
+                "XP3 entry uncompressed size mismatch; using decoded length"
+            );
         }
         if entry.adler32 != 0 {
             let got = adler32(&out);

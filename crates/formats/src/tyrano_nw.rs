@@ -16,12 +16,14 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::util::{read_bounded, DecodeBudget, MAX_ARCHIVE_DECODED, MAX_ENTRY_DECODED};
+
 use zip::read::ZipArchive;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 /// Default ceiling for sum of declared uncompressed sizes in one NW container.
-pub const MAX_NW_UNCOMPRESSED: u64 = 1024 * 1024 * 1024; // 1 GiB
+pub const MAX_NW_UNCOMPRESSED: u64 = MAX_ARCHIVE_DECODED;
 
 /// How far back from EOF we search for the EOCD signature (comment ≤ 64 KiB + record).
 const EOCD_SEARCH_MAX: usize = 64 * 1024 + 22 + 256;
@@ -98,7 +100,7 @@ impl NwArchive {
         let zip_slice = &data[zip_start..];
         check_declared_budget(zip_slice, &label)?;
 
-        let cursor = Cursor::new(zip_slice.to_vec());
+        let cursor = Cursor::new(zip_slice);
         let mut archive =
             ZipArchive::new(cursor).map_err(|e| err(&label, format!("ZIP open failed: {e}")))?;
 
@@ -140,7 +142,7 @@ impl NwArchive {
 
     pub fn read_entry(&self, entry: &NwEntry) -> Result<Vec<u8>, NwError> {
         let label = self.path.display().to_string();
-        let cursor = Cursor::new(self.zip_bytes().to_vec());
+        let cursor = Cursor::new(self.zip_bytes());
         let mut archive =
             ZipArchive::new(cursor).map_err(|e| err(&label, format!("ZIP reopen failed: {e}")))?;
         // Two-step name resolution: NLL can't hold both by_name borrows at once.
@@ -149,16 +151,12 @@ impl NwArchive {
         } else {
             entry.path.replace('/', "\\")
         };
-        let mut file = archive
+        let file = archive
             .by_name(&name)
             .map_err(|e| err(&label, format!("missing entry {}: {e}", entry.path)))?;
-        let mut buf = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut buf)
-            .map_err(|e| err(&label, format!("read {}: {e}", entry.path)))?;
-        if (buf.len() as u64) > MAX_NW_UNCOMPRESSED {
-            return Err(err(&label, "entry expanded past zip-bomb ceiling"));
-        }
-        Ok(buf)
+        let expected = file.size();
+        read_bounded(file, Some(expected), MAX_ENTRY_DECODED)
+            .map_err(|e| err(&label, format!("read {}: {e}", entry.path)))
     }
 
     pub fn scenario_ks_entries(&self) -> impl Iterator<Item = &NwEntry> {
@@ -303,21 +301,17 @@ fn check_declared_budget(zip_slice: &[u8], label: &str) -> Result<(), NwError> {
         Ok(a) => a,
         Err(e) => return Err(err(label, format!("ZIP open failed: {e}"))),
     };
-    let mut total = 0u64;
+    let mut budget = DecodeBudget::new(MAX_NW_UNCOMPRESSED);
     for i in 0..archive.len() {
         let f = archive
             .by_index(i)
             .map_err(|e| err(label, format!("ZIP entry {i}: {e}")))?;
-        total = total.saturating_add(f.size());
-        if total > MAX_NW_UNCOMPRESSED {
-            return Err(err(
-                label,
-                format!(
-                    "declared uncompressed total exceeds {} bytes (zip-bomb guard)",
-                    MAX_NW_UNCOMPRESSED
-                ),
-            ));
+        if f.size() > MAX_ENTRY_DECODED {
+            return Err(err(label, "entry exceeds decoded limit"));
         }
+        budget
+            .consume(f.size())
+            .map_err(|e| err(label, e.to_string()))?;
     }
     Ok(())
 }

@@ -7,6 +7,8 @@ use locust_core::error::{LocustError, Result};
 use locust_core::extraction::{Extraction, FormatPlugin, InjectionReport};
 use locust_core::models::{OutputMode, StringEntry};
 
+use crate::util::{decode_lzstring_base64_bounded, parse_err, MAX_ENTRY_DECODED};
+
 const ARRAY_FILES: &[&str] = &[
     "Actors", "Classes", "Skills", "Items", "Weapons", "Armors", "Enemies", "States", "Troops",
 ];
@@ -316,13 +318,8 @@ impl RpgMakerMvPlugin {
             return Ok(raw.to_string());
         }
         let trimmed = raw.trim();
-        let units =
-            lz_str::decompress_from_base64(trimmed).ok_or_else(|| LocustError::ParseError {
-                file: file_path.display().to_string(),
-                message: "failed to decompress .jsono (LZString base64 / POR_DatabaseEncoder)"
-                    .to_string(),
-            })?;
-        Ok(String::from_utf16_lossy(&units))
+        decode_lzstring_base64_bounded(trimmed, MAX_ENTRY_DECODED)
+            .map_err(|e| parse_err(&file_path.display().to_string(), e.to_string()))
     }
 
     /// True when the game's data files are wrapped by a protection plugin:
