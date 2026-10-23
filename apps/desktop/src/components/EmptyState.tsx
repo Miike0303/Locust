@@ -1,9 +1,12 @@
+import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 const ACTION = "rounded bg-accent px-4 py-2 text-body font-medium text-white hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-2 focus-visible:ring-offset-surface";
 
 interface EmptyStateProps {
 	title: string;
+	icon?: ReactNode;
+	action?: ReactNode;
 	description?: string;
 	actionLabel?: string;
 	actionTo?: string;
@@ -12,6 +15,8 @@ interface EmptyStateProps {
 
 export default function EmptyState({
 	title,
+	icon,
+	action,
 	description,
 	actionLabel,
 	actionTo,
@@ -19,9 +24,10 @@ export default function EmptyState({
 }: EmptyStateProps) {
 	return (
 		<div className="flex h-full flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+			{icon}
 			<p className="text-section font-medium text-text">{title}</p>
 			{description && <p className="text-body text-text-muted">{description}</p>}
-			{actionLabel && actionTo ? (
+			{action ?? (actionLabel && actionTo ? (
 				<Link to={actionTo} className={ACTION}>{actionLabel}</Link>
 			) : actionLabel && onAction && (
 				<button
@@ -31,7 +37,7 @@ export default function EmptyState({
 				>
 					{actionLabel}
 				</button>
-			)}
+			))}
 		</div>
 	);
 }

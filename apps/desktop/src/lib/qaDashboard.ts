@@ -2,6 +2,13 @@ import type { ValidationSummary } from "./api";
 
 export const QA_PAGE_SIZE = 50;
 
+export const qaLastRunKey = (projectKey: string) => ["validation-last-run", projectKey] as const;
+
+/** Issue rows prove prior validation, but an empty summary carries no run metadata. */
+export function qaHasBeenChecked(summary: ValidationSummary, lastCheckedAt: number | null): boolean {
+  return lastCheckedAt !== null || Object.values(summary).some(counts => counts.open + counts.ignored > 0);
+}
+
 export function buildQaSummary(summary: ValidationSummary, selectedKind?: string) {
   // Keep an active filter reachable even after its final issue disappears.
   const kinds = [...new Set([...Object.keys(summary), ...(selectedKind ? [selectedKind] : [])])].sort();

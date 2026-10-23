@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildQaSummary, qaPagination, qaRelativePath } from "./qaDashboard.ts";
+import { buildQaSummary, qaHasBeenChecked, qaLastRunKey, qaPagination, qaRelativePath } from "./qaDashboard.ts";
 
 test("QA chips count only open issues and preserve an empty selected kind", () => {
   const summary = { StaleTranslation: { open: 2, ignored: 3 }, EmptyTranslation: { open: 0, ignored: 4 } };
@@ -30,4 +30,18 @@ test("QA pagination recovers after ignore and validation shrink the result set",
   assert.deepEqual(qaPagination(50, 50), { offset: 0, from: 1, to: 50, page: 1, pages: 1 });
   assert.deepEqual(qaPagination(100, 0), { offset: 0, from: 0, to: 0, page: 1, pages: 1 });
   assert.equal(qaPagination(50, 151).offset, 50);
+});
+
+
+test("QA validation evidence requires a completed run or persisted open/ignored rows", () => {
+  assert.equal(qaHasBeenChecked({}, null), false);
+  assert.equal(qaHasBeenChecked({ EmptyTranslation: { open: 0, ignored: 0 } }, null), false);
+  assert.equal(qaHasBeenChecked({}, 1792771200000), true);
+  assert.equal(qaHasBeenChecked({ MissingPlaceholder: { open: 1, ignored: 0 } }, null), true);
+  assert.equal(qaHasBeenChecked({ MissingPlaceholder: { open: 0, ignored: 1 } }, null), true);
+});
+
+test("QA completed-run keys isolate project databases", () => {
+  assert.deepEqual(qaLastRunKey("project-a"), ["validation-last-run", "project-a"]);
+  assert.notDeepEqual(qaLastRunKey("project-a"), qaLastRunKey("project-b"));
 });

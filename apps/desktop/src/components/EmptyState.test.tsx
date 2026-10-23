@@ -27,3 +27,11 @@ test("no action is rendered without an actionable label", () => {
   const html = renderToStaticMarkup(<EmptyState title="Empty" actionLabel="Unavailable" />);
   assert.doesNotMatch(html, /<(a|button)\b/);
 });
+
+
+test("optional icon and action slot stay inside the centered empty state", () => {
+  const html = renderToStaticMarkup(<EmptyState title="Not checked yet" description="Check the project." icon={<svg aria-hidden="true" />} action={<button type="button" disabled className="bg-accent text-accent-fg">Run validation</button>} />);
+  assert.match(html, /justify-center/);
+  assert.match(html, /<svg[^>]*><\/svg><p[^>]*>Not checked yet<\/p>/);
+  assert.match(html, /<p[^>]*>Check the project\.<\/p><button[^>]*disabled=""[^>]*class="bg-accent text-accent-fg"[^>]*>Run validation<\/button><\/div>$/);
+});
