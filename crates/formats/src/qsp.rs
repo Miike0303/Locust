@@ -25,6 +25,7 @@
 //! quoted player-visible literals are extracted heuristically).
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use locust_core::error::{LocustError, Result};
@@ -34,6 +35,8 @@ use locust_core::models::{OutputMode, StringEntry};
 /// Per-character code shift used by QSP string fields (engine `QSP_CODREMOV`).
 const QSP_CODREMOV: u16 = 5;
 const QSP_GAMEID: &str = "QSPGAME";
+/// Bound model allocations even when the input contains enough empty records.
+const MAX_QSP_COUNT: usize = 100_000;
 
 pub struct QspPlugin;
 
@@ -101,9 +104,16 @@ fn encode_unit(ch: u16) -> u16 {
     }
 }
 
-fn decode_field(units: &[u16]) -> String {
+fn parse_error(file: &str, message: impl Into<String>) -> LocustError {
+    LocustError::ParseError {
+        file: file.into(),
+        message: message.into(),
+    }
+}
+
+fn decode_field(units: &[u16]) -> Result<String> {
     let decoded: Vec<u16> = units.iter().copied().map(decode_unit).collect();
-    String::from_utf16_lossy(&decoded)
+    String::from_utf16(&decoded).map_err(|_| parse_error("qsp", "invalid UTF-16 in encoded field"))
 }
 
 fn encode_field(s: &str) -> Vec<u16> {
@@ -142,36 +152,47 @@ fn read_u16le_units(bytes: &[u8]) -> Result<Vec<u16>> {
 }
 
 fn write_u16le_units(units: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(units.len() * 2);
+    let mut out = Vec::new();
     for u in units {
         out.extend_from_slice(&u.to_le_bytes());
     }
     out
 }
 
-/// Split UTF-16 units on CRLF (0x000D 0x000A).
-fn split_records(units: &[u16]) -> Vec<Vec<u16>> {
-    let mut records = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i < units.len() {
-        if units[i] == 0x000D && i + 1 < units.len() && units[i + 1] == 0x000A {
-            records.push(units[start..i].to_vec());
-            i += 2;
-            start = i;
-        } else {
-            i += 1;
+/// Record payload ranges exclude CRLF and retain an unterminated final record.
+/// A terminal CRLF is a terminator, not an additional empty record.
+fn record_ranges(units: &[u16]) -> Result<Vec<Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (i, pair) in units.windows(2).enumerate() {
+        if pair == [13, 10] {
+            ranges.push(start..i);
+            // The window proves both units exist within this allocated slice.
+            start = i
+                .checked_add(pair.len())
+                .ok_or_else(|| parse_error("qsp", "record offset overflow"))?;
         }
     }
     if start < units.len() {
-        records.push(units[start..].to_vec());
-    } else if start == units.len() && !units.is_empty() {
-        // File ended with CRLF → trailing empty record (harmless).
+        ranges.push(start..units.len());
+    }
+    Ok(ranges)
+}
+
+#[cfg(test)]
+fn split_records(units: &[u16]) -> Vec<Vec<u16>> {
+    let mut records: Vec<_> = record_ranges(units)
+        .unwrap()
+        .into_iter()
+        .map(|range| units[range].to_vec())
+        .collect();
+    if units.ends_with(&[13, 10]) {
         records.push(Vec::new());
     }
     records
 }
 
+#[cfg(test)]
 fn join_records(records: &[Vec<u16>]) -> Vec<u16> {
     let mut out = Vec::new();
     for rec in records {
@@ -206,87 +227,76 @@ struct QspGame {
     locations: Vec<QspLocation>,
 }
 
-fn parse_game(bytes: &[u8], file_label: &str) -> Result<QspGame> {
-    let units = read_u16le_units(bytes)?;
-    let records = split_records(&units);
-    if records.is_empty() {
-        return Err(LocustError::ParseError {
-            file: file_label.into(),
-            message: "empty QSP file".into(),
-        });
+fn next_field<'a>(
+    records: &mut impl Iterator<Item = &'a [u16]>,
+    encoded: bool,
+    file: &str,
+) -> Result<String> {
+    let units = records
+        .next()
+        .ok_or_else(|| parse_error(file, "truncated QSP record block"))?;
+    if encoded {
+        decode_field(units).map_err(|_| parse_error(file, "invalid UTF-16 in encoded field"))
+    } else {
+        String::from_utf16(units).map_err(|_| parse_error(file, "invalid UTF-16 in plain field"))
     }
+}
 
-    // Header game id is plain (not CODREMOV-shifted) — matches engine compare.
-    let header = String::from_utf16_lossy(&records[0]);
-    if header != QSP_GAMEID {
-        return Err(LocustError::ParseError {
-            file: file_label.into(),
-            message: format!(
-                "legacy pre-QSPGAME or unknown header {header:?}; only modern UTF-16LE QSPGAME is supported"
+fn next_count<'a>(
+    records: &mut impl ExactSizeIterator<Item = &'a [u16]>,
+    records_per_item: usize,
+    kind: &str,
+    file: &str,
+) -> Result<usize> {
+    let text = next_field(records, true, file)?;
+    let count: usize = text
+        .parse()
+        .map_err(|_| parse_error(file, format!("invalid {kind} count: {text:?}")))?;
+    if count > MAX_QSP_COUNT {
+        return Err(parse_error(
+            file,
+            format!("{kind} count {count} exceeds limit {MAX_QSP_COUNT}"),
+        ));
+    }
+    // Division avoids count multiplication overflow and precedes allocation.
+    if count > records.len() / records_per_item {
+        return Err(parse_error(
+            file,
+            format!(
+                "{kind} count {count} exceeds remaining records ({})",
+                records.len()
             ),
-        });
+        ));
     }
-    if records.len() < 4 {
-        return Err(LocustError::ParseError {
-            file: file_label.into(),
-            message: "truncated QSPGAME header".into(),
-        });
+    Ok(count)
+}
+
+fn parse_game(bytes: &[u8], file_label: &str) -> Result<QspGame> {
+    let units = read_u16le_units(bytes).map_err(|e| parse_error(file_label, e.to_string()))?;
+    let ranges = record_ranges(&units)?;
+    let mut records = ranges.iter().map(|range| &units[range.clone()]);
+    let header = next_field(&mut records, false, file_label)?;
+    if header != QSP_GAMEID {
+        return Err(parse_error(file_label, format!(
+            "legacy pre-QSPGAME or unknown header {header:?}; only modern UTF-16LE QSPGAME is supported"
+        )));
     }
-
-    let version = String::from_utf16_lossy(&records[1]);
-    let password = decode_field(&records[2]);
-    let loc_count: usize =
-        decode_field(&records[3])
-            .parse()
-            .map_err(|_| LocustError::ParseError {
-                file: file_label.into(),
-                message: format!(
-                    "invalid location count field: {:?}",
-                    decode_field(&records[3])
-                ),
-            })?;
-
-    let mut idx = 4;
+    let version = next_field(&mut records, false, file_label)?;
+    let password = next_field(&mut records, true, file_label)?;
+    let loc_count = next_count(&mut records, 4, "location", file_label)?;
     let mut locations = Vec::with_capacity(loc_count);
     for _ in 0..loc_count {
-        if idx + 3 > records.len() {
-            return Err(LocustError::ParseError {
-                file: file_label.into(),
-                message: "truncated location block".into(),
-            });
-        }
-        let name = decode_field(&records[idx]);
-        let description = decode_field(&records[idx + 1]);
-        let code = decode_field(&records[idx + 2]);
-        idx += 3;
-        if idx >= records.len() {
-            return Err(LocustError::ParseError {
-                file: file_label.into(),
-                message: "missing actsCount".into(),
-            });
-        }
-        let acts_count: usize =
-            decode_field(&records[idx])
-                .parse()
-                .map_err(|_| LocustError::ParseError {
-                    file: file_label.into(),
-                    message: "invalid actsCount".into(),
-                })?;
-        idx += 1;
+        let name = next_field(&mut records, true, file_label)?;
+        let description = next_field(&mut records, true, file_label)?;
+        let code = next_field(&mut records, true, file_label)?;
+        let acts_count = next_count(&mut records, 3, "action", file_label)?;
         let mut actions = Vec::with_capacity(acts_count);
         for _ in 0..acts_count {
-            if idx + 3 > records.len() {
-                return Err(LocustError::ParseError {
-                    file: file_label.into(),
-                    message: "truncated action block".into(),
-                });
-            }
             actions.push(QspAction {
-                image: decode_field(&records[idx]),
-                name: decode_field(&records[idx + 1]),
-                code: decode_field(&records[idx + 2]),
+                image: next_field(&mut records, true, file_label)?,
+                name: next_field(&mut records, true, file_label)?,
+                code: next_field(&mut records, true, file_label)?,
             });
-            idx += 3;
         }
         locations.push(QspLocation {
             name,
@@ -295,7 +305,6 @@ fn parse_game(bytes: &[u8], file_label: &str) -> Result<QspGame> {
             actions,
         });
     }
-
     Ok(QspGame {
         version,
         password,
@@ -303,6 +312,65 @@ fn parse_game(bytes: &[u8], file_label: &str) -> Result<QspGame> {
     })
 }
 
+/// Borrow record values in file order; None marks structural records.
+fn game_record_fields(game: &QspGame) -> Vec<Option<&str>> {
+    let mut fields = vec![
+        None,
+        Some(game.version.as_str()),
+        Some(game.password.as_str()),
+        None,
+    ];
+    for location in &game.locations {
+        fields.extend([
+            Some(location.name.as_str()),
+            Some(location.description.as_str()),
+            Some(location.code.as_str()),
+            None,
+        ]);
+        for action in &location.actions {
+            fields.extend([
+                Some(action.image.as_str()),
+                Some(action.name.as_str()),
+                Some(action.code.as_str()),
+            ]);
+        }
+    }
+    fields
+}
+
+/// Encode only changed payloads; copy all other bytes from the original file.
+fn splice_game(bytes: &[u8], before: &QspGame, after: &QspGame, file: &str) -> Result<Vec<u8>> {
+    let units = read_u16le_units(bytes)?;
+    let ranges = record_ranges(&units)?;
+    let mut output = Vec::new();
+    let mut cursor = 0;
+    for ((old, new), range) in game_record_fields(before)
+        .into_iter()
+        .zip(game_record_fields(after))
+        .zip(ranges)
+    {
+        if old == new {
+            continue;
+        }
+        if let Some(text) = new {
+            let start = range
+                .start
+                .checked_mul(2)
+                .ok_or_else(|| parse_error(file, "record byte offset overflow"))?;
+            let end = range
+                .end
+                .checked_mul(2)
+                .ok_or_else(|| parse_error(file, "record byte offset overflow"))?;
+            output.extend_from_slice(&bytes[cursor..start]);
+            output.extend(write_u16le_units(&encode_field(text)));
+            cursor = end;
+        }
+    }
+    output.extend_from_slice(&bytes[cursor..]);
+    Ok(output)
+}
+
+#[cfg(test)]
 fn serialize_game(game: &QspGame) -> Vec<u8> {
     // Plain header lines (no CODREMOV), matching converters writeQsp.
     let mut records: Vec<Vec<u16>> = vec![
@@ -474,31 +542,37 @@ fn apply_translations(game: &mut QspGame, entries: &[&StringEntry]) {
     }
 }
 
-/// Classify only the rows already counted when an entire file stays unchanged.
-/// The injector's last translation for a suffix wins, including identity edits.
-fn classify_unchanged_entries(
+/// Validate rows against the unmodified source; the last valid row wins.
+fn validated_translations<'a>(
     game: &QspGame,
-    entries: &[&StringEntry],
+    entries: &[&'a StringEntry],
     report: &mut InjectionReport,
-) {
+) -> Vec<&'a StringEntry> {
     let mut seen = std::collections::HashSet::new();
+    let mut accepted = Vec::new();
     for entry in entries.iter().rev() {
         let reason = if entry.translation.is_none() {
             "untranslated"
         } else if let Some((_, suffix)) = entry.id.split_once("#loc") {
             match qsp_locator_target(game, suffix) {
                 Err(reason) => reason,
-                Ok(()) if !seen.insert(suffix) => "duplicate",
-                Ok(()) => "unchanged",
+                Ok(source) if source != entry.source => "source_changed",
+                Ok(_) if !seen.insert(suffix) => "duplicate",
+                Ok(_) if entry.translation.as_ref() == Some(&entry.source) => "unchanged",
+                Ok(_) => {
+                    accepted.push(*entry);
+                    continue;
+                }
             }
         } else {
             "invalid_locator"
         };
         report.skip(reason, 1);
     }
+    accepted
 }
 
-fn qsp_locator_target(game: &QspGame, suffix: &str) -> std::result::Result<(), &'static str> {
+fn qsp_locator_target(game: &QspGame, suffix: &str) -> std::result::Result<String, &'static str> {
     fn index(value: &str) -> std::result::Result<usize, &'static str> {
         let index: usize = value.parse().map_err(|_| "invalid_locator")?;
         if index.to_string() != value {
@@ -512,7 +586,11 @@ fn qsp_locator_target(game: &QspGame, suffix: &str) -> std::result::Result<(), &
         .get(index(parts[0])?)
         .ok_or("target_missing")?;
     let code = match parts[1..] {
-        ["desc"] => return Ok(()),
+        ["desc"] => {
+            return looks_player_visible(&location.description)
+                .then(|| location.description.clone())
+                .ok_or("target_missing")
+        }
         ["code", literal] => Some((&location.code, literal)),
         [action, "name"] | [action, "code", _] if action.starts_with("act") => {
             let action = location
@@ -520,7 +598,9 @@ fn qsp_locator_target(game: &QspGame, suffix: &str) -> std::result::Result<(), &
                 .get(index(&action[3..])?)
                 .ok_or("target_missing")?;
             if parts.len() == 3 {
-                return Ok(());
+                return looks_player_visible(&action.name)
+                    .then(|| action.name.clone())
+                    .ok_or("target_missing");
             }
             Some((&action.code, parts[3]))
         }
@@ -528,11 +608,10 @@ fn qsp_locator_target(game: &QspGame, suffix: &str) -> std::result::Result<(), &
     };
     let (code, literal) = code.ok_or("invalid_locator")?;
     let literal = index(literal.strip_prefix("str").ok_or("invalid_locator")?)?;
-    if literal < extract_quoted_literals(code).len() {
-        Ok(())
-    } else {
-        Err("target_missing")
-    }
+    extract_quoted_literals(code)
+        .get(literal)
+        .cloned()
+        .ok_or("target_missing")
 }
 
 /// Rewrite quoted literals in `code` left-to-right with `replacements`
@@ -549,6 +628,11 @@ fn replace_quoted_in_order(code: &str, replacements: &[String]) -> String {
             let (buf, end) = scan_quoted_literal(&chars, start);
             i = end;
             if looks_player_visible(&buf) && rep_i < replacements.len() {
+                if replacements[rep_i] == buf {
+                    out.extend(chars[start..i].iter());
+                    rep_i += 1;
+                    continue;
+                }
                 out.push(q);
                 for c in replacements[rep_i].chars() {
                     if c == q {
@@ -665,7 +749,7 @@ impl FormatPlugin for QspPlugin {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let mut game = match parse_game(&bytes, &fname) {
+            let game = match parse_game(&bytes, &fname) {
                 Ok(g) => g,
                 Err(e) => {
                     report
@@ -676,20 +760,21 @@ impl FormatPlugin for QspPlugin {
                 }
             };
 
-            let before = serialize_game(&game);
-            apply_translations(&mut game, file_entries);
-            let after = serialize_game(&game);
-            if after == before {
-                classify_unchanged_entries(&game, file_entries, &mut report);
+            let accepted = validated_translations(&game, file_entries, &mut report);
+            if accepted.is_empty() {
+                continue;
+            }
+            let mut translated = game.clone();
+            apply_translations(&mut translated, &accepted);
+            let after = splice_game(&bytes, &game, &translated, &fname)?;
+            if after == bytes {
+                report.skip("unchanged", accepted.len());
                 continue;
             }
             std::fs::write(&actual, &after)?;
             report.files_modified += 1;
             report.files_written.push(actual);
-            report.strings_written += file_entries
-                .iter()
-                .filter(|e| e.translation.is_some())
-                .count();
+            report.strings_written += accepted.len();
         }
 
         Ok(report)
@@ -700,6 +785,224 @@ impl FormatPlugin for QspPlugin {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn fixture_records() -> Vec<Vec<u16>> {
+        let bytes = build_minimal_qsp_game();
+        let mut records = split_records(&read_u16le_units(&bytes).unwrap());
+        records.pop(); // The fixture ends with CRLF.
+        records
+    }
+
+    #[test]
+    fn qsp_rejects_huge_counts_before_allocation() {
+        // Start with a guaranteed capacity overflow so the unfixed parser cannot
+        // attempt a multi-GB allocation on the subsequent u32::MAX cases.
+        for field in [3, 7] {
+            for count in [usize::MAX, u32::MAX as usize, 20] {
+                let mut records = fixture_records();
+                records[field] = encode_field(&count.to_string());
+                let bytes = write_u16le_units(&join_records(&records));
+                let result = std::panic::catch_unwind(|| parse_game(&bytes, "crafted.qsp"));
+                assert!(result.is_ok(), "count {count} in field {field} panicked");
+                let error = result.unwrap().unwrap_err();
+                assert!(matches!(error, LocustError::ParseError { .. }));
+                assert!(error.to_string().contains("count"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn qsp_rejects_truncated_action_block() {
+        for length in 8..11 {
+            let mut records = fixture_records();
+            records.truncate(length);
+            let bytes = write_u16le_units(&join_records(&records));
+            assert!(
+                matches!(
+                    parse_game(&bytes, "truncated.qsp"),
+                    Err(LocustError::ParseError { .. })
+                ),
+                "accepted an action with {} fields",
+                length - 8
+            );
+        }
+    }
+
+    #[test]
+    fn qsp_count_limit_applies_even_with_enough_records() {
+        for actions in [false, true] {
+            let mut records = fixture_records();
+            let count = 100_001;
+            if actions {
+                records.truncate(8);
+                records[7] = encode_field(&count.to_string());
+                records.extend((0..count * 3).map(|_| Vec::new()));
+            } else {
+                records.truncate(4);
+                records[3] = encode_field(&count.to_string());
+                for _ in 0..count {
+                    records.extend([Vec::new(), Vec::new(), Vec::new(), encode_field("0")]);
+                }
+            }
+            let bytes = write_u16le_units(&join_records(&records));
+            let error = parse_game(&bytes, "limit.qsp").unwrap_err();
+            assert!(matches!(error, LocustError::ParseError { .. }));
+            assert!(
+                error.to_string().contains("exceeds limit 100000"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn qsp_edit_preserves_absent_final_terminator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.qsp");
+        let mut before = build_minimal_qsp_game();
+        before.truncate(before.len() - 4);
+        fs::write(&path, &before).unwrap();
+        let plugin = QspPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        let last = entries.last_mut().unwrap();
+        last.translation = Some("Translated action code".into());
+        let old_record = write_u16le_units(&encode_field("*pl 'You see trees and a path.'"));
+        let mut expected = before[..before.len() - old_record.len()].to_vec();
+        expected.extend(write_u16le_units(&encode_field(
+            "*pl 'Translated action code'",
+        )));
+        let report = plugin.inject(&path, &entries).unwrap();
+        assert_eq!((report.files_modified, report.strings_written), (1, 1));
+        assert_eq!(fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn qsp_extract_rejects_invalid_utf16() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.qsp");
+        // Include plain header/version and shifted fields, including fields
+        // that are validated but never extracted as translatable strings.
+        for field in 0..11 {
+            for surrogate in [0xD800, 0xDC00] {
+                let mut records = fixture_records();
+                records[field] = vec![if field < 2 {
+                    surrogate
+                } else {
+                    encode_unit(surrogate)
+                }];
+                fs::write(&path, write_u16le_units(&join_records(&records))).unwrap();
+                assert!(
+                    matches!(
+                        QspPlugin::new().extract(&path),
+                        Err(LocustError::ParseError { .. })
+                    ),
+                    "field {field} accepted an unpaired surrogate"
+                );
+            }
+        }
+        let mut bytes = build_minimal_qsp_game();
+        bytes.push(0x42);
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            QspPlugin::new().extract(&path),
+            Err(LocustError::ParseError { .. })
+        ));
+    }
+
+    #[test]
+    fn qsp_inject_preserves_unedited_records_and_trailing_bytes() {
+        for terminated in [false, true] {
+            for target in ["#desc", "#code#str0", "#act0#name", "#act0#code#str0"] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("game.qsp");
+                let mut records = fixture_records();
+                records[3] = encode_field("0001");
+                records[7] = encode_field("01");
+                // An alternate encoding of code unit 5 must remain untouched.
+                records[8] = vec![0];
+                // An untouched unterminated literal must not gain a quote.
+                records[6] = encode_field("*pl 'Hello, traveler!' & 'Unterminated text");
+                let mut before = write_u16le_units(&join_records(&records));
+                before.extend(write_u16le_units(&[0xD800, 13, 10, 0xDC00]));
+                if terminated {
+                    before.extend_from_slice(&[13, 0, 10, 0]);
+                }
+                fs::write(&path, &before).unwrap();
+                let plugin = QspPlugin::new();
+                let mut entry = plugin
+                    .extract(&path)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.id == format!("game.qsp#loc0{target}"))
+                    .unwrap();
+                entry.translation = Some("Translated text".into());
+                let report = plugin.inject(&path, &[entry]).unwrap();
+                assert_eq!((report.files_modified, report.strings_written), (1, 1));
+                let record = match target {
+                    "#desc" => 5,
+                    "#code#str0" => 6,
+                    "#act0#name" => 9,
+                    _ => 10,
+                };
+                let replacement = match record {
+                    6 => "*pl 'Translated text' & 'Unterminated text",
+                    10 => "*pl 'Translated text'",
+                    _ => "Translated text",
+                };
+                let start: usize = records[..record].iter().map(|r| (r.len() + 2) * 2).sum();
+                let end = start + records[record].len() * 2;
+                let mut expected = before[..start].to_vec();
+                expected.extend(write_u16le_units(&encode_field(replacement)));
+                expected.extend_from_slice(&before[end..]);
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    expected,
+                    "{target}, terminated={terminated}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qsp_identity_inject_is_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.qsp");
+        let mut records = fixture_records();
+        records[3] = encode_field("0001");
+        records[6] = encode_field("*pl 'Unterminated text");
+        let mut before = write_u16le_units(&join_records(&records));
+        before.extend_from_slice(&[0, 0xD8]);
+        fs::write(&path, &before).unwrap();
+        let plugin = QspPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        for entry in &mut entries {
+            entry.translation = Some(entry.source.clone());
+        }
+        for rows in [&[][..], entries.as_slice()] {
+            let report = plugin.inject(&path, rows).unwrap();
+            assert_eq!(report.files_modified, 0);
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn qsp_stale_sources_are_refused_without_modifying_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_qsp_fixture(dir.path()).join("game.qsp");
+        let before = fs::read(&path).unwrap();
+        let plugin = QspPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        for entry in &mut entries {
+            entry.source = "Stale source".into();
+            entry.translation = Some("Translated text".into());
+        }
+        let report = plugin.inject(&path, &entries).unwrap();
+        assert_eq!(
+            report.skip_reasons.get("source_changed"),
+            Some(&entries.len())
+        );
+        assert_eq!((report.files_modified, report.strings_written), (0, 0));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
 
     #[test]
     fn c123_named_skips_for_unchanged_qsp_file() {
@@ -918,8 +1221,8 @@ mod tests {
         // Char 5 stores as (u16)-5 per engine coding.c
         assert_eq!(encode_unit(5), (0u16).wrapping_sub(5));
         assert_eq!(decode_unit((0u16).wrapping_sub(5)), 5);
-        assert_eq!(decode_field(&encode_field("Hello")), "Hello");
-        assert_eq!(decode_field(&encode_field("Привет")), "Привет");
+        assert_eq!(decode_field(&encode_field("Hello")).unwrap(), "Hello");
+        assert_eq!(decode_field(&encode_field("Привет")).unwrap(), "Привет");
     }
 
     #[test]
