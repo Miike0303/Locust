@@ -3,12 +3,14 @@ import BufferedSetting, { SETTINGS_INPUT_CLASS } from "../../components/Buffered
 import { getConfig } from "../../lib/api";
 import { TABLE_ROW_HEIGHT_MAX, TABLE_ROW_HEIGHT_MIN, clampTableRowHeight } from "../../lib/appearance";
 import { useLocale, useT, type Locale } from "../../lib/i18n";
+import SectionState from "./SectionState";
 import useSettingsSave from "./useSettingsSave";
 
 export default function AppearanceSection() {
   const t = useT();
   const { locale, setLocale } = useLocale();
-  const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
+  const configQuery = useQuery({ queryKey: ["config"], queryFn: getConfig });
+  const { data: config } = configQuery;
   const saveSettings = useSettingsSave();
 
   const setTheme = async (theme: string) => {
@@ -27,7 +29,8 @@ export default function AppearanceSection() {
     return Boolean(await saveSettings({ ui: { table_row_height: height } }));
   };
 
-  if (!config) return null;
+  if (configQuery.isError) return <SectionState title={t("settings.appearance.title")} state="error" error={configQuery.error} onRetry={() => { void configQuery.refetch(); }} />;
+  if (configQuery.isPending || !config) return <SectionState title={t("settings.appearance.title")} state="loading" />;
 
   return (
     <div className="space-y-6 border border-border bg-surface rounded-xl p-5">

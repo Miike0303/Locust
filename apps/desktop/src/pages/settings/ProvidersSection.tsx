@@ -9,15 +9,26 @@ import { resolveProviderReadiness } from "../../lib/providerReadiness";
 import { GROK_SUB_PROVIDER_ID } from "../../lib/xaiAuth";
 import GrokSubCard from "./GrokSubCard";
 import ModelPolicySettings from "./ModelPolicySettings";
+import SectionState from "./SectionState";
 import useSettingsSave from "./useSettingsSave";
 
 export default function ProvidersSection() {
   const t = useT();
-  const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders });
-  const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
+  const providersQuery = useQuery({ queryKey: ["providers"], queryFn: getProviders });
+  const configQuery = useQuery({ queryKey: ["config"], queryFn: getConfig });
+  const { data: providers } = providersQuery;
+  const { data: config } = configQuery;
   const saveSettings = useSettingsSave();
   const [testing, setTesting] = useState<Record<string, boolean>>({});
   const [results, setResults] = useState<Record<string, { ok: boolean; message: string }>>({});
+
+  const queries = [configQuery, providersQuery];
+  const failed = queries.find(query => query.isError);
+  if (failed) return <SectionState title={t("settings.providers.title")} state="error" error={failed.error} onRetry={() => {
+    for (const query of queries) if (query.isError) void query.refetch();
+  }} />;
+  if (queries.some(query => query.isPending) || !config || !providers) return <SectionState title={t("settings.providers.title")} state="loading" />;
+  if (providers.length === 0) return <SectionState title={t("settings.providers.title")} state="empty" message={t("settings.providers.empty")} />;
 
   const handleTest = async (id: string) => {
     setTesting((p) => ({ ...p, [id]: true }));

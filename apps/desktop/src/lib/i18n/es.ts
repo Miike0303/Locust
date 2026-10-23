@@ -203,6 +203,8 @@ export const es: Record<keyof typeof en, string> = {
   "export.toast.staleSources": "{count} texto(s) originales ya no coinciden con este proyecto. Exporta el texto actual antes de volver a traducirlos.",
   "editor.recentSaveFailed": "El proyecto está abierto, pero no se pudo guardar en los proyectos recientes. Puede que debas seleccionar de nuevo su carpeta o base de datos la próxima vez.",
   "settings.saveFailed": "No se pudieron guardar los ajustes: {error}",
+  "settings.loadFailed": "No se pudieron cargar los ajustes",
+  "settings.providers.empty": "No hay proveedores disponibles. Revise la configuración de los proveedores y actualice la lista.",
   "recovery.title": "Recuperar inserción interrumpida",
   "recovery.close": "Cerrar recuperación",
   "recovery.description": "Si una inserción se detuvo inesperadamente, revisa el juego aquí aunque no puedas abrir su proyecto.",

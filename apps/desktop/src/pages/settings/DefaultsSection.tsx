@@ -2,19 +2,27 @@ import { useQuery } from "@tanstack/react-query";
 import BufferedSetting, { SETTINGS_INPUT_CLASS } from "../../components/BufferedSetting";
 import { getConfig, getProviders } from "../../lib/api";
 import { useT } from "../../lib/i18n";
+import SectionState from "./SectionState";
 import useSettingsSave from "./useSettingsSave";
 
 export default function DefaultsSection() {
   const t = useT();
-  const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
-  const { data: providers } = useQuery({ queryKey: ["providers"], queryFn: getProviders });
+  const configQuery = useQuery({ queryKey: ["config"], queryFn: getConfig });
+  const providersQuery = useQuery({ queryKey: ["providers"], queryFn: getProviders });
+  const { data: config } = configQuery;
+  const { data: providers } = providersQuery;
   const saveSettings = useSettingsSave();
 
   const save = async (key: string, value: any) => {
     return Boolean(await saveSettings({ [key]: value }));
   };
 
-  if (!config) return null;
+  const queries = [configQuery, providersQuery];
+  const failed = queries.find(query => query.isError);
+  if (failed) return <SectionState title={t("settings.defaults.title")} state="error" error={failed.error} onRetry={() => {
+    for (const query of queries) if (query.isError) void query.refetch();
+  }} />;
+  if (queries.some(query => query.isPending) || !config || !providers) return <SectionState title={t("settings.defaults.title")} state="loading" />;
 
   return (
     <div className="space-y-6 border border-border bg-surface rounded-xl p-5">

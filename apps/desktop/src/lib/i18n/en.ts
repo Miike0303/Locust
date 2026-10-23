@@ -201,6 +201,8 @@ export const en = {
   "export.toast.staleSources": "{count} source text(s) no longer match this project. Export the current text before translating them again.",
   "editor.recentSaveFailed": "The project is open, but its recent-project entry could not be saved. You may need to select its folder or database again next time.",
   "settings.saveFailed": "Settings could not be saved: {error}",
+  "settings.loadFailed": "Settings could not be loaded",
+  "settings.providers.empty": "No providers are available. Check your provider setup and refresh the list.",
   "recovery.title": "Recover interrupted insertion",
   "recovery.close": "Close recovery",
   "recovery.description": "If an insertion stopped unexpectedly, inspect the game here even when its project cannot be opened.",

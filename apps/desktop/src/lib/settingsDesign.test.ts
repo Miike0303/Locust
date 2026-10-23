@@ -64,7 +64,7 @@ test("language selector retains its id, locale binding, options and persistence 
 
 test("existing appearance saves and provider health/save payloads remain identical across checkout line endings", () => {
   for (const [name, start, end, hash] of [
-    ["AppearanceSection", "  const setTheme", "  if (!config)", "6a4cd5e5119c4786be679d7eaada69f843bcd21e5addc6e6ae129fdf99b0cbd6"],
+    ["AppearanceSection", "  const setTheme", "  if (configQuery.isError)", "6a4cd5e5119c4786be679d7eaada69f843bcd21e5addc6e6ae129fdf99b0cbd6"],
     ["ProvidersSection", "  const handleTest", "  const grokSub", "a7eae738ad55bf1671f121f29323ac65bfc802bfa5ef5f79ef2b361668159812"],
   ]) {
     for (const newline of ["\n", "\r\n"]) {
