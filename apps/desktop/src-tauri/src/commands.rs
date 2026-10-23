@@ -902,14 +902,7 @@ async fn apply_add_glossary_entry(s: &AppState, entry: &GlossaryEntry) -> Result
     if s.current_project.read().await.is_none() {
         return Err("no project open".into());
     }
-    s.glossary
-        .add(
-            &entry.term,
-            &entry.translation,
-            &entry.lang_pair,
-            entry.context.as_deref(),
-        )
-        .map_err(|e| e.to_string())
+    s.glossary.add_entry(entry).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1995,6 +1988,28 @@ mod tests {
             assert_eq!(std::fs::read(&file).unwrap(), original);
         }
         std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[tokio::test]
+    async fn glossary_add_preserves_case_sensitive_and_context() {
+        let state = locust_server::create_test_state();
+        *state.current_project.write().await = Some(ProjectInfo::default());
+        for context in [Some("  Organization title\nUSA  "), Some(""), None] {
+            let entry = GlossaryEntry {
+                term: "US".into(),
+                translation: "EEUU".into(),
+                lang_pair: "en-es".into(),
+                context: context.map(str::to_owned),
+                case_sensitive: true,
+            };
+            apply_add_glossary_entry(&state, &entry).await.unwrap();
+            let entries = apply_get_glossary(&state, "en-es").await.unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&entries[0]).unwrap(),
+                serde_json::to_value(&entry).unwrap()
+            );
+        }
     }
 
     #[tokio::test]

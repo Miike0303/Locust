@@ -344,6 +344,12 @@ enum GlossaryCommands {
         translation: String,
         #[arg(short, long)]
         lang_pair: String,
+        /// Match the term with exact capitalization.
+        #[arg(long)]
+        case_sensitive: bool,
+        /// Context for the glossary entry.
+        #[arg(long, value_name = "TEXT")]
+        context: Option<String>,
     },
     List {
         project: PathBuf,

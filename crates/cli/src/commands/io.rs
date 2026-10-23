@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use comfy_table::Table;
 use locust_core::config::AppConfig;
-use locust_core::database::EntryFilter;
+use locust_core::database::{EntryFilter, GlossaryEntry};
 use locust_core::export;
 use locust_core::glossary::Glossary;
 
@@ -18,11 +18,23 @@ pub(crate) fn cmd_glossary(action: GlossaryCommands) -> anyhow::Result<()> {
             term,
             translation,
             lang_pair,
+            case_sensitive,
+            context,
         } => {
             let db = Arc::new(open_existing_project(&project)?);
             let glossary = Glossary::new(db);
-            glossary.add(&term, &translation, &lang_pair, None)?;
-            println!("Added: {} → {} ({})", term, translation, lang_pair);
+            let entry = GlossaryEntry {
+                term,
+                translation,
+                lang_pair,
+                context,
+                case_sensitive,
+            };
+            glossary.add_entry(&entry)?;
+            println!(
+                "Added: {} → {} ({})",
+                entry.term, entry.translation, entry.lang_pair
+            );
         }
         GlossaryCommands::List { project, lang_pair } => {
             let db = Arc::new(open_existing_project(&project)?);

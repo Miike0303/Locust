@@ -198,6 +198,8 @@ impl Glossary {
         }
     }
 
+    /// Add a case-insensitive entry, preserving the supplied context.
+    /// Use [`Self::add_entry`] to specify case sensitivity.
     pub fn add(
         &self,
         term: &str,
@@ -490,6 +492,39 @@ mod tests {
         let entries = glossary.get_all("ja-en").unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| !entry.case_sensitive));
+    }
+
+    #[test]
+    fn test_add_entry_preserves_case_sensitive_and_context() {
+        let (_db, glossary) = setup();
+        for context in [Some("  Organization title\nUSA  "), Some(""), None] {
+            let entry = GlossaryEntry {
+                context: context.map(str::to_owned),
+                ..explicit("US", "EEUU", true)
+            };
+            glossary.add_entry(&entry).unwrap();
+            let entries = glossary.get_all("en-es").unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&entries[0]).unwrap(),
+                serde_json::to_value(&entry).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_preserves_context_and_defaults_to_case_insensitive() {
+        let (_db, glossary) = setup();
+        glossary
+            .add("US", "EEUU", "en-es", Some("  Organization title  "))
+            .unwrap();
+        let entries = glossary.get_all("en-es").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].case_sensitive);
+        assert_eq!(
+            entries[0].context.as_deref(),
+            Some("  Organization title  ")
+        );
     }
 
     #[test]

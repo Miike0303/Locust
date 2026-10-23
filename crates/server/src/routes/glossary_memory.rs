@@ -703,7 +703,7 @@ mod tests {
                 "term": "US",
                 "translation": "EEUU",
                 "lang_pair": "en-es",
-                "context": null,
+                "context": "  Organization title\nUSA  ",
                 "case_sensitive": true
             }))
             .send()
@@ -721,6 +721,7 @@ mod tests {
         assert_eq!(body.len(), 1);
         assert_eq!(body[0]["term"], "US");
         assert_eq!(body[0]["case_sensitive"], true);
+        assert_eq!(body[0]["context"], "  Organization title\nUSA  ");
         assert!(state.glossary.lookup_exact("us", "en", "es").is_none());
         assert_eq!(
             state.glossary.lookup_exact("US", "en", "es").as_deref(),
