@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { registerHooks } from "node:module";
+import * as a11y from "../lib/modalA11y.ts";
 import { setLocale, t } from "../lib/i18n";
 import type { StringEntry } from "../lib/api";
 
 const row: StringEntry = { id: "row", source: "Source", translation: "old text", status: "translated", tags: [], metadata: {}, created_at: "2026-01-01", file_path: "story.html", context: null, provider_used: null, char_limit: null, translated_at: null, reviewed_at: null };
 const h = {
-  t, states: [] as any[], cursor: 0, closed: 0, done: 0,
+  t, a11y, snapshot: null as any, estimatePending: false, states: [] as any[], cursor: 0, closed: 0, done: 0,
   setTauri: (_value: boolean) => {},
   reads: [] as any[], writes: [] as any[], toasts: [] as [string, string][], logs: [] as any[],
   entries: [row], total: 1,
@@ -24,13 +25,21 @@ const hooks = registerHooks({
     return nextLoad(url, context);
   },
   resolve(specifier, context, nextResolve) {
-    if (context.parentURL?.endsWith("/components/SearchReplaceModal.tsx")) {
+    if (["/components/SearchReplaceModal.tsx", "/components/TranslationModal.tsx"].some(path => context.parentURL?.endsWith(path))) {
       const stubs: Record<string, string> = {
-        react: "export const useState=initial=>{const i=h.cursor++;if(!(i in h.states))h.states[i]=initial;return [h.states[i],value=>{h.states[i]=value;}];};",
-        "../lib/i18n": "export const useT=()=>h.t;",
+        react: "export const useState=initial=>{const i=h.cursor++;if(!(i in h.states))h.states[i]=initial;return [h.states[i],value=>{h.states[i]=value;}];};export const useEffect=()=>{};export const useRef=initial=>({current:initial});",
+        "../lib/i18n": "export const useT=()=>h.t;export const useLocale=()=>({locale:'en'});",
+        "@tanstack/react-query": "export const useQuery=({queryKey})=>({data:queryKey[0]==='providers'?[]:{},isFetched:true});",
+        "react-router-dom": "export const useNavigate=()=>()=>{};",
+        "../stores/editorStore": "export const useEditorStore=()=>({isTranslating:!!h.snapshot,jobSnapshot:h.snapshot});",
+        "../stores/projectStore": "export const useProjectStore={getState:()=>({project:null})};",
+        "../lib/useTranslationSettings": "export const useTranslationSettings=()=>({fallbackIds:[],fallbackPick:'',providerReadiness:{ready:true}});",
+        "../lib/useTranslationEstimate": "export const useTranslationEstimate=()=>({pending:h.estimatePending});",
+        "../lib/translationStart": "export const startSingleTranslation=async()=>null;",
+        "../lib/translationJobSession": "export const clearTranslationSnapshotIfIdle=()=>{};export const reconnectTranslationJob=()=>{};export const requestTranslationCancel=()=>{};export const setTranslationModalOpen=()=>{};",
         "../stores/toastStore": "export const addToast=(...args)=>h.toasts.push(args);",
         "../stores/logStore": "export const addLog=(...args)=>h.logs.push(args);",
-        "../lib/modalA11y": "export const useModalA11y=()=>({});export const MODAL_BACKDROP_CLASS='';export const MODAL_FOOTER_CLASS='';export const modalPanelClass=()=>'';",
+        "../lib/modalA11y": "export const useModalA11y=()=>({dialogRef:{current:null},dialogProps:h.a11y.buildModalDialogProps({titleId:'title'}),titleProps:h.a11y.buildModalTitleProps('title')});export const MODAL_BACKDROP_CLASS=h.a11y.MODAL_BACKDROP_CLASS;export const MODAL_FOOTER_CLASS=h.a11y.MODAL_FOOTER_CLASS;export const modalPanelClass=h.a11y.modalPanelClass;",
       };
       if (stubs[specifier]) return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent("const h=globalThis.__bulkReplace;" + stubs[specifier])}` };
     }
@@ -58,6 +67,7 @@ globalThis.fetch = async (input, init) => {
   return new Response(JSON.stringify(h.read(Object.fromEntries(url.searchParams))));
 };
 const { default: SearchReplaceModal } = await import("./SearchReplaceModal");
+const { default: TranslationModal } = await import("./TranslationModal");
 // Resolve the real client's HTTP base through its desktop port seam first.
 await (await import("../lib/api")).getCurrentProject();
 after(() => {
@@ -153,3 +163,66 @@ test("missing rows use a partial warning without claiming all attempted occurren
   assert.deepEqual(h.toasts, [["warning", "Applied 0 of 1 translation(s); 1 skipped. Run the preview again before retrying."]]);
   assert.equal(h.closed, 0);
 });
+
+function assertClasses(node: any, expected: string[]) {
+  assert.ok(node, "expected modal region to render");
+  const classes = new Set(node.props.className?.split(/\s+/));
+  for (const token of expected) assert.ok(classes.has(token), `missing ${token}`);
+}
+function boundedRegions(tree: any) {
+  const panel = nodes(tree).find(n => n.props?.role === "dialog");
+  assertClasses(panel, ["max-h-[calc(100vh-2rem)]", "my-4", "flex", "flex-col"]);
+  const regions = panel.props.children;
+  assert.ok(Array.isArray(regions), "header, body, and footer must be siblings");
+  assert.equal(regions.length, 3);
+  const [header, body, footer] = regions;
+  assert.equal(header.type, "header");
+  assertClasses(header, ["shrink-0", "border-b", "border-border"]);
+  assert.ok(nodes(header).some(n => n.type === "h2" && n.props.id === "title"));
+  assert.ok(nodes(header).some(n => n.type === "button"));
+  assertClasses(body, ["flex-1", "min-h-0", "overflow-y-auto", "p-6"]);
+  assert.equal(footer.type, "footer");
+  assertClasses(footer, ["shrink-0", "border-t", "border-border", "bg-surface"]);
+  assert.ok(!footer.props.className.includes("overflow-y-auto"));
+  return { body, footer };
+}
+function assertFooterButton(footer: any, label: string) {
+  const button = nodes(footer).find(n => n.type === "button" && n.props.children === label);
+  assert.ok(button, `${label} must render in the fixed footer`);
+  return button;
+}
+
+test("Search/Replace bounds its frame, scrolls the preview body, and keeps all actions in the footer", async () => {
+  reset();
+  await click("replace.previewBtn");
+  const { body, footer } = boundedRegions(render());
+  const preview = nodes(body).find(n => n.type === "ul");
+  assertClasses(preview, ["overflow-y-auto"]);
+  for (const key of ["common.cancel", "replace.previewBtn", "replace.replaceAll"] as const) {
+    assertFooterButton(footer, t(key));
+  }
+});
+
+for (const pending of [false, true]) {
+  test(`Translation bounds its frame and keeps Start in the footer (estimate pending: ${pending})`, () => {
+    reset(); h.states = []; h.cursor = 0; h.snapshot = null; h.estimatePending = pending;
+    const tree = TranslationModal({ open: true, onClose() {}, totalPending: 1, onComplete() {} });
+    const { body, footer } = boundedRegions(tree);
+    assert.ok(nodes(body).some(n => n.props?.estimate?.pending === pending), "estimate stays in the scrolling body");
+    assert.equal(assertFooterButton(footer, t("translate.start")).props.disabled, pending);
+  });
+}
+
+for (const snapshot of [{ completed: 1, total: 2 }, { done: true, completed: 2, total: 2 }]) {
+  test(`Translation keeps progress actions in the footer (done: ${!!("done" in snapshot)})`, () => {
+    reset(); h.states = []; h.cursor = 0; h.snapshot = snapshot;
+    const tree = TranslationModal({ open: true, onClose() {}, totalPending: 1, onComplete() {}, onReview() {} });
+    const { footer } = boundedRegions(tree);
+    if ("done" in snapshot) {
+      assertFooterButton(footer, t("common.close"));
+      assertFooterButton(footer, t("translate.review"));
+    } else {
+      assertFooterButton(footer, t("translate.cancel"));
+    }
+  });
+}

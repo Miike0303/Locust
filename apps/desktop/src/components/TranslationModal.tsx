@@ -275,9 +275,9 @@ export default function TranslationModal({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-lg p-6")}
+				className={modalPanelClass("max-w-lg max-h-[calc(100vh-2rem)] flex flex-col my-4")}
 			>
-				<div className="flex justify-between items-center mb-4">
+				<header className="flex justify-between items-center shrink-0 p-6 border-b border-border">
 					<h2 {...titleProps} className="text-section font-bold">
 						{step === "configure"
 							? t("translate.title")
@@ -290,251 +290,315 @@ export default function TranslationModal({
 					>
 						<X aria-hidden="true" size={20} />
 					</button>
-				</div>
+				</header>
 
-				{step === "configure" && (
-					<div className="space-y-4">
-						<div>
-							<div className="flex items-end justify-between gap-2">
-								<label htmlFor="translation-provider" className="text-body font-medium">{t("translate.provider")}</label>
-								<button
-									type="button"
-									onClick={handleTestConnection}
-									disabled={!providerId || testingHealth}
-									className="text-caption font-medium text-accent-fg hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
+				<div className="flex-1 min-h-0 overflow-y-auto p-6">
+					{step === "configure" && (
+						<div className="space-y-4">
+							<div>
+								<div className="flex items-end justify-between gap-2">
+									<label htmlFor="translation-provider" className="text-body font-medium">{t("translate.provider")}</label>
+									<button
+										type="button"
+										onClick={handleTestConnection}
+										disabled={!providerId || testingHealth}
+										className="text-caption font-medium text-accent-fg hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
+									>
+										{testingHealth ? t("translate.testing") : t("translate.testConnection")}
+									</button>
+								</div>
+								<select id="translation-provider"
+									value={providerId}
+									onChange={(e) => {
+										setProviderId(e.target.value);
+										setFallbackIds((prev) =>
+											prev.filter((id) => id !== e.target.value),
+										);
+									}}
+									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
 								>
-									{testingHealth ? t("translate.testing") : t("translate.testConnection")}
-								</button>
-							</div>
-							<select id="translation-provider"
-								value={providerId}
-								onChange={(e) => {
-									setProviderId(e.target.value);
-									setFallbackIds((prev) =>
-										prev.filter((id) => id !== e.target.value),
-									);
-								}}
-								className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-							>
-								{providers?.map((p) => (
-									<option key={p.id} value={p.id}>
-										{formatProviderOptionLabel(p)}
-									</option>
-								))}
-							</select>
-							{!providerReadiness.ready &&
-								providerReadiness.reason === "missing_key" && (
-									<div className="mt-2 p-2 rounded border border-warning bg-warning-muted text-body text-warning">
-										{t("translate.needsKey")}{" "}
-										<button
-											type="button"
-											onClick={() => openSettings("provider-settings")}
-											className="font-medium text-accent-fg hover:underline"
-										>
-											{t("translate.openSettings")}
-										</button>
+									{providers?.map((p) => (
+										<option key={p.id} value={p.id}>
+											{formatProviderOptionLabel(p)}
+										</option>
+									))}
+								</select>
+								{!providerReadiness.ready &&
+									providerReadiness.reason === "missing_key" && (
+										<div className="mt-2 p-2 rounded border border-warning bg-warning-muted text-body text-warning">
+											{t("translate.needsKey")}{" "}
+											<button
+												type="button"
+												onClick={() => openSettings("provider-settings")}
+												className="font-medium text-accent-fg hover:underline"
+											>
+												{t("translate.openSettings")}
+											</button>
+										</div>
+									)}
+								{healthResult && (
+									<div
+										className={`mt-2 p-2 rounded border text-body ${
+											healthResult.ok
+												? "border-success bg-success-muted text-success"
+												: "border-danger bg-danger-muted text-danger"
+										}`}
+									>
+										{healthResult.message}
 									</div>
 								)}
-							{healthResult && (
-								<div
-									className={`mt-2 p-2 rounded border text-body ${
-										healthResult.ok
-											? "border-success bg-success-muted text-success"
-											: "border-danger bg-danger-muted text-danger"
-									}`}
-								>
-									{healthResult.message}
-								</div>
-							)}
-							<button
-								type="button"
-								onClick={() => openSettings("provider-settings")}
-								className="mt-1 text-caption font-medium text-accent-fg hover:underline"
-							>
-								{t("translate.providerSettings")}
-							</button>
-						</div>
-						<div>
-							<label htmlFor="translation-fallbacks" className="text-body font-medium">{t("translate.fallbacks")}
-							</label>
-							<p className="text-caption text-text-muted mt-0.5 mb-1">
-								{t("translate.fallbacksHint")}
-							</p>
-							<div className="flex gap-2">
-								<select id="translation-fallbacks"
-									value={fallbackPick}
-									onChange={(e) => setFallbackPick(e.target.value)}
-									className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-								>
-									<option value="">{t("translate.addFallback")}</option>
-									{providers
-										?.filter(
-											(p) => p.id !== providerId && !fallbackIds.includes(p.id),
-										)
-										.map((p) => (
-											<option key={p.id} value={p.id}>
-												{formatProviderOptionLabel(p)}
-											</option>
-										))}
-								</select>
 								<button
 									type="button"
-									onClick={addFallback}
-									disabled={!fallbackPick}
-									className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body font-medium disabled:opacity-50"
+									onClick={() => openSettings("provider-settings")}
+									className="mt-1 text-caption font-medium text-accent-fg hover:underline"
 								>
-									{t("common.add")}
+									{t("translate.providerSettings")}
 								</button>
 							</div>
-							{fallbackIds.length > 0 && (
-								<ol className="mt-2 space-y-1">
-									{fallbackIds.map((id, i) => {
-										const name =
-											providers?.find((p) => p.id === id)?.name ?? id;
-										return (
-											<li
-												key={id}
-												className="flex items-center justify-between text-body px-2 py-1 bg-surface-muted rounded"
-											>
-												<span>
-													<span className="text-text-muted mr-2">{i + 1}.</span>
-													{name}
-												</span>
-												<button
-													type="button"
-													onClick={() => removeFallback(id)}
-													className="text-danger hover:underline text-caption font-medium"
+							<div>
+								<label htmlFor="translation-fallbacks" className="text-body font-medium">{t("translate.fallbacks")}
+								</label>
+								<p className="text-caption text-text-muted mt-0.5 mb-1">
+									{t("translate.fallbacksHint")}
+								</p>
+								<div className="flex gap-2">
+									<select id="translation-fallbacks"
+										value={fallbackPick}
+										onChange={(e) => setFallbackPick(e.target.value)}
+										className="flex-1 p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
+									>
+										<option value="">{t("translate.addFallback")}</option>
+										{providers
+											?.filter(
+												(p) => p.id !== providerId && !fallbackIds.includes(p.id),
+											)
+											.map((p) => (
+												<option key={p.id} value={p.id}>
+													{formatProviderOptionLabel(p)}
+												</option>
+											))}
+									</select>
+									<button
+										type="button"
+										onClick={addFallback}
+										disabled={!fallbackPick}
+										className="px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body font-medium disabled:opacity-50"
+									>
+										{t("common.add")}
+									</button>
+								</div>
+								{fallbackIds.length > 0 && (
+									<ol className="mt-2 space-y-1">
+										{fallbackIds.map((id, i) => {
+											const name =
+												providers?.find((p) => p.id === id)?.name ?? id;
+											return (
+												<li
+													key={id}
+													className="flex items-center justify-between text-body px-2 py-1 bg-surface-muted rounded"
 												>
-													{t("common.remove")}
-												</button>
-											</li>
-										);
-									})}
-								</ol>
+													<span>
+														<span className="text-text-muted mr-2">{i + 1}.</span>
+														{name}
+													</span>
+													<button
+														type="button"
+														onClick={() => removeFallback(id)}
+														className="text-danger hover:underline text-caption font-medium"
+													>
+														{t("common.remove")}
+													</button>
+												</li>
+											);
+										})}
+									</ol>
+								)}
+							</div>
+							<div className="grid grid-cols-2 gap-3">
+								<div>
+									<label htmlFor="translation-source" className="text-body font-medium">{t("translate.source")}</label>
+									<select id="translation-source"
+										value={sourceLang}
+										onChange={(e) => setSourceLang(e.target.value)}
+										className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
+									>
+										<option value="auto">{t("translate.autoDetect")}</option>
+										{LANGUAGES.map((l) => (
+											<option key={l.code} value={l.code}>
+												{l.label}
+											</option>
+										))}
+									</select>
+								</div>
+								<div>
+									<label htmlFor="translation-target" className="text-body font-medium">{t("translate.target")}</label>
+									<select id="translation-target"
+										value={targetLang}
+										onChange={(e) => setTargetLang(e.target.value)}
+										className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
+									>
+										{LANGUAGES.map((l) => (
+											<option key={l.code} value={l.code}>
+												{l.label}
+											</option>
+										))}
+									</select>
+								</div>
+							</div>
+							<div>
+								<label htmlFor="translation-gameContext" className="text-body font-medium">{t("translate.gameContext")}</label>
+								<textarea id="translation-gameContext"
+									value={gameContext}
+									onChange={(e) => setGameContext(e.target.value)}
+									rows={2}
+									placeholder={t("translate.gameContextPlaceholder")}
+									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
+								/>
+							</div>
+							<div className="flex items-center gap-4">
+								<label className="flex items-center gap-2 text-body">
+									<input
+										type="checkbox"
+										checked={useGlossary}
+										onChange={(e) => setUseGlossary(e.target.checked)}
+									/>{" "}
+									{t("translate.useGlossary")}
+								</label>
+								<button
+									type="button"
+									onClick={() => openSettings("manage-glossary")}
+									className="text-caption font-medium text-accent-fg hover:underline"
+								>
+									{t("translate.manageGlossary")}
+								</button>
+								<label className="flex items-center gap-2 text-body">
+									<input
+										type="checkbox"
+										checked={useMemory}
+										onChange={(e) => setUseMemory(e.target.checked)}
+									/>{" "}
+									{t("translate.useMemory")}
+								</label>
+							</div>
+	                        {(providerId === "grok" || providerId === "grok-sub") && (
+	                            <button type="button" className="text-body text-accent-fg underline"
+	                                onClick={() => { setBatchSize(10); setMaxConcurrent(10); }}>
+	                                {t("translate.grokThroughputPreset")}
+	                            </button>
+	                        )}
+							<div className="grid grid-cols-3 gap-3">
+								<div>
+									<label htmlFor="translation-batchSize" className="text-body font-medium">{t("translate.batchSize")}</label>
+									<input id="translation-batchSize"
+										type="number"
+										value={batchSize ?? ""}
+										placeholder={t("common.providerDefault")}
+										onChange={(e) => setBatchSize(e.target.value ? +e.target.value : undefined)}
+										min={1}
+										className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
+									/>
+								</div>
+								<div>
+									<label htmlFor="translation-parallelRequests"
+										className="text-body font-medium"
+										title={t("translate.parallelTitle")}
+									>{t("translate.parallelRequests")}
+									</label>
+									<select id="translation-parallelRequests"
+										value={maxConcurrent ?? ""}
+										onChange={(e) => setMaxConcurrent(e.target.value ? +e.target.value : undefined)}
+										className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
+									>
+										<option value="">{t("common.providerDefault")}</option>
+										{Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+											<option key={n} value={n}>
+												{n}
+											</option>
+										))}
+									</select>
+								</div>
+								<div>
+									<label htmlFor="translation-costLimit" className="text-body font-medium">{t("translate.costLimit")}</label>
+									<input id="translation-costLimit"
+										value={costLimit}
+										onChange={(e) => setCostLimit(e.target.value)}
+										placeholder={t("translate.noLimit")}
+										className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
+									/>
+								</div>
+							</div>
+							<p className="text-body text-text-muted">
+								{t("translate.pending", { count: totalPending })}
+							</p>
+							{startError && (
+								<div className="p-2 bg-danger-muted border border-danger rounded text-body text-danger">
+									{startError}
+								</div>
+							)}
+							<TranslationEstimate estimate={estimate} />
+						</div>
+					)}
+
+					{step === "progress" && (
+						<div className="space-y-4">
+							<div className="w-full bg-border rounded-full h-3">
+								<div
+									className={`h-3 rounded-full transition-all ${error ? "bg-danger" : completedWithErrors ? "bg-warning" : "bg-accent"}`}
+									style={{ width: `${progressPercent}%` }}
+								/>
+							</div>
+							<div className={`text-center text-body ${error ? "text-danger" : completedWithErrors ? "text-warning" : ""}`}>
+								{error
+									? t("translate.failed")
+									: completedWithErrors
+										? t("translate.completedWithErrors")
+										: done
+											? t("translate.complete")
+											: cancelled
+												? t("translate.cancelled")
+												: `${completed} / ${total}`}
+								{` · ${formatObservedCost(costSoFar, jobSnapshot?.costIsComplete, t)}`}
+							</div>
+							{activeProviderLabel && !done && !cancelled && !error && (
+								<div className="text-caption text-center text-accent-fg">
+									{t("translate.usingProvider", { name: activeProviderLabel })}
+								</div>
+							)}
+							{lastTranslated && !done && !cancelled && !error && (
+								<div className="text-caption text-text-muted truncate">
+									{t("translate.last", { text: lastTranslated })}
+								</div>
+							)}
+							{disconnected && (
+								<div role="status" className="p-2 bg-warning-muted border border-warning rounded text-body text-warning space-y-2">
+									<p>{t("translate.connectionLost")}</p>
+									<p>{t("translate.connectionLostHint")}</p>
+									<button
+										onClick={reconnectTranslationJob}
+										className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
+									>
+										{t("translate.reconnect")}
+									</button>
+								</div>
+							)}
+							{error && (
+								<div className="p-2 bg-danger-muted border border-danger rounded text-body text-danger">
+									{error}
+								</div>
+							)}
+							{completedWithErrors && batchFailures && (
+								<div role="status" className="p-2 bg-warning-muted border border-warning rounded text-body text-warning space-y-1">
+									<p>{t("translate.completedWithErrorsSummary", { translated: completed, count: batchFailures.count })}</p>
+									<p className="whitespace-pre-wrap break-words">{batchFailures.lastReason}</p>
+									<p>{t("translate.pendingRetryHint")}</p>
+								</div>
 							)}
 						</div>
-						<div className="grid grid-cols-2 gap-3">
-							<div>
-								<label htmlFor="translation-source" className="text-body font-medium">{t("translate.source")}</label>
-								<select id="translation-source"
-									value={sourceLang}
-									onChange={(e) => setSourceLang(e.target.value)}
-									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-								>
-									<option value="auto">{t("translate.autoDetect")}</option>
-									{LANGUAGES.map((l) => (
-										<option key={l.code} value={l.code}>
-											{l.label}
-										</option>
-									))}
-								</select>
-							</div>
-							<div>
-								<label htmlFor="translation-target" className="text-body font-medium">{t("translate.target")}</label>
-								<select id="translation-target"
-									value={targetLang}
-									onChange={(e) => setTargetLang(e.target.value)}
-									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-								>
-									{LANGUAGES.map((l) => (
-										<option key={l.code} value={l.code}>
-											{l.label}
-										</option>
-									))}
-								</select>
-							</div>
-						</div>
-						<div>
-							<label htmlFor="translation-gameContext" className="text-body font-medium">{t("translate.gameContext")}</label>
-							<textarea id="translation-gameContext"
-								value={gameContext}
-								onChange={(e) => setGameContext(e.target.value)}
-								rows={2}
-								placeholder={t("translate.gameContextPlaceholder")}
-								className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-							/>
-						</div>
-						<div className="flex items-center gap-4">
-							<label className="flex items-center gap-2 text-body">
-								<input
-									type="checkbox"
-									checked={useGlossary}
-									onChange={(e) => setUseGlossary(e.target.checked)}
-								/>{" "}
-								{t("translate.useGlossary")}
-							</label>
-							<button
-								type="button"
-								onClick={() => openSettings("manage-glossary")}
-								className="text-caption font-medium text-accent-fg hover:underline"
-							>
-								{t("translate.manageGlossary")}
-							</button>
-							<label className="flex items-center gap-2 text-body">
-								<input
-									type="checkbox"
-									checked={useMemory}
-									onChange={(e) => setUseMemory(e.target.checked)}
-								/>{" "}
-								{t("translate.useMemory")}
-							</label>
-						</div>
-                        {(providerId === "grok" || providerId === "grok-sub") && (
-                            <button type="button" className="text-body text-accent-fg underline"
-                                onClick={() => { setBatchSize(10); setMaxConcurrent(10); }}>
-                                {t("translate.grokThroughputPreset")}
-                            </button>
-                        )}
-						<div className="grid grid-cols-3 gap-3">
-							<div>
-								<label htmlFor="translation-batchSize" className="text-body font-medium">{t("translate.batchSize")}</label>
-								<input id="translation-batchSize"
-									type="number"
-									value={batchSize ?? ""}
-									placeholder={t("common.providerDefault")}
-									onChange={(e) => setBatchSize(e.target.value ? +e.target.value : undefined)}
-									min={1}
-									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-								/>
-							</div>
-							<div>
-								<label htmlFor="translation-parallelRequests"
-									className="text-body font-medium"
-									title={t("translate.parallelTitle")}
-								>{t("translate.parallelRequests")}
-								</label>
-								<select id="translation-parallelRequests"
-									value={maxConcurrent ?? ""}
-									onChange={(e) => setMaxConcurrent(e.target.value ? +e.target.value : undefined)}
-									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-								>
-									<option value="">{t("common.providerDefault")}</option>
-									{Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
-										<option key={n} value={n}>
-											{n}
-										</option>
-									))}
-								</select>
-							</div>
-							<div>
-								<label htmlFor="translation-costLimit" className="text-body font-medium">{t("translate.costLimit")}</label>
-								<input id="translation-costLimit"
-									value={costLimit}
-									onChange={(e) => setCostLimit(e.target.value)}
-									placeholder={t("translate.noLimit")}
-									className="mt-1 w-full p-2 border border-border rounded bg-surface text-body text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
-								/>
-							</div>
-						</div>
-						<p className="text-body text-text-muted">
-							{t("translate.pending", { count: totalPending })}
-						</p>
-						{startError && (
-							<div className="p-2 bg-danger-muted border border-danger rounded text-body text-danger">
-								{startError}
-							</div>
-						)}
-						<TranslationEstimate estimate={estimate} />
+					)}
+				</div>
+
+				<footer className="shrink-0 border-t border-border bg-surface p-6 rounded-b-lg">
+					{step === "configure" && (
 						<button
 							onClick={handleStart}
 							disabled={estimate.pending}
@@ -542,96 +606,43 @@ export default function TranslationModal({
 						>
 							{t("translate.start")}
 						</button>
-					</div>
-				)}
-
-				{step === "progress" && (
-					<div className="space-y-4">
-						<div className="w-full bg-border rounded-full h-3">
-							<div
-								className={`h-3 rounded-full transition-all ${error ? "bg-danger" : completedWithErrors ? "bg-warning" : "bg-accent"}`}
-								style={{ width: `${progressPercent}%` }}
-							/>
-						</div>
-						<div className={`text-center text-body ${error ? "text-danger" : completedWithErrors ? "text-warning" : ""}`}>
-							{error
-								? t("translate.failed")
-								: completedWithErrors
-									? t("translate.completedWithErrors")
-									: done
-										? t("translate.complete")
-										: cancelled
-											? t("translate.cancelled")
-											: `${completed} / ${total}`}
-							{` · ${formatObservedCost(costSoFar, jobSnapshot?.costIsComplete, t)}`}
-						</div>
-						{activeProviderLabel && !done && !cancelled && !error && (
-							<div className="text-caption text-center text-accent-fg">
-								{t("translate.usingProvider", { name: activeProviderLabel })}
-							</div>
-						)}
-						{lastTranslated && !done && !cancelled && !error && (
-							<div className="text-caption text-text-muted truncate">
-								{t("translate.last", { text: lastTranslated })}
-							</div>
-						)}
-						{disconnected && (
-							<div role="status" className="p-2 bg-warning-muted border border-warning rounded text-body text-warning space-y-2">
-								<p>{t("translate.connectionLost")}</p>
-								<p>{t("translate.connectionLostHint")}</p>
+					)}
+					{step === "progress" && (
+						<>
+							{!done && !cancelled && !error && (
 								<button
-									onClick={reconnectTranslationJob}
-									className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
+									onClick={handleCancel}
+									disabled={cancelling}
+									className="w-full py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
 								>
-									{t("translate.reconnect")}
+									{cancelling ? t("translate.cancelling") : t("translate.cancel")}
 								</button>
-							</div>
-						)}
-						{error && (
-							<div className="p-2 bg-danger-muted border border-danger rounded text-body text-danger">
-								{error}
-							</div>
-						)}
-						{completedWithErrors && batchFailures && (
-							<div role="status" className="p-2 bg-warning-muted border border-warning rounded text-body text-warning space-y-1">
-								<p>{t("translate.completedWithErrorsSummary", { translated: completed, count: batchFailures.count })}</p>
-								<p className="whitespace-pre-wrap break-words">{batchFailures.lastReason}</p>
-								<p>{t("translate.pendingRetryHint")}</p>
-							</div>
-						)}
-						{!done && !cancelled && !error && (
-							<button
-								onClick={handleCancel}
-								disabled={cancelling}
-								className="w-full py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
-							>
-								{cancelling ? t("translate.cancelling") : t("translate.cancel")}
-							</button>
-						)}
-						{(done || cancelled || error) && (
-							<div className="flex gap-2">
-								<button
-									onClick={handleClose}
-									className={`w-full py-2 rounded font-medium ${
-										done && onReview
-											? "bg-surface-muted text-text hover:bg-surface"
-											: "bg-accent hover:bg-accent-hover text-white"
-									}`}
-								>
-									{t("common.close")}
-								</button>
-								{done && onReview && (
+							)}
+							{(done || cancelled || error) && (
+								<div className="flex gap-2">
 									<button
-										onClick={handleReview}
-										className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
+										onClick={handleClose}
+										className={`w-full py-2 rounded font-medium ${
+											done && onReview
+												? "bg-surface-muted text-text hover:bg-surface"
+												: "bg-accent hover:bg-accent-hover text-white"
+										}`}
 									>
-										{t("translate.review")}
+										{t("common.close")}
 									</button>
-								)}
-							</div>
-						)}
-					</div>
-				)}
+									{done && onReview && (
+										<button
+											onClick={handleReview}
+											className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium"
+										>
+											{t("translate.review")}
+										</button>
+									)}
+								</div>
+							)}
+						</>
+					)}
+				</footer>
 			</div>
 		</div>
 	);

@@ -205,9 +205,9 @@ export default function SearchReplaceModal({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-lg p-6")}
+				className={modalPanelClass("max-w-lg max-h-[calc(100vh-2rem)] flex flex-col my-4")}
 			>
-				<div className="flex justify-between items-center mb-4">
+				<header className="flex justify-between items-center shrink-0 p-6 border-b border-border">
 					<h2
 						{...titleProps}
 						className="text-section font-bold flex items-center gap-2"
@@ -220,9 +220,9 @@ export default function SearchReplaceModal({
 					>
 						<X size={20} />
 					</button>
-				</div>
+				</header>
 
-				<div className="space-y-3">
+				<div className="flex-1 min-h-0 overflow-y-auto p-6 space-y-3">
 					<div>
 						<label className="text-body font-medium">{t("replace.find")}</label>
 						<input
@@ -295,34 +295,34 @@ export default function SearchReplaceModal({
 							)}
 						</div>
 					)}
-
-					<div className={clsx(MODAL_FOOTER_CLASS, "-mx-6 -mb-6")}>
-						<button
-							onClick={onClose}
-							className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted"
-						>
-							{t("common.cancel")}
-						</button>
-						<button
-							onClick={() => {
-								void runPreview();
-							}}
-							disabled={loading || !find}
-							className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted disabled:opacity-50"
-						>
-							{loading ? "…" : t("replace.previewBtn")}
-						</button>
-						<button
-							onClick={() => {
-								void runReplace();
-							}}
-							disabled={loading || !find}
-							className="px-4 py-2 text-body font-medium rounded border border-danger bg-danger-muted hover:bg-danger-muted/80 disabled:opacity-50 text-danger"
-						>
-							{loading ? t("replace.replacing") : t("replace.replaceAll")}
-						</button>
-					</div>
 				</div>
+
+				<footer className={clsx(MODAL_FOOTER_CLASS, "shrink-0 bg-surface rounded-b-lg")}>
+					<button
+						onClick={onClose}
+						className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted"
+					>
+						{t("common.cancel")}
+					</button>
+					<button
+						onClick={() => {
+							void runPreview();
+						}}
+						disabled={loading || !find}
+						className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted disabled:opacity-50"
+					>
+						{loading ? "…" : t("replace.previewBtn")}
+					</button>
+					<button
+						onClick={() => {
+							void runReplace();
+						}}
+						disabled={loading || !find}
+						className="px-4 py-2 text-body font-medium rounded border border-danger bg-danger-muted hover:bg-danger-muted/80 disabled:opacity-50 text-danger"
+					>
+						{loading ? t("replace.replacing") : t("replace.replaceAll")}
+					</button>
+				</footer>
 			</div>
 		</div>
 	);
