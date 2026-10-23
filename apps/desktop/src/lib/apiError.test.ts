@@ -14,6 +14,22 @@ import { getLocale, setLocale, t } from "./i18n";
 
 // core/validation.rs's fixed refusal (no source/target prose) + core/error.rs Display.
 const yurisEncodingRefusal = "injection error: translation cannot be encoded as Shift-JIS for the declared YU-RIS quoted literal; injection is refused before backup or output; the original game and saved translation remain unchanged";
+test("inject language and output containment errors have EN/ES guidance", () => {
+	const cases = [
+		["invalid target language code: use 1 to 35 ASCII letters, digits, '-' or '_'", "api.error.invalidTargetLanguageCode"],
+		["Replace destination must be a direct child of output_dir", "api.error.replaceOutputContainment"],
+	] as const;
+	for (const locale of ["en", "es"] as const) {
+		setLocale(locale);
+		for (const [reason, key] of cases) {
+			for (const frame of ["", "500: "]) {
+				const error = new ApiError(`${frame}injection error: ${reason}`);
+				assert.equal(error.key, key);
+				assert.equal(error.message, t(key));
+			}
+		}
+	}
+});
 const yurisEncodingGuidance = {
 	en: "The translation cannot be represented in Shift-JIS for the declared YU-RIS quoted literal. Injection was refused before backup or output creation; the original game and saved translation remain unchanged. Run Validate and review encoding issues. Use a supported target language; do not remove accents to force injection. This does not enable Unicode in the game.",
 	es: "La traducción no se puede representar en Shift-JIS para el literal entre comillas de YU-RIS declarado. Se rechazó la inyección antes de crear copias de seguridad o archivos de salida; el juego original y la traducción guardada permanecen intactos. Ejecute Validar y revise los problemas de codificación. Use un idioma de destino compatible; no elimine los acentos para forzar la inyección. Esto no habilita Unicode en el juego.",

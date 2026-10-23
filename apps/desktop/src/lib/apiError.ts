@@ -69,6 +69,10 @@ const EXACT: Record<string, MessageKey> = {
 // Match the original line so trimming cannot turn a multiline diagnostic into guidance.
 // ProviderError adds its prefix in core/error.rs:14; batch entry-ID errors are bare.
 const SINGLE_LINE_EXACT: Record<string, MessageKey> = {
+	"injection error: invalid target language code: use 1 to 35 ASCII letters, digits, '-' or '_'":
+		"api.error.invalidTargetLanguageCode",
+	"injection error: Replace destination must be a direct child of output_dir":
+		"api.error.replaceOutputContainment",
 	"provider error: xAI session expired — run `locust auth grok` to log in again": "api.error.grokSessionExpired",
 	"provider error: provider request timeout: retry deadline exceeded": "api.error.providerConnection",
 	"provider error: cannot enforce a cost limit: this provider has no cost estimate": "api.error.unknownProviderCost",

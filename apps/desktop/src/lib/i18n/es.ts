@@ -2,6 +2,10 @@ import type { en } from "./en";
 
 /** Spanish UI catalog. Missing keys are a compile error. Neutral professional Spanish. */
 export const es: Record<keyof typeof en, string> = {
+  "api.error.invalidTargetLanguageCode":
+    "Código de idioma de destino no válido: use entre 1 y 35 letras ASCII, dígitos, '-' o '_'.",
+  "api.error.replaceOutputContainment":
+    "El destino de Reemplazar debe estar directamente dentro de la carpeta de salida. Seleccione otra carpeta de salida.",
   "estimate.title": "Estimación previa",
   "estimate.request": "Estimar",
   "estimate.refresh": "Actualizar estimación",

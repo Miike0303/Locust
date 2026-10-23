@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 use crate::backup::{BackupManager, RevisionOriginal};
 use crate::database::{Database, EntryFilter, RecordedBackup};
 use crate::error::{LocustError, Result};
+use crate::language_code::validate_language_code;
 use crate::models::{OutputMode, ProgressEvent, StringEntry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
@@ -295,6 +296,9 @@ pub fn inject_direct(
     format_id: &str,
     languages: &[String],
 ) -> Result<DirectInjectReport> {
+    for language in languages {
+        validate_language_code(language)?;
+    }
     if languages.len() > 1 {
         return Err(LocustError::InjectionError(
             "one project database can inject only one target language per run; use a separate pivot/database for each target language"
@@ -931,6 +935,9 @@ impl MultiLangInjector {
         output_dir: Option<PathBuf>,
         tx: mpsc::Sender<ProgressEvent>,
     ) -> Result<MultiLangReport> {
+        for language in &languages {
+            validate_language_code(language)?;
+        }
         let mode = options.mode;
         if options.require_binary_slot_fit && mode != OutputMode::Replace {
             return Err(LocustError::InjectionError(
@@ -1010,6 +1017,19 @@ impl MultiLangInjector {
         output_dir: PathBuf,
         tx: mpsc::Sender<ProgressEvent>,
     ) -> Result<MultiLangReport> {
+        let game_name = project_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        // Preflight every destination before acquiring a lock or making a backup.
+        let destinations = languages
+            .iter()
+            .map(|lang| {
+                let dest = output_dir.join(format!("{game_name}-{lang}"));
+                ensure_replace_destination(&output_dir, &dest)?;
+                Ok((lang, dest))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let selected = project_path.canonicalize()?;
         let source_root = if selected.is_file() {
             selected.parent().unwrap()
@@ -1040,16 +1060,8 @@ impl MultiLangInjector {
         let mut injected_roots = HashMap::new();
         let mut recording_outcomes = HashMap::new();
 
-        let game_name = project_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
         // inject accepts exactly one language, which consumes the loaded rows.
-        for (idx, (lang, entries)) in languages.iter().zip([entries]).enumerate() {
-            let dest = output_dir.join(format!("{}-{}", game_name, lang));
-
+        for (idx, ((lang, dest), entries)) in destinations.into_iter().zip([entries]).enumerate() {
             let dest_lock = match copy_dir_for_inject_under_lock(&selected, &dest, &source_lock) {
                 Ok(lock) => lock,
                 Err(e) => {
@@ -1617,6 +1629,24 @@ pub fn record_multilang_injection(
     Ok(outcomes)
 }
 
+/// Check path components without requiring the output directories to exist.
+/// Parent steps in the suffix are refused rather than followed outside the root.
+fn ensure_replace_destination(output_dir: &Path, dest: &Path) -> Result<()> {
+    let output_dir = std::path::absolute(output_dir)?;
+    let dest = std::path::absolute(dest)?;
+    let direct_child = dest.strip_prefix(&output_dir).is_ok_and(|relative| {
+        let mut components = relative.components();
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+    });
+    if !direct_child {
+        return Err(LocustError::InjectionError(
+            "Replace destination must be a direct child of output_dir".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn copy_dir_for_inject(src: &Path, dst: &Path) -> Result<()> {
     let source = src.canonicalize()?;
@@ -1722,6 +1752,31 @@ fn copy_dir_for_inject_under_lock(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replace_destination_requires_one_normal_child_component() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        for suffix in ["game-es", "game-pt-BR", "./game-zh_CN"] {
+            assert!(ensure_replace_destination(&output, &output.join(suffix)).is_ok());
+        }
+        for dest in [
+            output.clone(),
+            output.join("."),
+            output.join(".."),
+            output.join("../evil"),
+            output.join("nested/game-es"),
+            output.join("game-es/../../evil"),
+            temp.path().join("elsewhere/game-es"),
+        ] {
+            let error = ensure_replace_destination(&output, &dest).unwrap_err();
+            assert!(
+                error.to_string().contains("direct child"),
+                "{dest:?}: {error}"
+            );
+        }
+        assert!(!output.exists());
+    }
+
     // Exercise the locked preparation body without acquiring the OS lock. The
     // full public injection/restore workflow is covered in direct_after_restore.
     fn restored_direct_fixture() -> (tempfile::TempDir, Database, BackupManager, PathBuf) {

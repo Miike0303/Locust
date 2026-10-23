@@ -1,5 +1,9 @@
 /** English UI catalog. Keys are dotted namespaces. Keep in sync with es.ts. */
 export const en = {
+  "api.error.invalidTargetLanguageCode":
+    "Invalid target language code: use 1 to 35 ASCII letters, digits, '-' or '_'.",
+  "api.error.replaceOutputContainment":
+    "The Replace destination must be directly inside the output folder. Choose another output folder.",
   "estimate.title": "Prospective estimate",
   "estimate.request": "Estimate",
   "estimate.refresh": "Refresh estimate",
