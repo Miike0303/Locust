@@ -126,11 +126,21 @@ export default function PatchModal({
 		report: PatchRollbackResult;
 	} | null>(null);
 	const [packResult, setPackResult] = useState<PatchPackResult | null>(null);
-	const [status, setStatus] = useState<PatchStatusResult | null>(null);
-	const [error, setError] = useState<string | null>(null);
+	const [statusSnapshot, setStatusSnapshot] = useState<{
+		gamePath: string;
+		report: PatchStatusResult;
+	} | null>(null);
+	const status = statusSnapshot?.gamePath === gamePath.trim() ? statusSnapshot.report : null;
+	const [errorSnapshot, setErrorSnapshot] = useState<{
+		gamePath: string;
+		message: string;
+	} | null>(null);
+	const error = errorSnapshot?.gamePath === gamePath.trim() ? errorSnapshot.message : null;
+	const setError = (message: string | null) => {
+		setErrorSnapshot(message === null ? null : { gamePath: gamePath.trim(), message });
+	};
 	const [applying, setApplying] = useState(false);
 	const [cancellingApply, setCancellingApply] = useState(false);
-	const [needsRollback, setNeedsRollback] = useState(false);
 	const [applyProgress, setApplyProgress] = useState<{
 		current: number;
 		total: number;
@@ -339,15 +349,20 @@ export default function PatchModal({
 	};
 
 	const refreshStatus = async () => {
-		if (!gamePath.trim()) return;
+		// Capture the requested game before awaiting; selection can change in flight.
+		const requestedGamePath = gamePath.trim();
+		if (!requestedGamePath) return null;
+		setError(null);
 		setRollbackPreview(null);
 		try {
-			const s = await patchStatus({ game_path: gamePath.trim() });
-			setStatus(s);
+			const report = await patchStatus({ game_path: requestedGamePath });
+			setStatusSnapshot({ gamePath: requestedGamePath, report });
 			onPatchStateChanged?.();
+			return report;
 		} catch (err: any) {
-			setStatus(null);
+			setStatusSnapshot(null);
 			setError(err.message);
+			return null;
 		}
 	};
 
@@ -419,26 +434,28 @@ export default function PatchModal({
 		cancelled: boolean;
 		error?: string;
 	}) => {
-		setNeedsRollback(true);
-		if (opts.cancelled) {
-			addLog(
-				"warning",
-				t("activity.patch.cancelledPartial"),
-				undefined,
-				"patch",
-			);
-			addToast("warning", t("patch.toast.applyCancelled"));
-		} else {
-			const message = opts.error ?? t("ws.patchJobStreamLost");
-			setError(message);
-			addLog("error", t("activity.patch.applyFailed"), message, "patch");
-			addToast(
-				"warning",
-				t("patch.toast.applyFailedPartial", { error: message }),
-			);
-		}
 		try {
-			await refreshStatus();
+			// A refusal or lost stream does not prove writes occurred. The journal
+			// for the apply's game is the authority for recovery, even after selection changes.
+			const currentStatus = await refreshStatus();
+			const partial = currentStatus?.status === "interrupted";
+			const unknown = !currentStatus || currentStatus.status === "unknown";
+			const raw = opts.error ?? t("ws.patchJobStreamLost");
+			const message = unknown ? t("patch.stateUnknown") : opts.cancelled
+				? t(partial ? "patch.toast.applyCancelled" : "patch.toast.applyCancelledSafe")
+				: t(partial ? "patch.toast.applyFailedPartial" : "patch.toast.applyFailed", { error: raw });
+			setError(message);
+			if (opts.cancelled) {
+				addLog(
+					partial || unknown ? "warning" : "info",
+					partial ? t("activity.patch.cancelledPartial") : message,
+					opts.error,
+					"patch",
+				);
+			} else {
+				addLog("error", t("activity.patch.applyFailed"), raw, "patch");
+			}
+			addToast(partial || opts.cancelled ? "warning" : "error", message);
 		} finally {
 			setApplying(false);
 			setCancellingApply(false);
@@ -463,7 +480,7 @@ export default function PatchModal({
 		setError(null);
 		setApplyResult(null);
 		setApplyProgress(null);
-		setNeedsRollback(false);
+		setStatusSnapshot(null);
 		setApplying(true);
 		setCancellingApply(false);
 		applyFinishedRef.current = false;
@@ -519,30 +536,17 @@ export default function PatchModal({
 						applyFinishedRef.current = true;
 						applyUnsubRef.current = null;
 						applyJobIdRef.current = null;
-						if (applyCancelRequestedRef.current) {
-							void finishApplyInterrupted({ cancelled: true });
-							return;
-						}
-						const message = t("ws.patchJobStreamLost");
-						setError(message);
-						addLog("error", t("activity.patch.applyFailed"), message, "patch");
-						addToast(
-							"error",
-							t("patch.toast.applyFailed", { error: message }),
-						);
-						setApplying(false);
-						setCancellingApply(false);
+						void finishApplyInterrupted({
+							cancelled: applyCancelRequestedRef.current,
+							error: t("ws.patchJobStreamLost"),
+						});
 					},
 				},
 				"patch",
 			);
 		} catch (err: any) {
 			applyFinishedRef.current = true;
-			setError(err.message);
-			addLog("error", t("activity.patch.applyFailed"), err.message, "patch");
-			addToast("error", t("patch.toast.applyFailed", { error: err.message }));
-			setApplying(false);
-			setCancellingApply(false);
+			await finishApplyInterrupted({ cancelled: false, error: err.message });
 		}
 	};
 
@@ -619,7 +623,6 @@ export default function PatchModal({
 						deleted: report.deleted,
 					}),
 				);
-				setNeedsRollback(false);
 			}
 			addLog(
 				"info",
@@ -700,8 +703,7 @@ export default function PatchModal({
 		}
 	};
 
-	const showPartialWarning =
-		needsRollback || status?.status === "interrupted";
+	const showPartialWarning = status?.status === "interrupted";
 
 	const tabBtn = (id: Tab, label: string) => (
 		<button
@@ -805,7 +807,7 @@ export default function PatchModal({
 							handlePreviewRollback={handlePreviewRollback}
 							handleRollback={handleRollback}
 							showPartialWarning={showPartialWarning}
-							refreshStatus={refreshStatus}
+							refreshStatus={async () => { await refreshStatus(); }}
 							applyProgress={applyProgress}
 							handleCancelApply={handleCancelApply}
 							cancellingApply={cancellingApply}

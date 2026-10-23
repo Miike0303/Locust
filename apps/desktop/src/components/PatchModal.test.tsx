@@ -24,7 +24,7 @@ const h = {
       this.effects.push(fn);
     }
   },
-  jobHandlers: null as null | { onDone(event: any): void; onError(error: Error): void },
+  jobHandlers: null as null | { onDone(event: any): void; onError(error: { message: string }): void; onClosed(): void },
   state(initial: unknown) {
     const index = this.cursor++;
     if (!(index in this.values)) this.values[index] = typeof initial === "function" ? initial() : initial;
@@ -64,6 +64,10 @@ let failed = false;
 let deferred: (() => void) | null = null;
 let deferRollback = false;
 let status = "interrupted";
+let statusFailed = false;
+let applyStartFailed = false;
+let deferStatus = false;
+let deferredStatus: (() => void) | null = null;
 let recordedRoot = "/copies/game.pck-es";
 let report = {
   restored: 2, deleted: 1, baseline: "Pristine", dry_run: true,
@@ -89,7 +93,12 @@ globalThis.fetch = async (url, init) => {
   if (path.endsWith("/patch/recordings")) return new Response(JSON.stringify({ languages: ["es"], pristine_languages: ["es"], roots: { es: recordedRoot } }));
   if (path.endsWith("/config")) return new Response(JSON.stringify({ default_target_lang: "es" }));
   if (path.endsWith("/patch/pack")) return new Response(JSON.stringify({ patch_id: "godot", patch_version: "1", files_packed: 1, size_bytes: 200, tier: "Strict" }));
-  if (path.endsWith("/patch/apply")) return new Response(JSON.stringify({ job_id: "test-job" }));
+  if (path.endsWith("/patch/apply")) return new Response(applyStartFailed ? "pre-write refusal" : JSON.stringify({ job_id: "test-job" }), { status: applyStartFailed ? 400 : 200 });
+  if (path.endsWith("/patch/status")) {
+    const response = new Response(statusFailed ? "status unavailable" : JSON.stringify({ status, patch_id: "test-patch" }), { status: statusFailed ? 500 : 200 });
+    if (deferStatus) await new Promise<void>(resolve => { deferredStatus = resolve; });
+    return response;
+  }
   if (path.endsWith("/patch/verify")) return new Response(JSON.stringify({
     outcome: "Clean", tier: "Strict", replaced: ["data/original.txt"], added: [], conflicts: [],
     messages: ["verification retained"], backup_compromised: false, manifest: {},
@@ -131,7 +140,8 @@ function reset(locale: "en" | "es") {
   setLocale(locale);
   h.values = []; h.changed = 0; h.toasts = []; h.logs = [];
   calls.length = 0; failed = false; deferRollback = false; deferred = null;
-  status = "interrupted"; h.jobHandlers = null;
+  status = "interrupted"; statusFailed = false; applyStartFailed = false;
+  deferStatus = false; deferredStatus = null; h.jobHandlers = null;
   report = { restored: 2, deleted: 1, baseline: "Pristine", dry_run: true,
     messages: ["preview <message>"], aborted_edited: ["data/user<edit>.txt"], torn_deleted: [] };
   render();
@@ -239,7 +249,7 @@ test("a successful preview does not clear the modal's recovery warning after an 
   await verifyAndInterrupt();
   await button(t("patch.applyBtn")).props.onClick();
   assert.ok(h.jobHandlers);
-  status = "not_patched"; // Warning must be driven by needsRollback, not status.
+  status = "interrupted"; // Recovery follows the refreshed backend journal.
   h.jobHandlers.onError(new Error("partial apply"));
   for (let i = 0; button(t("patch.applyBtn")).props.disabled && i < 20; i++) {
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -253,6 +263,123 @@ test("a successful preview does not clear the modal's recovery warning after an 
   assert.equal(calls.length, 1);
   assert.equal(h.changed, 0);
   assert.deepEqual(h.toasts, []);
+});
+
+function selectSource() {
+  nodes(render()).find(node => node.type === "input" && node.props.placeholder === t("patch.zipPlaceholder"))
+    .props.onChange({ target: { value: "/patch.zip" } });
+}
+function selectGame(path: string) {
+  nodes(render()).find(node => node.type === "input" && node.props.placeholder === t("patch.placeholder.game"))
+    .props.onChange({ target: { value: path } });
+}
+async function settleApply() {
+  for (let i = 0; button(t("patch.applyBtn")).props.disabled && i < 30; i++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  assert.equal(button(t("patch.applyBtn")).props.disabled, false);
+}
+function assertRecovery(expected: boolean) {
+  const html = renderToStaticMarkup(render());
+  assert.equal(html.includes(t("patch.partialWarning")), expected);
+  assert.equal(html.includes(t("patch.rollbackNow")), expected);
+}
+for (const locale of ["en", "es"] as const) {
+  for (const terminal of ["job error", "stream loss", "start refusal"] as const) {
+    test(`${locale} ${terminal} before writes refreshes status without partial warning or rollback prompt`, async () => {
+      reset(locale); selectSource();
+      // A stale interrupted status must be replaced by the post-failure status.
+      await button(t("patch.refreshStatus")).props.onClick();
+      status = "not_patched";
+      calls.length = 0;
+      applyStartFailed = terminal === "start refusal";
+      await button(t("patch.applyBtn")).props.onClick();
+      if (terminal === "job error") h.jobHandlers!.onError({ message: "pre-write refusal" });
+      if (terminal === "stream loss") h.jobHandlers!.onClosed();
+      await settleApply();
+      assert.deepEqual(calls.filter(call => call.url.endsWith("/patch/status")).map(call => call.body), [{ game_path: "/game" }]);
+      assertRecovery(false);
+      assert.ok(!h.toasts.some(([, message]) => String(message).includes(t("patch.toast.applyFailedPartial", { error: "pre-write refusal" }))));
+      assert.ok(!h.toasts.some(([level]) => level === "success"));
+    });
+  }
+  for (const partial of [false, true]) {
+    test(`${locale} cancellation shows recovery only for refreshed interrupted status (partial=${partial})`, async () => {
+      reset(locale); selectSource();
+      status = partial ? "interrupted" : "not_patched";
+      await button(t("patch.applyBtn")).props.onClick();
+      await button(t("patch.cancelApply")).props.onClick();
+      h.toasts = []; h.logs = [];
+      h.jobHandlers!.onError({ message: "cancelled" });
+      await settleApply();
+      assert.deepEqual(calls.filter(call => call.url.endsWith("/patch/status")).map(call => call.body), [{ game_path: "/game" }]);
+      assertRecovery(partial);
+      const message = partial ? t("patch.toast.applyCancelled") : locale === "en"
+        ? "Apply cancelled. Patch status does not report a partial application."
+        : "Aplicación cancelada. El estado del parche no indica una aplicación parcial.";
+      assert.deepEqual(h.toasts, [["warning", message]]);
+      assert.equal(h.logs.some(([, title]) => title === t("activity.patch.cancelledPartial")), partial);
+    });
+  }
+  for (const terminal of ["job error", "stream loss", "start refusal", "cancelled"] as const) {
+    for (const lookupFails of [false, true]) {
+      test(`${locale} ${terminal} reports state unknown when ${lookupFails ? "status lookup fails" : "backend status is unknown"}`, async () => {
+        reset(locale); selectSource();
+        await button(t("patch.refreshStatus")).props.onClick();
+        statusFailed = lookupFails; status = "unknown";
+        applyStartFailed = terminal === "start refusal";
+        await button(t("patch.applyBtn")).props.onClick();
+        if (terminal === "cancelled") await button(t("patch.cancelApply")).props.onClick();
+        if (terminal !== "start refusal") { h.toasts = []; h.logs = []; }
+        if (terminal === "stream loss") h.jobHandlers!.onClosed();
+        if (terminal === "job error" || terminal === "cancelled") h.jobHandlers!.onError({ message: "apply stopped" });
+        await settleApply();
+        const message = locale === "en" ? "Game state unknown. Check patch status before continuing."
+          : "Estado del juego desconocido. Compruebe el estado del parche antes de continuar.";
+        assert.ok(renderToStaticMarkup(render()).includes(message));
+        assertRecovery(false);
+        assert.ok(h.toasts.some(([, text]) => String(text).includes(message)));
+        assert.ok(!h.toasts.some(([level]) => level === "success"));
+        assert.ok(!h.logs.some(([, title]) => title === t("activity.patch.cancelledPartial")));
+      });
+    }
+  }
+}
+
+test("status recorded for game A is ignored after selecting game B", async () => {
+  reset("en");
+  await button(t("patch.refreshStatus")).props.onClick();
+  assertRecovery(true);
+  selectGame("/other-game");
+  assertRecovery(false);
+  assert.ok(!renderToStaticMarkup(render()).includes(t("patch.interrupted", { id: "test-patch" })));
+});
+
+test("an in-flight status response for game A cannot supply recovery for game B", async () => {
+  reset("en");
+  deferStatus = true;
+  const pending = button(t("patch.refreshStatus")).props.onClick();
+  for (let i = 0; !deferredStatus && i < 20; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(deferredStatus);
+  selectGame("/other-game");
+  deferredStatus!(); await pending;
+  assertRecovery(false);
+  selectGame("/game");
+  assertRecovery(true);
+});
+
+test("apply interruption refreshes its original game and hides its recovery message on another game", async () => {
+  reset("en"); selectSource();
+  await button(t("patch.applyBtn")).props.onClick();
+  selectGame("/other-game");
+  calls.length = 0;
+  h.jobHandlers!.onError({ message: "apply stopped" });
+  await settleApply();
+  assert.deepEqual(calls.filter(call => call.url.endsWith("/patch/status")).map(call => call.body), [{ game_path: "/game" }]);
+  assertRecovery(false);
+  assert.ok(!renderToStaticMarkup(render()).includes("apply stopped"));
+  selectGame("/game");
+  assertRecovery(true);
 });
 
 for (const recovery of [false, true]) test(`${recovery ? "recovery" : "regular"} real rollback still omits dry_run and resets verification, refreshes status and reports success`, async () => {

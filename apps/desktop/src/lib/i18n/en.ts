@@ -1092,6 +1092,8 @@ export const en = {
   "patch.toast.applyFailed": "Apply failed: {error}",
   "patch.toast.applyCancelled": "Apply cancelled. The game was left partly patched and may not launch until you roll back.",
   "patch.toast.applyFailedPartial": "Apply failed: {error}. The game was left partly patched and may not launch until you roll back.",
+  "patch.stateUnknown": "Game state unknown. Check patch status before continuing.",
+  "patch.toast.applyCancelledSafe": "Apply cancelled. Patch status does not report a partial application.",
   "patch.partialWarning": "The game was left partly patched and may not launch. Roll back to restore the original files.",
   "patch.rollbackNow": "Roll back now",
   "patch.toast.applyCancelling": "Cancelling patch apply…",

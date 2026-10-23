@@ -1071,6 +1071,8 @@ export const es: Record<keyof typeof en, string> = {
   "patch.toast.applyFailed": "La aplicación falló: {error}",
   "patch.toast.applyCancelled": "Aplicación cancelada. El juego quedó parcialmente parcheado y es posible que no se inicie hasta que revierta.",
   "patch.toast.applyFailedPartial": "La aplicación falló: {error}. El juego quedó parcialmente parcheado y es posible que no se inicie hasta que revierta.",
+  "patch.stateUnknown": "Estado del juego desconocido. Compruebe el estado del parche antes de continuar.",
+  "patch.toast.applyCancelledSafe": "Aplicación cancelada. El estado del parche no indica una aplicación parcial.",
   "patch.partialWarning": "El juego quedó parcialmente parcheado y es posible que no se inicie. Revierta para restaurar los archivos originales.",
   "patch.rollbackNow": "Revertir ahora",
   "patch.toast.applyCancelling": "Cancelando la aplicación del parche…",
