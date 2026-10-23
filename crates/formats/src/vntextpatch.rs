@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use locust_core::error::{LocustError, Result};
@@ -68,6 +70,51 @@ impl VnTextPatchPlugin {
         Ok((name, index, key))
     }
 
+    /// Locate literals in an already validated JSON array. Only depth-two
+    /// strings belong to row fields; nested metadata is never an address.
+    /// Decode keys so escaped spellings and last-key-wins match serde_json.
+    fn string_spans(text: &str) -> Result<BTreeMap<(usize, String), Range<usize>>> {
+        let bytes = text.as_bytes();
+        let (mut offset, mut depth, mut row) = (0, 0, 0);
+        let mut key: Option<String> = None;
+        let mut spans = BTreeMap::new();
+        while offset < bytes.len() {
+            match bytes[offset] {
+                b'"' => {
+                    let start = offset;
+                    offset += 1;
+                    while bytes[offset] != b'"' {
+                        if bytes[offset] == b'\\' {
+                            offset += 1;
+                        }
+                        offset += 1;
+                    }
+                    offset += 1;
+                    if depth == 2 {
+                        if let Some(key) = &key {
+                            if Self::KEYS.contains(&key.as_str()) {
+                                spans.insert((row, key.clone()), start..offset);
+                            }
+                        } else {
+                            key = Some(serde_json::from_str(&text[start..offset])?);
+                        }
+                    }
+                    continue;
+                }
+                b'[' | b'{' => depth += 1,
+                b']' | b'}' => depth -= 1,
+                b',' if depth == 1 => {
+                    row += 1;
+                    key = None;
+                }
+                b',' if depth == 2 => key = None,
+                _ => {}
+            }
+            offset += 1;
+        }
+        Ok(spans)
+    }
+
     /// A file is VNTextPatch output if it parses as an array whose objects
     /// carry a "message" string field. Keying on "message" (not "name")
     /// avoids matching RPG Maker data files, whose array elements also have a
@@ -76,8 +123,9 @@ impl VnTextPatchPlugin {
         let Ok(text) = std::fs::read_to_string(path) else {
             return false;
         };
-        let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(&text)
-        else {
+        let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(
+            text.strip_prefix('\u{feff}').unwrap_or(&text),
+        ) else {
             return false;
         };
         arr.iter()
@@ -141,11 +189,13 @@ impl FormatPlugin for VnTextPatchPlugin {
                 continue;
             }
             let text = std::fs::read_to_string(file)?;
-            let arr: Vec<serde_json::Value> =
-                serde_json::from_str(&text).map_err(|e| LocustError::ParseError {
-                    file: file.display().to_string(),
-                    message: e.to_string(),
-                })?;
+            let arr: Vec<serde_json::Value> = serde_json::from_str(
+                text.strip_prefix('\u{feff}').unwrap_or(&text),
+            )
+            .map_err(|e| LocustError::ParseError {
+                file: file.display().to_string(),
+                message: e.to_string(),
+            })?;
             let fname = file.file_name().unwrap_or_default().to_string_lossy();
 
             for (idx, obj) in arr.iter().enumerate() {
@@ -173,7 +223,6 @@ impl FormatPlugin for VnTextPatchPlugin {
 
     fn inject(&self, path: &Path, entries: &[StringEntry]) -> Result<InjectionReport> {
         use locust_core::patch::zipsec::ensure_no_links;
-        use std::collections::BTreeMap;
 
         let single_file = path.is_file();
         let parent = if single_file {
@@ -259,28 +308,53 @@ impl FormatPlugin for VnTextPatchPlugin {
         let mut prepared = Vec::new();
         for (file_path, file_entries) in by_file {
             let text = std::fs::read_to_string(&file_path)?;
-            let mut arr: Vec<serde_json::Value> = serde_json::from_str(&text)?;
-            let mut modified = false;
+            let json = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            let arr: Vec<serde_json::Value> = serde_json::from_str(json)?;
+            // Span offsets include the original BOM, when present.
+            let spans = Self::string_spans(&text)?;
+            let mut seen = HashSet::new();
+            let mut edits = Vec::new();
             for (index, key, entry) in file_entries {
+                if !seen.insert((index, key)) {
+                    report.skip("duplicate", 1);
+                    continue;
+                }
                 let Some(translation) = entry.translation.as_deref().filter(|t| !t.is_empty())
                 else {
                     report.skip("untranslated", 1);
                     continue;
                 };
-                if let Some(obj) = arr.get_mut(index).and_then(|v| v.as_object_mut()) {
-                    if obj.contains_key(key) {
-                        obj.insert(
-                            key.to_string(),
-                            serde_json::Value::String(translation.to_string()),
-                        );
-                        report.strings_written += 1;
-                        modified = true;
-                    }
+                let Some(value) = arr.get(index).and_then(|v| v.get(key)) else {
+                    report.skip("target_missing", 1);
+                    continue;
+                };
+                let Some(source) = value.as_str() else {
+                    report.skip("not_a_string", 1);
+                    continue;
+                };
+                if source != entry.source {
+                    report.skip("source_changed", 1);
+                    continue;
                 }
+                if translation == source {
+                    report.skip("unchanged", 1);
+                    continue;
+                }
+                let span = spans
+                    .get(&(index, key.to_string()))
+                    .ok_or_else(|| Self::invalid_entry(&entry.id, "missing JSON string span"))?;
+                edits.push((span.clone(), serde_json::to_string(translation)?));
+                report.strings_written += 1;
             }
-            if modified {
-                // Prepare all JSON before the first write, including later files.
-                prepared.push((file_path, serde_json::to_string_pretty(&arr)?));
+            if !edits.is_empty() {
+                // Apply from the end so earlier offsets remain valid. Prepare
+                // every file before writing, preserving the path preflight.
+                edits.sort_unstable_by_key(|(span, _)| span.start);
+                let mut output = text;
+                for (span, literal) in edits.into_iter().rev() {
+                    output.replace_range(span, &literal);
+                }
+                prepared.push((file_path, output));
             }
         }
         for (file, _) in &prepared {
@@ -311,6 +385,186 @@ impl FormatPlugin for VnTextPatchPlugin {
 mod tests {
     use super::*;
     use std::fs;
+
+    // Deliberately noncanonical: escaped keys/question marks/slashes, CRLF,
+    // nested decoys, exponent notation, and a trailing newline.
+    fn safety_fixture() -> String {
+        concat!(
+            "[\r\n\t{ \"message\" : \"old\", \"name\":\"太郎\", ",
+            "\"meta\":{\"message\":\"old\",\"n\":1.2300e+02,",
+            "\"nested\":[null,true,{\"x\":\"}\\\"[\"}]} },\r\n",
+            "  {\"messa\\u0067e\":\"Why\\u003f\\/\\n\",\"name\":\"Other\"}\r\n]\r\n"
+        )
+        .into()
+    }
+
+    #[test]
+    fn vntextpatch_identity_preserves_every_byte() {
+        let dir = tmp();
+        let path = dir.path().join("story.json");
+        let original = safety_fixture();
+        fs::write(&path, &original).unwrap();
+        let plugin = VnTextPatchPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        assert_eq!(entries.len(), 4);
+        for entry in &mut entries {
+            entry.translation = Some(entry.source.clone());
+        }
+        let report = plugin.inject(&path, &entries).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+        assert_eq!((report.strings_written, report.files_modified), (0, 0));
+        assert!(report.files_written.is_empty());
+        assert_eq!(report.skip_reasons, [("unchanged".into(), 4)].into());
+    }
+
+    #[test]
+    fn vntextpatch_translation_changes_only_addressed_literal() {
+        let dir = tmp();
+        let path = dir.path().join("story.json");
+        let original = safety_fixture();
+        fs::write(&path, &original).unwrap();
+        let plugin = VnTextPatchPlugin::new();
+        let mut entries = plugin.extract(&path).unwrap();
+        entries[1].translation = Some("New \"quote\" \\ path\n\t\r\u{0001} café?".into());
+        let literal = r#""New \"quote\" \\ path\n\t\r\u0001 café?""#;
+        let start = original.find(r#""old""#).unwrap();
+        let end = start + r#""old""#.len();
+        let report = plugin.inject(&path, &entries).unwrap();
+        let actual = fs::read(&path).unwrap();
+        assert_eq!(&actual[..start], &original.as_bytes()[..start]);
+        assert_eq!(&actual[start..start + literal.len()], literal.as_bytes());
+        assert_eq!(
+            &actual[start + literal.len()..],
+            &original.as_bytes()[end..]
+        );
+        assert_eq!((report.strings_written, report.files_modified), (1, 1));
+        assert_eq!(report.files_written, [path.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn vntextpatch_bom_preserved_for_identity_and_multiple_edits() {
+        let dir = tmp();
+        let path = dir.path().join("story.json");
+        let original = format!("\u{feff}{}", safety_fixture());
+        fs::write(&path, &original).unwrap();
+        let plugin = VnTextPatchPlugin::new();
+        assert!(plugin.detect(&path));
+        let mut entries = plugin.extract(&path).unwrap();
+        assert_eq!(entries.len(), 4);
+        for entry in &mut entries {
+            entry.translation = Some(entry.source.clone());
+        }
+        assert_eq!(plugin.inject(&path, &entries).unwrap().files_modified, 0);
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+        entries[0].translation = Some("Taro".into());
+        entries[3].translation = Some("Longer translated message".into());
+        let report = plugin.inject(&path, &entries).unwrap();
+        let expected = original
+            .replace("太郎", "Taro")
+            .replace(r#""Why\u003f\/\n""#, r#""Longer translated message""#);
+        assert_eq!(fs::read(&path).unwrap(), expected.as_bytes());
+        assert_eq!((report.strings_written, report.files_modified), (2, 1));
+    }
+
+    #[test]
+    fn vntextpatch_stale_source_skipped_without_write() {
+        let dir = tmp();
+        let path = dir.path().join("story.json");
+        fs::write(&path, r#"[{"message":"original"}]"#).unwrap();
+        let entry = fixture_entry(&path);
+        let changed = b"[ {\"message\" : \"changed\"} ]\r\n";
+        fs::write(&path, changed).unwrap();
+        let report = VnTextPatchPlugin::new().inject(&path, &[entry]).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), changed);
+        assert_eq!(report.skip_reasons, [("source_changed".into(), 1)].into());
+        assert_eq!((report.strings_written, report.files_modified), (0, 0));
+        assert!(report.files_written.is_empty());
+    }
+
+    #[test]
+    fn vntextpatch_non_string_targets_skipped_without_write() {
+        let dir = tmp();
+        let path = dir.path().join("story.json");
+        for value in ["42", r#"{"message":"original"}"#, "null", "[]", "false"] {
+            let original = format!("[ {{\"message\": {value}}} ]\r\n");
+            fs::write(&path, &original).unwrap();
+            let report = VnTextPatchPlugin::new()
+                .inject(&path, &[fixture_entry(&path)])
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes(), "{value}");
+            assert_eq!(report.skip_reasons, [("not_a_string".into(), 1)].into());
+            assert_eq!((report.strings_written, report.files_modified), (0, 0));
+        }
+    }
+
+    #[test]
+    fn vntextpatch_missing_targets_skipped_without_write() {
+        let dir = tmp();
+        let path = dir.path().join("story.json");
+        for original in ["[]", "[{}]", "[null]", "[[]]", "[42]"] {
+            fs::write(&path, original).unwrap();
+            let report = VnTextPatchPlugin::new()
+                .inject(&path, &[fixture_entry(&path)])
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+            assert_eq!(report.skip_reasons, [("target_missing".into(), 1)].into());
+            assert_eq!((report.strings_written, report.files_modified), (0, 0));
+        }
+    }
+
+    #[test]
+    fn vntextpatch_duplicate_address_second_refused() {
+        let dir = tmp();
+        let path = dir.path().join("story.json");
+        fs::write(&path, r#"[{"message":"original"}]"#).unwrap();
+        let first = fixture_entry(&path);
+        let mut second = first.clone();
+        // Different ID spelling still addresses the same field.
+        second.id = "story.json#00#message".into();
+        second.translation = Some("must not win".into());
+        let report = VnTextPatchPlugin::new()
+            .inject(&path, &[first, second])
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), br#"[{"message":"translated"}]"#);
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(report.skip_reasons, [("duplicate".into(), 1)].into());
+    }
+
+    #[test]
+    fn vntextpatch_duplicate_after_identity_cannot_write() {
+        let dir = tmp();
+        let path = dir.path().join("story.json");
+        let original = br#"[{"message":"original"}]"#;
+        fs::write(&path, original).unwrap();
+        let second = fixture_entry(&path);
+        let mut first = second.clone();
+        first.translation = Some(first.source.clone());
+        let report = VnTextPatchPlugin::new()
+            .inject(&path, &[first, second])
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!((report.strings_written, report.files_modified), (0, 0));
+        assert_eq!(
+            report.skip_reasons,
+            [("duplicate".into(), 1), ("unchanged".into(), 1)].into()
+        );
+    }
+
+    #[test]
+    fn vntextpatch_duplicate_json_keys_edit_only_effective_value() {
+        let dir = tmp();
+        let path = dir.path().join("story.json");
+        let original = r#"[{"message":"decoy","messa\u0067e":"original"}]"#;
+        fs::write(&path, original).unwrap();
+        let report = VnTextPatchPlugin::new()
+            .inject(&path, &[fixture_entry(&path)])
+            .unwrap();
+        assert_eq!(report.strings_written, 1);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original.replace("original", "translated").as_bytes()
+        );
+    }
 
     #[test]
     fn c123_named_untranslated_skips_preserve_writes() {
