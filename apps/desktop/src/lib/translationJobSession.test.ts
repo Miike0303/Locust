@@ -489,3 +489,33 @@ test("a terminal event arriving during backoff ends the job and clears the pendi
   assert.equal(h.toasts.length, 1);
 });
 console.log("translationJobSession.test.ts: ok");
+
+for (const locale of ["en", "es"] as const) {
+  test(`explicit remaining count overrides interim totals and shows pending guidance in ${locale}`, () => {
+    setLocale(locale);
+    for (const failedBatches of [0, 1]) {
+      attach(`remaining-${locale}-${failedBatches}`);
+      h.logs = []; h.toasts = [];
+      h.handlers.onStarted({ total: 2 });
+      if (failedBatches) h.handlers.onBatchFailed({ error: "provider unavailable" });
+      h.handlers.onCompleted({ type: "completed", total_translated: 2, remaining: 3, total_cost: 0, cost_is_complete: true });
+      assert.equal(h.snapshot.done, true);
+      assert.equal(h.snapshot.batchFailures?.count ?? 0, failedBatches);
+      assert.equal(h.toasts[h.toasts.length - 1][0], "warning");
+      assert.ok(h.toasts[h.toasts.length - 1][1].includes(t("translate.pendingRetryHint")));
+      assert.ok(h.logs[h.logs.length - 1][1].includes(t("translate.pendingRetryHint")));
+    }
+  });
+
+  test(`explicit zero remaining proves fallback recovery with an unknown total in ${locale}`, () => {
+    setLocale(locale);
+    attach(`remaining-zero-${locale}`);
+    h.logs = []; h.toasts = [];
+    h.handlers.onBatchFailed({ error: "provider unavailable" });
+    h.handlers.onCompleted({ type: "completed", total_translated: 2, remaining: 0, total_cost: 0, cost_is_complete: true });
+    assert.equal(h.snapshot.batchFailures?.count ?? 0, 0);
+    assert.equal(h.snapshot.error, null);
+    assert.equal(h.toasts[h.toasts.length - 1][0], "success");
+    assert.ok(!h.toasts[h.toasts.length - 1][1].includes(t("translate.pendingRetryHint")));
+  });
+}

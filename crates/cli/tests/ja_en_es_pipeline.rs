@@ -392,8 +392,7 @@ impl Scenario {
                 "1",
                 "--no-memory",
             ])
-            .assert()
-            .success();
+            .assert();
         self.server.requests();
         result
     }
@@ -724,11 +723,11 @@ fn positive(engine: Engine) {
         .collect();
     scenario.extract("work", "ja.db");
     assert_stage(&scenario, "ja.db", 0);
-    scenario.translate("ja.db", "ja", "en");
+    scenario.translate("ja.db", "ja", "en").success();
     assert_stage(&scenario, "ja.db", 1);
     strict_english_pivot(&scenario);
     let japanese_db = snapshot(&scenario.path("ja.db"));
-    scenario.translate("es.db", "en", "es");
+    scenario.translate("es.db", "en", "es").success();
     let spanish = assert_stage(&scenario, "es.db", 2);
     assert_requests(&scenario, 2);
     let validation = scenario
@@ -826,7 +825,7 @@ fn negative(engine: Engine, fault: Fault) {
             "translation count mismatch: sent 1 strings, got 0 back",
         ),
         Fault::CorruptSpanishPlaceholder => {
-            scenario.translate("ja.db", "ja", "en");
+            scenario.translate("ja.db", "ja", "en").success();
             assert_stage(&scenario, "ja.db", 1);
             strict_english_pivot(&scenario);
             ("es.db", 1, "placeholder")
@@ -837,11 +836,11 @@ fn negative(engine: Engine, fault: Fault) {
     } else {
         ("en", "es")
     };
-    let translation = scenario.translate(database, source, target);
+    let translation = scenario.translate(database, source, target).failure();
     let stderr = String::from_utf8_lossy(&translation.get_output().stderr);
     assert!(stderr.contains(diagnostic), "{stderr}");
-    // Translate can exit successfully with pending rows. Exit status is NOT the
-    // release gate: a strict completeness preflight must refuse this inventory.
+    assert!(stderr.contains("Translation incomplete:"), "{stderr}");
+    // A strict completeness preflight must also refuse this inventory.
     let entries = rows(&scenario.path(database));
     let actual = inventory(&entries, &scenario.path("work"));
     assert_eq!(
@@ -920,7 +919,7 @@ fn missing_answers_and_corrupt_placeholders_stop_release_for_every_engine() {
 fn strict_pivot_carries_warning_metadata_but_is_not_an_extraction_warning_gate() {
     let scenario = Scenario::new(Engine::RenPy, None);
     scenario.extract("work", "ja.db");
-    scenario.translate("ja.db", "ja", "en");
+    scenario.translate("ja.db", "ja", "en").success();
     assert_stage(&scenario, "ja.db", 1);
     // These three loose engines do not emit persisted extraction warnings.
     // Seed ONLY metadata to characterize carry-forward; never seed translations

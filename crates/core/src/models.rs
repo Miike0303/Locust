@@ -499,6 +499,9 @@ pub enum ProgressEvent {
     Resumed,
     Completed {
         total_translated: usize,
+        /// Pending rows in the project after this run.
+        #[serde(default)]
+        remaining: usize,
         total_cost: f64,
         #[serde(default)]
         cost_is_complete: bool,
@@ -639,6 +642,7 @@ mod tests {
 
         let completed = ProgressEvent::Completed {
             total_translated: 50,
+            remaining: 3,
             total_cost: 1.23,
             cost_is_complete: true,
             duration_secs: 45.0,
@@ -648,11 +652,13 @@ mod tests {
         match back {
             ProgressEvent::Completed {
                 total_translated,
+                remaining,
                 total_cost,
                 duration_secs,
                 ..
             } => {
                 assert_eq!(total_translated, 50);
+                assert_eq!(remaining, 3);
                 assert!((total_cost - 1.23).abs() < f64::EPSILON);
                 assert!((duration_secs - 45.0).abs() < f64::EPSILON);
             }
@@ -693,6 +699,15 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
+    #[test]
+    fn translation_completed_defaults_remaining_for_legacy_json() {
+        let event: ProgressEvent = serde_json::from_str(
+            r#"{"type":"completed","total_translated":1,"total_cost":0.0,"duration_secs":1.0}"#,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap()["remaining"], 0);
+    }
+
     fn check_rpgmaker_namebox_translation(source: &str, translation: &str) {
         let mut entry = StringEntry::new(
             "Map001.json#0#event_1#page_0#cmd_0#msg",

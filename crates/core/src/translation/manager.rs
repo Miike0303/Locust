@@ -1984,6 +1984,10 @@ impl TranslationManager {
             } else {
                 ProgressEvent::Completed {
                     total_translated: completed,
+                    remaining: self.db.count_entries(&crate::database::EntryFilter {
+                        status: Some(StringStatus::Pending),
+                        ..Default::default()
+                    })?,
                     total_cost: cumulative_cost.amount,
                     cost_is_complete: cumulative_cost.complete,
                     duration_secs: duration,
@@ -2065,6 +2069,7 @@ pub async fn run_fallback_chain(
         let _ = tx
             .send(ProgressEvent::Completed {
                 total_translated: 0,
+                remaining: 0,
                 total_cost: 0.0,
                 cost_is_complete: true,
                 duration_secs: start.elapsed().as_secs_f64(),
@@ -2168,6 +2173,7 @@ pub async fn run_fallback_chain(
     let _ = tx
         .send(ProgressEvent::Completed {
             total_translated,
+            remaining,
             total_cost: cumulative_cost.amount,
             cost_is_complete: cumulative_cost.complete,
             duration_secs: start.elapsed().as_secs_f64(),

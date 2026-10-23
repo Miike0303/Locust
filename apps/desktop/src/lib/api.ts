@@ -441,7 +441,7 @@ export { encodedByteLen } from "./binaryBudget";
 export interface ProgressEventStarted { type: "started"; total: number; job_id: string }
 export interface ProgressEventBatchCompleted { type: "batch_completed"; completed: number; total: number; cost_so_far: number; cost_is_complete?: boolean; language: string | null }
 export interface ProgressEventStringTranslated { type: "string_translated"; entry_id: string; translation: string }
-export interface ProgressEventCompleted { type: "completed"; total_translated: number; total_cost: number; cost_is_complete?: boolean; duration_secs: number }
+export interface ProgressEventCompleted { type: "completed"; total_translated: number; remaining?: number; total_cost: number; cost_is_complete?: boolean; duration_secs: number }
 export interface ProgressEventBatchFailed { type: "batch_failed"; entry_id: string | null; error: string }
 export interface ProgressEventFailed { type: "failed"; entry_id: string | null; error: string }
 export interface ProgressEventProviderSwitched {

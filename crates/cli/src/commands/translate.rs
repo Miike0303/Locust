@@ -129,10 +129,12 @@ pub(crate) async fn cmd_translate(
     let mut cost_is_complete = false;
     let mut total_translated = 0;
     let mut errors = 0u64;
+    let mut batch_failed = false;
     let mut error_counts = std::collections::HashMap::<String, u64>::new();
     let start = std::time::Instant::now();
 
     while let Some(event) = rx.recv().await {
+        batch_failed |= matches!(event, ProgressEvent::BatchFailed { .. });
         match event {
             ProgressEvent::Started { total, .. } => {
                 bar.set_length(total as u64);
@@ -211,6 +213,11 @@ pub(crate) async fn cmd_translate(
         println!(
             "\n{left} strings still pending. Re-run to continue, or add --fallback <provider>."
         );
+        if batch_failed {
+            anyhow::bail!(
+                "Translation incomplete: {left} strings still pending after provider errors"
+            );
+        }
     } else {
         println!("\nAll strings translated.");
     }

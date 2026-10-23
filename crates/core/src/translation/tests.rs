@@ -4816,3 +4816,102 @@ async fn grouped_oversize_retry_cost_is_recorded_when_refused() {
         StringStatus::Pending
     );
 }
+
+#[tokio::test]
+async fn translation_completed_reports_database_pending_count() {
+    for (row_count, fail_primary, with_fallback, expected_remaining) in [
+        (0, false, false, 0),
+        (2, false, false, 0),
+        (2, true, false, 2),
+        (2, true, true, 0),
+    ] {
+        let (db, glossary) = setup();
+        let entries: Vec<_> = (0..row_count)
+            .map(|i| StringEntry::new(format!("row-{i}"), "Hello", PathBuf::from("f.json")))
+            .collect();
+        db.save_entries(&entries).unwrap();
+        let primary: Arc<dyn TranslationProvider> = if fail_primary {
+            Arc::new(AlwaysErrorProvider::new())
+        } else {
+            Arc::new(MockProvider::new())
+        };
+        let fallback: Arc<dyn TranslationProvider> = Arc::new(MockProvider::new());
+        let resolve = |id: &str| {
+            Some(if id == "primary" {
+                primary.clone()
+            } else {
+                fallback.clone()
+            })
+        };
+        let chain: Vec<String> = if with_fallback {
+            vec!["primary".into(), "fallback".into()]
+        } else {
+            vec!["primary".into()]
+        };
+        let (tx, mut rx) = mpsc::channel(100);
+        run_fallback_chain(
+            &chain,
+            &resolve,
+            db.clone(),
+            glossary,
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+            tx,
+            "outcomes".into(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut completed = 0;
+        let mut failures = 0;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, ProgressEvent::BatchFailed { .. }) {
+                failures += 1;
+            }
+            if matches!(event, ProgressEvent::Completed { .. }) {
+                let value = serde_json::to_value(event).unwrap();
+                assert_eq!(value["remaining"], expected_remaining);
+                assert_eq!(value["total_translated"], row_count - expected_remaining);
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(failures > 0, fail_primary && row_count > 0);
+        assert_eq!(load_pending_entries(&db).unwrap().len(), expected_remaining);
+    }
+}
+
+#[tokio::test]
+async fn translation_completed_counts_pending_outside_selected_entries() {
+    let (db, glossary) = setup();
+    let selected = StringEntry::new("selected", "Hello", PathBuf::from("f.json"));
+    let other = StringEntry::new("other", "World", PathBuf::from("f.json"));
+    db.save_entries(&[selected.clone(), other]).unwrap();
+    let manager = TranslationManager::new(Arc::new(MockProvider::new()), db.clone(), glossary);
+    let (tx, mut rx) = mpsc::channel(100);
+    manager
+        .translate_entries(
+            vec![selected],
+            TranslationOptions {
+                use_memory: false,
+                use_glossary: false,
+                ..Default::default()
+            },
+            tx,
+            "selected".into(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let mut completed = false;
+    while let Some(event) = rx.recv().await {
+        if matches!(event, ProgressEvent::Completed { .. }) {
+            assert_eq!(serde_json::to_value(event).unwrap()["remaining"], 1);
+            completed = true;
+        }
+    }
+    assert!(completed);
+}

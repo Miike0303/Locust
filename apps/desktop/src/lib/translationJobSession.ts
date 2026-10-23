@@ -170,11 +170,15 @@ export function attachTranslationJob(opts: {
     onCompleted: (e) => {
       if (finished) return;
       finished = true;
-      // Completed.total_translated is authoritative across provider fallbacks;
-      // batch progress and failure counts do not measure translated strings.
-      const unresolvedFailures = hasUnresolvedBatchFailures(
-        batchFailures.count, e.total_translated, useEditorStore.getState().jobSnapshot?.total ?? 0,
-      );
+      // The final pending count is authoritative across provider fallbacks.
+      // Older servers omit it, so retain the progress-total inference for them.
+      const pending = (e.remaining ?? 0) > 0;
+      const pendingGuidance = pending ? ` ${t("translate.pendingRetryHint")}` : "";
+      const unresolvedFailures = e.remaining !== undefined
+        ? batchFailures.count > 0 && pending
+        : hasUnresolvedBatchFailures(
+          batchFailures.count, e.total_translated, useEditorStore.getState().jobSnapshot?.total ?? 0,
+        );
       const totalFailure = unresolvedFailures && e.total_translated === 0;
       patchSnapshot({
         done: !totalFailure,
@@ -188,26 +192,26 @@ export function attachTranslationJob(opts: {
       if (unresolvedFailures) {
         const summary = t("translate.completedWithErrorsSummary", {
           translated: e.total_translated, count: batchFailures.count,
-        });
+        }) + pendingGuidance;
         // Each original diagnostic already has its own batch log entry.
-        addLog(totalFailure ? "error" : "warning", totalFailure ? t("activity.translation.failed") : summary, undefined, "translation");
+        addLog(totalFailure ? "error" : "warning", totalFailure ? t("activity.translation.failed") + pendingGuidance : summary, undefined, "translation");
         addToast(totalFailure ? "error" : "warning", totalFailure
-          ? t("translate.toast.failed", { error: batchFailures.lastReason })
+          ? t("translate.toast.failed", { error: batchFailures.lastReason }) + pendingGuidance
           : summary);
       } else {
         addLog(
-          "info",
-          t("activity.translation.completed", { count: e.total_translated, cost: formatObservedCost(e.total_cost, e.cost_is_complete, t) }),
+          pending ? "warning" : "info",
+          t("activity.translation.completed", { count: e.total_translated, cost: formatObservedCost(e.total_cost, e.cost_is_complete, t) }) + pendingGuidance,
           undefined,
           "translation",
         );
         const cost = e.total_cost ?? 0;
         addToast(
-          "success",
+          pending ? "warning" : "success",
           t("translate.toast.completeObservedCost", {
             count: e.total_translated,
             cost: formatObservedCost(cost, e.cost_is_complete, t),
-          }),
+          }) + pendingGuidance,
         );
       }
       endJob();
