@@ -32,7 +32,7 @@ registerHooks({
       return { format: "module", source: "export const useT=()=>globalThis.__badgeTranslate;", shortCircuit: true };
     }
     if (url.endsWith("/lib/modalA11y.ts")) {
-      return { format: "module", source: `export const useModalA11y=()=>({}); export const MODAL_BACKDROP_CLASS='', MODAL_FOOTER_CLASS=''; export const modalPanelClass=x=>x;`, shortCircuit: true };
+      return { format: "module", source: `export const useModalA11y=()=>({}); export const MODAL_BACKDROP_CLASS='', MODAL_FOOTER_CLASS='', MODAL_HEADER_CLASS='', MODAL_BODY_CLASS=''; export const modalPanelClass=x=>x;`, shortCircuit: true };
     }
     return nextLoad(url, context);
   },
@@ -101,5 +101,17 @@ for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
     }
     assert.ok(badges.includes("FutureValidationKind"));
     assert.ok(badges.includes("FutureValidationKind: 1"));
+  });
+}
+
+for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
+  test(`known validation messages use exact localized matches and preserve diagnostics (${locale})`, async () => {
+    const { localizeValidationMessage } = await import("./validationLabels.ts");
+    const t = (key: any) => translate(catalog, locale, key);
+    assert.equal(localizeValidationMessage("translation is empty", t), locale === "en" ? "Translation is empty." : "La traducción está vacía.");
+    assert.equal(localizeValidationMessage("translation is identical to source", t), locale === "en" ? "Translation is identical to the source." : "La traducción es idéntica al original.");
+    for (const message of ["future detail", "translation is empty\nentry: foo", "translation is empty ", "injection error: invalid provenance at C:/game/foo", "toString", "__proto__"]) {
+      assert.equal(localizeValidationMessage(message, t), message);
+    }
   });
 }

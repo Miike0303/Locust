@@ -1226,6 +1226,8 @@ export const en = {
   "validate.kind.charLimitLabel": "Character limit exceeded",
   "validate.kind.binarySlotLabel": "Byte limit exceeded",
   "validate.kind.unencodableLabel": "Encoding incompatible",
+  "validate.message.empty": "Translation is empty.",
+  "validate.message.identical": "Translation is identical to the source.",
   "validate.kind.emptyLabel": "Empty translation",
   "validate.kind.identicalLabel": "Identical to source",
   "validate.kind.provenanceLabel": "Invalid injection provenance",

@@ -74,8 +74,11 @@ export function formatProviderOptionLabel(meta: {
 	is_free?: boolean;
 	configured?: boolean;
 }): string {
-	let label = meta.name;
-	if (meta.is_free && !/\((?:free|gratuito)\)/i.test(label)) {
+	// Availability suffixes are owned metadata; normalize them for the current locale.
+	let label = meta.is_free
+		? meta.name.replace(/(?:\s*\((?:free|gratuito)\))+\s*$/i, "")
+		: meta.name;
+	if (meta.is_free) {
 		label += ` (${t("provider.free")})`;
 	}
 	if (meta.configured === false) label += ` (${t("provider.needsApiKeySuffix")})`;

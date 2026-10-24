@@ -1202,6 +1202,8 @@ export const es: Record<keyof typeof en, string> = {
   "validate.kind.charLimitLabel": "Límite de caracteres excedido",
   "validate.kind.binarySlotLabel": "Límite de bytes excedido",
   "validate.kind.unencodableLabel": "Codificación incompatible",
+  "validate.message.empty": "La traducción está vacía.",
+  "validate.message.identical": "La traducción es idéntica al original.",
   "validate.kind.emptyLabel": "Traducción vacía",
   "validate.kind.identicalLabel": "Igual al original",
   "validate.kind.provenanceLabel": "Procedencia de inserción inválida",

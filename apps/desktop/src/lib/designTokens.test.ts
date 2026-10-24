@@ -85,3 +85,21 @@ function contrast(foreground: string | undefined, background: string | undefined
   const values = [luminance(foreground), luminance(background)];
   return (Math.max(...values) + 0.05) / (Math.min(...values) + 0.05);
 }
+
+for (const selector of [":root", ".dark"]) {
+  test(`${selector} active sidebar shortcut inherits a foreground with at least 4.5:1 contrast`, () => {
+    const layout = readFileSync(new URL("../components/Layout.tsx", import.meta.url), "utf8");
+    const nav = layout.match(/<NavLink[\s\S]*?<\/NavLink>/)?.[0];
+    assert.ok(nav);
+    const hintClasses = nav.match(/<kbd className="([^"]+)"/)?.[1].split(/\s+/);
+    assert.ok(hintClasses);
+    const activeClasses = nav.match(/\? "([^"]+)"/)?.[1].split(/\s+/);
+    assert.ok(activeClasses);
+    const foreground = [...hintClasses, ...activeClasses].find(value => /^text-(?!caption$)/.test(value));
+    const background = activeClasses.find(value => value.startsWith("bg-"));
+    const palette = declarations(selector);
+    const ratio = contrast(palette.get(`--${foreground?.slice(5)}`), palette.get(`--${background?.slice(3)}`));
+    assert.ok(ratio >= 4.5, `${selector} shortcut contrast: ${ratio.toFixed(2)}:1`);
+    assert.ok(!hintClasses.some(value => value.startsWith("text-") && value !== "text-caption"), "shortcut inherits the item's foreground");
+  });
+}

@@ -9,7 +9,7 @@ import type {
 	FontSuggestion,
 } from "../lib/api";
 import { validationKindLabel } from "../lib/api";
-import { validationBadgeLabel } from "../lib/validationLabels";
+import { localizeValidationMessage, validationBadgeLabel } from "../lib/validationLabels";
 import { useT, type TranslateFn } from "../lib/i18n";
 import {
 	useModalA11y,
@@ -339,7 +339,7 @@ export default function ValidationResultsModal({
 															</div>
 														)}
 														<div className="text-caption text-text-muted mt-0.5">
-															{detail || issue.message}
+															{detail || localizeValidationMessage(issue.message, t)}
 														</div>
 													</div>
 												</div>

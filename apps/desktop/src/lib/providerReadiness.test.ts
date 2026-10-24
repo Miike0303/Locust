@@ -131,15 +131,15 @@ saveProviderSetupHintDismissed(false, memStorage);
 assert.equal(readProviderSetupHintDismissed(memStorage), false);
 
 for (const locale of ["en", "es"] as const) {
-	for (const suffix of ["", " (free)", " (FREE)", " (gratuito)", " (GrAtUiTo)"]) {
-		test(`provider label adds free suffix only when absent (${locale}, ${suffix || "no suffix"})`, () => {
+	for (const suffix of ["", " (free)", " (FREE)", " (gratuito)", " (GrAtUiTo)", " (free) (gratuito) (FREE)  ", "(free)(gratuito)"]) {
+		test(`provider label normalizes trailing owned free suffixes (${locale}, ${suffix || "no suffix"})`, () => {
 			const previous = getLocale();
 			try {
 				setLocale(locale);
 				const name = `Google Translate${suffix}`;
 				assert.equal(
 					formatProviderOptionLabel({ name, is_free: true }),
-					suffix ? name : `${name} (${t("provider.free")})`,
+					`Google Translate (${t("provider.free")})`,
 				);
 			} finally {
 				setLocale(previous);
@@ -150,9 +150,12 @@ for (const locale of ["en", "es"] as const) {
 		const previous = getLocale();
 		try {
 			setLocale(locale);
-			assert.equal(formatProviderOptionLabel({ name: "DeepL", is_free: false }), "DeepL");
+			for (const name of ["DeepL", "Paid (free)", "Paid (gratuito) (free)"]) {
+				assert.equal(formatProviderOptionLabel({ name, is_free: false }), name);
+			}
+			assert.equal(formatProviderOptionLabel({ name: "Example (free) Plus", is_free: true }), `Example (free) Plus (${t("provider.free")})`);
 			assert.equal(formatProviderOptionLabel({ name: "OpenAI", configured: false }), `OpenAI (${t("provider.needsApiKeySuffix")})`);
-			assert.equal(formatProviderOptionLabel({ name: "Google (FREE)", is_free: true, configured: false }), `Google (FREE) (${t("provider.needsApiKeySuffix")})`);
+			assert.equal(formatProviderOptionLabel({ name: "Google (FREE)", is_free: true, configured: false }), `Google (${t("provider.free")}) (${t("provider.needsApiKeySuffix")})`);
 			assert.equal(formatProviderOptionLabel({ name: "Carefree (free tier)", is_free: true }), `Carefree (free tier) (${t("provider.free")})`);
 		} finally {
 			setLocale(previous);

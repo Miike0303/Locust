@@ -17,6 +17,18 @@ const BADGE_LABEL_KEYS = {
   InvalidInjectionProvenance: "validate.kind.provenanceLabel",
 } as const satisfies Record<ValidationKindName, MessageKey>;
 
+const MESSAGE_KEYS = {
+  "translation is empty": "validate.message.empty",
+  "translation is identical to source": "validate.message.identical",
+} as const satisfies Record<string, MessageKey>;
+
+/** Only exact owned messages are localized; diagnostic/provenance details stay intact. */
+export function localizeValidationMessage(message: string, t: TranslateFn): string {
+  return Object.prototype.hasOwnProperty.call(MESSAGE_KEYS, message)
+    ? t(MESSAGE_KEYS[message as keyof typeof MESSAGE_KEYS])
+    : message;
+}
+
 /** Unknown kinds from newer backends remain readable without a missing-key lookup. */
 export function validationBadgeLabel(kind: string, t: TranslateFn): string {
   return Object.prototype.hasOwnProperty.call(BADGE_LABEL_KEYS, kind)

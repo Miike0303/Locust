@@ -12,7 +12,7 @@ import type { PatchVerifyResult } from "../lib/api.ts";
 // replacing only React's lifecycle hooks and non-DOM side-effect sinks.
 const h = {
   t, a11y, values: [] as unknown[], cursor: 0,
-  toasts: [] as unknown[][], logs: [] as unknown[][],
+  toasts: [] as unknown[][], logs: [] as unknown[][], apiLogs: [] as unknown[][],
   changed: 0,
   runEffects: false, effectCursor: 0, effectDeps: [] as unknown[][], effects: [] as (() => void)[],
   pickerCalls: [] as any[], selectedDirectory: null as string | null,
@@ -43,6 +43,9 @@ const h = {
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === "@tauri-apps/plugin-dialog") return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent("export async function open(options) { const h=globalThis.__patchModal; h.pickerCalls.push(options); return h.selectedDirectory; }")}` };
+    if (context.parentURL?.endsWith("/lib/api.ts") && specifier === "../stores/logStore") {
+      return { shortCircuit: true, url: `data:text/javascript,${encodeURIComponent("export const addLog=(...args)=>globalThis.__patchModal.apiLogs.push(args);")}` };
+    }
     if (context.parentURL?.endsWith("/components/PatchModal.tsx")) {
       const stubs: Record<string, string> = {
         react: `const h=globalThis.__patchModal;export const useState=initial=>h.state(initial);export const useRef=initial=>h.ref(initial);export const useEffect=(fn,deps)=>h.effect(fn,deps);`,
@@ -72,6 +75,8 @@ let statusFailed = false;
 let applyStartFailed = false;
 let deferStatus = false;
 let deferredStatus: (() => void) | null = null;
+let recordingsEmpty = false;
+let statusConflict = false;
 let recordedRoot = "/copies/game.pck-es";
 let verification: Partial<PatchVerifyResult> = {};
 let report = {
@@ -95,11 +100,12 @@ globalThis.fetch = async (url, init) => {
     if (deferRollback) await new Promise<void>(resolve => { deferred = resolve; });
     return new Response(failed ? "cannot preview rollback" : JSON.stringify({ ...report, dry_run: body.dry_run ?? false }), { status: failed ? 500 : 200 });
   }
-  if (path.endsWith("/patch/recordings")) return new Response(JSON.stringify({ languages: ["es"], pristine_languages: ["es"], roots: { es: recordedRoot } }));
+  if (path.endsWith("/patch/recordings")) return new Response(JSON.stringify(recordingsEmpty ? { languages: [], pristine_languages: [], roots: {} } : { languages: ["es"], pristine_languages: ["es"], roots: { es: recordedRoot } }));
   if (path.endsWith("/config")) return new Response(JSON.stringify({ default_target_lang: "es" }));
   if (path.endsWith("/patch/pack")) return new Response(JSON.stringify({ patch_id: "godot", patch_version: "1", files_packed: 1, size_bytes: 200, tier: "Strict" }));
   if (path.endsWith("/patch/apply")) return new Response(applyStartFailed ? "pre-write refusal" : JSON.stringify({ job_id: "test-job" }), { status: applyStartFailed ? 400 : 200 });
   if (path.endsWith("/patch/status")) {
+    if (statusConflict) return new Response("patch backup incomplete: invalid backup manifest", { status: 409 });
     const response = new Response(statusFailed ? "status unavailable" : JSON.stringify({ status, patch_id: "test-patch" }), { status: statusFailed ? 500 : 200 });
     if (deferStatus) await new Promise<void>(resolve => { deferredStatus = resolve; });
     return response;
@@ -143,7 +149,8 @@ function button(label: string, index = 0) {
 }
 function reset(locale: "en" | "es") {
   setLocale(locale);
-  h.values = []; h.changed = 0; h.toasts = []; h.logs = [];
+  h.values = []; h.changed = 0; h.toasts = []; h.logs = []; h.apiLogs = [];
+  recordingsEmpty = false; statusConflict = false;
   calls.length = 0; failed = false; deferRollback = false; deferred = null;
   status = "interrupted"; statusFailed = false; applyStartFailed = false;
   verification = {};
@@ -554,3 +561,44 @@ for (const root of ["/copies/game.pck-es", "/shared"]) test(`Godot pack uses rec
     h.runEffects = false; h.effects = []; renderOptions = {};
   }
 });
+
+for (const locale of ["en", "es"] as const) {
+  for (const initialTab of ["apply", "pack"] as const) {
+    test(`${locale} opening ${initialTab} for a never-patched game loads empty recordings without status, recovery or errors`, async () => {
+      reset(locale);
+      recordingsEmpty = true; status = "not_patched";
+      h.values = []; h.runEffects = true; h.effectDeps = []; h.effects = [];
+      renderOptions = { allowPack: true, initialTab };
+      try {
+        await flushEffects();
+        assert.equal(calls.filter(call => call.url.endsWith("/patch/recordings")).length, 1);
+        assert.ok(calls.every(call => call.url.endsWith("/patch/recordings") || call.url.includes("/patch/identity?")), JSON.stringify(calls));
+        if (initialTab === "pack") {
+          assert.ok(calls.some(call => new URL(call.url).searchParams.get("game_path") === "/game"));
+          assert.ok(text(nodes(render())).includes(t("patch.recordedLangsEmpty")));
+          assert.equal(button(t("patch.packBtn"), 1).props.disabled, true);
+        }
+        await button(t("patch.apply")).props.onClick();
+        await flushEffects();
+        await button(t("patch.refreshStatus")).props.onClick();
+        assert.deepEqual(calls.filter(call => call.url.endsWith("/patch/status")).map(call => call.body), [{ game_path: "/game" }]);
+        assert.ok(text(nodes(render())).includes(t("patch.status", { status: t("patch.status.notPatched") })));
+        assertRecovery(false);
+        assert.deepEqual(h.logs, []);
+        assert.deepEqual(h.apiLogs, []);
+        assert.deepEqual(h.toasts, []);
+      } finally {
+        h.runEffects = false; h.effects = []; renderOptions = {};
+      }
+    });
+  }
+  test(`${locale} a real status conflict remains visible and logged instead of becoming an empty state`, async () => {
+    reset(locale); statusConflict = true;
+    await button(t("patch.refreshStatus")).props.onClick();
+    assert.ok(text(nodes(render())).includes("invalid backup manifest"));
+    assert.equal(h.apiLogs.length, 1);
+    assert.equal(h.apiLogs[0][0], "error");
+    assert.ok(String(h.apiLogs[0][1]).includes("409"));
+    assertRecovery(false);
+  });
+}

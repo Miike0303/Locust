@@ -71,3 +71,21 @@ for (const [locale, catalog, expected] of [
     assert.equal(selected, "synthetic-row");
   });
 }
+
+for (const [locale, catalog] of [["en", en], ["es", es]] as const) {
+  test(`issue rows localize empty and identical messages while retaining provenance (${locale})`, () => {
+    (globalThis as any).__encodingTranslate = (key: string, vars?: any) => translate(catalog, locale, key, vars);
+    const messages = ["translation is empty", "translation is identical to source", "invalid provenance: game/script.rpy", "unknown future diagnostic"];
+    const kinds: ValidationKind[] = ["EmptyTranslation", "IdenticalToSource", "InvalidInjectionProvenance", "InvalidInjectionProvenance"];
+    const tree = ValidationResultsModal({
+      open: true, onClose() {}, onSelectEntry() {},
+      result: { fonts: [], validation: {
+        total_checked: 4, issues_found: 4, entries_with_issues: 4, by_kind: {},
+        issues: messages.map((message, i) => ({ entry_id: `row-${i}`, kind: kinds[i], message })),
+      } },
+    });
+    const text = textOf(tree);
+    for (const expected of locale === "en" ? ["Translation is empty.", "Translation is identical to the source."] : ["La traducción está vacía.", "La traducción es idéntica al original."]) assert.ok(text.includes(expected), text);
+    for (const message of messages.slice(2)) assert.ok(text.includes(message), text);
+  });
+}
