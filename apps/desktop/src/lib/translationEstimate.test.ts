@@ -29,7 +29,7 @@ const mocks: Record<string, string> = {
       "@tanstack/react-query": `export const useQuery=({queryKey})=>({data:queryKey[0]==='config'?globalThis.__estimateTest.config:queryKey[0]==='providers'?[{id:'mock',name:'Mock',available:true}]:[],isFetched:true});`,
       "react-router-dom": `export const useNavigate=()=>()=>{};`,
       "../lib/i18n": `export const useT=()=>globalThis.__estimateTest.t;export const useLocale=()=>({locale:'en'});`,
-      "../lib/modalA11y": `export const useModalA11y=()=>({});export const MODAL_BACKDROP_CLASS='';export const modalPanelClass=x=>x;`,
+      "../lib/modalA11y": `export const useModalA11y=()=>({});export const MODAL_BACKDROP_CLASS='';export const MODAL_HEADER_CLASS='';export const MODAL_BODY_CLASS='';export const MODAL_FOOTER_CLASS='';export const modalPanelClass=x=>x;`,
       "../lib/translationStart": `export const startSingleTranslation=async params=>{globalThis.__estimateTest.starts.push(params);return null;};`,
       "../lib/translationJobSession": `export const setTranslationModalOpen=()=>{};export const clearTranslationSnapshotIfIdle=()=>{};export const reconnectTranslationJob=()=>{};export const requestTranslationCancel=()=>{};`,
 };
