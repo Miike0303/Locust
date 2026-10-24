@@ -7,6 +7,7 @@ import {
 	type PatchVerifyResult,
 } from "../../lib/api";
 import type { TranslateFn } from "../../lib/i18n";
+import { patchVerificationSummary } from "../../lib/patchVerification";
 import { isHttpPatchUrl, patchSourceReady, resolvePatchSource } from "../../lib/patchSource";
 
 interface PatchApplyTabProps {
@@ -82,6 +83,7 @@ export default function PatchApplyTab({
 	verify,
 	applyResult,
 }: PatchApplyTabProps) {
+	const verifyDisplay = verify ? patchVerificationSummary(verify) : null;
 	return (
 		<>
 			<div>
@@ -395,9 +397,16 @@ export default function PatchApplyTab({
 				</div>
 			)}
 
-			{verify && (
-				<div className="p-3 border border-border rounded text-body space-y-1">
-					<div className="font-medium">{t("patch.verifyLine", { outcome: patchValue(verify.outcome) })}</div>
+			{verify && verifyDisplay && (
+				<div className={`p-3 border rounded text-body space-y-1 ${verifyDisplay.severity === "error" ? "border-danger bg-danger-muted text-danger" : verifyDisplay.severity === "warning" ? "border-warning bg-warning-muted text-warning" : "border-border"}`}>
+					<div className="font-medium">{t(verifyDisplay.summaryKey, verifyDisplay.params)}</div>
+					{verifyDisplay.conflicts.length > 0 && (
+						<ul className="list-disc pl-5 text-caption break-words">
+							{verifyDisplay.conflicts.map(({ path, reasonKey }) => (
+								<li key={path}>{path}: {t(reasonKey)}</li>
+							))}
+						</ul>
+					)}
 					{verify.tier && (
 						<div className="text-caption">{t("patch.tier", { tier: patchValue(verify.tier) })}</div>
 					)}
@@ -406,19 +415,16 @@ export default function PatchApplyTab({
 							replace: verify.replaced?.length ?? 0,
 							add: verify.added?.length ?? 0,
 						})}
-						{(verify.conflicts?.length ?? 0) > 0 &&
-							t("patch.conflicts", { count: verify.conflicts.length })}
 					</div>
 					{verify.backup_compromised && (
 						<div className="text-caption text-warning">
 							{t("patch.backupCompromised")}
 						</div>
 					)}
-					{verify.messages?.map((m, i) => (
-						<div key={i} className="text-caption text-text-muted">
-							{m}
-						</div>
-					))}
+					<details className="text-caption text-text-muted">
+						<summary className="cursor-pointer">{t("patch.technicalDetails")}</summary>
+						<pre className="whitespace-pre-wrap break-words mt-1">{verifyDisplay.technical.join("\n")}</pre>
+					</details>
 				</div>
 			)}
 

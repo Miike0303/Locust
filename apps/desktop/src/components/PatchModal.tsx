@@ -29,6 +29,7 @@ import {
 	resolvePatchSource,
 } from "../lib/patchSource";
 import { IS_TAURI } from "../lib/runtime";
+import { patchVerificationSummary } from "../lib/patchVerification";
 import { subscribeToJob } from "../lib/ws";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
@@ -69,6 +70,7 @@ export default function PatchModal({
 	const t = useT();
 	const patchValue = (value: string): string => {
 		const labels: Record<string, string> = {
+			not_patched: t("patch.status.notPatched"),
 			pristine: t("patch.status.pristine"),
 			patched: t("patch.status.patched"),
 			interrupted: t("patch.status.interrupted"),
@@ -391,13 +393,15 @@ export default function PatchModal({
 			rememberPatchSource(resolvedSource);
 			setVerify(report);
 			await refreshStatus();
+			const display = patchVerificationSummary(report);
+			const summary = t(display.summaryKey, display.params);
 			addLog(
-				"info",
-				t("activity.patch.verified", { outcome: patchValue(report.outcome) }),
-				report.messages?.join("\n") || "",
+				display.severity === "success" ? "info" : display.severity,
+				summary,
+				display.technical.join("\n"),
 				"patch",
 			);
-			addToast("success", t("patch.toast.verify", { outcome: patchValue(report.outcome) }));
+			addToast(display.severity, summary);
 		} catch (err: any) {
 			setError(err.message);
 			addLog("error", t("activity.patch.verifyFailed"), err.message, "patch");

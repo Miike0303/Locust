@@ -6,6 +6,7 @@ import { registerHooks } from "node:module";
 import { renderToStaticMarkup } from "react-dom/server";
 import { setLocale, t } from "../lib/i18n/index.ts";
 import * as a11y from "../lib/modalA11y.ts";
+import type { PatchVerifyResult } from "../lib/api.ts";
 
 // As in ResumeProjectDialog.test.tsx: exercise real element callbacks and SSR,
 // replacing only React's lifecycle hooks and non-DOM side-effect sinks.
@@ -69,6 +70,7 @@ let applyStartFailed = false;
 let deferStatus = false;
 let deferredStatus: (() => void) | null = null;
 let recordedRoot = "/copies/game.pck-es";
+let verification: Partial<PatchVerifyResult> = {};
 let report = {
   restored: 2, deleted: 1, baseline: "Pristine", dry_run: true,
   messages: ["preview <message>"], aborted_edited: ["data/user<edit>.txt"], torn_deleted: [] as string[],
@@ -101,7 +103,7 @@ globalThis.fetch = async (url, init) => {
   }
   if (path.endsWith("/patch/verify")) return new Response(JSON.stringify({
     outcome: "Clean", tier: "Strict", replaced: ["data/original.txt"], added: [], conflicts: [],
-    messages: ["verification retained"], backup_compromised: false, manifest: {},
+    messages: ["verification retained"], backup_compromised: false, manifest: {}, ...verification,
   }));
   return new Response(JSON.stringify({ status, patch_id: "test-patch" }));
 };
@@ -141,6 +143,7 @@ function reset(locale: "en" | "es") {
   h.values = []; h.changed = 0; h.toasts = []; h.logs = [];
   calls.length = 0; failed = false; deferRollback = false; deferred = null;
   status = "interrupted"; statusFailed = false; applyStartFailed = false;
+  verification = {};
   deferStatus = false; deferredStatus = null; h.jobHandlers = null;
   report = { restored: 2, deleted: 1, baseline: "Pristine", dry_run: true,
     messages: ["preview <message>"], aborted_edited: ["data/user<edit>.txt"], torn_deleted: [] };
@@ -268,6 +271,64 @@ test("a successful preview does not clear the modal's recovery warning after an 
 function selectSource() {
   nodes(render()).find(node => node.type === "input" && node.props.placeholder === t("patch.zipPlaceholder"))
     .props.onChange({ target: { value: "/patch.zip" } });
+}
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale} verification conflicts produce a localized warning, escaped files and collapsed diagnostics`, async () => {
+    reset(locale); selectSource(); status = "not_patched";
+    const path = "data/<script>alert(1)</script>.txt";
+    verification = {
+      outcome: `Mismatch([FileMismatch { path: ${JSON.stringify(path)}, expected: "present", found: "absent" }])`,
+      conflicts: [path, path], messages: ["raw <diagnostic>"],
+    };
+    await button(t("patch.verify")).props.onClick();
+    const summary = locale === "en" ? "Verification found 1 conflicting file."
+      : "La verificación encontró 1 archivo en conflicto.";
+    assert.deepEqual(h.toasts, [["warning", summary]]);
+    assert.equal(h.logs[0][0], "warning");
+    assert.equal(h.logs[0][1], summary);
+    assert.ok(String(h.logs[0][2]).includes(verification.outcome!));
+    const tree = render();
+    const details = nodes(tree).find(node => node.type === "details" && text(node).includes("raw <diagnostic>"));
+    assert.ok(details, "raw messages must be confined to technical details");
+    assert.ok(!details.props.open, "technical details must start collapsed");
+    assert.equal(text(nodes(details).find(node => node.type === "summary")), locale === "en" ? "Technical details" : "Detalles técnicos");
+    assert.ok(text(details).includes(verification.outcome!));
+    const visible = nodes(tree).filter(node => node.type === "li");
+    assert.equal(visible.filter(node => text(node).includes(path)).length, 1);
+    assert.ok(text(visible).includes(locale === "en" ? "Required file is missing" : "Falta un archivo necesario"));
+    const html = renderToStaticMarkup(tree);
+    assert.ok(html.includes("data/&lt;script&gt;alert(1)&lt;/script&gt;.txt"));
+    assert.ok(!html.includes("<script>"));
+    assert.ok(html.includes(summary));
+    const panel = nodes(tree).find(node => node.props?.className?.includes("border-warning") && text(node).includes(summary));
+    assert.ok(panel, "warning results need warning styling");
+  });
+
+  test(`${locale} not_patched status renders its localized label`, async () => {
+    reset(locale); status = "not_patched";
+    await button(t("patch.refreshStatus")).props.onClick();
+    const html = renderToStaticMarkup(render());
+    const label = locale === "en" ? "No patch applied" : "Sin parche aplicado";
+    assert.ok(html.includes(t("patch.status", { status: label })));
+    assert.ok(!html.includes("not_patched"));
+  });
+
+  for (const [outcome, backup_compromised, level, key] of [
+    ["Clean", false, "success", "patch.verify.clean"],
+    ["FutureOutcome", false, "warning", "patch.verify.unknown"],
+    ['DowngradeBlocked { installed: "2", incoming: "1" }', false, "warning", "patch.verify.downgrade"],
+    ["Interrupted", false, "error", "patch.verify.interrupted"],
+    ["Clean", true, "error", "patch.verify.backupCompromised"],
+  ] as const) test(`${locale} verification ${outcome} backup_compromised=${backup_compromised} uses matching toast, log and panel severity`, async () => {
+    reset(locale); selectSource(); status = "not_patched";
+    verification = { outcome, backup_compromised };
+    await button(t("patch.verify")).props.onClick();
+    assert.deepEqual(h.toasts, [[level, t(key)]]);
+    assert.equal(h.logs[0][0], level === "success" ? "info" : level);
+    assert.equal(h.logs[0][1], t(key));
+    assert.ok(nodes(render()).some(node => node.props?.className?.includes(level === "error" ? "border-danger" : level === "warning" ? "border-warning" : "border-border") && text(node).includes(t(key))));
+  });
 }
 function selectGame(path: string) {
   nodes(render()).find(node => node.type === "input" && node.props.placeholder === t("patch.placeholder.game"))
