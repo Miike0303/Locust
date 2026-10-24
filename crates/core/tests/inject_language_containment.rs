@@ -1,6 +1,8 @@
 //! Exercise the same small NScripter fixture as replace_source_provenance.
 #[path = "../../formats/src/nscripter.rs"]
 mod nscripter;
+// Only the helpers nscripter.rs needs are used; the rest of util.rs is dead here.
+#[allow(dead_code)]
 #[path = "../../formats/src/util.rs"]
 mod util;
 
