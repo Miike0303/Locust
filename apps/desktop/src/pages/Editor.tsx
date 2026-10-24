@@ -96,6 +96,8 @@ function EditorProgress({ stats }: { stats: ProjectStats }) {
 
 export default function Editor() {
 	const t = useT();
+	const tableRef = useRef<HTMLTableElement>(null);
+	const detailRef = useRef<HTMLElement>(null);
 	const { filter, selectedEntryId, setSelected, isTranslating } = useEditorStore();
 	const validationWorklist = useEditorStore((s) => s.validationWorklist);
 	const validationWorklistIndex = useEditorStore((s) => s.validationWorklistIndex);
@@ -241,6 +243,25 @@ export default function Editor() {
 		showReplaceModal ||
 		showValidationModal || showFontPatch;
 
+	const closeDetail = useCallback(() => {
+		setSelected(null);
+		const target = tableRef.current?.querySelector<HTMLElement>('tbody tr[tabindex="0"]') ?? tableRef.current;
+		target?.focus();
+	}, [setSelected]);
+
+	const detailKey = hasProject && !stringsLoading && !stringsError && selectedEntry
+		? draftEntryKey(projectKey, selectedEntry.id)
+		: null;
+	const previousDetailKey = useRef<string | null>(null);
+	useEffect(() => {
+		const detailChanged = previousDetailKey.current !== detailKey;
+		// Record transitions behind modals so closing one preserves its restored focus.
+		previousDetailKey.current = detailKey;
+		if (detailChanged && detailKey && !editorModalOpen) {
+			detailRef.current?.querySelector<HTMLTextAreaElement>("textarea:not([readonly])")?.focus();
+		}
+	}, [detailKey, editorModalOpen]);
+
 	// Action hotkeys pause behind work modals; Escape remains available in their inputs.
 	useHotkey(
 		"translate",
@@ -292,7 +313,7 @@ export default function Editor() {
 			else if (showPatchModal) setShowPatchModal(false);
 			else if (showInjectModal) setShowInjectModal(false);
 			else if (showTranslateModal) setShowTranslateModal(false);
-			else if (selectedEntryId) setSelected(null);
+			else if (selectedEntryId) closeDetail();
 		},
 		!showFontPatch && (editorModalOpen || !!selectedEntryId),
 		true,
@@ -569,6 +590,7 @@ export default function Editor() {
 					</div>
 				) : (
 					<StringTable
+						tableRef={tableRef}
 						data={entries}
 						onRefetch={handleRefetch}
 						hasActiveFilters={hasActiveFilters}
@@ -576,12 +598,13 @@ export default function Editor() {
 				)}
 				{hasProject && !stringsLoading && !stringsError && selectedEntry && (
 					<DetailPanel
+						panelRef={detailRef}
 						key={draftEntryKey(projectKey, selectedEntry.id)}
 						projectKey={projectKey}
 						entry={selectedEntry}
 						sampleSources={sampleSources}
 						onRefetch={handleRefetch}
-						onClose={() => setSelected(null)}
+						onClose={closeDetail}
 					/>
 				)}
 			</div>

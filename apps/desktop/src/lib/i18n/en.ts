@@ -1,5 +1,10 @@
 /** English UI catalog. Keys are dotted namespaces. Keep in sync with es.ts. */
 export const en = {
+  "table.sortPageBy": "Sort this page by {column}",
+  "table.keyboardHelp": "Strings. Use Arrow Up and Arrow Down to move between rows, and Enter to open details.",
+  "filter.searchLabel": "Search strings",
+  "filter.previousPage": "Previous page",
+  "filter.nextPage": "Next page",
   "api.error.invalidTargetLanguageCode":
     "Invalid target language code: use 1 to 35 ASCII letters, digits, '-' or '_'.",
   "api.error.replaceOutputContainment":

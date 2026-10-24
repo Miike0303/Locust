@@ -2,6 +2,11 @@ import type { en } from "./en";
 
 /** Spanish UI catalog. Missing keys are a compile error. Neutral professional Spanish. */
 export const es: Record<keyof typeof en, string> = {
+  "table.sortPageBy": "Ordenar esta página por {column}",
+  "table.keyboardHelp": "Cadenas. Use las flechas arriba y abajo para moverse entre filas y Enter para abrir los detalles.",
+  "filter.searchLabel": "Buscar cadenas",
+  "filter.previousPage": "Página anterior",
+  "filter.nextPage": "Página siguiente",
   "api.error.invalidTargetLanguageCode":
     "Código de idioma de destino no válido: use entre 1 y 35 letras ASCII, dígitos, '-' o '_'.",
   "api.error.replaceOutputContainment":

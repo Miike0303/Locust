@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type Ref } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import clsx from "clsx";
 import { useQueryClient } from "@tanstack/react-query";
@@ -21,6 +21,7 @@ interface DetailPanelProps {
 	sampleSources?: readonly string[];
 	onRefetch: () => void;
 	onClose: () => void;
+	panelRef?: Ref<HTMLElement>;
 }
 
 export default function DetailPanel({
@@ -29,8 +30,10 @@ export default function DetailPanel({
 	sampleSources,
 	onRefetch,
 	onClose,
+	panelRef,
 }: DetailPanelProps) {
 	const t = useT();
+	const fieldId = `detail-${encodeURIComponent(entry.id)}`;
 	const queryClient = useQueryClient();
 	const draftKey = draftEntryKey(projectKey, entry.id);
 	const draft = useDraftStore((state) => state.drafts[draftKey]);
@@ -105,8 +108,17 @@ export default function DetailPanel({
 	const binarySlotExceeded =
 		srcSlotBytes != null && trSlotBytes != null && trSlotBytes > srcSlotBytes;
 
+	const translationDescription = [
+		`${fieldId}-help`,
+		(actionError || draft?.error) && `${fieldId}-error`,
+		draft?.conflict && `${fieldId}-conflict`,
+		persistenceIssue && `${fieldId}-storage-error`,
+		limitExceeded && `${fieldId}-limit-error`,
+		binarySlotExceeded && `${fieldId}-slot-error`,
+	].filter(Boolean).join(" ");
+
 	return (
-		<aside className="w-[340px] border-l border-border overflow-y-auto bg-surface flex flex-col">
+		<aside ref={panelRef} className="w-[340px] border-l border-border overflow-y-auto bg-surface flex flex-col">
 			<div className="px-3 py-2 border-b border-border flex justify-between items-center">
 				<h3 className="text-caption font-semibold text-text">
 					{t("detail.title")}
@@ -126,15 +138,15 @@ export default function DetailPanel({
 						<strong>{t("validate.kind.staleLabel")}. </strong>{t("validate.kind.staleDetail")}
 					</p>
 				)}
-				{(actionError || draft?.error) && <p role="alert" className="text-caption text-danger break-words">{actionError || draft?.error}</p>}
+				{(actionError || draft?.error) && <p id={`${fieldId}-error`} role="alert" className="text-caption text-danger break-words">{actionError || draft?.error}</p>}
 				{draft?.conflict && <div className="text-caption">
-					<p role="alert" className="text-danger">{t("api.error.translationConflict")}</p>
+					<p id={`${fieldId}-conflict`} role="alert" className="text-danger">{t("api.error.translationConflict")}</p>
 					<div className="flex gap-3">
 					<button type="button" disabled={saving || changingStatus} onClick={handleLoadLatest} className="underline">{t("detail.loadLatest")}</button>
 					<button type="button" disabled={saving || changingStatus} onClick={() => handleSave(true)} className="underline">{t("detail.overwrite")}</button>
 					</div>
 				</div>}
-                {persistenceIssue && <p role="alert" className="text-caption text-danger">{t("detail.draftStorageFailed")}</p>}
+                {persistenceIssue && <p id={`${fieldId}-storage-error`} role="alert" className="text-caption text-danger">{t("detail.draftStorageFailed")}</p>}
                 {alternatives.length > 0 && <div className="text-caption text-warning">
                     <p>{t("detail.draftConflict")}</p>
                     {alternatives.map(alternative => <button key={alternative.revision} type="button" disabled={saving || changingStatus}
@@ -145,20 +157,23 @@ export default function DetailPanel({
                 </div>}
 				{/* Source */}
 				<div>
-					<label className="text-caption font-medium text-text-muted">
+					<label htmlFor={`${fieldId}-source`} className="text-caption font-medium text-text-muted">
 						{t("detail.source")}
 					</label>
-					<div className="mt-1 p-2 bg-surface-muted rounded font-mono text-body text-text select-all whitespace-pre-wrap">
+					<output id={`${fieldId}-source`} className="block mt-1 p-2 bg-surface-muted rounded font-mono text-body text-text select-all whitespace-pre-wrap">
 						{entry.source}
-					</div>
+					</output>
 				</div>
 
 				{/* Translation */}
 				<div>
-					<label className="text-caption font-medium text-text-muted">
+					<label htmlFor={`${fieldId}-translation`} className="text-caption font-medium text-text-muted">
 						{t("detail.translation")}
 					</label>
 					<textarea
+						id={`${fieldId}-translation`}
+						aria-describedby={translationDescription}
+						aria-invalid={limitExceeded || binarySlotExceeded || !!draft?.error || !!actionError || !!draft?.conflict}
 						disabled={saving || changingStatus}
 						value={translation}
 						onFocus={() => {
@@ -173,6 +188,7 @@ export default function DetailPanel({
 						rows={4}
 					/>
 					<div
+						id={`${fieldId}-help`}
 						className={clsx(
 							"text-caption mt-1",
 							limitExceeded || binarySlotExceeded
@@ -203,10 +219,10 @@ export default function DetailPanel({
 					}} />
 
 				{/* Status */}
-				<div>
-					<label className="text-caption font-medium text-text-muted">
+				<fieldset>
+					<legend className="text-caption font-medium text-text-muted">
 						{t("detail.status")}
-					</label>
+					</legend>
 					<div className="flex gap-1.5 mt-1">
 						{statusButtons.map((value) => (
 							<button
@@ -225,17 +241,17 @@ export default function DetailPanel({
 							</button>
 						))}
 					</div>
-				</div>
+				</fieldset>
 
 				{/* Validation warnings */}
 				{limitExceeded && (
-					<div className="flex items-center gap-2 p-2 bg-danger-muted border border-danger rounded text-body text-danger">
+					<div id={`${fieldId}-limit-error`} className="flex items-center gap-2 p-2 bg-danger-muted border border-danger rounded text-body text-danger">
 						<AlertTriangle size={16} />
 						{t("detail.exceedsLimit")}
 					</div>
 				)}
 				{binarySlotExceeded && (
-					<div className="flex items-center gap-2 p-2 bg-danger-muted border border-danger rounded text-body text-danger">
+					<div id={`${fieldId}-slot-error`} className="flex items-center gap-2 p-2 bg-danger-muted border border-danger rounded text-body text-danger">
 						<AlertTriangle size={16} />
 						{t("detail.exceedsSlot", {
 							slot: binarySlot ?? "",

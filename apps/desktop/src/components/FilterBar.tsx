@@ -111,7 +111,9 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 					size={16}
 					className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted"
 				/>
+				<label htmlFor="editor-search" className="sr-only">{t("filter.searchLabel")}</label>
 				<input
+					id="editor-search"
 					data-search-input
 					type="text"
 					value={searchInput}
@@ -226,6 +228,8 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 									),
 								})
 							}
+							type="button"
+							aria-label={t("filter.previousPage")}
 							disabled={(filter.offset ?? 0) === 0}
 							className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
 						>
@@ -237,6 +241,8 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 									offset: (filter.offset ?? 0) + (filter.limit ?? 100),
 								})
 							}
+							type="button"
+							aria-label={t("filter.nextPage")}
 							disabled={(filter.offset ?? 0) + (filter.limit ?? 100) >= total}
 							className="p-1 text-text-muted hover:text-text disabled:opacity-30 focus:outline-none focus:ring-2 focus:ring-accent-fg rounded"
 						>

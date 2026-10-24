@@ -84,3 +84,14 @@ test("removed welcome guide has no runtime exports or catalog keys", () => {
     assert.doesNotMatch(catalog, /"welcome\.guide\./);
   }
 });
+
+test("editor returns detail focus to the roving table row on close and Escape", () => {
+  const editor = readFileSync(new URL("../pages/Editor.tsx", import.meta.url), "utf8");
+  assert.match(editor, /const tableRef = useRef<HTMLTableElement>\(null\)/);
+  assert.match(editor, /const detailRef = useRef<HTMLElement>\(null\)/);
+  assert.match(editor, /const closeDetail = useCallback\(\(\) => \{[\s\S]*?setSelected\(null\)[\s\S]*?tableRef\.current\?\.querySelector<HTMLElement>\('tbody tr\[tabindex="0"\]'\) \?\? tableRef\.current;[\s\S]*?target\?\.focus\(\)/);
+  assert.match(editor, /else if \(selectedEntryId\) closeDetail\(\)/);
+  assert.match(editor, /<StringTable[\s\S]*?tableRef=\{tableRef\}/);
+  assert.match(editor, /<DetailPanel[\s\S]*?panelRef=\{detailRef\}[\s\S]*?onClose=\{closeDetail\}/);
+  assert.match(editor, /detailRef\.current\?\.querySelector<HTMLTextAreaElement>\("textarea:not\(\[readonly\]\)"\)\?\.focus\(\)/);
+});

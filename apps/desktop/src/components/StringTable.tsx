@@ -1,5 +1,5 @@
 import { pathBasename } from "../lib/path";
-import { useState, useRef, useMemo, useEffect } from "react";
+import { useState, useRef, useMemo, useEffect, type Ref } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
 	useReactTable,
@@ -11,6 +11,7 @@ import {
 	type VisibilityState,
 } from "@tanstack/react-table";
 import clsx from "clsx";
+import { ChevronUp, ChevronDown, ChevronsUpDown } from "lucide-react";
 import type { StringEntry } from "../lib/api";
 import { getConfig, getString, patchString } from "../lib/api";
 import { clampTableRowHeight, showSourceColumnEnabled } from "../lib/appearance";
@@ -95,6 +96,7 @@ function InlineEdit({
 		<div onClick={e => e.stopPropagation()}>
 		<button type="button" disabled={!project || saving}
 			aria-label={t("table.editTranslation")}
+			tabIndex={-1}
 			onClick={(e) => {
 				e.stopPropagation();
 				cancelled.current = false;
@@ -145,16 +147,21 @@ interface StringTableProps {
 	data: StringEntry[];
 	onRefetch: () => void;
 	hasActiveFilters?: boolean;
+	tableRef?: Ref<HTMLTableElement>;
 }
 
 export default function StringTable({
 	data,
 	onRefetch,
 	hasActiveFilters = false,
+	tableRef,
 }: StringTableProps) {
 	const t = useT();
 	const { selectedEntryId, setSelected } = useEditorStore();
 	const [sorting, setSorting] = useState<SortingState>([]);
+	const [focusedEntryId, setFocusedEntryId] = useState<string | null>(null);
+	const [bodyFocused, setBodyFocused] = useState(false);
+	const bodyRef = useRef<HTMLTableSectionElement>(null);
 	const { data: config } = useQuery({ queryKey: ["config"], queryFn: getConfig });
 	const showSource = showSourceColumnEnabled(config?.ui.show_source_column);
 	const rowHeight = clampTableRowHeight(config?.ui.table_row_height);
@@ -236,45 +243,77 @@ export default function StringTable({
 	const table = useReactTable({
 		data,
 		columns,
+		getRowId: entry => entry.id,
 		state: { sorting, columnVisibility },
 		onSortingChange: setSorting,
 		getCoreRowModel: getCoreRowModel(),
 		getSortedRowModel: getSortedRowModel(),
 	});
 
+	const rows = table.getRowModel().rows;
+	const focusedRowId = rows.find(row => row.original.id === focusedEntryId)?.original.id ?? rows[0]?.original.id;
+
 	return (
 		<div className="overflow-auto flex-1 bg-surface">
-			<table className="w-full text-left">
+			<table ref={tableRef} role="grid" tabIndex={-1} className="w-full text-left">
+				<caption className="sr-only">{t("table.keyboardHelp")}</caption>
 				<thead className="sticky top-0 z-10 bg-surface/95 backdrop-blur border-b border-border">
 					{table.getHeaderGroups().map((hg) => (
 						<tr key={hg.id}>
 							{hg.headers.map((header) => (
 								<th
 									key={header.id}
-									onClick={header.column.getToggleSortingHandler()}
-									className="px-3 py-2 text-caption font-medium text-text-muted cursor-pointer hover:text-text select-none"
+									scope="col"
+									aria-sort={header.column.getIsSorted() === "asc" ? "ascending" : header.column.getIsSorted() === "desc" ? "descending" : "none"}
+									className="px-3 py-2 text-caption font-medium text-text-muted select-none"
 									style={{ width: header.getSize() }}
 								>
-									{flexRender(
-										header.column.columnDef.header,
-										header.getContext(),
-									)}
-									{{ asc: " ↑", desc: " ↓" }[
-										header.column.getIsSorted() as string
-									] ?? ""}
+									<button type="button"
+										onClick={header.column.getToggleSortingHandler()}
+										title={t("table.sortPageBy", { column: String(header.column.columnDef.header) })}
+										className="inline-flex items-center gap-1 rounded-sm hover:text-text focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
+									>
+										<span aria-hidden="true">{flexRender(header.column.columnDef.header, header.getContext())}</span>
+										<span className="sr-only">{t("table.sortPageBy", { column: String(header.column.columnDef.header) })}</span>
+										{header.column.getIsSorted() === "asc" ? <ChevronUp size={12} className="text-text-muted" aria-hidden="true" />
+											: header.column.getIsSorted() === "desc" ? <ChevronDown size={12} className="text-text-muted" aria-hidden="true" />
+											: <ChevronsUpDown size={12} className="text-text-muted" aria-hidden="true" />}
+									</button>
 								</th>
 							))}
 						</tr>
 					))}
 				</thead>
-				<tbody>
-					{table.getRowModel().rows.map((row) => (
+				<tbody ref={bodyRef} onFocus={() => setBodyFocused(true)}
+					onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget)) setBodyFocused(false); }}>
+					{rows.map((row, index) => (
 						<tr
 							key={row.id}
-							onClick={() => setSelected(row.original.id)}
+							tabIndex={focusedRowId === row.original.id ? 0 : -1}
+							aria-selected={focusedRowId === row.original.id}
+							onFocus={() => setFocusedEntryId(row.original.id)}
+							onClick={event => {
+								event.currentTarget.focus();
+								setFocusedEntryId(row.original.id);
+								setSelected(row.original.id);
+							}}
+							onKeyDown={event => {
+								// Let nested controls and modified action hotkeys keep their own behavior.
+								if (event.target !== event.currentTarget || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+								if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+									event.preventDefault();
+									const next = Math.max(0, Math.min(rows.length - 1, index + (event.key === "ArrowDown" ? 1 : -1)));
+									setFocusedEntryId(rows[next].original.id);
+									bodyRef.current?.rows[next]?.focus();
+								} else if (event.key === "Enter") {
+									event.preventDefault();
+									setSelected(row.original.id);
+								}
+							}}
 							style={{ height: rowHeight }}
 							className={clsx(
-								"group border-b border-border cursor-pointer transition-colors",
+								"group border-b border-border cursor-pointer transition-colors focus:outline-none focus:ring-1 focus:ring-accent-fg focus:bg-surface-muted",
+								bodyFocused && focusedRowId === row.original.id && "ring-1 ring-accent-fg bg-surface-muted",
 								selectedEntryId === row.original.id
 									? "bg-accent-muted shadow-[inset_2px_0_0_0_var(--color-accent)]"
 									: "hover:bg-surface-muted",
