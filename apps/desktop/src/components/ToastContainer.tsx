@@ -10,10 +10,10 @@ const icons = {
 };
 
 const colors = {
-	success: "bg-accent text-white",
-	error: "bg-red-600 text-white dark:bg-red-700",
-	info: "bg-blue-600 text-white dark:bg-blue-700",
-	warning: "bg-amber-700 text-white dark:bg-amber-800",
+	success: "bg-success-muted text-success",
+	error: "bg-danger-muted text-danger",
+	info: "bg-accent-muted text-accent-fg",
+	warning: "bg-warning-muted text-warning",
 };
 
 export default function ToastContainer() {
@@ -42,7 +42,7 @@ export default function ToastContainer() {
 							type="button"
 							onClick={() => dismiss(toast.id)}
 							aria-label={t("toast.dismiss")}
-							className="shrink-0 opacity-70 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-white/50 rounded p-0.5"
+							className="shrink-0 focus:outline-none focus:ring-2 focus:ring-current rounded p-0.5"
 						>
 							<X size={14} />
 						</button>

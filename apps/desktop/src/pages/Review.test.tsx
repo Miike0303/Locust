@@ -292,3 +292,14 @@ test("a failed delayed approval releases the guard and retries the same row", as
   await approve();
   progress(2, 1);
 });
+
+test("Review header uses the shared status badge and success progress color", async () => {
+  const { StatusBadge } = await import("../lib/statusStyles.ts");
+  const header = () => render().props.children[0];
+  const badge = () => nodes(header()).find(node => node.type === StatusBadge);
+  assert.equal(badge()?.props.status, "translated");
+  assert.ok(nodes(header()).some(node => node.props?.className?.includes("bg-success")));
+  await approve();
+  button(t("review.previous")).props.onClick();
+  assert.equal(badge()?.props.status, "approved");
+});

@@ -3,9 +3,10 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle } from "lucide-react";
-import { getCurrentProject, getStats, getFileStats, getTranslationRuns, getInjectionStatus, type StringStatus } from "../lib/api";
+import { getCurrentProject, getStats, getFileStats, getTranslationRuns, getInjectionStatus } from "../lib/api";
 import { ApiError } from "../lib/apiError";
 import { useT, getLocale } from "../lib/i18n";
+import { StatusBadge, statusStyles } from "../lib/statusStyles";
 import { buildProjectDashboard, formatDashboardCost } from "../lib/projectDashboard";
 import { formatObservedCost } from "../lib/translationCost";
 import { readSkipReviewPreference } from "../lib/workflowGuide";
@@ -16,14 +17,6 @@ import InjectionRecoveryModal from "../components/InjectionRecoveryModal";
 
 const CARD = "rounded-lg border border-border bg-surface p-4 space-y-3";
 const ACTION = "inline-flex items-center justify-center rounded-md bg-accent-muted px-4 py-2 text-body font-medium text-accent-fg hover:bg-accent-muted/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg";
-const SEGMENT_CLASS: Record<StringStatus, string> = {
-  pending: "bg-border",
-  translated: "bg-accent-muted",
-  reviewed: "bg-warning",
-  approved: "bg-success",
-  error: "bg-danger",
-};
-
 export default function Dashboard() {
   const project = useProjectStore(s => s.project);
   const projectKey = project ? draftProjectKey(project) : "";
@@ -99,10 +92,10 @@ function ProjectDashboard({ projectKey, gamePath }: { projectKey: string; gamePa
           <h2 id="dashboard-progress" className="font-semibold">{t("dashboard.progress")}</h2>
           <p className="text-page font-bold tabular-nums">{model.percent}%</p>
           <div role="img" aria-label={progressLabel} className="flex h-3 overflow-hidden rounded-full bg-surface-muted">
-            {model.segments.map(segment => <span key={segment.status} aria-hidden="true" title={t(`dashboard.status.${segment.status}`)} className={SEGMENT_CLASS[segment.status]} style={{ width: `${segment.width}%` }} />)}
+            {model.segments.map(segment => <span key={segment.status} aria-hidden="true" title={t(`dashboard.status.${segment.status}`)} className={statusStyles[segment.status].bar} style={{ width: `${segment.width}%` }} />)}
           </div>
           <ul className="flex flex-wrap gap-x-3 gap-y-1 text-caption text-text-muted">
-            {model.segments.map(segment => <li key={segment.status} className="inline-flex items-center gap-1.5"><span aria-hidden="true" className={`h-2 w-2 rounded-sm ${SEGMENT_CLASS[segment.status]}`} />{t(`dashboard.status.${segment.status}`)}: {segment.count}</li>)}
+            {model.segments.map(segment => <li key={segment.status} className="inline-flex items-center gap-1.5"><StatusBadge status={segment.status} labelKey={`dashboard.status.${segment.status}`} />: {segment.count}</li>)}
           </ul>
         </section>
         <section className={CARD} aria-labelledby="dashboard-cost">

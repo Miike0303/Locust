@@ -6,7 +6,7 @@ const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
 const colorTokens = [
   "surface", "surface-muted", "border", "text", "text-muted",
   "accent", "accent-hover", "accent-muted", "accent-fg",
-  "danger", "danger-muted", "warning", "warning-muted", "success", "success-muted",
+  "danger", "danger-contrast", "danger-muted", "warning", "warning-muted", "success", "success-muted",
 ] as const;
 const typeTokens = {
   caption: [".75rem", "1rem"],
@@ -101,5 +101,20 @@ for (const selector of [":root", ".dark"]) {
     const ratio = contrast(palette.get(`--${foreground?.slice(5)}`), palette.get(`--${background?.slice(3)}`));
     assert.ok(ratio >= 4.5, `${selector} shortcut contrast: ${ratio.toFixed(2)}:1`);
     assert.ok(!hintClasses.some(value => value.startsWith("text-") && value !== "text-caption"), "shortcut inherits the item's foreground");
+  });
+}
+
+for (const selector of [":root", ".dark"]) {
+  test(`${selector} status labels, selected rows, checks and destructive buttons meet 4.5:1`, () => {
+    const palette = declarations(selector);
+    for (const foreground of ["text-muted", "accent-fg", "success", "danger"]) {
+      for (const background of ["surface", "surface-muted", "accent-muted"]) {
+        const ratio = contrast(palette.get(`--${foreground}`), palette.get(`--${background}`));
+        assert.ok(ratio >= 4.5, `${selector} ${foreground} on ${background}: ${ratio.toFixed(2)}:1`);
+      }
+    }
+    const ratio = contrast(palette.get("--danger-contrast"), palette.get("--danger"));
+    assert.ok(ratio >= 4.5, `${selector} destructive button: ${ratio.toFixed(2)}:1`);
+    assert.equal(declarations("@theme inline").get("--color-danger-contrast"), "var(--danger-contrast)");
   });
 }

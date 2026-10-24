@@ -78,9 +78,9 @@ export default function ConfirmDialog({
 						ref={confirmRef}
 						type="button"
 						onClick={onConfirm}
-						className={`px-4 py-2 text-body font-medium rounded text-white ${destructive
-							? "bg-red-600 hover:bg-red-700"
-							: "bg-accent hover:bg-accent-hover"
+						className={`px-4 py-2 text-body font-medium rounded ${destructive
+							? "bg-danger text-danger-contrast hover:bg-danger/90"
+							: "bg-accent text-white hover:bg-accent-hover"
 							}`}
 					>
 						{resolvedConfirm}

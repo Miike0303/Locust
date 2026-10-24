@@ -66,21 +66,14 @@ test("toolbar and guide translation actions retain the same modal path and dismi
   assert.match(banner, /onClick=\{onDismiss\}/);
 });
 
-test("translated and approved status use accent tokens with hollow versus filled dots", () => {
-  const source = readFileSync(new URL("../components/StringTable.tsx", import.meta.url), "utf8");
-  const dots = source.match(/const statusDot[^=]*= \{([\s\S]*?)\};/)?.[1] ?? "";
-  const text = source.match(/const statusText[^=]*= \{([\s\S]*?)\};/)?.[1] ?? "";
-  assert.doesNotMatch(dots + text, /(?:bg|text)-blue-/);
-  assert.match(dots, /translated: "bg-transparent ring-1 ring-inset ring-accent"/);
-  assert.match(dots, /approved: "bg-accent"/);
-  assert.match(text, /translated: "text-accent-fg"/);
-  assert.match(text, /approved: "text-accent-fg"/);
-  assert.match(source, /statusLabel\[status\] \? t\(statusLabel\[status\]\) : status/);
-});
-
-test("translated progress uses accent without changing its count width", () => {
-  const source = readFileSync(new URL("../pages/Editor.tsx", import.meta.url), "utf8");
-  assert.match(source, /className="h-full bg-accent\/50" style=\{\{ width: width\(stats.translated\) \}\}/);
+test("editor table and progress consume the shared status palette", () => {
+  const table = readFileSync(new URL("../components/StringTable.tsx", import.meta.url), "utf8");
+  assert.match(table, /<StatusBadge status=\{status\}/);
+  const editor = readFileSync(new URL("../pages/Editor.tsx", import.meta.url), "utf8");
+  for (const status of ["approved", "reviewed", "translated"]) {
+    assert.ok(editor.includes(`statusStyles.${status}.bar`));
+    assert.ok(editor.includes(`width(stats.${status})`));
+  }
 });
 
 test("removed welcome guide has no runtime exports or catalog keys", () => {

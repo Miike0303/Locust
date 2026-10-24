@@ -1,3 +1,4 @@
+import { statusStyles } from "../lib/statusStyles";
 import { projectScopedQueryFn, useProjectScopedQueryEnabled } from "../lib/projectScope";
 import { formatSourceKind } from "../lib/gameSource";
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
@@ -82,9 +83,9 @@ function EditorProgress({ stats }: { stats: ProjectStats }) {
 				aria-valuenow={done}
 				className="flex h-2 w-36 overflow-hidden rounded-full bg-border"
 			>
-				<span className="h-full bg-success" style={{ width: width(stats.approved) }} />
-				<span className="h-full bg-warning" style={{ width: width(stats.reviewed) }} />
-				<span className="h-full bg-accent/50" style={{ width: width(stats.translated) }} />
+				<span className={`h-full ${statusStyles.approved.bar}`} style={{ width: width(stats.approved) }} />
+				<span className={`h-full ${statusStyles.reviewed.bar}`} style={{ width: width(stats.reviewed) }} />
+				<span className={`h-full ${statusStyles.translated.bar}`} style={{ width: width(stats.translated) }} />
 			</div>
 			<span className="text-caption font-semibold tabular-nums text-text">
 				{t("editor.progressPercent", { percent })}

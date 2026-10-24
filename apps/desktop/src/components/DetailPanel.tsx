@@ -11,27 +11,9 @@ import { useProjectStore } from "../stores/projectStore";
 import StringHistory from "./StringHistory";
 import MemorySuggestions from "./MemorySuggestions";
 
-import type { MessageKey } from "../lib/i18n";
+import { StatusBadge, statusStyles } from "../lib/statusStyles";
 
-const statusButtons: { value: StringStatus; labelKey: MessageKey; color: string }[] = [
-	{
-		value: "pending",
-		labelKey: "detail.status.pending",
-		color: "bg-border text-text",
-	},
-	{
-		value: "reviewed",
-		labelKey: "detail.status.reviewed",
-		color:
-			"bg-warning-muted text-warning",
-	},
-	{
-		value: "approved",
-		labelKey: "detail.status.approved",
-		color:
-			"bg-success-muted text-success",
-	},
-];
+const statusButtons: readonly StringStatus[] = ["pending", "reviewed", "approved"];
 
 interface DetailPanelProps {
 	projectKey: string;
@@ -226,19 +208,20 @@ export default function DetailPanel({
 						{t("detail.status")}
 					</label>
 					<div className="flex gap-1.5 mt-1">
-						{statusButtons.map(({ value, labelKey, color }) => (
+						{statusButtons.map((value) => (
 							<button
 								key={value}
+								aria-pressed={entry.status === value}
 								disabled={changingStatus}
 								onClick={() => handleStatusChange(value)}
 								className={clsx(
 									"px-2.5 py-0.5 rounded-full text-caption font-medium transition-colors",
 									entry.status === value
-										? color
-										: "bg-surface-muted text-text-muted hover:bg-border",
+										? `${statusStyles[value].chip} ${statusStyles[value].text}`
+										: "bg-surface hover:bg-surface-muted",
 								)}
 							>
-								{t(labelKey)}
+								<StatusBadge status={value} />
 							</button>
 						))}
 					</div>

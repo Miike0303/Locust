@@ -1,3 +1,4 @@
+import { StatusBadge, statusStyles } from "../lib/statusStyles";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -308,19 +309,20 @@ export default function Review() {
       {/* Header */}
       <div className="p-4 border-b border-border space-y-2">
         <div className="flex justify-between items-center">
-          <span className="text-body font-medium">
+          <span className="text-body font-medium inline-flex items-center gap-3">
             {t("review.progress", {
               current: progress.current,
               total: progress.total,
               approved: progress.approved,
             })}
+            {entry && <StatusBadge status={entry.status} />}
           </span>
           <button onClick={handleExit} disabled={approving} className="text-body text-text-muted hover:text-text flex items-center gap-1 disabled:opacity-50">
             <X size={14} /> {t("common.exit")}
           </button>
         </div>
         <div className="w-full bg-border rounded-full h-2">
-          <div className="bg-accent h-2 rounded-full transition-all" style={{ width: `${bar}%` }} />
+          <div className={`${statusStyles.approved.bar} h-2 rounded-full transition-all`} style={{ width: `${bar}%` }} />
         </div>
       </div>
 

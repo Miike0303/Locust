@@ -135,3 +135,25 @@ test("file stats use embedded HTTP and unwrap the server response even in Tauri"
   try { assert.deepEqual(await getFileStats(), files); }
   finally { globalThis.fetch = originalFetch; }
 });
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale}: Dashboard preserves segment widths and labels with the shared palette`, () => {
+    setLocale(locale);
+    seed();
+    const html = render();
+    const progress = html.match(/<div role="img"[^>]*>([\s\S]*?)<\/div>/)?.[1];
+    assert.ok(progress);
+    const segments = [...progress.matchAll(/class="([^"]+)" style="width:([^"]+)"/g)];
+    assert.deepEqual(segments.map(([, classes, width]) => [classes, width]), [
+      ["bg-border", "30%"], ["bg-accent/60", "20%"], ["bg-accent", "10%"],
+      ["bg-success", "30%"], ["bg-danger", "10%"],
+    ]);
+    const legend = html.match(/<ul[^>]*>([\s\S]*?)<\/ul>/)?.[1];
+    assert.ok(legend);
+    assert.doesNotMatch(legend, /bg-warning|text-warning/);
+    assert.equal((legend.match(/lucide-check/g) ?? []).length, 1);
+    for (const status of ["pending", "translated", "reviewed", "approved", "error"] as const) {
+      assert.ok(legend.includes(t(`dashboard.status.${status}`)));
+    }
+  });
+}

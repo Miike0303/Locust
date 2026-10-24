@@ -13,6 +13,8 @@ import {
 } from "../lib/stringFilterFacets";
 import { useT } from "../lib/i18n";
 
+import { StatusBadge, statusStyles } from "../lib/statusStyles";
+
 import type { MessageKey } from "../lib/i18n";
 
 const STATUSES: { labelKey: MessageKey; value: StringStatus | undefined }[] = [
@@ -23,14 +25,6 @@ const STATUSES: { labelKey: MessageKey; value: StringStatus | undefined }[] = [
 	{ labelKey: "filter.approved", value: "approved" },
 	{ labelKey: "filter.error", value: "error" },
 ];
-
-const statusColors: Record<string, string> = {
-	pending: "bg-border text-text",
-	translated: "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300",
-	reviewed: "bg-warning-muted text-warning",
-	approved: "bg-success-muted text-success",
-	error: "bg-danger-muted text-danger",
-};
 
 interface FilterBarProps {
 	total: number;
@@ -97,16 +91,17 @@ export default function FilterBar({ total, showing }: FilterBarProps) {
 					<button
 						key={labelKey}
 						onClick={() => setFilter({ status: value, offset: 0 })}
+						aria-pressed={filter.status === value}
 						className={clsx(
 							"px-2.5 py-0.5 rounded-full text-caption font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg",
 							filter.status === value
 								? value
-									? statusColors[value]
+									? `${statusStyles[value].chip} ${statusStyles[value].text}`
 									: "bg-accent-muted text-accent-fg"
 								: "text-text-muted hover:bg-surface-muted hover:text-text",
 						)}
 					>
-						{t(labelKey)}
+						{value ? <StatusBadge status={value} labelKey={labelKey} /> : t(labelKey)}
 					</button>
 				))}
 			</div>

@@ -15,34 +15,11 @@ import type { StringEntry } from "../lib/api";
 import { getConfig, getString, patchString } from "../lib/api";
 import { clampTableRowHeight, showSourceColumnEnabled } from "../lib/appearance";
 import { useEditorStore } from "../stores/editorStore";
-import { useT, type MessageKey } from "../lib/i18n";
+import { useT } from "../lib/i18n";
 import { useProjectStore } from "../stores/projectStore";
 import { acknowledgeDraft, draftEntryKey, draftProjectKey, editDraft, loadLatestDraft, saveDraft, useDraftStore } from "../stores/draftStore";
 
-const statusLabel: Record<string, MessageKey> = {
-	pending: "detail.status.pending",
-	translated: "detail.status.translated",
-	reviewed: "detail.status.reviewed",
-	approved: "detail.status.approved",
-	error: "detail.status.error",
-};
-
-/** Status markers keep labels; translated is hollow and approved is filled. */
-const statusDot: Record<string, string> = {
-	pending: "bg-transparent ring-1 ring-inset ring-text-muted",
-	translated: "bg-transparent ring-1 ring-inset ring-accent",
-	reviewed: "bg-warning",
-	approved: "bg-accent",
-	error: "bg-danger",
-};
-
-const statusText: Record<string, string> = {
-	pending: "text-text-muted",
-	translated: "text-accent-fg",
-	reviewed: "text-warning",
-	approved: "text-accent-fg",
-	error: "text-danger",
-};
+import { StatusBadge } from "../lib/statusStyles";
 
 function InlineEdit({
 	entry,
@@ -194,23 +171,7 @@ export default function StringTable({
 				size: 90,
 				cell: ({ getValue }) => {
 					const status = getValue() as string;
-					return (
-						<span
-							className={clsx(
-								"inline-flex items-center gap-1.5 whitespace-nowrap text-caption font-medium",
-								statusText[status] || "text-text-muted",
-							)}
-						>
-							<span
-								aria-hidden="true"
-								className={clsx(
-									"size-2 shrink-0 rounded-full",
-									statusDot[status] || "bg-text-muted",
-								)}
-							/>
-							{statusLabel[status] ? t(statusLabel[status]) : status}
-						</span>
-					);
+					return <StatusBadge status={status} />;
 				},
 			},
 			{
