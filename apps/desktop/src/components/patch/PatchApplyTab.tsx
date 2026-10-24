@@ -63,20 +63,9 @@ export default function PatchApplyTab({
 	setConfirmLegacy,
 	dryRun,
 	setDryRun,
-	handleVerify,
-	loading,
 	applying,
-	canVerifyApply,
-	gamePath,
-	sourceOk,
-	handleApply,
-	handlePreviewRollback,
-	handleRollback,
 	showPartialWarning,
-	refreshStatus,
 	applyProgress,
-	handleCancelApply,
-	cancellingApply,
 	preview,
 	status,
 	patchValue,
@@ -196,68 +185,6 @@ export default function PatchApplyTab({
 				</label>
 			</div>
 
-			<div className="flex flex-wrap gap-2">
-				<button
-					onClick={handleVerify}
-					disabled={loading || applying || !canVerifyApply}
-					title={
-						!gamePath.trim()
-							? t("patch.selectGame")
-							: !sourceOk
-								? t("patch.selectSource")
-								: undefined
-					}
-					className="flex items-center gap-1.5 px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body font-medium disabled:opacity-50"
-				>
-					<ShieldCheck size={16} /> {t("patch.verify")}
-				</button>
-				<button
-					onClick={handleApply}
-					disabled={loading || applying || !canVerifyApply}
-					title={
-						!gamePath.trim()
-							? t("patch.selectGame")
-							: !sourceOk
-								? t("patch.selectSource")
-								: undefined
-					}
-					className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50"
-				>
-					{applying ? (
-						<Loader2 size={16} className="animate-spin" />
-					) : (
-						<Package size={16} />
-					)}{" "}
-					{dryRun ? t("patch.planApply") : t("patch.applyBtn")}
-				</button>
-				<button
-					type="button"
-					onClick={handlePreviewRollback}
-					disabled={loading || applying || !gamePath.trim()}
-					className="flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-surface hover:bg-warning-muted rounded text-body font-medium disabled:opacity-50"
-				>
-					<RotateCcw size={16} /> {t("patch.rollbackPreview")}
-				</button>
-				<button
-					onClick={handleRollback}
-					disabled={loading || applying}
-					className={
-						showPartialWarning
-							? "flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-transparent hover:underline rounded text-body font-medium disabled:opacity-50 ring-2 ring-warning ring-offset-1 ring-offset-surface"
-							: "flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-transparent hover:underline rounded text-body font-medium disabled:opacity-50"
-					}
-				>
-					<RotateCcw size={16} /> {t("patch.rollback")}
-				</button>
-				<button
-					onClick={refreshStatus}
-					disabled={loading || applying || !gamePath.trim()}
-					className="px-3 py-2 text-body text-text-muted hover:underline disabled:opacity-50"
-				>
-					{t("patch.refreshStatus")}
-				</button>
-			</div>
-
 			{applying && (
 				<div className="p-3 border border-success bg-success-muted rounded text-body space-y-2">
 					<div className="flex items-center gap-2 font-medium">
@@ -308,16 +235,7 @@ export default function PatchApplyTab({
 							)}
 						</>
 					)}
-					<button
-						type="button"
-						onClick={handleCancelApply}
-						disabled={cancellingApply}
-						className="w-full py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded text-body font-medium"
-					>
-						{cancellingApply
-							? t("patch.cancelling")
-							: t("patch.cancelApply")}
-					</button>
+
 				</div>
 			)}
 
@@ -327,22 +245,7 @@ export default function PatchApplyTab({
 						<AlertCircle size={16} className="shrink-0 mt-0.5" />
 						<span>{t("patch.partialWarning")}</span>
 					</div>
-					<button
-						type="button"
-						onClick={handlePreviewRollback}
-						disabled={loading || !gamePath.trim()}
-						className="w-full flex items-center justify-center gap-1.5 py-2 border border-warning text-warning bg-surface hover:bg-warning-muted rounded text-body font-medium disabled:opacity-50"
-					>
-						<RotateCcw size={16} /> {t("patch.rollbackPreview")}
-					</button>
-					<button
-						type="button"
-						onClick={handleRollback}
-						disabled={loading}
-						className="w-full flex items-center justify-center gap-1.5 py-2 bg-amber-700 hover:bg-amber-800 disabled:opacity-50 text-white rounded text-body font-medium"
-					>
-						<RotateCcw size={16} /> {t("patch.rollbackNow")}
-					</button>
+
 				</div>
 			)}
 
@@ -461,4 +364,114 @@ export default function PatchApplyTab({
 			</p>
 		</>
 	);
+}
+
+export function PatchApplyActions({
+	t,
+	handleVerify,
+	loading,
+	applying,
+	canVerifyApply,
+	gamePath,
+	sourceOk,
+	handleApply,
+	handlePreviewRollback,
+	handleRollback,
+	showPartialWarning,
+	refreshStatus,
+	dryRun,
+	handleCancelApply,
+	cancellingApply
+}: Pick<PatchApplyTabProps, "t" | "handleVerify" | "loading" | "applying" | "canVerifyApply" | "gamePath" | "sourceOk" | "handleApply" | "handlePreviewRollback" | "handleRollback" | "showPartialWarning" | "refreshStatus" | "dryRun" | "handleCancelApply" | "cancellingApply">) {
+	return <>
+		<div className="flex flex-wrap gap-2">
+			<button
+				onClick={handleVerify}
+				disabled={loading || applying || !canVerifyApply}
+				title={
+					!gamePath.trim()
+						? t("patch.selectGame")
+						: !sourceOk
+							? t("patch.selectSource")
+							: undefined
+				}
+				className="flex items-center gap-1.5 px-3 py-2 bg-surface-muted text-text hover:bg-surface rounded text-body font-medium disabled:opacity-50"
+			>
+				<ShieldCheck size={16} /> {t("patch.verify")}
+			</button>
+			<button
+				onClick={handleApply}
+				disabled={loading || applying || !canVerifyApply}
+				title={
+					!gamePath.trim()
+						? t("patch.selectGame")
+						: !sourceOk
+							? t("patch.selectSource")
+							: undefined
+				}
+				className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50"
+			>
+				{applying ? (
+					<Loader2 size={16} className="animate-spin" />
+				) : (
+					<Package size={16} />
+				)}{" "}
+				{dryRun ? t("patch.planApply") : t("patch.applyBtn")}
+			</button>
+			<button
+				type="button"
+				onClick={handlePreviewRollback}
+				disabled={loading || applying || !gamePath.trim()}
+				className="flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-surface hover:bg-warning-muted rounded text-body font-medium disabled:opacity-50"
+			>
+				<RotateCcw size={16} /> {t("patch.rollbackPreview")}
+			</button>
+			<button
+				onClick={handleRollback}
+				disabled={loading || applying}
+				className={
+					showPartialWarning
+						? "flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-transparent hover:underline rounded text-body font-medium disabled:opacity-50 ring-2 ring-warning ring-offset-1 ring-offset-surface"
+						: "flex items-center gap-1.5 px-3 py-2 border border-warning text-warning bg-transparent hover:underline rounded text-body font-medium disabled:opacity-50"
+				}
+			>
+				<RotateCcw size={16} /> {t("patch.rollback")}
+			</button>
+			<button
+				onClick={refreshStatus}
+				disabled={loading || applying || !gamePath.trim()}
+				className="px-3 py-2 text-body text-text-muted hover:underline disabled:opacity-50"
+			>
+				{t("patch.refreshStatus")}
+			</button>
+		</div>
+		{!applying && showPartialWarning && <div className="flex flex-wrap gap-2 w-full">
+			<button
+				type="button"
+				onClick={handlePreviewRollback}
+				disabled={loading || !gamePath.trim()}
+				className="w-full flex items-center justify-center gap-1.5 py-2 border border-warning text-warning bg-surface hover:bg-warning-muted rounded text-body font-medium disabled:opacity-50"
+			>
+				<RotateCcw size={16} /> {t("patch.rollbackPreview")}
+			</button>
+			<button
+				type="button"
+				onClick={handleRollback}
+				disabled={loading}
+				className="w-full flex items-center justify-center gap-1.5 py-2 bg-amber-700 hover:bg-amber-800 disabled:opacity-50 text-white rounded text-body font-medium"
+			>
+				<RotateCcw size={16} /> {t("patch.rollbackNow")}
+			</button>
+		</div>}
+		{applying && <button
+			type="button"
+			onClick={handleCancelApply}
+			disabled={cancellingApply}
+			className="w-full py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded text-body font-medium"
+		>
+			{cancellingApply
+				? t("patch.cancelling")
+				: t("patch.cancelApply")}
+		</button>}
+	</>;
 }

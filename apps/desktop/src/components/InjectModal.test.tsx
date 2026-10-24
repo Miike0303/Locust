@@ -55,6 +55,9 @@ const hooks = registerHooks({
         "../stores/logStore": `export const addLog=(...args)=>globalThis.__injectModal.logs.push(args);`,
         "../lib/modalA11y": `const h=globalThis.__injectModal;
           export const MODAL_BACKDROP_CLASS=h.a11y.MODAL_BACKDROP_CLASS;
+          export const MODAL_HEADER_CLASS=h.a11y.MODAL_HEADER_CLASS;
+          export const MODAL_BODY_CLASS=h.a11y.MODAL_BODY_CLASS;
+          export const MODAL_FOOTER_CLASS=h.a11y.MODAL_FOOTER_CLASS;
           export const modalPanelClass=h.a11y.modalPanelClass;
           export const useModalA11y=()=>({dialogRef:{current:null},dialogProps:h.a11y.buildModalDialogProps({titleId:'title'}),titleProps:h.a11y.buildModalTitleProps('title')});`,
       };
@@ -131,8 +134,11 @@ function render() {
   throw new Error("InjectModal did not settle after effects");
 }
 function button(label: string) {
-  const found = nodes(render()).find(node => node.type === "button" && text(node).trim() === label);
+  const tree = render();
+  const found = nodes(tree).find(node => node.type === "button" && text(node).trim() === label);
   assert.ok(found, `missing action: ${label}`);
+  const footer = nodes(tree).find(node => node.type === "footer");
+  assert.ok(nodes(footer).includes(found), `action must stay in the footer: ${label}`);
   return found;
 }
 function checkbox() {
@@ -502,7 +508,6 @@ test("Add injection still skips automatic registration when no translations were
   await inject("add");
   assert.equal(registerCalls().length, 0);
 });
-
 
 for (const locale of ["en", "es"] as const) test(`${locale} Godot defaults to Replace, offers Direct, omits Add and explains archive-only copy`, () => {
   reset(locale, "add");

@@ -3,7 +3,7 @@ import { FolderOpen, Loader2, X } from "lucide-react";
 import { createFontPatch, getTranslationRuns, type FontPatchRequest } from "../lib/api";
 import { useT } from "../lib/i18n";
 import { readLastUsedTranslationPrefs } from "../lib/translationDefaults";
-import { MODAL_BACKDROP_CLASS, MODAL_FOOTER_CLASS, modalPanelClass, useModalA11y } from "../lib/modalA11y";
+import { MODAL_BACKDROP_CLASS, MODAL_HEADER_CLASS, MODAL_BODY_CLASS, MODAL_FOOTER_CLASS, modalPanelClass, useModalA11y } from "../lib/modalA11y";
 
 type Props = { open: boolean; defaultGamePath: string; onClose: () => void; onUsePatch: (path: string, gamePath: string) => void };
 const empty = (): FontPatchRequest => ({ game_path: "", source_font: "", target_path: "", language: "", output_path: "" });
@@ -53,12 +53,12 @@ export default function FontPatchDialog({ open, defaultGamePath, onClose, onUseP
     ["base_patch", "fontPatch.base", true], ["output_path", "fontPatch.output", true],
   ] as const;
   return <div className={MODAL_BACKDROP_CLASS}>
-    <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-2xl max-h-[90vh] flex flex-col")}>
-      <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+    <div ref={dialogRef} {...dialogProps} className={modalPanelClass("max-w-2xl")}>
+      <header className={`${MODAL_HEADER_CLASS} flex items-center justify-between px-5 py-4 border-b border-border`}>
         <h2 {...titleProps} className="text-section font-semibold">{t("fontPatch.title")}</h2>
         <button onClick={close} disabled={busy} aria-label={t("common.close")}><X size={20} /></button>
-      </div>
-      <div className="px-5 py-4 space-y-3 overflow-y-auto">
+      </header>
+      <div className={`${MODAL_BODY_CLASS} px-5 py-4 space-y-3`}>
         <p className="text-body text-text-muted">{t("fontPatch.description")}</p>
         <p className="text-caption text-text-muted">{t("fontPatch.combineNote")}</p>
         <fieldset disabled={busy} className="space-y-3">
@@ -74,11 +74,11 @@ export default function FontPatchDialog({ open, defaultGamePath, onClose, onUseP
         {error && <p role="alert" className="text-body text-danger break-words">{error}</p>}
         {output && <div role="status" className="text-body text-success break-all"><p>{t("fontPatch.created")}</p><p>{output}</p></div>}
       </div>
-      <div className={MODAL_FOOTER_CLASS}>
+      <footer className={MODAL_FOOTER_CLASS}>
         {output ? <button className="px-4 py-2 rounded text-body bg-accent hover:bg-accent-hover text-white" onClick={() => onUsePatch(output, draft.game_path)}>{t("fontPatch.use")}</button>
           : <button disabled={!ready || busy} onClick={() => void submit()} className="flex items-center gap-2 px-4 py-2 rounded text-body bg-accent hover:bg-accent-hover text-white disabled:opacity-50">{busy && <Loader2 size={16} className="animate-spin" />}{t("fontPatch.create")}</button>}
         <button onClick={close} disabled={busy} className="px-4 py-2 rounded text-body border border-border bg-surface text-text hover:bg-surface-muted">{t("common.close")}</button>
-      </div>
+      </footer>
     </div>
   </div>;
 }

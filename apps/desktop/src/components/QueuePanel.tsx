@@ -43,6 +43,9 @@ import {
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_HEADER_CLASS,
+	MODAL_BODY_CLASS,
+	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
 import {
@@ -301,10 +304,10 @@ export default function QueuePanel() {
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-2xl max-h-[80vh] flex flex-col")}
+				className={modalPanelClass("max-w-2xl")}
 			>
 				{/* Header */}
-				<div className="flex items-center justify-between p-4 border-b border-border">
+				<header className={`${MODAL_HEADER_CLASS} flex items-center justify-between p-4 border-b border-border`}>
 					<h2 {...titleProps} className="font-bold text-section">
 						{t("queue.title")}
 					</h2>
@@ -337,9 +340,9 @@ export default function QueuePanel() {
 							<X size={20} />
 						</button>
 					</div>
-				</div>
+				</header>
 
-				<div className="flex-1 overflow-y-auto">
+				<div className={MODAL_BODY_CLASS}>
 					{/* Queue list */}
 					{items.length === 0 ? (
 						<EmptyState
@@ -565,7 +568,7 @@ export default function QueuePanel() {
 				</div>
 
 				{/* Footer */}
-				<div className="p-4 border-t border-border">
+				<footer className={`${MODAL_FOOTER_CLASS} flex-col items-stretch p-4`}>
 					{!providerReadiness.ready &&
 						providerReadiness.reason === "missing_key" &&
 						!isRunning &&
@@ -584,7 +587,7 @@ export default function QueuePanel() {
 								</button>
 							</div>
 						)}
-					<div className="flex items-center justify-between gap-4">
+					<div className="flex flex-wrap items-center justify-between gap-2">
 						<div className="text-body text-text-muted tabular-nums">
 							{isRunning ? (
 								<span>
@@ -620,7 +623,7 @@ export default function QueuePanel() {
 							</button>
 						)}
 					</div>
-				</div>
+				</footer>
 			</div>
 		</div>
 	);

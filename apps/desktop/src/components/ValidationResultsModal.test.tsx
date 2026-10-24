@@ -19,7 +19,7 @@ registerHooks({
       return { format: "module", source: "export const useT=()=>globalThis.__encodingTranslate;", shortCircuit: true };
     }
     if (url.endsWith("/lib/modalA11y.ts")) {
-      return { format: "module", source: "export const useModalA11y=()=>({}); export const MODAL_BACKDROP_CLASS='', MODAL_FOOTER_CLASS=''; export const modalPanelClass=x=>x;", shortCircuit: true };
+      return { format: "module", source: "export const useModalA11y=()=>({}); export const MODAL_BACKDROP_CLASS='', MODAL_FOOTER_CLASS='', MODAL_HEADER_CLASS='shrink-0', MODAL_BODY_CLASS='flex-1 min-h-0 overflow-y-auto'; export const modalPanelClass=x=>x;", shortCircuit: true };
     }
     return nextLoad(url, context);
   },

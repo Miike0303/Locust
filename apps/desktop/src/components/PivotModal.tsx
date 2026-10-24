@@ -18,11 +18,12 @@ import { addToast } from "../stores/toastStore";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_HEADER_CLASS,
+	MODAL_BODY_CLASS,
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
 import { useT } from "../lib/i18n";
-import clsx from "clsx";
 
 interface PivotModalProps {
 	open: boolean;
@@ -165,9 +166,9 @@ export default function PivotModal({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-md p-6")}
+				className={modalPanelClass("max-w-md")}
 			>
-				<div className="flex justify-between items-center mb-4">
+				<header className={`${MODAL_HEADER_CLASS} flex justify-between items-center px-6 pt-6 pb-4`}>
 					<h2
 						{...titleProps}
 						className="text-section font-bold flex items-center gap-2"
@@ -181,23 +182,25 @@ export default function PivotModal({
 					>
 						<X size={20} />
 					</button>
-				</div>
+				</header>
 
 				{result ? (
-					<div className="space-y-4">
-						<p className="text-body text-text">
-							{t("pivot.success", {
-								count: result.entries,
-								path: result.database_path,
-							})}
-						</p>
-						<p className="text-caption text-text-muted break-all">
-							{result.database_path}
-						</p>
-						{error && (
-							<p className="text-body text-danger">{error}</p>
-						)}
-						<div className={clsx(MODAL_FOOTER_CLASS, "-mx-6 -mb-6")}>
+					<>
+						<div className={`${MODAL_BODY_CLASS} px-6 pb-4 space-y-4`}>
+							<p className="text-body text-text">
+								{t("pivot.success", {
+									count: result.entries,
+									path: result.database_path,
+								})}
+							</p>
+							<p className="text-caption text-text-muted break-all">
+								{result.database_path}
+							</p>
+							{error && (
+								<p className="text-body text-danger">{error}</p>
+							)}
+						</div>
+						<footer className={MODAL_FOOTER_CLASS}>
 							<button
 								type="button"
 								onClick={stayHere}
@@ -221,28 +224,30 @@ export default function PivotModal({
 								)}
 								{t("pivot.openNow")}
 							</button>
-						</div>
-					</div>
+						</footer>
+					</>
 				) : (
-					<div className="space-y-4">
-						<p className="text-body text-text">
-							{t("pivot.explain")}
-						</p>
-						<p className="text-body text-text-muted">
-							{t("pivot.skipNote")}
-						</p>
-						{carryOverCount !== null && totalEntries !== null && (
-							<p className="text-body font-medium">
-								{t("pivot.statusCount", {
-									count: carryOverCount,
-									total: totalEntries,
-								})}
+					<>
+						<div className={`${MODAL_BODY_CLASS} px-6 pb-4 space-y-4`}>
+							<p className="text-body text-text">
+								{t("pivot.explain")}
 							</p>
-						)}
-						{error && (
-							<p className="text-body text-danger">{error}</p>
-						)}
-						<div className={clsx(MODAL_FOOTER_CLASS, "-mx-6 -mb-6")}>
+							<p className="text-body text-text-muted">
+								{t("pivot.skipNote")}
+							</p>
+							{carryOverCount !== null && totalEntries !== null && (
+								<p className="text-body font-medium">
+									{t("pivot.statusCount", {
+										count: carryOverCount,
+										total: totalEntries,
+									})}
+								</p>
+							)}
+							{error && (
+								<p className="text-body text-danger">{error}</p>
+							)}
+						</div>
+						<footer className={MODAL_FOOTER_CLASS}>
 							<button
 								type="button"
 								onClick={onClose}
@@ -265,8 +270,8 @@ export default function PivotModal({
 								)}
 								{loading ? t("pivot.creating") : t("pivot.create")}
 							</button>
-						</div>
-					</div>
+						</footer>
+					</>
 				)}
 			</div>
 		</div>

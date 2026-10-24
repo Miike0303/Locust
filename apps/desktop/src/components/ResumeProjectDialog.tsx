@@ -5,7 +5,7 @@ import {
 } from "../lib/openProjectFlow";
 import { useT } from "../lib/i18n";
 import {
-  useModalA11y, MODAL_BACKDROP_CLASS, MODAL_FOOTER_CLASS, modalPanelClass,
+  useModalA11y, MODAL_BACKDROP_CLASS, MODAL_HEADER_CLASS, MODAL_BODY_CLASS, MODAL_FOOTER_CLASS, modalPanelClass,
 } from "../lib/modalA11y";
 
 interface Props {
@@ -32,12 +32,14 @@ export default function ResumeProjectDialog({ request, onChoose }: Props) {
   return (
     <div className={MODAL_BACKDROP_CLASS} onClick={cancel}>
       <div ref={dialogRef} {...dialogProps} aria-describedby={descriptionId}
-        className={modalPanelClass("max-w-lg p-5 max-h-[90vh] overflow-y-auto")}
+        className={modalPanelClass("max-w-lg")}
         onClick={(event) => event.stopPropagation()}>
-        <h2 {...titleProps} className="text-section font-bold mb-2">
-          {t(verified ? "resume.title" : "resume.attentionTitle")}
-        </h2>
-        <div id={descriptionId} className="text-body text-text-muted space-y-3 mb-4">
+        <header className={`${MODAL_HEADER_CLASS} px-5 pt-5 pb-2`}>
+          <h2 {...titleProps} className="text-section font-bold">
+            {t(verified ? "resume.title" : "resume.attentionTitle")}
+          </h2>
+        </header>
+        <div id={descriptionId} className={`${MODAL_BODY_CLASS} px-5 pb-4 text-body text-text-muted space-y-3`}>
           <p>{t(verified ? "resume.message" : "resume.attentionMessage")}</p>
           <p className="break-all font-mono text-caption">{request.gamePath}</p>
           {request.preflight.kind === "needs_attention" && (
@@ -47,7 +49,7 @@ export default function ResumeProjectDialog({ request, onChoose }: Props) {
           )}
           <p>{t("resume.refreshWarning")}</p>
         </div>
-        <div className={`${MODAL_FOOTER_CLASS} -mx-5 -mb-5 flex-wrap`}>
+        <footer className={MODAL_FOOTER_CLASS}>
           <button ref={cancelRef} type="button" onClick={cancel}
             className="px-3 py-2 text-body rounded border border-border bg-surface text-text hover:bg-surface-muted">
             {t("common.cancel")}
@@ -62,7 +64,7 @@ export default function ResumeProjectDialog({ request, onChoose }: Props) {
               {t("resume.resume")}
             </button>
           )}
-        </div>
+        </footer>
       </div>
     </div>
   );

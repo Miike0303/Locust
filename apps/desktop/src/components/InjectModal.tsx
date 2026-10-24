@@ -45,6 +45,9 @@ import { addToast } from "../stores/toastStore";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_HEADER_CLASS,
+	MODAL_BODY_CLASS,
+	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
 import { operationalShortcutTarget } from "../lib/settingsNav";
@@ -398,9 +401,9 @@ export default function InjectModal({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-lg p-6 max-h-[90vh] overflow-y-auto")}
+				className={modalPanelClass("max-w-lg")}
 			>
-				<div className="flex justify-between items-center mb-4">
+				<header className={`${MODAL_HEADER_CLASS} flex justify-between items-center px-6 pt-6 pb-4`}>
 					<h2 {...titleProps} className="text-section font-bold">
 						{t("inject.title")}
 					</h2>
@@ -411,10 +414,10 @@ export default function InjectModal({
 					>
 						<X size={20} />
 					</button>
-				</div>
+				</header>
 
 				{!result ? (
-					<div className="space-y-4">
+					<div className={`${MODAL_BODY_CLASS} px-6 pb-6 space-y-4`}>
 						<div>
 							<label htmlFor="inject-mode" className="text-body font-medium">{t("inject.mode")}</label>
 							<select
@@ -561,20 +564,6 @@ export default function InjectModal({
 							</p>
 						)}
 
-						<button
-							onClick={handleInject}
-							disabled={loading || !canInject}
-							className="w-full py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
-						>
-							{loading
-								? t("inject.injecting")
-								: mode === "direct"
-									? t("inject.directAction")
-									: mode === "replace"
-										? t("inject.copyAction")
-										: t("inject.injectAction")}
-						</button>
-
 						{isRpgMaker && (
 							<div className="pt-1 border-t border-border space-y-2">
 								<p id="inject-register-mode-hint" className="text-caption text-text-muted">
@@ -620,19 +609,7 @@ export default function InjectModal({
 										</p>
 									</div>
 								)}
-								<button
-									type="button"
-									onClick={handleRegisterLang}
-									disabled={!canRegisterLang || regLoading || selectedLangs.length === 0}
-									aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
-									className="w-full py-1.5 text-body border border-accent-fg text-accent-fg hover:bg-accent-muted disabled:opacity-50 rounded font-medium"
-								>
-									{regLoading
-										? t("inject.registering")
-										: t("inject.registerOnly", {
-												langs: selectedLangs.join(", ") || "lang",
-											})}
-								</button>
+
 								{regReports.length > 0 && (
 									<div className="text-caption text-accent-fg space-y-0.5">
 										{regReports.map(({ lang, label, report }) => (
@@ -651,7 +628,7 @@ export default function InjectModal({
 						)}
 					</div>
 				) : (
-					<div className="space-y-4">
+					<div className={`${MODAL_BODY_CLASS} px-6 pb-6 space-y-4`}>
 						<div
 							className={
 								resultKind === "unchanged"
@@ -803,18 +780,7 @@ export default function InjectModal({
 								<p className="text-caption mt-1">
 									{t("inject.recordingHint")}
 								</p>
-								{onOpenPack && (
-									<button
-										type="button"
-										onClick={() => {
-											onClose();
-											onOpenPack(result?.pristine_backup_id || undefined);
-										}}
-										className="mt-2 text-caption font-medium text-sky-700 dark:text-sky-300 hover:underline"
-									>
-										{t("inject.openPack")}
-									</button>
-								)}
+
 							</div>
 						)}
 
@@ -860,19 +826,7 @@ export default function InjectModal({
 										</p>
 									</div>
 								)}
-								<button
-									type="button"
-									onClick={handleRegisterLang}
-									disabled={!canRegisterLang || regLoading || selectedLangs.length === 0}
-									aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
-									className="w-full py-1.5 text-body bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded font-medium"
-								>
-									{regLoading
-										? t("inject.registering")
-										: t("inject.registerUi", {
-												langs: selectedLangs.join(", ") || "lang",
-											})}
-								</button>
+
 								{regReports.length > 0 && (
 									<div className="text-caption text-accent-fg space-y-1">
 										{regReports.map(({ lang, label, report }) => (
@@ -894,6 +848,60 @@ export default function InjectModal({
 							</div>
 						)}
 
+					</div>
+				)}
+				<footer className={MODAL_FOOTER_CLASS}>
+					{!result ? <>
+						<button
+							onClick={handleInject}
+							disabled={loading || !canInject}
+							className="w-full py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded font-medium transition-colors"
+						>
+							{loading
+								? t("inject.injecting")
+								: mode === "direct"
+									? t("inject.directAction")
+									: mode === "replace"
+										? t("inject.copyAction")
+										: t("inject.injectAction")}
+						</button>
+						{isRpgMaker && <button
+							type="button"
+							onClick={handleRegisterLang}
+							disabled={!canRegisterLang || regLoading || selectedLangs.length === 0}
+							aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
+							className="w-full py-1.5 text-body border border-accent-fg text-accent-fg hover:bg-accent-muted disabled:opacity-50 rounded font-medium"
+						>
+							{regLoading
+								? t("inject.registering")
+								: t("inject.registerOnly", {
+									langs: selectedLangs.join(", ") || "lang",
+								})}
+						</button>}
+					</> : <>
+						{offerPack && onOpenPack && <button
+							type="button"
+							onClick={() => {
+								onClose();
+								onOpenPack(result?.pristine_backup_id || undefined);
+							}}
+							className="mt-2 text-caption font-medium text-sky-700 dark:text-sky-300 hover:underline"
+						>
+							{t("inject.openPack")}
+						</button>}
+						{isRpgMaker && <button
+							type="button"
+							onClick={handleRegisterLang}
+							disabled={!canRegisterLang || regLoading || selectedLangs.length === 0}
+							aria-describedby={!canRegisterLang ? "inject-register-mode-hint" : undefined}
+							className="w-full py-1.5 text-body bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded font-medium"
+						>
+							{regLoading
+								? t("inject.registering")
+								: t("inject.registerUi", {
+									langs: selectedLangs.join(", ") || "lang",
+								})}
+						</button>}
 						<button
 							type="button"
 							onClick={() => {
@@ -910,8 +918,8 @@ export default function InjectModal({
 						>
 							{t("common.close")}
 						</button>
-					</div>
-				)}
+					</>}
+				</footer>
 			</div>
 		</div>
 	);

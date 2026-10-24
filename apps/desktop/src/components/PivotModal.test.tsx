@@ -35,7 +35,7 @@ const hooks = registerHooks({
         "../stores/projectStore": "export const useProjectStore=()=>({project:h.project,setProject:value=>h.changed.push(value)});",
         "../stores/toastStore": "export const addToast=(...args)=>h.toasts.push(args);",
         "../stores/logStore": "export const addLog=(...args)=>h.logs.push(args);",
-        "../lib/modalA11y": "export const useModalA11y=()=>({});export const MODAL_BACKDROP_CLASS='';export const MODAL_FOOTER_CLASS='';export const modalPanelClass=()=>'';",
+        "../lib/modalA11y": "export const useModalA11y=()=>({});export const MODAL_BACKDROP_CLASS='';export const MODAL_FOOTER_CLASS='';export const MODAL_HEADER_CLASS='shrink-0';export const MODAL_BODY_CLASS='flex-1 min-h-0 overflow-y-auto';export const modalPanelClass=()=>'';",
       };
       if (stubs[specifier]) return {
         shortCircuit: true,

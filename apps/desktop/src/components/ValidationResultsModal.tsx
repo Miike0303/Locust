@@ -14,6 +14,8 @@ import { useT, type TranslateFn } from "../lib/i18n";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_HEADER_CLASS,
+	MODAL_BODY_CLASS,
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
@@ -221,9 +223,9 @@ export default function ValidationResultsModal({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-2xl max-h-[85vh] flex flex-col")}
+				className={modalPanelClass("max-w-2xl")}
 			>
-				<div className="flex justify-between items-center px-5 py-4 border-b border-border">
+				<header className={`${MODAL_HEADER_CLASS} flex justify-between items-center px-5 py-4 border-b border-border`}>
 					<div className="flex items-center gap-2">
 						<Shield size={18} className="text-accent-fg" />
 						<h2 {...titleProps} className="text-section font-bold">
@@ -236,9 +238,9 @@ export default function ValidationResultsModal({
 					>
 						<X size={20} />
 					</button>
-				</div>
+				</header>
 
-				<div className="px-5 py-4 overflow-y-auto flex-1 space-y-4">
+				<div className={`${MODAL_BODY_CLASS} px-5 py-4 space-y-4`}>
 					{/* Summary */}
 					<div className="flex flex-wrap gap-3 text-body">
 						<span className="text-text-muted">
@@ -355,7 +357,7 @@ export default function ValidationResultsModal({
 					<FontSection fonts={fonts ?? []} suggestions={result.font_suggestions ?? []} issues={result.font_issues ?? []} limitations={result.font_limitations} />
 				</div>
 
-				<div className={MODAL_FOOTER_CLASS}>
+				<footer className={MODAL_FOOTER_CLASS}>
 					{onFontPatch && <button type="button" onClick={onFontPatch} className="px-4 py-2 border border-border bg-surface text-text hover:bg-surface-muted rounded text-body font-medium">{t("fontPatch.title")}</button>}
 					{onReviewInEditor && (
 						<button
@@ -378,7 +380,7 @@ export default function ValidationResultsModal({
 					>
 						{t("common.close")}
 					</button>
-				</div>
+				</footer>
 			</div>
 		</div>
 	);

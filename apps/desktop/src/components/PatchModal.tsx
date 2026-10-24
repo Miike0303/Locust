@@ -17,7 +17,7 @@ import {
 	type PatchVerifyResult,
 } from "../lib/api";
 import { useT } from "../lib/i18n";
-import { MODAL_BACKDROP_CLASS, modalPanelClass, useModalA11y } from "../lib/modalA11y";
+import { MODAL_BACKDROP_CLASS, MODAL_HEADER_CLASS, MODAL_BODY_CLASS, MODAL_FOOTER_CLASS, modalPanelClass, useModalA11y } from "../lib/modalA11y";
 import { defaultEntryPath, patchPublishFields, publishCommand } from "../lib/patchPublish";
 import { canPackFromRecordings, preferredPackLang, type RecordedLang } from "../lib/patchRecordings";
 import {
@@ -33,8 +33,8 @@ import { patchVerificationSummary } from "../lib/patchVerification";
 import { subscribeToJob } from "../lib/ws";
 import { addLog } from "../stores/logStore";
 import { addToast } from "../stores/toastStore";
-import PatchApplyTab from "./patch/PatchApplyTab";
-import PatchPackTab from "./patch/PatchPackTab";
+import PatchApplyTab, { PatchApplyActions } from "./patch/PatchApplyTab";
+import PatchPackTab, { PatchPackActions } from "./patch/PatchPackTab";
 
 type Tab = "apply" | "pack";
 
@@ -726,39 +726,114 @@ export default function PatchModal({
 		</button>
 	);
 
+	const applyProps = {
+		t,
+		zipPath,
+		setZipPath,
+		setZipUrl,
+		pickZip,
+		zipUrl,
+		urlFieldError,
+		urlZipHint,
+		resolvedSource,
+		force,
+		setForce,
+		confirmLegacy,
+		setConfirmLegacy,
+		dryRun,
+		setDryRun,
+		handleVerify,
+		loading,
+		applying,
+		canVerifyApply,
+		gamePath,
+		sourceOk,
+		handleApply,
+		handlePreviewRollback,
+		handleRollback,
+		showPartialWarning,
+		refreshStatus: async () => { await refreshStatus(); },
+		applyProgress,
+		handleCancelApply,
+		cancellingApply,
+		preview,
+		status,
+		patchValue,
+		verify,
+		applyResult
+	};
+	const packProps = {
+		t,
+		outputPath,
+		setOutputPath,
+		pickOutputZip,
+		languages,
+		setLanguages,
+		recordings,
+		pristine,
+		setPristine,
+		pristineRecordings,
+		initialBackupId,
+		gamePath,
+		defaultGamePath,
+		pristinePath,
+		setPristinePath,
+		pickPristineFolder,
+		rjCode,
+		rjEdited,
+		setRjCode,
+		detectId,
+		setDetectId,
+		gameVersion,
+		setGameVersion,
+		createEntry,
+		setCreateEntry,
+		entryPath,
+		setEntryPathOverride,
+		pickEntry,
+		handlePack,
+		loading,
+		applying,
+		packResult,
+		patchValue,
+		copyPublishCommand
+	};
+
 	return (
 		<div className={MODAL_BACKDROP_CLASS}>
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-xl p-6 max-h-[90vh] overflow-y-auto")}
+				className={modalPanelClass("max-w-xl")}
 			>
-				<div className="flex justify-between items-center mb-2">
-					<h2
-						{...titleProps}
-						className="text-section font-bold flex items-center gap-2"
-					>
-						<Package size={20} /> {t("patch.title")}
-					</h2>
-					<button
-						onClick={onClose}
-						aria-label={t("common.close")}
-						className="text-text-muted hover:text-text"
-					>
-						<X size={20} />
-					</button>
-				</div>
-
-				{allowPack ? (
-					<div className="flex gap-1 border-b border-border mb-4">
-						{tabBtn("apply", t("patch.apply"))}
-						{tabBtn("pack", t("patch.pack"))}
+				<header className={`${MODAL_HEADER_CLASS} px-6 pt-6`}>
+					<div className="flex justify-between items-center mb-2">
+						<h2
+							{...titleProps}
+							className="text-section font-bold flex items-center gap-2"
+						>
+							<Package size={20} /> {t("patch.title")}
+						</h2>
+						<button
+							onClick={onClose}
+							aria-label={t("common.close")}
+							className="text-text-muted hover:text-text"
+						>
+							<X size={20} />
+						</button>
 					</div>
-				) : (
-					<div className="mb-4" />
-				)}
 
-				<div className="space-y-4">
+					{allowPack ? (
+						<div className="flex gap-1 border-b border-border mb-4">
+							{tabBtn("apply", t("patch.apply"))}
+							{tabBtn("pack", t("patch.pack"))}
+						</div>
+					) : (
+						<div className="mb-4" />
+					)}
+
+				</header>
+				<div className={`${MODAL_BODY_CLASS} px-6 pb-6 space-y-4`}>
 					<div>
 						<label className="text-body font-medium">
 							{tab === "pack" ? t("patch.recordedFolder") : t("patch.gameFolder")}
@@ -785,81 +860,11 @@ export default function PatchModal({
 					</div>
 
 					{tab === "apply" && (
-						<PatchApplyTab
-							t={t}
-							zipPath={zipPath}
-							setZipPath={setZipPath}
-							setZipUrl={setZipUrl}
-							pickZip={pickZip}
-							zipUrl={zipUrl}
-							urlFieldError={urlFieldError}
-							urlZipHint={urlZipHint}
-							resolvedSource={resolvedSource}
-							force={force}
-							setForce={setForce}
-							confirmLegacy={confirmLegacy}
-							setConfirmLegacy={setConfirmLegacy}
-							dryRun={dryRun}
-							setDryRun={setDryRun}
-							handleVerify={handleVerify}
-							loading={loading}
-							applying={applying}
-							canVerifyApply={canVerifyApply}
-							gamePath={gamePath}
-							sourceOk={sourceOk}
-							handleApply={handleApply}
-							handlePreviewRollback={handlePreviewRollback}
-							handleRollback={handleRollback}
-							showPartialWarning={showPartialWarning}
-							refreshStatus={async () => { await refreshStatus(); }}
-							applyProgress={applyProgress}
-							handleCancelApply={handleCancelApply}
-							cancellingApply={cancellingApply}
-							preview={preview}
-							status={status}
-							patchValue={patchValue}
-							verify={verify}
-							applyResult={applyResult}
-						/>
+						<PatchApplyTab {...applyProps} />
 					)}
 
 					{tab === "pack" && (
-						<PatchPackTab
-							t={t}
-							outputPath={outputPath}
-							setOutputPath={setOutputPath}
-							pickOutputZip={pickOutputZip}
-							languages={languages}
-							setLanguages={setLanguages}
-							recordings={recordings}
-							pristine={pristine}
-							setPristine={setPristine}
-							pristineRecordings={pristineRecordings}
-							initialBackupId={initialBackupId}
-							gamePath={gamePath}
-							defaultGamePath={defaultGamePath}
-							pristinePath={pristinePath}
-							setPristinePath={setPristinePath}
-							pickPristineFolder={pickPristineFolder}
-							rjCode={rjCode}
-							rjEdited={rjEdited}
-							setRjCode={setRjCode}
-							detectId={detectId}
-							setDetectId={setDetectId}
-							gameVersion={gameVersion}
-							setGameVersion={setGameVersion}
-							createEntry={createEntry}
-							setCreateEntry={setCreateEntry}
-							entryPath={entryPath}
-							setEntryPathOverride={setEntryPathOverride}
-							pickEntry={pickEntry}
-							handlePack={handlePack}
-							loading={loading}
-							applying={applying}
-							packResult={packResult}
-							patchValue={patchValue}
-							copyPublishCommand={copyPublishCommand}
-						/>
+						<PatchPackTab {...packProps} />
 					)}
 
 					{error && (
@@ -871,6 +876,9 @@ export default function PatchModal({
 						</div>
 					)}
 				</div>
+				<footer className={MODAL_FOOTER_CLASS}>
+					{tab === "apply" ? <PatchApplyActions {...applyProps} /> : <PatchPackActions {...packProps} />}
+				</footer>
 			</div>
 		</div>
 	);

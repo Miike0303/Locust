@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import PatchApplyTab from "./patch/PatchApplyTab";
-import PatchPackTab from "./patch/PatchPackTab";
+import PatchApplyTab, { PatchApplyActions } from "./patch/PatchApplyTab";
+import PatchPackTab, { PatchPackActions } from "./patch/PatchPackTab";
 import { after, test } from "node:test";
 import { registerHooks } from "node:module";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -52,6 +52,9 @@ const hooks = registerHooks({
         "../lib/ws": `export const subscribeToJob=(_id,handlers)=>{globalThis.__patchModal.jobHandlers=handlers;return ()=>{};};`,
         "../lib/modalA11y": `const h=globalThis.__patchModal;
           export const MODAL_BACKDROP_CLASS=h.a11y.MODAL_BACKDROP_CLASS;
+          export const MODAL_HEADER_CLASS=h.a11y.MODAL_HEADER_CLASS;
+          export const MODAL_BODY_CLASS=h.a11y.MODAL_BODY_CLASS;
+          export const MODAL_FOOTER_CLASS=h.a11y.MODAL_FOOTER_CLASS;
           export const modalPanelClass=h.a11y.modalPanelClass;
           export const useModalA11y=()=>({dialogRef:{current:null},dialogProps:h.a11y.buildModalDialogProps({titleId:'title'}),titleProps:h.a11y.buildModalTitleProps('title')});`,
       };
@@ -119,7 +122,7 @@ after(() => {
 function nodes(node: any): any[] {
   if (!node || typeof node !== "object") return [];
   if (Array.isArray(node)) return node.flatMap(nodes);
-  if (node.type === PatchApplyTab || node.type === PatchPackTab) return nodes(node.type(node.props));
+  if (node.type === PatchApplyTab || node.type === PatchPackTab || node.type === PatchApplyActions || node.type === PatchPackActions) return nodes(node.type(node.props));
   return [node, ...nodes(node.props?.children)];
 }
 function text(node: any): string {
@@ -457,7 +460,6 @@ for (const recovery of [false, true]) test(`${recovery ? "recovery" : "regular"}
   assert.ok(!renderToStaticMarkup(render()).includes("verification retained"));
 });
 
-
 for (const locale of ["en", "es"] as const) test(`${locale} Rollback is outlined in normal and recovery states with unchanged action guards`, () => {
   reset(locale);
   const applyTab = (node: any): any => {
@@ -469,7 +471,7 @@ for (const locale of ["en", "es"] as const) test(`${locale} Rollback is outlined
   for (const loading of [false, true]) for (const applying of [false, true]) {
     for (const gamePath of ["", " /game "]) for (const sourceOk of [false, true]) {
       for (const showPartialWarning of [false, true]) {
-        const tree = PatchApplyTab({ ...props, loading, applying, gamePath, sourceOk,
+        const tree = PatchApplyActions({ ...props, loading, applying, gamePath, sourceOk,
           canVerifyApply: Boolean(gamePath.trim()) && sourceOk, showPartialWarning });
         const action = (key: Parameters<typeof t>[0]) => nodes(tree).find(node => node.type === "button" && text(node).trim() === t(key));
         const rollback = action("patch.rollback");

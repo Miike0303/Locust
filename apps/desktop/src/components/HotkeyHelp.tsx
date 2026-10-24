@@ -4,6 +4,9 @@ import { useT, type MessageKey } from "../lib/i18n";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_HEADER_CLASS,
+	MODAL_BODY_CLASS,
+	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
 
@@ -61,10 +64,10 @@ export default function HotkeyHelp({ open, onClose }: Props) {
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-xl max-h-[80vh] overflow-y-auto")}
+				className={modalPanelClass("max-w-xl")}
 				onClick={(e) => e.stopPropagation()}
 			>
-				<div className="flex items-center justify-between p-4 border-b border-border">
+				<header className={`${MODAL_HEADER_CLASS} flex items-center justify-between p-4 border-b border-border`}>
 					<h2 {...titleProps} className="text-section font-bold">
 						{t("hotkeys.title")}
 					</h2>
@@ -74,9 +77,9 @@ export default function HotkeyHelp({ open, onClose }: Props) {
 					>
 						<X size={18} />
 					</button>
-				</div>
+				</header>
 
-				<div className="p-4 space-y-6">
+				<div className={`${MODAL_BODY_CLASS} p-4 space-y-6`}>
 					{GROUP_ORDER.map((group) => {
 						const items = groups[group];
 						if (!items || items.length === 0) return null;
@@ -105,11 +108,11 @@ export default function HotkeyHelp({ open, onClose }: Props) {
 					})}
 				</div>
 
-				<div className="p-4 border-t border-border text-center">
-					<span className="text-caption text-text-muted">
+				<footer className={`${MODAL_FOOTER_CLASS} justify-center p-4 text-center`}>
+					<span className="w-full text-caption text-text-muted">
 						{t("hotkeys.closeHint")}
 					</span>
-				</div>
+				</footer>
 			</div>
 		</div>
 	);

@@ -28,6 +28,8 @@ registerHooks({
         "../lib/i18n": `export const useT=()=>globalThis.__resumeDialog.t;`,
         "../lib/modalA11y": `const h=globalThis.__resumeDialog;
           export const MODAL_BACKDROP_CLASS=h.a11y.MODAL_BACKDROP_CLASS;
+          export const MODAL_HEADER_CLASS=h.a11y.MODAL_HEADER_CLASS;
+          export const MODAL_BODY_CLASS=h.a11y.MODAL_BODY_CLASS;
           export const MODAL_FOOTER_CLASS=h.a11y.MODAL_FOOTER_CLASS;
           export const modalPanelClass=h.a11y.modalPanelClass;
           export function useModalA11y(options){h.modal=options;return {dialogRef:{current:null},dialogProps:h.a11y.buildModalDialogProps({titleId:'title'}),titleProps:h.a11y.buildModalTitleProps('title')};}`,

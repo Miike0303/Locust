@@ -76,9 +76,6 @@ export default function PatchPackTab({
 	entryPath,
 	setEntryPathOverride,
 	pickEntry,
-	handlePack,
-	loading,
-	applying,
 	packResult,
 	patchValue,
 	copyPublishCommand,
@@ -222,18 +219,6 @@ export default function PatchPackTab({
 				</div>
 			</details>
 
-			<button
-				onClick={handlePack}
-				disabled={
-					loading ||
-					applying ||
-					!canPackFromRecordings(recordings, languages)
-				}
-				className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50"
-			>
-				<Archive size={16} /> {t("patch.packBtn")}
-			</button>
-
 			{packResult && (
 				<div className="p-3 border border-success bg-success-muted rounded text-body space-y-1">
 					<div className="font-medium">
@@ -286,4 +271,18 @@ export default function PatchPackTab({
 			</p>
 		</>
 	);
+}
+
+export function PatchPackActions({ t, handlePack, loading, applying, recordings, languages }: Pick<PatchPackTabProps, "t" | "handlePack" | "loading" | "applying" | "recordings" | "languages">) {
+	return <button
+		onClick={handlePack}
+		disabled={
+			loading ||
+			applying ||
+			!canPackFromRecordings(recordings, languages)
+		}
+		className="flex items-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent-hover text-white rounded text-body font-medium disabled:opacity-50"
+	>
+		<Archive size={16} /> {t("patch.packBtn")}
+	</button>;
 }

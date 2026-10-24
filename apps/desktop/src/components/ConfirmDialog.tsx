@@ -1,8 +1,9 @@
 import { useRef } from "react";
-import clsx from "clsx";
 import {
 	useModalA11y,
 	MODAL_BACKDROP_CLASS,
+	MODAL_HEADER_CLASS,
+	MODAL_BODY_CLASS,
 	MODAL_FOOTER_CLASS,
 	modalPanelClass,
 } from "../lib/modalA11y";
@@ -52,16 +53,20 @@ export default function ConfirmDialog({
 			<div
 				ref={dialogRef}
 				{...dialogProps}
-				className={modalPanelClass("max-w-sm p-5")}
+				className={modalPanelClass("max-w-sm")}
 				onClick={(e) => e.stopPropagation()}
 			>
-				<h2 {...titleProps} className="text-section font-bold mb-2">
-					{title}
-				</h2>
-				<p className="text-body text-text-muted mb-4 whitespace-pre-wrap">
-					{message}
-				</p>
-				<div className={clsx(MODAL_FOOTER_CLASS, "-mx-5 -mb-5")}>
+				<header className={`${MODAL_HEADER_CLASS} px-5 pt-5 pb-2`}>
+					<h2 {...titleProps} className="text-section font-bold">
+						{title}
+					</h2>
+				</header>
+				<div className={`${MODAL_BODY_CLASS} px-5 pb-4`}>
+					<p className="text-body text-text-muted whitespace-pre-wrap">
+						{message}
+					</p>
+				</div>
+				<footer className={MODAL_FOOTER_CLASS}>
 					<button
 						type="button"
 						onClick={onCancel}
@@ -73,15 +78,14 @@ export default function ConfirmDialog({
 						ref={confirmRef}
 						type="button"
 						onClick={onConfirm}
-						className={`px-4 py-2 text-body font-medium rounded text-white ${
-							destructive
-								? "bg-red-600 hover:bg-red-700"
-								: "bg-accent hover:bg-accent-hover"
-						}`}
+						className={`px-4 py-2 text-body font-medium rounded text-white ${destructive
+							? "bg-red-600 hover:bg-red-700"
+							: "bg-accent hover:bg-accent-hover"
+							}`}
 					>
 						{resolvedConfirm}
 					</button>
-				</div>
+				</footer>
 			</div>
 		</div>
 	);

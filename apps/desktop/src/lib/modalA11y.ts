@@ -59,13 +59,17 @@ export function shouldOwnModalEscape({
 export const MODAL_BACKDROP_CLASS =
 	"fixed inset-0 bg-black/50 flex items-center justify-center z-50";
 
+/** Fixed modal regions surround the only vertically scrolling region. */
+export const MODAL_HEADER_CLASS = "shrink-0";
+export const MODAL_BODY_CLASS = "flex-1 min-h-0 overflow-y-auto";
+
 /** Shared modal action footer. Append layout extras with clsx. */
 export const MODAL_FOOTER_CLASS =
-	"flex justify-end gap-2 border-t border-border px-5 py-3";
+	"shrink-0 flex flex-wrap justify-end gap-2 border-t border-border px-5 py-3";
 
-/** Shared modal panel chrome; pass size/overflow utilities as extraClass. */
+/** Shared modal panel chrome and viewport bound; pass width/spacing utilities as extraClass. */
 export function modalPanelClass(extraClass = ""): string {
-	const base = "bg-surface text-text border border-border rounded-lg shadow-xl w-full";
+	const base = "bg-surface text-text border border-border rounded-lg shadow-xl w-full max-h-[calc(100vh-2rem)] flex flex-col my-4";
 	return extraClass ? `${base} ${extraClass}` : base;
 }
 
