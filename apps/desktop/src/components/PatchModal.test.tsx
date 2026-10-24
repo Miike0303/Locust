@@ -79,6 +79,7 @@ let recordingsEmpty = false;
 let statusConflict = false;
 let recordedRoot = "/copies/game.pck-es";
 let verification: Partial<PatchVerifyResult> = {};
+let verificationError: string | null = null;
 let report = {
   restored: 2, deleted: 1, baseline: "Pristine", dry_run: true,
   messages: ["preview <message>"], aborted_edited: ["data/user<edit>.txt"], torn_deleted: [] as string[],
@@ -110,6 +111,7 @@ globalThis.fetch = async (url, init) => {
     if (deferStatus) await new Promise<void>(resolve => { deferredStatus = resolve; });
     return response;
   }
+  if (path.endsWith("/patch/verify") && verificationError) return new Response(verificationError, { status: 400 });
   if (path.endsWith("/patch/verify")) return new Response(JSON.stringify({
     outcome: "Clean", tier: "Strict", replaced: ["data/original.txt"], added: [], conflicts: [],
     messages: ["verification retained"], backup_compromised: false, manifest: {}, ...verification,
@@ -153,7 +155,7 @@ function reset(locale: "en" | "es") {
   recordingsEmpty = false; statusConflict = false;
   calls.length = 0; failed = false; deferRollback = false; deferred = null;
   status = "interrupted"; statusFailed = false; applyStartFailed = false;
-  verification = {};
+  verification = {}; verificationError = null;
   deferStatus = false; deferredStatus = null; h.jobHandlers = null;
   report = { restored: 2, deleted: 1, baseline: "Pristine", dry_run: true,
     messages: ["preview <message>"], aborted_edited: ["data/user<edit>.txt"], torn_deleted: [] };
@@ -350,6 +352,43 @@ async function settleApply() {
   }
   assert.equal(button(t("patch.applyBtn")).props.disabled, false);
 }
+for (const locale of ["en", "es"] as const) {
+  const raw = "patch URL redirects to a private network address; download refused";
+  const localized = locale === "en"
+    ? "The patch URL redirects to a private network address. Download refused."
+    : "La URL del parche redirige a una dirección de red privada. Se rechazó la descarga.";
+
+  function assertErrorDetails(message: string, technical: string, level = "error") {
+    const tree = render();
+    assert.ok(nodes(tree).some(node => node.type === "pre" && text(node) === message), "the dialog must show the localized error");
+    const details = nodes(tree).find(node => node.type === "details" && text(node).includes(technical));
+    assert.ok(details, "the original error must remain available as technical detail");
+    assert.ok(!details.props.open, "technical details must start collapsed");
+    assert.equal(text(nodes(details).find(node => node.type === "summary")), t("patch.technicalDetails"));
+    assert.deepEqual(h.toasts, [[level, message]]);
+    assert.deepEqual(h.logs, [["error", message, technical, "patch"]]);
+  }
+
+  for (const partial of [false, true]) test(`${locale} streamed Apply errors localize dialog, toast and activity log while retaining raw details (partial=${partial})`, async () => {
+    reset(locale); selectSource(); status = partial ? "interrupted" : "not_patched";
+    await button(t("patch.applyBtn")).props.onClick();
+    assert.ok(h.jobHandlers);
+    h.jobHandlers.onError({ message: raw });
+    await settleApply();
+    const message = t(partial ? "patch.toast.applyFailedPartial" : "patch.toast.applyFailed", { error: localized });
+    assertErrorDetails(message, raw, partial ? "warning" : "error");
+    assertRecovery(partial);
+  });
+
+  test(`${locale} Verify HTTP errors retain localized guidance and original technical details`, async () => {
+    reset(locale); selectSource(); verificationError = raw;
+    await button(t("patch.verify")).props.onClick();
+    const message = t("patch.toast.verifyFailed", { error: localized });
+    assertErrorDetails(message, `400: ${raw}`);
+    assert.equal(h.apiLogs[0][2], raw);
+  });
+}
+
 function assertRecovery(expected: boolean) {
   const html = renderToStaticMarkup(render());
   assert.equal(html.includes(t("patch.partialWarning")), expected);

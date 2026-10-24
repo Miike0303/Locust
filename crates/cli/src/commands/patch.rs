@@ -246,24 +246,69 @@ pub(crate) fn cmd_apply(
     Ok(())
 }
 
-/// Download a patch zip over http(s) with size and scheme guards.
+/// Download a patch zip with per-hop network validation and pinned DNS answers.
 fn download_patch_zip(url: &str, dest: &Path) -> anyhow::Result<()> {
+    download_patch_zip_with_policy(url, dest, |addr| {
+        locust_core::patch::net_policy::is_public_address(addr.ip())
+    })
+}
+
+fn download_patch_zip_with_policy<F: Fn(std::net::SocketAddr) -> bool>(
+    url: &str,
+    dest: &Path,
+    allow: F,
+) -> anyhow::Result<()> {
+    use locust_core::patch::net_policy;
+    use std::net::ToSocketAddrs;
+
     let max_bytes = locust_core::patch::zipsec::max_download_bytes();
+    let mut parsed = reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
+    let mut redirects = 0;
+    let mut resp = loop {
+        net_policy::validate_scheme(parsed.scheme(), None).map_err(anyhow::Error::msg)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!(net_policy::DNS_FAILED))?
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!(net_policy::DNS_FAILED))?;
+        let addresses: Vec<_> = (host, port)
+            .to_socket_addrs()
+            .map_err(|_| anyhow::anyhow!(net_policy::DNS_FAILED))?
+            .collect();
+        net_policy::validate_addresses(&addresses, redirects > 0, &allow)
+            .map_err(anyhow::Error::msg)?;
 
-    let parsed = reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => anyhow::bail!("only http/https URLs are allowed (got {other})"),
-    }
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30 * 60))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent(format!("locust/{}", env!("CARGO_PKG_VERSION")))
-        .build()?;
-
-    let mut resp = client.get(parsed).send()?.error_for_status()?;
+        // A fresh, direct client per hop prevents DNS rebinding and connection
+        // pool reuse. Keep the original hostname for Host and TLS validation.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30 * 60))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve_to_addrs(host, &addresses)
+            .user_agent(format!("locust/{}", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        let response = client.get(parsed.clone()).send()?.error_for_status()?;
+        if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            break response;
+        }
+        if redirects == net_policy::MAX_REDIRECTS {
+            anyhow::bail!(net_policy::REDIRECT_LIMIT);
+        }
+        let next = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|location| parsed.join(location).ok())
+            .ok_or_else(|| anyhow::anyhow!(net_policy::INVALID_REDIRECT))?;
+        net_policy::validate_scheme(next.scheme(), Some(parsed.scheme()))
+            .map_err(anyhow::Error::msg)?;
+        parsed = next;
+        redirects += 1;
+    };
     if let Some(len) = resp.content_length() {
         if len > max_bytes {
             anyhow::bail!("remote zip too large: {len} bytes (max {max_bytes})");
@@ -487,6 +532,52 @@ mod tests {
     use locust_core::database::sha256_hex;
     use locust_core::models::{StringEntry, StringStatus};
     use std::fs;
+
+    #[test]
+    fn patch_download_refuses_private_redirect_before_connecting() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let source = listener.local_addr().unwrap();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            assert!(socket.read(&mut buffer).unwrap() > 0);
+            write!(socket, "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/private.zip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("patch.zip");
+        let error = download_patch_zip_with_policy(
+            &format!("http://localhost:{}/patch.zip", source.port()),
+            &dest,
+            |addr| addr.port() == source.port(),
+        )
+        .unwrap_err()
+        .to_string();
+        server.join().unwrap();
+        assert_eq!(
+            error,
+            "patch URL redirects to a private network address; download refused"
+        );
+        assert_eq!(
+            target.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn patch_download_refuses_private_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("patch.zip");
+        for url in ["http://127.0.0.1:1/p.zip", "http://[::1]:1/p.zip"] {
+            let error = download_patch_zip(url, &dest).unwrap_err().to_string();
+            assert!(error.contains("private network address"), "{error}");
+            assert!(!dest.exists());
+        }
+    }
 
     #[test]
     fn download_patch_zip_rejects_non_http_schemes() {

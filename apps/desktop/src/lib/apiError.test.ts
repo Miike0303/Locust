@@ -1131,3 +1131,25 @@ test("detection failure recognition is unchanged in both locales", async () => {
 		assert.equal(isDetectionFailure(localizeApiError(poError("27", "quote"))), false);
 	}
 });
+
+test("patch URL policy errors have EN/ES guidance", () => {
+    const cases = [
+        ["patch URL resolves to a private network address; download refused", "api.error.patchUrlPrivate"],
+        ["patch URL redirects to a private network address; download refused", "api.error.patchRedirectPrivate"],
+        ["patch URL redirects from https to http; download refused", "api.error.patchUrlDowngrade"],
+        ["patch URL exceeded the redirect limit; download refused", "api.error.patchRedirectLimit"],
+        ["patch URL has an invalid redirect target; download refused", "api.error.patchRedirectInvalid"],
+        ["patch URL host could not be resolved; download refused", "api.error.patchUrlDns"],
+    ] as const;
+    for (const locale of ["en", "es"] as const) {
+        setLocale(locale);
+        for (const [message, key] of cases) {
+            for (const prefix of ["", "400: "]) {
+                const error = new ApiError(prefix + message);
+                assert.equal(error.key, key);
+                assert.equal(error.message, t(key));
+                assert.notEqual(error.message, key);
+            }
+        }
+    }
+});

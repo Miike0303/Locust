@@ -16,6 +16,7 @@ import {
 	type PatchStatusResult,
 	type PatchVerifyResult,
 } from "../lib/api";
+import { ApiError, localizeApiError } from "../lib/apiError";
 import { useT } from "../lib/i18n";
 import { MODAL_BACKDROP_CLASS, MODAL_HEADER_CLASS, MODAL_BODY_CLASS, MODAL_FOOTER_CLASS, modalPanelClass, useModalA11y } from "../lib/modalA11y";
 import { defaultEntryPath, patchPublishFields, publishCommand } from "../lib/patchPublish";
@@ -136,10 +137,11 @@ export default function PatchModal({
 	const [errorSnapshot, setErrorSnapshot] = useState<{
 		gamePath: string;
 		message: string;
+		technical?: string;
 	} | null>(null);
 	const error = errorSnapshot?.gamePath === gamePath.trim() ? errorSnapshot.message : null;
-	const setError = (message: string | null) => {
-		setErrorSnapshot(message === null ? null : { gamePath: gamePath.trim(), message });
+	const setError = (message: string | null, technical?: string) => {
+		setErrorSnapshot(message === null ? null : { gamePath: gamePath.trim(), message, technical });
 	};
 	const [applying, setApplying] = useState(false);
 	const [cancellingApply, setCancellingApply] = useState(false);
@@ -403,9 +405,11 @@ export default function PatchModal({
 			);
 			addToast(display.severity, summary);
 		} catch (err: any) {
-			setError(err.message);
-			addLog("error", t("activity.patch.verifyFailed"), err.message, "patch");
-			addToast("error", t("patch.toast.verifyFailed", { error: err.message }));
+			const raw = err instanceof ApiError ? err.raw : err.message;
+			const message = t("patch.toast.verifyFailed", { error: localizeApiError(raw) });
+			setError(message, raw);
+			addLog("error", message, raw, "patch");
+			addToast("error", message);
 		} finally {
 			setLoading(false);
 		}
@@ -447,8 +451,8 @@ export default function PatchModal({
 			const raw = opts.error ?? t("ws.patchJobStreamLost");
 			const message = unknown ? t("patch.stateUnknown") : opts.cancelled
 				? t(partial ? "patch.toast.applyCancelled" : "patch.toast.applyCancelledSafe")
-				: t(partial ? "patch.toast.applyFailedPartial" : "patch.toast.applyFailed", { error: raw });
-			setError(message);
+				: t(partial ? "patch.toast.applyFailedPartial" : "patch.toast.applyFailed", { error: localizeApiError(raw) });
+			setError(message, opts.error);
 			if (opts.cancelled) {
 				addLog(
 					partial || unknown ? "warning" : "info",
@@ -457,7 +461,7 @@ export default function PatchModal({
 					"patch",
 				);
 			} else {
-				addLog("error", t("activity.patch.applyFailed"), raw, "patch");
+				addLog("error", message, raw, "patch");
 			}
 			addToast(partial || opts.cancelled ? "warning" : "error", message);
 		} finally {
@@ -550,7 +554,7 @@ export default function PatchModal({
 			);
 		} catch (err: any) {
 			applyFinishedRef.current = true;
-			await finishApplyInterrupted({ cancelled: false, error: err.message });
+			await finishApplyInterrupted({ cancelled: false, error: err instanceof ApiError ? err.raw : err.message });
 		}
 	};
 
@@ -870,9 +874,17 @@ export default function PatchModal({
 					{error && (
 						<div className="flex gap-2 p-3 bg-danger-muted border border-danger rounded text-body text-danger">
 							<AlertCircle size={16} className="shrink-0 mt-0.5" />
-							<pre className="whitespace-pre-wrap break-words font-sans">
-								{error}
-							</pre>
+							<div className="min-w-0">
+								<pre className="whitespace-pre-wrap break-words font-sans">
+									{error}
+								</pre>
+								{errorSnapshot?.technical && (
+									<details className="mt-2">
+										<summary className="cursor-pointer">{t("patch.technicalDetails")}</summary>
+										<pre className="whitespace-pre-wrap break-words">{errorSnapshot.technical}</pre>
+									</details>
+								)}
+							</div>
 						</div>
 					)}
 				</div>

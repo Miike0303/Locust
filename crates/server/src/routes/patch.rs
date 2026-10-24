@@ -56,7 +56,7 @@ pub(crate) struct PatchPathsRequest {
     game_path: String,
     zip_path: Option<String>,
     /// http(s) URL of a patch zip — downloaded to a temp file then applied/verified.
-    /// Mutually exclusive with `zip_path`. Loopback server only; still scheme-gated.
+    /// Mutually exclusive with `zip_path`. Every hop must resolve to public IPs.
     zip_url: Option<String>,
     #[serde(default)]
     force: bool,
@@ -110,32 +110,99 @@ async fn download_patch_zip_async(
     dest: &Path,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(), ApiError> {
-    let max_bytes = locust_core::patch::zipsec::max_download_bytes();
-    let parsed = reqwest::Url::parse(url)
+    download_patch_zip_with_policy(url, dest, cancel, |addr| {
+        locust_core::patch::net_policy::is_public_address(addr.ip())
+    })
+    .await
+}
+
+/// Resolve once per hop, validate every answer, and pin that exact set for the
+/// connection. The original URL retains the hostname for Host and TLS checks.
+async fn patch_response_with_policy<F: Fn(std::net::SocketAddr) -> bool>(
+    url: &str,
+    allow: &F,
+) -> Result<reqwest::Response, ApiError> {
+    use locust_core::patch::net_policy;
+
+    let mut parsed = reqwest::Url::parse(url)
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid zip_url: {e}")))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                format!("only http/https zip_url allowed (got {other})"),
-            ));
-        }
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30 * 60))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent(format!("locust-server/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let mut resp = client
-        .get(parsed)
-        .send()
+    let mut redirects = 0;
+    loop {
+        net_policy::validate_scheme(parsed.scheme(), None)
+            .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, net_policy::DNS_FAILED))?
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, net_policy::DNS_FAILED))?;
+        let addresses: Vec<_> = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::net::lookup_host((host, port)),
+        )
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download failed: {e}")))?
-        .error_for_status()
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download HTTP error: {e}")))?;
+        .map_err(|_| err(StatusCode::BAD_GATEWAY, net_policy::DNS_FAILED))?
+        .map_err(|_| err(StatusCode::BAD_GATEWAY, net_policy::DNS_FAILED))?
+        .collect();
+        net_policy::validate_addresses(&addresses, redirects > 0, allow)
+            .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
+
+        // Disable proxies and connection reuse across hops so neither can
+        // bypass address validation. Automatic redirects must remain disabled.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30 * 60))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve_to_addrs(host, &addresses)
+            .user_agent(format!("locust-server/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let response = client
+            .get(parsed.clone())
+            .send()
+            .await
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("download HTTP error: {e}")))?;
+        if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            return Ok(response);
+        }
+        if redirects == net_policy::MAX_REDIRECTS {
+            return Err(err(StatusCode::BAD_REQUEST, net_policy::REDIRECT_LIMIT));
+        }
+        let next = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|location| parsed.join(location).ok())
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, net_policy::INVALID_REDIRECT))?;
+        net_policy::validate_scheme(next.scheme(), Some(parsed.scheme()))
+            .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
+        parsed = next;
+        redirects += 1;
+    }
+}
+
+async fn download_patch_zip_with_policy<F: Fn(std::net::SocketAddr) -> bool>(
+    url: &str,
+    dest: &Path,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    allow: F,
+) -> Result<(), ApiError> {
+    let max_bytes = locust_core::patch::zipsec::max_download_bytes();
+    let request = patch_response_with_policy(url, &allow);
+    let mut resp = if let Some(cancel) = cancel {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(err(StatusCode::BAD_REQUEST, "cancelled")),
+            response = request => response?,
+        }
+    } else {
+        request.await?
+    };
     if let Some(len) = resp.content_length() {
         if len > max_bytes {
             return Err(err(
@@ -794,6 +861,88 @@ pub(crate) async fn patch_status(
 mod tests {
     use crate::routes::test_support::*;
 
+    // These job-lifecycle fixtures park jobs directly: production downloads
+    // deliberately refuse loopback sources, including slow mock downloads.
+    #[tokio::test]
+    async fn test_second_patch_apply_same_game_returns_409() {
+        let (url, _handle, state) = setup_with_state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        std::fs::create_dir(&game).unwrap();
+        let zip = dir.path().join("bad.zip");
+        std::fs::write(&zip, b"not a zip").unwrap();
+        park_job_with_patch_key(
+            &state,
+            "first-patch",
+            crate::JobKind::Patch,
+            None,
+            Some(crate::patch_game_key(game.to_str().unwrap())),
+        );
+        let response = client()
+            .post(format!("{url}/api/patch/apply"))
+            .json(&serde_json::json!({"game_path": game, "zip_path": zip}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409);
+        assert_eq!(
+            response.text().await.unwrap(),
+            crate::PATCH_APPLY_IN_FLIGHT_MESSAGE
+        );
+
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let response = client()
+            .post(format!("{url}/api/patch/apply"))
+            .json(&serde_json::json!({"game_path": other, "zip_path": zip}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            202,
+            "a different game must still be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_patch_apply_cancel_stops_job() {
+        use futures_util::StreamExt;
+        let (url, _handle, state) = setup_with_state().await;
+        let job_id = "parked-patch";
+        park_job(&state, job_id, crate::JobKind::Patch, None);
+        let cancel_token = state.active_jobs.get(job_id).unwrap().cancel.clone();
+        let ws_url = format!("{}/api/patch/ws/{job_id}", url.replacen("http", "ws", 1));
+        let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+        let response = client()
+            .post(format!("{url}/api/patch/cancel/{job_id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(cancel_token.is_cancelled());
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(message) = ws.next().await {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message.unwrap() {
+                    return serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                }
+            }
+            panic!("cancelled patch must emit a terminal event");
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({"type": "error", "message": "cancelled"})
+        );
+        let response = client()
+            .post(format!("{url}/api/patch/cancel/{job_id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "cancelled job must be removed");
+    }
+
     #[tokio::test]
     async fn patch_recordings_lists_langs_and_hides_them_without_a_project() {
         let (url, _h, state) = setup_with_state().await;
@@ -887,6 +1036,148 @@ mod tests {
 mod download_guard_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn patch_download_refuses_private_redirect_before_connecting() {
+        use httpmock::MockServer;
+        let source = MockServer::start_async().await;
+        let target = MockServer::start_async().await;
+        let redirect = source
+            .mock_async(|when, then| {
+                when.path("/patch.zip");
+                then.status(302)
+                    .header("Location", target.url("/private.zip"));
+            })
+            .await;
+        let private = target
+            .mock_async(|when, then| {
+                when.path("/private.zip");
+                then.status(200).body("private");
+            })
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("patch.zip");
+        let (_, error) =
+            download_patch_zip_with_policy(&source.url("/patch.zip"), &dest, None, |addr| {
+                addr.port() == source.port()
+            })
+            .await
+            .expect_err("redirect must be checked before connecting");
+        assert_eq!(
+            error,
+            "patch URL redirects to a private network address; download refused"
+        );
+        redirect.assert_hits_async(1).await;
+        private.assert_hits_async(0).await;
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn patch_download_allows_public_redirect_chain_and_pins_dns() {
+        let server = httpmock::MockServer::start_async().await;
+        let first = server
+            .mock_async(|when, then| {
+                when.path("/first");
+                then.status(302).header("Location", "/second");
+            })
+            .await;
+        let second = server
+            .mock_async(|when, then| {
+                when.path("/second");
+                then.status(307).header("Location", "/patch.zip");
+            })
+            .await;
+        let patch = server
+            .mock_async(|when, then| {
+                when.path("/patch.zip");
+                then.status(200).body("patch bytes");
+            })
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("patch.zip");
+        // A DNS hostname, rather than an IP literal, exercises the pinned resolver.
+        let url = format!("http://localhost:{}/first", server.port());
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        download_patch_zip_with_policy(&url, &dest, None, |addr| {
+            checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            addr.port() == server.port()
+        })
+        .await
+        .unwrap();
+        assert!(checks.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+        assert_eq!(std::fs::read(dest).unwrap(), b"patch bytes");
+        first.assert_hits_async(1).await;
+        second.assert_hits_async(1).await;
+        patch.assert_hits_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn patch_download_enforces_redirect_limit() {
+        let server = httpmock::MockServer::start_async().await;
+        let redirect = server
+            .mock_async(|when, then| {
+                when.path("/loop");
+                then.status(302).header("Location", "/loop");
+            })
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("patch.zip");
+        let (_, error) =
+            download_patch_zip_with_policy(&server.url("/loop"), &dest, None, |_| true)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error,
+            "patch URL exceeded the redirect limit; download refused"
+        );
+        redirect.assert_hits_async(6).await;
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn patch_download_refuses_missing_or_invalid_redirect_target() {
+        for location in [None, Some("http://[invalid")] {
+            let server = httpmock::MockServer::start_async().await;
+            let redirect = server
+                .mock_async(|when, then| {
+                    when.path("/patch.zip");
+                    let then = then.status(302);
+                    if let Some(location) = location {
+                        then.header("Location", location);
+                    }
+                })
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("patch.zip");
+            let (_, error) =
+                download_patch_zip_with_policy(&server.url("/patch.zip"), &dest, None, |_| true)
+                    .await
+                    .unwrap_err();
+            assert_eq!(error, locust_core::patch::net_policy::INVALID_REDIRECT);
+            redirect.assert_hits_async(1).await;
+            assert!(!dest.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_download_refuses_non_http_redirect() {
+        let server = httpmock::MockServer::start_async().await;
+        let redirect = server
+            .mock_async(|when, then| {
+                when.path("/patch.zip");
+                then.status(302).header("Location", "file:///private.zip");
+            })
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("patch.zip");
+        let (_, error) =
+            download_patch_zip_with_policy(&server.url("/patch.zip"), &dest, None, |_| true)
+                .await
+                .unwrap_err();
+        assert!(error.contains("only http/https"), "{error}");
+        redirect.assert_hits_async(1).await;
+        assert!(!dest.exists());
+    }
+
     /// Serve one chunked HTTP response with NO Content-Length, which is exactly
     /// the shape that defeats a pre-flight size check. `total` of `usize::MAX`
     /// streams until the client hangs up.
@@ -925,6 +1216,40 @@ mod download_guard_tests {
     }
 
     #[tokio::test]
+    async fn patch_download_refuses_private_addresses_before_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("patch.zip");
+        for url in [
+            format!(
+                "http://localhost:{}/patch.zip",
+                listener.local_addr().unwrap().port()
+            ),
+            "http://127.0.0.1/patch.zip".into(),
+            "http://169.254.169.254/patch.zip".into(),
+            "http://10.0.0.1/patch.zip".into(),
+        ] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                download_patch_zip_async(&url, &dest, None),
+            )
+            .await
+            .expect("private addresses must be refused before connecting");
+            let (_, message) = result.expect_err("private URL must be refused");
+            assert!(
+                message.contains("private network address"),
+                "{url}: {message}"
+            );
+            assert!(!dest.exists());
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn download_rejects_non_http_scheme() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("p.zip");
@@ -950,7 +1275,7 @@ mod download_guard_tests {
 
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            download_patch_zip_async(&url, &dest, None),
+            download_patch_zip_with_policy(&url, &dest, None, |addr| addr.ip().is_loopback()),
         )
         .await;
         std::env::remove_var(locust_core::patch::zipsec::MAX_DOWNLOAD_ENV);
@@ -966,7 +1291,7 @@ mod download_guard_tests {
         let url = serve_chunked(0).await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("p.zip");
-        let e = download_patch_zip_async(&url, &dest, None)
+        let e = download_patch_zip_with_policy(&url, &dest, None, |addr| addr.ip().is_loopback())
             .await
             .expect_err("empty body must be rejected");
         assert!(format!("{e:?}").contains("empty"), "{e:?}");

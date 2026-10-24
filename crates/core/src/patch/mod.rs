@@ -19,6 +19,7 @@ pub mod apply;
 pub mod identity;
 mod lock;
 pub mod manifest;
+pub mod net_policy;
 pub mod pack;
 pub mod release_entry;
 pub mod rollback;
