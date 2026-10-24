@@ -391,8 +391,23 @@ struct PatchIdentityArgs {
     no_detect_id: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Keep parsing and the large debug dispatch future off Windows' small
+    // OS main-thread stack, including construction of the future itself.
+    std::thread::Builder::new()
+        .name("locust-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(run())
+        })?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let filter = if cli.verbose { "debug" } else { "info" };
