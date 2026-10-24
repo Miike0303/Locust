@@ -299,6 +299,49 @@ fn normalize_dialogue_translation(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Ordered inline engine controls, including parameters. Scan decoded text so
+/// CP932 multibyte trail bytes cannot masquerade as ASCII controls. The leading
+/// backtick is the dialogue-mode prefix handled by normalize_dialogue_translation;
+/// every subsequent backtick is an inline half-width toggle and must survive.
+fn dialogue_controls(text: &str) -> Vec<&str> {
+    let text = text.trim_start_matches([' ', '\t']);
+    let text = text.strip_prefix('`').unwrap_or(text);
+    let bytes = text.as_bytes();
+    let mut controls = Vec::new();
+    let mut p = 0;
+    while p < bytes.len() {
+        let start = p;
+        let end = match bytes[p] {
+            b'@' | b'\\' | b'`' => p + 1,
+            b'/' if p + 1 == bytes.len() => p + 1,
+            b'!' if matches!(bytes.get(p + 1), Some(b'w' | b's' | b'd')) => {
+                p += 2;
+                if bytes[start + 1] == b's' && bytes.get(p) == Some(&b'd') {
+                    p += 1; // !sd restores the default text speed.
+                } else {
+                    while bytes.get(p).is_some_and(u8::is_ascii_digit) {
+                        p += 1;
+                    }
+                }
+                p
+            }
+            b'#' if bytes
+                .get(p + 1..p + 7)
+                .is_some_and(|color| color.iter().all(u8::is_ascii_hexdigit)) =>
+            {
+                p + 7
+            }
+            _ => {
+                p += 1;
+                continue;
+            }
+        };
+        controls.push(&text[start..end]);
+        p = end;
+    }
+    controls
+}
+
 #[derive(Debug)]
 struct DisplayField {
     command: &'static str,
@@ -525,9 +568,10 @@ impl FormatPlugin for NScripterPlugin {
     ) -> Result<()> {
         // Core supplies these keys only for a verified prior Direct output with
         // a verified pristine backup. RevisionOriginal's text reader is UTF-8
-        // only, so use the extraction snapshot to validate source/field identity
-        // and all non-value bytes on the line. Never relax normal inject checks.
-        for current_path in originals.keys() {
+        // only, so decode verified original bytes for dialogue source identity.
+        // Display fields also validate the extraction snapshot and all non-value
+        // bytes on the line. Never relax normal inject checks.
+        for (current_path, original) in originals {
             let Some(name) = current_path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
@@ -540,8 +584,26 @@ impl FormatPlugin for NScripterPlugin {
                 .split('\n')
                 .map(|l| l.strip_suffix('\r').unwrap_or(l))
                 .collect();
+            let (pristine, _) = decode_container(&original.read_bytes()?, kind, name)?;
+            let original_lines: Vec<_> = pristine
+                .split('\n')
+                .map(|l| l.strip_suffix('\r').unwrap_or(l))
+                .collect();
             for entry in entries.iter_mut().filter(|e| e.file_path == *current_path) {
-                let Some((line_no, Some(locator))) = entry_locator(&entry.id, name) else {
+                let Some((line_no, locator)) = entry_locator(&entry.id, name) else {
+                    continue;
+                };
+                let Some(locator) = locator else {
+                    if let (Some(old), Some(new)) =
+                        (original_lines.get(line_no), lines.get(line_no))
+                    {
+                        if *old == entry.source
+                            && is_player_text_line(old)
+                            && is_player_text_line(new)
+                        {
+                            entry.source = (*new).to_owned();
+                        }
+                    }
                     continue;
                 };
                 let Some(old) = entry
@@ -682,14 +744,38 @@ impl FormatPlugin for NScripterPlugin {
                         }
                         (field.range.clone(), Cow::Borrowed(translation))
                     } else {
+                        if line != entry.source {
+                            return Err("source_changed");
+                        }
                         if !is_player_text_line(&line) {
                             return Err("not_dialogue");
                         }
+                        // Inventory scanning assumes one engine-visible line.
+                        // A NUL terminates engine input before later controls.
+                        if translation.contains(['\r', '\n']) {
+                            return Err("embedded_line_break");
+                        }
+                        if translation.contains('\0') {
+                            return Err("embedded_control_char");
+                        }
                         (0..raw.len(), normalize_dialogue_translation(translation))
                     };
+                    // Identity translations must retain the original CP932 aliases,
+                    // even when encoding the same Unicode would choose other bytes.
+                    if value == entry.source {
+                        return Err("unchanged");
+                    }
                     let (encoded, _, errors) = encoding_rs::SHIFT_JIS.encode(&value);
                     if errors {
                         return Err("not_encodable_as_Shift-JIS");
+                    }
+                    if locator.is_none() {
+                        // Validate the engine-visible form: CP932 also encodes the
+                        // Unicode yen sign as an ASCII backslash (page wait).
+                        let (engine_value, _, _) = encoding_rs::SHIFT_JIS.decode(&encoded);
+                        if dialogue_controls(&line) != dialogue_controls(&engine_value) {
+                            return Err("control_inventory_mismatch");
+                        }
                     }
                     if raw[range.clone()] == *encoded {
                         return Err("unchanged");
@@ -1007,13 +1093,19 @@ click"
     fn test_inject_preserves_dialogue_prefixes_and_indentation() {
         for (translation, expected) in [
             ("`Hi", "`Hi"),
-            ("さようなら。@", "さようなら。@"),
             ("  Hi", "  `Hi"),
             (" \t Hi", " \t `Hi"),
             (" \t `Hi", " \t `Hi"),
-            (" \t さようなら。@", " \t さようなら。@"),
             ("123", "`123"),
             (";Hi", "`;Hi"),
+            ("`Hi@", "`Hi@"),
+            ("さようなら。@", "さようなら。@"),
+            ("  Hi@", "  `Hi@"),
+            (" \t Hi@", " \t `Hi@"),
+            (" \t `Hi@", " \t `Hi@"),
+            (" \t さようなら。@", " \t さようなら。@"),
+            ("123@", "`123@"),
+            (";Hi@", "`;Hi@"),
         ] {
             let dir_guard = tempdir();
             let dir = dir_guard.path().to_path_buf();
@@ -1023,6 +1115,22 @@ click"
             entries[0].translation = Some(translation.into());
 
             let report = plugin.inject(&dir, &entries).unwrap();
+            if !translation.ends_with('@') {
+                assert_eq!(
+                    (report.strings_written, report.strings_skipped),
+                    (0, 1),
+                    "{translation:?}: {report:?}"
+                );
+                assert_eq!(
+                    report.skip_reasons.get("control_inventory_mismatch"),
+                    Some(&1)
+                );
+                assert_eq!(
+                    fs::read(dir.join("0.txt")).unwrap(),
+                    encode_sjis_fixture("こんにちは。@\n")
+                );
+                continue;
+            }
             assert_eq!(report.strings_written, 1, "{translation:?}: {report:?}");
             assert_eq!(report.strings_skipped, 0, "{translation:?}: {report:?}");
             assert!(report.warnings.is_empty(), "{report:?}");
@@ -1038,7 +1146,7 @@ click"
     }
 
     #[test]
-    fn test_inject_keeps_empty_and_whitespace_translations() {
+    fn test_inject_refuses_empty_and_whitespace_translations_dropping_wait() {
         for translation in ["", "   ", "\t", " \t ", " \t\n"] {
             let dir_guard = tempdir();
             let dir = dir_guard.path().to_path_buf();
@@ -1048,14 +1156,281 @@ click"
             entries[0].translation = Some(translation.into());
 
             let report = plugin.inject(&dir, &entries).unwrap();
-            assert_eq!(report.strings_written, 1, "{translation:?}: {report:?}");
-            assert_eq!(report.strings_skipped, 0, "{translation:?}: {report:?}");
-            assert!(report.warnings.is_empty(), "{report:?}");
+            assert_eq!(report.strings_written, 0, "{translation:?}: {report:?}");
+            assert_eq!(report.strings_skipped, 1, "{translation:?}: {report:?}");
+            let reason = if translation.contains('\n') {
+                "embedded_line_break"
+            } else {
+                "control_inventory_mismatch"
+            };
+            assert_eq!(report.skip_reasons.get(reason), Some(&1));
             assert_eq!(
                 fs::read(dir.join("0.txt")).unwrap(),
-                format!("{translation}\n").as_bytes(),
+                encode_sjis_fixture("こんにちは。@\n"),
                 "{translation:?}"
             );
+        }
+    }
+
+    #[test]
+    fn fmt4_stale_dialogue_is_skipped_without_changing_bytes() {
+        for name in SUPPORTED_CONTAINERS {
+            for changed in ["変更した台詞。@", "caption \"Now a command\""] {
+                let dir = tempdir();
+                let path = dir.path().join(name);
+                let kind = ContainerKind::from_name(name).unwrap();
+                fs::write(&path, fixture_container("こんにちは。@\r\n; tail\n", kind)).unwrap();
+                let plugin = NScripterPlugin::new();
+                let mut entries = plugin.extract(dir.path()).unwrap();
+                entries[0].translation = Some("Hello.@".into());
+                let before = fixture_container(&format!("{changed}\r\n; tail\n"), kind);
+                fs::write(&path, &before).unwrap();
+
+                let report = plugin.inject(dir.path(), &entries).unwrap();
+                assert_eq!(
+                    (report.strings_written, report.strings_skipped),
+                    (0, 1),
+                    "{name}: {report:?}"
+                );
+                assert_eq!(
+                    report.skip_reasons.get("source_changed"),
+                    Some(&1),
+                    "{name}: {report:?}"
+                );
+                assert_eq!(report.files_modified, 0);
+                assert!(report.files_written.is_empty());
+                assert_eq!(fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+
+    fn assert_embedded_dialogue_control_is_refused(source: &str, translation: &str, reason: &str) {
+        for name in SUPPORTED_CONTAINERS {
+            let dir = tempdir();
+            let path = dir.path().join(name);
+            let kind = ContainerKind::from_name(name).unwrap();
+            let before = fixture_container(&format!("{source}\r\n; tail\n"), kind);
+            fs::write(&path, &before).unwrap();
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 1);
+            entries[0].translation = Some(translation.into());
+
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(
+                (report.strings_written, report.strings_skipped),
+                (0, 1),
+                "{name}, {translation:?}: {report:?}"
+            );
+            assert_eq!(report.skip_reasons.get(reason), Some(&1), "{report:?}");
+            assert_eq!(report.skip_reasons.values().sum::<usize>(), 1);
+            assert!(report.warnings.iter().any(|w| w.contains(reason)));
+            assert_eq!(report.files_modified, 0);
+            assert!(report.files_written.is_empty());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn fmt4_embedded_lf_dialogue_is_refused_in_all_containers() {
+        for translation in ["?/\n??/", "?/\r\n??/"] {
+            assert_embedded_dialogue_control_is_refused(
+                "台詞/",
+                translation,
+                "embedded_line_break",
+            );
+        }
+    }
+
+    #[test]
+    fn fmt4_embedded_cr_dialogue_is_refused_in_all_containers() {
+        assert_embedded_dialogue_control_is_refused("台詞/", "?/\r??/", "embedded_line_break");
+    }
+
+    #[test]
+    fn fmt4_embedded_nul_dialogue_is_refused_in_all_containers() {
+        assert_embedded_dialogue_control_is_refused("台詞@", "Hello\0@", "embedded_control_char");
+    }
+
+    #[test]
+    fn fmt4_extracted_other_c0_controls_remain_supported() {
+        // Extraction preserves these bytes inside dialogue, including TAB.
+        let controls: String = (1u8..=0x1f)
+            .filter(|b| !matches!(b, b'\r' | b'\n'))
+            .map(char::from)
+            .collect();
+        for name in SUPPORTED_CONTAINERS {
+            let dir = tempdir();
+            let path = dir.path().join(name);
+            let kind = ContainerKind::from_name(name).unwrap();
+            let source = format!("台詞{controls}@");
+            fs::write(&path, fixture_container(&format!("{source}\r\n"), kind)).unwrap();
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].source, source);
+            let translation = format!("Hello{controls}@");
+            entries[0].translation = Some(translation.clone());
+
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(
+                (report.strings_written, report.strings_skipped),
+                (1, 0),
+                "{name}: {report:?}"
+            );
+            assert!(report.warnings.is_empty(), "{report:?}");
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                fixture_container(&format!("`{translation}\r\n"), kind)
+            );
+        }
+    }
+
+    #[test]
+    fn fmt4_dialogue_control_inventory_mismatches_are_refused() {
+        for name in SUPPORTED_CONTAINERS {
+            for (source, translation) in [
+                ("台詞@", "Hello"),
+                ("台詞\\", "Hello"),
+                ("台詞/", "Hello"),
+                ("台詞!w10", "Hello"),
+                ("台詞!s20", "Hello"),
+                ("台詞!sd", "Hello"),
+                ("台詞!d30", "Hello"),
+                ("台詞#123aBC", "Hello"),
+                ("台詞`ABC`@", "Hello@"),
+                ("台詞@\\", "Hello\\@"),
+                ("台詞!w10!s20", "Hello!s20!w10"),
+                ("台詞#123456#abcdef", "Hello#abcdef#123456"),
+                ("台詞!w10", "Hello!w11"),
+                ("台詞#123456", "Hello#123457"),
+                ("台詞@", "Hello@@"),
+                ("台詞@", "Hello!d30@"),
+                ("台詞@", "Hello#123456@"),
+                ("台詞@", "Hello`ABC`@"),
+                ("台詞@/", "Hello/@"), // EOL continuation moved into ordinary text.
+                ("台詞@", "Hello¥@"),  // CP932 encodes U+00A5 as a page wait.
+                ("`Text`@", "`Hello@"), // Keep inline half-width toggles after the prefix.
+            ] {
+                let dir = tempdir();
+                let path = dir.path().join(name);
+                let kind = ContainerKind::from_name(name).unwrap();
+                let before = fixture_container(&format!("{source}\r\n; tail\n"), kind);
+                fs::write(&path, &before).unwrap();
+                let plugin = NScripterPlugin::new();
+                let mut entries = plugin.extract(dir.path()).unwrap();
+                entries[0].translation = Some(translation.into());
+
+                let report = plugin.inject(dir.path(), &entries).unwrap();
+                assert_eq!(
+                    (report.strings_written, report.strings_skipped),
+                    (0, 1),
+                    "{name}, {source:?} -> {translation:?}: {report:?}"
+                );
+                assert_eq!(
+                    report.skip_reasons.get("control_inventory_mismatch"),
+                    Some(&1),
+                    "{report:?}"
+                );
+                assert!(report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("control_inventory_mismatch")));
+                assert_eq!(report.files_modified, 0);
+                assert_eq!(fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn fmt4_matching_dialogue_controls_are_written_with_raw_splicing() {
+        for name in SUPPORTED_CONTAINERS {
+            for (source, translation) in [
+                ("台詞@\\", "Hello@\\"),
+                (
+                    "台詞!w10!s20!sd!d30#123aBC`ABC`@/",
+                    "Hello!w10!s20!sd!d30#123aBC`DEF`@/",
+                ),
+                ("台詞/続き#no-color!wow@", "Hello/there#not-hex!wow@"),
+                ("台詞\\", "Hello¥"),
+                ("`Text`@", "`Hello`@"),
+            ] {
+                let dir = tempdir();
+                let path = dir.path().join(name);
+                let kind = ContainerKind::from_name(name).unwrap();
+                // A non-canonical CP932 alias in an untouched comment plus mixed newlines.
+                let prefix = [b";".as_slice(), &[0xed, 0x40], b"\r\n"].concat();
+                let original = [
+                    prefix.clone(),
+                    encode_sjis_fixture(&format!("{source}\n; tail\r\n")),
+                ]
+                .concat();
+                fs::write(&path, transform_container(&original, kind)).unwrap();
+                let plugin = NScripterPlugin::new();
+                let mut entries = plugin.extract(dir.path()).unwrap();
+                assert_eq!(entries.len(), 1);
+                entries[0].translation = Some(translation.into());
+
+                let report = plugin.inject(dir.path(), &entries).unwrap();
+                assert_eq!(
+                    (report.strings_written, report.strings_skipped),
+                    (1, 0),
+                    "{name}, {translation:?}: {report:?}"
+                );
+                assert!(report.warnings.is_empty(), "{report:?}");
+                let expected = [
+                    prefix,
+                    encode_sjis_fixture(&format!(
+                        "{}\n; tail\r\n",
+                        normalize_dialogue_translation(translation)
+                    )),
+                ]
+                .concat();
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    transform_container(&expected, kind)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fmt4_identity_injection_is_byte_identical_for_all_containers() {
+        for name in SUPPORTED_CONTAINERS {
+            let dir = tempdir();
+            let path = dir.path().join(name);
+            let kind = ContainerKind::from_name(name).unwrap();
+            let plain = [
+                b";".as_slice(),
+                &[0xed, 0x40],
+                b"\r\n",
+                &[0xed, 0x40],
+                b"@\ncaption \"",
+                &[0xed, 0x40],
+                b"\"\r\n",
+                &encode_sjis_fixture("台詞!w10!s20!d30#123aBC`ABC`@/\n`Text`\\"),
+            ]
+            .concat();
+            let before = transform_container(&plain, kind);
+            fs::write(&path, &before).unwrap();
+            let plugin = NScripterPlugin::new();
+            let mut entries = plugin.extract(dir.path()).unwrap();
+            assert_eq!(entries.len(), 4);
+            for entry in &mut entries {
+                entry.translation = Some(entry.source.clone());
+            }
+
+            let report = plugin.inject(dir.path(), &entries).unwrap();
+            assert_eq!(
+                (report.strings_written, report.strings_skipped),
+                (0, 4),
+                "{name}: {report:?}"
+            );
+            assert_eq!(report.skip_reasons.get("unchanged"), Some(&4));
+            assert_eq!(report.files_modified, 0);
+            assert!(report.files_written.is_empty());
+            assert!(report.warnings.is_empty());
+            assert_eq!(fs::read(&path).unwrap(), before);
         }
     }
 
@@ -1546,16 +1921,20 @@ click"
                 .prepare_revision_entries(&mut unverified, &HashMap::new())
                 .unwrap();
             assert_eq!(unverified[0].source, entries[0].source);
+            assert_eq!(unverified[3].source, entries[3].source);
             let mut stale = entries.clone();
             stale[0].source = "wrong source".into();
+            stale[3].source = "wrong dialogue".into();
             plugin
                 .prepare_revision_entries(&mut stale, &originals)
                 .unwrap();
             assert_eq!(stale[0].source, "wrong source");
+            assert_eq!(stale[3].source, "wrong dialogue");
             plugin
                 .prepare_revision_entries(&mut entries, &originals)
                 .unwrap();
             assert_eq!(entries[0].source, "TL 題名");
+            assert_eq!(entries[3].source, "`TL こんにちは。@");
             let report = plugin.inject(&dir, &entries).unwrap();
             assert_eq!(
                 (report.strings_written, report.strings_skipped),
