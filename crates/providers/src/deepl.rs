@@ -127,19 +127,35 @@ impl TranslationProvider for DeepLProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| LocustError::ProviderError(format!("DeepL connection failed: {}", e)))?;
+            .map_err(|e| {
+                LocustError::ProviderError(format!(
+                    "DeepL connection failed: {}",
+                    crate::error_sanitizer::sanitize_provider_error(
+                        &e.to_string(),
+                        &[&self.api_key]
+                    )
+                ))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(LocustError::ProviderError(format!(
-                "DeepL returned status {}: {}",
-                status, body_text
-            )));
+            let body_text = crate::error_sanitizer::sanitize_provider_error(
+                &resp.text().await.unwrap_or_default(),
+                &[&self.api_key],
+            );
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!("DeepL returned status {}: {}", status, body_text),
+                    &[&self.api_key],
+                ),
+            ));
         }
 
         let deepl_resp: DeepLResponse = resp.json().await.map_err(|e| {
-            LocustError::ProviderError(format!("DeepL returned malformed response: {}", e))
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &format!("DeepL returned malformed response: {}", e),
+                &[&self.api_key],
+            ))
         })?;
 
         Ok(requests
@@ -177,13 +193,23 @@ impl TranslationProvider for DeepLProvider {
             .header("Authorization", format!("DeepL-Auth-Key {}", self.api_key))
             .send()
             .await
-            .map_err(|e| LocustError::ProviderError(format!("DeepL health check failed: {}", e)))?;
+            .map_err(|e| {
+                LocustError::ProviderError(format!(
+                    "DeepL health check failed: {}",
+                    crate::error_sanitizer::sanitize_provider_error(
+                        &e.to_string(),
+                        &[&self.api_key]
+                    )
+                ))
+            })?;
 
         if !resp.status().is_success() {
-            return Err(LocustError::ProviderError(format!(
-                "DeepL health check returned status {}",
-                resp.status()
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!("DeepL health check returned status {}", resp.status()),
+                    &[&self.api_key],
+                ),
+            ));
         }
 
         Ok(())

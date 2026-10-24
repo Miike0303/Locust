@@ -850,6 +850,7 @@ export const en = {
   "translate.needsKey": "This provider needs an API key — add it in Settings.",
   "translate.openSettings": "Open Settings",
   "translate.providerSettings": "Provider health & settings",
+  "providers.healthCheckTimedOut": "Provider health check timed out",
   "translate.fallbacks": "Fallback providers (optional)",
   "translate.fallbacksHint": "Tried in order if the primary stops making progress on pending strings.",
   "translate.addFallback": "Add fallback…",

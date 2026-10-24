@@ -831,6 +831,7 @@ export const es: Record<keyof typeof en, string> = {
   "translate.needsKey": "Este proveedor necesita una clave API — añádala en Ajustes.",
   "translate.openSettings": "Abrir Ajustes",
   "translate.providerSettings": "Estado y ajustes del proveedor",
+  "providers.healthCheckTimedOut": "Se agotó el tiempo de espera de la comprobación del proveedor",
   "translate.fallbacks": "Proveedores de respaldo (opcional)",
   "translate.fallbacksHint": "Se prueban en orden si el principal deja de avanzar en las cadenas pendientes.",
   "translate.addFallback": "Añadir respaldo…",

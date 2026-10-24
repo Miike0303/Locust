@@ -78,25 +78,40 @@ impl TranslationProvider for ArgosProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| LocustError::ProviderError(format!("Argos connection failed: {}", e)))?;
+            .map_err(|e| {
+                LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Argos connection failed: {}", e),
+                    &[],
+                ))
+            })?;
 
         if !resp.status().is_success() {
-            return Err(LocustError::ProviderError(format!(
-                "Argos returned status {}",
-                resp.status()
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Argos returned status {}", resp.status()),
+                    &[],
+                ),
+            ));
         }
 
         let argos_resp: ArgosResponse = resp.json().await.map_err(|e| {
-            LocustError::ProviderError(format!("Argos returned malformed response: {}", e))
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &format!("Argos returned malformed response: {}", e),
+                &[],
+            ))
         })?;
 
         if argos_resp.translated_text.len() != requests.len() {
-            return Err(LocustError::ProviderError(format!(
-                "Argos returned {} translations for {} requests",
-                argos_resp.translated_text.len(),
-                requests.len()
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!(
+                        "Argos returned {} translations for {} requests",
+                        argos_resp.translated_text.len(),
+                        requests.len()
+                    ),
+                    &[],
+                ),
+            ));
         }
 
         Ok(requests
@@ -126,17 +141,19 @@ impl TranslationProvider for ArgosProvider {
             .send()
             .await
             .map_err(|e| {
-                LocustError::ProviderError(format!(
+                LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(&format!(
                     "Argos is not running at {}. Install with: pip install argostranslate && argos-translate-server. Error: {}",
                     self.base_url, e
-                ))
+                ), &[]))
             })?;
 
         if !resp.status().is_success() {
-            return Err(LocustError::ProviderError(format!(
-                "Argos health check failed with status {}",
-                resp.status()
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Argos health check failed with status {}", resp.status()),
+                    &[],
+                ),
+            ));
         }
 
         Ok(())

@@ -185,10 +185,10 @@ impl AntigravityProvider {
                     start = end - 1;
                 }
                 if !self.prompt_fits(&build_prompt(&requests[start..end])?) {
-                    return Err(LocustError::ProviderError(format!(
+                    return Err(LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(&format!(
                         "Antigravity command line limit exceeded by entry {}; shorten its source/context/glossary",
                         requests[start].entry_id
-                    )));
+                    ), &[])));
                 }
             }
         }
@@ -201,12 +201,12 @@ impl AntigravityProvider {
             .prefix("locust-antigravity-")
             .tempdir()?;
         let output = tokio::time::timeout(timeout, self.runner.run(&self.executable, args, cwd.path())).await
-            .map_err(|_| LocustError::ProviderError(format!("Antigravity CLI timeout after {} seconds", timeout.as_secs())))?
+            .map_err(|_| LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(&format!("Antigravity CLI timeout after {} seconds", timeout.as_secs()), &[])))?
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     LocustError::ProviderNotConfigured("Antigravity executable not found; install Antigravity CLI and log in, or set antigravity.extra.agy_path".into())
                 } else {
-                    LocustError::ProviderError(format!("Antigravity CLI could not run: {error}"))
+                    LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(&format!("Antigravity CLI could not run: {error}"), &[]))
                 }
             })?;
         if !output.success {
@@ -256,7 +256,7 @@ impl AntigravityProvider {
                     ));
                 }
                 if chunk.len() == 1 {
-                    return Err(LocustError::ProviderError(format!("Antigravity invalid translation for entry {}: expected one non-empty JSON string per source", chunk[0].entry_id)));
+                    return Err(LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(&format!("Antigravity invalid translation for entry {}: expected one non-empty JSON string per source", chunk[0].entry_id), &[])));
                 }
                 let (left, right) = chunk.split_at(chunk.len() / 2);
                 pending.push(right);
@@ -318,8 +318,7 @@ fn process_error(output: &ProcessOutput) -> LocustError {
         .find(|marker| lower.contains(marker))
         .unwrap_or("process failed")
     };
-    let tail: String = output
-        .stderr
+    let tail: String = crate::error_sanitizer::redact_provider_error(&output.stderr, &[])
         .chars()
         .rev()
         .take(400)
@@ -330,8 +329,9 @@ fn process_error(output: &ProcessOutput) -> LocustError {
     let code = output
         .code
         .map_or_else(|| "unknown (terminated)".into(), |code| code.to_string());
-    LocustError::ProviderError(format!(
-        "Antigravity CLI exit code {code} ({reason}): {tail}"
+    LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+        &format!("Antigravity CLI exit code {code} ({reason}): {tail}"),
+        &[],
     ))
 }
 
@@ -417,7 +417,10 @@ impl TranslationProvider for AntigravityProvider {
                 break;
             };
             completed.push(result.map_err(|e| {
-                LocustError::ProviderError(format!("Antigravity worker failed: {e}"))
+                LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Antigravity worker failed: {e}"),
+                    &[],
+                ))
             })??);
         }
         completed.sort_by_key(|(index, _)| *index);
@@ -758,6 +761,53 @@ mod tests {
             );
             assert!(!call.cwd.exists());
         }
+    }
+
+    #[tokio::test]
+    async fn cli_diagnostics_and_io_errors_redact_credentials() {
+        let diagnostic =
+            r#"{"Cookie":["cli-header-sentinel"]} https://example.test?token=cli-query-sentinel"#;
+        let (provider, _) = fake(move |_| {
+            Ok(ProcessOutput {
+                success: false,
+                code: Some(7),
+                stdout: String::new(),
+                stderr: diagnostic.into(),
+            })
+        });
+        let error = provider
+            .translate(&requests(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("cli-header-sentinel"), "{error}");
+        assert!(!error.contains("cli-query-sentinel"), "{error}");
+        // Sanitizing a pre-truncated tail loses the credential's header label.
+        let (provider, _) = fake(|_| {
+            Ok(ProcessOutput {
+                success: false,
+                code: Some(7),
+                stdout: String::new(),
+                stderr: format!(r#"{{"Cookie":["{}cli-tail-sentinel"]}}"#, "x".repeat(450)),
+            })
+        });
+        let error = provider
+            .translate(&requests(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("cli-tail-sentinel"), "{error}");
+        let (provider, _) = fake(|_| {
+            Err(std::io::Error::other(
+                "https://example.test?token=cli-io-sentinel",
+            ))
+        });
+        let error = provider
+            .translate(&requests(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("cli-io-sentinel"), "{error}");
     }
 
     #[tokio::test]

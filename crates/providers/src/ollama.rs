@@ -95,8 +95,12 @@ impl TranslationProvider for OllamaProvider {
 
         let system_prompt = build_system_prompt(&requests[0]);
         let sources: Vec<&str> = requests.iter().map(|r| r.source.as_str()).collect();
-        let user_content = serde_json::to_string(&sources)
-            .map_err(|e| LocustError::ProviderError(e.to_string()))?;
+        let user_content = serde_json::to_string(&sources).map_err(|e| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &e.to_string(),
+                &[],
+            ))
+        })?;
 
         let body = OllamaRequest {
             model: self.model.clone(),
@@ -119,33 +123,51 @@ impl TranslationProvider for OllamaProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| LocustError::ProviderError(format!("Ollama connection failed: {}", e)))?;
+            .map_err(|e| {
+                LocustError::ProviderError(format!(
+                    "Ollama connection failed: {}",
+                    crate::error_sanitizer::sanitize_provider_error(&e.to_string(), &[])
+                ))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(LocustError::ProviderError(format!(
-                "Ollama returned status {}: {}",
-                status, body_text
-            )));
+            let body_text = crate::error_sanitizer::sanitize_provider_error(
+                &resp.text().await.unwrap_or_default(),
+                &[],
+            );
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Ollama returned status {}: {}", status, body_text),
+                    &[],
+                ),
+            ));
         }
 
-        let ollama_resp: OllamaResponse = resp
-            .json()
-            .await
-            .map_err(|e| LocustError::ProviderError(format!("Ollama malformed response: {}", e)))?;
+        let ollama_resp: OllamaResponse = resp.json().await.map_err(|e| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &format!("Ollama malformed response: {}", e),
+                &[],
+            ))
+        })?;
 
-        let translations =
-            parse_json_array(&ollama_resp.message.content).map_err(LocustError::ProviderError)?;
+        let translations = parse_json_array(&ollama_resp.message.content).map_err(|error| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(&error, &[]))
+        })?;
 
         // A count mismatch would silently shift every translation onto the
         // wrong entry via zip; discard the whole batch instead.
         if translations.len() != requests.len() {
-            return Err(LocustError::ProviderError(format!(
-                "translation count mismatch: sent {} strings, got {} back",
-                requests.len(),
-                translations.len()
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!(
+                        "translation count mismatch: sent {} strings, got {} back",
+                        requests.len(),
+                        translations.len()
+                    ),
+                    &[],
+                ),
+            ));
         }
 
         let input_tokens = ollama_resp.prompt_eval_count;
@@ -185,23 +207,30 @@ impl TranslationProvider for OllamaProvider {
             .send()
             .await
             .map_err(|e| {
-                LocustError::ProviderError(format!(
-                    "Ollama is not running at {}. Install from https://ollama.ai. Error: {}",
-                    self.base_url, e
+                LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                    &format!(
+                        "Ollama is not running at {}. Install from https://ollama.ai. Error: {}",
+                        self.base_url, e
+                    ),
+                    &[],
                 ))
             })?;
 
         if !resp.status().is_success() {
-            return Err(LocustError::ProviderError(format!(
-                "Ollama health check returned status {}",
-                resp.status()
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Ollama health check returned status {}", resp.status()),
+                    &[],
+                ),
+            ));
         }
 
-        let tags: OllamaTagsResponse = resp
-            .json()
-            .await
-            .map_err(|e| LocustError::ProviderError(format!("Ollama tags malformed: {}", e)))?;
+        let tags: OllamaTagsResponse = resp.json().await.map_err(|e| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &format!("Ollama tags malformed: {}", e),
+                &[],
+            ))
+        })?;
 
         let model_found = tags
             .models
@@ -209,10 +238,15 @@ impl TranslationProvider for OllamaProvider {
             .any(|m| m.name == self.model || m.name.starts_with(&format!("{}:", self.model)));
 
         if !model_found {
-            return Err(LocustError::ProviderError(format!(
-                "Model '{}' not found in Ollama. Run: ollama pull {}",
-                self.model, self.model
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!(
+                        "Model '{}' not found in Ollama. Run: ollama pull {}",
+                        self.model, self.model
+                    ),
+                    &[],
+                ),
+            ));
         }
 
         Ok(())

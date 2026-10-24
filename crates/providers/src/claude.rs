@@ -108,21 +108,36 @@ impl TranslationProvider for ClaudeProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| LocustError::ProviderError(format!("Claude connection failed: {}", e)))?;
+            .map_err(|e| {
+                LocustError::ProviderError(format!(
+                    "Claude connection failed: {}",
+                    crate::error_sanitizer::sanitize_provider_error(
+                        &e.to_string(),
+                        &[&self.api_key]
+                    )
+                ))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(LocustError::ProviderError(format!(
-                "Claude returned status {}: {}",
-                status, body_text
-            )));
+            let body_text = crate::error_sanitizer::sanitize_provider_error(
+                &resp.text().await.unwrap_or_default(),
+                &[&self.api_key],
+            );
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Claude returned status {}: {}", status, body_text),
+                    &[&self.api_key],
+                ),
+            ));
         }
 
-        let claude_resp: ClaudeResponse = resp
-            .json()
-            .await
-            .map_err(|e| LocustError::ProviderError(format!("Claude malformed response: {}", e)))?;
+        let claude_resp: ClaudeResponse = resp.json().await.map_err(|e| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &format!("Claude malformed response: {}", e),
+                &[&self.api_key],
+            ))
+        })?;
 
         let content = claude_resp
             .content
@@ -130,16 +145,26 @@ impl TranslationProvider for ClaudeProvider {
             .map(|c| c.text.as_str())
             .unwrap_or("[]");
 
-        let translations = parse_json_array(content).map_err(LocustError::ProviderError)?;
+        let translations = parse_json_array(content).map_err(|error| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &error,
+                &[&self.api_key],
+            ))
+        })?;
 
         // A count mismatch would silently shift every translation onto the
         // wrong entry via zip; discard the whole batch instead.
         if translations.len() != requests.len() {
-            return Err(LocustError::ProviderError(format!(
-                "translation count mismatch: sent {} strings, got {} back",
-                requests.len(),
-                translations.len()
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!(
+                        "translation count mismatch: sent {} strings, got {} back",
+                        requests.len(),
+                        translations.len()
+                    ),
+                    &[&self.api_key],
+                ),
+            ));
         }
 
         let usage = claude_resp.usage.as_ref();
@@ -194,14 +219,22 @@ impl TranslationProvider for ClaudeProvider {
             .send()
             .await
             .map_err(|e| {
-                LocustError::ProviderError(format!("Claude health check failed: {}", e))
+                LocustError::ProviderError(format!(
+                    "Claude health check failed: {}",
+                    crate::error_sanitizer::sanitize_provider_error(
+                        &e.to_string(),
+                        &[&self.api_key]
+                    )
+                ))
             })?;
 
         if !resp.status().is_success() {
-            return Err(LocustError::ProviderError(format!(
-                "Claude health check returned status {}",
-                resp.status()
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Claude health check returned status {}", resp.status()),
+                    &[&self.api_key],
+                ),
+            ));
         }
 
         Ok(())

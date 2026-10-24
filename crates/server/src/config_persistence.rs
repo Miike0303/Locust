@@ -58,16 +58,35 @@ pub async fn update_app_config(
     if let Some(warning) = startup_failure(state) {
         return Err(err(StatusCode::CONFLICT, warning));
     }
-    let mut config = state.config.write().await;
+    let (mut config, mut registry) = lock_config_and_registry(state).await;
     let next = config
         .patched(partial)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     next.save(&state.config_path)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    *state.provider_registry.write().await = locust_providers::default_registry(&next);
+    *registry = locust_providers::default_registry(&next);
     let response = next.redacted_json();
     *config = next;
     Ok(response)
+}
+
+pub(crate) async fn lock_config_and_registry(
+    state: &AppState,
+) -> (
+    tokio::sync::RwLockWriteGuard<'_, AppConfig>,
+    tokio::sync::RwLockWriteGuard<'_, ProviderRegistry>,
+) {
+    loop {
+        // Both settings updates and registry rebuilds acquire registry then config.
+        // Never await a second lock while holding the first: release and wait for
+        // config alone before retrying. Publication and persistence stay atomic.
+        let registry = state.provider_registry.write().await;
+        if let Ok(config) = state.config.try_write() {
+            return (config, registry);
+        }
+        drop(registry);
+        drop(state.config.write().await);
+    }
 }
 
 #[cfg(test)]
@@ -75,6 +94,59 @@ mod tests {
     use super::*;
     use crate::routes::project::OpenProjectRequest;
     use axum::{extract::State, Json};
+
+    #[tokio::test]
+    async fn settings_waiting_for_registry_leave_config_readable() {
+        let state = create_test_state();
+        let registry = state.provider_registry.read().await;
+        let update = update_app_config(&state, serde_json::json!({"default_target_lang": "fr"}));
+        tokio::pin!(update);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut update)
+                .await
+                .is_err()
+        );
+        let config = state
+            .config
+            .try_read()
+            .expect("config guard held while waiting for registry");
+        assert_ne!(config.default_target_lang, "fr");
+        drop(config);
+        drop(registry);
+        update.await.unwrap();
+        assert_eq!(state.config.read().await.default_target_lang, "fr");
+    }
+
+    #[tokio::test]
+    async fn registry_rebuild_waiting_for_registry_leaves_config_writable() {
+        let state = create_test_state();
+        let registry = state.provider_registry.read().await;
+        let rebuild = rebuild_provider_registry(&state);
+        tokio::pin!(rebuild);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut rebuild)
+                .await
+                .is_err()
+        );
+        let mut config = state
+            .config
+            .try_write()
+            .expect("config guard held while waiting for registry");
+        config.providers.insert(
+            "openai".into(),
+            locust_core::config::ProviderConfig {
+                api_key: Some("test-sentinel".into()),
+                base_url: None,
+                model: None,
+                free_tier: false,
+                extra: Default::default(),
+            },
+        );
+        drop(config);
+        drop(registry);
+        rebuild.await;
+        assert!(state.provider_registry.read().await.get("openai").is_some());
+    }
 
     #[tokio::test]
     async fn unreadable_startup_config_stays_protected_after_repair_until_restart() {

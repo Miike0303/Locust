@@ -49,16 +49,21 @@ pub(crate) async fn provider_health(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Json<serde_json::Value> {
-    let reg = state.provider_registry.read().await;
-    let provider = match reg.get(&id) {
+    // Registry::get clones the Arc; no registry guard may cross the network await.
+    let provider = match state.provider_registry.read().await.get(&id) {
         Some(p) => p,
         None => {
             return Json(serde_json::json!({"ok": false, "message": "provider not found"}));
         }
     };
-    match provider.health_check().await {
-        Ok(()) => Json(serde_json::json!({"ok": true, "message": "healthy"})),
-        Err(e) => Json(serde_json::json!({"ok": false, "message": e.to_string()})),
+    // Match the HTTP adapters' existing 30-second health-check limit, including
+    // adapters whose implementation has no transport-level timeout.
+    match tokio::time::timeout(Duration::from_secs(30), provider.health_check()).await {
+        Ok(Ok(())) => Json(serde_json::json!({"ok": true, "message": "healthy"})),
+        Ok(Err(e)) => Json(serde_json::json!({"ok": false, "message": e.to_string()})),
+        Err(_) => Json(
+            serde_json::json!({"ok": false, "message": "Provider health check timed out", "message_key": "providers.healthCheckTimedOut"}),
+        ),
     }
 }
 
@@ -77,8 +82,8 @@ pub(crate) async fn patch_config(
 /// Shared by `PATCH /api/config` and xAI device-login completion so
 /// `grok-sub` appears without restarting the process.
 pub async fn rebuild_provider_registry(state: &AppState) {
-    let config = state.config.read().await;
-    *state.provider_registry.write().await = locust_providers::default_registry(&config);
+    let (config, mut registry) = config_persistence::lock_config_and_registry(state).await;
+    *registry = locust_providers::default_registry(&config);
 }
 
 // ─── xAI device-code login ─────────────────────────────────────────────────
@@ -129,7 +134,8 @@ fn sweep_expired_xai_pending(state: &AppState) {
 /// Start an xAI device-code grant. Shared by HTTP and the Tauri command.
 pub async fn start_xai_device_login(state: &AppState) -> Result<XaiAuthStartResponse, String> {
     sweep_expired_xai_pending(state);
-    let device = match state.xai_device_code_url.read().await.as_ref() {
+    let device_code_url = state.xai_device_code_url.read().await.clone();
+    let device = match device_code_url.as_ref() {
         Some(url) => locust_providers::xai_oauth::request_device_code_at(url).await,
         None => locust_providers::xai_oauth::request_device_code().await,
     }
@@ -183,7 +189,8 @@ pub async fn poll_xai_device_login(
         session.device.clone()
     };
 
-    let outcome = match state.xai_token_url.read().await.as_ref() {
+    let token_url = state.xai_token_url.read().await.clone();
+    let outcome = match token_url.as_ref() {
         Some(url) => locust_providers::xai_oauth::poll_for_token_at(url, &device).await,
         None => locust_providers::xai_oauth::poll_for_token(&device).await,
     }
@@ -230,8 +237,183 @@ pub(crate) async fn auth_xai_poll(
 
 #[cfg(test)]
 mod tests {
+    use super::provider_health;
     use crate::routes::test_support::*;
     use crate::*;
+    use axum::extract::{Path, State};
+
+    struct PendingHealth(tokio::sync::Notify);
+
+    #[async_trait::async_trait]
+    impl locust_core::translation::TranslationProvider for PendingHealth {
+        fn id(&self) -> &str {
+            "pending-health"
+        }
+        fn name(&self) -> &str {
+            "Pending health"
+        }
+        fn is_free(&self) -> bool {
+            true
+        }
+        fn requires_api_key(&self) -> bool {
+            false
+        }
+        async fn translate(
+            &self,
+            _: &[locust_core::models::TranslationRequest],
+        ) -> locust_core::error::Result<Vec<locust_core::models::TranslationResult>> {
+            unreachable!()
+        }
+        async fn estimate_cost(&self, _: usize, _: &str) -> Option<f64> {
+            None
+        }
+        async fn health_check(&self) -> locust_core::error::Result<()> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_health_does_not_block_settings_or_registry_updates() {
+        let state = create_test_state();
+        let provider = Arc::new(PendingHealth(tokio::sync::Notify::new()));
+        state
+            .provider_registry
+            .write()
+            .await
+            .register(provider.clone());
+        let health = tokio::spawn(provider_health(
+            State(state.clone()),
+            Path("pending-health".into()),
+        ));
+        provider.0.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            update_app_config(&state, serde_json::json!({"default_target_lang": "fr"})),
+        )
+        .await
+        .expect("pending network call blocked settings update")
+        .unwrap();
+        assert_eq!(state.config.read().await.default_target_lang, "fr");
+        health.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_health_times_out() {
+        let state = create_test_state();
+        state
+            .provider_registry
+            .write()
+            .await
+            .register(Arc::new(PendingHealth(tokio::sync::Notify::new())));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(31),
+            provider_health(State(state.clone()), Path("pending-health".into())),
+        )
+        .await
+        .expect("health check was not bounded")
+        .0;
+        assert_eq!(response["ok"], false);
+        assert!(response["message"].as_str().unwrap().contains("timed out"));
+        assert!(state.provider_registry.try_write().is_ok());
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_secrets_never_reach_batch_failed_events_or_logs() {
+        use httpmock::prelude::*;
+        use locust_core::models::{ProgressEvent, StringEntry};
+        use locust_core::translation::{RetryConfig, TranslationManager, TranslationOptions};
+
+        let server = MockServer::start();
+        let secret = "configured-job-secret-sentinel";
+        let bearer = "echoed-bearer-secret-sentinel";
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("Hello");
+            then.status(401).body(format!(
+                "Rejected {secret}; Authorization: Bearer {bearer}\n{}",
+                "x".repeat(1000)
+            ));
+        });
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(logs.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let state = create_test_state();
+        let provider = Arc::new(locust_providers::openai::OpenAiProvider::new(
+            secret.into(),
+            None,
+            Some(server.base_url()),
+        ));
+        let manager = TranslationManager::new(provider, state.db.clone(), state.glossary.clone())
+            .with_retry_config(RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            });
+        let entry = StringEntry::new("secret-test", "Hello", "story.txt".into());
+        state.db.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        manager
+            .translate_entries(
+                vec![entry],
+                TranslationOptions {
+                    use_memory: false,
+                    use_glossary: false,
+                    ..Default::default()
+                },
+                tx,
+                "secret-job".into(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let mut failed = false;
+        while let Some(event) = rx.recv().await {
+            let serialized = serde_json::to_string(&event).unwrap();
+            assert!(!serialized.contains(secret));
+            assert!(!serialized.contains(bearer));
+            if let ProgressEvent::BatchFailed { error, .. } = event {
+                failed = true;
+                assert!(error.contains("401"));
+                assert!(error.contains("[REDACTED]"));
+                assert!(error.chars().count() <= 560);
+            }
+        }
+        assert!(failed, "expected a real BatchFailed event");
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("Batch translation failed"),
+            "expected manager error log"
+        );
+        assert!(!logged.contains(secret));
+        assert!(!logged.contains(bearer));
+        mock.assert();
+    }
 
     #[tokio::test]
     async fn test_health_returns_ok() {
@@ -356,6 +538,50 @@ mod xai_auth_tests {
     use crate::{create_test_state, start_test_server};
     use httpmock::prelude::*;
     use locust_providers::xai_oauth::{set_token_path_override, token_store_test_lock, DeviceCode};
+
+    #[tokio::test]
+    async fn xai_network_waits_release_endpoint_override_locks() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let state = create_test_state();
+        *state.xai_device_code_url.write().await = Some(url.clone());
+        *state.xai_token_url.write().await = Some(url);
+        state.xai_pending.insert(
+            "pending".into(),
+            XaiPendingAuth {
+                device: Arc::new(DeviceCode::from_parts(
+                    "device-fixture",
+                    "ABCD",
+                    "https://example.test",
+                    1,
+                    900,
+                    u64::MAX,
+                )),
+                last_poll: None,
+            },
+        );
+        let start_state = state.clone();
+        let start = tokio::spawn(async move { start_xai_device_login(&start_state).await });
+        let poll_state = state.clone();
+        let poll = tokio::spawn(async move { poll_xai_device_login(&poll_state, "pending").await });
+        // Accept both connections without replying, so each helper stays in its
+        // network await while the endpoint override locks are inspected.
+        let first = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let start_unlocked = state.xai_device_code_url.try_write().is_ok();
+        let poll_unlocked = state.xai_token_url.try_write().is_ok();
+        start.abort();
+        poll.abort();
+        drop((first, second));
+        assert!(start_unlocked, "device request retained an endpoint guard");
+        assert!(poll_unlocked, "token poll retained an endpoint guard");
+    }
 
     fn assert_no_secrets(body: &serde_json::Value) {
         let dumped = body.to_string();

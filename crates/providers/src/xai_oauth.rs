@@ -210,19 +210,32 @@ pub async fn request_device_code_at(url: &str) -> Result<DeviceCode> {
         .form(&[("client_id", CLIENT_ID), ("scope", SCOPE)])
         .send()
         .await
-        .map_err(|e| LocustError::ProviderError(format!("device code request failed: {}", e)))?;
+        .map_err(|e| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &format!("device code request failed: {}", e),
+                &[],
+            ))
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(LocustError::ProviderError(format!(
-            "device code request returned {}: {}",
-            status, body
-        )));
+        let body = crate::error_sanitizer::sanitize_provider_error(
+            &resp.text().await.unwrap_or_default(),
+            &[],
+        );
+        return Err(LocustError::ProviderError(
+            crate::error_sanitizer::sanitize_provider_error(
+                &format!("device code request returned {}: {}", status, body),
+                &[],
+            ),
+        ));
     }
 
     let dc: DeviceCodeResponse = resp.json().await.map_err(|e| {
-        LocustError::ProviderError(format!("malformed device code response: {}", e))
+        LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+            &format!("malformed device code response: {}", e),
+            &[],
+        ))
     })?;
 
     let verification_uri = dc.verification_uri_complete.unwrap_or(dc.verification_uri);
@@ -257,13 +270,20 @@ pub async fn poll_for_token_at(url: &str, device: &DeviceCode) -> Result<PollOut
         ])
         .send()
         .await
-        .map_err(|e| LocustError::ProviderError(format!("token poll failed: {}", e)))?;
+        .map_err(|e| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &format!("token poll failed: {}", e),
+                &[&device.device_code],
+            ))
+        })?;
 
     if resp.status().is_success() {
-        let tr: TokenResponse = resp
-            .json()
-            .await
-            .map_err(|e| LocustError::ProviderError(format!("malformed token response: {}", e)))?;
+        let tr: TokenResponse = resp.json().await.map_err(|e| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &format!("malformed token response: {}", e),
+                &[&device.device_code],
+            ))
+        })?;
         let store = TokenStore {
             access_token: tr.access_token,
             refresh_token: tr.refresh_token.unwrap_or_default(),
@@ -286,7 +306,7 @@ pub async fn poll_for_token_at(url: &str, device: &DeviceCode) -> Result<PollOut
         "expired_token" => Ok(PollOutcome::Expired),
         other => Err(LocustError::ProviderError(format!(
             "login failed: {}",
-            other
+            crate::error_sanitizer::sanitize_provider_error(other, &[&device.device_code])
         ))),
     }
 }
@@ -339,7 +359,12 @@ async fn refresh(tokens: &TokenStore) -> Result<TokenStore> {
         ])
         .send()
         .await
-        .map_err(|e| LocustError::ProviderError(format!("token refresh failed: {}", e)))?;
+        .map_err(|e| {
+            LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                &format!("token refresh failed: {}", e),
+                &[&tokens.access_token, &tokens.refresh_token],
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(LocustError::ProviderError(
@@ -347,10 +372,12 @@ async fn refresh(tokens: &TokenStore) -> Result<TokenStore> {
         ));
     }
 
-    let tr: TokenResponse = resp
-        .json()
-        .await
-        .map_err(|e| LocustError::ProviderError(format!("malformed refresh response: {}", e)))?;
+    let tr: TokenResponse = resp.json().await.map_err(|e| {
+        LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+            &format!("malformed refresh response: {}", e),
+            &[&tokens.access_token, &tokens.refresh_token],
+        ))
+    })?;
     let store = TokenStore {
         access_token: tr.access_token,
         refresh_token: tr

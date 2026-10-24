@@ -75,25 +75,30 @@ impl GoogleTranslateProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    LocustError::ProviderError(format!("Google Translate request failed: {}", e))
+                    LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                        &format!("Google Translate request failed: {}", e),
+                        &[],
+                    ))
                 })?;
 
             // Let the engine retry HTTP failures according to their status. Splitting
             // these would multiply requests during rate limits or upstream outages.
             if !resp.status().is_success() {
-                return Err(LocustError::ProviderError(format!(
-                    "Google Translate returned status {}",
-                    resp.status()
-                )));
+                return Err(LocustError::ProviderError(
+                    crate::error_sanitizer::sanitize_provider_error(
+                        &format!("Google Translate returned status {}", resp.status()),
+                        &[],
+                    ),
+                ));
             }
 
             let parsed = resp
                 .json::<serde_json::Value>()
                 .await
                 .map_err(|e| {
-                    LocustError::ProviderError(format!(
-                        "Google Translate returned invalid JSON: {}",
-                        e
+                    LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                        &format!("Google Translate returned invalid JSON: {}", e),
+                        &[],
                     ))
                 })
                 .and_then(|body| Self::parse_response(&body, chunk));
@@ -119,11 +124,16 @@ impl GoogleTranslateProvider {
             LocustError::ProviderError("Google Translate returned a non-array response".to_string())
         })?;
         if items.len() != requests.len() {
-            return Err(LocustError::ProviderError(format!(
-                "Google Translate returned {} items for {} sources",
-                items.len(),
-                requests.len()
-            )));
+            return Err(LocustError::ProviderError(
+                crate::error_sanitizer::sanitize_provider_error(
+                    &format!(
+                        "Google Translate returned {} items for {} sources",
+                        items.len(),
+                        requests.len()
+                    ),
+                    &[],
+                ),
+            ));
         }
 
         items
@@ -140,9 +150,12 @@ impl GoogleTranslateProvider {
                     _ => (None, None),
                 };
                 let text = text.ok_or_else(|| {
-                    LocustError::ProviderError(format!(
-                        "Google Translate returned an invalid translation item at index {}",
-                        i
+                    LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                        &format!(
+                            "Google Translate returned an invalid translation item at index {}",
+                            i
+                        ),
+                        &[],
                     ))
                 })?;
                 if text.is_empty() && !request.source.is_empty() {
@@ -213,8 +226,12 @@ impl TranslationProvider for GoogleTranslateProvider {
             let Some(task) = tasks.join_next().await else {
                 break;
             };
-            let (index, translations) =
-                task.map_err(|e| LocustError::ProviderError(format!("task join error: {}", e)))?;
+            let (index, translations) = task.map_err(|e| {
+                LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                    &format!("task join error: {}", e),
+                    &[],
+                ))
+            })?;
             results[index] = translations?;
         }
         Ok(results.into_iter().flatten().collect())
@@ -245,6 +262,30 @@ mod tests {
     use locust_core::translation::is_retryable;
     use serde_json::json;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn google_transport_and_decode_errors_redact_url_queries() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST);
+            then.status(200).body("not JSON");
+        });
+        for base in [format!("http://{address}"), server.base_url()] {
+            let provider = GoogleTranslateProvider {
+                base_url: format!("{base}/?token=google-query-sentinel"),
+                ..GoogleTranslateProvider::new()
+            };
+            let error = provider
+                .translate(&requests(&["Hello"], "en"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("google-query-sentinel"), "{error}");
+        }
+    }
 
     fn make_provider(server: &MockServer) -> GoogleTranslateProvider {
         GoogleTranslateProvider {
