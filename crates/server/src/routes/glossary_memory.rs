@@ -95,7 +95,9 @@ pub(crate) async fn list_memory(
     State(state): State<Arc<AppState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    // This single DB read (including list count + rows) holds the connection
+    // mutex, also used by writes and connection replacement. Reserving the
+    // whole project would make concurrent Memory page reads reject each other.
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
@@ -217,6 +219,9 @@ pub(crate) async fn memory_suggestions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<MemorySuggestionsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Unlike the list reads, scoring spans multiple DB calls in a blocking
+    // worker. Keep project ownership so a destructive open cannot swap the
+    // connection between reading the entry and its project candidates.
     let guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
@@ -290,7 +295,8 @@ async fn clear_memory_owned(state: Arc<AppState>) -> Result<Json<serde_json::Val
 pub(crate) async fn memory_lang_pairs(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<String>>, ApiError> {
-    let _guard = try_project_operation(&state).map_err(|m| err(StatusCode::CONFLICT, m))?;
+    // The connection mutex serializes this query with writes and replacement;
+    // no project reservation is needed alongside the page's entries read.
     if state.current_project.read().await.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "no project open"));
     }
@@ -304,6 +310,52 @@ pub(crate) async fn memory_lang_pairs(
 #[cfg(test)]
 mod tests {
     use crate::routes::test_support::*;
+
+    #[tokio::test]
+    async fn memory_reads_do_not_contend_with_each_other_or_project_operations() {
+        use axum::extract::State;
+        use std::sync::atomic::Ordering;
+
+        let (url, _server, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_memory("hello", "Hello", "Hola", "en-es")
+            .await
+            .unwrap();
+        // Reproduce a language-pair read yielding after admission, before the
+        // entries request arrives. It must never reserve the live project.
+        let project = state.current_project.write().await;
+        let pairs = super::memory_lang_pairs(State(state.clone()));
+        tokio::pin!(pairs);
+        assert!(futures_util::poll!(&mut pairs).is_pending());
+        assert_eq!(state.project_exclusive.load(Ordering::SeqCst), 0);
+        drop(project);
+        assert_eq!(pairs.await.unwrap().0, ["en-es"]);
+
+        // A read is safe even while another operation owns the project: each
+        // database method serializes with writes and connection replacement.
+        let guard = crate::try_project_operation(&state).unwrap();
+        for path in [
+            "/api/memory?limit=50",
+            "/api/memory/lang-pairs",
+            "/api/memory/stats",
+        ] {
+            let response = client().get(format!("{url}{path}")).send().await.unwrap();
+            assert_eq!(response.status(), 200, "{path}");
+            let body: serde_json::Value = response.json().await.unwrap();
+            match path {
+                "/api/memory?limit=50" => {
+                    assert_eq!(body["total"], 1);
+                    assert_eq!(body["entries"][0]["translation"], "Hola");
+                }
+                "/api/memory/lang-pairs" => assert_eq!(body, serde_json::json!(["en-es"])),
+                _ => assert_eq!(body["project_entries"], 1),
+            }
+        }
+        drop(guard);
+        assert!(crate::try_project_operation(&state).is_ok());
+    }
 
     #[tokio::test]
     async fn memory_suggestions_require_open_project_pair_and_known_entry() {

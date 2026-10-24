@@ -194,22 +194,34 @@ async fn page_operations_require_an_open_project_without_touching_either_store()
 }
 
 #[tokio::test]
-async fn page_operations_hold_the_existing_project_guard() {
+async fn page_reads_succeed_while_mutations_respect_the_project_guard() {
     let state = seeded_state().await;
     let held = locust_server::try_project_operation(&state).unwrap();
     let (base, server) = start_test_server(state.clone()).await;
     let client = Client::builder().no_proxy().build().unwrap();
     for (method, path) in project_routes() {
+        let is_read = method == Method::GET;
         let response = client
             .request(method, format!("{base}/api/{path}"))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 409, "{path}");
-        assert_eq!(
-            response.text().await.unwrap(),
-            locust_server::PROJECT_BUSY_MESSAGE
-        );
+        if is_read {
+            assert_eq!(response.status(), 200, "{path}");
+            let body: Value = response.json().await.unwrap();
+            if path == "memory/lang-pairs" {
+                assert_eq!(body, json!(["en-es", "en-fr"]));
+            } else {
+                assert_eq!(body["total"], 1);
+                assert_eq!(body["entries"][0]["translation"], "Hola");
+            }
+        } else {
+            assert_eq!(response.status(), 409, "{path}");
+            assert_eq!(
+                response.text().await.unwrap(),
+                locust_server::PROJECT_BUSY_MESSAGE
+            );
+        }
     }
     assert_eq!(state.db.memory_count().unwrap(), 3);
     assert_eq!(state.global_memory.memory_count().unwrap(), 1);

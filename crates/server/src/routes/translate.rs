@@ -611,6 +611,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_http_after_project_open_and_dialog_reads_including_pending_estimate() {
+        let (url, _server, state) = setup_with_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("project");
+        std::fs::create_dir_all(game.join("game")).unwrap();
+        std::fs::write(
+            game.join("game/script.rpy"),
+            "label start:\n    \"Hello\"\n    return\n",
+        )
+        .unwrap();
+        let response = client()
+            .post(format!("{url}/api/project/open"))
+            .json(&serde_json::json!({"path": game, "format_id": "renpy"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+        assert!(
+            try_project_operation(&state).is_ok(),
+            "project open releases its reservation"
+        );
+        state
+            .db
+            .save_memory("hello", "Hello", "Hola", "en-es")
+            .await
+            .unwrap();
+
+        // Inject uses cached stats; recovery/status and Patch's initialization
+        // reads must also leave the project available after their response.
+        for path in ["/api/stats", "/api/patch/recordings", "/api/config"] {
+            assert_eq!(
+                client()
+                    .get(format!("{url}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK,
+                "{path}"
+            );
+            assert!(try_project_operation(&state).is_ok(), "{path}");
+        }
+        for path in ["/api/inject/status", "/api/patch/status"] {
+            assert_eq!(
+                client()
+                    .post(format!("{url}{path}"))
+                    .json(&serde_json::json!({"game_path": game}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK,
+                "{path}"
+            );
+            assert!(try_project_operation(&state).is_ok(), "{path}");
+        }
+
+        let provider = Arc::new(EstimateProvider {
+            model: None,
+            policy: None,
+            cost: None,
+            calls: Default::default(),
+            gate: Some(Default::default()),
+        });
+        state
+            .provider_registry
+            .write()
+            .await
+            .register(provider.clone());
+        let request_url = url.clone();
+        let request =
+            tokio::spawn(async move { estimate_post(&request_url, estimate_options()).await });
+        let (entered, release) = provider.gate.as_ref().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            try_project_operation(&state).is_err(),
+            "estimate owns the reservation while awaiting provider cost"
+        );
+        // Closing a dialog does not guarantee its HTTP estimate has finished.
+        // Memory must remain readable both during and after that request.
+        let response = client()
+            .get(format!("{url}/api/memory?limit=50"))
+            .send()
+            .await
+            .unwrap();
+        release.notify_one();
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+        assert!(
+            try_project_operation(&state).is_ok(),
+            "estimate releases its reservation"
+        );
+        assert!(
+            state.active_jobs.is_empty(),
+            "dialog reads do not start background jobs"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["total"], 1);
+        let (entries, stats, pairs) = tokio::join!(
+            client().get(format!("{url}/api/memory?limit=50")).send(),
+            client().get(format!("{url}/api/memory/stats")).send(),
+            client().get(format!("{url}/api/memory/lang-pairs")).send(),
+        );
+        for response in [entries, stats, pairs] {
+            assert_eq!(response.unwrap().status(), StatusCode::OK);
+        }
+        assert!(try_project_operation(&state).is_ok());
+    }
+
+    #[tokio::test]
     async fn estimate_http_temporary_reservation_and_empty_project() {
         let (url, _server, state) = setup_with_state().await;
         mark_project_open(&state).await;

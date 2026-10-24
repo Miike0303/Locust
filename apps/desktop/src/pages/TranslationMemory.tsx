@@ -30,25 +30,35 @@ function ProjectTranslationMemory({ projectScope }: { projectScope: string | nul
   const [offset, setOffset] = useState(0);
   const [searchInput, setSearchInput] = useState("");
 
-  const { data: stats } = useQuery({
+  const statsQuery = useQuery({
     queryKey: ["tm-stats", projectScope],
     queryFn: ({ signal }) => getTranslationMemoryStats(signal),
     enabled: projectScope !== null,
   });
 
-  const { data: langPairs } = useQuery({
+  const langPairsQuery = useQuery({
     queryKey: ["tm-lang-pairs", projectScope],
     queryFn: ({ signal }) => getTranslationMemoryLangPairs(signal),
     enabled: projectScope !== null,
   });
 
-  const { data, refetch, isLoading, isError, error } = useQuery({
+  const entriesQuery = useQuery({
     queryKey: ["tm-entries", projectScope, search, langPair, offset],
     queryFn: ({ signal }) => getTranslationMemory({ search: search || undefined, lang_pair: langPair, limit: PAGE_SIZE, offset }, signal),
     enabled: projectScope !== null,
     staleTime: 10_000,
     refetchOnMount: "always",
   });
+
+  const queries = [entriesQuery, statsQuery, langPairsQuery];
+  const failed = queries.find((query) => query.isError);
+  const isError = failed !== undefined;
+  const error = failed?.error;
+  const isLoading = queries.some((query) => query.isPending);
+  const { data } = entriesQuery;
+  const { data: stats } = statsQuery;
+  const { data: langPairs } = langPairsQuery;
+  const retry = () => Promise.all(queries.map((query) => query.refetch()));
 
   // Deleting the final row of a later page must not strand the user on an
   // empty offset with no pagination controls. Keep valid pages unchanged.
@@ -111,7 +121,7 @@ function ProjectTranslationMemory({ projectScope }: { projectScope: string | nul
     }
   };
 
-  if (projectScope === null || (error instanceof ApiError && error.key === "api.error.noProjectOpen")) {
+  if (projectScope === null || queries.some((query) => query.error instanceof ApiError && query.error.key === "api.error.noProjectOpen")) {
     return (
       <div className="flex flex-col h-full bg-surface text-text">
         <h1 className="px-6 py-4 border-b border-border text-page font-bold">{t("memory.title")}</h1>
@@ -138,11 +148,13 @@ function ProjectTranslationMemory({ projectScope }: { projectScope: string | nul
         </div>
 
         {/* Stats */}
-        <div className="flex gap-6 text-body text-text-muted mb-4">
-          <span className="text-text">{t("memory.globalEntries", { count: stats?.global_entries ?? 0 })}</span>
-          <span className="text-text">{t("memory.projectEntries", { count: stats?.project_entries ?? 0 })}</span>
-          <span className="text-text">{t("memory.languagePairs", { count: langPairs?.length ?? 0 })}</span>
-        </div>
+        {!isError && stats && langPairs && (
+          <div className="flex gap-6 text-body text-text-muted mb-4">
+            <span className="text-text">{t("memory.globalEntries", { count: stats.global_entries })}</span>
+            <span className="text-text">{t("memory.projectEntries", { count: stats.project_entries })}</span>
+            <span className="text-text">{t("memory.languagePairs", { count: langPairs.length })}</span>
+          </div>
+        )}
 
         {/* Search & Filter */}
         <div className="flex gap-3">
@@ -177,23 +189,23 @@ function ProjectTranslationMemory({ projectScope }: { projectScope: string | nul
 
       {/* Table / page states */}
       <div className="flex-1 overflow-auto">
-        {isLoading ? (
-          <div className="flex h-full items-center justify-center text-text-muted">
-            {t("memory.loading")}
-          </div>
-        ) : isError ? (
-          <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+        {isError ? (
+          <div role="alert" className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
             <p className="font-medium text-danger">{t("memory.loadError")}</p>
             <p className="text-body text-text-muted">
               {errorMessage(error, t("common.tryAgain"))}
             </p>
             <button
               type="button"
-              onClick={() => { void refetch(); }}
+              onClick={() => { void retry(); }}
               className="rounded bg-accent px-4 py-2 text-body font-medium text-white hover:bg-accent-hover"
             >
               {t("common.retry")}
             </button>
+          </div>
+        ) : isLoading ? (
+          <div className="flex h-full items-center justify-center text-text-muted">
+            {t("memory.loading")}
           </div>
         ) : entries.length === 0 ? (
           hasActiveFilter ? (

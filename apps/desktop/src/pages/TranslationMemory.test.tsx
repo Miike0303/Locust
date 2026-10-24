@@ -53,6 +53,10 @@ function seedEntries(source: string) {
     total: 1, limit: 50, offset: 0,
     entries: [{ source_hash: source, source, translation: "Translation", lang_pair: "en-es", uses: 1, last_used: "2026-01-01" }],
   });
+  for (const metadata of memoryQueries()) {
+    if (metadata.queryKey[0] === "tm-stats") client.setQueryData(metadata.queryKey, { project_entries: 1, global_entries: 2 });
+    if (metadata.queryKey[0] === "tm-lang-pairs") client.setQueryData(metadata.queryKey, ["en-es"]);
+  }
 }
 
 for (const locale of ["en", "es"] as const) {
@@ -149,5 +153,65 @@ for (const locale of ["en", "es"] as const) {
       : "Abra un proyecto para ver su memoria de traducción."));
     assert.ok(!html.includes(t("memory.loadError")));
     assert.ok(!html.includes(t("memory.clearAll")));
+  });
+}
+
+function seedMemory() {
+  seedEntries("Saved source");
+}
+
+for (const locale of ["en", "es"] as const) {
+  for (const key of ["tm-entries", "tm-stats", "tm-lang-pairs"]) {
+    for (const status of [409, 500]) {
+      test(`${locale}: ${key} HTTP ${status} shows Retry without empty state or fabricated counts`, () => {
+        setLocale(locale);
+        h.project = project("/projects/error.locust.db");
+        render();
+        seedMemory();
+        const query = memoryQueries().find(query => query.queryKey[0] === key)!;
+        const error = new ApiError(`${status}: ${status === 409 ? "A project operation is still running. Wait for it to finish before opening another project." : "memory unavailable"}`);
+        query.setState({ status: "error", data: undefined, error });
+        const html = render();
+        assert.ok(html.includes(t("memory.loadError")));
+        assert.ok(html.includes(t("common.retry")));
+        assert.ok(html.includes(error.message));
+        assert.ok(html.includes('role="alert"'));
+        assert.ok(!html.includes(t("memory.empty.title")));
+        assert.ok(!html.includes(t("memory.emptyFiltered.title")));
+        for (const countKey of ["memory.globalEntries", "memory.projectEntries", "memory.languagePairs"] as const) {
+          assert.ok(!html.includes(t(countKey, { count: 0 })), "errors must not substitute zero counts");
+        }
+        seedMemory();
+        assert.ok(render().includes("Saved source"), "successful retry restores the memory contents");
+        assert.ok(!render().includes(t("memory.loadError")));
+      });
+    }
+  }
+
+  test(`${locale}: pending metadata does not show zero counts or an empty memory`, () => {
+    setLocale(locale);
+    h.project = project("/projects/loading.locust.db");
+    render();
+    const query = memoryQueries().find(query => query.queryKey[0] === "tm-entries")!;
+    client.setQueryData(query.queryKey, { entries: [], total: 0, limit: 50, offset: 0 });
+    const html = render();
+    assert.ok(html.includes(t("memory.loading")));
+    assert.ok(!html.includes(t("memory.empty.title")));
+    assert.ok(!html.includes(t("memory.globalEntries", { count: 0 })));
+  });
+
+  test(`${locale}: only successful empty reads render zero counts and the empty state`, () => {
+    setLocale(locale);
+    h.project = project("/projects/empty.locust.db");
+    render();
+    for (const query of memoryQueries()) {
+      client.setQueryData(query.queryKey, query.queryKey[0] === "tm-entries"
+        ? { entries: [], total: 0, limit: 50, offset: 0 }
+        : query.queryKey[0] === "tm-stats" ? { project_entries: 0, global_entries: 0 } : []);
+    }
+    const html = render();
+    assert.ok(html.includes(t("memory.empty.title")));
+    assert.ok(html.includes(t("memory.globalEntries", { count: 0 })));
+    assert.ok(!html.includes(t("memory.loadError")));
   });
 }
