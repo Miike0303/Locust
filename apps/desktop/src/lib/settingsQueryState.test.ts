@@ -1,3 +1,4 @@
+import { draftProjectKey } from "./projectScope";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { after, before, test } from "node:test";
@@ -149,7 +150,7 @@ async function renderQueryFailure(section: "glossary" | "history", raw: string):
       }));
     } else {
       await assert.rejects(client.fetchQuery({
-        queryKey: ["translation-runs"], queryFn: api.getTranslationRuns,
+        queryKey: ["translation-runs", draftProjectKey(glossary.project)], queryFn: api.getTranslationRuns,
       }));
     }
     return renderToStaticMarkup(createElement(QueryClientProvider, { client },
@@ -401,7 +402,7 @@ async function renderPopulatedSection(section: SettingsSectionId): Promise<strin
     client.setQueryData(["glossary", glossary.project.database_path, "ja-en"], [
       { term: "Greeting", translation: "Hello", lang_pair: "ja-en", context: null, case_sensitive: false },
     ]);
-    client.setQueryData(["translation-runs"], [run]);
+    client.setQueryData(["translation-runs", draftProjectKey(glossary.project)], [run]);
     client.setQueryData(["backups", "report"], { entries: [healthyBackup], unreadable: [] });
     return renderToStaticMarkup(createElement(QueryClientProvider, { client },
       createElement(MemoryRouter, { initialEntries: [`/settings?section=${section}`] },

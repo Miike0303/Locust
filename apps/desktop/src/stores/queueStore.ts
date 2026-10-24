@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { startTranslation, cancelTranslation, validate, type TranslationStartParams } from "../lib/api";
-import { completeOpenProject } from "../lib/openProjectFlow";
-import { queryClient } from "../lib/queryClient";
+import { completeOpenProject, projectFromOpenResponse } from "../lib/openProjectFlow";
+import { invalidateProjectData, queryClient } from "../lib/queryClient";
+import { draftProjectKey } from "../lib/projectScope";
 import { waitForJob } from "../lib/ws";
 import { useProjectStore } from "./projectStore";
 import { useEditorStore } from "./editorStore";
@@ -186,6 +187,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         addToast("info", t("queue.toast.itemCancelled", { name }));
       };
 
+      let jobProjectKey: string | null = null;
       try {
         // Step 1: Open project
         updateItem({ status: "extracting" });
@@ -240,6 +242,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
         const job = await startTranslation(translationParams);
         activeJobId = job.job_id;
+        jobProjectKey = draftProjectKey(projectFromOpenResponse(result));
         let failedBatches = 0;
         let lastBatchReason = "";
         let translated = 0;
@@ -342,6 +345,14 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           });
           addLog("error", t("activity.queue.itemFailed", { name: item.projectName }), raw, "queue");
           addToast("error", t("queue.toast.itemFailed", { name: item.projectName }));
+        }
+      } finally {
+        if (jobProjectKey !== null) {
+          const currentProject = useProjectStore.getState().project;
+          const stillOpen = currentProject && draftProjectKey(currentProject) === jobProjectKey;
+          // Failed/cancelled jobs can write rows too. Refresh after validation,
+          // awaiting live-project reads before the next item switches the backend.
+          await invalidateProjectData(queryClient, jobProjectKey, stillOpen ? "active" : "none");
         }
       }
     }

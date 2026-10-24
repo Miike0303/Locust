@@ -1,3 +1,4 @@
+import { projectScopedQueryFn, useProjectScopedQueryEnabled } from "../lib/projectScope";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -34,13 +35,14 @@ function ProjectDashboard({ projectKey, gamePath }: { projectKey: string; gamePa
   const t = useT();
   const [recoveryPath, setRecoveryPath] = useState<string | null>(null);
   const [skipReview] = useState(readSkipReviewPreference);
-  const enabled = !!gamePath;
+  const enabled = useProjectScopedQueryEnabled(projectKey, !!gamePath);
   const projectQuery = useQuery({ queryKey: ["current-project", projectKey], queryFn: getCurrentProject, enabled, staleTime: 10_000 });
-  const hasProject = enabled && projectQuery.data !== null;
-  const statsQuery = useQuery({ queryKey: ["stats", projectKey], queryFn: getStats, enabled: hasProject, staleTime: 10_000 });
-  const filesQuery = useQuery({ queryKey: ["file-stats", projectKey], queryFn: getFileStats, enabled: hasProject, staleTime: 10_000 });
-  const runsQuery = useQuery({ queryKey: ["translation-runs", projectKey], queryFn: getTranslationRuns, enabled: hasProject, staleTime: 10_000 });
-  const injectionQuery = useQuery({ queryKey: ["injection-status", projectKey], queryFn: () => getInjectionStatus(gamePath!), enabled: hasProject, staleTime: 10_000 });
+  const hasProject = !!gamePath && projectQuery.data !== null;
+  const dataEnabled = useProjectScopedQueryEnabled(projectKey, hasProject);
+  const statsQuery = useQuery({ queryKey: ["stats", projectKey], queryFn: projectScopedQueryFn(projectKey, () => getStats()), enabled: dataEnabled, staleTime: 10_000 });
+  const filesQuery = useQuery({ queryKey: ["file-stats", projectKey], queryFn: projectScopedQueryFn(projectKey, () => getFileStats()), enabled: dataEnabled, staleTime: 10_000 });
+  const runsQuery = useQuery({ queryKey: ["translation-runs", projectKey], queryFn: projectScopedQueryFn(projectKey, () => getTranslationRuns()), enabled: dataEnabled, staleTime: 10_000 });
+  const injectionQuery = useQuery({ queryKey: ["injection-status", projectKey], queryFn: projectScopedQueryFn(projectKey, () => getInjectionStatus(gamePath!)), enabled: dataEnabled, staleTime: 10_000 });
   const queries = [projectQuery, statsQuery, filesQuery, runsQuery, injectionQuery];
   const failed = queries.find(query => query.isError);
   const noProject = !hasProject || queries.some(query => query.error instanceof ApiError && query.error.key === "api.error.noProjectOpen");

@@ -1,3 +1,5 @@
+import { draftProjectKey, projectScopedQueryFn, useProjectScopedQueryEnabled } from "../../lib/projectScope";
+import { useProjectStore } from "../../stores/projectStore";
 import { useQuery } from "@tanstack/react-query";
 import { Loader } from "lucide-react";
 import { useMemo } from "react";
@@ -42,9 +44,13 @@ function formatDuration(secs: number, t: TranslateFn): string {
 
 export default function HistorySection() {
   const t = useT();
+  const project = useProjectStore(state => state.project);
+  const projectKey = project ? draftProjectKey(project) : "";
+  const scopedEnabled = useProjectScopedQueryEnabled(projectKey);
   const { data: runs, isLoading, isError, error, refetch } = useQuery({
-    queryKey: ["translation-runs"],
-    queryFn: getTranslationRuns,
+    queryKey: ["translation-runs", projectKey],
+    enabled: scopedEnabled,
+    queryFn: projectScopedQueryFn(projectKey, () => getTranslationRuns()),
   });
   const queryState = isError ? settingsQueryState(error) : null;
 

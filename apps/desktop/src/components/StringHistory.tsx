@@ -1,3 +1,4 @@
+import { projectScopedQueryFn, useProjectScopedQueryEnabled } from "../lib/projectScope";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
@@ -18,10 +19,11 @@ export default function StringHistory({ projectKey, entryId, translation, busy, 
   const t = useT();
   const { locale } = useLocale();
   const [open, setOpen] = useState(false);
+  const scopedEnabled = useProjectScopedQueryEnabled(projectKey, open);
   const history = useQuery({
     queryKey: ["string-history", projectKey, entryId],
-    queryFn: () => getStringHistory(entryId),
-    enabled: open,
+    queryFn: projectScopedQueryFn(projectKey, () => getStringHistory(entryId)),
+    enabled: scopedEnabled,
     staleTime: 0,
   });
 

@@ -1,3 +1,4 @@
+import { openProjectTransition } from "../lib/openProjectFlow";
 import { IS_TAURI } from "../lib/runtime";
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -128,11 +129,11 @@ export default function PivotModal({
 		setError(null);
 		try {
 			const args = pivotOpenDbArgs(result.database_path, sourceProject);
-			const opened = await openProjectDb(
+			const opened = await openProjectTransition(() => openProjectDb(
 				args.databasePath,
 				args.gamePath,
 				args.formatId,
-			);
+			));
 			setProject(projectInfoAfterPivotOpen(sourceProject, opened));
 			dropProjectQueries(queryClient);
 			addToast("success", t("pivot.toast.opened", { path: result.database_path }));

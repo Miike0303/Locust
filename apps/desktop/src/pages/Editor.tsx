@@ -1,3 +1,4 @@
+import { projectScopedQueryFn, useProjectScopedQueryEnabled } from "../lib/projectScope";
 import { formatSourceKind } from "../lib/gameSource";
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
@@ -24,6 +25,7 @@ import {
 import { useEditorStore } from "../stores/editorStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useHotkey } from "../lib/hotkeys";
+import { invalidateProjectData } from "../lib/queryClient";
 import {
 	readSkipReviewPreference,
 	readWorkflowGuideDismissed,
@@ -127,6 +129,8 @@ export default function Editor() {
 		readSkipReviewPreference(),
 	);
 
+	const scopedEnabled = useProjectScopedQueryEnabled(projectKey);
+	const detailEnabled = useProjectScopedQueryEnabled(projectKey, !!selectedEntryId);
 	const {
 		data: stringsData,
 		isLoading: stringsLoading,
@@ -135,9 +139,9 @@ export default function Editor() {
 		refetch,
 	} = useQuery({
 		queryKey: ["strings", filter, projectKey],
-		queryFn: () => getStrings(filter),
+		queryFn: projectScopedQueryFn(projectKey, () => getStrings(filter)),
 		staleTime: 30_000,
-		enabled: !!project,
+		enabled: scopedEnabled,
 	});
 
 	const sampleSources = useMemo(
@@ -147,15 +151,15 @@ export default function Editor() {
 
 	const { data: statsData } = useQuery({
 		queryKey: ["stats", projectKey],
-		queryFn: getStats,
+		queryFn: projectScopedQueryFn(projectKey, () => getStats()),
 		staleTime: 10_000,
-		enabled: !!project,
+		enabled: scopedEnabled,
 	});
 
 	const { data: selectedEntry } = useQuery({
 		queryKey: ["string", selectedEntryId, projectKey],
-		queryFn: () => getString(selectedEntryId!),
-		enabled: !!project && !!selectedEntryId,
+		queryFn: projectScopedQueryFn(projectKey, () => getString(selectedEntryId!)),
+		enabled: detailEnabled,
 	});
 
 	const bumpPatchStatus = useCallback(() => {
@@ -163,12 +167,8 @@ export default function Editor() {
 	}, []);
 
 	const handleRefetch = useCallback(() => {
-		refetch();
-		queryClient.invalidateQueries({ queryKey: ["stats"] });
-		if (selectedEntryId) {
-			queryClient.invalidateQueries({ queryKey: ["string", selectedEntryId] });
-		}
-	}, [refetch, queryClient, selectedEntryId]);
+		return invalidateProjectData(queryClient, projectKey);
+	}, [queryClient, projectKey]);
 
 	const wasTranslating = useRef(false);
 	useEffect(() => {

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-import { beforeEach, test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import { registerHooks } from "node:module";
+import { focusManager, onlineManager, QueryObserver } from "@tanstack/react-query";
+import { projectScopedQueryEnabled } from "../lib/projectScope.ts";
+import { queryClient } from "../lib/queryClient.ts";
+import { draftProjectKey } from "./draftStore.ts";
 import {
   getProjectOpenChoice, resolveProjectOpenChoice,
   type ProjectOpenChoice, type ProjectOpenChoiceRequest,
@@ -11,6 +15,7 @@ const h = {
   calls: [] as string[], toasts: [] as unknown[][],
   logs: [] as unknown[][], jobError: null as string | null,
   batchErrors: [] as string[], translated: 1, progressTotal: 100, onJob: () => {},
+  openedPaths: [] as string[], onOpen: async (_path: string) => {},
   preflight: { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" } as ProjectOpenPreflight,
 };
 (globalThis as any).__resumeQueue = h;
@@ -20,7 +25,7 @@ registerHooks({
       "/src/lib/api.ts": `const h=globalThis.__resumeQueue;
         const result={project_path:'/fixture/game',project_name:'Fixture',format_id:'renpy',total_strings:1,supported_modes:['replace'],database_path:'/fixture/game.locust.db',extraction_warnings:['Saved warning'],added:0,updated:0,stale_source_reset:0,removed:0,preserved_translations:0};
         export async function preflightProjectOpen(){h.calls.push('preflight');return h.preflight;}
-        export async function openProject(){h.calls.push('extract');return result;}
+        export async function openProject(path){h.calls.push('extract');h.openedPaths.push(path);await h.onOpen(path);return {...result,project_path:path,database_path:path+'.locust.db'};}
         export async function resumeProject(){h.calls.push('resume');return result;}
         export async function startTranslation(){h.calls.push('translate');return {job_id:'job'};}
         export async function cancelTranslation(){h.calls.push('cancelTranslation');}
@@ -84,9 +89,10 @@ beforeEach(() => {
   if (pending) resolveProjectOpenChoice(pending, "cancel");
   queue.setState({ items: [], history: [], isRunning: false, cancelRequested: false, globalProgress: null, translationParams: params });
   editor.setState({ isTranslating: false });
-  project.setState({ project: originalProject });
-  h.calls = []; h.toasts = []; h.logs = []; h.jobError = null;
+  project.getState().setProject(originalProject);
+  h.calls = []; h.toasts = []; h.logs = []; h.jobError = null; h.openedPaths = [];
   h.batchErrors = []; h.translated = 1; h.progressTotal = 100; h.onJob = () => {};
+  h.onOpen = async () => {};
   h.preflight = { kind: "resume_available", database_path: "/fixture/game.locust.db", project_path: "/fixture/game", format_id: "renpy" };
   setLocale("en");
 });
@@ -422,5 +428,255 @@ test("queue persists every durable change including run history, but skips runti
   } finally {
     if (descriptor) Object.defineProperty(globalThis, "localStorage", descriptor);
     else Reflect.deleteProperty(globalThis, "localStorage");
+  }
+});
+
+afterEach(() => queryClient.clear());
+
+const jobProject = { path: "/fixture/game", database_path: "/fixture/game.locust.db", format_id: "renpy", name: "Fixture" };
+function projectDataKeys(scope: string) {
+  return [
+    ["strings", { status: "pending" }, scope], ["strings", { offset: 50 }, scope],
+    ["string", "row", scope], ["stats", scope], ["file-stats", scope],
+    ["current-project", scope], ["translation-runs", scope], ["injection-status", scope],
+    ["validation-issues", scope, "syntax", false, 0], ["validation-summary", scope],
+    ["string-history", scope, "row"],
+  ];
+}
+
+for (const outcome of ["success", "failure", "cancellation"] as const) {
+  test(`queue ${outcome} invalidates only the settled job's project data`, async () => {
+    h.preflight = { kind: "extract" };
+    const own = projectDataKeys(draftProjectKey(jobProject));
+    // Same game folder, separate database: matching by path would corrupt this cache.
+    const other = projectDataKeys(draftProjectKey({ ...jobProject, database_path: "/fixture/other.locust.db" }));
+    h.onJob = () => {
+      for (const key of [...own, ...other]) queryClient.setQueryData(key, "cached");
+      if (outcome === "cancellation") queue.getState().cancelQueue();
+    };
+    if (outcome === "failure") h.jobError = "partial write before failure";
+    queue.getState().addItem(jobProject.path);
+    await queue.getState().startQueue();
+    assert.equal(queue.getState().items[0].status, outcome === "success" ? "done" : outcome === "failure" ? "error" : "cancelled");
+    for (const key of own) assert.equal(queryClient.getQueryState(key)?.isInvalidated, true, JSON.stringify(key));
+    for (const key of other) assert.equal(queryClient.getQueryState(key)?.isInvalidated, false, JSON.stringify(key));
+  });
+}
+
+test("queue marks a non-open job project stale without fetching its active queries", async () => {
+  h.preflight = { kind: "extract" };
+  const key = ["stats", draftProjectKey(jobProject)];
+  let reads = 0;
+  let unsubscribe = () => {};
+  h.onJob = () => {
+    project.setState({ project: { ...jobProject, database_path: "/fixture/other.locust.db" } });
+    queryClient.setQueryData(key, "cached");
+    const observer = new QueryObserver(queryClient, { queryKey: key, staleTime: Infinity,
+      queryFn: async () => { reads++; return "wrong live project"; } });
+    unsubscribe = observer.subscribe(() => {});
+  };
+  try {
+    queue.getState().addItem(jobProject.path);
+    await queue.getState().startQueue();
+    assert.equal(queryClient.getQueryState(key)?.isInvalidated, true);
+    assert.equal(reads, 0);
+    assert.equal(queryClient.getQueryData(key), "cached");
+  } finally { unsubscribe(); }
+});
+
+for (const outcome of ["success", "failure"] as const) {
+  test(`queue awaits the open project's active refetch before opening a different project (${outcome})`, async () => {
+    h.preflight = { kind: "extract" };
+    const key = ["stats", draftProjectKey(jobProject)];
+    let release = () => {};
+    let unsubscribe = () => {};
+    let reads = 0;
+    h.onJob = () => {
+      h.onJob = () => {};
+      queryClient.setQueryData(key, "cached");
+      const observer = new QueryObserver(queryClient, { queryKey: key, staleTime: Infinity,
+        queryFn: async () => {
+          reads++;
+          await new Promise<void>(resolve => { release = resolve; });
+          assert.equal(project.getState().project?.path, jobProject.path);
+          return "refreshed";
+        } });
+      unsubscribe = observer.subscribe(() => {});
+    };
+    if (outcome === "failure") h.jobError = "partial write before failure";
+    queue.getState().addItem(jobProject.path);
+    queue.getState().addItem("/fixture/next");
+    const running = queue.getState().startQueue();
+    try {
+      for (let i = 0; i < 100 && !reads && queue.getState().isRunning; i++) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      assert.equal(reads, 1, "settlement starts the active refetch");
+      assert.deepEqual(h.openedPaths, [jobProject.path], "the backend must still serve the settled project");
+      assert.equal(queue.getState().isRunning, true);
+    } finally { release(); await running; unsubscribe(); }
+    assert.deepEqual(h.openedPaths, [jobProject.path, "/fixture/next"]);
+  });
+}
+
+
+test("queue cancels A's paused refresh before B opens and reconnects", async () => {
+  h.preflight = { kind: "extract" };
+  const nextProject = { ...jobProject, path: "/fixture/next", database_path: "/fixture/next.locust.db" };
+  const families = ["validation-summary", "file-stats", "string-history"];
+  const keys = (scope: string) => families.map(family => [family, scope]);
+  const own = keys(draftProjectKey(jobProject));
+  const next = keys(draftProjectKey(nextProject));
+  const reads: string[] = [];
+  const contaminated: unknown[] = [];
+  let paused = false;
+  let unsubscribeA: (() => void)[] = [];
+  const unsubscribeB: (() => void)[] = [];
+  const stopTracking = queryClient.getQueryCache().subscribe(event => {
+    if (event.query.queryKey[1] !== draftProjectKey(jobProject)) return;
+    if (event.query.state.fetchStatus === "paused") paused = true;
+    if (event.query.state.data === nextProject.path) contaminated.push(event.query.queryKey);
+  });
+  queryClient.mount();
+  h.onJob = () => {
+    if (h.openedPaths.length === 1) {
+      for (const key of own) {
+        queryClient.setQueryData(key, jobProject.path);
+        const observer = new QueryObserver(queryClient, { queryKey: key, staleTime: Infinity,
+          queryFn: async () => {
+            const backendPath = h.openedPaths[h.openedPaths.length - 1];
+            reads.push(`A:${backendPath}`);
+            return backendPath;
+          } });
+        unsubscribeA.push(observer.subscribe(() => {}));
+      }
+      onlineManager.setOnline(false);
+    } else {
+      // Model the view detaching A's observers after the backend opens B.
+      unsubscribeA.forEach(unsubscribe => unsubscribe());
+      unsubscribeA = [];
+      for (const key of next) {
+        queryClient.setQueryData(key, "old B data");
+        const observer = new QueryObserver(queryClient, { queryKey: key, staleTime: Infinity,
+          queryFn: async () => {
+            const backendPath = h.openedPaths[h.openedPaths.length - 1];
+            reads.push(`B:${backendPath}`);
+            return backendPath;
+          } });
+        unsubscribeB.push(observer.subscribe(() => {}));
+      }
+      onlineManager.setOnline(true);
+    }
+  };
+  try {
+    queue.getState().addItem(jobProject.path);
+    queue.getState().addItem(nextProject.path);
+    await queue.getState().startQueue();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(paused, true, "A's settlement refresh must pause while offline");
+    assert.deepEqual(h.openedPaths, [jobProject.path, nextProject.path]);
+    assert.deepEqual(queue.getState().items.map(item => item.status), ["done", "done"]);
+    assert.deepEqual(contaminated, [], "A's cache must never receive B's data");
+    assert.ok(reads.every(read => read === `B:${nextProject.path}`), JSON.stringify(reads));
+    assert.equal(reads.length, families.length, "B's scoped queries must fetch B's data");
+    for (const key of own) {
+      assert.equal(queryClient.getQueryData(key), jobProject.path);
+      assert.equal(queryClient.getQueryState(key)?.fetchStatus, "idle");
+      assert.equal(queryClient.getQueryState(key)?.isInvalidated, true);
+    }
+    for (const key of next) assert.equal(queryClient.getQueryData(key), nextProject.path);
+  } finally {
+    stopTracking();
+    [...unsubscribeA, ...unsubscribeB].forEach(unsubscribe => unsubscribe());
+    queryClient.clear();
+    queryClient.unmount();
+    onlineManager.setOnline(true);
+  }
+});
+
+
+test("live scoped observers cannot read A while B open is pending, and reopening A refetches", async () => {
+  h.preflight = { kind: "extract" };
+  const nextProject = { ...jobProject, path: "/fixture/next", database_path: "/fixture/next.locust.db" };
+  const aKeys = projectDataKeys(draftProjectKey(jobProject));
+  const bKeys = projectDataKeys(draftProjectKey(nextProject));
+  const reads: string[] = [];
+  const observers: (() => void)[] = [];
+  let releaseOpen = () => {};
+  let releaseRead = () => {};
+  let openingB = false;
+  let paused = false;
+  const observe = (key: unknown[], label: string, initial: string) => {
+    queryClient.setQueryData(key, initial);
+    const scope = String(key[key[0] === "strings" || key[0] === "string" ? 2 : 1]);
+    const options = { queryKey: key, staleTime: Infinity, enabled: projectScopedQueryEnabled(scope),
+      queryFn: async () => {
+        const backendPath = h.openedPaths[h.openedPaths.length - 1];
+        reads.push(`${label}:${backendPath}`);
+        if (label === "A" && reads.length === 1) {
+          await new Promise<void>(resolve => { releaseRead = resolve; });
+        }
+        return backendPath;
+      } };
+    const observer = new QueryObserver(queryClient, options);
+    observers.push(observer.subscribe(() => {}));
+    observers.push(project.subscribe(() => observer.setOptions({ ...options, enabled: projectScopedQueryEnabled(scope) })));
+    return observer;
+  };
+  const stopTracking = queryClient.getQueryCache().subscribe(event => {
+    if (event.query.state.fetchStatus === "paused") paused = true;
+  });
+  h.onJob = () => {
+    if (h.openedPaths.length !== 1) return;
+    const active = aKeys.map(key => observe(key, "A", jobProject.path));
+    void active[0].refetch();
+    onlineManager.setOnline(false);
+  };
+  h.onOpen = async path => {
+    if (path !== nextProject.path) return;
+    assert.equal(project.getState().projectTransitionInProgress, true);
+    assert.equal(project.getState().confirmedOpenProjectKey, draftProjectKey(jobProject));
+    openingB = true;
+    await new Promise<void>(resolve => { releaseOpen = resolve; });
+  };
+  queryClient.mount();
+  queue.getState().addItem(jobProject.path);
+  queue.getState().addItem(nextProject.path);
+  const running = queue.getState().startQueue();
+  try {
+    for (let i = 0; i < 100 && !openingB; i++) await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(openingB, true);
+    assert.equal(paused, true, "A's settlement refresh paused offline");
+    bKeys.forEach(key => observe(key, "B", "old B"));
+    await queryClient.invalidateQueries({ predicate: q => bKeys.some(key => JSON.stringify(key) === JSON.stringify(q.queryKey)), refetchType: "none" });
+    const beforeReconnect = reads.slice();
+    onlineManager.setOnline(true);
+    focusManager.setFocused(false);
+    focusManager.setFocused(true);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await queryClient.invalidateQueries({ predicate: q => aKeys.some(key => JSON.stringify(key) === JSON.stringify(q.queryKey)) });
+    assert.deepEqual(reads, beforeReconnect, "reconnect during B's RPC must issue no scoped reads");
+    for (const key of aKeys) assert.equal(queryClient.getQueryData(key), jobProject.path);
+    releaseRead(); releaseOpen();
+    await running;
+    assert.equal(project.getState().projectTransitionInProgress, false);
+    assert.equal(project.getState().confirmedOpenProjectKey, draftProjectKey(nextProject));
+    assert.ok(reads.some(read => read === `B:${nextProject.path}`));
+    for (const key of aKeys) assert.equal(queryClient.getQueryData(key), jobProject.path);
+    for (const key of bKeys) assert.equal(queryClient.getQueryData(key), nextProject.path);
+    const beforeReopen = reads.length;
+    queue.setState({ items: [] });
+    queue.getState().addItem(jobProject.path);
+    h.onJob = () => {};
+    await queue.getState().startQueue();
+    assert.ok(reads.slice(beforeReopen).some(read => read === `A:${jobProject.path}`));
+    assert.ok(reads.slice(beforeReopen).every(read => read === `A:${jobProject.path}`));
+    for (const key of aKeys) assert.equal(queryClient.getQueryData(key), jobProject.path);
+  } finally {
+    observers.forEach(stop => stop()); stopTracking();
+    releaseRead(); releaseOpen(); onlineManager.setOnline(true);
+    await running;
+    queryClient.unmount();
+    focusManager.setFocused(undefined);
   }
 });

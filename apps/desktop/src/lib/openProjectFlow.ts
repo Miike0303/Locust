@@ -1,3 +1,6 @@
+import { useProjectStore } from "../stores/projectStore";
+import { draftProjectKey } from "./projectScope";
+import { cancelProjectData, queryClient as sharedQueryClient } from "./queryClient";
 import { isTauri } from "./runtime";
 import type { QueryClient } from "@tanstack/react-query";
 import type { ProjectInfo, ProjectOpenPreflight, ProjectOpenResponse } from "./api";
@@ -72,7 +75,11 @@ export const PROJECT_QUERY_KEYS = [
 
 export function dropProjectQueries(queryClient: QueryClient): void {
   for (const key of PROJECT_QUERY_KEYS) {
-    void queryClient.removeQueries({ queryKey: [key] });
+    // Project-keyed caches stay attached to their observers across switches.
+    void queryClient.removeQueries({ queryKey: [key], predicate: query =>
+      key === "strings" || key === "string" ? query.queryKey.length < 3
+        : key === "stats" ? query.queryKey.length < 2 : true,
+    });
   }
 }
 
@@ -202,6 +209,16 @@ export interface FolderOpenOptions {
   signal?: AbortSignal;
 }
 
+/** Disable reads synchronously, then revert in-flight reads before the backend switches. */
+export async function openProjectTransition(open: () => Promise<ProjectOpenResponse>): Promise<ProjectOpenResponse> {
+  const state = useProjectStore.getState();
+  state.beginProjectTransition();
+  if (state.project) await cancelProjectData(sharedQueryClient, draftProjectKey(state.project));
+  // On failure the backend's identity is unconfirmed. Keep reads disabled until
+  // a later successful open delivers state through setProject (or clearProject).
+  return open();
+}
+
 /** Folder opening only. Explicit DB and legacy recent opening bypass this flow. */
 export async function openFolderProject(
   path: string,
@@ -212,16 +229,16 @@ export async function openFolderProject(
   const { preflightProjectOpen, openProject, resumeProject } = await import("./api");
   const preflight = await preflightProjectOpen(path, formatId);
   if (options.signal?.aborted) return null;
-  if (preflight.kind === "extract") return openProject(path, formatId);
+  if (preflight.kind === "extract") return openProjectTransition(() => openProject(path, formatId));
   if (preflight.kind !== "resume_available" && preflight.kind !== "needs_attention") {
     throw new Error(t("resume.invalidPreflight"));
   }
   const choice = await (options.choose ?? requestProjectOpenChoice)({ gamePath: path, preflight }, options.signal);
   if (options.signal?.aborted || choice === "cancel") return null;
-  if (choice === "refresh") return openProject(path, formatId);
+  if (choice === "refresh") return openProjectTransition(() => openProject(path, formatId));
   // An erroneous/custom chooser cannot promote unverified evidence to resume.
   if (choice !== "resume" || preflight.kind !== "resume_available") return null;
-  return resumeProject(preflight.database_path, preflight.project_path, preflight.format_id);
+  return openProjectTransition(() => resumeProject(preflight.database_path, preflight.project_path, preflight.format_id));
 }
 
 export async function completeOpenProject(
@@ -235,7 +252,7 @@ export async function completeOpenProject(
 ): Promise<ProjectOpenResponse | null> {
   const { openProject } = await import("./api");
   const result = preferSaved
-    ? await openProject(path, formatId, true)
+    ? await openProjectTransition(() => openProject(path, formatId, true))
     : await openFolderProject(path, formatId, deps);
   if (!result) return null;
   deps.setProject(projectFromOpenResponse(result));
@@ -254,7 +271,7 @@ export async function completeOpenProjectDb(
   },
 ): Promise<ProjectOpenResponse> {
   const { openProjectDb } = await import("./api");
-  const result = await openProjectDb(databasePath, gamePath, formatId);
+  const result = await openProjectTransition(() => openProjectDb(databasePath, gamePath, formatId));
   deps.setProject(projectFromOpenResponse(result));
   dropProjectQueries(deps.queryClient);
   return result;

@@ -1,3 +1,4 @@
+import { projectScopedQueryFn, useProjectScopedQueryEnabled } from "../lib/projectScope";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -31,16 +32,17 @@ function ProjectQa({ project, projectKey }: { project: ProjectInfo | null; proje
   const [kind, setKind] = useState<string | undefined>();
   const [includeIgnored, setIncludeIgnored] = useState(false);
   const [offset, setOffset] = useState(0);
+  const scopedEnabled = useProjectScopedQueryEnabled(projectKey);
   const issuesQuery = useQuery({
     queryKey: ["validation-issues", projectKey, kind, includeIgnored, offset],
-    queryFn: ({ signal }) => getValidationIssues({ kind, include_ignored: includeIgnored, offset, limit: QA_PAGE_SIZE }, signal),
-    enabled: !!project,
+    queryFn: projectScopedQueryFn(projectKey, ({ signal }) => getValidationIssues({ kind, include_ignored: includeIgnored, offset, limit: QA_PAGE_SIZE }, signal)),
+    enabled: scopedEnabled,
     refetchOnMount: "always",
   });
   const summaryQuery = useQuery({
     queryKey: ["validation-summary", projectKey],
-    queryFn: ({ signal }) => getValidationSummary(signal),
-    enabled: !!project,
+    queryFn: projectScopedQueryFn(projectKey, ({ signal }) => getValidationSummary(signal)),
+    enabled: scopedEnabled,
     refetchOnMount: "always",
   });
   // The API has no last-run metadata. Retain only successful QA runs in this

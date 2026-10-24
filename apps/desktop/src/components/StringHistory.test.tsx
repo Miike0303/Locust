@@ -5,6 +5,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setLocale } from "../lib/i18n";
+import { useProjectStore } from "../stores/projectStore";
 import type { StringRevision } from "../lib/api";
 
 const h = { open: undefined as boolean | undefined };
@@ -28,7 +29,7 @@ const { getStringHistory } = await import("../lib/api");
 const client = new QueryClient({ defaultOptions: { queries: { retry: false, retryOnMount: false, staleTime: Infinity, gcTime: Infinity } } });
 const key = ["string-history", "project", "row"];
 const revision: StringRevision = { id: 2, entry_id: "row", old_translation: "Old", new_translation: "New", old_status: "pending", new_status: "translated", provider: "fixture-provider", changed_at: "2026-10-19T12:00:00.123Z" };
-beforeEach(() => { client.clear(); h.open = undefined; setLocale("en"); });
+beforeEach(() => { client.clear(); useProjectStore.setState({ confirmedOpenProjectKey: "project", projectTransitionInProgress: false }); h.open = undefined; setLocale("en"); });
 after(() => { client.clear(); hooks.deregister(); Reflect.deleteProperty(globalThis, "__stringHistory"); setLocale("en"); });
 function render(projectKey = "project", entryId = "row", translation: string | null = "Current") {
   return renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(StringHistory, {
@@ -47,13 +48,13 @@ for (const [locale, title, empty, restore, statuses] of [
     assert.match(html, /aria-expanded="false"/);
     assert.ok(!html.includes(empty));
     assert.ok(client.getQueryCache().find({ queryKey: key, exact: true })?.isDisabled());
-    assert.equal((client.getQueryCache().find({ queryKey: key, exact: true })?.options as { enabled?: boolean }).enabled, false);
+    assert.equal((client.getQueryCache().find({ queryKey: key, exact: true })?.options as { enabled: () => boolean }).enabled(), false);
   });
   test(`${locale}: open history renders localized empty state`, () => {
     setLocale(locale); h.open = true;
     client.setQueryData(key, []);
     assert.ok(render().includes(empty));
-    assert.equal((client.getQueryCache().find({ queryKey: key, exact: true })?.options as { enabled?: boolean }).enabled, true);
+    assert.equal((client.getQueryCache().find({ queryKey: key, exact: true })?.options as { enabled: () => boolean }).enabled(), true);
   });
   test(`${locale}: revisions render time, status, provider, diff and eligible restore actions`, () => {
     setLocale(locale); h.open = true;
@@ -101,4 +102,20 @@ test("desktop history uses embedded HTTP and escapes the entry id", async () => 
     assert.deepEqual(await getStringHistory("file#row/1"), [revision]);
     assert.deepEqual(urls, ["http://localhost:7842/api/strings/file%23row%2F1/history"]);
   } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test("open history's gate blocks transitions immediately and re-enables only the confirmed scope", () => {
+  h.open = true;
+  render();
+  const captured = (client.getQueryCache().find({ queryKey: key, exact: true })!.options as { enabled: () => boolean }).enabled;
+  assert.equal(captured(), true);
+  useProjectStore.getState().beginProjectTransition();
+  assert.equal(captured(), false, "the old render cannot fetch while an open is pending");
+  useProjectStore.setState({ confirmedOpenProjectKey: "other-project", projectTransitionInProgress: false });
+  render();
+  assert.equal((client.getQueryCache().find({ queryKey: key, exact: true })!.options as { enabled: () => boolean }).enabled(), false);
+  useProjectStore.setState({ confirmedOpenProjectKey: "project" });
+  render();
+  assert.equal((client.getQueryCache().find({ queryKey: key, exact: true })!.options as { enabled: () => boolean }).enabled(), true);
 });
