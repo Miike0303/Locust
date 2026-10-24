@@ -41,6 +41,8 @@ features = ["rt"]
 # member enabled the feature and Cargo unified it. Declared here so
 # `cargo test -p locust-core` works on its own.
 [dev-dependencies]
+# tests/inject_language_containment.rs path-includes crates/formats/src/util.rs.
+flate2 = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 

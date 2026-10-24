@@ -3228,6 +3228,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "encoding_rs",
+ "flate2",
  "hex",
  "quick-xml 0.36.2",
  "rusqlite",
