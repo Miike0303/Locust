@@ -54,9 +54,21 @@ const h = {
     this.values[index] = { deps, callback: wrapped };
     return wrapped;
   },
-  async getStrings({ status }: { status: string }) {
-    const entries = Object.values(this.rows).filter(entry => entry.status === status);
-    return { entries, total: entries.length };
+  speakers: [] as { id: string; name: string; count: number; entry_ids: string[]; note: string }[],
+  format: "renpy", contextFailure: false, contextWaits: {} as Record<string, Promise<void> | undefined>,
+  focused: 0,
+  reads: [] as { status?: string; file_path?: string; limit?: number; offset?: number }[],
+  async getStrings(filter: { status?: string; file_path?: string; limit?: number; offset?: number }) {
+    this.reads.push(filter);
+    if (filter.file_path) {
+      if (this.contextWaits[filter.file_path]) await this.contextWaits[filter.file_path];
+      if (this.contextFailure) throw new Error("Context unavailable");
+    }
+    const entries = Object.values(this.rows).filter(entry =>
+      (!filter.status || entry.status === filter.status) && (!filter.file_path || entry.file_path === filter.file_path));
+    const offset = filter.offset ?? 0;
+    return { entries: entries.slice(offset, offset + (filter.limit ?? entries.length)), total: entries.length,
+      offset, limit: filter.limit ?? entries.length };
   },
   async patchString(id: string, patch: Patch) {
     this.writes.push({ id, patch });
@@ -74,9 +86,9 @@ const hooks = registerHooks({
         react: `const h=globalThis.__reviewTest;export const useState=x=>h.state(x);export const useRef=x=>h.ref(x);export const useEffect=(fn,deps)=>h.effect(fn,deps);export const useCallback=(fn,deps)=>h.callback(fn,deps);`,
         "react-router-dom": `export const useNavigate=()=>path=>globalThis.__reviewTest.navigations.push(path);`,
         "@tanstack/react-query": `export const useQueryClient=()=>({invalidateQueries:async()=>{globalThis.__reviewTest.invalidations++;}});`,
-        "../stores/projectStore": `export const useProjectStore=select=>select({project:{path:'/game'}});`,
+        "../stores/projectStore": `export const useProjectStore=select=>select({project:{path:'/game',database_path:'/game.db',format_id:globalThis.__reviewTest.format}});`,
         "../lib/i18n": `export const useT=()=>globalThis.__reviewTest.t;`,
-        "../lib/api": `const h=globalThis.__reviewTest;export const getStrings=filter=>h.getStrings(filter);export const patchString=(id,patch)=>h.patchString(id,patch);`,
+        "../lib/api": `const h=globalThis.__reviewTest;export const getStrings=filter=>h.getStrings(filter);export const patchString=(id,patch)=>h.patchString(id,patch);export const getSpeakers=async()=>({groups:h.speakers,unassigned_entry_ids:[]});`,
       };
       if (stubs[specifier]) return { url: `data:text/javascript,${encodeURIComponent(stubs[specifier])}`, shortCircuit: true };
     }
@@ -92,7 +104,9 @@ Object.defineProperty(globalThis, "window", {
   },
 });
 Object.defineProperty(globalThis, "document", {
-  configurable: true, value: { documentElement: { lang: "en" }, querySelector() { return null; } },
+  configurable: true, value: { documentElement: { lang: "en" }, querySelector(selector: string) {
+    return selector === "#review-textarea" ? { focus() { h.focused++; } } : null;
+  } },
 });
 const { default: Review, reviewApprovalPatch } = await import("./Review.tsx");
 after(() => {
@@ -136,7 +150,10 @@ function progress(current: number, approved: number, total = 2) {
   assert.ok(text(render()).includes(t("review.progress", { current, total, approved })), text(render()));
 }
 async function settle() {
-  do { await Promise.all(h.pending.splice(0)); render(); } while (h.pending.length);
+  for (let round = 0; round < 12; round++) {
+    await Promise.all(h.pending.splice(0));
+    render();
+  }
 }
 async function approve() {
   button(t("review.approve")).props.onClick();
@@ -147,7 +164,8 @@ beforeEach(async () => {
   h.values = []; h.effects = []; h.pending = []; h.errors = [];
   h.rows = { A: row("A"), B: row("B") }; h.writes = [];
   h.failure = null; h.waitForSave = null; h.invalidations = 0;
-  h.keydown = null; h.navigations = [];
+  h.keydown = null; h.navigations = []; h.speakers = []; h.reads = [];
+  h.format = "renpy"; h.contextFailure = false; h.contextWaits = {}; h.focused = 0;
   render();
   await settle();
   assert.equal(textarea().props.value, "Translation A");
@@ -181,7 +199,7 @@ test("approving an unchanged previously approved row advances without a write", 
   button(t("review.previous")).props.onClick();
   h.writes = [];
   await approve();
-  assert.deepEqual(h.writes, []);
+  assert.equal(h.writes.length, 0);
   progress(2, 1);
 });
 
@@ -302,4 +320,226 @@ test("Review header uses the shared status badge and success progress color", as
   await approve();
   button(t("review.previous")).props.onClick();
   assert.equal(badge()?.props.status, "approved");
+});
+
+async function startWith(entries: StringEntry[]) {
+  h.values = []; h.effects = []; h.pending = [];
+  h.rows = Object.fromEntries(entries.map(entry => [entry.id, entry]));
+  render();
+  await settle();
+}
+function contextRows() {
+  const panel = nodes(render()).find(node => node.type === "aside");
+  assert.ok(panel, "context panel is visible");
+  return nodes(panel).filter(node => node.type === "li");
+}
+
+test("context shows the first and last file edges, including rows outside the review queue", async () => {
+  const entries = Array.from({ length: 9 }, (_, i) => ({ ...row(`r${i}`), status: "pending" as StringEntry["status"] }));
+  entries[0].status = "translated";
+  entries[8].status = "translated";
+  await startWith([...entries, { ...row("other"), file_path: "other.json" }]);
+  assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]), ["r0", "r1", "r2", "r3"]);
+  assert.equal(contextRows()[0].props["aria-current"], true);
+  button(t("review.skip")).props.onClick();
+  await settle();
+  assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]), ["r5", "r6", "r7", "r8"]);
+  assert.ok(contextRows()[3].props.className.includes("border-accent"));
+  assert.ok(contextRows().every(node => !node.props.onClick));
+  assert.ok(h.reads.some(filter => filter.file_path === "dialogue.json" && !filter.status));
+});
+
+test("context crosses a page boundary and keeps three rows on either side in locator order", async () => {
+  const entries = Array.from({ length: 60 }, (_, i) => ({ ...row(`r${i}`), status: "pending" as StringEntry["status"] }));
+  entries[49].status = "translated";
+  await startWith(entries);
+  assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]), ["r46", "r47", "r48", "r49", "r50", "r51", "r52"]);
+  assert.ok(h.reads.some(filter => filter.file_path === "dialogue.json" && filter.offset === 50));
+});
+
+test("known speaker membership is shown on the card and context; arbitrary context is not a speaker", async () => {
+  h.speakers = [{ id: "alice", name: "Alice", count: 1, entry_ids: ["A"], note: "" }];
+  await startWith([{ ...row("A"), context: "scene 4", tags: ["dialogue"] }, row("B")]);
+  assert.ok(nodes(render()).some(node => node.props?.["data-speaker"] === "Alice" && text(node) === "Alice"));
+  assert.ok(nodes(contextRows()[0]).some(node => node.type === "strong" && text(node) === "Alice"));
+  assert.ok(!nodes(render()).some(node => node.props?.["data-speaker"] === "scene 4"));
+  const path = nodes(render()).find(node => node.props?.title === "dialogue.json");
+  assert.ok(path?.props.className.includes("truncate"));
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`placeholder chips and live present/missing/extra checks use ${locale} labels and occurrence counts`, async () => {
+    setLocale(locale);
+    await startWith([{ ...row("A"), source: "Pay [gold] {b}", translation: "Pague [gold] {b}" }]);
+    const chips = nodes(render()).filter(node => node.props?.["data-placeholder"]);
+    assert.deepEqual(chips.map(text), ["[gold]", "{b}"]);
+    assert.ok(chips.every(node => node.props.className.includes("font-mono")));
+    let check = nodes(render()).find(node => node.props?.role === "status");
+    assert.equal(text(check), locale === "en" ? "Placeholders: 2/2 present" : "Marcadores: 2/2 presentes");
+    assert.ok(check.props.className.includes("text-success"));
+    edit("Pague {b} {b}");
+    check = nodes(render()).find(node => node.props?.role === "status");
+    assert.equal(text(check), locale === "en" ? "Placeholders: missing [gold]; extra {b}" : "Marcadores: faltan [gold]; sobran {b}");
+    assert.ok(check.props.className.includes("text-warning"));
+    edit("");
+    assert.ok(text(nodes(render()).find(node => node.props?.role === "status")).includes("[gold], {b}"));
+    assert.ok(!textarea().props.className.includes("font-mono"));
+    assert.ok(textarea().props.className.includes("leading-relaxed"));
+    button(t("review.showDiff")).props.onClick();
+    assert.ok(button(t("review.hideDiff")));
+  });
+}
+
+test("repeated source placeholders require the same number of translated occurrences", async () => {
+  await startWith([{ ...row("A"), source: "[gold] and [gold]", translation: "[gold]" }]);
+  assert.equal(text(nodes(render()).find(node => node.props?.role === "status")), "Placeholders: missing [gold]");
+});
+
+test("review content stacks below 1100px and uses a centered two-to-one layout above it", () => {
+  const layout = nodes(render()).find(node => node.props?.className?.includes("max-w-5xl"));
+  assert.ok(layout?.props.className.includes("min-[1100px]:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]"));
+  assert.ok(layout.props.className.includes("gap-6"));
+  assert.ok(layout.props.className.includes("mx-auto"));
+});
+
+test("review shortcuts and key hints remain available and ignore textarea typing", async () => {
+  const key = (value: string, target: any = null, ctrlKey = false) =>
+    h.keydown?.({ key: value, ctrlKey, target, preventDefault() {} });
+  for (const value of ["a", "s", "p", "Escape"]) key(value, { tagName: "TEXTAREA" });
+  assert.equal(textarea().props.value, "Translation A");
+  assert.equal(h.writes.length, 0);
+  assert.deepEqual(h.navigations, []);
+  key("e");
+  assert.equal(h.focused, 1);
+  key("s");
+  assert.equal(textarea().props.value, "Translation B");
+  key("p");
+  assert.equal(textarea().props.value, "Translation A");
+  key("Enter", null, true);
+  await settle();
+  assert.deepEqual(h.writes.map(write => write.id), ["A"]);
+  assert.deepEqual(nodes(render()).filter(node => node.type === "kbd").map(text), ["P", "S", "A"]);
+  key("a");
+  await settle();
+  assert.deepEqual(h.writes.map(write => write.id), ["A", "B"]);
+  key("Escape");
+  assert.deepEqual(h.navigations, ["/editor"]);
+});
+
+test("pending context shows loading and ignores a late response after moving to another file", async () => {
+  let finish!: () => void;
+  h.contextWaits["dialogue.json"] = new Promise<void>(resolve => { finish = resolve; });
+  try {
+    await startWith([row("A"), { ...row("B"), file_path: "other.json" }]);
+    assert.ok(text(render()).includes("Loading surrounding entries…"));
+    assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]), ["A"]);
+    button(t("review.skip")).props.onClick();
+    await settle();
+    assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]), ["B"]);
+  } finally {
+    finish();
+    await settle();
+  }
+  assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]), ["B"]);
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`context failure keeps the current row and shows a ${locale} message without blocking approval`, async () => {
+    setLocale(locale);
+    h.contextFailure = true;
+    await startWith([row("A"), row("B")]);
+    assert.ok(text(render()).includes(locale === "en" ? "Could not load surrounding entries." : "No se pudieron cargar las entradas cercanas."));
+    assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]), ["A"]);
+    await approve();
+    assert.equal(h.rows.A.status, "approved");
+  });
+}
+
+test("context reuses fetched file pages and reflects saved and unsaved translations", async () => {
+  await startWith([row("A"), row("B")]);
+  const reads = h.reads.filter(filter => filter.file_path).length;
+  edit("New A");
+  assert.ok(text(contextRows()[0]).includes("New A"));
+  await approve();
+  await settle();
+  assert.equal(h.reads.filter(filter => filter.file_path).length, reads);
+  assert.ok(text(contextRows()[0]).includes("New A"));
+});
+
+test("live placeholder hints cover common engine controls and respect escaped delimiters", async () => {
+  const tokens = ["{name}", "{/b}", "{color=#fff}", "<b>", "</b>", "%s", "%(name)s", "%1", "\\C[2]", "\\n"];
+  await startWith([{ ...row("A"), source: `${tokens.join(" ")} {{literal} [[literal] {P}`, translation: tokens.join(" ") }]);
+  assert.deepEqual(nodes(render()).filter(node => node.props?.["data-placeholder"]).map(text), tokens);
+  assert.equal(text(nodes(render()).find(node => node.props?.role === "status")), "Placeholders: 10/10 present");
+});
+
+test("RPG Maker plain brackets are body text while engine controls are placeholder chips", async () => {
+  h.format = "rpgmaker-mv";
+  await startWith([{ ...row("A"), source: "[plain] \\V[1]", translation: "[texto] \\V[1]" }]);
+  assert.deepEqual(nodes(render()).filter(node => node.props?.["data-placeholder"]).map(text), ["\\V[1]"]);
+  assert.equal(text(nodes(render()).find(node => node.props?.role === "status")), "Placeholders: 1/1 present");
+});
+
+for (const locator of [
+  (n: number) => `script.rpy#${n}`,
+  (n: number) => `Map001.json#0#event_1#page_0#cmd_${n}#msg`,
+  (n: number) => `Map001.json#0#event_${n}#page_0#cmd_0#msg`,
+  (n: number) => `Map001.json#0#event_1#page_${n}#cmd_0#msg`,
+]) {
+  test(`context orders numeric locators across 9/10 and API pages: ${locator(8)}`, async () => {
+    const entries = Array.from({ length: 120 }, (_, i) => ({
+      ...row(locator(i + 1)), status: i === 7 ? "translated" : "pending",
+    } as StringEntry)).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    await startWith(entries);
+    assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]),
+      [5, 6, 7, 8, 9, 10, 11].map(locator));
+    assert.ok(h.reads.some(filter => filter.file_path && filter.offset === 100));
+  });
+}
+
+for (const [format, source, translated, expected] of [
+  ["rpgmaker-mv", String.raw`Gold \g`, "Oro", String.raw`Placeholders: missing \g`],
+  ["renpy", "Hello [party[0].name]", "Hola [party[1].name]", "Placeholders: missing [party[0].name]; extra [party[1].name]"],
+]) {
+  test(`live validation detects removed or changed controls: ${source}`, async () => {
+    h.format = format;
+    await startWith([{ ...row("A"), source, translation: source }]);
+    edit(translated);
+    const check = nodes(render()).find(node => node.props?.role === "status");
+    assert.equal(text(check), expected);
+    assert.ok(!check.props.className.includes("text-success"));
+  });
+}
+
+for (const escape of [String.raw`\n`, String.raw`\nc`, String.raw`\nr`, String.raw`\N`, String.raw`\NC`, String.raw`\NR`]) {
+  test(`name-box arguments are translatable while ${escape} remains protected`, async () => {
+    h.format = "rpgmaker-mv";
+    await startWith([{ ...row("A"), source: `${escape}<Guard> Hello`, translation: `${escape}<Guardia> Hola` }]);
+    assert.deepEqual(nodes(render()).filter(node => node.props?.["data-placeholder"]).map(text), [escape]);
+    assert.equal(text(nodes(render()).find(node => node.props?.role === "status")), "Placeholders: 1/1 present");
+    edit("<Guardia> Hola");
+    assert.equal(text(nodes(render()).find(node => node.props?.role === "status")), `Placeholders: missing ${escape}; extra <Guardia>`);
+  });
+}
+
+for (const filePath of [String.raw`C:\Users\Mike\StarHarbor\game\options.rpy`, "/games/StarHarbor/game/options.rpy", "options.rpy"]) {
+  test(`card header uses the Editor filename with full path tooltip: ${filePath}`, async () => {
+    await startWith([{ ...row("A"), file_path: filePath }]);
+    const label = nodes(render()).find(node => node.props?.title === filePath);
+    assert.ok(label);
+    assert.equal(text(label), "options.rpy");
+    assert.ok(label.props.className.includes("truncate"));
+  });
+}
+
+test("context never crosses archive member boundaries in the same RPA file", async () => {
+  const entries = ["chapter1.rpyc", "chapter2.rpyc"].flatMap(member =>
+    Array.from({ length: 5 }, (_, n) => ({
+      ...row(`scripts.rpa#${member}#s${n}`), file_path: "scripts.rpa",
+      status: member === "chapter2.rpyc" && n === 0 ? "translated" : "pending",
+    } as StringEntry)));
+  await startWith(entries);
+  assert.deepEqual(contextRows().map(node => node.props["data-entry-id"]),
+    [0, 1, 2, 3].map(n => `scripts.rpa#chapter2.rpyc#s${n}`));
+  assert.equal(contextRows()[0].props["aria-current"], true);
 });
