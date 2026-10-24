@@ -153,7 +153,13 @@ async fn patch_string_owned(
     if let Some(ref translation) = req.translation {
         let outcome = state
             .db
-            .save_translation_if_unchanged(&id, translation, "manual", req.expected_translation)
+            .save_translation_and_status_if_unchanged(
+                &id,
+                translation,
+                "manual",
+                req.status,
+                req.expected_translation,
+            )
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         if outcome == locust_core::database::TranslationSaveOutcome::Conflict {
@@ -162,8 +168,7 @@ async fn patch_string_owned(
                 locust_core::database::TRANSLATION_CONFLICT_MESSAGE,
             ));
         }
-    }
-    if let Some(ref status) = req.status {
+    } else if let Some(ref status) = req.status {
         state
             .db
             .update_entry_status(&id, status.clone())
@@ -531,6 +536,60 @@ mod tests {
                 .translation
                 .as_deref(),
             Some("Hola")
+        );
+    }
+
+    #[tokio::test]
+    async fn strings_patch_translation_and_status_records_one_final_revision() {
+        let (url, _h, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        state
+            .db
+            .save_entries(&[StringEntry::new("atomic", "Hello", PathBuf::from("f.json"))])
+            .unwrap();
+
+        let response = client()
+            .patch(format!("{url}/api/strings/atomic"))
+            .json(&serde_json::json!({
+                "translation": "Hola", "status": "approved", "expected_translation": null
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let saved: StringEntry = response.json().await.unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("Hola"));
+        assert_eq!(saved.status, StringStatus::Approved);
+        assert_eq!(saved.provider_used.as_deref(), Some("manual"));
+        assert!(saved.translated_at.is_some());
+        assert!(saved.reviewed_at.is_some());
+        let history = state.db.get_string_history("atomic", 50).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].old_status.as_deref(), Some("pending"));
+        assert_eq!(history[0].new_status.as_deref(), Some("approved"));
+        assert_eq!(history[0].new_translation.as_deref(), Some("Hola"));
+
+        let before = serde_json::to_value(&saved).unwrap();
+        let response = client()
+            .patch(format!("{url}/api/strings/atomic"))
+            .json(&serde_json::json!({
+                "translation": "Stale", "status": "pending", "expected_translation": null
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409);
+        assert_eq!(
+            response.text().await.unwrap(),
+            locust_core::database::TRANSLATION_CONFLICT_MESSAGE
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.get_entry("atomic").unwrap().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(state.db.get_string_history("atomic", 50).unwrap()).unwrap(),
+            serde_json::to_value(history).unwrap()
         );
     }
 

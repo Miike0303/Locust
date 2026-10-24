@@ -405,17 +405,54 @@ impl Database {
         provider: &str,
         expected_translation: Option<Option<String>>,
     ) -> Result<TranslationSaveOutcome> {
+        self.save_translation_and_status_if_unchanged(
+            entry_id,
+            translation,
+            provider,
+            None,
+            expected_translation,
+        )
+        .await
+    }
+
+    /// Save an editor translation and optional final status in one transaction.
+    /// The comparison guard, timestamps, provider, and history trigger share the
+    /// same write. With no explicit status, retain translation-only semantics.
+    pub async fn save_translation_and_status_if_unchanged(
+        &self,
+        entry_id: &str,
+        translation: &str,
+        provider: &str,
+        status: Option<StringStatus>,
+        expected_translation: Option<Option<String>>,
+    ) -> Result<TranslationSaveOutcome> {
         let conn = self.conn.clone();
         let entry_id = entry_id.to_string();
         let translation = translation.to_string();
         let provider = provider.to_string();
+        let status = status.map(|status| status.to_string());
         tokio::task::spawn_blocking(move || {
             let conn = lock_connection(&conn);
             let now = Utc::now().to_rfc3339();
             let tx = conn.unchecked_transaction()?;
             let n = tx.execute(
-                "UPDATE strings SET translation = ?1, status = 'translated', provider_used = ?2, translated_at = ?3, metadata = CASE WHEN ?5 THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END WHERE id = ?4 AND (?6 = 0 OR translation IS ?7)",
-                params![translation, provider, now, entry_id, !translation.trim().is_empty(), expected_translation.is_some(), expected_translation.flatten()],
+                "UPDATE strings SET translation = ?1, status = COALESCE(?8, 'translated'),
+                 provider_used = ?2, translated_at = ?3,
+                 metadata = CASE WHEN ?5 OR ?8 IN ('reviewed', 'approved')
+                     THEN json_remove(metadata, '$.locust_stale_translation') ELSE metadata END,
+                 reviewed_at = CASE WHEN ?8 IN ('reviewed', 'approved')
+                     THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE reviewed_at END
+                 WHERE id = ?4 AND (?6 = 0 OR translation IS ?7)",
+                params![
+                    translation,
+                    provider,
+                    now,
+                    entry_id,
+                    !translation.trim().is_empty(),
+                    expected_translation.is_some(),
+                    expected_translation.flatten(),
+                    status
+                ],
             )?;
             let outcome = if n > 0 {
                 TranslationSaveOutcome::Updated

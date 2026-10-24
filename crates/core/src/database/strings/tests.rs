@@ -815,6 +815,183 @@ fn test_get_entries_page_preserves_shared_originals_and_errors() {
 }
 
 #[tokio::test]
+async fn strings_atomic_edit_status_failure_rolls_back_row_and_history() {
+    let db = Database::open_in_memory().unwrap();
+    db.save_entries(&[make_entry("atomic", "Hello")]).unwrap();
+    db.save_translation("atomic", "Old", "previous")
+        .await
+        .unwrap();
+    db.update_entry_status("atomic", StringStatus::Reviewed)
+        .await
+        .unwrap();
+    let mut entry = db.get_entry("atomic").unwrap().unwrap();
+    entry.metadata.insert(
+        STALE_TRANSLATION_METADATA_KEY.into(),
+        serde_json::json!({"source": "Old source"}),
+    );
+    db.save_entries(&[entry]).unwrap();
+    let before = serde_json::to_value(db.get_entry("atomic").unwrap().unwrap()).unwrap();
+    let history = serde_json::to_value(db.get_string_history("atomic", 50).unwrap()).unwrap();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_approved AFTER UPDATE OF status ON strings
+         WHEN NEW.status = 'approved'
+         BEGIN SELECT RAISE(FAIL, 'simulated status failure'); END;",
+        )
+        .unwrap();
+
+    let error = db
+        .save_translation_and_status_if_unchanged(
+            "atomic",
+            "New",
+            "manual",
+            Some(StringStatus::Approved),
+            Some(Some("Old".into())),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("simulated status failure"));
+    assert_eq!(
+        serde_json::to_value(db.get_entry("atomic").unwrap().unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(
+        serde_json::to_value(db.get_string_history("atomic", 50).unwrap()).unwrap(),
+        history
+    );
+}
+
+#[tokio::test]
+async fn strings_atomic_edit_updates_fields_and_records_one_final_revision() {
+    for status in [
+        StringStatus::Pending,
+        StringStatus::Translated,
+        StringStatus::Reviewed,
+        StringStatus::Approved,
+        StringStatus::Error,
+    ] {
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = make_entry("atomic", "Hello");
+        entry.metadata.insert(
+            STALE_TRANSLATION_METADATA_KEY.into(),
+            serde_json::json!({"source": "Old source"}),
+        );
+        db.save_entries(&[entry]).unwrap();
+        assert_eq!(
+            db.save_translation_and_status_if_unchanged(
+                "atomic",
+                "Hola",
+                "manual",
+                Some(status.clone()),
+                Some(None),
+            )
+            .await
+            .unwrap(),
+            TranslationSaveOutcome::Updated
+        );
+        let saved = db.get_entry("atomic").unwrap().unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("Hola"));
+        assert_eq!(saved.status, status);
+        assert_eq!(saved.provider_used.as_deref(), Some("manual"));
+        assert!(saved.translated_at.is_some());
+        assert_eq!(
+            saved.reviewed_at.is_some(),
+            matches!(status, StringStatus::Reviewed | StringStatus::Approved)
+        );
+        assert!(!saved.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY));
+        let history = db.get_string_history("atomic", 50).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].old_translation, None);
+        assert_eq!(history[0].new_translation.as_deref(), Some("Hola"));
+        assert_eq!(history[0].old_status.as_deref(), Some("pending"));
+        assert_eq!(history[0].new_status, Some(status.to_string()));
+        assert_eq!(history[0].provider.as_deref(), Some("manual"));
+    }
+}
+
+#[tokio::test]
+async fn strings_atomic_edit_stale_guard_preserves_every_field_and_history() {
+    let db = Database::open_in_memory().unwrap();
+    db.save_entries(&[make_entry("atomic", "Hello")]).unwrap();
+    db.save_translation("atomic", "Current", "previous")
+        .await
+        .unwrap();
+    db.update_entry_status("atomic", StringStatus::Approved)
+        .await
+        .unwrap();
+    let before = serde_json::to_value(db.get_entry("atomic").unwrap().unwrap()).unwrap();
+    let history = serde_json::to_value(db.get_string_history("atomic", 50).unwrap()).unwrap();
+    for expected in [None, Some(String::new()), Some("Stale".into())] {
+        assert_eq!(
+            db.save_translation_and_status_if_unchanged(
+                "atomic",
+                "New",
+                "manual",
+                Some(StringStatus::Pending),
+                Some(expected),
+            )
+            .await
+            .unwrap(),
+            TranslationSaveOutcome::Conflict
+        );
+        assert_eq!(
+            serde_json::to_value(db.get_entry("atomic").unwrap().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(db.get_string_history("atomic", 50).unwrap()).unwrap(),
+            history
+        );
+    }
+    assert_eq!(
+        db.save_translation_and_status_if_unchanged(
+            "missing",
+            "New",
+            "manual",
+            Some(StringStatus::Approved),
+            Some(None),
+        )
+        .await
+        .unwrap(),
+        TranslationSaveOutcome::Missing
+    );
+}
+
+#[tokio::test]
+async fn strings_atomic_edit_blank_translation_preserves_status_metadata_rules() {
+    for status in [StringStatus::Pending, StringStatus::Approved] {
+        let db = Database::open_in_memory().unwrap();
+        let mut entry = make_entry("atomic", "Hello");
+        entry.reviewed_at = Some(entry.created_at);
+        entry.metadata.insert(
+            STALE_TRANSLATION_METADATA_KEY.into(),
+            serde_json::json!({"source": "Old source"}),
+        );
+        let reviewed_at = entry.reviewed_at;
+        db.save_entries(&[entry]).unwrap();
+        db.save_translation_and_status_if_unchanged(
+            "atomic",
+            "  ",
+            "manual",
+            Some(status.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let saved = db.get_entry("atomic").unwrap().unwrap();
+        assert_eq!(
+            saved.metadata.contains_key(STALE_TRANSLATION_METADATA_KEY),
+            status == StringStatus::Pending
+        );
+        if status == StringStatus::Pending {
+            assert_eq!(saved.reviewed_at, reviewed_at);
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_save_translation_updates_status() {
     let db = Database::open_in_memory().unwrap();
     db.save_entries(&[make_entry("tr1", "Hello")]).unwrap();

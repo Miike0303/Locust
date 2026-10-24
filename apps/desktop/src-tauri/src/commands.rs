@@ -390,14 +390,19 @@ async fn apply_string_patch(
 ) -> Result<StringEntry, String> {
     if let Some(ref translation) = data.translation {
         let outcome = db
-            .save_translation_if_unchanged(id, translation, "manual", data.expected_translation)
+            .save_translation_and_status_if_unchanged(
+                id,
+                translation,
+                "manual",
+                data.status,
+                data.expected_translation,
+            )
             .await
             .map_err(|e| e.to_string())?;
         if outcome == locust_core::database::TranslationSaveOutcome::Conflict {
             return Err(locust_core::database::TRANSLATION_CONFLICT_MESSAGE.into());
         }
-    }
-    if let Some(ref status) = data.status {
+    } else if let Some(ref status) = data.status {
         db.update_entry_status(id, status.clone())
             .await
             .map_err(|e| e.to_string())?;
@@ -1374,6 +1379,37 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn strings_manual_save_translation_and_status_records_one_final_revision() {
+        let db = locust_core::database::Database::open_in_memory().unwrap();
+        db.save_entries(&[StringEntry::new(
+            "atomic",
+            "Hello",
+            PathBuf::from("story.html"),
+        )])
+        .unwrap();
+        let saved = apply_string_patch(
+            &db,
+            "atomic",
+            serde_json::from_value(serde_json::json!({
+                "translation": "Hola", "status": "reviewed", "expected_translation": null
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.translation.as_deref(), Some("Hola"));
+        assert_eq!(saved.status, StringStatus::Reviewed);
+        assert_eq!(saved.provider_used.as_deref(), Some("manual"));
+        assert!(saved.translated_at.is_some());
+        assert!(saved.reviewed_at.is_some());
+        let history = db.get_string_history("atomic", 50).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].old_status.as_deref(), Some("pending"));
+        assert_eq!(history[0].new_status.as_deref(), Some("reviewed"));
+        assert_eq!(history[0].new_translation.as_deref(), Some("Hola"));
+    }
 
     #[tokio::test]
     async fn manual_save_conflict_preserves_row_and_maps_the_stable_message() {
