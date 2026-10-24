@@ -7,6 +7,9 @@ import {
   operationalShortcutTarget,
   parseSettingsSectionParam,
 } from "./settingsNav.ts";
+import { readFileSync } from "node:fs";
+import { test } from "node:test";
+import nodeAssert from "node:assert/strict";
 
 const assert = {
   equal(actual: unknown, expected: unknown, message?: string) {
@@ -52,3 +55,11 @@ assert.deepEqual(operationalShortcutTarget("manage-backups"), {
 });
 
 console.log("settingsNav.test.ts: ok");
+
+test("Settings switches from compact horizontal tabs to the original vertical nav at 1200px", () => {
+  const source = readFileSync(new URL("../pages/Settings.tsx", import.meta.url), "utf8");
+  nodeAssert.match(source, /flex-col min-\[1200px\]:flex-row/);
+  nodeAssert.match(source, /overflow-x-auto/);
+  nodeAssert.match(source, /min-\[1200px\]:w-56/);
+  nodeAssert.match(source, /aria-current=\{section === id \? "page" : undefined\}/);
+});

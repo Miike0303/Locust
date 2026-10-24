@@ -44,3 +44,12 @@ test("body uses tokens without changing the white light and recessed dark bases"
   const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
   assert.match(css, /body\s*\{\s*@apply bg-surface text-text dark:bg-surface-muted;\s*\}/);
 });
+
+test("collapsed sidebar is a 64px rail with hover and keyboard-focus tooltips", () => {
+  const source = readFileSync(new URL("../components/Layout.tsx", import.meta.url), "utf8");
+  assert.match(source, /data-\[collapsed=true\]:w-16/);
+  assert.match(source, /group-hover:visible/);
+  assert.match(source, /group-focus-visible:visible/);
+  assert.match(source, /PanelLeftOpen/);
+  assert.match(source, /PanelLeftClose/);
+});

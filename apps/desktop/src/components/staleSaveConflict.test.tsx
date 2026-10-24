@@ -35,6 +35,7 @@ registerHooks({
       const stubs: Record<string, string> = {
         react: `export const useState=initial=>{const i=h.cursor++;if(!(i in h.states))h.states[i]=initial;return [h.states[i],value=>{h.states[i]=value;}];};export const useRef=initial=>{const i=h.cursor++;return h.states[i]??=( {current:initial});};export const useEffect=()=>{};export const useMemo=fn=>fn();`,
         "../lib/i18n": "export const useT=()=>h.t;",
+        "../lib/modalA11y": "export const isTopmostOverlayDialog=()=>false;export const useModalA11y=()=>({dialogRef:{current:null},dialogProps:{}});",
         "../lib/api": "export const patchString=h.patchString;export const getString=h.getString;export const getConfig=async()=>({});export const encodedByteLen=()=>0;",
         "../stores/draftStore": `export const useDraftStore=Object.assign(selector=>selector(h.drafts.useDraftStore.getState()),{getState:h.drafts.useDraftStore.getState});${Object.keys(drafts).filter(k => k !== "useDraftStore").map(k => `export const ${k}=h.drafts.${k};`).join("")}`,
         "../stores/projectStore": "export const useProjectStore=Object.assign(selector=>selector(h.useProjectStore.getState()),{getState:h.useProjectStore.getState});",

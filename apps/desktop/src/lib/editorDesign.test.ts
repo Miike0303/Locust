@@ -95,3 +95,12 @@ test("editor returns detail focus to the roving table row on close and Escape", 
   assert.match(editor, /<DetailPanel[\s\S]*?panelRef=\{detailRef\}[\s\S]*?onClose=\{closeDetail\}/);
   assert.match(editor, /detailRef\.current\?\.querySelector<HTMLTextAreaElement>\("textarea:not\(\[readonly\]\)"\)\?\.focus\(\)/);
 });
+
+test("compact details overlay the table with viewport-bounded width and a dismissible backdrop", () => {
+  const source = readFileSync(new URL("../components/DetailPanel.tsx", import.meta.url), "utf8");
+  assert.match(source, /fixed inset-0 z-40/);
+  assert.match(source, /w-\[min\(420px,92vw\)\]/);
+  assert.match(source, /shadow-xl/);
+  assert.match(source, /bg-black\/20/);
+  assert.match(source, /data-detail-backdrop[\s\S]*?onClick=\{onClose\}/);
+});

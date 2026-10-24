@@ -10,6 +10,8 @@ import { acknowledgeDraft, draftAlternatives, selectDraftAlternative, draftEntry
 import { useProjectStore } from "../stores/projectStore";
 import StringHistory from "./StringHistory";
 import MemorySuggestions from "./MemorySuggestions";
+import { isCompactLayout, subscribeCompactLayout } from "../lib/layoutPrefs";
+import { isTopmostOverlayDialog, useModalA11y } from "../lib/modalA11y";
 
 import { StatusBadge, statusStyles } from "../lib/statusStyles";
 
@@ -33,6 +35,18 @@ export default function DetailPanel({
 	panelRef,
 }: DetailPanelProps) {
 	const t = useT();
+	const [compact, setCompact] = useState(isCompactLayout);
+	useEffect(() => subscribeCompactLayout(setCompact), []);
+	const translationRef = useRef<HTMLTextAreaElement>(null);
+	const closeButtonRef = useRef<HTMLButtonElement>(null);
+	const fallbackFocusRef = useRef<HTMLElement | null>(null);
+	const { dialogRef, dialogProps } = useModalA11y({
+		open: compact,
+		onClose,
+		ownEscape: true,
+		ariaLabel: t("detail.title"),
+		initialFocusRef: translationRef,
+	});
 	const fieldId = `detail-${encodeURIComponent(entry.id)}`;
 	const queryClient = useQueryClient();
 	const draftKey = draftEntryKey(projectKey, entry.id);
@@ -45,6 +59,37 @@ export default function DetailPanel({
 	const [actionError, setActionError] = useState<string | null>(null);
 	const saving = draft?.saving ?? false;
 	const [changingStatus, setChangingStatus] = useState(false);
+	// A disabled preferred field cannot receive the shared modal's initial focus.
+	useEffect(() => {
+		if (!compact) { fallbackFocusRef.current = null; return; }
+		const root = dialogRef.current;
+		if (!root || !isTopmostOverlayDialog(root)) return;
+		if (!root.contains(document.activeElement)) {
+			const fallback = closeButtonRef.current ?? root;
+			fallbackFocusRef.current = fallback;
+			fallback.focus();
+		}
+		const field = translationRef.current;
+		if (field && !field.disabled) {
+			const stillOnFallback = document.activeElement === fallbackFocusRef.current;
+			fallbackFocusRef.current = null;
+			if (stillOnFallback) field.focus();
+		}
+	}, [compact, saving, changingStatus, dialogRef]);
+
+	useEffect(() => {
+		if (!compact) return;
+		const containFocus = () => {
+			const root = dialogRef.current;
+			if (!root || !isTopmostOverlayDialog(root) || root.contains(document.activeElement)) return;
+			const fallback = closeButtonRef.current ?? root;
+			fallbackFocusRef.current = fallback;
+			fallback.focus();
+		};
+		window.addEventListener("focusin", containFocus);
+		return () => window.removeEventListener("focusin", containFocus);
+	}, [compact, dialogRef]);
+
 	const currentEntryId = useRef(entry.id);
 	currentEntryId.current = entry.id;
 	const isCurrentProject = () => {
@@ -117,15 +162,16 @@ export default function DetailPanel({
 		binarySlotExceeded && `${fieldId}-slot-error`,
 	].filter(Boolean).join(" ");
 
-	return (
-		<aside ref={panelRef} className="w-[340px] border-l border-border overflow-y-auto bg-surface flex flex-col">
+	const panel = (
+		<aside ref={panelRef} className={clsx("relative border-l border-border overflow-y-auto bg-surface flex flex-col", compact ? "w-[min(420px,92vw)] shadow-xl" : "w-[340px]")}>
 			<div className="px-3 py-2 border-b border-border flex justify-between items-center">
 				<h3 className="text-caption font-semibold text-text">
 					{t("detail.title")}
 				</h3>
 				<button
+					ref={closeButtonRef}
 					onClick={onClose}
-					className="text-text-muted hover:text-text text-section"
+					className="text-text-muted hover:text-text text-section rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg"
 					aria-label={t("detail.closeAria")}
 				>
 					&times;
@@ -171,6 +217,7 @@ export default function DetailPanel({
 						{t("detail.translation")}
 					</label>
 					<textarea
+						ref={translationRef}
 						id={`${fieldId}-translation`}
 						aria-describedby={translationDescription}
 						aria-invalid={limitExceeded || binarySlotExceeded || !!draft?.error || !!actionError || !!draft?.conflict}
@@ -322,4 +369,10 @@ export default function DetailPanel({
 			</div>
 		</aside>
 	);
+	return compact ? (
+		<div ref={dialogRef} {...dialogProps} className="fixed inset-0 z-40 flex justify-end">
+			<div data-detail-backdrop="" aria-hidden="true" className="absolute inset-0 bg-black/20" onClick={onClose} />
+			{panel}
+		</div>
+	) : panel;
 }

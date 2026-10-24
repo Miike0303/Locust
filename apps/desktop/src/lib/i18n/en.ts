@@ -1,5 +1,7 @@
 /** English UI catalog. Keys are dotted namespaces. Keep in sync with es.ts. */
 export const en = {
+  "nav.expandSidebar": "Expand sidebar",
+  "nav.collapseSidebar": "Collapse sidebar",
   "table.sortPageBy": "Sort this page by {column}",
   "table.keyboardHelp": "Strings. Use Arrow Up and Arrow Down to move between rows, and Enter to open details.",
   "filter.searchLabel": "Search strings",

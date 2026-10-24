@@ -31,17 +31,17 @@ export default function Settings() {
   };
 
   return (
-    <div className="flex h-full min-h-0 bg-surface-muted text-text text-body">
-      <nav className="w-56 shrink-0 overflow-y-auto border-r border-border bg-surface p-4 space-y-2">
+    <div className="flex flex-col min-[1200px]:flex-row h-full min-h-0 bg-surface-muted text-text text-body">
+      <nav className="flex shrink-0 gap-2 overflow-x-auto border-b border-border bg-surface px-4 min-[1200px]:block min-[1200px]:w-56 min-[1200px]:overflow-y-auto min-[1200px]:border-b-0 min-[1200px]:border-r min-[1200px]:p-4 min-[1200px]:space-y-2">
         {SETTINGS_SECTIONS.map(({ id, labelKey }) => (
           <button
             key={id}
             onClick={() => selectSection(id)}
             aria-current={section === id ? "page" : undefined}
             className={clsx(
-              "block w-full rounded-lg border text-left px-3 py-2 text-body font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg",
+              "block shrink-0 whitespace-nowrap border-b-2 text-left px-3 py-2 text-body font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-fg min-[1200px]:w-full min-[1200px]:rounded-lg min-[1200px]:border",
               section === id
-                ? "border-accent-fg bg-accent-muted text-accent-fg font-semibold"
+                ? "border-accent text-accent-fg font-semibold min-[1200px]:border-accent-fg min-[1200px]:bg-accent-muted"
                 : "border-transparent text-text-muted hover:bg-surface-muted hover:text-text"
             )}
           >
