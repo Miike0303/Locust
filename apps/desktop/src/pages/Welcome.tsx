@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	FolderOpen,
 	File,
@@ -26,7 +26,10 @@ import {
 	Database,
 	RotateCcw,
 } from "lucide-react";
-import { getFormats, getConfig, getProviders, getInjectionStatus } from "../lib/api";
+import { getFormats, getConfig, getProviders, getInjectionStatus, type AppConfig, type ProjectStats } from "../lib/api";
+import { draftProjectKey } from "../lib/projectScope";
+import { statusStyles } from "../lib/statusStyles";
+import { APP_VERSION } from "../lib/appVersion";
 import { useProjectStore } from "../stores/projectStore";
 import { useQueueStore } from "../stores/queueStore";
 import { addLog } from "../stores/logStore";
@@ -60,7 +63,7 @@ import {
 	saveProviderSetupHintDismissed,
 } from "../lib/providerReadiness";
 import { buildSettingsPath } from "../lib/settingsNav";
-import { useT } from "../lib/i18n";
+import { useLocale, useT } from "../lib/i18n";
 import { formatDescriptionKey } from "../lib/formatDescriptions";
 
 const PatchModal = lazy(() => import("../components/PatchModal"));
@@ -84,6 +87,59 @@ const FORMAT_ICONS: Record<string, typeof Globe> = {
 };
 
 const FORMAT_COLOR = "bg-surface-muted text-text-muted";
+
+type RecentProject = AppConfig["recent_projects"][number];
+
+function RecentProjectRow({ project, opening, onOpen, onQueue }: {
+	project: RecentProject;
+	opening: boolean;
+	onOpen: () => void;
+	onQueue: () => void;
+}) {
+	const t = useT();
+	const { locale } = useLocale();
+	// Passive observer: never open a project or fetch stats to populate Home.
+	const { data: stats } = useQuery<ProjectStats>({
+		queryKey: ["stats", draftProjectKey({ ...project, database_path: project.database_path ?? undefined })],
+		queryFn: skipToken,
+		enabled: false,
+	});
+	const percent = stats && stats.total > 0
+		? Math.min(100, Math.max(0, Math.round((stats.translated + stats.reviewed + stats.approved) / stats.total * 100)))
+		: undefined;
+	const opened = Date.parse(project.last_opened);
+	const seconds = (opened - Date.now()) / 1000;
+	const unit = Math.abs(seconds) < 3600 ? "minute" : Math.abs(seconds) < 86400 ? "hour"
+		: Math.abs(seconds) < 2592000 ? "day" : Math.abs(seconds) < 31536000 ? "month" : "year";
+	const divisor = { minute: 60, hour: 3600, day: 86400, month: 2592000, year: 31536000 }[unit];
+	return (
+		<div className="flex items-center gap-2 border-t border-border first:border-t-0">
+			<button type="button" data-recent-project={project.path} onClick={onOpen} disabled={opening}
+				className="min-w-0 flex-1 rounded-md px-4 py-3 text-left hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg disabled:opacity-50 disabled:cursor-not-allowed [@media(max-height:760px)]:py-1.5">
+				<span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+					<span className="min-w-0 truncate font-bold">{project.name}</span>
+					<span className="rounded bg-surface-muted px-1.5 py-0.5 font-mono text-caption text-text-muted" title={t("editor.formatTitle")}>{project.format_id}</span>
+					{shouldOpenProjectDb(project.database_path) && <span className="rounded bg-surface-muted px-1.5 py-0.5 text-caption text-text-muted" title={project.database_path!}>{t("welcome.recentDbBadge")}</span>}
+					{Number.isFinite(opened) && <time dateTime={project.last_opened} title={new Date(opened).toLocaleString(locale)} className="ml-auto inline-flex items-center gap-1 text-caption text-text-muted">
+						<Clock size={12} aria-hidden="true" />{new Intl.RelativeTimeFormat(locale, { numeric: "auto" }).format(Math.round(seconds / divisor), unit)}
+					</time>}
+				</span>
+				<span className="mt-1 flex min-w-0 flex-col gap-1 sm:flex-row sm:items-center sm:gap-4">
+					<span className="min-w-0 flex-1 truncate text-caption text-text-muted" title={project.path}>{project.path}</span>
+				{percent !== undefined && <span className="flex shrink-0 items-center gap-2 sm:w-44">
+					<span role="progressbar" aria-label={t("welcome.translatedPercent", { percent })} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} className={`h-1.5 flex-1 overflow-hidden rounded-full ${statusStyles.pending.bar}`}>
+						<span className={`block h-full ${statusStyles.translated.bar}`} style={{ width: `${percent}%` }} />
+					</span>
+					<span className="text-caption text-text-muted">{t("welcome.translatedPercent", { percent })}</span>
+				</span>}
+				</span>
+			</button>
+			<button type="button" onClick={onQueue} title={t("welcome.addToQueue")} aria-label={t("welcome.addToQueue")} className="mr-3 rounded p-1 text-text-muted hover:bg-accent-muted hover:text-accent-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg">
+				<Plus size={14} />
+			</button>
+		</div>
+	);
+}
 
 export default function Welcome() {
 	const t = useT();
@@ -320,7 +376,14 @@ export default function Welcome() {
 	const continueProject = project ?? recentProjects[0];
 	const availableFormats = formats?.filter((f) => f.stability !== "comingsoon") ?? [];
 	const stableFormats = availableFormats.filter((f) => f.stability !== "experimental");
-	const experimentalCount = availableFormats.length - stableFormats.length;
+	const orderedFormats = [...stableFormats, ...availableFormats.filter((f) => f.stability === "experimental")];
+	const engineChip = (f: typeof orderedFormats[number]) => (
+		<span key={f.id} data-engine={f.id} title={`${formatDescriptionText(f.id, f.description) ?? ""} (${f.extensions.join(", ")})`}
+			className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-caption ${f.stability === "experimental" ? "border-border bg-surface-muted text-text-muted" : "border-accent bg-surface text-accent-fg"}`}>
+			{f.name}
+			{f.stability === "experimental" && <span className="text-text-muted">{t("welcome.format.experimental")}</span>}
+		</span>
+	);
 	const showProviderHint =
 		providers !== undefined &&
 		!hasAnyReadyProvider(providers, config) &&
@@ -332,9 +395,10 @@ export default function Welcome() {
 	};
 
 	return (
-		<div className="flex flex-col min-h-full p-8 max-w-4xl mx-auto text-text text-body">
+		<div className="flex w-full flex-col min-h-full gap-8 px-6 pb-6 pt-16 max-w-4xl mx-auto text-text text-body [@media(max-height:760px)]:pt-4 [@media(max-height:760px)]:gap-4 [@media(max-height:760px)]:pb-4">
 			{/* Hero */}
-			<div className="mb-8">
+			<section className="flex flex-col gap-6 [@media(max-height:760px)]:gap-3">
+			<div>
 				<h1 className="text-page font-bold mb-1">{t("welcome.headline")}</h1>
 				<p className="text-section text-text-muted">
 					{t("welcome.tagline")}
@@ -342,13 +406,13 @@ export default function Welcome() {
 			</div>
 
 			{/* Open buttons */}
-			<div className="mb-10">
+			<div>
 				<div className="flex gap-4 flex-wrap">
 					{continueProject && (
 						<button
 							onClick={() => project ? navigate("/editor") : openRecent(recentProjects[0])}
 							disabled={opening}
-							className="flex items-center gap-2 px-6 py-3 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-body font-medium transition-colors"
+							className="flex items-center gap-2 px-6 py-3 [@media(max-height:760px)]:py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-body font-medium transition-colors"
 						>
 							{opening && <Loader size={18} className="animate-spin" />}
 							{t("welcome.continue", { name: continueProject.name })}
@@ -357,7 +421,7 @@ export default function Welcome() {
 					<button
 						onClick={handleOpenFolder}
 						disabled={opening}
-						className={`flex items-center gap-2 px-6 py-3 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors ${continueProject ? "border border-border bg-surface hover:bg-surface-muted" : "bg-accent hover:bg-accent-hover text-white"}`}
+						className={`flex items-center gap-2 px-6 py-3 [@media(max-height:760px)]:py-2 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors ${continueProject ? "border border-border bg-surface hover:bg-surface-muted" : "bg-accent hover:bg-accent-hover text-white"}`}
 					>
 						{opening ? (
 							<Loader size={18} className="animate-spin" />
@@ -369,7 +433,7 @@ export default function Welcome() {
 					<button
 						onClick={handleOpenFile}
 						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors"
+						className="flex items-center gap-2 px-6 py-3 [@media(max-height:760px)]:py-2 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors"
 					>
 						{opening ? (
 							<Loader size={18} className="animate-spin" />
@@ -379,14 +443,14 @@ export default function Welcome() {
 						{opening ? t("welcome.opening") : t("welcome.openFile")}
 					</button>
 				</div>
-				<details className="mt-4">
+				<details className="mt-4 [@media(max-height:760px)]:mt-3">
 					<summary className="cursor-pointer text-body text-text-muted">{t("welcome.otherWays")}</summary>
 					<div className="flex gap-3 flex-wrap mt-3">
 					<button
 						type="button"
 						onClick={handleOpenProjectDb}
 						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors"
+						className="flex items-center gap-2 px-6 py-3 [@media(max-height:760px)]:py-2 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors"
 					>
 						{opening ? (
 							<Loader size={18} className="animate-spin" />
@@ -399,13 +463,13 @@ export default function Welcome() {
 						type="button"
 						onClick={() => setShowPatchModal(true)}
 						disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors"
+						className="flex items-center gap-2 px-6 py-3 [@media(max-height:760px)]:py-2 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-body font-medium transition-colors"
 					>
 						<Package size={18} />
 						{t("welcome.applyPatch")}
 					</button>
 					<button type="button" onClick={() => setRecoveryPath(project?.path ?? "")} disabled={opening}
-						className="flex items-center gap-2 px-6 py-3 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 rounded-lg text-body font-medium">
+						className="flex items-center gap-2 px-6 py-3 [@media(max-height:760px)]:py-2 border border-border bg-surface hover:bg-surface-muted disabled:opacity-50 rounded-lg text-body font-medium">
 						<RotateCcw size={18} />{t("recovery.action")}
 					</button>
 				</div>
@@ -427,8 +491,10 @@ export default function Welcome() {
 				)}
 			</div>
 
+			</section>
+
 			{showProviderHint && (
-				<div className="mb-8 p-4 rounded-lg border border-border bg-warning-muted">
+				<div className="p-4 rounded-lg border border-border bg-warning-muted [@media(max-height:760px)]:p-3">
 					<div className="flex items-start justify-between gap-3">
 						<p className="text-body text-warning">
 							{t("welcome.providerHint")}{" "}
@@ -593,157 +659,32 @@ export default function Welcome() {
 				</div>
 			)}
 
-			{/* Recent Projects */}
 			{recentProjects.length > 0 && (
-				<div className="mb-10">
-					<h2 className="text-body font-semibold text-text-muted mb-3">
-						{t("welcome.recent")}
-					</h2>
-					<div className="space-y-2">
-						{recentProjects.map((p, i) => {
-							const Icon = FORMAT_ICONS[p.format_id] ?? Globe;
-							const colorClass = FORMAT_COLOR;
-							const isDbRecent = shouldOpenProjectDb(p.database_path);
-							return (
-								<div
-									key={i}
-									className="w-full p-3 rounded-lg border border-border bg-surface hover:border-accent-fg hover:bg-surface-muted transition-colors flex items-center gap-3"
-								>
-									<button
-										onClick={() => openRecent(p)}
-										disabled={opening}
-										className="flex items-center gap-3 flex-1 min-w-0 text-left disabled:opacity-50 disabled:cursor-not-allowed"
-									>
-										<div className={`p-2 rounded-lg ${colorClass}`}>
-											<Icon size={18} />
-										</div>
-										<div className="flex-1 min-w-0">
-											<div className="text-section font-medium truncate flex items-center gap-2">
-												<span className="truncate">{p.name}</span>
-												{isDbRecent && (
-													<span className="shrink-0 text-caption px-1.5 py-0.5 rounded bg-surface-muted text-text-muted">
-														{t("welcome.recentDbBadge")}
-													</span>
-												)}
-											</div>
-											<div className="text-caption text-text-muted truncate">
-												{isDbRecent ? p.database_path : p.path}
-											</div>
-											{isDbRecent && (
-												<div className="text-caption text-text-muted truncate">
-													{t("welcome.recentGame", { path: p.path })}
-												</div>
-											)}
-										</div>
-									</button>
-									<div className="flex items-center gap-2 text-caption text-text-muted shrink-0">
-										<span
-											className={`px-2 py-0.5 rounded-full text-caption ${colorClass}`}
-										>
-											{p.format_id}
-										</span>
-										{p.last_opened && (
-											<span className="flex items-center gap-1">
-												<Clock size={12} />
-												{new Date(p.last_opened).toLocaleDateString()}
-											</span>
-										)}
-										<button
-											onClick={(e) => {
-												e.stopPropagation();
-												handleAddToQueue(p.path);
-											}}
-											className="p-1 rounded hover:bg-accent-muted text-text-muted hover:text-accent-fg"
-											title={t("welcome.addToQueue")}
-										>
-											<Plus size={14} />
-										</button>
-									</div>
-								</div>
-							);
-						})}
+				<section aria-labelledby="recent-projects-title" className="rounded-lg border border-border bg-surface">
+					<h2 id="recent-projects-title" className="px-4 py-3 text-body font-semibold [@media(max-height:760px)]:py-2">{t("welcome.recent")}</h2>
+					<div>
+						{recentProjects.slice(0, 6).map((p) => <RecentProjectRow key={`${p.database_path ?? ""}:${p.path}:${p.format_id}`} project={p} opening={opening} onOpen={() => openRecent(p)} onQueue={() => handleAddToQueue(p.path)} />)}
 					</div>
-				</div>
+				</section>
 			)}
 
-			{formats && formats.length > 0 && (
-				<div>
-					<p className="text-body text-text-muted mb-3">
-						{t("welcome.stableFormats", { names: stableFormats.map((f) => f.name).join(", ") })}
-					</p>
-					<details>
-					<summary className="cursor-pointer text-body text-text-muted mb-3">
-						{t("welcome.allFormats", { stable: stableFormats.length, experimental: experimentalCount })}
-					</summary>
-					<div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))] gap-3">
-						{formats
-							.filter((f) => f.stability !== "comingsoon")
-							.map((f) => {
-								const Icon = FORMAT_ICONS[f.id] ?? Globe;
-								const colorClass = FORMAT_COLOR;
-								const experimental = f.stability === "experimental";
-								return (
-									<div
-										key={f.id}
-										className="p-3 rounded-lg border border-border bg-surface"
-									>
-										<div className="flex items-start gap-2 mb-2">
-											<div className={`p-1.5 rounded shrink-0 ${colorClass}`}>
-												<Icon size={14} />
-											</div>
-											<div className="min-w-0 flex-1">
-											<span className="block text-body font-medium break-words">
-												{f.name}
-											</span>
-											{experimental && (
-												<span className="inline-block mt-1 text-caption px-1.5 py-0.5 rounded bg-warning-muted text-warning">
-													{t("welcome.format.experimental")}
-												</span>
-											)}
-											</div>
-										</div>
-										{(formatDescriptionKey(f.id) || f.description) && (
-											<p className="text-caption text-text-muted line-clamp-2">
-												{formatDescriptionText(f.id, f.description)}
-											</p>
-										)}
-										<div className="mt-1.5 flex flex-wrap gap-1">
-											{f.extensions.slice(0, 3).map((ext) => (
-												<span
-													key={ext}
-													className="px-1.5 py-0.5 bg-surface-muted rounded text-caption text-text-muted"
-												>
-													{ext}
-												</span>
-											))}
-										</div>
-									</div>
-								);
-							})}
+			{orderedFormats.length > 0 && (
+				<section aria-labelledby="supported-engines-title">
+					<h2 id="supported-engines-title" className="mb-3 text-body font-semibold">{t("welcome.supportedEngines")}</h2>
+					<div className="flex flex-wrap gap-2">
+						{orderedFormats.slice(0, 8).map(engineChip)}
+						{orderedFormats.length > 8 && <details className="basis-full">
+							<summary className="w-fit cursor-pointer rounded text-caption text-text-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg">{t("welcome.moreEngines", { count: orderedFormats.length - 8 })}</summary>
+							<div className="mt-2 flex flex-wrap gap-2">{orderedFormats.slice(8).map(engineChip)}</div>
+						</details>}
 					</div>
-					</details>
-				</div>
+				</section>
 			)}
 
-			{/* Footer stats */}
-			<div className="mt-auto pt-8 flex justify-center gap-6 text-caption text-text-muted">
-				<span>
-					{t("welcome.formatsAvailable", {
-						count: formats?.filter((f) => f.stability !== "comingsoon").length ?? 0,
-					})}
-				</span>
-				<span>{t("welcome.recentCount", { count: recentProjects.length })}</span>
-				<span>
-					<a
-						href="https://github.com/Miike0303/Locust"
-						target="_blank"
-						rel="noopener noreferrer"
-						className="hover:underline"
-					>
-						GitHub
-					</a>
-				</span>
-			</div>
+			<footer className="mt-auto flex justify-center gap-6 text-caption text-text-muted">
+				<a href="https://github.com/Miike0303/Locust" target="_blank" rel="noopener noreferrer" className="hover:underline">GitHub</a>
+				<span>v{APP_VERSION}</span>
+			</footer>
 
 			{showPatchModal && (
 				<Suspense fallback={null}>

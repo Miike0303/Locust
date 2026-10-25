@@ -34,3 +34,19 @@ test("the HTML entry declares an SVG favicon instead of a missing favicon.ico", 
   assert.match(html, /<link\b[^>]*rel="icon"[^>]*type="image\/svg\+xml"[^>]*href="data:image\/svg\+xml,[^"]+"/);
   assert.ok(html.includes("%23047857"), "icon uses the existing accent color");
 });
+
+test("Welcome centers its content with compact-height spacing and a minimal footer", () => {
+  assert.match(source, /max-w-4xl mx-auto/);
+  assert.match(source, /gap-8/);
+  assert.match(source, /pt-16/);
+  assert.match(source, /\[@media\(max-height:760px\)\]:pt-4/);
+  assert.match(source, /<footer/);
+  assert.doesNotMatch(source, /t\("welcome\.(recentCount|formatsAvailable)"/);
+});
+
+test("Welcome keeps recent progress beside the path on desktop and compacts short windows", () => {
+  assert.match(source, /sm:flex-row sm:items-center/);
+  assert.match(source, /sm:w-44/);
+  assert.match(source, /\[@media\(max-height:760px\)\]:gap-4/);
+  assert.match(source, /\[@media\(max-height:760px\)\]:py-1\.5/);
+});
