@@ -4498,34 +4498,6 @@ mod tests {
         archive
     }
 
-    #[derive(Clone, Default)]
-    struct RpaWarningBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for RpaWarningBuffer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture_rpa_warnings<T>(action: impl FnOnce() -> T) -> (T, String) {
-        let buffer = RpaWarningBuffer::default();
-        let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, action);
-        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
-        (result, logs)
-    }
-
     /// A key-zero index lets bounds tests declare ranges independently of data.
     fn rpa_range_index(members: &[(&str, i64, i64)]) -> Vec<u8> {
         let mut pickle = vec![0x80, 2, b'}', b'('];
@@ -4721,9 +4693,8 @@ mod tests {
                 ]),
             )
             .unwrap();
-            let (result, warnings) = capture_rpa_warnings(|| {
-                RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new())
-            });
+            let mut warnings = Vec::new();
+            let result = RenPyPlugin::extract_rpa(&archive, &output, &mut warnings);
             assert!(!dir.path().join("escape.rpy").exists(), "escaped: {name:?}");
             assert!(
                 !dir.path().join("escape.rpyc").exists(),
@@ -4741,12 +4712,14 @@ mod tests {
                 fs::read(output.join("scripts/valid.rpy")).unwrap(),
                 b"\"Valid sibling\"\n"
             );
+            assert_eq!(warnings.len(), 1, "{name:?}: {warnings:?}");
+            let warning = &warnings[0];
             assert!(
-                warnings.contains("unsafe RPA member path"),
-                "{name:?}: {warnings}"
+                warning.contains("unsafe RPA member path"),
+                "{name:?}: {warning}"
             );
             // Debug formatting keeps NUL and backslashes visible in diagnostics.
-            assert!(warnings.contains(&format!("{name:?}")), "{warnings}");
+            assert!(warning.contains(&format!("{name:?}")), "{warning}");
         }
     }
 
@@ -4763,8 +4736,8 @@ mod tests {
             ]),
         )
         .unwrap();
-        let (result, warnings) =
-            capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new()));
+        let mut warnings = Vec::new();
+        let result = RenPyPlugin::extract_rpa(&archive, &output, &mut warnings);
         assert_eq!(
             result.unwrap(),
             vec![
@@ -4772,7 +4745,7 @@ mod tests {
                 output.join("scripts/nested/second.rpy")
             ]
         );
-        assert!(warnings.is_empty(), "{warnings}");
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
             RenPyPlugin::new()
                 .extract(&archive)
@@ -4800,18 +4773,19 @@ mod tests {
             let index =
                 rpa_range_index(&[("bad.rpy", offset, length), ("valid.rpy", header_len, 16)]);
             write_rpa_index_at(&archive, 64, &index);
-            let (result, warnings) = capture_rpa_warnings(|| {
-                RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new())
-            });
+            let mut warnings = Vec::new();
+            let result = RenPyPlugin::extract_rpa(&archive, &output, &mut warnings);
             assert_eq!(result.unwrap(), vec![output.join("valid.rpy")]);
             assert!(!output.join("bad.rpy").exists());
             assert_eq!(
                 fs::read(output.join("valid.rpy")).unwrap(),
                 b"\"Valid sibling\"\n"
             );
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            let warning = &warnings[0];
             assert!(
-                warnings.contains("bad.rpy") && warnings.contains("archive size"),
-                "{warnings}"
+                warning.contains("bad.rpy") && warning.contains("archive size"),
+                "{warning}"
             );
         }
     }
@@ -4825,13 +4799,15 @@ mod tests {
         let index = rpa_range_index(&[("oversized.rpy", 64, length)]);
         // Sparse padding makes the declared range fit without a large fixture allocation.
         write_rpa_index_at(&archive, 64 + length as u64, &index);
-        let (result, warnings) =
-            capture_rpa_warnings(|| RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new()));
+        let mut warnings = Vec::new();
+        let result = RenPyPlugin::extract_rpa(&archive, &output, &mut warnings);
         assert!(result.unwrap().is_empty());
         assert!(!output.join("oversized.rpy").exists());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = &warnings[0];
         assert!(
-            warnings.contains("oversized.rpy") && warnings.contains("64 MiB"),
-            "{warnings}"
+            warning.contains("oversized.rpy") && warning.contains("64 MiB"),
+            "{warning}"
         );
     }
 
@@ -4850,14 +4826,15 @@ mod tests {
                 index[end] = b's';
             }
             write_rpa_index_at(&archive, 64, &index);
-            let (result, warnings) = capture_rpa_warnings(|| {
-                RenPyPlugin::extract_rpa(&archive, &output, &mut Vec::new())
-            });
+            let mut warnings = Vec::new();
+            let result = RenPyPlugin::extract_rpa(&archive, &output, &mut warnings);
             assert!(result.unwrap().is_empty());
             assert!(!output.join("prefixed.rpy").exists());
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            let warning = &warnings[0];
             assert!(
-                warnings.contains("prefixed.rpy") && warnings.contains("archive size"),
-                "{warnings}"
+                warning.contains("prefixed.rpy") && warning.contains("archive size"),
+                "{warning}"
             );
         }
     }
@@ -4911,6 +4888,32 @@ mod tests {
 
     #[test]
     fn rpa_security_injection_never_writes_traversal_members_outside_game() {
+        assert_rpa_security_injection(|_, _| {});
+    }
+
+    #[test]
+    fn rpa_security_injection_warnings_survive_unsubscribed_cache_rebuild() {
+        assert_rpa_security_injection(|archive, output| {
+            // Register the warning callsite on an unsubscribed thread, as another
+            // parallel test can do while a thread-local capture is active.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let mut warnings = Vec::new();
+                        let extracted =
+                            RenPyPlugin::extract_rpa(archive, output, &mut warnings).unwrap();
+                        assert_eq!(extracted, [output.join("scripts/valid.rpy")]);
+                        assert_eq!(warnings.len(), 1, "{warnings:?}");
+                        assert!(warnings[0].contains("../escape.rpy"), "{warnings:?}");
+                        tracing::callsite::rebuild_interest_cache();
+                    })
+                    .join()
+                    .unwrap();
+            });
+        });
+    }
+
+    fn assert_rpa_security_injection(before_inject: impl FnOnce(&Path, &Path)) {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("scripts.rpa");
         let game = dir.path().join("game");
@@ -4933,17 +4936,16 @@ mod tests {
             archive.clone(),
         );
         malicious.translation = Some("No escribir".into());
-        let (result, warnings) = capture_rpa_warnings(|| {
-            RenPyPlugin::inject_rpa_inner(
-                &game,
-                &staging,
-                &HashSet::from([archive]),
-                &[valid, malicious],
-                &HashSet::new(),
-            )
-        });
+        before_inject(&archive, &dir.path().join("unsubscribed"));
+        let report = RenPyPlugin::inject_rpa_inner(
+            &game,
+            &staging,
+            &HashSet::from([archive.clone()]),
+            &[valid, malicious],
+            &HashSet::new(),
+        )
+        .unwrap();
         assert!(!dir.path().join("escape.rpy").exists());
-        let report = result.unwrap();
         assert_eq!(report.strings_written, 1);
         assert_eq!(report.strings_skipped, 1);
         assert_eq!(report.files_written, [game.join("scripts/valid.rpy")]);
@@ -4951,11 +4953,14 @@ mod tests {
             fs::read_to_string(game.join("scripts/valid.rpy")).unwrap(),
             "\"Hermano válido\"\n"
         );
-        assert!(warnings.contains("../escape.rpy"), "{warnings}");
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("../escape.rpy")));
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        let warning = &report.warnings[0];
+        assert!(warning.contains("../escape.rpy"), "{warning}");
+        assert!(warning.contains("unsafe RPA member path"), "{warning}");
+        assert!(
+            warning.contains(&archive.display().to_string()),
+            "{warning}"
+        );
     }
 
     #[test]
