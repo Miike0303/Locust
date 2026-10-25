@@ -49,7 +49,7 @@ const hooks = registerHooks({
         "../stores/editorStore": "export const useEditorStore=selector=>selector?selector(h.useEditorStore.getState()):h.useEditorStore.getState();",
         "../stores/projectStore": "export const useProjectStore=Object.assign(selector=>selector?selector(h.useProjectStore.getState()):h.useProjectStore.getState(),{getState:h.useProjectStore.getState});",
         "../stores/draftStore": `export const useDraftStore=selector=>selector(h.drafts.useDraftStore.getState());${Object.keys(drafts).filter(k => k !== "useDraftStore").map(k => `export const ${k}=h.drafts.${k};`).join("")}`,
-        "@tanstack/react-query": "export const useQuery=options=>({data:h.queryData[options.queryKey[0]],isLoading:false,isError:false});export const useQueryClient=()=>({invalidateQueries:async()=>{}});",
+        "@tanstack/react-query": "export const useIsMutating=()=>0;export const useQuery=options=>({data:h.queryData[options.queryKey[0]],isLoading:false,isError:false});export const useQueryClient=()=>({invalidateQueries:async()=>{}});",
         "@tanstack/react-table": "export const useReactTable=h.createTable;export const getCoreRowModel=h.tableCore.getCoreRowModel;export const getSortedRowModel=h.tableCore.getSortedRowModel;export const flexRender=(value,context)=>typeof value==='function'?value(context):value;",
         "react-router-dom": "export const useNavigate=()=>()=>{};",
         "../lib/projectScope": "export const useProjectScopedQueryEnabled=()=>true;export const projectScopedQueryFn=(_key,fn)=>fn;",

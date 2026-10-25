@@ -1,3 +1,4 @@
+import { recordTranslationWrite, translationWriteProjectKey } from "./translationWrites";
 import { getWsUrl, type WsChannel } from "./api";
 import type {
   ProgressEventStarted,
@@ -66,7 +67,10 @@ export function subscribeToJob(
   jobId: string,
   handlers: JobHandlers,
   channel: WsChannel = "translate",
+  ownerProjectKey?: string,
 ): () => void {
+  // Reconnecting sessions supply their original owner, including an empty key.
+  const projectKey = channel === "translate" ? ownerProjectKey ?? translationWriteProjectKey() : "";
   let ws: WebSocket | null = null;
   let cancelled = false;
 
@@ -94,9 +98,11 @@ export function subscribeToJob(
               handlers.onBatchCompleted?.(data);
               break;
             case "string_translated":
+              recordTranslationWrite(projectKey);
               handlers.onStringTranslated?.(data);
               break;
             case "completed":
+              if (data.total_translated > 0) recordTranslationWrite(projectKey);
               handlers.onCompleted?.(data);
               break;
             case "batch_failed":

@@ -55,9 +55,17 @@ registerHooks({
 		if (normalized.endsWith("/src/lib/api.ts")) {
 			return {
 				format: "module",
-				source: `export async function getWsUrl(jobId, channel) {
+				source: `export async function cancelTranslation() {}
+        export async function getWsUrl(jobId, channel) {
           return globalThis.__locustGetWsUrl(jobId, channel ?? "translate");
         }`,
+				shortCircuit: true,
+			};
+		}
+		if (normalized.endsWith("/src/stores/queueStore.ts")) {
+			return {
+				format: "module",
+				source: `export const useQueueStore = { getState: () => ({ globalProgress: null, setGlobalProgress() {} }) };`,
 				shortCircuit: true,
 			};
 		}
@@ -315,4 +323,106 @@ console.log("ws.test.ts: ok");
     socket.emitMessage({ type: "failed", entry_id: null, error: "terminal" });
     assert.equal(errors, 1);
     unsub();
+}
+
+const { test } = await import("node:test");
+const { queryClient } = await import("./queryClient.ts");
+const { useProjectStore } = await import("../stores/projectStore.ts");
+const { draftProjectKey } = await import("./projectScope.ts");
+const project = { path: "/game", database_path: "/game.db", format_id: "html", name: "Fixture" };
+const editKey = ["workflow-last-edit", draftProjectKey(project)];
+for (const translated of [0, 2]) {
+  test(`translation job completion with ${translated} changed rows records only real writes`, async () => {
+    reset(); queryClient.clear(); useProjectStore.getState().setProject(project);
+    const job = waitForJob(`workflow-${translated}`);
+    const socket = await lastSocket();
+    socket.emitMessage({ type: "completed", total_translated: translated, total_cost: 0, duration_secs: 0 });
+    await job;
+    assert.equal((queryClient.getQueryData<number>(editKey) ?? 0) > 0, translated > 0);
+    queryClient.clear();
+  });
+}
+test("translation row events stale the original project even if the job later fails", async () => {
+  reset(); queryClient.clear(); useProjectStore.getState().setProject(project);
+  const job = waitForJob("workflow-partial");
+  const socket = await lastSocket();
+  const other = { ...project, database_path: "/other.db" };
+  useProjectStore.getState().setProject(other);
+  socket.emitMessage({ type: "string_translated", entry_id: "row", translation: "Saved" });
+  socket.emitMessage({ type: "failed", error: "cancelled" });
+  await assert.rejects(job, /cancelled/);
+  assert.ok(queryClient.getQueryData<number>(editKey)! > 0);
+  assert.equal(queryClient.getQueryData(["workflow-last-edit", draftProjectKey(other)]), undefined);
+  queryClient.clear();
+});
+test("patch jobs and unsubscribed sockets do not mark translation edits", async () => {
+  reset(); queryClient.clear(); useProjectStore.getState().setProject(project);
+  const stop = subscribeToJob("workflow-patch", {}, "patch");
+  const socket = await lastSocket();
+  socket.emitMessage({ type: "completed", total_translated: 2 });
+  assert.equal(queryClient.getQueryData(editKey), undefined);
+  stop();
+  const stopTranslation = subscribeToJob("workflow-unsubscribed", {});
+  const translationSocket = await lastSocket();
+  stopTranslation();
+  translationSocket.emitMessage({ type: "string_translated", translation: "Ignored" });
+  assert.equal(queryClient.getQueryData(editKey), undefined);
+  queryClient.clear(); useProjectStore.setState({ project: null });
+});
+
+for (const reconnect of ["automatic", "manual"] as const) {
+  test(`${reconnect} reconnect replays offline completion to the job owner after switching projects`, async (ctx) => {
+    const session = await import("./translationJobSession.ts");
+    const { useEditorStore } = await import("../stores/editorStore.ts");
+    const { qaLastRunKey } = await import("./qaDashboard.ts");
+    const { resolveWorkflowCheckState } = await import("./workflowGuide.ts");
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    ctx.mock.method(Date, "now", () => 200);
+    reset(); queryClient.clear();
+    const ownerKey = draftProjectKey(project);
+    const other = { ...project, database_path: "/other.db" };
+    const otherKey = draftProjectKey(other);
+    const evidence = (key: string) => {
+      const latestEditAt = queryClient.getQueryData<number>(["workflow-last-edit", key]) ?? null;
+      return {
+        latestEditAt,
+        state: resolveWorkflowCheckState({
+          summary: {}, latestEditAt,
+          lastCheckedAt: queryClient.getQueryData<number>(qaLastRunKey(key)) ?? null,
+          isChecking: false,
+        }).state,
+      };
+    };
+    queryClient.setQueryData(qaLastRunKey(ownerKey), 100);
+    queryClient.setQueryData(qaLastRunKey(otherKey), 100);
+    useProjectStore.getState().setProject(project);
+    session.setTranslationModalOpen(true);
+    try {
+      session.attachTranslationJob({ jobId: `offline-${reconnect}`, projectName: project.name, providerLabel: "Mock" });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const original = FakeWebSocket.instances[0];
+      assert.ok(original);
+      original.emitClose();
+      assert.equal(useEditorStore.getState().jobSnapshot?.disconnected, true);
+      // The server finishes A while offline; its completion waits for reconnect.
+      const completed = { type: "completed", total_translated: 2, total_cost: 0, duration_secs: 0 };
+      useProjectStore.getState().setProject(other);
+      assert.deepEqual(evidence(ownerKey), { latestEditAt: null, state: "current" });
+      assert.deepEqual(evidence(otherKey), { latestEditAt: null, state: "current" });
+      if (reconnect === "automatic") ctx.mock.timers.tick(1000);
+      else session.reconnectTranslationJob();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(FakeWebSocket.instances.length, 2);
+      FakeWebSocket.instances[1].emitMessage(completed);
+      assert.equal(useEditorStore.getState().jobSnapshot?.done, true);
+      assert.equal(session.subscribedTranslationJobId(), null);
+      assert.deepEqual(evidence(ownerKey), { latestEditAt: 200, state: "not-checked" });
+      assert.deepEqual(evidence(otherKey), { latestEditAt: null, state: "current" });
+    } finally {
+      FakeWebSocket.instances[FakeWebSocket.instances.length - 1]?.emitMessage({ type: "failed", error: "cancelled" });
+      session.setTranslationModalOpen(false);
+      session.clearTranslationSnapshotIfIdle();
+      queryClient.clear(); useProjectStore.setState({ project: null });
+    }
+  });
 }

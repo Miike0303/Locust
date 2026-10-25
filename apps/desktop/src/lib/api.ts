@@ -1,3 +1,4 @@
+import { trackTranslationWrite } from "./translationWrites";
 import { IS_TAURI } from "./runtime";
 import { refreshGameState } from "./queryClient";
 import { invoke } from "@tauri-apps/api/core";
@@ -592,9 +593,10 @@ export const getStringHistory = (id: string): Promise<StringRevision[]> =>
   request(`/strings/${encodeURIComponent(id)}/history`);
 
 export const patchString = (id: string, data: Partial<Pick<StringEntry, "translation" | "status">> & { expected_translation?: string | null }): Promise<StringEntry> =>
-  IS_TAURI
+  trackTranslationWrite<StringEntry>(() => IS_TAURI
     ? tauriInvoke("patch_string", { id, data })
-    : request(`/strings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
+    : request(`/strings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) }),
+    () => data.translation !== undefined);
 
 export interface BatchPatchResult {
   requested: number;
@@ -608,12 +610,12 @@ export const batchPatchStrings = (
   updates: { id: string; translation: string; expected_translation?: string | null }[],
   provider = "manual"
 ): Promise<BatchPatchResult> =>
-  IS_TAURI
+  trackTranslationWrite<BatchPatchResult>(() => IS_TAURI
     ? tauriInvoke("batch_patch_strings", { data: { updates, provider } })
     : request("/strings/batch", {
         method: "POST",
         body: JSON.stringify({ updates, provider }),
-      });
+      }), result => result.applied > 0);
 
 export const getStats = (): Promise<ProjectStats> =>
   IS_TAURI ? tauriInvoke("get_stats") : request("/stats");
@@ -709,18 +711,18 @@ export const deleteGlossaryEntry = (term: string, langPair: string) =>
 export const exportPo = (lang: string) => requestText(`/export/po?lang=${encodeURIComponent(lang)}`);
 export const exportXliff = (lang: string) => requestText(`/export/xliff?lang=${encodeURIComponent(lang)}`);
 export const importPo = (content: string) =>
-  request<ImportCounts>(`/import/po`, {
+  trackTranslationWrite(() => request<ImportCounts>(`/import/po`, {
     method: "POST",
     body: content,
     headers: { "Content-Type": "text/plain" },
-  });
+  }), result => result.imported > 0);
 
 export const importXliff = (content: string) =>
-  request<ImportCounts>(`/import/xliff`, {
+  trackTranslationWrite(() => request<ImportCounts>(`/import/xliff`, {
     method: "POST",
     body: content,
     headers: { "Content-Type": "text/plain" },
-  });
+  }), result => result.imported > 0);
 
 export type ExportFormat = "po" | "xliff";
 
@@ -777,10 +779,10 @@ export async function importTranslations(
   pathOrContent: string
 ): Promise<ImportResult> {
   if (IS_TAURI) {
-    return tauriInvoke<ImportResult>("import_translations", {
+    return trackTranslationWrite(() => tauriInvoke<ImportResult>("import_translations", {
       format,
       path: pathOrContent,
-    });
+    }), result => result.imported > 0);
   }
   const content = pathOrContent;
   const res =

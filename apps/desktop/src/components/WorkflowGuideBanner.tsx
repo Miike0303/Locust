@@ -1,28 +1,36 @@
 import { Check, X } from "lucide-react";
 import clsx from "clsx";
-import type { WorkflowGuideStep } from "../lib/workflowGuide";
+import type { WorkflowGuideCheck, WorkflowGuideStep } from "../lib/workflowGuide";
 import { useT } from "../lib/i18n";
 
 interface WorkflowGuideBannerProps {
   step: WorkflowGuideStep;
+  check: WorkflowGuideCheck;
   onPrimaryAction: () => void;
   onSkipReview?: () => void;
   onDismiss: () => void;
 }
 
-const STEPS: readonly WorkflowGuideStep[] = ["translate", "review", "inject"];
+const STEPS: readonly WorkflowGuideStep[] = ["translate", "review", "check", "write"];
 
 export default function WorkflowGuideBanner({
   step,
+  check,
   onPrimaryAction,
   onSkipReview,
   onDismiss,
 }: WorkflowGuideBannerProps) {
   const t = useT();
   const currentIndex = STEPS.indexOf(step);
+  const checking = step === "check" && check.state === "checking";
+  const hasIssues = check.state === "issues";
   const content = {
-    description: t(`workflow.${step}Desc`),
-    action: t(`workflow.${step}Action`),
+    description: checking ? t("workflow.checking")
+      : step === "check" && hasIssues ? t("workflow.checkIssuesDesc")
+      : t(`workflow.${step}Desc`),
+    action: checking ? t("workflow.checking")
+      : step === "check" && hasIssues ? t("workflow.reviewIssuesAction")
+      : t(`workflow.${step}Action`),
   };
 
   return (
@@ -35,7 +43,7 @@ export default function WorkflowGuideBanner({
         className="flex shrink-0 items-center gap-1.5 text-caption"
       >
         {STEPS.map((item, index) => {
-          const done = index < currentIndex;
+          const done = item === "check" ? check.state === "current" : index < currentIndex;
           const current = index === currentIndex;
           return (
             <li key={item} className="flex items-center gap-1.5">
@@ -75,6 +83,13 @@ export default function WorkflowGuideBanner({
                   {done ? <Check size={10} strokeWidth={3} /> : index + 1}
                 </span>
                 {t(`workflow.${item}`)}
+                {item === "check" && check.state !== "current" && (
+                  <span className="flex items-center gap-1 text-caption" role="status">
+                    {hasIssues && <span aria-hidden="true" className="size-1.5 rounded-full bg-warning" />}
+                    {hasIssues ? t("workflow.issues", { count: check.openIssues })
+                      : t(check.state === "checking" ? "workflow.checking" : "workflow.notChecked")}
+                  </span>
+                )}
                 {done && <span className="sr-only">{t("workflow.stepDone")}</span>}
               </span>
             </li>
@@ -99,7 +114,8 @@ export default function WorkflowGuideBanner({
         <button
           type="button"
           onClick={onPrimaryAction}
-          className="rounded border border-accent-fg px-2.5 py-1 text-caption font-medium text-accent-fg transition-colors hover:bg-accent-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
+          disabled={checking}
+          className="rounded border border-accent-fg px-2.5 py-1 text-caption font-medium text-accent-fg transition-colors disabled:cursor-not-allowed disabled:opacity-50 hover:bg-accent-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-fg focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
         >
           {content.action}
         </button>

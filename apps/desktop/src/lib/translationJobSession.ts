@@ -9,6 +9,7 @@ import {
   formatObservedCost,
 } from "./translationCost";
 import { shouldSubscribeToJob } from "./translationJob";
+import { translationWriteProjectKey } from "./translationWrites";
 import { subscribeToJob, type JobHandlers } from "./ws";
 import { useEditorStore } from "../stores/editorStore";
 import { addLog } from "../stores/logStore";
@@ -16,7 +17,7 @@ import { useQueueStore, type GlobalProgress } from "../stores/queueStore";
 import { addToast } from "../stores/toastStore";
 
 let unsub: (() => void) | null = null;
-let subscribedJobId: string | null = null;
+let subscribedJob: { jobId: string; projectKey: string } | null = null;
 let finished = false;
 let cancelRequested = false;
 let modalOpen = false;
@@ -35,7 +36,7 @@ export function setTranslationModalOpen(open: boolean): void {
 }
 
 export function subscribedTranslationJobId(): string | null {
-  return subscribedJobId;
+  return subscribedJob?.jobId ?? null;
 }
 
 function patchSnapshot(
@@ -60,10 +61,10 @@ function endJob(): void {
   useEditorStore.getState().setTranslating(false);
   useEditorStore.getState().setJob(null);
   const queue = useQueueStore.getState();
-  if (queue.globalProgress?.owner.kind === "single" && queue.globalProgress.owner.jobId === subscribedJobId) {
+  if (queue.globalProgress?.owner.kind === "single" && queue.globalProgress.owner.jobId === subscribedJob?.jobId) {
     queue.setGlobalProgress(null);
   }
-  subscribedJobId = null;
+  subscribedJob = null;
 }
 
 function discardSnapshotIfModalClosed(): void {
@@ -85,11 +86,13 @@ export function attachTranslationJob(opts: {
   projectName: string;
   providerLabel: string;
 }): void {
-  if (!shouldSubscribeToJob(opts.jobId, subscribedJobId)) {
+  if (!shouldSubscribeToJob(opts.jobId, subscribedJob?.jobId ?? null)) {
     return;
   }
   stopSubscription();
-  subscribedJobId = opts.jobId;
+  // Ownership belongs to the job session, not to whichever project is open on reconnect.
+  const jobSession = { jobId: opts.jobId, projectKey: translationWriteProjectKey() };
+  subscribedJob = jobSession;
   finished = false;
   cancelRequested = false;
   let batchFailures = { count: 0, lastReason: "" };
@@ -119,7 +122,7 @@ export function attachTranslationJob(opts: {
   const publishProgress = (progress: Omit<GlobalProgress, "owner" | "projectName">) => {
     const queue = useQueueStore.getState();
     const owner = queue.globalProgress?.owner;
-    if (finished || subscribedJobId !== opts.jobId || queue.isRunning) return;
+    if (finished || subscribedJob !== jobSession || queue.isRunning) return;
     if (owner && (owner.kind !== "single" || owner.jobId !== opts.jobId)) return;
     queue.setGlobalProgress({
       ...progress,
@@ -249,7 +252,7 @@ export function attachTranslationJob(opts: {
   const connect = () => {
     stopSubscription();
     const version = subscriptionVersion;
-    const current = () => !finished && subscribedJobId === opts.jobId && version === subscriptionVersion;
+    const current = () => !finished && subscribedJob === jobSession && version === subscriptionVersion;
     let closed = false;
     const replayed = new Map<string, number>();
     const receive = <E,>(handler: (event: E) => void, terminal = false) => (event: E) => {
@@ -294,7 +297,7 @@ export function attachTranslationJob(opts: {
         const delay = RECONNECT_DELAYS[retryAttempt++];
         if (delay !== undefined) retryTimer = setTimeout(connect, delay);
       },
-    });
+    }, "translate", jobSession.projectKey);
   };
   retrySubscription = () => {
     retryAttempt = 0;
@@ -320,18 +323,18 @@ export function clearTranslationCancelRequested(): void {
 
 export async function requestTranslationCancel(): Promise<void> {
   const jobId = useEditorStore.getState().jobId;
-  if (!jobId || jobId !== subscribedJobId || finished || cancelRequested) return;
+  if (!jobId || jobId !== subscribedJob?.jobId || finished || cancelRequested) return;
   markTranslationCancelRequested();
   try {
     await cancelTranslation(jobId);
-    if (finished || subscribedJobId !== jobId) return;
+    if (finished || subscribedJob?.jobId !== jobId) return;
     addLog("info", t("activity.translation.cancelRequested", { jobId }), undefined, "translation");
     addToast("info", t("translate.toast.cancelling"));
     // Cancellation remains available after retries are exhausted; subscribe
     // again to receive the server's terminal cancellation replay.
     reconnectTranslationJob();
   } catch (err: unknown) {
-    if (finished || subscribedJobId !== jobId) return;
+    if (finished || subscribedJob?.jobId !== jobId) return;
     clearTranslationCancelRequested();
     const message = err instanceof Error ? err.message : String(err);
     addToast("error", t("translate.toast.cancelFailed", { error: message }));

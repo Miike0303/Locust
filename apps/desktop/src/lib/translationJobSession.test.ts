@@ -9,7 +9,7 @@ const h = {
   snapshot: null as any, jobId: null as string | null, translating: false,
   handlers: null as any, toasts: [] as any[], logs: [] as any[], unsubscribed: 0,
   cancellations: [] as string[],
-  subscriptions: [] as { jobId: string; handlers: any }[],
+  subscriptions: [] as { jobId: string; handlers: any; projectKey?: string }[],
 };
 (globalThis as any).__sessionHarness = h;
 registerHooks({
@@ -22,7 +22,7 @@ registerHooks({
         export async function getProviders(){return [];}
         export async function getConfig(){return {};}
         export async function checkProviderHealth(){return {ok:true};}`,
-      "/src/lib/ws.ts": `export const JOB_STREAM_LOST_MESSAGE='stream lost'; export function subscribeToJob(id,handlers){const h=globalThis.__sessionHarness;h.handlers=handlers;h.subscriptions.push({jobId:id,handlers});return()=>{h.unsubscribed++;};}`,
+      "/src/lib/ws.ts": `export const JOB_STREAM_LOST_MESSAGE='stream lost'; export function subscribeToJob(id,handlers,channel,projectKey){const h=globalThis.__sessionHarness;h.handlers=handlers;h.subscriptions.push({jobId:id,handlers,projectKey});return()=>{h.unsubscribed++;};}`,
       "/src/stores/editorStore.ts": `const h=globalThis.__sessionHarness; export const useEditorStore=Object.assign(()=>({isTranslating:h.translating,jobSnapshot:h.snapshot}),{getState:()=>({jobId:h.jobId,isTranslating:h.translating,jobSnapshot:h.snapshot,setJob:id=>{h.jobId=id;},setTranslating:v=>{h.translating=v;},setJobSnapshot:v=>{h.snapshot=v;},patchJobSnapshot:v=>{h.snapshot={...h.snapshot,...v};}})});`,
       "/src/stores/queueStore.ts": `export const useQueueStore={getState:()=>({setGlobalProgress:()=>{},globalProgress:null})};`,
       "/src/stores/logStore.ts": `export function addLog(...args){globalThis.__sessionHarness.logs.push(args);}`,
@@ -349,6 +349,32 @@ for (const locale of ["en", "es"] as const) {
     assert.equal(h.subscriptions.length, subscriptions);
   });
 }
+
+test("job ownership survives reattach and reconnect and resets for a new job", async (ctx) => {
+  const { useProjectStore } = await import("../stores/projectStore.ts");
+  const { draftProjectKey } = await import("./projectScope.ts");
+  ctx.mock.timers.enable({ apis: ["setTimeout"] });
+  const owner = { path: "/game", database_path: "/owner.db", format_id: "html", name: "Owner" };
+  const other = { ...owner, database_path: "/other.db", name: "Other" };
+  h.subscriptions = [];
+  useProjectStore.getState().setProject(owner);
+  try {
+    attach("owned-job");
+    useProjectStore.getState().setProject(other);
+    attach("owned-job");
+    assert.equal(h.subscriptions.length, 1, "reattach must preserve the live session");
+    h.handlers.onClosed();
+    ctx.mock.timers.tick(1000);
+    assert.equal(h.subscriptions.length, 2);
+    assert.deepEqual(h.subscriptions.map(({ projectKey }) => projectKey), [draftProjectKey(owner), draftProjectKey(owner)]);
+    h.handlers.onCompleted({ type: "completed", total_translated: 2, total_cost: 0 });
+    attach("other-job");
+    assert.equal(h.subscriptions[2].projectKey, draftProjectKey(other));
+  } finally {
+    h.handlers.onFailed({ type: "failed", error: "cancelled" });
+    useProjectStore.setState({ project: null });
+  }
+});
 
 test("replay preserves progress and counts repeated batch failures once per occurrence", (ctx) => {
   ctx.mock.timers.enable({ apis: ["setTimeout"] });

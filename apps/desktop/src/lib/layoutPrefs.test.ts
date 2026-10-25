@@ -37,7 +37,7 @@ const hooks = registerHooks({
         react: "export const useState=h.useState;export const useRef=h.useRef;export const useEffect=h.useEffect;export const useMemo=fn=>fn();export const useCallback=fn=>fn;export const useId=()=>'drawer-title';export const Suspense='suspense';",
         "@tanstack/react-table": "export const useReactTable=options=>{const table=h.tableCore.createTable(options);table.setOptions({...options,state:{...table.initialState,...options.state}});return table;};export const getCoreRowModel=h.tableCore.getCoreRowModel;export const getSortedRowModel=h.tableCore.getSortedRowModel;export const flexRender=(value,context)=>typeof value==='function'?value(context):value;",
         "../lib/i18n": "export const useT=()=>h.t;",
-        "@tanstack/react-query": "export const useQuery=o=>({data:h.queryData[o.queryKey[0]],isLoading:false,isError:false});export const useQueryClient=()=>({invalidateQueries:async()=>{}});",
+        "@tanstack/react-query": "export const useIsMutating=()=>0;export const useQuery=o=>({data:h.queryData[o.queryKey[0]],isLoading:false,isError:false});export const useQueryClient=()=>({invalidateQueries:async()=>{}});",
         "react-router-dom": "export const NavLink='nav-link';export const Outlet='outlet';export const useLocation=()=>({pathname:'/settings',search:'?section=appearance'});export const useNavigate=()=>()=>{};",
         "../lib/hotkeys": "export const useGlobalHotkeys=()=>{};export const useHotkey=(action,callback,enabled=true)=>h.hotkeys.push({action,callback,enabled});",
         "../lib/projectScope": "export const useProjectScopedQueryEnabled=()=>true;export const projectScopedQueryFn=(_key,fn)=>fn;",

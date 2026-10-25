@@ -61,9 +61,9 @@ test("warnings are bounded to ten with a remaining count", () => {
   assert.equal(build().moreWarnings, 0);
 });
 
-test("next steps reuse workflow priorities and map review to Review, translate and inject to Editor", () => {
+test("next steps reuse workflow priorities and map review to Review, translate and check to Editor", () => {
   assert.deepEqual(build().nextStep, { step: "translate", path: "/editor" });
   assert.deepEqual(build({ stats: { ...stats, pending: 0 } }).nextStep, { step: "review", path: "/review" });
-  assert.deepEqual(build({ stats: { ...stats, pending: 0 }, skipReview: true }).nextStep, { step: "inject", path: "/editor" });
-  assert.deepEqual(build({ stats: { ...stats, pending: 0, translated: 0, reviewed: 0 } }).nextStep, { step: "inject", path: "/editor" });
+  assert.deepEqual(build({ stats: { ...stats, pending: 0 }, skipReview: true }).nextStep, { step: "check", path: "/editor" });
+  assert.deepEqual(build({ stats: { ...stats, pending: 0, translated: 0, reviewed: 0 } }).nextStep, { step: "check", path: "/editor" });
 });

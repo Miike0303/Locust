@@ -3,7 +3,7 @@ import { projectScopedQueryFn, useProjectScopedQueryEnabled } from "../lib/proje
 import { formatSourceKind } from "../lib/gameSource";
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	Languages,
 	Shield,
@@ -19,6 +19,7 @@ import {
 	getStrings,
 	getStats,
 	getString,
+	getValidationSummary,
 	validate,
 	type ProjectStats,
 	type ValidationResponse,
@@ -30,10 +31,14 @@ import { invalidateProjectData } from "../lib/queryClient";
 import {
 	readSkipReviewPreference,
 	readWorkflowGuideDismissed,
+	resolveWorkflowCheckState,
 	resolveWorkflowGuideStep,
+	resolveWorkflowGuideTarget,
 	saveSkipReviewPreference,
 	saveWorkflowGuideDismissed,
 } from "../lib/workflowGuide";
+import { workflowLastEditKey } from "../lib/translationWrites";
+import { qaLastRunKey } from "../lib/qaDashboard";
 import { addToast } from "../stores/toastStore";
 import { addLog } from "../stores/logStore";
 import FilterBar from "../components/FilterBar";
@@ -159,6 +164,29 @@ export default function Editor() {
 		enabled: scopedEnabled,
 	});
 
+	const validationSummaryQuery = useQuery({
+		queryKey: ["validation-summary", projectKey],
+		queryFn: projectScopedQueryFn(projectKey, ({ signal }) => getValidationSummary(signal)),
+		enabled: scopedEnabled,
+	});
+	const { data: lastCheckedAt } = useQuery<number | null>({
+		queryKey: qaLastRunKey(projectKey),
+		queryFn: () => null,
+		initialData: null,
+		enabled: false,
+		staleTime: Infinity,
+		gcTime: Infinity,
+	});
+	const { data: latestEditAt } = useQuery<number | null>({
+		queryKey: workflowLastEditKey(projectKey),
+		queryFn: () => null,
+		initialData: null,
+		enabled: false,
+		staleTime: Infinity,
+		gcTime: Infinity,
+	});
+	const pendingQaRuns = useIsMutating({ mutationKey: ["validation-run", projectKey] });
+
 	const { data: selectedEntry } = useQuery({
 		queryKey: ["string", selectedEntryId, projectKey],
 		queryFn: projectScopedQueryFn(projectKey, () => getString(selectedEntryId!)),
@@ -193,6 +221,9 @@ export default function Editor() {
 			if (!res.fonts) {
 				res.fonts = [];
 			}
+			const completedAt = Date.now();
+			await queryClient.invalidateQueries({ queryKey: ["validation-summary", projectKey] });
+			queryClient.setQueryData(qaLastRunKey(projectKey), completedAt);
 			setValidationResult(res);
 			setShowValidationModal(true);
 
@@ -221,7 +252,7 @@ export default function Editor() {
 		} finally {
 			setValidating(false);
 		}
-	}, [validating, t]);
+	}, [validating, t, queryClient, projectKey]);
 
 	// Project-gated actions: buttons are disabled without a project, and the
 	// matching hotkeys give toast feedback instead of a silent no-op.
@@ -324,16 +355,23 @@ export default function Editor() {
 	const hasActiveFilters = Boolean(
 		filter.status || filter.search || filter.file_path || filter.tag,
 	);
+	const workflowCheck = resolveWorkflowCheckState({
+		summary: validationSummaryQuery.isError ? undefined : validationSummaryQuery.data,
+		lastCheckedAt: lastCheckedAt ?? null,
+		latestEditAt: latestEditAt ?? null,
+		isChecking: validating || pendingQaRuns > 0,
+	});
 	const workflowStep = resolveWorkflowGuideStep({
 		hasProject,
 		stats: statsData,
 		skipReview,
+		checkState: workflowCheck.state,
 	});
 
 	const handleGuidePrimaryAction = () => {
 		if (workflowStep === "translate") setShowTranslateModal(true);
-		else if (workflowStep === "review") navigate("/review");
-		else if (workflowStep === "inject") setShowInjectModal(true);
+		else if (workflowStep === "write") setShowInjectModal(true);
+		else if (workflowStep) navigate(resolveWorkflowGuideTarget(workflowStep));
 	};
 
 	const handleSkipReview = () => {
@@ -544,6 +582,7 @@ export default function Editor() {
 			{!guideDismissed && workflowStep && (
 				<WorkflowGuideBanner
 					step={workflowStep}
+					check={workflowCheck}
 					onPrimaryAction={handleGuidePrimaryAction}
 					onSkipReview={
 						workflowStep === "review" && !skipReview
