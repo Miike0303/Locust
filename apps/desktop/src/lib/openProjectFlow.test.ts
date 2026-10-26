@@ -5,6 +5,7 @@ import nodeAssert from "node:assert/strict";
 import { test } from "node:test";
 import { registerHooks } from "node:module";
 import type { QueryClient } from "@tanstack/react-query";
+import type { ProjectOpenResponse } from "./api.ts";
 import {
   completeOpenProject,
   completeOpenProjectDb,
@@ -132,7 +133,7 @@ const resumed = {
   kind: "resume_available", database_path: "/games/title.locust.db",
   project_path: "/games/title", format_id: "renpy",
 };
-const outcome = {
+const outcome: ProjectOpenResponse = {
   format_id: "renpy", format_name: "Ren'Py", total_strings: 1,
   project_path: "/games/title", project_name: "title", supported_modes: ["replace"],
   database_path: "/games/title.locust.db", extraction_warnings: ["Saved warning"],
@@ -167,12 +168,34 @@ registerHooks({
 function deps(choice: ProjectOpenChoice): Parameters<typeof completeOpenProject>[2] {
   return {
     setProject(p: unknown) { h.calls.push(["setProject", p]); },
-    queryClient: { removeQueries(q: unknown) { h.calls.push(["removeQueries", q]); } } as unknown as QueryClient,
+    queryClient: {
+      removeQueries(q: unknown) { h.calls.push(["removeQueries", q]); },
+      invalidateQueries(q: unknown) {
+        h.calls.push(["invalidateQueries", q]);
+        // Optional recent-project refresh must never hold up project opening.
+        return new Promise<void>(() => {});
+      },
+    } as unknown as QueryClient,
     async choose(request: unknown) { h.calls.push(["choose", request]); return choice; },
   };
 }
 function reset(preflight: Record<string, unknown> = resumed) {
   h.calls = []; h.preflight = preflight; h.error = null;
+}
+
+for (const route of ["extract", "resume", "refresh", "legacy-recent", "saved-db"] as const) {
+  test(`successful ${route} refreshes config without blocking project opening`, async () => {
+    reset(route === "extract" ? { kind: "extract" } : resumed);
+    const options = deps(route === "refresh" ? "refresh" : "resume");
+    const result = route === "saved-db"
+      ? await completeOpenProjectDb("/pivot.locust.db", "/selected", "renpy", options)
+      : await completeOpenProject("/selected", "renpy", options, route === "legacy-recent");
+    nodeAssert.deepEqual(result, outcome);
+    nodeAssert.deepEqual(h.calls.filter(c => c[0] === "setProject"), [["setProject", projectFromOpenResponse(outcome)]]);
+    nodeAssert.equal(h.calls.filter(c => c[0] === "removeQueries").length, 5);
+    nodeAssert.deepEqual(h.calls.filter(c => c[0] === "invalidateQueries"), [["invalidateQueries", { queryKey: ["config"] }]]);
+    nodeAssert.ok(h.calls.findIndex(c => c[0] === "setProject") < h.calls.findIndex(c => c[0] === "invalidateQueries"));
+  });
 }
 
 for (const choice of ["resume", "refresh", "cancel"] as const) {

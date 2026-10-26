@@ -257,6 +257,7 @@ export async function completeOpenProject(
   if (!result) return null;
   deps.setProject(projectFromOpenResponse(result));
   dropProjectQueries(deps.queryClient);
+  void deps.queryClient.invalidateQueries({ queryKey: ["config"] });
   return result;
 }
 
@@ -274,6 +275,7 @@ export async function completeOpenProjectDb(
   const result = await openProjectTransition(() => openProjectDb(databasePath, gamePath, formatId));
   deps.setProject(projectFromOpenResponse(result));
   dropProjectQueries(deps.queryClient);
+  void deps.queryClient.invalidateQueries({ queryKey: ["config"] });
   return result;
 }
 
