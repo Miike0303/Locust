@@ -1,5 +1,9 @@
 # Current task index
 
+## Renewed continuation
+
+Owner continuation **"hazlo"** reopens AUTO-6 isolated UI correction/proof and AUTO-4 recovery of missing B2 audit prerequisites, in that order. Prefer installed/retained audit inputs; any necessary provisioning stays disposable and project-local. Renewed job23 conclusively reproduced stale Home recents (UI0/API1/reload1; five captures/25 real responses), not full visual acceptance. Ordered AUTO-12 now fixes successful-open config invalidation, focused RED15/5→GREEN20/0; job24 build caught fixture typing (other gates pass); job25 corrected fullfrontend/tests/build pass, independent item3 PASS20+14 probes and parent focused spotcheck0. Job26 integration with new frontend assets PASS (Rust2998/0/25ignored, fmt/Clippy/cleanup0). AUTO-12 locally committed c5cf3c4; AUTO-6 bounded job27 PASS: four cases/72 captures/496 real responses, full no-write checks and scoped normal cleanup; not full visual/native acceptance. Public unverified-warning setup and full SDK-OS closure remain unverified; sampled transient toast readability is not accepted. [Report](../docs/UI-ACCEPTANCE-2026-10-25.md). AUTO-4 is now active for B2 prerequisite recovery, no scanner/DB/dependency result yet. [Owner](tasks/autonomous-2026-10-25.md) S3/L31 is current; AUTO-11 tracks the renewed closeout. All local-only, secrets, real-game and retained-evidence restrictions remain.
+
 ## Local checkpoint — 2026-10-25
 
 Latest verified source/test candidate: **`56b165c`**, local `main` only. Parent job22 passed focused HTTP1/0, Rust2998/0/25ignored across120 suites, frontend1121/0/0skipped, production frontend build, fmt and strict Clippy. The25ignored Rust tests were not run. No push, new remote CI, native Tauri or game-runtime certification.
