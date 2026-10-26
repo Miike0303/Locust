@@ -266,7 +266,10 @@ fn pack_recovers_the_recorded_store_after_reopen_for_directory_and_file() {
         db.record_injection_with_backup(Some("es"), &game, &[source], Some(&provenance))
             .unwrap();
         let saved_zip = fs::read(&options.output).unwrap();
-        original_store.delete_backup(&backup.id).unwrap();
+        // Model external loss without invoking the provenance-protected delete API.
+        let missing = backup.path.canonicalize().unwrap();
+        assert!(missing.starts_with(original_store.root().canonicalize().unwrap()));
+        fs::remove_dir_all(missing).unwrap();
         assert!(pack_with_pristine_backup(&db, options.clone(), &other_store, None, true).is_err());
         assert_eq!(fs::read(&options.output).unwrap(), saved_zip);
         // An explicitly supplied intact copy remains a supported recovery route.

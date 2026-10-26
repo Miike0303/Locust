@@ -17,10 +17,15 @@ impl Database {
         }
         let conn = Connection::open(path)?;
         init_schema(&conn)?;
-        Ok(Self {
+        let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             path: Mutex::new(path.to_path_buf()),
-        })
+        };
+        if let Err(error) = db.index_backup_references() {
+            tracing::warn!(database = %path.display(), %error,
+                "Backup reference indexing is unavailable; deletion requires verified references");
+        }
+        Ok(db)
     }
 
     /// Open an existing database without creating directories or migrating it.

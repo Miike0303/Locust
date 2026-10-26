@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -11,7 +11,138 @@ use super::{
     InjectionRecording, RecordedBackup, RecordedFile,
 };
 
+impl RecordedBackup {
+    /// Legacy restore/pack provenance uses the effective fallback store.
+    pub fn resolved_storage_root(&self) -> PathBuf {
+        self.storage_root
+            .clone()
+            .unwrap_or_else(crate::backup::effective_backup_root)
+    }
+}
+
 impl Database {
+    /// Backfill existing provenance when a project is opened or switched in.
+    pub(super) fn index_backup_references(&self) -> Result<()> {
+        let conn = lock_connection(&self.conn);
+        self.with_backup_reference_update(&conn, &[], || Ok(()))
+    }
+
+    fn backup_refs_from(conn: &Connection) -> Result<Vec<RecordedBackup>> {
+        let mut stmt = conn.prepare(
+            "SELECT pristine_backup FROM injected_files WHERE pristine_backup IS NOT NULL
+             UNION SELECT registration_backup FROM injected_files WHERE registration_backup IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    /// Read committed provenance without creating or migrating a project DB.
+    pub(crate) fn backup_refs_at(path: &Path) -> Result<Vec<RecordedBackup>> {
+        let db = Self::read_project_snapshot(path)?;
+        let conn = lock_connection(&db.conn);
+        Self::backup_refs_from(&conn)
+    }
+
+    fn with_backup_reference_update<T>(
+        &self,
+        conn: &Connection,
+        incoming: &[&RecordedBackup],
+        update: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let path = self.path();
+        if path == Path::new(":memory:") {
+            return update();
+        }
+        let path = path.canonicalize()?;
+        let previous = Self::backup_refs_from(conn)?;
+        // Lock all affected stores in identity order to avoid cross-store deadlocks.
+        let mut roots = BTreeMap::new();
+        for backup in previous.iter().chain(incoming.iter().copied()) {
+            let root = backup.resolved_storage_root();
+            roots.insert(path_identity_key(&root), root);
+        }
+        let mut indexes = Vec::new();
+        for (identity, root) in roots {
+            let ids: BTreeSet<_> = previous
+                .iter()
+                .chain(incoming.iter().copied())
+                .filter(|backup| path_identity_key(&backup.resolved_storage_root()) == identity)
+                .map(|backup| backup.id.clone())
+                .collect();
+            let warn = |error: &LocustError| {
+                tracing::warn!(database = %path.display(), %error, "Backup reference indexing unavailable; project operation continues");
+                crate::backup::BackupReferenceIndex::mark_unverified(&root, &ids);
+            };
+            let index = match crate::backup::BackupReferenceIndex::open(&root) {
+                Ok(index) => index,
+                Err(error) => {
+                    warn(&error);
+                    continue;
+                }
+            };
+            // Missing modern backups are invalid provenance, independently of
+            // best-effort index writes. Validate while holding deletion exclusion.
+            for backup in incoming {
+                if backup.storage_root.is_some()
+                    && path_identity_key(&backup.resolved_storage_root()) == identity
+                {
+                    index.ensure_backup_exists(&backup.id)?;
+                }
+            }
+            // Reserve references before commit, holding exclusion through commit.
+            // Neither pending nor committed project writes establish globally
+            // complete ownership history for a pre-index backup.
+            if let Err(error) = index.replace_project(&path, &ids) {
+                warn(&error);
+            }
+            indexes.push((identity, root, ids, index));
+        }
+        let result = update()?;
+        let current = Self::backup_refs_from(conn)?;
+        for (identity, root, affected, index) in indexes {
+            let ids: BTreeSet<_> = current
+                .iter()
+                .filter(|backup| path_identity_key(&backup.resolved_storage_root()) == identity)
+                .map(|backup| backup.id.clone())
+                .collect();
+            if let Err(error) = index.replace_project(&path, &ids) {
+                tracing::warn!(database = %path.display(), %error, "Backup reference index update failed; project operation completed");
+                crate::backup::BackupReferenceIndex::mark_unverified(&root, &affected);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Explicitly release a backup across all languages while retaining output
+    /// hashes. Packing can no longer use these originals after this operation.
+    pub fn release_backup_reference(&self, backup: &RecordedBackup) -> Result<()> {
+        let conn = lock_connection(&self.conn);
+        self.with_backup_reference_update(&conn, &[], || {
+            let tx = conn.unchecked_transaction()?;
+            let mut changes = Vec::new();
+            {
+                let mut stmt = tx.prepare("SELECT id, pristine_backup, registration_backup FROM injected_files")?;
+                let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)))?;
+                for row in rows {
+                    let (id, pristine, registration) = row?;
+                    let matches = |json: &Option<String>| -> Result<bool> {
+                        let reference = json.as_deref().map(serde_json::from_str::<RecordedBackup>).transpose()?;
+                        Ok(reference.as_ref().is_some_and(|reference| {
+                            reference.id == backup.id && super::paths_identical(
+                                &reference.resolved_storage_root(), &backup.resolved_storage_root())
+                        }))
+                    };
+                    changes.push((id, matches(&pristine)?, matches(&registration)?));
+                }
+            }
+            for (id, pristine, registration) in changes {
+                tx.execute("UPDATE injected_files SET pristine_backup = CASE WHEN ?2 THEN NULL ELSE pristine_backup END, registration_backup = CASE WHEN ?3 THEN NULL ELSE registration_backup END WHERE id = ?1", params![id, pristine, registration])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn get_project_metadata(&self, key: &str) -> Result<Option<serde_json::Value>> {
         let conn = lock_connection(&self.conn);
         let mut stmt = conn.prepare("SELECT value FROM project_metadata WHERE key = ?1")?;
@@ -128,6 +259,9 @@ impl Database {
         if written.is_empty() {
             return Ok(());
         }
+        let mut incoming = Vec::new();
+        incoming.extend(pristine_backup);
+        incoming.extend(extension.and_then(|(_, backup)| backup));
         let pristine_backup = pristine_backup.map(serde_json::to_string).transpose()?;
         let root_abs = std::path::absolute(root)?;
         let mut seen: HashMap<String, (String, PathBuf)> = HashMap::new();
@@ -179,55 +313,57 @@ impl Database {
         let root_str = root_abs.to_string_lossy().to_string();
         let now = Utc::now().to_rfc3339();
         let conn = lock_connection(&self.conn);
-        let tx = conn.unchecked_transaction()?;
-        let mut registration_backups = HashMap::new();
-        if let Some((expected, backup)) = extension {
-            if Self::get_injection_from(&tx, lang)?.as_ref() != Some(expected) {
-                return Err(LocustError::InjectionError(
-                    "injection recording changed during language registration".into(),
-                ));
-            }
-            let mut stmt =
-                tx.prepare("SELECT rel, registration_backup FROM injected_files WHERE lang IS ?1")?;
-            let saved = stmt.query_map(params![lang], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?;
-            for row in saved {
-                let (rel, backup) = row?;
-                registration_backups.insert(fold_path_case(&rel), backup);
-            }
-            let backup = backup.map(serde_json::to_string).transpose()?;
-            for (rel, _, _) in &rows {
-                registration_backups
-                    .entry(fold_path_case(rel))
-                    .or_insert_with(|| backup.clone());
-            }
-        }
-        tx.execute("DELETE FROM injected_files WHERE lang IS ?1", params![lang])?;
-        // Same class as save_entries/merge_entries: one plan for N file rows
-        // (Unreal/Unity injects can record hundreds of written paths).
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO injected_files (lang, root, rel, hash, size, recorded_at, pristine_backup, registration_backup)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for (rel, hash, size) in &rows {
-                insert.execute(params![
-                    lang,
-                    root_str,
-                    rel,
-                    hash,
-                    *size as i64,
-                    now,
-                    pristine_backup,
+        self.with_backup_reference_update(&conn, &incoming, || {
+            let tx = conn.unchecked_transaction()?;
+            let mut registration_backups = HashMap::new();
+            if let Some((expected, backup)) = extension {
+                if Self::get_injection_from(&tx, lang)?.as_ref() != Some(expected) {
+                    return Err(LocustError::InjectionError(
+                        "injection recording changed during language registration".into(),
+                    ));
+                }
+                let mut stmt =
+                    tx.prepare("SELECT rel, registration_backup FROM injected_files WHERE lang IS ?1")?;
+                let saved = stmt.query_map(params![lang], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
+                for row in saved {
+                    let (rel, backup) = row?;
+                    registration_backups.insert(fold_path_case(&rel), backup);
+                }
+                let backup = backup.map(serde_json::to_string).transpose()?;
+                for (rel, _, _) in &rows {
                     registration_backups
-                        .get(&fold_path_case(rel))
-                        .and_then(Option::as_ref)
-                ])?;
+                        .entry(fold_path_case(rel))
+                        .or_insert_with(|| backup.clone());
+                }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            tx.execute("DELETE FROM injected_files WHERE lang IS ?1", params![lang])?;
+            // Same class as save_entries/merge_entries: one plan for N file rows
+            // (Unreal/Unity injects can record hundreds of written paths).
+            {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO injected_files (lang, root, rel, hash, size, recorded_at, pristine_backup, registration_backup)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                for (rel, hash, size) in &rows {
+                    insert.execute(params![
+                        lang,
+                        root_str,
+                        rel,
+                        hash,
+                        *size as i64,
+                        now,
+                        pristine_backup,
+                        registration_backups
+                            .get(&fold_path_case(rel))
+                            .and_then(Option::as_ref)
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// The recording persisted by [`Self::record_injection`] for exactly this

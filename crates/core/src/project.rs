@@ -315,7 +315,7 @@ fn resolve_project_db_path_with(
 /// Both locations are returned without probing parent writability: an existing
 /// file at either path is a saved project, even if a later extract would have
 /// chosen the other location.
-fn saved_project_db_candidates(game_root: &Path, config_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn saved_project_db_candidates(game_root: &Path, config_dir: &Path) -> Vec<PathBuf> {
     let raw_name = game_root
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())

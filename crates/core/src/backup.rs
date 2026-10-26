@@ -10,8 +10,208 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+/// Resolve the same profile used by default restore/pack callers.
+pub(crate) fn reference_profile_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(profile) = tests::REFERENCE_PROFILE.with(|profile| profile.borrow().clone()) {
+        return profile;
+    }
+    crate::config::AppConfig::config_dir()
+}
+
+/// Effective fallback store shared by restore, packing and legacy provenance.
+pub fn effective_backup_root() -> PathBuf {
+    std::env::var_os("LOCUST_BACKUP_ROOT")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| reference_profile_dir().join("backups"))
+}
+
 pub struct BackupManager {
     backup_root: PathBuf,
+}
+
+/// Durable reverse references, serialized with deletion across processes. The
+/// lock file is never removed: replacing it would create two lock domains.
+pub(crate) struct BackupReferenceIndex {
+    conn: rusqlite::Connection,
+    _lock: Option<fs::File>,
+    root: PathBuf,
+}
+
+impl BackupReferenceIndex {
+    pub(crate) fn open(root: &Path) -> Result<Self> {
+        let lock = Self::lock_store(root)?;
+        let mut index = Self::open_locked(root)?;
+        index._lock = Some(lock);
+        Ok(index)
+    }
+
+    fn lock_store(root: &Path) -> Result<fs::File> {
+        let root = checked_absolute(root)?;
+        fs::create_dir_all(&root)?;
+        let path = checked_absolute(&root.join(".backup-references.lock"))?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x0020_0000).share_mode(0x0000_0003);
+        }
+        let lock = options.open(&path)?;
+        reject_link(&path, &lock.metadata()?)?;
+        lock.lock()?;
+        Ok(lock)
+    }
+
+    // Caller retains the store lock even if SQLite cannot be opened.
+    fn open_locked(root: &Path) -> Result<Self> {
+        let root = checked_absolute(root)?;
+        let conn = rusqlite::Connection::open(checked_absolute(
+            &root.join(".backup-references.sqlite3"),
+        )?)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS backup_references (
+                backup_id TEXT NOT NULL,
+                database_path TEXT NOT NULL,
+                PRIMARY KEY (backup_id, database_path)
+            );
+            CREATE TABLE IF NOT EXISTS indexed_backups (backup_id TEXT PRIMARY KEY)",
+        )?;
+        Ok(Self {
+            conn,
+            _lock: None,
+            root,
+        })
+    }
+
+    // Only a newly created backup has complete ownership history in this index.
+    // Discovering references in one project cannot establish that for old backups.
+    fn mark_authoritative(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("INSERT OR IGNORE INTO indexed_backups VALUES (?1)", [id])?;
+        Ok(())
+    }
+
+    /// Persist uncertainty outside SQLite so recovering a failed index cannot
+    /// make an unindexed committed reference appear safe to delete.
+    pub(crate) fn mark_unverified(root: &Path, ids: &BTreeSet<String>) {
+        let manager = BackupManager::new(root.to_owned());
+        for id in ids {
+            let mark = || -> Result<()> {
+                let dir = manager.resolve_backup_dir(id)?;
+                if dir.is_dir() {
+                    let path =
+                        checked_absolute(&root.join(format!(".backup-reference-unverified-{id}")))?;
+                    let mut marker = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(path)?;
+                    marker.write_all(b"index update failed")?;
+                    marker.sync_all()?;
+                }
+                Ok(())
+            };
+            if let Err(error) = mark() {
+                tracing::warn!(%error, backup = %id, "Cannot persist backup reference uncertainty");
+            }
+        }
+    }
+
+    pub(crate) fn ensure_backup_exists(&self, backup_id: &str) -> Result<()> {
+        let manager = BackupManager::new(self.root.clone());
+        if !manager.resolve_backup_dir(backup_id)?.is_dir() {
+            return Err(failure("cannot record a reference to a missing backup"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn add(&self, backup_id: &str, database: &Path) -> Result<()> {
+        self.ensure_backup_exists(backup_id)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO backup_references VALUES (?1, ?2)",
+            rusqlite::params![backup_id, database.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    /// Update known references without changing store-wide completeness: other
+    /// unopened legacy projects may still reference any of these backups.
+    pub(crate) fn replace_project(&self, database: &Path, ids: &BTreeSet<String>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM backup_references WHERE database_path = ?1",
+            [database.to_string_lossy()],
+        )?;
+        for id in ids {
+            tx.execute(
+                "INSERT INTO backup_references VALUES (?1, ?2)",
+                rusqlite::params![id, database.to_string_lossy()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn referencing_projects(&self, backup_id: &str) -> Result<(usize, bool)> {
+        let mut authoritative: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM indexed_backups WHERE backup_id = ?1)",
+            [backup_id],
+            |row| row.get(0),
+        )?;
+        if self
+            .root
+            .join(format!(".backup-reference-unverified-{backup_id}"))
+            .try_exists()
+            .unwrap_or(true)
+        {
+            authoritative = false;
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT database_path FROM backup_references WHERE backup_id = ?1")?;
+        let paths = stmt
+            .query_map([backup_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut projects = BTreeMap::new();
+        for path in paths.into_iter().map(PathBuf::from) {
+            projects.insert(crate::database::path_identity_key(&path), path);
+        }
+        let mut count = 0;
+        for database in projects.values() {
+            let check = || -> Result<bool> {
+                Ok(database.try_exists()?
+                    && crate::database::Database::backup_refs_at(database)?
+                        .iter()
+                        .any(|backup| {
+                            backup.id == backup_id
+                                && crate::database::paths_identical(
+                                    &backup.resolved_storage_root(),
+                                    &self.root,
+                                )
+                        }))
+            };
+            match check() {
+                Ok(true) => count += 1,
+                Ok(false) => {
+                    if let Err(error) = self.conn.execute(
+                        "DELETE FROM backup_references WHERE backup_id = ?1 AND database_path = ?2",
+                        rusqlite::params![backup_id, database.to_string_lossy()],
+                    ) {
+                        tracing::warn!(%error, "Cannot prune stale backup reference");
+                        authoritative = false;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(database = %database.display(), %error, "Cannot verify backup reference");
+                    authoritative = false;
+                }
+            }
+        }
+        Ok((count, authoritative))
+    }
 }
 
 /// File changes a restore would make after passing its locked preflight.
@@ -716,6 +916,12 @@ impl BackupManager {
         file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
         file.sync_all()?;
         drop(file);
+        let indexed = BackupReferenceIndex::open(&self.backup_root)
+            .and_then(|index| index.mark_authoritative(&id));
+        if let Err(error) = indexed {
+            tracing::warn!(%error, backup = %id, "Backup created without authoritative reference index");
+            BackupReferenceIndex::mark_unverified(&self.backup_root, &BTreeSet::from([id.clone()]));
+        }
         fs::rename(path.join("manifest.pending"), path.join("manifest.json"))?;
         Ok(BackupEntry {
             id,
@@ -1292,7 +1498,40 @@ impl BackupManager {
     }
 
     pub fn delete_backup(&self, backup_id: &str) -> Result<()> {
+        self.delete_backup_with_confirmation(backup_id, false)
+    }
+
+    /// Confirmation applies only to unverified backups, never live references.
+    pub fn delete_backup_with_confirmation(
+        &self,
+        backup_id: &str,
+        confirm_unverified: bool,
+    ) -> Result<()> {
         let dir = self.resolve_backup_dir(backup_id)?;
+        if !dir.try_exists()? {
+            return Ok(());
+        }
+        let unverified =
+            || failure("Locust cannot confirm that no project still needs this backup");
+        // Retain cross-process exclusion through removal, including corrupt-index overrides.
+        let _lock = BackupReferenceIndex::lock_store(&self.backup_root).map_err(|error| {
+            tracing::warn!(%error, "Backup reference store is unavailable");
+            unverified()
+        })?;
+        let status = BackupReferenceIndex::open_locked(&self.backup_root)
+            .and_then(|index| index.referencing_projects(backup_id));
+        let (projects, authoritative) = status.unwrap_or_else(|error| {
+            tracing::warn!(%error, "Backup reference index is unavailable");
+            (0, false)
+        });
+        if projects != 0 {
+            return Err(failure(format!(
+                "backup is referenced by {projects} project(s); release their references before deleting it"
+            )));
+        }
+        if !authoritative && !confirm_unverified {
+            return Err(unverified());
+        }
         if dir.exists() {
             // Validate descendants before recursive removal; do not follow links.
             for entry in WalkDir::new(&dir).follow_links(false) {
@@ -1319,6 +1558,781 @@ impl BackupManager {
 mod tests {
     use super::*;
     use std::fs;
+
+    thread_local! {
+        pub(super) static REFERENCE_PROFILE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct ReferenceProfile {
+        _directory: tempfile::TempDir,
+    }
+
+    impl ReferenceProfile {
+        fn isolated() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            REFERENCE_PROFILE
+                .with(|profile| *profile.borrow_mut() = Some(directory.path().to_owned()));
+            Self {
+                _directory: directory,
+            }
+        }
+    }
+
+    impl Drop for ReferenceProfile {
+        fn drop(&mut self) {
+            REFERENCE_PROFILE.with(|profile| *profile.borrow_mut() = None);
+        }
+    }
+
+    fn referenced_backup_fixture() -> (
+        tempfile::TempDir,
+        BackupManager,
+        BackupEntry,
+        crate::database::Database,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game-a");
+        fs::create_dir(&game).unwrap();
+        let file = game.join("story.txt");
+        fs::write(&file, b"original").unwrap();
+        let manager = BackupManager::new(temp.path().join("backups"));
+        let entry = manager.create_backup(&game).unwrap();
+        let db = crate::database::Database::open(&temp.path().join("a.db")).unwrap();
+        let backup = crate::database::RecordedBackup {
+            id: entry.id.clone(),
+            source_path: game.clone(),
+            storage_root: Some(manager.root().to_owned()),
+        };
+        db.record_injection_with_backup(Some("es"), &game, &[file], Some(&backup))
+            .unwrap();
+        (temp, manager, entry, db)
+    }
+
+    fn pre_index_project(
+        path: &Path,
+        entry: &BackupEntry,
+        store: Option<&Path>,
+        registration: bool,
+    ) {
+        let db = crate::database::Database::open(path).unwrap();
+        let (root, file) = if entry.source_path.is_file() {
+            (
+                entry.source_path.parent().unwrap(),
+                entry.source_path.clone(),
+            )
+        } else {
+            (
+                entry.source_path.as_path(),
+                entry.source_path.join("story.txt"),
+            )
+        };
+        db.record_injection(Some("es"), root, &[file]).unwrap();
+        drop(db);
+        let reference = crate::database::RecordedBackup {
+            id: entry.id.clone(),
+            source_path: entry.source_path.clone(),
+            storage_root: store.map(Path::to_path_buf),
+        };
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let column = if registration {
+            "registration_backup"
+        } else {
+            "pristine_backup"
+        };
+        conn.execute(
+            &format!("UPDATE injected_files SET {column} = ?1"),
+            [serde_json::to_string(&reference).unwrap()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn backup_custom_location_pre_upgrade_is_unverified() {
+        let (temp, manager, entry, db) = referenced_backup_fixture();
+        let path = temp.path().join("arbitrary-output/deep/custom.db");
+        pre_index_project(&path, &entry, Some(manager.root()), false);
+        drop(db);
+        fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+        let before = fs::read(&path).unwrap();
+        let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+        assert!(
+            error.contains("Locust cannot confirm that no project still needs this backup"),
+            "{error}"
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(entry.path.exists());
+        manager
+            .delete_backup_with_confirmation(&entry.id, true)
+            .unwrap();
+        assert!(!entry.path.exists());
+    }
+
+    #[test]
+    fn backup_corrupt_index_does_not_block_record_or_release() {
+        for release in [false, true] {
+            let (_temp, manager, entry, db) = referenced_backup_fixture();
+            let recording = db.get_injection(Some("es")).unwrap().unwrap();
+            fs::write(
+                manager.root().join(".backup-references.sqlite3"),
+                b"invalid index",
+            )
+            .unwrap();
+            if release {
+                db.release_backup_reference(recording.pristine_backup.as_ref().unwrap())
+                    .unwrap();
+            } else {
+                db.record_injection(
+                    Some("es"),
+                    &recording.root,
+                    &[recording.root.join("story.txt")],
+                )
+                .unwrap();
+            }
+            assert!(db
+                .get_injection(Some("es"))
+                .unwrap()
+                .unwrap()
+                .pristine_backup
+                .is_none());
+            let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+            assert!(
+                error.contains("Locust cannot confirm that no project still needs this backup"),
+                "{error}"
+            );
+            assert!(entry.path.exists());
+            // A recovered empty SQLite index must retain the uncertainty marker.
+            fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+            BackupReferenceIndex::open(manager.root())
+                .unwrap()
+                .mark_authoritative(&entry.id)
+                .unwrap();
+            assert!(manager.delete_backup(&entry.id).is_err());
+            manager
+                .delete_backup_with_confirmation(&entry.id, true)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn backup_legacy_override_store_is_protected() {
+        if std::env::var_os("LOCUST_CORE8_OVERRIDE_CHILD").is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup::tests::backup_legacy_override_store_is_protected",
+                    "--nocapture",
+                ])
+                .env("LOCUST_CORE8_OVERRIDE_CHILD", "1")
+                .env("LOCUST_DATA_DIR", temp.path().join("profile"))
+                .env("LOCUST_BACKUP_ROOT", temp.path().join("override"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let file = game.join("story.txt");
+        fs::write(&file, b"original").unwrap();
+        let manager = BackupManager::new(std::env::var_os("LOCUST_BACKUP_ROOT").unwrap().into());
+        let entry = manager.create_backup(&game).unwrap();
+        let db = crate::database::Database::open(&temp.path().join("custom.db")).unwrap();
+        let reference = crate::database::RecordedBackup {
+            id: entry.id.clone(),
+            source_path: game.clone(),
+            storage_root: None,
+        };
+        db.record_injection_with_backup(Some("es"), &game, &[file], Some(&reference))
+            .unwrap();
+        let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+        assert!(error.contains("referenced by 1 project(s)"), "{error}");
+    }
+
+    #[test]
+    fn backup_delete_checks_unopened_pre_index_projects() {
+        let _profile = ReferenceProfile::isolated();
+        for location in ["adjacent", "current-profile", "origin-profile"] {
+            for registration in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let game = temp.path().join("game-a");
+                fs::create_dir(&game).unwrap();
+                fs::write(game.join("story.txt"), b"original").unwrap();
+                let manager = BackupManager::new(temp.path().join("backups"));
+                let entry = manager.create_backup(&game).unwrap();
+                let path = if location == "adjacent" {
+                    temp.path().join("game-a.locust.db")
+                } else {
+                    let hash = crate::database::sha256_hex(game.to_string_lossy().as_bytes());
+                    let profile = if location == "origin-profile" {
+                        temp.path().to_owned()
+                    } else {
+                        reference_profile_dir()
+                    };
+                    profile
+                        .join("projects")
+                        .join(format!("game-a-{}.locust.db", &hash[..8]))
+                };
+                pre_index_project(&path, &entry, Some(manager.root()), registration);
+                let before = fs::read(&path).unwrap();
+                fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+                let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+                assert!(
+                    error.contains("Locust cannot confirm that no project still needs this backup"),
+                    "{error}"
+                );
+                assert!(entry.path.is_dir());
+                assert_eq!(fs::read(&path).unwrap(), before);
+                fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn backup_delete_checks_unopened_single_file_origin_and_folder_projects() {
+        for folder_project in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game-a");
+            fs::create_dir(&game).unwrap();
+            let file = game.join("story.txt");
+            fs::write(&file, b"original").unwrap();
+            let manager = BackupManager::new(temp.path().join("backups"));
+            let entry = manager.create_backup(&file).unwrap();
+            let path = if folder_project {
+                temp.path().join("game-a.locust.db")
+            } else {
+                game.join("story.txt.locust.db")
+            };
+            pre_index_project(&path, &entry, Some(manager.root()), false);
+            fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+            let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+            assert!(
+                error.contains("Locust cannot confirm that no project still needs this backup"),
+                "{error}"
+            );
+            assert!(entry.path.is_dir());
+        }
+    }
+
+    #[test]
+    fn backup_delete_does_not_scan_unrelated_unreadable_project() {
+        let (temp, manager, entry, db) = referenced_backup_fixture();
+        db.release_backup_reference(
+            &db.get_injection(Some("es"))
+                .unwrap()
+                .unwrap()
+                .pristine_backup
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(temp.path().join("game-a.locust.db"), b"corrupt project").unwrap();
+        manager.delete_backup(&entry.id).unwrap();
+        assert!(!entry.path.exists());
+    }
+
+    #[test]
+    fn backup_delete_uses_listed_projects_without_origin_discovery() {
+        let (temp, manager, entry, db) = referenced_backup_fixture();
+        pre_index_project(
+            &temp.path().join("game-a.locust.db"),
+            &entry,
+            Some(manager.root()),
+            false,
+        );
+        drop(db);
+        let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+        assert!(error.contains("referenced by 1 project(s)"), "{error}");
+        assert!(entry.path.is_dir());
+    }
+
+    #[test]
+    fn backup_authoritative_delete_does_not_depend_on_origin_manifest() {
+        for damage in ["missing", "corrupt", "relative"] {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game");
+            fs::create_dir(&game).unwrap();
+            let manager = BackupManager::new(temp.path().join("backups"));
+            let entry = manager.create_backup(&game).unwrap();
+            let manifest = entry.path.join("manifest.json");
+            match damage {
+                "missing" => fs::remove_file(&manifest).unwrap(),
+                "corrupt" => fs::write(&manifest, b"invalid").unwrap(),
+                _ => {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+                    value["source_path"] = serde_json::json!("relative-game");
+                    fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+            }
+            manager.delete_backup(&entry.id).unwrap();
+            assert!(!entry.path.exists());
+        }
+    }
+
+    #[test]
+    fn backup_open_healthy_project_with_unavailable_index() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let path = db.path();
+        let recording = db.get_injection(Some("es")).unwrap();
+        drop(db);
+        fs::write(
+            manager.root().join(".backup-references.sqlite3"),
+            b"invalid index",
+        )
+        .unwrap();
+        let reopened = crate::database::Database::open(&path)
+            .expect("a broken index must not block a healthy project");
+        assert_eq!(reopened.get_injection(Some("es")).unwrap(), recording);
+        reopened
+            .set_project_metadata("still-usable", &serde_json::json!(true))
+            .unwrap();
+        assert_eq!(
+            reopened.get_project_metadata("still-usable").unwrap(),
+            Some(serde_json::json!(true))
+        );
+        assert!(manager.delete_backup(&entry.id).is_err());
+        assert!(entry.path.is_dir());
+    }
+
+    #[test]
+    fn backup_legacy_default_store_is_indexed_on_record_and_reopen() {
+        let _profile = ReferenceProfile::isolated();
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("legacy-game");
+        fs::create_dir(&game).unwrap();
+        let file = game.join("story.txt");
+        fs::write(&file, b"original").unwrap();
+        let manager = BackupManager::new(reference_profile_dir().join("backups"));
+        let entry = manager.create_backup(&game).unwrap();
+        let path = temp.path().join("custom.db");
+        let db = crate::database::Database::open(&path).unwrap();
+        let reference = crate::database::RecordedBackup {
+            id: entry.id.clone(),
+            source_path: entry.source_path.clone(),
+            storage_root: None,
+        };
+        db.record_injection_with_backup(Some("es"), &game, &[file], Some(&reference))
+            .unwrap();
+        for reopen in [false, true] {
+            if reopen {
+                let index = BackupReferenceIndex::open(manager.root()).unwrap();
+                index
+                    .conn
+                    .execute(
+                        "DELETE FROM backup_references WHERE backup_id = ?1",
+                        [&entry.id],
+                    )
+                    .unwrap();
+                drop(index);
+                drop(crate::database::Database::open(&path).unwrap());
+            }
+            let index = BackupReferenceIndex::open(manager.root()).unwrap();
+            let count: usize = index
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM backup_references WHERE backup_id = ?1",
+                    [&entry.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "legacy provenance must be indexed; reopen={reopen}"
+            );
+            drop(index);
+            assert!(manager.delete_backup(&entry.id).is_err());
+        }
+        let resolved = crate::database::RecordedBackup {
+            storage_root: Some(manager.root().to_owned()),
+            ..reference
+        };
+        db.release_backup_reference(&resolved).unwrap();
+        assert!(db
+            .get_injection(Some("es"))
+            .unwrap()
+            .unwrap()
+            .pristine_backup
+            .is_none());
+        manager.delete_backup(&entry.id).unwrap();
+    }
+
+    #[test]
+    fn backup_delete_checks_unopened_legacy_default_store_project() {
+        let _profile = ReferenceProfile::isolated();
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game-a");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("story.txt"), b"original").unwrap();
+        let manager = BackupManager::new(reference_profile_dir().join("backups"));
+        let entry = manager.create_backup(&game).unwrap();
+        let path = temp.path().join("game-a.locust.db");
+        pre_index_project(&path, &entry, None, false);
+        fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+        let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+        assert!(
+            error.contains("Locust cannot confirm that no project still needs this backup"),
+            "{error}"
+        );
+        assert!(entry.path.is_dir());
+        fs::remove_file(path).unwrap();
+        manager
+            .delete_backup_with_confirmation(&entry.id, true)
+            .unwrap();
+    }
+
+    #[test]
+    fn backup_delete_checks_persisted_project_references_after_restart() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        drop(db);
+        let restarted = BackupManager::new(manager.root().to_owned());
+        let error = restarted.delete_backup(&entry.id).unwrap_err().to_string();
+        assert!(error.contains("referenced by 1 project(s)"), "{error}");
+        assert!(entry.path.exists());
+    }
+
+    #[test]
+    fn backup_open_existing_project_backfills_reference_index() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let path = db.path();
+        drop(db);
+        // Simulate provenance written by a release predating the reverse index.
+        fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+        let reopened = crate::database::Database::open(&path).unwrap();
+        drop(reopened);
+        let restarted = BackupManager::new(manager.root().to_owned());
+        assert!(restarted.delete_backup(&entry.id).is_err());
+        assert!(entry.path.exists());
+    }
+
+    #[test]
+    fn backup_delete_cleans_deleted_project_reference() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let path = db.path();
+        drop(db);
+        fs::remove_file(&path).unwrap();
+        manager.delete_backup(&entry.id).unwrap();
+        assert!(!entry.path.exists());
+        assert!(
+            !path.exists(),
+            "read-only checks must not recreate a database"
+        );
+        let index = BackupReferenceIndex::open(manager.root()).unwrap();
+        assert_eq!(
+            index
+                .conn
+                .query_row("SELECT COUNT(*) FROM backup_references", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn backup_delete_rechecks_released_reference_read_only() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let path = db.path();
+        drop(db);
+        // Simulate a project release outside this process, leaving a stale index.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM injected_files", []).unwrap();
+        drop(conn);
+        let before = fs::read(&path).unwrap();
+        manager.delete_backup(&entry.id).unwrap();
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(!entry.path.exists());
+    }
+
+    #[test]
+    fn backup_delete_counts_projects_once_across_languages() {
+        let (temp, manager, entry, db) = referenced_backup_fixture();
+        let reference = db
+            .get_injection(Some("es"))
+            .unwrap()
+            .unwrap()
+            .pristine_backup
+            .unwrap();
+        let file = reference.source_path.join("story.txt");
+        db.record_injection_with_backup(
+            Some("fr"),
+            &reference.source_path,
+            std::slice::from_ref(&file),
+            Some(&reference),
+        )
+        .unwrap();
+        let second = crate::database::Database::open(&temp.path().join("b.db")).unwrap();
+        second
+            .record_injection_with_backup(None, &reference.source_path, &[file], Some(&reference))
+            .unwrap();
+        let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+        assert!(error.contains("referenced by 2 project(s)"), "{error}");
+    }
+
+    #[test]
+    fn backup_confirmation_never_overrides_live_reference_with_unreadable_peer() {
+        let (temp, manager, entry, _db) = referenced_backup_fixture();
+        let corrupt = temp.path().join("corrupt.db");
+        fs::write(&corrupt, b"invalid database").unwrap();
+        BackupReferenceIndex::open(manager.root())
+            .unwrap()
+            .add(&entry.id, &corrupt)
+            .unwrap();
+        let error = manager
+            .delete_backup_with_confirmation(&entry.id, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("referenced by 1 project(s)"), "{error}");
+        assert!(entry.path.exists());
+    }
+
+    #[test]
+    fn backup_uncertainty_marker_never_becomes_legacy_game_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let manager = BackupManager::new(temp.path().join("backups"));
+        let dir = manager.root().join("legacy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("story.txt"), b"original").unwrap();
+        let manifest = BackupManifest {
+            source_path: game.clone(),
+            created_at: Utc::now(),
+            file_count: 1,
+            size_bytes: 8,
+        };
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        BackupReferenceIndex::mark_unverified(manager.root(), &BTreeSet::from(["legacy".into()]));
+        manager.restore("legacy").unwrap();
+        assert_eq!(fs::read(game.join("story.txt")).unwrap(), b"original");
+        assert_eq!(
+            fs::read_dir(&game).unwrap().count(),
+            1,
+            "index bookkeeping must never be restored as game content"
+        );
+    }
+
+    #[test]
+    fn backup_failed_recording_does_not_authorize_unverified_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let file = game.join("story.txt");
+        fs::write(&file, b"original").unwrap();
+        let manager = BackupManager::new(temp.path().join("backups"));
+        let entry = manager.create_backup(&game).unwrap();
+        fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+        let path = temp.path().join("project.db");
+        let db = crate::database::Database::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_recording BEFORE INSERT ON injected_files BEGIN SELECT RAISE(FAIL, 'project write failed'); END;").unwrap();
+        let reference = crate::database::RecordedBackup {
+            id: entry.id.clone(),
+            source_path: game.clone(),
+            storage_root: Some(manager.root().to_owned()),
+        };
+        assert!(db
+            .record_injection_with_backup(Some("es"), &game, &[file], Some(&reference))
+            .is_err());
+        assert!(db.get_injection(Some("es")).unwrap().is_none());
+        let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+        assert!(error.contains("Locust cannot confirm"), "{error}");
+    }
+
+    #[test]
+    fn backup_successful_record_and_release_cannot_authorize_legacy_ownership() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let recording = db.get_injection(Some("es")).unwrap().unwrap();
+        let reference = recording.pristine_backup.as_ref().unwrap();
+        // A successful new recording against an old backup is still not proof
+        // that every other project's pre-index provenance has been discovered.
+        fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+        db.record_injection_with_backup(
+            Some("fr"),
+            &recording.root,
+            &[recording.root.join("story.txt")],
+            Some(reference),
+        )
+        .unwrap();
+        let error = manager
+            .delete_backup_with_confirmation(&entry.id, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("referenced by 1 project(s)"), "{error}");
+        db.release_backup_reference(reference).unwrap();
+        let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+        assert!(error.contains("Locust cannot confirm"), "{error}");
+        assert_eq!(
+            fs::read(entry.path.join("payload/story.txt")).unwrap(),
+            b"original"
+        );
+        manager
+            .delete_backup_with_confirmation(&entry.id, true)
+            .unwrap();
+        assert!(!entry.path.exists());
+    }
+
+    #[test]
+    fn backup_recording_still_refuses_missing_modern_backup() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let recording = db.get_injection(Some("es")).unwrap().unwrap();
+        db.release_backup_reference(recording.pristine_backup.as_ref().unwrap())
+            .unwrap();
+        manager.delete_backup(&entry.id).unwrap();
+        let error = db
+            .record_injection_with_backup(
+                Some("fr"),
+                &recording.root,
+                &[recording.root.join("story.txt")],
+                recording.pristine_backup.as_ref(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot record a reference to a missing backup"),
+            "{error}"
+        );
+        assert!(db.get_injection(Some("fr")).unwrap().is_none());
+    }
+
+    #[test]
+    fn backup_index_write_failure_does_not_block_recording_or_release() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let recording = db.get_injection(Some("es")).unwrap().unwrap();
+        {
+            let index = BackupReferenceIndex::open(manager.root()).unwrap();
+            index.conn.execute_batch("CREATE TRIGGER fail_reference_update BEFORE INSERT ON backup_references BEGIN SELECT RAISE(FAIL, 'index write failure'); END;").unwrap();
+        }
+        db.record_injection_with_backup(
+            Some("fr"),
+            &recording.root,
+            &[recording.root.join("story.txt")],
+            recording.pristine_backup.as_ref(),
+        )
+        .unwrap();
+        db.release_backup_reference(recording.pristine_backup.as_ref().unwrap())
+            .unwrap();
+        let error = manager.delete_backup(&entry.id).unwrap_err().to_string();
+        assert!(error.contains("Locust cannot confirm"), "{error}");
+        manager
+            .delete_backup_with_confirmation(&entry.id, true)
+            .unwrap();
+    }
+
+    #[test]
+    fn backup_delete_preserves_reference_when_project_is_unreadable() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let path = db.path();
+        drop(db);
+        fs::write(path, b"corrupt sqlite").unwrap();
+        assert!(manager.delete_backup(&entry.id).is_err());
+        assert!(entry.path.exists());
+    }
+
+    #[test]
+    fn backup_delete_tracks_registration_originals_and_replacement() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let recording = db.get_injection(Some("es")).unwrap().unwrap();
+        let registration = manager.create_backup(&recording.root).unwrap();
+        let reference = crate::database::RecordedBackup {
+            id: registration.id.clone(),
+            source_path: recording.root.clone(),
+            storage_root: Some(manager.root().to_owned()),
+        };
+        let menu = recording.root.join("menu.txt");
+        fs::write(&menu, b"menu").unwrap();
+        db.extend_injection_with_registration_backup(
+            &recording,
+            std::slice::from_ref(&menu),
+            &reference,
+        )
+        .unwrap();
+        assert!(manager.delete_backup(&registration.id).is_err());
+        // An ordinary replacement releases both original associations.
+        db.record_injection(Some("es"), &recording.root, &[menu])
+            .unwrap();
+        manager.delete_backup(&registration.id).unwrap();
+        manager.delete_backup(&entry.id).unwrap();
+    }
+
+    #[test]
+    fn backup_retention_cannot_delete_referenced_backup() {
+        let (_temp, manager, entry, _db) = referenced_backup_fixture();
+        assert!(manager.delete_old_backups(0).is_err());
+        assert!(entry.path.exists());
+    }
+
+    #[test]
+    fn backup_explicit_release_updates_index_and_preserves_outputs() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let recording = db.get_injection(Some("es")).unwrap().unwrap();
+        let reference = recording.pristine_backup.as_ref().unwrap();
+        db.release_backup_reference(reference).unwrap();
+        let released = db.get_injection(Some("es")).unwrap().unwrap();
+        assert!(released.pristine_backup.is_none());
+        assert_eq!(released.files, recording.files);
+        {
+            let index = BackupReferenceIndex::open(manager.root()).unwrap();
+            assert_eq!(
+                index
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM backup_references", [], |row| row
+                        .get::<_, usize>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        manager.delete_backup(&entry.id).unwrap();
+        assert!(!entry.path.exists());
+    }
+
+    #[test]
+    fn backup_release_keeps_other_languages_and_other_store_references() {
+        let (_temp, manager, entry, db) = referenced_backup_fixture();
+        let es = db.get_injection(Some("es")).unwrap().unwrap();
+        let reference = es.pristine_backup.as_ref().unwrap();
+        let menu = es.root.join("menu.txt");
+        fs::write(&menu, b"menu").unwrap();
+        let other = manager.create_backup(&es.root).unwrap();
+        let other_reference = crate::database::RecordedBackup {
+            id: other.id.clone(),
+            ..reference.clone()
+        };
+        db.record_injection_with_backup(
+            Some("fr"),
+            &es.root,
+            std::slice::from_ref(&menu),
+            Some(&other_reference),
+        )
+        .unwrap();
+        db.extend_injection_with_registration_backup(&es, &[menu], reference)
+            .unwrap();
+        let wrong_store = crate::database::RecordedBackup {
+            storage_root: Some(manager.root().join("other-store")),
+            ..reference.clone()
+        };
+        db.release_backup_reference(&wrong_store).unwrap();
+        assert!(manager.delete_backup(&entry.id).is_err());
+        db.release_backup_reference(reference).unwrap();
+        assert!(db.registration_backups(Some("es")).unwrap().is_empty());
+        assert_eq!(
+            db.get_injection(Some("fr"))
+                .unwrap()
+                .unwrap()
+                .pristine_backup,
+            Some(other_reference)
+        );
+        manager.delete_backup(&entry.id).unwrap();
+        assert!(manager.delete_backup(&other.id).is_err());
+    }
 
     fn c127_inject(manager: &BackupManager, game: &Path, outputs: &[(&str, &str)]) -> BackupEntry {
         crate::injection_transaction::run(
@@ -3042,16 +4056,38 @@ mod tests {
             .to_string()
             .contains("origin is relative"));
     }
+    // Identity/retention fixtures must be completed backups: unknown origins
+    // are deliberately protected by the deletion guard.
+    fn claim_completed_backup(manager: &BackupManager, now: DateTime<Utc>) -> (String, PathBuf) {
+        let (id, path) = manager.claim_backup_dir(now).unwrap();
+        let summary = BackupManifest {
+            source_path: std::path::absolute(manager.root().join("game-origin")).unwrap(),
+            created_at: now,
+            file_count: 0,
+            size_bytes: 0,
+        };
+        fs::write(
+            path.join("manifest.json"),
+            serde_json::to_vec(&summary).unwrap(),
+        )
+        .unwrap();
+        BackupReferenceIndex::open(manager.root())
+            .unwrap()
+            .mark_authoritative(&id)
+            .unwrap();
+        (id, path)
+    }
+
     #[test]
     fn stale_retention_cannot_delete_a_reused_backup_id() {
         let backups = tempfile::tempdir().unwrap();
         let mgr = BackupManager::new(backups.path().to_owned());
         let now = Utc::now();
         // Retention A captured old_id. Retention B deletes it meanwhile.
-        let (old_id, _) = mgr.claim_backup_dir(now).unwrap();
+        let (old_id, _) = claim_completed_backup(&mgr, now);
         mgr.delete_backup(&old_id).unwrap();
         // A new writer claims a directory in the exact same second.
-        let (new_id, new_path) = mgr.claim_backup_dir(now).unwrap();
+        let (new_id, new_path) = claim_completed_backup(&mgr, now);
         fs::write(new_path.join("in-progress"), b"owned by new writer").unwrap();
         // Retention A finally executes its stale plan.
         mgr.delete_backup(&old_id).unwrap();
@@ -3118,10 +4154,10 @@ mod tests {
             });
             for _ in 0..8 {
                 let now = Utc::now();
-                let (old, _) = mgr.claim_backup_dir(now).unwrap();
+                let (old, _) = claim_completed_backup(&mgr, now);
                 plan_tx.send(old.clone()).unwrap();
                 mgr.delete_backup(&old).unwrap();
-                let (fresh, path) = mgr.claim_backup_dir(now).unwrap();
+                let (fresh, path) = claim_completed_backup(&mgr, now);
                 fs::write(path.join("sentinel"), b"new generation").unwrap();
                 go_tx.send(()).unwrap();
                 done_rx.recv().unwrap().unwrap();
