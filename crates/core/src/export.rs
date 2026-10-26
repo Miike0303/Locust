@@ -323,6 +323,49 @@ fn parse_po_string(s: &str, line: usize) -> Result<String> {
     })
 }
 
+// quick-xml 0.41 splits one textual run into Text and GeneralRef events.
+// Decode the original UTF-8 run once, including numeric references, with the
+// shared unescaper. Keeping the run intact preserves single expansion, error
+// byte ranges/precedence and TMX's per-run validation; CDATA is never included.
+fn xml_text_run<'a>(
+    content: &'a str,
+    event: &quick_xml::events::Event<'_>,
+    text_end: &mut usize,
+) -> Option<&'a str> {
+    use quick_xml::events::Event;
+    // Reader::from_str and NsReader::from_str borrow these raw event slices
+    // directly from content. Unlike buffer_position, this excludes lookahead
+    // delimiters and also accounts for a skipped UTF-8 BOM.
+    let start = match event {
+        Event::Text(text) => text.as_ref().as_ptr() as usize - content.as_ptr() as usize,
+        Event::GeneralRef(reference) => {
+            reference.as_ref().as_ptr() as usize - content.as_ptr() as usize - 1
+        }
+        _ => unreachable!("expected textual XML event"),
+    };
+    if start < *text_end {
+        return None;
+    }
+    *text_end = start + content[start..].find('<').unwrap_or(content.len() - start);
+    Some(&content[start..*text_end])
+}
+
+fn xml_parse_error(error: quick_xml::Error) -> String {
+    use quick_xml::{errors::SyntaxError, Error};
+    // The new lexer distinguishes these formerly shared syntax errors. Keep
+    // the existing public diagnostics rather than expose dependency wording.
+    match error {
+        Error::Syntax(SyntaxError::UnclosedPI | SyntaxError::UnclosedXmlDecl) => {
+            "syntax error: processing instruction or xml declaration not closed: `?>` not found before end of input".into()
+        }
+        Error::Syntax(
+            SyntaxError::UnclosedSingleQuotedAttributeValue
+            | SyntaxError::UnclosedDoubleQuotedAttributeValue,
+        ) => "syntax error: tag not closed: `>` not found before end of input".into(),
+        _ => error.to_string(),
+    }
+}
+
 // ─── XLIFF format ──────────────────────────────────────────────────────────
 
 pub fn export_xliff(entries: &[StringEntry], source_lang: &str, target_lang: &str) -> String {
@@ -399,6 +442,9 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
     let content = normalize_line_endings(content);
     let mut reader = NsReader::from_str(&content);
     reader.config_mut().expand_empty_elements = true;
+    // Let the shared unescaper retain the old unterminated-reference errors.
+    reader.config_mut().allow_dangling_amp = true;
+    let mut text_end = 0;
     let mut stack = Vec::new();
     let mut root_seen = false;
     let mut root_namespaced = false;
@@ -406,7 +452,9 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
     let mut ids = HashSet::new();
     let mut units = Vec::new();
     loop {
-        let (namespace, event) = reader.read_resolved_event().map_err(invalid)?;
+        let (namespace, event) = reader
+            .read_resolved_event()
+            .map_err(|error| invalid(xml_parse_error(error)))?;
         let namespaced = match namespace {
             ResolveResult::Bound(ns) => ns.as_ref() == b"urn:oasis:names:tc:xliff:document:1.2",
             ResolveResult::Unbound => false,
@@ -428,7 +476,12 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                 let mut state = None;
                 for attribute in element.attributes() {
                     let attribute = attribute.map_err(invalid)?;
-                    let value = attribute.unescape_value().map_err(invalid)?.into_owned();
+                    // XLIFF historically preserves literal attribute whitespace;
+                    // 0.41's normalized_value would change it to spaces.
+                    let raw = std::str::from_utf8(&attribute.value).map_err(invalid)?;
+                    let value = quick_xml::escape::unescape(raw)
+                        .map_err(invalid)?
+                        .into_owned();
                     match attribute.key.as_ref() {
                         b"id" => id = Some(value),
                         b"version" => version = Some(value),
@@ -501,8 +554,11 @@ pub fn import_xliff(content: &str) -> Result<Vec<XliffUnit>> {
                 };
                 stack.push(kind);
             }
-            Event::Text(text) => {
-                let value = text.unescape().map_err(invalid)?;
+            event @ (Event::Text(_) | Event::GeneralRef(_)) => {
+                let Some(raw) = xml_text_run(&content, &event, &mut text_end) else {
+                    continue;
+                };
+                let value = quick_xml::escape::unescape(raw).map_err(invalid)?;
                 match stack.last() {
                     Some(Element::Source) => current.as_mut().unwrap().source.push_str(&value),
                     Some(Element::Target) => current.as_mut().unwrap().target.push_str(&value),
@@ -1315,14 +1371,112 @@ msgstr "Hola"
 <x:xliff xmlns:x="urn:oasis:names:tc:xliff:document:1.2" version="1.2">
  <x:file><x:body><x:group><x:trans-unit id="entry&amp;日本語">
   <x:source>  A &amp; B <![CDATA[<tag>]]>  </x:source>
-  <x:target><![CDATA[ Español <tag> ]]>&amp; &#x65E5;</x:target>
+  <x:target><![CDATA[ Español <tag> ]]>&amp; &#x65E5; &amp;unknown; &amp;#x1F980; &#x1F980;</x:target>
  </x:trans-unit></x:group></x:body></x:file>
 </x:xliff>"#;
         let units = import_xliff(input).unwrap();
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].id, "entry&日本語");
         assert_eq!(units[0].source, "  A & B <tag>  ");
-        assert_eq!(units[0].target, " Español <tag> & 日");
+        assert_eq!(
+            units[0].target,
+            " Español <tag> & 日 &unknown; &#x1F980; 🦀"
+        );
+    }
+
+    #[test]
+    fn xliff_entity_only_fields_decode_once_including_supplementary_references() {
+        for (encoded, decoded) in [
+            ("&lt;&gt;&amp;&apos;&quot;", "<>&'\""),
+            ("&#x1F980;&#129408;", "🦀🦀"),
+            (
+                "&amp;lt;&amp;#129408;&amp;unknown;",
+                "&lt;&#129408;&unknown;",
+            ),
+        ] {
+            let input = format!(
+                "<xliff><file><body><trans-unit id=\"{encoded}\"><source>{encoded}</source><target>{encoded}</target></trans-unit></body></file></xliff>"
+            );
+            let units = import_xliff(&input).unwrap();
+            assert_eq!(units.len(), 1);
+            assert_eq!(units[0].id, decoded);
+            assert_eq!(units[0].source, decoded);
+            assert_eq!(units[0].target, decoded);
+        }
+    }
+
+    #[test]
+    fn xliff_preserves_existing_attribute_whitespace_and_character_policy() {
+        let units = import_xliff(
+            "<xliff><file><body><trans-unit id=\"a\tb\nc&#13;&amp;#13;\"><source>&#1;&#xFFFE;</source><target><![CDATA[&amp;]]>&amp;lt;</target></trans-unit></body></file></xliff>",
+        )
+        .unwrap();
+        assert_eq!(units[0].id, "a\tb\nc\r&#13;");
+        // XLIFF has never enforced TMX's stricter XML 1.0 character policy.
+        assert_eq!(units[0].source, "\u{1}\u{fffe}");
+        assert_eq!(units[0].target, "&amp;&lt;");
+    }
+
+    #[test]
+    fn xliff_reference_errors_keep_whole_text_run_byte_ranges() {
+        for (text, message) in [
+            (
+                "🦀&amp;&unknown;",
+                "at 10..17: unrecognized entity `unknown`",
+            ),
+            (
+                "A&amp;B&unfinished",
+                "Error while escaping character at range 7..18: Cannot find ';' after '&'",
+            ),
+        ] {
+            let xml = format!(
+                "<xliff><file><body><trans-unit id=\"id\"><source>{text}</source></trans-unit></body></file></xliff>"
+            );
+            assert_eq!(
+                import_xliff(&xml).unwrap_err().to_string(),
+                format!("parse error in xliff: XLIFF parse error: {message}")
+            );
+        }
+    }
+
+    #[test]
+    fn xliff_foreign_namespace_local_names_do_not_become_translation_fields() {
+        let units = import_xliff(
+            r#"<xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:m="urn:metadata">
+            <file><body>
+              <m:trans-unit id="ignored"><m:source>Noise</m:source><m:target>Noise</m:target></m:trans-unit>
+              <trans-unit id="id"><source>Source</source><m:target>Foreign</m:target><target>Target</target></trans-unit>
+            </body></file></xliff>"#,
+        )
+        .unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].id, "id");
+        assert_eq!(units[0].source, "Source");
+        assert_eq!(units[0].target, "Target");
+    }
+
+    #[test]
+    fn xliff_rejects_invalid_numeric_references_in_attributes_and_text() {
+        // Invalid Unicode scalars and malformed numbers, not a new XML policy.
+        for reference in [
+            "&#xD800;",
+            "&#1114112;",
+            "&#x110000;",
+            "&#;",
+            "&#x;",
+            "&#-1;",
+        ] {
+            for (id, source, target) in [
+                (reference, "Source", "Target"),
+                ("id", reference, "Target"),
+                ("id", "Source", reference),
+            ] {
+                let input = format!(
+                    "<xliff><file><body><trans-unit id=\"{id}\"><source>{source}</source><target>{target}</target></trans-unit></body></file></xliff>"
+                );
+                assert!(import_xliff(&input).is_err(), "accepted: {input}");
+            }
+        }
     }
 
     #[test]

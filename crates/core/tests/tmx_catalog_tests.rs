@@ -83,6 +83,37 @@ fn cdata_references_and_physical_line_endings() {
 }
 
 #[test]
+fn entity_only_segments_include_named_and_supplementary_references() {
+    for (encoded, decoded) in [
+        ("&lt;&gt;&amp;&apos;&quot;", "<>&'\""),
+        ("&#x1F980;&#129408;", "🦀🦀"),
+    ] {
+        let xml = catalog().replace("Hello", encoded).replace("Hola", encoded);
+        let units = import_tmx(&xml, "en", "es").unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].source, decoded);
+        assert_eq!(units[0].target, decoded);
+    }
+}
+
+#[test]
+fn reference_errors_keep_whole_text_ranges_and_precede_segment_limits() {
+    let xml = catalog().replace("Hello", "🦀&amp;&unknown;");
+    assert_eq!(
+        import_tmx(&xml, "en", "es").unwrap_err().to_string(),
+        "parse error in tmx: TMX profile error: at 10..17: unrecognized entity `unknown`"
+    );
+    let text = format!("{}&unknown;", "A".repeat(1024 * 1024 + 1));
+    let error = import_tmx(&catalog().replace("Hello", &text), "en", "es")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "parse error in tmx: TMX profile error: at 1048578..1048585: unrecognized entity `unknown`"
+    );
+}
+
+#[test]
 fn languages_are_explicit_concrete_distinct_and_exact() {
     for (source, target) in [
         ("", "es"),

@@ -1,6 +1,6 @@
 # Remaining Rust dependency remediation
 
-The first bounded unit removes **five warnings**: **29 vulnerability records /18 warnings →29 /13**, without suppressing other findings. This is not a clean audit. [B2 S8/D10-D16](../odd/tasks/b2-dependencies.md) owns the remaining work; all work stays local, with no publication or new remote CI claim.
+Two bounded units now remove **five warnings and two XML vulnerability records**: **29 vulnerability records /18 warnings →27 /13**, without suppressing other findings. This is not a clean audit. [B2 S8/D10-D16](../odd/tasks/b2-dependencies.md) owns the remaining work; all work stays local, with no publication or new remote CI claim.
 
 ## D11: compatible warning patches — verified locally
 
@@ -38,7 +38,7 @@ The corrected comparison establishes29→29 vulnerability records,18→13 warnin
 
 | Owner | Next bounded outcome |
 | --- | --- |
-| D12 | Migrate quick-xml0.36.2→patched0.41.0, preserving XLIFF/TMX references, namespaces, exact errors and atomic rejection. |
+| D12 | Complete locally: quick-xml0.41.0, exact public compatibility and independent S3/S8 PASS; two findings removed. |
 | D13 | Migrate optional Wasmtime25→patched36.0.19 with actual feature-enabled tests, not feature removal. |
 | D14 | Migrate application ZIP2→patched9; keep updater ZIP4 separate. Latest inspected updater2.14.0 still requires ZIP4. |
 | D15 | Maintained mock/progress/font and supported desktop-parent migrations; upstream constraints remain explicit. |
@@ -55,3 +55,16 @@ Protected parent-owned `.test-tmp/b2-remediation-20261026/`:
 - `d11/gates/`: full parent check streams and exit files.
 
 The source commit is the work-unit commit containing B2 L51; the observed SHA is recorded in the owning ledger after Git succeeds. Subsequent family units must remain separate review slices rather than publishing the inherited local stack wholesale.
+
+
+## D12: XML migration — verified locally
+
+The core manifest now pins quick-xml `=0.41.0` with `serialize`. The minimal Cargo-generated closure removes0.36.2, adds the existing serde edge to0.41.0 and requalifies only core/plist XML references; **778 other whole records and the header remain exact**. Isolated job8 exited0: **29/13→27/13**, removing only the two XML vulnerabilities, with every remaining full vulnerability/warning object and setting identical (zero field transforms).
+
+The API migration coalesces Text/GeneralRef runs for one existing unescape operation, preserving whole-run error ranges/precedence, literal entity single expansion, CDATA separation, attribute whitespace and the distinct existing XLIFF/TMX character-admission policies. Public diagnostics are mapped only where dependency lexer wording split. No CLI flag or requested contract changes.
+
+Actual old-parser baseline: core export45, TMX15, CLI11+4 and31 public CLI cases passed. Actual candidate: core export47, TMX16, CLI11+4 and all31 cases passed; exact exit/stdout/stderr, catalog bytes, status-filtered public projections, refusal/no-write and destination-preservation comparison has **zero differences**. Frontend1126/0/build passed. After formatting-only correction, job11 exited0: Rust3005/0/25ignored across120summaries, fmt, strict locked workspace/all-target Clippy, collector10/10, lock/source502hash immutability and classified cleanup. The ignored tests were not run.
+
+Preserved failures are separate from product defects: job9 stopped before compilation on the exact authorized L57 ledger append; a pinned780-byte reconciliation retained all source/human checks and586 original artifacts. Job10 passed focused/differential/frontend checks, then failed fmt before Clippy/workspace; rustfmt changed only wrapping/optional trailing commas on three known files. The parent's initial whitespace-only assertion rejected those commas and was retained. The textual `format-correction/before` copy uses Windows CRLF due to read_text/write_text capture; it is **not byte-authoritative**. Actual staged raw source/gate hashes match, and normalized captured text is identical. Final after-snapshots use raw bytes.
+
+Independent verifier `mvpl78xx-a-ai11` returned **PASS S3/S8** for the final formatted candidate: independently checked raw graph/audit/archives, pinned slice-reader borrowing assumptions, all31 public cases, source/registry/DB ownership and final gate evidence. The bounded XML unit is complete locally; the work-unit commit containing B2 L59 records its source, with observed SHA annotated separately after commit. Protected evidence is under `d12/characterization/baseline-proof` and `d12/migration/{stage-proof,gates-correction1,ownership-correction1,format-correction}` beneath the remediation evidence root. This does not establish native/game, minimum-toolchain, optional-feature runtime, remote CI or a clean audit.

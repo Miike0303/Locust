@@ -24,7 +24,7 @@ walkdir.workspace = true
 encoding_rs = "0.8"
 chardet = "0.2"
 ttf-parser = "0.21"
-quick-xml = { version = "0.36", features = ["serialize"] }
+quick-xml = { version = "=0.41.0", features = ["serialize"] }
 # Read-side zip for automatic patch apply (write-side stays in crates/cli).
 zip = { version = "2", default-features = false, features = ["deflate"] }
 semver = "1"

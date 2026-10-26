@@ -1,5 +1,7 @@
 //! Restricted bilingual TMX 1.4b Level-1 project catalogs; see docs/TMX-CATALOGS.md.
-use super::{escape_xml, normalize_line_endings, ImportedTranslation};
+use super::{
+    escape_xml, normalize_line_endings, xml_parse_error, xml_text_run, ImportedTranslation,
+};
 use crate::{
     error::{LocustError, Result},
     models::{StringEntry, STALE_TRANSLATION_METADATA_KEY},
@@ -191,6 +193,8 @@ pub fn import_tmx(content: &str, source_lang: &str, target_lang: &str) -> Result
     reader.config_mut().expand_empty_elements = true;
     reader.config_mut().check_comments = true;
     reader.config_mut().check_end_names = true;
+    reader.config_mut().allow_dangling_amp = true;
+    let mut text_end = 0;
     let mut stack = Vec::new();
     let (mut root_seen, mut header_seen, mut body_seen) = (false, false, false);
     let mut first_event = true;
@@ -202,7 +206,10 @@ pub fn import_tmx(content: &str, source_lang: &str, target_lang: &str) -> Result
     let mut is_source = false;
     let mut prop = String::new();
     loop {
-        match reader.read_event().map_err(invalid)? {
+        match reader
+            .read_event()
+            .map_err(|error| invalid(xml_parse_error(error)))?
+        {
             Event::Start(element) => {
                 let parent = stack.last().copied();
                 let name = element.name();
@@ -336,20 +343,18 @@ pub fn import_tmx(content: &str, source_lang: &str, target_lang: &str) -> Result
                 stack.push(kind);
                 require(stack.len() <= 5, "nesting limit exceeded")?;
             }
-            Event::Text(text) => {
-                require(
-                    !text.as_ref().windows(3).any(|w| w == b"]]>"),
-                    "CDATA terminator in text",
-                )?;
+            event @ (Event::Text(_) | Event::GeneralRef(_)) => {
+                let Some(raw) = xml_text_run(&content, &event, &mut text_end) else {
+                    continue;
+                };
+                require(!raw.contains("]]>"), "CDATA terminator in text")?;
                 if stack.is_empty() {
                     require(
-                        text.as_ref()
-                            .iter()
-                            .all(|c| matches!(c, b' ' | b'\t' | b'\n')),
+                        raw.bytes().all(|c| matches!(c, b' ' | b'\t' | b'\n')),
                         "only literal whitespace is allowed outside the root",
                     )?;
                 }
-                let value = text.unescape().map_err(invalid)?;
+                let value = quick_xml::escape::unescape(raw).map_err(invalid)?;
                 append_text(&stack, current.as_mut(), is_source, &mut prop, &value)?;
             }
             Event::CData(text) => {

@@ -36,18 +36,48 @@ fn prefixed_xliff_updates_the_exact_id_and_rejects_incomplete_documents_atomical
       <x:trans-unit id="entry&amp;日本語"><x:source>Source</x:source><x:target><![CDATA[ Español <texto> ]]>&amp; 日</x:target></x:trans-unit>
     </x:body></x:file></x:xliff>"#;
     let input = temp.path().join("translations.xlf");
-    fs::write(&input, valid.replace("</x:body></x:file></x:xliff>", "")).unwrap();
-    command(temp.path(), &database, &input).assert().failure();
-    let db = Database::open(&database).unwrap();
-    assert_eq!(
-        db.get_entry("entry&日本語")
+    let before = serde_json::to_value(
+        Database::open(&database)
             .unwrap()
-            .unwrap()
-            .translation
-            .as_deref(),
-        Some("Existing translation")
-    );
-    drop(db);
+            .get_entries(&Default::default())
+            .unwrap(),
+    )
+    .unwrap();
+    for (document, message) in [
+        (
+            valid.replace("</x:body></x:file></x:xliff>", ""),
+            "empty or incomplete XLIFF document",
+        ),
+        (
+            format!("{valid}<xliff/>"),
+            "expected one XLIFF 1.2 document",
+        ),
+        (
+            format!("{valid}late text"),
+            "text outside the document root",
+        ),
+        (
+            valid.replace("</x:body>", "<q:trans-unit/></x:body>"),
+            "undeclared XML namespace prefix",
+        ),
+    ] {
+        fs::write(&input, document).unwrap();
+        for extra in [vec![], vec!["--dry-run"], vec!["--keep-existing"]] {
+            command(temp.path(), &database, &input)
+                .args(extra)
+                .assert()
+                .code(1)
+                .stdout("")
+                .stderr(format!(
+                    "Error: parse error in xliff: XLIFF parse error: {message}\n"
+                ));
+            let after = Database::open(&database)
+                .unwrap()
+                .get_entries(&Default::default())
+                .unwrap();
+            assert_eq!(serde_json::to_value(after).unwrap(), before);
+        }
+    }
     fs::write(&input, valid).unwrap();
     command(temp.path(), &database, &input)
         .assert()
