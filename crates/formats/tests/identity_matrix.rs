@@ -27,6 +27,16 @@
 //! SugarCube and NScripter select one container; their second container is an
 //! untouched guard. This covers one representative path per plugin, not every
 //! supported codec.
+//! After each single edit, public extraction must return the same logical row
+//! identities (file path and entry ID), the exact fixture translation on the
+//! selected row, and the original text on every other observable row. NScripter
+//! retains its backticks; KiriKiri/Tyrano retain [p]. Unity's first sorted row is
+//! the dummy object's heuristic name, not the structural TextAsset: its five-byte
+//! ASCII translation meets the public scanner's five-byte/three-letter minimum.
+//! These fixture profiles need no text normalization.
+//! Provenance metadata (such as checksums or container-layout context) is not
+//! compared. Public extraction does not establish runtime behavior or
+//! preservation of arbitrary bytes inside edited containers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -440,14 +450,20 @@ fn single_edit(id: &str) {
             physical == primary || physical == game.primary
         })
         .expect("primary fixture must contain an extracted entry");
-    // Short ASCII stays within Wolf/Unity fixed slots; retain NScripter's marker.
+    // Short ASCII fits Wolf's slot; retain script markers. Unity's heuristic
+    // "Dummy" row needs five bytes and three letters to remain publicly visible.
     let translation = match id {
         "nscripter" => "`Hi`",
         "kirikiri" | "tyrano" => "Hi[p]",
+        "unity" => "Howdy",
         _ => "Hi",
     };
-    assert_ne!(row.source, translation);
+    assert_ne!(
+        row.source, translation,
+        "{id}: fixture edit must change text"
+    );
     row.translation = Some(translation.into());
+    let changed_key = (row.file_path.clone(), row.id.clone());
     let report = game.inject(plugin, &entries);
     assert!(
         report.strings_written >= 1,
@@ -489,15 +505,33 @@ fn single_edit(id: &str) {
             }
         }
     }
-    if id == "yuris" {
-        let extracted = game.entries(plugin);
-        let changed = extracted
-            .iter()
-            .find(|entry| plugin.revision_original_path(&entry.file_path) == primary)
-            .unwrap();
-        assert_eq!(changed.source, translation);
+    let extracted = game.entries(plugin);
+    let keys = |rows: &[StringEntry]| {
+        rows.iter()
+            .map(|entry| (entry.file_path.clone(), entry.id.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        keys(&extracted),
+        keys(&entries),
+        "{id}: public re-extraction changed logical row identities; {report:?}"
+    );
+    for (before, after) in entries.iter().zip(&extracted) {
+        let expected = if (&before.file_path, &before.id) == (&changed_key.0, &changed_key.1) {
+            translation
+        } else {
+            &before.source
+        };
+        assert_eq!(
+            after.source, expected,
+            "{id}: public re-extraction has wrong text for {:?} / {}; selected: {changed_key:?}; {report:?}",
+            before.file_path, before.id
+        );
     }
-    eprintln!("{id} | {} | single-edit isolation: pass", entries.len());
+    eprintln!(
+        "{id} | {} | single-edit isolation and exact public re-extraction: pass",
+        entries.len()
+    );
 }
 
 fn pck_members(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
