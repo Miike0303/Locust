@@ -1409,6 +1409,207 @@ async fn collect_patch_ws_frames(base_url: &str, job_id: &str) -> Vec<serde_json
 }
 
 #[tokio::test]
+async fn structural_add_http_confirmation_and_rollback_preserve_state() {
+    let fixture = TempDir::new().unwrap();
+    let recorded = fixture.path().join("recorded");
+    let game = fixture.path().join("target");
+    std::fs::create_dir_all(game.join("game")).unwrap();
+    std::fs::write(game.join("game/script.rpy"), b"label start:\n    return\n").unwrap();
+    let pristine = snapshot_tree(&game);
+    let added = [
+        ("game/locust_languages.rpy", "# synthetic language picker\n"),
+        ("game/tl/es/script.rpy", "# synthetic Spanish translation\n"),
+    ];
+    let db = locust_core::database::Database::open_in_memory().unwrap();
+    let mut entries = Vec::new();
+    let mut written = Vec::new();
+    for (i, (relative, text)) in added.iter().enumerate() {
+        let path = recorded.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        written.push(path);
+        let mut entry = locust_core::models::StringEntry::new(
+            format!("line{i}"),
+            format!("source{i}"),
+            std::path::PathBuf::from(*relative),
+        );
+        entry.translation = Some(text.to_string());
+        entry.status = locust_core::models::StringStatus::Translated;
+        entries.push(entry);
+    }
+    db.save_entries(&entries).unwrap();
+    db.record_injection(Some("es"), &recorded, &written)
+        .unwrap();
+    let zip = fixture.path().join("structural-add.zip");
+    locust_core::patch::pack_injection_recording(
+        &db,
+        locust_core::patch::PackOptions {
+            game: None,
+            game_path: recorded,
+            lang: Some("es".into()),
+            output: zip.clone(),
+            // A known original tree marks absent paths as Add files. Since
+            // every packed file is new, there are still no original hashes.
+            pristine: Some(game.clone()),
+            engine: Some("renpy".into()),
+            project: fixture.path().join("project.locust.db"),
+            require_pristine: false,
+        },
+    )
+    .unwrap();
+    // At the fixture root, snapshot_tree includes nested target/.locust bytes.
+    // Include directories too, so a rejected job cannot leave an empty store.
+    let persisted = || {
+        let mut dirs: Vec<_> = walkdir::WalkDir::new(fixture.path())
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_dir())
+            .map(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(fixture.path())
+                    .unwrap()
+                    .to_path_buf()
+            })
+            .collect();
+        dirs.sort();
+        (snapshot_tree(fixture.path()), dirs)
+    };
+    let (base_url, server) =
+        locust_server::start_test_server(locust_server::create_test_state()).await;
+    let response = client()
+        .post(format!("{base_url}/api/patch/status"))
+        .json(&serde_json::json!({"game_path": game}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let original_status: serde_json::Value = response.json().await.unwrap();
+
+    for confirm in [None, Some(false)] {
+        let before = persisted();
+        let mut body = serde_json::json!({"game_path": game, "zip_path": zip});
+        if let Some(confirm) = confirm {
+            body["confirm_legacy"] = confirm.into();
+        }
+        let job = start_patch_apply_job(&base_url, &body).await;
+        let frames = collect_patch_ws_frames(&base_url, &job).await;
+        assert!(
+            !frames.iter().any(|frame| frame["type"] == "done"),
+            "{frames:?}"
+        );
+        let error = frames
+            .iter()
+            .find(|frame| frame["type"] == "error")
+            .unwrap();
+        assert_eq!(
+            error["message"],
+            "legacy patch requires explicit confirmation: structural-tier patch (no original hashes) requires --confirm-legacy or --force"
+        );
+        assert_eq!(
+            persisted(),
+            before,
+            "refusal must preserve every fixture byte and directory"
+        );
+    }
+
+    let job = start_patch_apply_job(
+        &base_url,
+        &serde_json::json!({"game_path": game, "zip_path": zip, "confirm_legacy": true}),
+    )
+    .await;
+    let frames = collect_patch_ws_frames(&base_url, &job).await;
+    assert!(
+        !frames.iter().any(|frame| frame["type"] == "error"),
+        "{frames:?}"
+    );
+    let report = frames.iter().find(|frame| frame["type"] == "done").unwrap()["report"].clone();
+    for (key, expected) in [
+        ("replaced", serde_json::json!(0)),
+        ("added", serde_json::json!(2)),
+        ("forced", serde_json::json!(false)),
+        ("baseline", serde_json::json!("Unverified")),
+        ("dry_run", serde_json::json!(false)),
+        ("user_edits_overwritten", serde_json::json!([])),
+    ] {
+        assert_eq!(report[key], expected, "{report}");
+    }
+    let mut expected_payload = pristine.clone();
+    for (relative, text) in added {
+        expected_payload.insert(relative.into(), text.as_bytes().to_vec());
+    }
+    assert_eq!(snapshot_tree(&game), expected_payload);
+    let response = client()
+        .post(format!("{base_url}/api/patch/status"))
+        .json(&serde_json::json!({"game_path": game}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let applied_status: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(applied_status["status"], "patched");
+    assert_eq!(applied_status["patch_id"], report["patch_id"]);
+
+    // Already-applied refusal takes precedence over legacy confirmation.
+    // Without force, this must remain an error with no persisted changes.
+    let before_duplicate = persisted();
+    let job = start_patch_apply_job(
+        &base_url,
+        &serde_json::json!({"game_path": game, "zip_path": zip}),
+    )
+    .await;
+    let frames = collect_patch_ws_frames(&base_url, &job).await;
+    assert!(
+        !frames.iter().any(|frame| frame["type"] == "done"),
+        "{frames:?}"
+    );
+    let error = frames
+        .iter()
+        .find(|frame| frame["type"] == "error")
+        .unwrap();
+    assert_eq!(
+        error,
+        &serde_json::json!({
+            "type": "error",
+            "message": format!("patch already applied: {}@{}",
+                report["patch_id"].as_str().unwrap(), report["patch_version"].as_str().unwrap())
+        })
+    );
+    assert_eq!(
+        persisted(),
+        before_duplicate,
+        "duplicate refusal must preserve all state"
+    );
+
+    let response = client()
+        .post(format!("{base_url}/api/patch/rollback"))
+        .json(&serde_json::json!({"game_path": game}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let rollback: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(rollback["baseline"], "Unverified");
+    assert_eq!(rollback["restored"], 0);
+    assert_eq!(rollback["deleted"], 2);
+    assert_eq!(rollback["aborted_edited"], serde_json::json!([]));
+    assert_eq!(snapshot_tree(&game), pristine);
+    assert!(!game.join(".locust").exists());
+    let response = client()
+        .post(format!("{base_url}/api/patch/status"))
+        .json(&serde_json::json!({"game_path": game}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        original_status
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn patch_rollback_dry_run_changes_nothing() {
     let (_fixture, zip, game) = make_patch_fixture(1, 1);
     std::fs::write(game.join("untouched.bin"), b"unrelated game bytes").unwrap();
