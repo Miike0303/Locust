@@ -289,7 +289,7 @@ pub fn create_app_state() -> Arc<AppState> {
     let db_path = data_dir.join("project.db");
     let db = Arc::new(Database::open(&db_path).expect("Failed to open project database"));
     let glossary = Arc::new(Glossary::new(db.clone()));
-    let backup_root = data_dir.join("backups");
+    let backup_root = locust_core::backup::effective_backup_root();
     std::fs::create_dir_all(&backup_root).ok();
 
     // Startup never prunes: project DB recordings may reference any backup; users delete in Settings → Data.

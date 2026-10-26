@@ -73,38 +73,50 @@ pub(crate) async fn restore_backup(
     Ok(Json(report))
 }
 
+#[derive(Default, Deserialize)]
+pub(crate) struct BackupDeleteQuery {
+    #[serde(default)]
+    confirm_unverified: bool,
+}
+
 pub(crate) async fn delete_backup(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Query(params): Query<BackupDeleteQuery>,
+    body: Option<Json<BackupDeleteQuery>>,
 ) -> Result<StatusCode, ApiError> {
+    let confirm_unverified =
+        params.confirm_unverified || body.is_some_and(|Json(body)| body.confirm_unverified);
     let exclusive = try_project_operation(&state).map_err(|e| err(StatusCode::CONFLICT, e))?;
     let manager = state.backup_manager.clone();
     tokio::task::spawn_blocking(move || {
         let _exclusive = exclusive;
-        // Only the open project's recordings are known here; recordings in
-        // other project databases cannot be checked from this handler.
-        for (lang, backup) in state
+        // The open project's live references remain verifiable even when the
+        // store index is unavailable. Confirmation must never bypass them.
+        for (_, backup) in state
             .db
             .recorded_backup_refs()
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
         {
             if backup.id == id
-                && backup.storage_root.as_deref().is_none_or(|root| {
-                    locust_core::database::paths_identical(root, manager.root())
-                })
+                && locust_core::database::paths_identical(&backup.resolved_storage_root(), manager.root())
             {
                 return Err(err(
                     StatusCode::CONFLICT,
-                    format!(
-                        "backup {id} is needed to pack the injection recorded for {}; inject again or open another project before deleting it",
-                        lang.as_deref().unwrap_or("default")
-                    ),
+                    "backup error: backup is referenced by 1 project(s); release their references before deleting it",
                 ));
             }
         }
         manager
-            .delete_backup(&id)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+            .delete_backup_with_confirmation(&id, confirm_unverified)
+            .map_err(|e| {
+                let status = if matches!(&e, locust_core::LocustError::BackupError(message) if message.starts_with("backup is referenced by ") || message == "Locust cannot confirm that no project still needs this backup") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                err(status, e)
+            })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))??;
@@ -116,6 +128,215 @@ mod tests {
     use super::*;
     use crate::routes::test_support::*;
     use crate::*;
+
+    #[tokio::test]
+    async fn backups_delete_unverified_requires_explicit_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = create_test_state_with_db(&temp.path().join("open.db"));
+        Arc::get_mut(&mut state).unwrap().backup_manager = Arc::new(
+            locust_core::backup::BackupManager::new(temp.path().join("backups")),
+        );
+        let game = temp.path().join("game");
+        std::fs::create_dir(&game).unwrap();
+        let backup = state.backup_manager.create_backup(&game).unwrap();
+        std::fs::remove_file(
+            state
+                .backup_manager
+                .root()
+                .join(".backup-references.sqlite3"),
+        )
+        .unwrap();
+        let (url, server) = start_test_server(state).await;
+        for suffix in ["", "?confirm_unverified=false"] {
+            let response = client()
+                .delete(format!("{url}/api/backups/{}{suffix}", backup.id))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(response
+                .text()
+                .await
+                .unwrap()
+                .contains("Locust cannot confirm that no project still needs this backup"));
+            assert!(backup.path.exists());
+        }
+        let response = client()
+            .delete(format!(
+                "{url}/api/backups/{}?confirm_unverified=true",
+                backup.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(!backup.path.exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backups_delete_accepts_json_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = create_test_state_with_db(&temp.path().join("open.db"));
+        Arc::get_mut(&mut state).unwrap().backup_manager = Arc::new(
+            locust_core::backup::BackupManager::new(temp.path().join("backups")),
+        );
+        let game = temp.path().join("game");
+        std::fs::create_dir(&game).unwrap();
+        let backup = state.backup_manager.create_backup(&game).unwrap();
+        std::fs::write(
+            state
+                .backup_manager
+                .root()
+                .join(".backup-references.sqlite3"),
+            b"invalid index",
+        )
+        .unwrap();
+        let (url, server) = start_test_server(state).await;
+        for confirm in [false, true] {
+            let response = client()
+                .delete(format!("{url}/api/backups/{}", backup.id))
+                .json(&serde_json::json!({"confirm_unverified": confirm}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if confirm {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::CONFLICT
+                }
+            );
+        }
+        assert!(!backup.path.exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backups_confirmation_cannot_override_open_project_with_corrupt_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = create_test_state_with_db(&temp.path().join("open.db"));
+        Arc::get_mut(&mut state).unwrap().backup_manager = Arc::new(
+            locust_core::backup::BackupManager::new(temp.path().join("backups")),
+        );
+        let game = temp.path().join("game");
+        std::fs::create_dir(&game).unwrap();
+        let file = game.join("story.txt");
+        std::fs::write(&file, b"original").unwrap();
+        let backup = state.backup_manager.create_backup(&game).unwrap();
+        state
+            .db
+            .record_injection_with_backup(
+                Some("es"),
+                &game,
+                &[file],
+                Some(&locust_core::database::RecordedBackup {
+                    id: backup.id.clone(),
+                    source_path: game.clone(),
+                    storage_root: Some(state.backup_manager.root().to_owned()),
+                }),
+            )
+            .unwrap();
+        std::fs::write(
+            state
+                .backup_manager
+                .root()
+                .join(".backup-references.sqlite3"),
+            b"invalid index",
+        )
+        .unwrap();
+        let (url, server) = start_test_server(state).await;
+        let response = client()
+            .delete(format!(
+                "{url}/api/backups/{}?confirm_unverified=true",
+                backup.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("referenced by 1 project(s)"));
+        assert!(backup.path.exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backups_delete_refuses_other_project_after_server_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game-a");
+        std::fs::create_dir(&game).unwrap();
+        let file = game.join("story.txt");
+        std::fs::write(&file, b"original").unwrap();
+        let root = temp.path().join("backups");
+        let entry = {
+            let mut state = create_test_state_with_db(&temp.path().join("a.db"));
+            Arc::get_mut(&mut state).unwrap().backup_manager =
+                Arc::new(locust_core::backup::BackupManager::new(root.clone()));
+            let entry = state.backup_manager.create_backup(&game).unwrap();
+            state
+                .db
+                .record_injection_with_backup(
+                    Some("es"),
+                    &game,
+                    &[file],
+                    Some(&locust_core::database::RecordedBackup {
+                        id: entry.id.clone(),
+                        source_path: game.clone(),
+                        storage_root: Some(root.clone()),
+                    }),
+                )
+                .unwrap();
+            entry
+        };
+        // Fresh process state uses the same persistent store, with B open or no project.
+        for open_b in [true, false] {
+            let mut state = create_test_state_with_db(&temp.path().join("b.db"));
+            Arc::get_mut(&mut state).unwrap().backup_manager =
+                Arc::new(locust_core::backup::BackupManager::new(root.clone()));
+            if open_b {
+                *state.current_project.write().await = Some(ProjectInfo {
+                    path: temp.path().join("game-b"),
+                    name: "game-b".into(),
+                    ..Default::default()
+                });
+            }
+            let (url, server) = start_test_server(state).await;
+            let response = client()
+                .delete(format!(
+                    "{url}/api/backups/{}?confirm_unverified=true",
+                    entry.id
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = response.text().await.unwrap();
+            assert!(body.contains("referenced by 1 project(s)"), "{body}");
+            assert!(entry.path.exists());
+            server.abort();
+        }
+        std::fs::remove_file(temp.path().join("a.db")).unwrap();
+        let mut state = create_test_state_with_db(&temp.path().join("b.db"));
+        Arc::get_mut(&mut state).unwrap().backup_manager =
+            Arc::new(locust_core::backup::BackupManager::new(root));
+        assert_eq!(
+            delete_backup(
+                State(state),
+                AxumPath(entry.id),
+                Query(BackupDeleteQuery::default()),
+                None,
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(!entry.path.exists());
+    }
 
     #[tokio::test]
     async fn list_backups_returns_readable_backup_despite_damaged_manifest() {

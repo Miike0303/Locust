@@ -55,8 +55,8 @@ async fn injection_backup_packs_strictly_for_directory_and_single_file_projects(
             .unwrap()
             .starts_with("text/plain"));
         let message = refused.text().await.unwrap();
-        assert!(message.contains(&format!("backup {id} is needed to pack")));
-        assert!(message.contains("recorded for es"));
+        assert!(message.contains("backup is referenced by 1 project(s)"));
+        assert!(message.contains("release their references before deleting it"));
         assert!(backup.is_dir());
 
         let unrecorded = state.backup_manager.create_backup(selected).unwrap();
@@ -147,13 +147,43 @@ async fn injection_backup_packs_strictly_for_directory_and_single_file_projects(
 
 #[tokio::test]
 async fn backup_deletion_respects_recorded_store_and_default_language() {
+    // Legacy provenance resolves the effective store, not an arbitrary manager.
+    // Run in a child to isolate environment overrides from concurrent tests.
+    if std::env::var_os("LOCUST_CORE8_SERVER_LEGACY_CHILD").is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backup_deletion_respects_recorded_store_and_default_language",
+                "--nocapture",
+            ])
+            .env("LOCUST_CORE8_SERVER_LEGACY_CHILD", "1")
+            .env("LOCUST_DATA_DIR", temp.path().join("profile"))
+            .env("LOCUST_BACKUP_ROOT", temp.path().join("override-backups"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     for store in ["same", "legacy", "different"] {
         let directory = tempfile::tempdir().unwrap();
         let game = directory.path().join("game");
         std::fs::create_dir(&game).unwrap();
         let source = game.join("story.html");
         std::fs::write(&source, "<p>Hello player</p>").unwrap();
-        let state = locust_server::create_test_state();
+        let mut state = locust_server::create_test_state();
+        if store == "legacy" {
+            std::sync::Arc::get_mut(&mut state).unwrap().backup_manager =
+                std::sync::Arc::new(locust_core::backup::BackupManager::new(
+                    locust_core::backup::effective_backup_root(),
+                ));
+        }
         let backup = state.backup_manager.create_backup(&game).unwrap();
         let backup_path = state.backup_manager.root().join(&backup.id);
         let storage_root = match store {
@@ -196,7 +226,7 @@ async fn backup_deletion_respects_recorded_store_and_default_language() {
                 .text()
                 .await
                 .unwrap()
-                .contains("recorded for default"));
+                .contains("backup is referenced by 1 project(s)"));
             assert!(backup_path.is_dir());
         }
         handle.shutdown().await;
@@ -339,10 +369,15 @@ async fn repeated_injection_keeps_the_original_pack_baseline() {
         assert_eq!(refused.status(), 400);
         assert_eq!(std::fs::read(&output).unwrap(), saved_zip);
         // A removed recorded original must fail, never guess one of the newer backups.
-        state
+        // Model external loss without invoking the provenance-protected delete API.
+        let missing = state
             .backup_manager
-            .delete_backup(first["backup_id"].as_str().unwrap())
+            .root()
+            .join(first["backup_id"].as_str().unwrap())
+            .canonicalize()
             .unwrap();
+        assert!(missing.starts_with(state.backup_manager.root().canonicalize().unwrap()));
+        std::fs::remove_dir_all(missing).unwrap();
         let refused = client
             .post(format!("{restart_url}/api/patch/pack"))
             .json(&cold_request)

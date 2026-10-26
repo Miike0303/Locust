@@ -123,7 +123,13 @@ async fn backup_handlers_refuse_project_conflicts_before_mutation() {
     let exclusive = try_project_operation(&state).unwrap();
     let restored = restore_backup(State(state.clone()), AxumPath(backup.id.clone())).await;
     assert_eq!(restored.unwrap_err().0, StatusCode::CONFLICT);
-    let deleted = delete_backup(State(state.clone()), AxumPath(backup.id.clone())).await;
+    let deleted = delete_backup(
+        State(state.clone()),
+        AxumPath(backup.id.clone()),
+        Query(BackupDeleteQuery::default()),
+        None,
+    )
+    .await;
     assert_eq!(deleted.unwrap_err().0, StatusCode::CONFLICT);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "Changed");
     assert!(backup.path.exists());
@@ -136,9 +142,14 @@ async fn backup_handlers_refuse_project_conflicts_before_mutation() {
     assert!(report.removed.is_empty());
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "Original");
     assert_eq!(
-        delete_backup(State(state.clone()), AxumPath(backup.id))
-            .await
-            .unwrap(),
+        delete_backup(
+            State(state.clone()),
+            AxumPath(backup.id),
+            Query(BackupDeleteQuery::default()),
+            None,
+        )
+        .await
+        .unwrap(),
         StatusCode::NO_CONTENT
     );
     assert!(!backup.path.exists());
