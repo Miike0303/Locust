@@ -1275,19 +1275,23 @@ fn inject_into_ystb(
         let start = attr.offset as usize;
         let end = start + attr.size as usize;
         validate_payload_edit(ystb, index)?;
-        if raw_control_sequence(
-            &ystb
-                .strings
-                .iter()
-                .find(|s| s.attr_index == index)
-                .unwrap()
-                .text,
-        ) != raw_control_sequence(text)
+        let current = ystb.strings.iter().find(|s| s.attr_index == index).unwrap();
+        if raw_control_sequence(&current.text) != raw_control_sequence(text)
             && attr.type_ == ATTR_RAW
         {
             return Err(parse_err("ystb", "raw control sequence changed"));
         }
-        edits.push((start, end, index, serialize_attr_value(attr.type_, text)?));
+        let bytes = serialize_attr_value(attr.type_, text)?;
+        // Compare the effective translation with the current physical text,
+        // not the extraction's possibly older source. Expression decoding also
+        // restores CRLF after the rewrapper/serializer's LF handling.
+        if text == current.text
+            || (attr.type_ == ATTR_EXPRESSION
+                && evaluate_push_string(&bytes).as_deref() == Some(current.text.as_str()))
+        {
+            continue;
+        }
+        edits.push((start, end, index, bytes));
     }
     edits.sort_by_key(|e| e.0);
     let old_values = &ystb.data[attr_vals_off..line_off];
@@ -2250,6 +2254,154 @@ mod tests {
 
     fn fixture_expr(text: &str) -> Vec<u8> {
         pushstring_double_quoted(text)
+    }
+
+    #[test]
+    fn auto2_public_changed_and_reinjection_compatibility() {
+        // Retain the existing Replace/Direct writer accounting and serializer,
+        // including both routing paths and the caller-held lock entry point.
+        for packed in [false, true] {
+            for held in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let original = real_layout(
+                    &[(108, vec![(0, 3, fixture_expr("Original display"))])],
+                    TRUE_KEY_B4626AD8,
+                );
+                let path = dir
+                    .path()
+                    .join(if packed { "game.ypf" } else { "story.ybn" });
+                let bytes = if packed {
+                    crate::yuris_ypf::write_ypf(
+                        0x1E4,
+                        0xFF,
+                        &[("story.ybn".into(), original, true)],
+                    )
+                    .unwrap()
+                } else {
+                    original
+                };
+                fs::write(&path, bytes).unwrap();
+                let plugin = YurisPlugin::new();
+                assert_eq!(plugin.supported_modes(), [OutputMode::Replace]);
+                let mut rows = plugin.extract(dir.path()).unwrap();
+                assert!(plugin.inject_add(dir.path(), "es", &rows).is_err());
+                let mut previous = Vec::new();
+                for (step, text) in ["Changed display", "Changed display", "Original display"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    // Keep the originally extracted source throughout Direct revisions.
+                    rows[0].translation = Some(text.into());
+                    let report = if held {
+                        let lock = GameLock::acquire(dir.path()).unwrap();
+                        plugin.inject_under_lock(dir.path(), &rows, &lock).unwrap()
+                    } else {
+                        plugin.inject(dir.path(), &rows).unwrap()
+                    };
+                    assert_eq!(
+                        (
+                            report.files_modified,
+                            report.strings_written,
+                            report.strings_skipped
+                        ),
+                        (1, 1, 0)
+                    );
+                    assert!(report.skip_reasons.is_empty());
+                    assert!(report.warnings.iter().all(|w| !w.starts_with("skip ")));
+                    assert_eq!(plugin.extract(dir.path()).unwrap()[0].source, text);
+                    let physical = fs::read(&path).unwrap();
+                    if step == 1 {
+                        assert_eq!(physical, previous);
+                    }
+                    // Deterministic public result/physical bytes for the retained
+                    // baseline-vs-candidate executable differential.
+                    eprintln!(
+                        "packed={packed} held={held} step={step} report=1/1/0 bytes={physical:?}"
+                    );
+                    previous = physical;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto2_mixed_expression_edit_preserves_current_physical_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("story.ybn");
+        let original = real_layout(
+            &[
+                (108, vec![(0, 3, fixture_expr("First display"))]),
+                (108, vec![(0, 3, fixture_expr("Second display"))]),
+            ],
+            TRUE_KEY_B4626AD8,
+        );
+        fs::write(&path, &original).unwrap();
+        let plugin = YurisPlugin::new();
+        let mut rows = plugin.extract(dir.path()).unwrap();
+        rows[0].translation = Some("Hi".into());
+        rows[1].translation = Some(rows[1].source.clone());
+        let report = plugin.inject(dir.path(), &rows).unwrap();
+        assert_eq!((report.strings_written, report.strings_skipped), (2, 0));
+        assert!(report.skip_reasons.is_empty());
+        assert!(report.warnings.is_empty());
+        let output = fs::read(&path).unwrap();
+        let before = load_ystb(&original, "before").unwrap().unwrap();
+        let after = load_ystb(&output, "after").unwrap().unwrap();
+        let (_, bd, bv, bl) = section_offsets(&before.hdr);
+        let (_, ad, av, al) = section_offsets(&after.hdr);
+        assert_eq!(&before.data[..0x14], &after.data[..0x14]);
+        assert_eq!(&before.data[0x18..bd], &after.data[0x18..ad]);
+        assert_eq!(&before.data[bl..], &after.data[al..]);
+        // Exact suffix includes both padding gaps and the original double-quoted
+        // second expression. Only the first payload and its size/offsets move.
+        let old_end = before.attrs[0].size as usize;
+        let new_end = after.attrs[0].size as usize;
+        assert_eq!(
+            &before.data[bv + old_end..bl],
+            &after.data[av + new_end..al]
+        );
+        for i in 0..2 {
+            assert_eq!(
+                &before.data[bd + i * 12..bd + i * 12 + 4],
+                &after.data[ad + i * 12..ad + i * 12 + 4]
+            );
+        }
+        assert_eq!(after.attrs[1].size, before.attrs[1].size);
+        assert_eq!(
+            plugin
+                .extract(dir.path())
+                .unwrap()
+                .into_iter()
+                .map(|e| e.source)
+                .collect::<Vec<_>>(),
+            ["Hi", "Second display"]
+        );
+        // Restore the old source through the same old rows; comparing with
+        // entry.source instead of the current physical text would lose this edit.
+        rows[0].translation = Some(rows[0].source.clone());
+        plugin.inject(dir.path(), &rows).unwrap();
+        assert_eq!(
+            plugin.extract(dir.path()).unwrap()[0].source,
+            "First display"
+        );
+    }
+
+    #[test]
+    fn auto2_effective_rewrapped_identity_preserves_original_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("story.ybn");
+        let original = real_layout(
+            &[(108, vec![(0, 3, fixture_expr("Hello there\nworld here"))])],
+            TRUE_KEY_B4626AD8,
+        );
+        fs::write(&path, &original).unwrap();
+        let plugin = YurisPlugin::new();
+        let mut rows = plugin.extract(dir.path()).unwrap();
+        rows[0].translation = Some("Hello there world here".into());
+        let report = plugin.inject(dir.path(), &rows).unwrap();
+        assert_eq!((report.strings_written, report.strings_skipped), (1, 0));
+        assert!(report.skip_reasons.is_empty());
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! | qsp | Replace / generated UTF-16LE QSPGAME | None |
 //! | tyrano | Replace / loose scenario | None |
 //! | kirikiri | Replace / UTF-16LE scenario | None |
-//! | yuris | Replace / generated XOR-encrypted YSTB | BUG: identity rows reserialize double quotes as backticks; strict tests ignored below |
+//! | yuris | Replace / generated XOR-encrypted YSTB | None |
 //! | nscripter | Replace / 0.txt | None |
 //! | vntextpatch | Replace / JSON | None |
 //!
@@ -22,6 +22,8 @@
 //! that any new backup is an exact copy of the original archive. Unrelated files
 //! must remain byte-identical; unrelated PCK members are also checked. Other
 //! edited containers are not subject to a general intra-file byte-span oracle.
+//! The focused YU-RIS unit regression checks untouched expression/padding,
+//! instructions and line data inside its edited synthetic YSTB.
 //! SugarCube and NScripter select one container; their second container is an
 //! untouched guard. This covers one representative path per plugin, not every
 //! supported codec.
@@ -487,6 +489,14 @@ fn single_edit(id: &str) {
             }
         }
     }
+    if id == "yuris" {
+        let extracted = game.entries(plugin);
+        let changed = extracted
+            .iter()
+            .find(|entry| plugin.revision_original_path(&entry.file_path) == primary)
+            .unwrap();
+        assert_eq!(changed.source, translation);
+    }
     eprintln!("{id} | {} | single-edit isolation: pass", entries.len());
 }
 
@@ -535,13 +545,11 @@ matrix! {
 
 mod yuris {
     #[test]
-    #[ignore = "bug: identity YSTB expressions are rewritten from double quotes to backticks"]
     fn identity_bytes() {
         super::identity("yuris");
     }
 
     #[test]
-    #[ignore = "bug: identity rows in unrelated YSTB files are normalized during a single edit"]
     fn single_edit_isolation() {
         super::single_edit("yuris");
     }
