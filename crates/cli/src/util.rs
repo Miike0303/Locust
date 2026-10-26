@@ -42,10 +42,7 @@ pub(crate) fn locust_backup_root() -> PathBuf {
             || std::env::var_os("LOCUST_DATA_DIR").is_some_and(|path| !path.is_empty()),
         "tests must set LOCUST_BACKUP_ROOT or LOCUST_DATA_DIR before selecting a backup root"
     );
-    std::env::var_os("LOCUST_BACKUP_ROOT")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| locust_core::config::AppConfig::config_dir().join("backups"))
+    locust_core::backup::effective_backup_root()
 }
 
 pub(crate) fn format_observed_cost(amount: f64, complete: bool) -> String {

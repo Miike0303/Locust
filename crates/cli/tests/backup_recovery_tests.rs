@@ -336,3 +336,156 @@ fn cli_backups_total_counts_shared_payload_once() {
         "Total: 16 logical bytes, 16 on-disk bytes"
     );
 }
+
+#[test]
+fn cli_opening_one_legacy_project_never_authorizes_deleting_an_unopened_peers_backup() {
+    use locust_core::database::{Database, RecordedBackup};
+    use std::fs;
+
+    // Exercise both fallback pristine provenance and explicit-store registration
+    // provenance without opening either project after its legacy rows are seeded.
+    for explicit_store in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        let file = game.join("story.txt");
+        fs::write(&file, b"shared original").unwrap();
+        let manager = BackupManager::new(temp.path().join("backups"));
+        let backup = manager.create_backup(&game).unwrap();
+        let reference = RecordedBackup {
+            id: backup.id.clone(),
+            source_path: game.clone(),
+            storage_root: explicit_store.then(|| manager.root().to_owned()),
+        };
+        let a = temp.path().join("visited/a.db");
+        let b = temp.path().join("unopened/deep/b.db");
+        let column = if explicit_store {
+            "registration_backup"
+        } else {
+            "pristine_backup"
+        };
+        for path in [&a, &b] {
+            let db = Database::open(path).unwrap();
+            db.record_injection(Some("es"), &game, std::slice::from_ref(&file))
+                .unwrap();
+            drop(db);
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute(
+                &format!("UPDATE injected_files SET {column} = ?1"),
+                [serde_json::to_string(&reference).unwrap()],
+            )
+            .unwrap();
+        }
+        fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+        let unopened_before = fs::read(&b).unwrap();
+        let run = || {
+            let mut cmd = assert_cmd::Command::cargo_bin("locust").unwrap();
+            cmd.env("LOCUST_DATA_DIR", temp.path().join("profile"))
+                .env("LOCUST_BACKUP_ROOT", manager.root());
+            cmd
+        };
+        let assert_unverified = |output: std::process::Output| {
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("Locust cannot confirm that no project still needs this backup"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read(&b).unwrap(), unopened_before);
+            assert_eq!(
+                fs::read(backup.path.join("payload/story.txt")).unwrap(),
+                b"shared original"
+            );
+        };
+        assert_unverified(run().args(["delete-backup", &backup.id]).output().unwrap());
+
+        // Public stats opens only A and lazily backfills its references.
+        run().arg("stats").arg(&a).assert().success();
+        run()
+            .args(["delete-backup", &backup.id, "--confirm-unverified"])
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(predicates::str::contains("referenced by 1 project(s)"));
+        assert_eq!(fs::read(&b).unwrap(), unopened_before);
+        assert!(backup.path.is_dir());
+
+        // Model A releasing its provenance, leaving the index stale. B still
+        // owns the same original but has never been visited by this release.
+        let conn = rusqlite::Connection::open(&a).unwrap();
+        conn.execute(
+            "UPDATE injected_files SET pristine_backup = NULL, registration_backup = NULL",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert_unverified(run().args(["delete-backup", &backup.id]).output().unwrap());
+    }
+}
+
+#[test]
+fn cli_delete_unverified_requires_confirmation_and_never_overrides_live_references() {
+    use locust_core::database::{Database, RecordedBackup};
+    let temp = tempfile::tempdir().unwrap();
+    let game = temp.path().join("game");
+    std::fs::create_dir(&game).unwrap();
+    let file = game.join("story.txt");
+    std::fs::write(&file, b"original").unwrap();
+    let manager = BackupManager::new(temp.path().join("backups"));
+    let backup = manager.create_backup(&game).unwrap();
+    std::fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+    let run = |confirm: bool| {
+        let mut cmd = assert_cmd::Command::cargo_bin("locust").unwrap();
+        cmd.env("LOCUST_DATA_DIR", temp.path().join("profile"))
+            .env("LOCUST_BACKUP_ROOT", manager.root())
+            .args(["delete-backup", &backup.id]);
+        if confirm {
+            cmd.arg("--confirm-unverified");
+        }
+        cmd
+    };
+    run(false)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Locust cannot confirm that no project still needs this backup",
+        ));
+    assert!(backup.path.exists());
+    let db = Database::open(&temp.path().join("custom/project.db")).unwrap();
+    db.record_injection_with_backup(
+        Some("es"),
+        &game,
+        &[file],
+        Some(&RecordedBackup {
+            id: backup.id.clone(),
+            source_path: game.clone(),
+            storage_root: Some(manager.root().to_owned()),
+        }),
+    )
+    .unwrap();
+    run(true)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("referenced by 1 project(s)"));
+    assert!(backup.path.exists());
+    db.release_backup_reference(
+        &db.get_injection(Some("es"))
+            .unwrap()
+            .unwrap()
+            .pristine_backup
+            .unwrap(),
+    )
+    .unwrap();
+    // Make it unverified again to exercise the explicit CLI override.
+    std::fs::remove_file(manager.root().join(".backup-references.sqlite3")).unwrap();
+    run(true).assert().success();
+    assert!(!backup.path.exists());
+}

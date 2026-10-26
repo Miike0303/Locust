@@ -2,6 +2,11 @@ import type { en } from "./en";
 
 /** Spanish UI catalog. Missing keys are a compile error. Neutral professional Spanish. */
 export const es: Record<keyof typeof en, string> = {
+  "api.error.backupReferenceMissing": "La copia de seguridad necesaria para registrar esta inyección ya no existe. Revise el estado de recuperación antes de volver a intentarlo.",
+  "api.error.backupUnverified": "Locust no puede confirmar que ningún proyecto siga necesitando esta copia de seguridad.",
+  "settings.data.confirm.unverifiedMessage": "Locust no puede confirmar que ningún proyecto siga necesitando la copia de seguridad {id}. Si la elimina, es posible que un proyecto anterior no pueda generar un parche ni restaurar sus archivos originales. ¿Desea eliminarla de todos modos?",
+  "api.error.backupReferencesUnverifiable": "No se puede eliminar la copia de seguridad porque no se pueden verificar sus referencias. Revise los metadatos de origen, las bases de datos de los proyectos y el índice de referencias antes de volver a intentarlo.",
+  "api.error.backupReferenced": "No se puede eliminar la copia de seguridad: {count} proyecto(s) aún la necesitan. Libere sus referencias antes de eliminarla.",
   "nav.expandSidebar": "Expandir barra lateral",
   "nav.collapseSidebar": "Contraer barra lateral",
   "table.sortPageBy": "Ordenar esta página por {column}",

@@ -221,10 +221,12 @@ fn direct_json_records_then_keeps_the_original_backup_on_unchanged_runs() {
                 .unwrap()
                 .contains("redundant new backup removed")));
         assert_eq!(fs::read(&fixture.asset).unwrap(), injected);
+        // Reference-index metadata is not a saved original-game backup.
         assert_eq!(
-            fs::read_dir(fixture.root.path().join("backups"))
+            locust_core::backup::BackupManager::new(fixture.root.path().join("backups"))
+                .list_backups()
                 .unwrap()
-                .count(),
+                .len(),
             1
         );
     }
@@ -275,9 +277,10 @@ fn add_json_reports_generated_paths_roots_and_committed_outcomes() {
             assert_eq!(fs::read(path).unwrap(), bytes);
         }
         assert_eq!(
-            fs::read_dir(fixture.root.path().join("backups"))
+            locust_core::backup::BackupManager::new(fixture.root.path().join("backups"))
+                .list_backups()
                 .unwrap()
-                .count(),
+                .len(),
             2
         );
     }

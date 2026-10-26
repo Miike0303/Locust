@@ -26,6 +26,7 @@ export const INJECT_EMPTY_LANGUAGES_EN =
 	"inject requires at least one language (e.g. [\"es\"])";
 
 const EXACT: Record<string, MessageKey> = {
+  "backup error: cannot record a reference to a missing backup": "api.error.backupReferenceMissing",
   "translation changed since it was loaded": "api.error.translationConflict",
   "Configuration could not be loaded. The existing file is protected. Repair the configuration and restart Locust before saving settings.": "settings.configLoadFailed",
   "cost limit must be finite and non-negative": "api.error.invalidCostLimit",
@@ -75,6 +76,7 @@ const EXACT: Record<string, MessageKey> = {
 // Match the original line so trimming cannot turn a multiline diagnostic into guidance.
 // ProviderError adds its prefix in core/error.rs:14; batch entry-ID errors are bare.
 const SINGLE_LINE_EXACT: Record<string, MessageKey> = {
+    "backup error: Locust cannot confirm that no project still needs this backup": "api.error.backupUnverified",
 	"injection error: invalid target language code: use 1 to 35 ASCII letters, digits, '-' or '_'":
 		"api.error.invalidTargetLanguageCode",
 	"injection error: Replace destination must be a direct child of output_dir":
@@ -111,6 +113,7 @@ const SPANISH_ONLY_EXACT: Record<string, MessageKey> = {
 type PrefixRule = { prefix: string; key: MessageKey; detail?: boolean; singleLine?: boolean; spanishOnly?: boolean };
 
 const PREFIXES: PrefixRule[] = [
+    { prefix: "backup error: cannot verify backup references; deletion refused: ", key: "api.error.backupReferencesUnverifiable", singleLine: true },
 	// Batch 3: opaque paths/parser diagnostics stay in the existing raw logs.
 	{ prefix: "IO error: refusing to overwrite existing file: ", key: "api.error.pivotOutputExists", singleLine: true, spanishOnly: true },
 	{ prefix: "IO error: not a Locust project database: ", key: "api.error.invalidProjectDatabase", singleLine: true, spanishOnly: true },
@@ -212,6 +215,8 @@ const DOWNGRADE_VERSIONS = new RegExp(`^patch downgrade blocked: installed (${VE
 /** Narrow owned families; IDs/versions are useful, nested diagnostics are not. */
 function mapRecoveryDetails(body: string): string | null {
 	if (/[\r\n]/.test(body)) return null;
+	const references = /^backup error: backup is referenced by ([1-9][0-9]*) project\(s\); release their references before deleting it$/.exec(body);
+	if (references?.[0] === body) return t("api.error.backupReferenced", { count: references[1] });
 	const backup = /^backup error: backup (\S+) has no readable manifest\.json: [^\r\n]+$/.exec(body);
 	if (backup?.[0] === body) return t("api.error.backupManifestUnreadable", { id: backup[1] });
 

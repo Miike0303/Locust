@@ -1,5 +1,10 @@
 /** English UI catalog. Keys are dotted namespaces. Keep in sync with es.ts. */
 export const en = {
+  "api.error.backupReferenceMissing": "The backup needed to record this injection no longer exists. Review recovery status before trying again.",
+  "api.error.backupUnverified": "Locust cannot confirm that no project still needs this backup.",
+  "settings.data.confirm.unverifiedMessage": "Locust cannot confirm that no project still needs backup {id}. Deleting it may prevent an older project from packing or restoring its original files. Delete it anyway?",
+  "api.error.backupReferencesUnverifiable": "Cannot delete backup because its references cannot be verified. Check the origin metadata, project databases, and reference index before trying again.",
+  "api.error.backupReferenced": "Cannot delete backup: {count} project(s) still need it. Release their references before deleting it.",
   "nav.expandSidebar": "Expand sidebar",
   "nav.collapseSidebar": "Collapse sidebar",
   "table.sortPageBy": "Sort this page by {column}",

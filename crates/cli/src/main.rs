@@ -248,6 +248,13 @@ enum Commands {
     },
     /// List saved original-game backups from injection
     Backups,
+    /// Delete a saved backup after checking project references
+    DeleteBackup {
+        id: String,
+        /// Accept the risk that an unverified backup is still needed by a project
+        #[arg(long)]
+        confirm_unverified: bool,
+    },
     /// Restore original game files from a saved injection backup
     RestoreBackup {
         id: String,
@@ -534,6 +541,10 @@ async fn run() -> anyhow::Result<()> {
         Commands::InjectStatus { game_path } => inject::status(&game_path)?,
         Commands::InjectRecover { game_path, force } => inject::recover(&game_path, force)?,
         Commands::Backups => project::cmd_backups()?,
+        Commands::DeleteBackup {
+            id,
+            confirm_unverified,
+        } => project::cmd_delete_backup(&id, confirm_unverified)?,
         Commands::RestoreBackup { id, dry_run } => project::cmd_restore_backup(&id, dry_run)?,
         Commands::Auth { provider } => auth_info::cmd_auth(provider).await?,
         Commands::Providers => auth_info::cmd_providers(&config)?,

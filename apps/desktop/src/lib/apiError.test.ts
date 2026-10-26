@@ -12,6 +12,35 @@ import {
 } from "./apiError";
 import { getLocale, setLocale, t } from "./i18n";
 
+test("backup reference refusal localizes the project count in EN and ES", () => {
+	for (const locale of ["en", "es"] as const) {
+		setLocale(locale);
+		const expected = locale === "es"
+			? "No se puede eliminar la copia de seguridad: 2 proyecto(s) aún la necesitan. Libere sus referencias antes de eliminarla."
+			: "Cannot delete backup: 2 project(s) still need it. Release their references before deleting it.";
+		for (const prefix of ["", "409: "]) {
+			assert.equal(localizeApiError(`${prefix}backup error: backup is referenced by 2 project(s); release their references before deleting it`), expected);
+		}
+		assert.equal(localizeApiError("backup error: cannot record a reference to a missing backup"), locale === "es"
+			? "La copia de seguridad necesaria para registrar esta inyección ya no existe. Revise el estado de recuperación antes de volver a intentarlo."
+			: "The backup needed to record this injection no longer exists. Review recovery status before trying again.");
+	}
+});
+
+test("unverifiable backup references explain refused deletion in EN and ES", () => {
+    for (const locale of ["en", "es"] as const) {
+        setLocale(locale);
+        const expected = locale === "es"
+            ? "No se puede eliminar la copia de seguridad porque no se pueden verificar sus referencias. Revise los metadatos de origen, las bases de datos de los proyectos y el índice de referencias antes de volver a intentarlo."
+            : "Cannot delete backup because its references cannot be verified. Check the origin metadata, project databases, and reference index before trying again.";
+        for (const frame of ["", "500: "]) {
+            for (const detail of ["unreadable origin", "file is not a database"]) {
+                assert.equal(localizeApiError(`${frame}backup error: cannot verify backup references; deletion refused: ${detail}`), expected);
+            }
+        }
+    }
+});
+
 // core/validation.rs's fixed refusal (no source/target prose) + core/error.rs Display.
 const yurisEncodingRefusal = "injection error: translation cannot be encoded as Shift-JIS for the declared YU-RIS quoted literal; injection is refused before backup or output; the original game and saved translation remain unchanged";
 test("inject language and output containment errors have EN/ES guidance", () => {
@@ -1152,4 +1181,17 @@ test("patch URL policy errors have EN/ES guidance", () => {
             }
         }
     }
+});
+
+test("unverified backup refusal has an exact localized identity", () => {
+  for (const locale of ["en", "es"] as const) {
+    setLocale(locale);
+    for (const frame of ["", "409: "]) {
+      const raw = "backup error: Locust cannot confirm that no project still needs this backup";
+      const error = new ApiError(frame + raw);
+      assert.equal(error.key, "api.error.backupUnverified");
+      assert.equal(error.message, t("api.error.backupUnverified"));
+      assert.equal(new ApiError(frame + raw + "\nextra").key, undefined);
+    }
+  }
 });

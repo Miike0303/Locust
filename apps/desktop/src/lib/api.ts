@@ -850,8 +850,8 @@ export const restoreBackup = (id: string): Promise<BackupRestoreReport> =>
   request<BackupRestoreReport>(`/backups/${encodeURIComponent(id)}/restore`, { method: "POST" }).finally(refreshGameState);
 
 /** Delete a backup by id (HTTP DELETE — uses baseUrl for Tauri port). */
-export const deleteBackup = (id: string): Promise<void> =>
-  request<void>(`/backups/${encodeURIComponent(id)}`, { method: "DELETE" });
+export const deleteBackup = (id: string, confirmUnverified = false): Promise<void> =>
+  request<void>(`/backups/${encodeURIComponent(id)}${confirmUnverified ? "?confirm_unverified=true" : ""}`, { method: "DELETE" });
 
 // ─── Patch apply / rollback (HTTP — server embeds the core engine) ────────
 

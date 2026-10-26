@@ -77,6 +77,14 @@ Los respaldos nuevos excluyen de la copia el store `.locust-injections` únicame
 
 Los respaldos legacy no tienen hashes históricos por archivo. Se pueden comprobar sus archivos legibles, cantidades y tamaños, pero no demostrar retrospectivamente que no sufrieron una alteración del mismo tamaño. Los orígenes relativos se rechazan porque no quedó guardado el directorio de trabajo original. Si el formato antiguo sobrescribió el `manifest.json` del juego con metadatos, esa información perdida no se puede reconstruir. Una restauración completa tampoco combina ediciones posteriores ni elimina automáticamente todos los archivos añadidos desde el respaldo.
 
+## Borrar respaldos sin perder originales de otro proyecto
+
+`locust backups` lista los respaldos. Para borrar uno que ya no necesitás, usá `locust delete-backup <id>` o **Settings → Data → Delete**. La comprobación consulta las referencias conocidas de otros proyectos, no solamente el proyecto abierto. Un respaldo todavía referenciado se rechaza; confirmar el riesgo no permite eludir esa protección. La retención automática usa la misma protección.
+
+Los respaldos antiguos pueden tener propietarios que el índice todavía desconoce. Abrir una DB registra sus referencias, pero no demuestra que no existan otras DB sin abrir. Si Locust no puede verificar la propiedad completa, la eliminación normal se rechaza. Conservá el respaldo mientras revisás esos proyectos.
+
+Solamente si aceptás perder originales que algún proyecto antiguo todavía pueda necesitar, podés usar `locust delete-backup <id> --confirm-unverified`; en la interfaz se pide una segunda confirmación de riesgo. No es una búsqueda exhaustiva de todas las DB del disco ni una certificación de que el respaldo esté libre. Un error de índice no debe impedir abrir el proyecto, pero puede impedir borrar el respaldo sin esa confirmación explícita.
+
 ## Archivos individuales, bloqueo y espacio
 
 Puedes consultar o recuperar mediante la ruta de un archivo seleccionado. La operación usa su carpeta padre como raíz de bloqueo y del journal; distintas operaciones sobre archivos de esa carpeta comparten ese bloqueo. Si el archivo ya no existe, consulta la carpeta padre que contiene el historial de esa operación.

@@ -4,6 +4,7 @@ import { useState } from "react";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import type { BackupRestoreReport } from "../../lib/api";
 import { deleteBackup, getBackupsReport, restoreBackup } from "../../lib/api";
+import { ApiError } from "../../lib/apiError";
 import { useT } from "../../lib/i18n";
 import { addToast } from "../../stores/toastStore";
 
@@ -23,7 +24,7 @@ export default function DataSection() {
   const backups = listing?.entries ?? [];
   const unreadable = listing?.unreadable ?? [];
   const [pendingAction, setPendingAction] = useState<
-    { kind: "restore" | "delete"; id: string; game: string; sourcePath: string } | null
+    { kind: "restore" | "delete"; id: string; game: string; sourcePath: string; confirmUnverified?: boolean } | null
   >(null);
   const [restoreResult, setRestoreResult] = useState<{
     id: string; restored: number; kept: BackupRestoreReport["kept"];
@@ -34,7 +35,7 @@ export default function DataSection() {
 
   const runPendingAction = async () => {
     if (!pendingAction) return;
-    const { kind, id } = pendingAction;
+    const { kind, id, confirmUnverified = false } = pendingAction;
     setPendingAction(null);
     if (kind === "restore") {
       setRestoreResult(null);
@@ -52,9 +53,13 @@ export default function DataSection() {
       }
     } else {
       try {
-        await deleteBackup(id);
+        await deleteBackup(id, confirmUnverified);
         refetch();
       } catch (e: any) {
+        if (!confirmUnverified && e instanceof ApiError && e.key === "api.error.backupUnverified") {
+          setPendingAction({ ...pendingAction, confirmUnverified: true });
+          return;
+        }
         addToast("error", t("settings.data.toast.deleteFailed", { error: e.message }));
       }
     }
@@ -160,7 +165,7 @@ export default function DataSection() {
                 game: pendingAction.game,
                 path: pendingAction.sourcePath || pendingAction.game,
               })
-            : t("settings.data.confirm.deleteMessage", { id: pendingAction?.id ?? "" })
+            : t(pendingAction?.confirmUnverified ? "settings.data.confirm.unverifiedMessage" : "settings.data.confirm.deleteMessage", { id: pendingAction?.id ?? "" })
         }
         confirmLabel={pendingAction?.kind === "restore" ? t("settings.data.restore") : t("common.delete")}
         destructive

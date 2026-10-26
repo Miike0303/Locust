@@ -37,6 +37,13 @@ pub(crate) fn cmd_backups() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn cmd_delete_backup(id: &str, confirm_unverified: bool) -> anyhow::Result<()> {
+    BackupManager::new(locust_backup_root())
+        .delete_backup_with_confirmation(id, confirm_unverified)?;
+    println!("Deleted backup {id}.");
+    Ok(())
+}
+
 pub(crate) fn cmd_restore_backup(id: &str, dry_run: bool) -> anyhow::Result<()> {
     let manager = BackupManager::new(locust_backup_root());
     let preview = if dry_run {

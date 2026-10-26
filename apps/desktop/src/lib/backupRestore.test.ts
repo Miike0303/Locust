@@ -16,6 +16,7 @@ const restoreReport = {
 };
 let response = restoreReport;
 let failed = false;
+let deleteFailure = "";
 const calls: unknown[][] = [];
 
 // Exercise Settings' real restore/confirmation callbacks and API client, using
@@ -74,6 +75,9 @@ Object.defineProperty(globalThis, "window", { configurable: true, value: {
 } });
 globalThis.fetch = async (url, init) => {
   calls.push([String(url), init?.method ?? "GET"]);
+  if (init?.method === "DELETE") {
+    return new Response(deleteFailure || null, { status: deleteFailure ? 409 : 204 });
+  }
   return new Response(failed ? "restore unavailable" : JSON.stringify(response), { status: failed ? 500 : 200 });
 };
 const api = await import("./api.ts");
@@ -102,7 +106,7 @@ function render() {
 }
 function reset(locale: "en" | "es") {
   h.values = []; h.toasts = []; calls.length = 0;
-  response = restoreReport; failed = false;
+  response = restoreReport; failed = false; deleteFailure = "";
   setLocale(locale);
 }
 async function restore() {
@@ -176,4 +180,49 @@ test("a failed restore clears the previous report and keeps the failure visible"
   assert.equal(h.toasts.length, 1);
   assert.equal(h.toasts[0][0], "error");
   assert.match(String(h.toasts[0][1]), /restore unavailable/);
+});
+
+for (const locale of ["en", "es"] as const) {
+  test(`${locale} unverified deletion requires a second risk confirmation and resends explicitly`, async () => {
+    reset(locale);
+    deleteFailure = "backup error: Locust cannot confirm that no project still needs this backup";
+    const button = nodes(render()).find(node => node.type === "button" && node.props.title === t("settings.data.delete"));
+    button.props.onClick();
+    let dialog = nodes(render()).find(node => node.props?.open && node.props?.onConfirm);
+    await dialog.props.onConfirm();
+    assert.equal(calls.length, 1);
+    dialog = nodes(render()).find(node => node.props?.open && node.props?.onConfirm);
+    assert.ok(dialog, "an unverified refusal must offer explicit risk confirmation");
+    assert.equal(dialog.props.message, t("settings.data.confirm.unverifiedMessage", { id: backup.id }));
+    assert.match(dialog.props.message, locale === "en" ? /project.*pack|pack.*project/i : /proyecto.*parche|parche.*proyecto/i);
+    assert.equal(h.toasts.length, 0);
+    deleteFailure = "";
+    await dialog.props.onConfirm();
+    assert.deepEqual(calls, [
+      ["http://localhost:7842/api/backups/before%20injection", "DELETE"],
+      ["http://localhost:7842/api/backups/before%20injection?confirm_unverified=true", "DELETE"],
+    ]);
+    assert.ok(!nodes(render()).some(node => node.props?.open));
+  });
+}
+
+test("canceling unverified deletion sends no retry; referenced backups never offer override", async () => {
+  for (const referenced of [false, true]) {
+    reset("en");
+    deleteFailure = referenced
+      ? "backup error: backup is referenced by 1 project(s); release their references before deleting it"
+      : "backup error: Locust cannot confirm that no project still needs this backup";
+    nodes(render()).find(node => node.type === "button" && node.props.title === t("settings.data.delete")).props.onClick();
+    await nodes(render()).find(node => node.props?.open && node.props?.onConfirm).props.onConfirm();
+    const dialog = nodes(render()).find(node => node.props?.open && node.props?.onConfirm);
+    if (referenced) {
+      assert.equal(dialog, undefined);
+      assert.equal(h.toasts[0][0], "error");
+    } else {
+      assert.ok(dialog);
+      dialog.props.onCancel();
+      assert.ok(!nodes(render()).some(node => node.props?.open));
+    }
+    assert.equal(calls.length, 1);
+  }
 });
