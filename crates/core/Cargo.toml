@@ -29,7 +29,7 @@ quick-xml = { version = "=0.41.0", features = ["serialize"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 semver = "1"
 
-wasmtime = { version = "25", optional = true }
+wasmtime = { version = "=36.0.19", optional = true }
 
 [dependencies.tokio-util]
 version = "0.7"

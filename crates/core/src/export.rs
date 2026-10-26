@@ -337,10 +337,8 @@ fn xml_text_run<'a>(
     // directly from content. Unlike buffer_position, this excludes lookahead
     // delimiters and also accounts for a skipped UTF-8 BOM.
     let start = match event {
-        Event::Text(text) => text.as_ref().as_ptr() as usize - content.as_ptr() as usize,
-        Event::GeneralRef(reference) => {
-            reference.as_ref().as_ptr() as usize - content.as_ptr() as usize - 1
-        }
+        Event::Text(text) => text.as_ptr() as usize - content.as_ptr() as usize,
+        Event::GeneralRef(reference) => reference.as_ptr() as usize - content.as_ptr() as usize - 1,
         _ => unreachable!("expected textual XML event"),
     };
     if start < *text_end {

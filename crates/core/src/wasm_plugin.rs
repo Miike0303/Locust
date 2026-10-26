@@ -12,7 +12,7 @@ fn log_range(ptr: i32, len: i32, mem_len: usize) -> Option<std::ops::Range<usize
 
 #[cfg(feature = "wasm-plugins")]
 mod inner {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use serde::Deserialize;
     use wasmtime::*;
@@ -63,11 +63,11 @@ mod inner {
                         }
                     },
                 )
-                .map_err(|e| LocustError::Other(e.into()))?;
+                .map_err(LocustError::Other)?;
 
             let instance = linker
                 .instantiate(&mut store, &self.module)
-                .map_err(|e| LocustError::Other(e.into()))?;
+                .map_err(LocustError::Other)?;
 
             Ok((store, instance))
         }
@@ -108,13 +108,13 @@ mod inner {
         ) -> Result<(i32, i32)> {
             let alloc = instance
                 .get_typed_func::<i32, i32>(&mut *store, "locust_alloc")
-                .map_err(|e| LocustError::Other(e.into()))?;
+                .map_err(LocustError::Other)?;
 
             let bytes = s.as_bytes();
             let total_len = 4 + bytes.len();
             let ptr = alloc
                 .call(&mut *store, total_len as i32)
-                .map_err(|e| LocustError::Other(e.into()))?;
+                .map_err(LocustError::Other)?;
 
             let memory = instance
                 .get_memory(&mut *store, "memory")
@@ -169,11 +169,11 @@ mod inner {
 
             let extract_fn = instance
                 .get_typed_func::<(i32, i32), i32>(&mut store, "locust_extract")
-                .map_err(|e| LocustError::Other(e.into()))?;
+                .map_err(LocustError::Other)?;
 
             let result_ptr = extract_fn
                 .call(&mut store, (path_ptr, path_len))
-                .map_err(|e| LocustError::Other(e.into()))?;
+                .map_err(LocustError::Other)?;
 
             let memory = instance
                 .get_memory(&mut store, "memory")
@@ -197,11 +197,11 @@ mod inner {
 
             let inject_fn = instance
                 .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "locust_inject")
-                .map_err(|e| LocustError::Other(e.into()))?;
+                .map_err(LocustError::Other)?;
 
             let result_ptr = inject_fn
                 .call(&mut store, (path_ptr, path_len, entries_ptr, entries_len))
-                .map_err(|e| LocustError::Other(e.into()))?;
+                .map_err(LocustError::Other)?;
 
             let memory = instance
                 .get_memory(&mut store, "memory")
@@ -225,7 +225,7 @@ mod inner {
         let mut linker = Linker::new(&engine);
         linker
             .func_wrap("env", "locust_log", |_: Caller<'_, ()>, _: i32, _: i32| {})
-            .map_err(|e| LocustError::Other(e.into()))?;
+            .map_err(LocustError::Other)?;
 
         let instance = linker.instantiate(&mut store, &module).map_err(|e| {
             LocustError::Other(anyhow::anyhow!("failed to instantiate WASM: {}", e))
@@ -239,7 +239,7 @@ mod inner {
 
         let meta_ptr = metadata_fn
             .call(&mut store, ())
-            .map_err(|e| LocustError::Other(e.into()))?;
+            .map_err(LocustError::Other)?;
 
         let memory = instance
             .get_memory(&mut store, "memory")
@@ -271,7 +271,7 @@ mod inner {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "wasm") {
+            if path.extension().is_some_and(|e| e == "wasm") {
                 match load_wasm_plugin(&path) {
                     Ok(plugin) => {
                         tracing::info!("Registered WASM plugin: {}", plugin.metadata.id);
@@ -425,6 +425,304 @@ mod tests {
         {
             let result = scan_plugin_dir(&dir).unwrap();
             assert!(result.is_empty());
+        }
+    }
+
+    #[cfg(not(feature = "wasm-plugins"))]
+    #[test]
+    fn feature_off_scan_is_inert_even_for_a_file() {
+        let dir = tempdir();
+        let path = dir.path().join("plugin.wasm");
+        let bytes = b"\0asm\x01\0\0\0";
+        fs::write(&path, bytes).unwrap();
+        assert!(scan_plugin_dir(&path).unwrap().is_empty());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    // WAT is accepted by Wasmtime's existing default `wat` feature. These guests
+    // have no loops, WASI, external SDK, filesystem access or timing assertions.
+    #[cfg(feature = "wasm-plugins")]
+    mod contracts {
+        use super::*;
+        use crate::extraction::{FormatPlugin, FormatStability};
+        use crate::models::{OutputMode, StringEntry};
+
+        const META: &str =
+            r#"{"id":"fixture","name":"Fixture 日本語","extensions":[".故事","TXT"]}"#;
+
+        fn escaped(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("\\{byte:02x}")).collect()
+        }
+
+        fn data(ptr: usize, bytes: &[u8]) -> String {
+            let mut prefixed = (bytes.len() as u32).to_le_bytes().to_vec();
+            prefixed.extend_from_slice(bytes);
+            assert!(ptr + prefixed.len() <= 32768, "fixture data overlaps heap");
+            format!("(data (i32.const {ptr}) \"{}\")", escaped(&prefixed))
+        }
+
+        fn fixture(metadata: &[u8], operations: &str) -> String {
+            format!(
+                r#"(module
+                    (import "env" "locust_log" (func $log (param i32 i32)))
+                    (memory (export "memory") 1)
+                    (global $heap (mut i32) (i32.const 32768))
+                    {}
+                    (func (export "locust_plugin_metadata") (result i32) i32.const 0)
+                    (func (export "locust_alloc") (param $size i32) (result i32)
+                        (local $ptr i32)
+                        global.get $heap local.tee $ptr
+                        local.get $size i32.add global.set $heap
+                        local.get $ptr)
+                    {operations})"#,
+                data(0, metadata)
+            )
+        }
+
+        fn load(dir: &tempfile::TempDir, name: &str, wat: &str) -> WasmPlugin {
+            let path = dir.path().join(name);
+            fs::write(&path, wat).unwrap();
+            load_wasm_plugin(&path).unwrap()
+        }
+
+        // The guest refuses any mismatch in the public ABI: byte length (not
+        // character count), little-endian prefix, payload and total allocation.
+        // Comparing both arguments also detects overlapping host allocations.
+        fn check_string(ptr: &str, len: &str, value: &str) -> String {
+            let mut wat = format!(
+                "local.get ${len} i32.const {} i32.ne if unreachable end\n\
+                 local.get ${ptr} i32.load i32.const {} i32.ne if unreachable end\n",
+                value.len() + 4,
+                value.len()
+            );
+            for (offset, byte) in value.bytes().enumerate() {
+                wat.push_str(&format!(
+                    "local.get ${ptr} i32.load8_u offset={} i32.const {byte} \
+                     i32.ne if unreachable end\n",
+                    offset + 4
+                ));
+            }
+            wat
+        }
+
+        #[test]
+        fn public_roundtrip_preserves_unicode_identity_and_reports() {
+            let dir = tempdir();
+            let path = dir.path().join("会話.故事");
+            fs::write(&path, b"unchanged host input").unwrap();
+            let mut expected: Vec<StringEntry> = serde_json::from_value(serde_json::json!([
+                {
+                    "id": "scene#1", "source": "同じ台詞 🦀\n{hero}",
+                    "translation": null, "file_path": path, "context": "First speaker",
+                    "tags": ["dialogue"], "metadata": {"slot": 1}, "status": "pending",
+                    "provider_used": null, "char_limit": 80,
+                    "created_at": "2026-01-01T00:00:00Z", "translated_at": null,
+                    "reviewed_at": null
+                },
+                {
+                    "id": "scene#2", "source": "同じ台詞 🦀\n{hero}",
+                    "translation": null, "file_path": path, "context": "Second speaker",
+                    "tags": [], "metadata": {}, "status": "pending",
+                    "provider_used": null, "char_limit": null,
+                    "created_at": "2026-01-01T00:00:00Z", "translated_at": null,
+                    "reviewed_at": null
+                }
+            ]))
+            .unwrap();
+            let extracted_json = serde_json::to_string(&expected).unwrap();
+            expected[0].translation = Some("¡Hola, héroe! 🦀\n{hero}".into());
+            let injected_json = serde_json::to_string(&expected).unwrap();
+            let report_json = serde_json::json!({
+                "files_modified": 1, "strings_written": 1, "strings_skipped": 1,
+                "warnings": ["Fixture report only; no host file was written."],
+                "files_written": ["salida/会話.故事"], "skip_reasons": {"untranslated": 1}
+            })
+            .to_string();
+            let operations = format!(
+                r#"{} {}
+                    (func (export "locust_extract") (param $path i32) (param $path_len i32)
+                        (result i32)
+                        {}
+                        local.get $path i32.const 4 i32.add
+                        local.get $path i32.load call $log
+                        i32.const -1 i32.const 1 call $log
+                        i32.const 0 i32.const -1 call $log
+                        i32.const 65535 i32.const 2 call $log
+                        i32.const 1024)
+                    (func (export "locust_inject")
+                        (param $path i32) (param $path_len i32)
+                        (param $entries i32) (param $entries_len i32) (result i32)
+                        {} {} i32.const 8192)"#,
+                data(1024, extracted_json.as_bytes()),
+                data(8192, report_json.as_bytes()),
+                check_string("path", "path_len", path.to_str().unwrap()),
+                check_string("path", "path_len", path.to_str().unwrap()),
+                check_string("entries", "entries_len", &injected_json)
+            );
+            let wasm = load(
+                &dir,
+                "positive.wasm",
+                &fixture(META.as_bytes(), &operations),
+            );
+            let plugin: &dyn FormatPlugin = &wasm;
+            assert_eq!(plugin.id(), "fixture");
+            assert_eq!(plugin.name(), "Fixture 日本語");
+            assert_eq!(plugin.description(), "");
+            assert!(plugin.supported_extensions().is_empty()); // detect is overridden
+            assert_eq!(plugin.supported_modes(), vec![OutputMode::Replace]);
+            assert_eq!(plugin.stability(), FormatStability::Stable);
+            assert!(plugin.detect(&path));
+            assert!(plugin.detect(std::path::Path::new("UPPER.tXt")));
+            assert!(!plugin.detect(std::path::Path::new("other.bin")));
+            assert!(!plugin.detect(std::path::Path::new("no_extension")));
+            assert!(plugin.validate_source(&path).is_ok());
+            assert!(plugin.inject_add(&path, "es", &[]).is_err());
+
+            let extracted = plugin.extract_with_diagnostics(&path).unwrap();
+            assert!(extracted.complete);
+            assert!(extracted.warnings.is_empty());
+            assert_eq!(
+                serde_json::to_string(&extracted.entries).unwrap(),
+                extracted_json
+            );
+            let mut entries = extracted.entries;
+            entries[0].translation = expected[0].translation.clone();
+            let report = plugin.inject(&path, &entries).unwrap();
+            assert_eq!(
+                serde_json::to_value(report).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&report_json).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_string(&plugin.extract(&path).unwrap()).unwrap(),
+                extracted_json
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"unchanged host input");
+            // The scanner uses the same loader, skips invalid .wasm and ignores
+            // non-.wasm files; it must still return the one valid guest.
+            fs::write(dir.path().join("broken.wasm"), b"invalid").unwrap();
+            fs::write(dir.path().join("ignored.txt"), fixture(META.as_bytes(), "")).unwrap();
+            let plugins = scan_plugin_dir(dir.path()).unwrap();
+            assert_eq!(plugins.len(), 1);
+            assert_eq!(FormatPlugin::id(&plugins[0]), "fixture");
+        }
+
+        #[test]
+        fn public_empty_extract_and_legacy_report_defaults() {
+            let dir = tempdir();
+            let report = br#"{"files_modified":0,"strings_written":0,"strings_skipped":2,"warnings":["legacy"]}"#;
+            let operations = format!(
+                r#"{} {}
+                    (func (export "locust_extract") (param i32 i32) (result i32) i32.const 1024)
+                    (func (export "locust_inject") (param i32 i32 i32 i32) (result i32) i32.const 8192)"#,
+                data(1024, b"[]"),
+                data(8192, report)
+            );
+            let wasm = load(&dir, "legacy.wasm", &fixture(META.as_bytes(), &operations));
+            let plugin: &dyn FormatPlugin = &wasm;
+            let path = std::path::Path::new("empty.txt");
+            let extracted = plugin.extract_with_diagnostics(path).unwrap();
+            assert!(extracted.complete);
+            assert!(extracted.entries.is_empty());
+            assert!(extracted.warnings.is_empty());
+            let report = plugin.inject(path, &[]).unwrap();
+            assert_eq!(report.files_modified, 0);
+            assert_eq!(report.strings_written, 0);
+            assert_eq!(report.strings_skipped, 2);
+            assert_eq!(report.warnings, ["legacy"]);
+            assert!(report.files_written.is_empty());
+            assert!(report.skip_reasons.is_empty());
+        }
+
+        #[test]
+        fn loader_rejects_missing_exports_imports_traps_and_malformed_metadata() {
+            let dir = tempdir();
+            let valid = fixture(META.as_bytes(), "");
+            let cases = [
+                (
+                    "missing-metadata",
+                    "(module (memory (export \"memory\") 1))".to_string(),
+                ),
+                (
+                    "missing-memory",
+                    "(module (func (export \"locust_plugin_metadata\") (result i32) i32.const 0))"
+                        .to_string(),
+                ),
+                (
+                    "unknown-import",
+                    valid.replacen("\"locust_log\"", "\"not_available\"", 1),
+                ),
+                (
+                    "metadata-trap",
+                    valid.replace("(result i32) i32.const 0)", "(result i32) unreachable)"),
+                ),
+                (
+                    "pointer-beyond-memory",
+                    valid.replace("(result i32) i32.const 0)", "(result i32) i32.const 65536)"),
+                ),
+                (
+                    "length-beyond-memory",
+                    fixture(b"", r#"(data (i32.const 0) "\00\00\01\00")"#),
+                ),
+                ("invalid-utf8", fixture(&[0xff], "")),
+                ("malformed-json", fixture(b"{", "")),
+                (
+                    "missing-id",
+                    fixture(br#"{"name":"missing","extensions":[]}"#, ""),
+                ),
+            ];
+            for (name, wat) in cases {
+                let path = dir.path().join(format!("{name}.wasm"));
+                fs::write(&path, wat).unwrap();
+                assert!(load_wasm_plugin(&path).is_err(), "{name}");
+            }
+        }
+
+        #[test]
+        fn public_operations_reject_missing_exports_traps_and_malformed_results() {
+            let dir = tempdir();
+            let path = std::path::Path::new("input.txt");
+            let results = format!("{} {}", data(1024, b"not json"), data(8192, &[0xff]));
+            let bad = format!(
+                r#"{results}
+                    (func (export "locust_extract") (param i32 i32) (result i32) i32.const 1024)
+                    (func (export "locust_inject") (param i32 i32 i32 i32) (result i32) i32.const 8192)"#
+            );
+            let bad_shape = format!(
+                r#"{} {}
+                    (func (export "locust_extract") (param i32 i32) (result i32) i32.const 1024)
+                    (func (export "locust_inject") (param i32 i32 i32 i32) (result i32) i32.const 8192)"#,
+                data(1024, b"{}"),
+                data(8192, b"{}")
+            );
+            let bad_pointer = r#"
+                (func (export "locust_extract") (param i32 i32) (result i32) i32.const 65536)
+                (func (export "locust_inject") (param i32 i32 i32 i32) (result i32) i32.const 65536)"#;
+            let trapped = r#"
+                (func (export "locust_extract") (param i32 i32) (result i32) unreachable)
+                (func (export "locust_inject") (param i32 i32 i32 i32) (result i32) unreachable)"#;
+            let wrong_type = r#"
+                (func (export "locust_extract") (result i32) i32.const 0)
+                (func (export "locust_inject") (result i32) i32.const 0)"#;
+            for (name, wat) in [
+                ("missing-operations", fixture(META.as_bytes(), "")),
+                (
+                    "missing-allocator",
+                    fixture(META.as_bytes(), &bad).replace("\"locust_alloc\"", "\"unused_alloc\""),
+                ),
+                ("wrong-signatures", fixture(META.as_bytes(), wrong_type)),
+                ("traps", fixture(META.as_bytes(), trapped)),
+                ("malformed-results", fixture(META.as_bytes(), &bad)),
+                ("wrong-json-shape", fixture(META.as_bytes(), &bad_shape)),
+                (
+                    "result-pointer-beyond-memory",
+                    fixture(META.as_bytes(), bad_pointer),
+                ),
+            ] {
+                let wasm = load(&dir, &format!("{name}.wasm"), &wat);
+                let plugin: &dyn FormatPlugin = &wasm;
+                assert!(plugin.extract(path).is_err(), "{name}: extract");
+                assert!(plugin.inject(path, &[]).is_err(), "{name}: inject");
+            }
         }
     }
 
