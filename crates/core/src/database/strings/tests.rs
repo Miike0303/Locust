@@ -1,6 +1,635 @@
 use super::super::tests::{make_entry, recording_tempdir, shared_textasset_rows};
 use super::*;
 
+// Retained pre-NEXT-06 implementation: both the parity oracle and benchmark
+// baseline exercise the original window query and the real row hydration.
+fn legacy_entries_page(db: &Database, filter: &EntryFilter) -> Result<(Vec<StringEntry>, usize)> {
+    let conn = lock_connection(&db.conn);
+    let (where_clause, param_values) = entry_where_clause(filter);
+    let mut sql =
+        format!("SELECT {ENTRY_COLUMNS}, COUNT(*) OVER () AS total FROM strings {where_clause}");
+    let mut page_params = param_values.clone();
+    append_entry_pagination(&mut sql, &mut page_params, filter);
+    let mut entries = Vec::new();
+    let mut total = None;
+    let mut originals = OriginalCache::new();
+    {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(&page_params))?;
+        while let Some(row) = rows.next()? {
+            total = Some(row.get::<_, usize>("total")?);
+            entries.push(entry_from_row(row, &conn, &mut originals)?);
+        }
+    }
+    let total = match total {
+        Some(total) => total,
+        None => count_filtered_entries(&conn, &where_clause, &param_values)?,
+    };
+    Ok((entries, total))
+}
+
+fn seed_latency_project(db: &Database, size: usize) {
+    let timestamp = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    for start in (0..size).step_by(1000) {
+        let entries: Vec<_> = (start..size.min(start + 1000))
+            .map(|i| {
+                // Fixed permutation keeps id order independent of file/status.
+                let id = format!("line-{:016x}", (i as u64).wrapping_mul(0x9e3779b97f4a7c15));
+                let source = if i % 2 == 0 {
+                    format!("村の入口で待っている。冒険者 {i}、準備はできましたか？")
+                } else {
+                    format!("Traveller {i}, meet the captain at the northern gate before dawn.")
+                };
+                let mut entry = StringEntry::new(
+                    id,
+                    source,
+                    PathBuf::from(format!("data/chapter-{:02}.json", i % 40)),
+                );
+                entry.status = match (i / 40 + i % 40) % 10 {
+                    0..=3 => StringStatus::Pending,
+                    4..=6 => StringStatus::Translated,
+                    7 => StringStatus::Reviewed,
+                    8 => StringStatus::Approved,
+                    _ => StringStatus::Error,
+                };
+                if entry.status != StringStatus::Pending {
+                    entry.translation = Some(format!(
+                        "Viajero {i}, espera junto a la puerta. {}",
+                        if i % 13 == 0 {
+                            "moonstone"
+                        } else {
+                            "Adelante."
+                        }
+                    ));
+                    entry.provider_used = Some("fixture-provider".into());
+                    entry.translated_at = Some(timestamp);
+                }
+                entry.created_at = timestamp;
+                if matches!(
+                    entry.status,
+                    StringStatus::Reviewed | StringStatus::Approved
+                ) {
+                    entry.reviewed_at = Some(timestamp);
+                }
+                entry.context = Some(format!("Scene {} / speaker {}", i / 40, i % 7));
+                entry.tags = vec![
+                    if i % 3 == 0 { "ui" } else { "dialogue" }.into(),
+                    format!("speaker-{}", i % 7),
+                ];
+                entry.char_limit = Some(240);
+                entry.metadata.insert(
+                    "locator".into(),
+                    serde_json::json!({"line": i, "scene": i / 40, "speaker": i % 7}),
+                );
+                entry
+                    .metadata
+                    .insert("format_id".into(), serde_json::json!("json"));
+                entry.metadata.insert(
+                    "notes".into(),
+                    serde_json::json!(["Keep punctuation", "翻訳メモ", {"optional": true}]),
+                );
+                entry
+            })
+            .collect();
+        db.save_entries(&entries).unwrap();
+    }
+}
+
+fn latency_cases(size: usize) -> Vec<(&'static str, EntryFilter)> {
+    let first = EntryFilter {
+        limit: Some(100),
+        offset: Some(0),
+        ..Default::default()
+    };
+    vec![
+        ("first", first.clone()),
+        (
+            "offset50",
+            EntryFilter {
+                offset: Some(size / 2),
+                ..first.clone()
+            },
+        ),
+        (
+            "offset95",
+            EntryFilter {
+                offset: Some(size * 95 / 100),
+                ..first.clone()
+            },
+        ),
+        (
+            "status",
+            EntryFilter {
+                status: Some(StringStatus::Translated),
+                ..first.clone()
+            },
+        ),
+        (
+            "file",
+            EntryFilter {
+                file_path: Some("data/chapter-07.json".into()),
+                ..first.clone()
+            },
+        ),
+        (
+            "status_file",
+            EntryFilter {
+                status: Some(StringStatus::Translated),
+                file_path: Some("data/chapter-07.json".into()),
+                ..first.clone()
+            },
+        ),
+        (
+            "search_latin",
+            EntryFilter {
+                search: Some("captain".into()),
+                ..first.clone()
+            },
+        ),
+        (
+            "search_cjk",
+            EntryFilter {
+                search: Some("冒険者".into()),
+                ..first.clone()
+            },
+        ),
+        (
+            "search_translation",
+            EntryFilter {
+                search: Some("moonstone".into()),
+                ..first.clone()
+            },
+        ),
+        (
+            "search_sparse",
+            EntryFilter {
+                search: Some("Traveller 9999,".into()),
+                ..first.clone()
+            },
+        ),
+        (
+            "search_missing",
+            EntryFilter {
+                search: Some("not-in-seeded-project".into()),
+                ..first.clone()
+            },
+        ),
+        (
+            "tag",
+            EntryFilter {
+                tag: Some("ui".into()),
+                ..first.clone()
+            },
+        ),
+        (
+            "combined",
+            EntryFilter {
+                status: Some(StringStatus::Translated),
+                file_path: Some("data/chapter-07.json".into()),
+                tag: Some("dialogue".into()),
+                search: Some("captain".into()),
+                ..first
+            },
+        ),
+    ]
+}
+
+fn latency_plan(db: &Database, sql: &str, params: &[Value]) -> Vec<(i64, i64, i64, String)> {
+    lock_connection(&db.conn)
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn latency_percentiles(mut samples: Vec<f64>) -> (f64, f64, f64, f64) {
+    samples.sort_by(f64::total_cmp);
+    let percentile = |p: usize| samples[(samples.len() * p).div_ceil(100) - 1];
+    (
+        percentile(50),
+        percentile(95),
+        samples[0],
+        samples[samples.len() - 1],
+    )
+}
+
+#[test]
+fn seeded_editor_page_parity_with_legacy_window_query() {
+    let db = Database::open_in_memory().unwrap();
+    seed_latency_project(&db, 401);
+    let mut special = make_entry("quoted-'", "captain 冒険者 % _");
+    special.file_path = PathBuf::from("data/menu's.json");
+    special.tags = vec!["ui".into(), "ui_label".into()];
+    special.translation = Some(String::new());
+    special
+        .metadata
+        .insert("nullable".into(), serde_json::Value::Null);
+    db.save_entries(&[special]).unwrap();
+    let mut comparisons = 0;
+    for status in [
+        None,
+        Some(StringStatus::Pending),
+        Some(StringStatus::Translated),
+        Some(StringStatus::Reviewed),
+        Some(StringStatus::Approved),
+        Some(StringStatus::Error),
+    ] {
+        for file in [
+            None,
+            Some("data/chapter-07.json"),
+            Some("data/menu's.json"),
+            Some("missing"),
+        ] {
+            for tag in [
+                None,
+                Some("ui"),
+                Some("dialogue"),
+                Some("speaker-%"),
+                Some("missing"),
+            ] {
+                for search in [
+                    None,
+                    Some("captain"),
+                    Some("冒険者"),
+                    Some("moonstone"),
+                    Some(""),
+                    Some("%"),
+                    Some("_"),
+                    Some("missing"),
+                ] {
+                    let mut filter = EntryFilter {
+                        status: status.clone(),
+                        file_path: file.map(str::to_owned),
+                        tag: tag.map(str::to_owned),
+                        search: search.map(str::to_owned),
+                        ..Default::default()
+                    };
+                    let total = db.count_entries(&filter).unwrap();
+                    for offset in [
+                        None,
+                        Some(0),
+                        Some(1),
+                        Some(total / 2),
+                        Some(total * 95 / 100),
+                        Some(total),
+                        Some(total + 5),
+                    ] {
+                        for limit in [None, Some(0), Some(1), Some(17), Some(100)] {
+                            filter.offset = offset;
+                            filter.limit = limit;
+                            let (expected, expected_total) =
+                                legacy_entries_page(&db, &filter).unwrap();
+                            let (actual, actual_total) = db.get_entries_page(&filter).unwrap();
+                            assert_eq!(actual_total, expected_total, "{filter:?}");
+                            assert_eq!(actual_total, total, "{filter:?}");
+                            assert_eq!(
+                                serde_json::to_value(actual).unwrap(),
+                                serde_json::to_value(expected).unwrap(),
+                                "{filter:?}"
+                            );
+                            comparisons += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 33_600);
+}
+
+/// See docs/SQLITE-PERFORMANCE.md. No timing assertions: host load varies.
+#[test]
+#[ignore = "deterministic 25k/100k SQLite latency benchmark; run in release mode"]
+fn benchmark_editor_string_pages() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let runs = std::env::var("LOCUST_SQLITE_BENCH_RUNS")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("benchmark runs must be an integer")
+        })
+        .unwrap_or(30);
+    assert!(runs >= 20, "at least 20 timed runs per arm are required");
+    let trials = std::env::var("LOCUST_SQLITE_BENCH_TRIALS")
+        .map(|value| value.parse::<usize>().expect("trials must be an integer"))
+        .unwrap_or(1);
+    assert!(trials > 0, "at least one trial is required");
+    let only_cases: Option<Vec<String>> = std::env::var("LOCUST_SQLITE_BENCH_CASE")
+        .ok()
+        .map(|value| value.split(',').map(str::to_owned).collect());
+    assert!(only_cases.as_ref().is_none_or(|cases| cases
+        .iter()
+        .all(|case| latency_cases(25_000).iter().any(|(name, _)| name == case))));
+    let sizes: Vec<usize> = std::env::var("LOCUST_SQLITE_BENCH_SIZES")
+        .unwrap_or_else(|_| "25000,100000".into())
+        .split(',')
+        .map(|value| {
+            value
+                .parse()
+                .expect("sizes must be comma-separated integers")
+        })
+        .collect();
+    let operations =
+        std::env::var("LOCUST_SQLITE_BENCH_OPERATIONS").unwrap_or_else(|_| "page,count".into());
+    assert!(operations
+        .split(',')
+        .all(|op| matches!(op, "page" | "count")));
+    let baseline_only = std::env::var_os("LOCUST_SQLITE_BASELINE_ONLY").is_some();
+    let parent = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let dir = tempfile::Builder::new()
+        .prefix("sqlite-latency-")
+        .tempdir_in(parent)
+        .unwrap();
+    println!(
+        "SQLite {} | warmups=5 runs={runs} per arm trials={trials} interleaved A/B | milliseconds",
+        rusqlite::version()
+    );
+    println!("size,operation,case,trial,before_p50,before_p95,api_p50,api_p95,before_min,before_max,api_min,api_max,paired_delta_pct_p50,paired_delta_pct_p95,paired_delta_pct_min,paired_delta_pct_max,total");
+    for size in sizes {
+        let db = Database::open(&dir.path().join(format!("{size}.db"))).unwrap();
+        seed_latency_project(&db, size);
+        lock_connection(&db.conn)
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        for (name, filter) in latency_cases(size) {
+            if only_cases
+                .as_ref()
+                .is_some_and(|cases| !cases.iter().any(|case| case == name))
+            {
+                continue;
+            }
+            let (where_clause, params) = entry_where_clause(&filter);
+            let count_sql = format!("SELECT COUNT(*) FROM strings {where_clause}");
+            let mut page_params = params.clone();
+            let mut old_sql = format!(
+                "SELECT {ENTRY_COLUMNS}, COUNT(*) OVER () AS total FROM strings {where_clause}"
+            );
+            append_entry_pagination(&mut old_sql, &mut page_params, &filter);
+            let (api_sql, api_params) = entry_page_sql(&filter, &where_clause, &params);
+            let old_plan = latency_plan(&db, &old_sql, &page_params);
+            let api_plan = latency_plan(&db, &api_sql, &api_params);
+            println!("SQL {size} {name} window: {old_sql:?}");
+            println!("SQL {size} {name} api: {api_sql:?}");
+            if !split_entry_page(&filter) {
+                assert_eq!(api_sql.as_bytes(), old_sql.as_bytes(), "{name}");
+                assert_eq!(api_params, page_params, "{name}");
+                assert_eq!(api_plan, old_plan, "{name}");
+                println!("IDENTICAL {size} {name}: SQL bytes, parameters, full EQP tuples");
+            }
+            println!("PLAN {size} {name} window: {:?}", old_plan);
+            println!("PLAN {size} {name} api: {:?}", api_plan);
+            println!(
+                "PLAN {size} {name} count: {:?}",
+                latency_plan(&db, &count_sql, &params)
+            );
+            for count_only in [false, true] {
+                let operation = if count_only { "count" } else { "page" };
+                if !operations.split(',').any(|op| op == operation) {
+                    continue;
+                }
+                let run = |legacy: bool| {
+                    if count_only {
+                        black_box(db.count_entries(black_box(&filter)).unwrap())
+                    } else {
+                        let (entries, total) = if legacy {
+                            legacy_entries_page(&db, black_box(&filter)).unwrap()
+                        } else {
+                            db.get_entries_page(black_box(&filter)).unwrap()
+                        };
+                        black_box(entries);
+                        total
+                    }
+                };
+                let mut trial_results = Vec::new();
+                for trial in 1..=trials {
+                    for _ in 0..5 {
+                        run(false);
+                        if !baseline_only {
+                            run(true);
+                        }
+                    }
+                    let mut before = Vec::with_capacity(runs);
+                    let mut after = Vec::with_capacity(runs);
+                    let mut total = 0;
+                    // Every trial uses this same connection and DB. Reverse the
+                    // pair order each iteration, and the first order each trial.
+                    for i in 0..runs {
+                        for legacy in if (i + trial) % 2 == 0 {
+                            [true, false]
+                        } else {
+                            [false, true]
+                        } {
+                            if baseline_only && legacy {
+                                continue;
+                            }
+                            let started = Instant::now();
+                            total = run(legacy);
+                            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                            if legacy {
+                                before.push(elapsed);
+                            } else {
+                                after.push(elapsed);
+                            }
+                        }
+                    }
+                    let deltas: Vec<_> = before
+                        .iter()
+                        .zip(&after)
+                        .map(|(old, new)| (new / old - 1.0) * 100.0)
+                        .collect();
+                    let (p50, p95, min, max) = latency_percentiles(after);
+                    let (old50, old95, old_min, old_max) = if baseline_only {
+                        (p50, p95, min, max)
+                    } else {
+                        latency_percentiles(before)
+                    };
+                    let (delta50, delta95, delta_min, delta_max) = if baseline_only {
+                        (0.0, 0.0, 0.0, 0.0)
+                    } else {
+                        latency_percentiles(deltas)
+                    };
+                    println!(
+                        "{size},{operation},{name},{trial},{old50:.3},{old95:.3},{p50:.3},{p95:.3},{old_min:.3},{old_max:.3},{min:.3},{max:.3},{delta50:.3},{delta95:.3},{delta_min:.3},{delta_max:.3},{total}"
+                    );
+                    trial_results.push([old50, old95, p50, p95]);
+                }
+                let spans: Vec<_> = (0..4)
+                    .map(|i| {
+                        let (_, _, min, max) = latency_percentiles(
+                            trial_results.iter().map(|values| values[i]).collect(),
+                        );
+                        format!("{min:.3}..{max:.3}")
+                    })
+                    .collect();
+                println!(
+                    "SPREAD {size} {operation} {name}: before_p50={} before_p95={} api_p50={} api_p95={}",
+                    spans[0], spans[1], spans[2], spans[3]
+                );
+            }
+        }
+    }
+}
+
+// Frozen predecessor SQL builder: independent of the production WHERE,
+// pagination and page-query helpers so this catches accidental SQL changes.
+fn pre_next06_page_sql(filter: &EntryFilter) -> (String, Vec<Value>) {
+    let mut sql = String::from("SELECT id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at, COUNT(*) OVER () AS total FROM strings WHERE 1=1");
+    let mut params = Vec::new();
+    if let Some(status) = &filter.status {
+        sql.push_str(" AND status = ?");
+        params.push(Value::Text(status.to_string()));
+    }
+    if let Some(file) = &filter.file_path {
+        sql.push_str(" AND file_path = ?");
+        params.push(Value::Text(file.clone()));
+    }
+    if let Some(tag) = &filter.tag {
+        sql.push_str(" AND tags LIKE ?");
+        params.push(Value::Text(format!("%\"{tag}\"%")));
+    }
+    if let Some(search) = &filter.search {
+        sql.push_str(" AND (source LIKE ? OR translation LIKE ?)");
+        let pattern = format!("%{search}%");
+        params.extend([Value::Text(pattern.clone()), Value::Text(pattern)]);
+    }
+    sql.push_str(" ORDER BY id");
+    if let Some(limit) = filter.limit {
+        sql.push_str(" LIMIT ?");
+        params.push(Value::Integer(limit as i64));
+    }
+    if let Some(offset) = filter.offset {
+        if filter.limit.is_none() {
+            sql.push_str(" LIMIT -1");
+        }
+        sql.push_str(" OFFSET ?");
+        params.push(Value::Integer(offset as i64));
+    }
+    (sql, params)
+}
+
+#[test]
+fn selective_page_sql_is_byte_identical_to_pre_next06() {
+    let mut comparisons = 0;
+    for mask in 0..16 {
+        if mask & 14 == 0 {
+            continue; // Only unfiltered and status-only pages may change.
+        }
+        for text in ["captain", "冒険者", "", "%", "quote's_"] {
+            for limit in [None, Some(0), Some(100)] {
+                for offset in [None, Some(0), Some(500)] {
+                    let filter = EntryFilter {
+                        status: (mask & 1 != 0).then_some(StringStatus::Translated),
+                        file_path: (mask & 2 != 0).then(|| text.to_owned()),
+                        tag: (mask & 4 != 0).then(|| text.to_owned()),
+                        search: (mask & 8 != 0).then(|| text.to_owned()),
+                        limit,
+                        offset,
+                    };
+                    let (where_clause, params) = entry_where_clause(&filter);
+                    let (sql, bindings) = entry_page_sql(&filter, &where_clause, &params);
+                    let (before, before_bindings) = pre_next06_page_sql(&filter);
+                    assert!(!split_entry_page(&filter), "{filter:?}");
+                    assert_eq!(sql.as_bytes(), before.as_bytes(), "{filter:?}");
+                    assert_eq!(bindings, before_bindings, "{filter:?}");
+                    comparisons += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 630);
+}
+
+#[test]
+fn search_sql_and_full_query_plans_are_identical_with_metadata_rows() {
+    let db = Database::open_in_memory().unwrap();
+    seed_latency_project(&db, 401);
+    // EntryFilter has no metadata predicate. Metadata must remain hydrated
+    // payload, and a search for a metadata-only value must still match no rows.
+    for search in ["captain", "冒険者", "翻訳メモ"] {
+        let filter = EntryFilter {
+            search: Some(search.into()),
+            limit: Some(100),
+            offset: Some(0),
+            ..Default::default()
+        };
+        let (before_sql, before_params) = pre_next06_page_sql(&filter);
+        let before_plan = latency_plan(&db, &before_sql, &before_params);
+        let (where_clause, params) = entry_where_clause(&filter);
+        let (after_sql, after_params) = entry_page_sql(&filter, &where_clause, &params);
+        assert_eq!(before_sql.as_bytes(), after_sql.as_bytes());
+        assert_eq!(before_params, after_params);
+        assert_eq!(before_plan, latency_plan(&db, &after_sql, &after_params));
+        assert!(before_plan
+            .iter()
+            .any(|(_, _, _, detail)| detail == "SCAN strings"));
+        let (before, before_total) = legacy_entries_page(&db, &filter).unwrap();
+        let (after, after_total) = db.get_entries_page(&filter).unwrap();
+        assert_eq!(before_total, after_total);
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        if search == "翻訳メモ" {
+            assert_eq!(after_total, 0);
+        } else {
+            assert!(after.iter().all(|row| row.metadata.contains_key("notes")));
+        }
+    }
+}
+
+#[test]
+fn guarded_pages_use_covering_counts_and_id_index_without_sorting() {
+    let db = Database::open_in_memory().unwrap();
+    seed_latency_project(&db, 401);
+    for status in [None, Some(StringStatus::Translated)] {
+        let filter = EntryFilter {
+            status,
+            limit: Some(100),
+            offset: Some(0),
+            ..Default::default()
+        };
+        let (where_clause, params) = entry_where_clause(&filter);
+        let (sql, page_params) = entry_page_sql(&filter, &where_clause, &params);
+        let count_plan = latency_plan(
+            &db,
+            &format!("SELECT COUNT(*) FROM strings {where_clause}"),
+            &params,
+        );
+        let page_plan = latency_plan(&db, &sql, &page_params);
+        assert!(count_plan
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("COVERING INDEX")));
+        assert!(page_plan
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("USING INDEX sqlite_autoindex_strings_1")));
+        assert!(!page_plan
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("TEMP B-TREE")));
+        for (limit, offset) in [(100, 0), (0, 0), (100, 500)] {
+            let page_filter = EntryFilter {
+                limit: Some(limit),
+                offset: Some(offset),
+                ..filter.clone()
+            };
+            STRINGS_QUERIES.with(|count| count.set(Some(0)));
+            let result = db.get_entries_page(&page_filter);
+            let queries = STRINGS_QUERIES.with(|count| count.replace(None));
+            result.unwrap();
+            assert_eq!(queries, Some(2), "{page_filter:?}");
+        }
+    }
+}
+
 #[test]
 fn partial_extract_preserves_absent_rows_and_pivot_provenance() {
     let db = Database::open_in_memory().unwrap();
@@ -2485,4 +3114,184 @@ async fn control_manual_and_imported_results_remain_reportable_and_block_pivot()
     assert!(fr.get_entries(&EntryFilter::default()).unwrap()[0]
         .translation
         .is_none());
+}
+
+#[test]
+fn guarded_entry_pages_preserve_transaction_ownership_on_success_and_error() {
+    let db = Database::open_in_memory().unwrap();
+    db.save_entries(&[make_entry("a", "original"), make_entry("b", "other")])
+        .unwrap();
+    let filter = EntryFilter {
+        limit: Some(1),
+        ..Default::default()
+    };
+    let (page, total) = db.get_entries_page(&filter).unwrap();
+    assert_eq!(page[0].source, "original");
+    assert_eq!(total, 2);
+    assert!(lock_connection(&db.conn).is_autocommit());
+
+    lock_connection(&db.conn)
+        .execute("UPDATE strings SET metadata = '{' WHERE id = 'a'", [])
+        .unwrap();
+    assert!(db
+        .get_entries_page(&filter)
+        .unwrap_err()
+        .to_string()
+        .contains("malformed metadata"));
+    assert!(lock_connection(&db.conn).is_autocommit());
+    lock_connection(&db.conn)
+        .execute("UPDATE strings SET metadata = '{}' WHERE id = 'a'", [])
+        .unwrap();
+    assert_eq!(
+        db.get_entries_page(&filter).unwrap().0[0].source,
+        "original"
+    );
+
+    lock_connection(&db.conn)
+        .execute_batch("BEGIN; UPDATE strings SET source = 'caller edit' WHERE id = 'a';")
+        .unwrap();
+    let (page, total) = db.get_entries_page(&filter).unwrap();
+    assert_eq!(page[0].source, "caller edit");
+    assert_eq!(total, 2);
+    assert!(!lock_connection(&db.conn).is_autocommit());
+
+    lock_connection(&db.conn)
+        .execute("UPDATE strings SET metadata = '{' WHERE id = 'a'", [])
+        .unwrap();
+    assert!(db.get_entries_page(&filter).is_err());
+    {
+        let conn = lock_connection(&db.conn);
+        assert!(!conn.is_autocommit());
+        let source: String = conn
+            .query_row("SELECT source FROM strings WHERE id = 'a'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source, "caller edit");
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+    assert!(lock_connection(&db.conn).is_autocommit());
+    let (page, total) = db.get_entries_page(&filter).unwrap();
+    assert_eq!(page[0].source, "original");
+    assert_eq!(total, 2);
+}
+
+#[test]
+fn guarded_entry_pages_reuse_a_pinned_wal_snapshot() {
+    let parent = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let dir = tempfile::Builder::new()
+        .prefix("sqlite-page-snapshot-")
+        .tempdir_in(parent)
+        .unwrap();
+    let path = dir.path().join("project.db");
+    let db = Database::open(&path).unwrap();
+    db.save_entries(&[make_entry("a", "original"), make_entry("b", "other")])
+        .unwrap();
+    let writer = Database::open(&path).unwrap();
+    {
+        let conn = lock_connection(&db.conn);
+        conn.execute_batch("BEGIN DEFERRED").unwrap();
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM strings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+    writer
+        .save_entries(&[
+            make_entry("a", "writer edit"),
+            make_entry("c", "writer insertion"),
+        ])
+        .unwrap();
+    assert_eq!(writer.count_entries(&EntryFilter::default()).unwrap(), 3);
+
+    for status in [None, Some(StringStatus::Pending)] {
+        let filter = EntryFilter {
+            status,
+            limit: Some(10),
+            ..Default::default()
+        };
+        let (page, total) = db.get_entries_page(&filter).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(
+            page.iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(page[0].source, "original");
+        assert!(!lock_connection(&db.conn).is_autocommit());
+    }
+    lock_connection(&db.conn).execute_batch("ROLLBACK").unwrap();
+    let (page, total) = db.get_entries_page(&EntryFilter::default()).unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(page[0].source, "writer edit");
+    assert!(lock_connection(&db.conn).is_autocommit());
+}
+
+#[test]
+fn guarded_entry_pages_reopen_existing_database_without_schema_changes() {
+    let parent = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let dir = tempfile::Builder::new()
+        .prefix("sqlite-page-existing-")
+        .tempdir_in(parent)
+        .unwrap();
+    let path = dir.path().join("project.db");
+    let schema_state = |db: &Database| {
+        let conn = lock_connection(&db.conn);
+        let version: i64 = conn
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        let indexes: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'strings' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        (version, indexes)
+    };
+    let db = Database::open(&path).unwrap();
+    db.save_entries(&[make_entry("b", "other"), make_entry("a", "retained")])
+        .unwrap();
+    let before = schema_state(&db);
+    assert_eq!(
+        before
+            .1
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "idx_strings_file",
+            "idx_strings_status",
+            "sqlite_autoindex_strings_1"
+        ]
+    );
+    drop(db);
+
+    for _ in 0..2 {
+        let db = Database::open(&path).unwrap();
+        assert_eq!(schema_state(&db), before);
+        for status in [None, Some(StringStatus::Pending)] {
+            let (page, total) = db
+                .get_entries_page(&EntryFilter {
+                    status,
+                    limit: Some(1),
+                    offset: Some(0),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(total, 2);
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].id, "a");
+            assert_eq!(page[0].source, "retained");
+        }
+        assert_eq!(schema_state(&db), before);
+    }
 }

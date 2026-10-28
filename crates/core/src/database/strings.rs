@@ -80,18 +80,28 @@ impl Database {
         query_entries(&conn, &sql, &params_refs, &mut OriginalCache::new())
     }
 
-    /// Return a page and its unpaginated total from one strings query. An empty
-    /// page has no window total, so count it under the same connection lock.
+    /// Return a page and its unpaginated total. Unfiltered/status-only pages
+    /// count a covering index and walk the id index in one read snapshot.
+    /// Selective filters retain the window query and its empty-page count.
     pub fn get_entries_page(&self, filter: &EntryFilter) -> Result<(Vec<StringEntry>, usize)> {
         let conn = lock_connection(&self.conn);
         let (where_clause, param_values) = entry_where_clause(filter);
-        let mut sql = format!(
-            "SELECT {ENTRY_COLUMNS}, COUNT(*) OVER () AS total FROM strings {where_clause}"
-        );
-        let mut page_params = param_values.clone();
-        append_entry_pagination(&mut sql, &mut page_params, filter);
+        let split = split_entry_page(filter);
+        // The mutex excludes this connection's writers, but WAL permits other
+        // connections to write. Pin count/page/hydration to the same snapshot.
+        // Leave a caller-owned transaction open and untouched on either path.
+        let tx = if split && conn.is_autocommit() {
+            Some(conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let (sql, page_params) = entry_page_sql(filter, &where_clause, &param_values);
         let mut entries = Vec::new();
-        let mut total = None;
+        let mut total = if split {
+            Some(count_filtered_entries(&conn, &where_clause, &param_values)?)
+        } else {
+            None
+        };
         let mut originals = OriginalCache::new();
         {
             let mut stmt = conn.prepare(&sql)?;
@@ -99,7 +109,9 @@ impl Database {
             record_strings_query();
             let mut rows = stmt.query(rusqlite::params_from_iter(&page_params))?;
             while let Some(row) = rows.next()? {
-                total = Some(row.get::<_, usize>("total")?);
+                if !split {
+                    total = Some(row.get::<_, usize>("total")?);
+                }
                 entries.push(entry_from_row(row, &conn, &mut originals)?);
             }
         }
@@ -107,6 +119,9 @@ impl Database {
             Some(total) => total,
             None => count_filtered_entries(&conn, &where_clause, &param_values)?,
         };
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok((entries, total))
     }
 
@@ -1340,6 +1355,27 @@ struct RawEntry {
 type OriginalCache = HashMap<String, Arc<crate::models::TextAssetOriginal>>;
 
 const ENTRY_COLUMNS: &str = "id, source, translation, status, file_path, context, tags, metadata, char_limit, provider_used, created_at, translated_at, reviewed_at";
+
+fn split_entry_page(filter: &EntryFilter) -> bool {
+    filter.file_path.is_none() && filter.tag.is_none() && filter.search.is_none()
+}
+
+fn entry_page_sql(
+    filter: &EntryFilter,
+    where_clause: &str,
+    params: &[Value],
+) -> (String, Vec<Value>) {
+    let mut sql = if split_entry_page(filter) {
+        // Reuse the PRIMARY KEY index, including for status-only pages: SQLite
+        // otherwise chooses the status index and sorts all matching wide rows.
+        format!("SELECT {ENTRY_COLUMNS} FROM strings INDEXED BY sqlite_autoindex_strings_1 {where_clause}")
+    } else {
+        format!("SELECT {ENTRY_COLUMNS}, COUNT(*) OVER () AS total FROM strings {where_clause}")
+    };
+    let mut page_params = params.to_vec();
+    append_entry_pagination(&mut sql, &mut page_params, filter);
+    (sql, page_params)
+}
 
 fn entry_where_clause(filter: &EntryFilter) -> (String, Vec<Value>) {
     let mut sql = String::from("WHERE 1=1");
