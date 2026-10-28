@@ -91,6 +91,17 @@ pub(crate) async fn memory_stats(
     })))
 }
 
+fn parse_memory_limit(value: &str) -> Option<usize> {
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    // Clamp while accumulating so even integers larger than u64 remain valid.
+    Some(digits.bytes().fold(0, |limit, digit| {
+        (limit * 10 + usize::from(digit - b'0')).min(500)
+    }))
+}
+
 pub(crate) async fn list_memory(
     State(state): State<Arc<AppState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -105,7 +116,7 @@ pub(crate) async fn list_memory(
     let lang_pair = params.get("lang_pair").map(|s| s.as_str());
     let limit: usize = params
         .get("limit")
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| parse_memory_limit(s))
         .unwrap_or(50);
     let offset: usize = params
         .get("offset")
@@ -310,6 +321,54 @@ pub(crate) async fn memory_lang_pairs(
 #[cfg(test)]
 mod tests {
     use crate::routes::test_support::*;
+
+    #[test]
+    fn memory_limit_caps_valid_decimal_integers_without_overflow() {
+        for (value, expected) in [
+            ("0", 0),
+            ("000", 0),
+            ("+0", 0),
+            ("1", 1),
+            ("50", 50),
+            ("+50", 50),
+            ("000050", 50),
+            ("499", 499),
+            ("500", 500),
+            ("501", 500),
+            ("000501", 500),
+            ("+000501", 500),
+            ("18446744073709551615", 500),
+            ("18446744073709551616", 500),
+            ("+18446744073709551616", 500),
+            (
+                "999999999999999999999999999999999999999999999999999999999999999999",
+                500,
+            ),
+        ] {
+            assert_eq!(super::parse_memory_limit(value), Some(expected), "{value}");
+        }
+    }
+
+    #[test]
+    fn memory_limit_rejects_invalid_syntax_even_after_reaching_the_cap() {
+        for value in [
+            "",
+            "nope",
+            "-1",
+            "-0",
+            "1.5",
+            " 501",
+            "501 ",
+            "501\n",
+            "999999999999999999999999x",
+            "+",
+            "++50",
+            "+-0",
+            "１２",
+        ] {
+            assert_eq!(super::parse_memory_limit(value), None, "{value}");
+        }
+    }
 
     #[tokio::test]
     async fn memory_reads_do_not_contend_with_each_other_or_project_operations() {

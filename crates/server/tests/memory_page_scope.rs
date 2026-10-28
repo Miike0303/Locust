@@ -164,6 +164,206 @@ async fn clear_uses_the_same_project_store_as_list_and_clears_legacy_global_memo
     server.abort();
 }
 
+async fn pagination_state() -> Arc<AppState> {
+    let state = seeded_state().await;
+    let rows = (0..498)
+        .map(|i| {
+            (
+                format!("page-{i:03}"),
+                format!("Page source {i:03}"),
+                format!("Página {i:03}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    state.db.save_memory_batch(&rows, "en-es").await.unwrap();
+    // Nontrivial usage counters and timestamps must survive every read.
+    state
+        .db
+        .save_memory("hello", "Hello", "Hola", "en-es")
+        .await
+        .unwrap();
+    state
+}
+
+async fn public_snapshot(client: &Client, base: &str) -> Value {
+    json!({
+        "first": get(client, base, "memory?limit=500").await,
+        "tail": get(client, base, "memory?limit=500&offset=500").await,
+        "stats": get(client, base, "memory/stats").await,
+        "pairs": get(client, base, "memory/lang-pairs").await,
+    })
+}
+
+fn expected_page(rows: &[Value], limit: usize, offset: usize) -> Value {
+    json!({
+        "entries": rows.iter().skip(offset).take(limit).collect::<Vec<_>>(),
+        "total": rows.len(),
+        "limit": limit,
+        "offset": offset,
+    })
+}
+
+#[tokio::test]
+async fn pagination_caps_only_valid_limits_and_preserves_full_responses_and_stores() {
+    let state = pagination_state().await;
+    // Public repository APIs capture opaque timestamps and the complete row schema;
+    // expectations below are not inferred from the handler under test.
+    let rows = serde_json::to_value(state.db.list_memory(None, None, 501, 0).unwrap().0)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone();
+    let global_before = serde_json::to_value(
+        state
+            .global_memory
+            .list_memory(None, None, 500, 0)
+            .unwrap()
+            .0,
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 501);
+    assert!(rows.iter().all(|row| row["source"] != "Global source"));
+    assert!(rows.iter().any(|row| row["uses"] == 2));
+    let (base, server) = start_test_server(state.clone()).await;
+    let client = Client::builder().no_proxy().build().unwrap();
+    let before = public_snapshot(&client, &base).await;
+    assert_eq!(before["first"], expected_page(&rows, 500, 0));
+    assert_eq!(before["tail"], expected_page(&rows, 500, 500));
+    assert_eq!(
+        before["stats"],
+        json!({"project_entries": 501, "global_entries": 1})
+    );
+    assert_eq!(before["pairs"], json!(["en-es", "en-fr"]));
+
+    for (query, limit, offset) in [
+        ("", 50, 0),
+        ("limit=50", 50, 0),
+        ("limit=500", 500, 0),
+        ("limit=501", 500, 0),
+        ("limit=18446744073709551615", 500, 0),
+        ("limit=18446744073709551616", 500, 0),
+        (
+            "limit=999999999999999999999999999999999999999999999999999999999999999999",
+            500,
+            0,
+        ),
+        ("limit=0", 0, 0),
+        ("limit=000", 0, 0),
+        ("limit=000501", 500, 0),
+        ("limit=%2B50", 50, 0),
+        ("limit=%2B18446744073709551616", 500, 0),
+        ("limit=", 50, 0),
+        ("limit=nope", 50, 0),
+        ("limit=-1", 50, 0),
+        ("limit=-0", 50, 0),
+        ("limit=1.5", 50, 0),
+        ("limit=%20501", 50, 0),
+        ("limit=501%20", 50, 0),
+        ("limit=999999999999999999999999x", 50, 0),
+        ("limit=%2B", 50, 0),
+        ("limit=１２", 50, 0),
+        ("limit=500&offset=500", 500, 500),
+        ("limit=501&offset=500", 500, 500),
+        ("offset=501", 50, 501),
+        ("limit=0&offset=500", 0, 500),
+        ("offset=", 50, 0),
+        ("offset=nope", 50, 0),
+        ("offset=-1", 50, 0),
+        ("offset=18446744073709551616", 50, 0),
+    ] {
+        assert_eq!(
+            get(&client, &base, &format!("memory?{query}")).await,
+            expected_page(&rows, limit, offset),
+            "{query}",
+        );
+    }
+    for (query, search, pair, limit, offset) in [
+        ("search=Page&limit=501", "Page", "", 500, 0),
+        ("search=Página&limit=1&offset=1", "Página", "", 1, 1),
+        ("lang_pair=en-es&limit=501", "", "en-es", 500, 0),
+        ("lang_pair=en-fr&limit=501", "", "en-fr", 500, 0),
+        ("search=Hello&lang_pair=en-fr", "Hello", "en-fr", 50, 0),
+        ("search=Mundo&lang_pair=en-fr", "Mundo", "en-fr", 50, 0),
+        (
+            "search=Hello&lang_pair=en-es&limit=0",
+            "Hello",
+            "en-es",
+            0,
+            0,
+        ),
+        ("search=&limit=501", "", "", 500, 0),
+        ("lang_pair=", "", "missing", 50, 0),
+    ] {
+        let filtered = rows
+            .iter()
+            .filter(|row| {
+                (pair.is_empty() || row["lang_pair"] == pair)
+                    && (row["source"].as_str().unwrap().contains(search)
+                        || row["translation"].as_str().unwrap().contains(search))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            get(&client, &base, &format!("memory?{query}")).await,
+            expected_page(&filtered, limit, offset),
+            "{query}",
+        );
+    }
+    assert_eq!(public_snapshot(&client, &base).await, before);
+    assert_eq!(
+        serde_json::to_value(
+            state
+                .global_memory
+                .list_memory(None, None, 500, 0)
+                .unwrap()
+                .0,
+        )
+        .unwrap(),
+        global_before
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn capped_reads_remain_concurrent_and_no_project_errors_leave_public_state_unchanged() {
+    let state = pagination_state().await;
+    let (base, server) = start_test_server(state.clone()).await;
+    let client = Client::builder().no_proxy().build().unwrap();
+    let before = public_snapshot(&client, &base).await;
+    let held = locust_server::try_project_operation(&state).unwrap();
+    let (page, pairs, stats) = tokio::join!(
+        get(&client, &base, "memory?limit=501"),
+        get(&client, &base, "memory/lang-pairs"),
+        get(&client, &base, "memory/stats"),
+    );
+    assert_eq!(page, before["first"]);
+    assert_eq!(pairs, before["pairs"]);
+    assert_eq!(stats, before["stats"]);
+    drop(held);
+    assert_eq!(public_snapshot(&client, &base).await, before);
+
+    let project = state.current_project.write().await.take();
+    for query in [
+        "",
+        "limit=501",
+        "limit=18446744073709551616",
+        "limit=0",
+        "limit=nope&offset=500",
+    ] {
+        let response = client
+            .get(format!("{base}/api/memory?{query}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{query}");
+        assert_eq!(response.text().await.unwrap(), "no project open");
+    }
+    assert_eq!(get(&client, &base, "memory/stats").await, before["stats"]);
+    *state.current_project.write().await = project;
+    assert_eq!(public_snapshot(&client, &base).await, before);
+    server.abort();
+}
+
 fn project_routes() -> [(Method, &'static str); 4] {
     [
         (Method::GET, "memory?search=Hello&lang_pair=en-es"),

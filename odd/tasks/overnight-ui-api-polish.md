@@ -12,7 +12,7 @@ S4. Original audit request: "envia agentges, checa el estado completo, capturas,
 T1 | S1,S2,S3 | delegated/context-backstop | done | Accessible selection/F2/Escape; focused27/0, corrected-seam42/0, differential20shared cases/base+new, tsc0; parent job5 frontend1138/0+build PASS; commit e85417c.
 T2 | S1,S2,S3 | delegated/context-backstop | done | Severity-aware persistence/priority/pause/geometry; RED9/12 to GREEN26/0; parent job6 fullfrontend1164/0+build PASS; independent Risk3 PASS4138probes; commit 03305f6.
 T3 | S1,S3,S4 | delegated/context-backstop | done | Reproduced RED40/4, GREEN52/0, differential43/9 to52/0; parent job8 suite/build PASS; independent Risk4 PASS52tests+9probes; commit pending.
-T4 | S1,S3 | delegated/context-backstop | in_progress | Public HTTP tests authored; first compile timeout30s before RED, handler unchanged; parent job9 bounded retry1 pending under owner standing retry grant.
+T4 | S1,S3 | delegated/context-backstop | done | Cap500/lenient parser; Codex RED5/2 to GREEN7/0, parser unit2/0, fmt/strictClippy PASS. Codex-sandbox backup accounting16!=8 was hard-link fallback inside the unelevated sandbox; parent rerun outside sandbox memory7/0, backup1/0, parser2/0 (2026-10-28).
 T5 | S1,S3,S4 | delegated/context-backstop | pending | Measure edit invalidation, SQLite/list latency and websocket retention; implement only evidenced bounded improvements; evidence pending.
 T6 | S1,S3,S4 | inline | pending | Verify exact memory retrieval beyond3000candidates; fix if reproduced; evidence pending.
 T7 | S1,S3,S4 | inline | pending | Candidate-bound responsive captures and bounded workflow simplification where demonstrated; evidence pending.
