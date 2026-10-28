@@ -1,14 +1,38 @@
 use async_trait::async_trait;
+use std::sync::Arc;
+use std::time::Duration;
 
 use locust_core::error::{LocustError, Result};
 use locust_core::models::{TranslationRequest, TranslationResult};
-use locust_core::translation::TranslationProvider;
+use locust_core::translation::{rate_limiter_for, RateLimiter, TranslationProvider};
+
+// Bound the encoded POST body as well as Unicode characters. The endpoint URL
+// contains only language/options; source text is never placed in its query.
+const MAX_FORM_BYTES: usize = 64 * 1024;
+
+fn source_form_bytes(source: &str) -> usize {
+    4 + source
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b' ' | b'*' | b'-' | b'.' | b'_') {
+                1
+            } else {
+                3
+            }
+        })
+        .sum::<usize>()
+}
 
 /// Google Translate provider using the free web API (no API key required).
 /// Uses the undocumented but widely-used translate.googleapis.com endpoint.
 pub struct GoogleTranslateProvider {
     client: reqwest::Client,
     base_url: String,
+    limiter: Arc<RateLimiter>,
+    max_sources: usize,
+    max_chars: usize,
+    concurrency: usize,
 }
 
 impl GoogleTranslateProvider {
@@ -16,33 +40,58 @@ impl GoogleTranslateProvider {
         Self {
             client: reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                .timeout(Duration::from_secs(20))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             base_url: "https://translate.googleapis.com".to_string(),
+            limiter: rate_limiter_for("google"),
+            // Bounded live measurements and rationale: docs/GOOGLE-FAST-MODE.md.
+            max_sources: 200,
+            max_chars: 9000,
+            concurrency: 4,
         }
     }
 
-    fn chunks(requests: &[TranslationRequest]) -> Vec<&[TranslationRequest]> {
-        const MAX_SOURCES: usize = 50;
-        const MAX_CHARS: usize = 4500;
+    /// Explicit tuning for the opt-in bounded endpoint probe. Normal callers use
+    /// the process-wide Google limiter, including configured fixed-rpm overrides.
+    pub fn with_tuning(
+        limiter: Arc<RateLimiter>,
+        max_sources: usize,
+        max_chars: usize,
+        concurrency: usize,
+    ) -> Self {
+        Self {
+            limiter,
+            max_sources: max_sources.max(1),
+            max_chars: max_chars.max(1),
+            concurrency: concurrency.max(1),
+            ..Self::new()
+        }
+    }
 
+    fn chunks<'a>(&self, requests: &'a [TranslationRequest]) -> Vec<&'a [TranslationRequest]> {
         let mut chunks = Vec::new();
         let mut start = 0;
         let mut chars = 0;
+        let mut form_bytes = 0;
         for (i, request) in requests.iter().enumerate() {
             let source_chars = request.source.chars().count();
+            let source_bytes = source_form_bytes(&request.source);
             if i > start
-                && (i - start == MAX_SOURCES
-                    || chars + source_chars > MAX_CHARS
+                && (i - start == self.max_sources
+                    || chars + source_chars > self.max_chars
+                    || form_bytes + source_bytes > MAX_FORM_BYTES
                     || request.source_lang != requests[start].source_lang
                     || request.target_lang != requests[start].target_lang)
             {
                 chunks.push(&requests[start..i]);
                 start = i;
                 chars = 0;
+                form_bytes = 0;
             }
             // A source over the character budget must travel alone, without truncation.
             chars += source_chars;
+            form_bytes += source_bytes;
         }
         if start < requests.len() {
             chunks.push(&requests[start..]);
@@ -54,6 +103,7 @@ impl GoogleTranslateProvider {
         client: &reqwest::Client,
         base_url: &str,
         requests: &[TranslationRequest],
+        limiter: &RateLimiter,
     ) -> Result<Vec<TranslationResult>> {
         let url = format!("{base_url}/translate_a/t");
         let mut results = Vec::with_capacity(requests.len());
@@ -62,6 +112,16 @@ impl GoogleTranslateProvider {
         // Traverse the halving retry tree in input order. Each split strictly reduces
         // the chunk size, so malformed responses eventually fail at a single source.
         while let Some(chunk) = pending.pop() {
+            if chunk.len() == 1 && source_form_bytes(&chunk[0].source) > MAX_FORM_BYTES {
+                return Err(LocustError::ProviderError(
+                    "Google Translate source exceeds the 64 KiB POST form budget".into(),
+                ));
+            }
+            if !limiter.acquire_http().await {
+                return Err(LocustError::ProviderError(
+                    "Google live probe stopped after consecutive blocked responses".into(),
+                ));
+            }
             let fields: Vec<_> = chunk.iter().map(|r| ("q", r.source.as_str())).collect();
             let resp = client
                 .post(&url)
@@ -81,20 +141,49 @@ impl GoogleTranslateProvider {
                     ))
                 })?;
 
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let html = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.to_ascii_lowercase().contains("text/html"));
+            if status.as_u16() == 429 || status.as_u16() == 503 || html {
+                limiter.record_google_response(status.as_u16(), true, retry_after.as_deref());
+                return Err(Self::traffic_error(status));
+            }
+            let body = resp.text().await.map_err(|e| {
+                LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
+                    &format!("Google Translate response read failed: {e}"),
+                    &[],
+                ))
+            })?;
+            let lower = body.trim_start().to_ascii_lowercase();
+            let decoded = serde_json::from_str::<serde_json::Value>(&body);
+            let blocked = lower.starts_with("<!doctype html")
+                || lower.starts_with("<html")
+                || (decoded.is_err() && lower.contains("unusual traffic"))
+                || (lower.starts_with('<') && lower.contains("captcha"));
+            if blocked {
+                limiter.record_google_response(status.as_u16(), true, retry_after.as_deref());
+                return Err(Self::traffic_error(status));
+            }
             // Let the engine retry HTTP failures according to their status. Splitting
             // these would multiply requests during rate limits or upstream outages.
-            if !resp.status().is_success() {
+            if !status.is_success() {
                 return Err(LocustError::ProviderError(
                     crate::error_sanitizer::sanitize_provider_error(
-                        &format!("Google Translate returned status {}", resp.status()),
+                        &format!("Google Translate returned status {}", status),
                         &[],
                     ),
                 ));
             }
 
-            let parsed = resp
-                .json::<serde_json::Value>()
-                .await
+            let parsed = decoded
                 .map_err(|e| {
                     LocustError::ProviderError(crate::error_sanitizer::sanitize_provider_error(
                         &format!("Google Translate returned invalid JSON: {}", e),
@@ -104,7 +193,10 @@ impl GoogleTranslateProvider {
                 .and_then(|body| Self::parse_response(&body, chunk));
 
             match parsed {
-                Ok(translations) => results.extend(translations),
+                Ok(translations) => {
+                    limiter.record_google_response(status.as_u16(), false, None);
+                    results.extend(translations);
+                }
                 Err(_) if chunk.len() > 1 => {
                     let (left, right) = chunk.split_at(chunk.len() / 2);
                     pending.push(right);
@@ -114,6 +206,19 @@ impl GoogleTranslateProvider {
             }
         }
         Ok(results)
+    }
+
+    fn traffic_error(status: reqwest::StatusCode) -> LocustError {
+        // Do not echo challenge HTML or a 403: core's generic auth-error
+        // classifier must see this as a retryable traffic limit instead.
+        LocustError::ProviderError(format!(
+            "Google Translate rate limit (429/503 or traffic challenge; status {})",
+            if status.as_u16() == 403 {
+                "traffic challenge".to_string()
+            } else {
+                status.to_string()
+            }
+        ))
     }
 
     fn parse_response(
@@ -203,23 +308,23 @@ impl TranslationProvider for GoogleTranslateProvider {
     }
 
     async fn translate(&self, requests: &[TranslationRequest]) -> Result<Vec<TranslationResult>> {
-        const CONCURRENCY: usize = 8;
-
-        let chunks = Self::chunks(requests);
+        let chunks = self.chunks(requests);
         let mut results = vec![Vec::new(); chunks.len()];
         let mut chunks = chunks.into_iter().enumerate();
         // Dropping the set on failure or cancellation aborts the remaining tasks.
         let mut tasks = tokio::task::JoinSet::new();
         loop {
-            while tasks.len() < CONCURRENCY {
+            while tasks.len() < self.concurrency {
                 let Some((index, chunk)) = chunks.next() else {
                     break;
                 };
                 let client = self.client.clone();
                 let base_url = self.base_url.clone();
                 let chunk = chunk.to_vec();
+                let limiter = self.limiter.clone();
                 tasks.spawn(async move {
-                    let translations = Self::translate_chunk(&client, &base_url, &chunk).await;
+                    let translations =
+                        Self::translate_chunk(&client, &base_url, &chunk, &limiter).await;
                     (index, translations)
                 });
             }
@@ -261,7 +366,6 @@ mod tests {
     use httpmock::prelude::*;
     use locust_core::translation::is_retryable;
     use serde_json::json;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn google_transport_and_decode_errors_redact_url_queries() {
@@ -276,6 +380,7 @@ mod tests {
         for base in [format!("http://{address}"), server.base_url()] {
             let provider = GoogleTranslateProvider {
                 base_url: format!("{base}/?token=google-query-sentinel"),
+                limiter: Arc::new(RateLimiter::unlimited()),
                 ..GoogleTranslateProvider::new()
             };
             let error = provider
@@ -290,6 +395,11 @@ mod tests {
     fn make_provider(server: &MockServer) -> GoogleTranslateProvider {
         GoogleTranslateProvider {
             base_url: server.base_url(),
+            limiter: Arc::new(RateLimiter::unlimited()),
+            // Keep the original boundary/isolation regressions at their explicit
+            // 50-source/4500-character settings; larger bodies have separate tests.
+            max_sources: 50,
+            max_chars: 4500,
             ..GoogleTranslateProvider::new()
         }
     }
@@ -636,6 +746,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unicode_post_chunks_obey_encoded_body_budget() {
+        let server = MockServer::start();
+        let sources = ["🦀".repeat(3000), "猫".repeat(4000), "🦊".repeat(3000)];
+        let source_refs: Vec<_> = sources.iter().map(String::as_str).collect();
+        let requests = requests(&source_refs, "ja");
+        let provider = GoogleTranslateProvider {
+            max_sources: 200,
+            max_chars: 9000,
+            ..make_provider(&server)
+        };
+        let mut mocks = Vec::new();
+        for request in &requests {
+            let body = form_body(std::slice::from_ref(request));
+            assert!(body.len() < MAX_FORM_BYTES);
+            mocks.push(server.mock(|when, then| {
+                when.method(POST).body(body);
+                then.status(200).json_body(json!(["A"]));
+            }));
+        }
+        assert_eq!(provider.translate(&requests).await.unwrap().len(), 3);
+        for mock in mocks {
+            mock.assert_hits(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn single_source_over_body_budget_fails_without_sending_or_truncating() {
+        let server = MockServer::start();
+        let mock = server.mock(|_when, then| {
+            then.status(200);
+        });
+        let source = "🦀".repeat(6000);
+        let error = make_provider(&server)
+            .translate(&requests(&[&source], "ja"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("POST form budget"));
+        mock.assert_hits(0);
+    }
+
+    #[tokio::test]
     async fn different_language_pairs_use_separate_chunks() {
         let server = MockServer::start();
         let mut requests = requests(&["a", "b", "c"], "ja");
@@ -671,9 +822,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains(&format!(
-                "Google Translate returned status {status} {reason}"
-            )),
+            error.to_string().contains(&format!("{status} {reason}")),
             "{error}"
         );
         assert_eq!(is_retryable(&error), retryable, "{error}");
@@ -705,6 +854,223 @@ mod tests {
         });
         make_provider(&server).health_check().await.unwrap();
         mock.assert();
+    }
+
+    #[tokio::test]
+    async fn mocked_success_grows_google_rate_and_429_halves_it() {
+        let server = MockServer::start();
+        let success = server.mock(|when, then| {
+            when.method(POST).body("q=a");
+            then.status(200).json_body(json!(["A"]));
+        });
+        let block = server.mock(|when, then| {
+            when.method(POST).body("q=b");
+            then.status(429).header("Retry-After", "75");
+        });
+        let limiter = Arc::new(RateLimiter::google(None, None));
+        let provider = GoogleTranslateProvider {
+            limiter: limiter.clone(),
+            ..make_provider(&server)
+        };
+        provider.translate(&requests(&["a"], "en")).await.unwrap();
+        assert_eq!(limiter.requests_per_minute(), 62);
+        let error = provider
+            .translate(&requests(&["b"], "en"))
+            .await
+            .unwrap_err();
+        assert!(is_retryable(&error));
+        assert_eq!(limiter.requests_per_minute(), 31);
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        assert!(limiter.acquire_http().await);
+        assert!(start.elapsed() >= Duration::from_secs(74));
+        success.assert();
+        block.assert();
+    }
+
+    #[tokio::test]
+    async fn mocked_fixed_override_observes_retry_after_without_adaptation() {
+        let server = MockServer::start();
+        let block = server.mock(|_when, then| {
+            then.status(503).header("Retry-After", "80");
+        });
+        let limiter = Arc::new(RateLimiter::google(Some(120), None));
+        let provider = GoogleTranslateProvider {
+            limiter: limiter.clone(),
+            ..make_provider(&server)
+        };
+        assert!(provider
+            .translate(&requests(&["a", "b"], "en"))
+            .await
+            .is_err());
+        assert_eq!(limiter.requests_per_minute(), 120);
+        assert!(!limiter.is_adaptive());
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        limiter.acquire_http().await;
+        assert!(start.elapsed() >= Duration::from_secs(79));
+        block.assert();
+    }
+
+    #[tokio::test]
+    async fn captcha_and_unusual_traffic_never_amplify_into_split_requests() {
+        for (status, body) in [
+            (200, "<!doctype html><html>captcha</html>"),
+            (
+                403,
+                "<html>Our systems have detected unusual traffic</html>",
+            ),
+            (200, "Our systems have detected unusual traffic"),
+        ] {
+            let server = MockServer::start();
+            let blocked = server.mock(|_when, then| {
+                then.status(status).body(body);
+            });
+            let limiter = Arc::new(RateLimiter::google(None, None));
+            let provider = GoogleTranslateProvider {
+                limiter: limiter.clone(),
+                ..make_provider(&server)
+            };
+            let error = provider
+                .translate(&requests(&["a", "b", "c", "d"], "en"))
+                .await
+                .unwrap_err();
+            assert!(is_retryable(&error), "{error}");
+            assert_eq!(limiter.requests_per_minute(), 30);
+            assert_eq!(limiter.google_stats().blocked, 1);
+            blocked.assert_hits(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn legitimate_traffic_dialogue_is_not_a_challenge() {
+        let server = MockServer::start();
+        let success = server.mock(|_when, then| {
+            then.status(200)
+                .json_body(json!(["There is unusual traffic near the castle."]));
+        });
+        let limiter = Arc::new(RateLimiter::google(None, None));
+        let provider = GoogleTranslateProvider {
+            limiter: limiter.clone(),
+            ..make_provider(&server)
+        };
+        provider.translate(&requests(&["a"], "en")).await.unwrap();
+        assert_eq!(limiter.google_stats().blocked, 0);
+        success.assert();
+    }
+
+    #[tokio::test]
+    async fn blocked_headers_take_effect_without_waiting_for_the_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1];
+            socket.read_exact(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 90\r\nContent-Length: 1000000\r\n\r\n").await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let limiter = Arc::new(RateLimiter::google(None, None));
+        let provider = GoogleTranslateProvider {
+            base_url: format!("http://{address}"),
+            limiter: limiter.clone(),
+            ..GoogleTranslateProvider::new()
+        };
+        let batch = requests(&["a"], "en");
+        let error = tokio::time::timeout(Duration::from_secs(2), provider.translate(&batch))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(is_retryable(&error));
+        assert_eq!(limiter.requests_per_minute(), 30);
+        assert_eq!(limiter.google_stats().http_429, 1);
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_during_google_cooldown_and_deadline_still_bounds_it() {
+        use locust_core::translation::{with_retry, RetryConfig};
+        let server = MockServer::start();
+        let blocked = server.mock(|_when, then| {
+            then.status(429).header("Retry-After", "120");
+        });
+        let limiter = Arc::new(RateLimiter::google(None, None));
+        let provider = Arc::new(GoogleTranslateProvider {
+            limiter,
+            ..make_provider(&server)
+        });
+        provider
+            .translate(&requests(&["a"], "en"))
+            .await
+            .unwrap_err();
+        let cfg = RetryConfig {
+            cancel: Some(Default::default()),
+            ..Default::default()
+        };
+        cfg.cancel.as_ref().unwrap().cancel();
+        let error = with_retry(&cfg, || provider.translate(&[]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+
+        let cfg = RetryConfig {
+            cancel: Some(Default::default()),
+            ..Default::default()
+        };
+        let cancel = cfg.cancel.clone().unwrap();
+        let waiting_provider = provider.clone();
+        let waiting = tokio::spawn(async move {
+            let batch = requests(&["b"], "en");
+            with_retry(&cfg, || waiting_provider.translate(&batch)).await
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        assert!(waiting
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+
+        tokio::time::pause();
+        let cfg = RetryConfig {
+            overall_deadline: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let batch = requests(&["c"], "en");
+        let error = with_retry(&cfg, || provider.translate(&batch))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+        blocked.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_batches_share_http_rate_without_starvation() {
+        let server = MockServer::start();
+        let success = server.mock(|_when, then| {
+            then.status(200).json_body(json!(["A"]));
+        });
+        let limiter = Arc::new(RateLimiter::google(Some(6000), None));
+        let provider = Arc::new(GoogleTranslateProvider {
+            limiter: limiter.clone(),
+            ..make_provider(&server)
+        });
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let provider = provider.clone();
+            tasks.spawn(async move { provider.translate(&requests(&["a"], "en")).await });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = tasks.join_next().await {
+                assert_eq!(result.unwrap().unwrap().len(), 1);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(limiter.google_stats().requests, 16);
+        success.assert_hits(16);
     }
 
     #[tokio::test]

@@ -14,7 +14,8 @@ pub use provider::{
     TranslationProvider,
 };
 pub use rate_limit::{
-    default_requests_per_minute, rate_limiter_for, requests_per_minute_for, RateLimiter,
+    default_requests_per_minute, rate_limiter_for, requests_per_minute_for, GoogleRateStats,
+    RateLimiter, GOOGLE_INITIAL_RPM, GOOGLE_MAX_RPM, GOOGLE_MIN_RPM,
 };
 pub use retry::{is_retryable, with_retry, RetryConfig};
 
