@@ -32,12 +32,27 @@ async fn connect_handler(
     oneshot::Receiver<()>,
     test_server::TestServer,
 ) {
+    connect_handler_with_write_limit(found, None).await
+}
+
+async fn connect_handler_with_write_limit(
+    found: Option<JobStream>,
+    write_limit: Option<usize>,
+) -> (
+    ClientSocket,
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+    test_server::TestServer,
+) {
     let (start, ready) = oneshot::channel();
     let (finished, done) = oneshot::channel();
     let input = Arc::new(std::sync::Mutex::new(Some((found, ready, finished))));
     let app = Router::new().route(
         "/ws",
-        get(move |ws: WebSocketUpgrade| {
+        get(move |mut ws: WebSocketUpgrade| {
+            if let Some(limit) = write_limit {
+                ws = ws.write_buffer_size(0).max_write_buffer_size(limit);
+            }
             let (found, ready, finished) = input.lock().unwrap().take().unwrap();
             async move {
                 ws.on_upgrade(move |socket| async move {
@@ -69,58 +84,203 @@ fn replay_frames(terminal: &str) -> Vec<serde_json::Value> {
     frames
 }
 
+async fn with_paused_ws_clock(test: impl std::future::Future<Output = ()>) {
+    let (release, hold) = std::sync::mpsc::channel::<()>();
+    let (holding, held) = oneshot::channel();
+    let (expired, deadline) = oneshot::channel();
+    // A running blocking task inhibits Tokio's automatic clock advances while
+    // waiting for TCP. The wall-clock watchdog still bounds a broken fixture.
+    let guard = tokio::task::spawn_blocking(move || {
+        let _ = holding.send(());
+        if matches!(
+            hold.recv_timeout(Duration::from_secs(6)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = expired.send(());
+        }
+    });
+    held.await.unwrap();
+    tokio::time::pause();
+    tokio::select! {
+        () = test => {},
+        _ = deadline => panic!("WebSocket fixture exceeded its six-second wall-clock deadline"),
+    }
+    tokio::time::resume();
+    drop(release);
+    guard.await.unwrap();
+}
+
+async fn slow_reader_delay(delay: Duration) {
+    // Preserve the actual slow reader while keeping scheduler delays out of
+    // the handler's two-second close budget.
+    tokio::task::spawn_blocking(move || std::thread::sleep(delay))
+        .await
+        .unwrap();
+    tokio::time::advance(delay).await;
+}
+
 #[tokio::test]
 async fn finished_job_replay_reaches_slow_reader() {
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .finish(),
+    );
     for terminal in ["done", "error", "completed", "failed"] {
-        let expected = replay_frames(terminal);
-        let (tx, rx) = broadcast::channel(8);
+        with_paused_ws_clock(async {
+            let expected = replay_frames(terminal);
+            let (tx, rx) = broadcast::channel(8);
+            let (mut client, start, mut done, server) =
+                connect_handler(Some(fixture_stream(rx, expected.clone()))).await;
+            // Pending inbound traffic must be drained before dropping the socket.
+            client
+                .send(ClientMessage::Ping(vec![1, 2, 3]))
+                .await
+                .unwrap();
+            start.send(()).unwrap();
+            slow_reader_delay(Duration::from_millis(50)).await;
+
+            let mut actual = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match client
+                        .next()
+                        .await
+                        .expect("replay ended before Close")
+                        .unwrap()
+                    {
+                        ClientMessage::Text(text) => {
+                            actual.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+                            slow_reader_delay(Duration::from_millis(2)).await;
+                        }
+                        ClientMessage::Close(frame) => {
+                            assert_eq!(frame, None, "preserve the existing empty Close frame");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("slow replay timed out");
+            assert_eq!(
+                actual,
+                expected,
+                "all replay frames must arrive in order; received type/index pairs: {:?}",
+                actual
+                    .iter()
+                    .map(|event| (&event["type"], &event["index"]))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "handler dropped TCP before receiving the client's Close reply"
+            );
+            // Reading Close queued the reply; flushing actually sends it.
+            client.flush().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), done)
+                .await
+                .expect("handler did not finish after Close reply")
+                .unwrap();
+            drop(tx);
+            server.shutdown().await;
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn finished_job_replay_ignores_overlapping_and_lagged_live_frames() {
+    for terminal in ["done", "error", "completed", "failed"] {
+        for capacity in [1, 64] {
+            let expected = replay_frames(terminal);
+            let (tx, rx) = broadcast::channel(capacity);
+            // Deliberately queue the entire unsequenced snapshot live as well.
+            // Capacity 1 forces Lagged before the handler can receive anything;
+            // capacity 64 preserves the overlapping frames in the live ring.
+            for event in &expected {
+                tx.send(event.clone()).unwrap();
+            }
+            assert_eq!(rx.len(), expected.len());
+            let (mut client, start, done, server) =
+                connect_handler(Some(fixture_stream(rx, expected.clone()))).await;
+            start.send(()).unwrap();
+            assert_eq!(read_to_close(&mut client).await, expected);
+            done.await.unwrap();
+            drop(tx);
+            server.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn finished_job_replay_is_complete_even_after_close_timeout() {
+    with_paused_ws_clock(async {
+        let expected = vec![
+            serde_json::json!({"type": "progress", "index": 0}),
+            serde_json::json!({"type": "progress", "index": 1}),
+            serde_json::json!({"type": "done"}),
+        ];
+        let (tx, rx) = broadcast::channel(1);
         let (mut client, start, mut done, server) =
             connect_handler(Some(fixture_stream(rx, expected.clone()))).await;
-        // Pending inbound traffic must be drained before dropping the socket.
         client
             .send(ClientMessage::Ping(vec![1, 2, 3]))
             .await
             .unwrap();
         start.send(()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let mut actual = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match client
-                    .next()
-                    .await
-                    .expect("replay ended before Close")
-                    .unwrap()
-                {
-                    ClientMessage::Text(text) => {
-                        actual.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                    }
-                    ClientMessage::Close(frame) => {
-                        assert_eq!(frame, None, "preserve the existing empty Close frame");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("slow replay timed out");
+        let mut actual: Vec<serde_json::Value> = Vec::new();
+        for _ in &expected {
+            let ClientMessage::Text(text) = client.next().await.unwrap().unwrap() else {
+                panic!("expected replay before Close");
+            };
+            actual.push(serde_json::from_str(&text).unwrap());
+        }
         assert_eq!(actual, expected, "all replay frames must arrive in order");
-        assert!(
-            matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-            "handler dropped TCP before receiving the client's Close reply"
-        );
-        // Reading Close queued the reply; flushing actually sends it.
-        client.flush().await.unwrap();
+        assert!(matches!(
+            done.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        // The terminal read proves the handler reached its close handshake. Leave
+        // Close unread and advance beyond its deadline, as a descheduled reader
+        // can do in wall time. The handler finishes despite complete, ordered data.
+        tokio::time::advance(Duration::from_secs(3)).await;
         tokio::time::timeout(Duration::from_secs(1), done)
             .await
-            .expect("handler did not finish after Close reply")
+            .expect("handler did not finish without a Close reply")
             .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            ClientMessage::Close(None)
+        );
         drop(tx);
         server.shutdown().await;
-    }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn job_ws_send_error_can_close_with_partial_replay() {
+    let prefix = serde_json::json!({"type": "progress", "index": 0});
+    let expected = vec![
+        prefix.clone(),
+        serde_json::json!({"type": "progress", "index": 1, "data": "x".repeat(128)}),
+        serde_json::json!({"type": "done"}),
+    ];
+    let (tx, rx) = broadcast::channel(1);
+    // The first frame and Close fit; the second send deterministically returns
+    // WriteBufferFull, even though TCP remains connected and writable.
+    let (mut client, start, done, server) =
+        connect_handler_with_write_limit(Some(fixture_stream(rx, expected.clone())), Some(64))
+            .await;
+    start.send(()).unwrap();
+    // A normal Close alone cannot establish successful replay. A write error
+    // also initiates the close handshake, after the already delivered prefix.
+    assert_eq!(read_to_close(&mut client).await, vec![prefix]);
+    done.await.unwrap();
+    drop(tx);
+    server.shutdown().await;
 }
 
 #[tokio::test]

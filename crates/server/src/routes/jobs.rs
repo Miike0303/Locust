@@ -142,9 +142,11 @@ async fn handle_job_ws(
                     fields.remove("seq");
                 }
             }
-            if socket.send(Message::Text(event.to_string())).await.is_err()
-                || job_event_is_terminal(&event)
-            {
+            let sent = socket.send(Message::Text(event.to_string())).await;
+            if let Err(error) = &sent {
+                tracing::warn!(%error, "Job WebSocket send failed");
+            }
+            if sent.is_err() || job_event_is_terminal(&event) {
                 close_job_ws(&mut socket).await;
                 return;
             }

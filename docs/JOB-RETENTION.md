@@ -33,6 +33,38 @@ replay. Holding its replay `Arc` also permits recovery after map cleanup. Thus
 subscribe/snapshot overlap and lag recovery do not duplicate delivered frames;
 only intentional replay compaction/retention can omit historical frames.
 
+A finished snapshot stops at its terminal before the handler reads the live
+receiver. Even an overlapping or already lagged live ring cannot duplicate
+that snapshot, including legacy unsequenced fixtures. The slow-reader fixture
+does not publish anything to its broadcast channel. Its awaited WebSocket sends
+and TCP preserve frame order regardless of delays between client reads.
+
+An empty WebSocket Close does not by itself prove that replay completed: a send
+error also starts that handshake and can leave the client with a proper prefix
+of the snapshot. Send failures now log their error. A regression fixture forces
+this path with a 64-byte write-buffer limit: its first frame and Close fit, its
+second frame does not, and the remaining replay is unsent. This reproduces a
+partial-replay equality failure without a replay race; it does not establish
+that a send error caused the reported one-off failure. The slow-reader assertion
+also reports compact type/index pairs so future failures distinguish a missing
+suffix from duplication or reordering.
+
+There is a separate timing assumption in the slow-reader fixture: it checks
+that the handler is still waiting for the client's Close reply after reading
+every frame. Its 50 ms initial sleep and 33 two-ms sleeps do not bound elapsed
+wall time under CPU load. If reading takes over two seconds, the handler may
+correctly time out first. This was reproduced during concurrent replay loops:
+frame equality passed, then the Close-reply assertion failed. It is a different
+failure from the originally reported frame-equality assertion.
+
+The fixture now pauses Tokio time through replay and acknowledgement, keeps
+the real reader sleeps, and explicitly advances only their intended durations
+(116 ms per terminal case). A blocking guard inhibits automatic clock advances
+during TCP waits; a separate six-second wall-clock watchdog prevents hangs.
+The full frame equality and Close-reply assertions remain in place. A second
+test reads the terminal, leaves Close unread, advances three seconds, and proves
+the handler can finish before acknowledgement without losing or reordering data.
+
 Translation's additive `seq` field is compatible with desktop consumers: `lib/ws.ts` parses
 JSON and dispatches on `type`; handlers read named fields and accept unknown ones.
 `lib/translationJobSession.ts` dedupes serialized payloads across reconnects, so
