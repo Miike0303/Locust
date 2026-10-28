@@ -23,6 +23,7 @@ impl PatchIdentityArgs {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_patch(
     game_path: PathBuf,
     project: PathBuf,
@@ -31,6 +32,7 @@ pub(crate) fn cmd_patch(
     astro: Option<PathBuf>,
     pristine: Option<PathBuf>,
     identity: PatchIdentityArgs,
+    compression: locust_core::patch::PatchCompression,
 ) -> anyhow::Result<()> {
     use locust_core::patch::{pack_with_pristine_backup, PackOptions};
 
@@ -68,7 +70,8 @@ pub(crate) fn cmd_patch(
             engine: Some(engine.as_deref().unwrap_or("unknown").to_string()),
             project: project.clone(),
             require_pristine: false,
-        },
+        }
+        .with_compression(compression),
         &backup_store,
         None,
         true,
@@ -790,6 +793,41 @@ mod tests {
     }
 
     #[test]
+    fn patch_compression_cli_parses_defaults_and_rejects_unknown_values() {
+        use locust_core::patch::PatchCompression;
+
+        for (value, expected) in [
+            (None, PatchCompression::Default),
+            (Some("default"), PatchCompression::Default),
+            (Some("fast"), PatchCompression::Fast),
+            (Some("store"), PatchCompression::Store),
+        ] {
+            let mut args = vec!["locust", "patch", "game", "-P", "project.db"];
+            if let Some(value) = value {
+                args.extend(["--compression", value]);
+            }
+            let Commands::Patch { compression, .. } = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("expected patch");
+            };
+            assert_eq!(compression, expected);
+        }
+        let error = Cli::try_parse_from([
+            "locust",
+            "patch",
+            "game",
+            "-P",
+            "project.db",
+            "--compression",
+            "turbo",
+        ])
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("default, fast, or store"), "{error}");
+    }
+
+    #[test]
     fn patch_identity_flags_parse_and_normalize() {
         let cli = Cli::try_parse_from([
             "locust",
@@ -875,6 +913,7 @@ mod tests {
                 rj: Some("RJ12345".into()),
                 ..Default::default()
             },
+            Default::default(),
         )
         .unwrap_err()
         .to_string();
@@ -913,6 +952,7 @@ mod tests {
                 game_version: Some(" 1.2 \"test\" ".into()),
                 no_detect_id: false,
             },
+            Default::default(),
         )
         .unwrap();
         let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
@@ -981,6 +1021,7 @@ mod tests {
                 Some(output.clone()),
                 Some(pristine),
                 PatchIdentityArgs::default(),
+                Default::default(),
             );
             assert!(result.is_err(), "{case} unexpectedly accepted");
             assert!(
@@ -1016,6 +1057,7 @@ mod tests {
             Some(stub.clone()),
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .unwrap();
         assert!(fs::read_to_string(stub)
@@ -1058,6 +1100,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .unwrap();
 
@@ -1097,6 +1140,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect("a case-divergent spelling of the recorded root must still pack");
 
@@ -1141,6 +1185,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect("an all-archive database with recorded injection output must pack");
 
@@ -1184,6 +1229,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("no recording must be a hard error, never an entry-derived guess");
         let msg = err.to_string();
@@ -1233,6 +1279,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("a language with no recording must be a hard error");
         let msg = err.to_string();
@@ -1276,6 +1323,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect("the language-unspecified recording must pack without -l");
         assert!(out_zip.exists());
@@ -1288,6 +1336,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("a named language must never silently match the unspecified key");
         let msg = err.to_string();
@@ -1326,6 +1375,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("multiple keys without -l must be a hard error, not a guess");
         let msg = err.to_string();
@@ -1357,6 +1407,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect("choosing a key with -l must unblock");
         assert!(out_zip.exists());
@@ -1400,6 +1451,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("no recording must be a hard error");
         let msg = err.to_string();
@@ -1423,6 +1475,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .unwrap_err();
         assert!(err2.to_string().contains("restore the original"), "{err2}");
@@ -1454,6 +1507,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .unwrap_err();
         let msg3 = err3.to_string();
@@ -1486,6 +1540,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("a key miss must be a hard error");
         let msg = err.to_string();
@@ -1538,6 +1593,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("an absolute recorded rel must be refused, never packed");
         assert!(
@@ -1559,6 +1615,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("a parent-dir rel must be refused");
         assert!(err.to_string().contains("escapes the game root"), "{err}");
@@ -1595,6 +1652,7 @@ mod tests {
                 None,
                 None,
                 PatchIdentityArgs::default(),
+                Default::default(),
             )
             .expect_err("no recording exists, so patch still errors — but LATER");
             let msg = err.to_string();
@@ -1628,6 +1686,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .unwrap_err();
         assert!(
@@ -1666,6 +1725,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("packing recorded rels out of a different tree must be refused");
         let msg = err.to_string();
@@ -1684,6 +1744,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect("patch pointed at the recorded root must pack");
         assert!(out_zip.exists());
@@ -1715,6 +1776,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("a changed file must refuse to pack");
         let msg = err.to_string();
@@ -1758,6 +1820,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("a missing recorded file must be an error, not a silent skip");
         let msg = err.to_string();
@@ -1800,6 +1863,7 @@ mod tests {
             None,
             None,
             PatchIdentityArgs::default(),
+            Default::default(),
         )
         .expect_err("a recording that cannot be honored must remain an error");
         assert!(err.to_string().contains("missing from disk"), "{err}");

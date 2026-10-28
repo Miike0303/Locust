@@ -37,7 +37,7 @@ pub use manifest::{
 };
 pub use pack::{
     ensure_pack_output_outside, pack_injection_recording, pack_recorded_generation,
-    pack_with_pristine_backup, PackOptions, PackReport,
+    pack_with_pristine_backup, PackConfiguration, PackOptions, PackReport, PatchCompression,
 };
 pub use rollback::{preview_rollback, rollback, RollbackOptions, RollbackReport};
 pub use store::{PatchStatus, PatchStore};

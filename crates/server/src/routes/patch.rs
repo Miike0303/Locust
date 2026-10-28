@@ -269,6 +269,9 @@ pub(crate) struct PatchPackRequest {
     /// More than one language is refused (one zip = one recording).
     #[serde(default)]
     languages: Vec<String>,
+    /// Omission retains the existing Deflate writer settings.
+    #[serde(default)]
+    compression: locust_core::patch::PatchCompression,
     /// When true, require pristine hashes (`.locust/backup` or fail).
     #[serde(default)]
     pristine: bool,
@@ -476,7 +479,8 @@ pub(crate) async fn patch_pack(
                 engine,
                 project: db_path_for_errors,
                 require_pristine,
-            },
+            }
+            .with_compression(req.compression),
             &backups,
             pristine_backup_id.as_deref(),
             require_pristine,
@@ -861,6 +865,104 @@ pub(crate) async fn patch_status(
 #[cfg(test)]
 mod tests {
     use crate::routes::test_support::*;
+
+    #[test]
+    fn patch_pack_compression_json_defaults_and_validation() {
+        use locust_core::patch::PatchCompression;
+
+        for (value, expected) in [
+            (None, PatchCompression::Default),
+            (Some("default"), PatchCompression::Default),
+            (Some("fast"), PatchCompression::Fast),
+            (Some("store"), PatchCompression::Store),
+        ] {
+            let mut body = serde_json::json!({"game_path": "game", "output_path": "out.zip"});
+            if let Some(value) = value {
+                body["compression"] = value.into();
+            }
+            let request: super::PatchPackRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(request.compression, expected);
+        }
+        for value in [
+            serde_json::json!("turbo"),
+            serde_json::json!(null),
+            serde_json::json!(1),
+        ] {
+            assert!(
+                serde_json::from_value::<super::PatchPackRequest>(serde_json::json!({
+                    "game_path": "game", "output_path": "out.zip", "compression": value
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_patch_pack_compression_http_policies_and_invalid_value() {
+        let (url, handle, state) = setup_with_state().await;
+        mark_project_open(&state).await;
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let pristine = dir.path().join("pristine");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::create_dir(&pristine).unwrap();
+        let script = game.join("script.txt");
+        std::fs::write(&script, "Hola\n".repeat(1000)).unwrap();
+        std::fs::write(pristine.join("script.txt"), "Hello").unwrap();
+        state
+            .db
+            .save_entries(&[translated(
+                "line",
+                "Hello",
+                script.to_str().unwrap(),
+                "Hola",
+            )])
+            .unwrap();
+        state
+            .db
+            .record_injection(Some("es"), &game, &[script])
+            .unwrap();
+        for compression in [None, Some("default"), Some("fast"), Some("store")] {
+            let output = dir.path().join("patch.zip");
+            let mut body = serde_json::json!({
+                "game_path": game, "output_path": output,
+                "pristine": true, "pristine_path": pristine
+            });
+            if let Some(value) = compression {
+                body["compression"] = value.into();
+            }
+            let response = client()
+                .post(format!("{url}/api/patch/pack"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let response = response.text().await.unwrap();
+            assert_eq!(status, 200, "{compression:?}: {response}");
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["tier"], "strict");
+            let bytes = std::fs::read(output).unwrap();
+            assert_eq!(&bytes[..4], b"PK\x03\x04");
+            // Method in the first local payload header: Stored=0, Deflate=8.
+            assert_eq!(
+                u16::from_le_bytes([bytes[8], bytes[9]]),
+                if compression == Some("store") { 0 } else { 8 }
+            );
+        }
+        let absent = dir.path().join("invalid.zip");
+        let response = client()
+            .post(format!("{url}/api/patch/pack"))
+            .json(&serde_json::json!({
+                "game_path": game, "output_path": absent, "compression": "turbo"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 422);
+        assert!(!absent.exists());
+        handle.abort();
+    }
 
     // These job-lifecycle fixtures park jobs directly: production downloads
     // deliberately refuse loopback sources, including slow mock downloads.

@@ -200,6 +200,9 @@ enum Commands {
         /// <game>/.locust/backup/ if valid. Missing recorded backups are errors.
         #[arg(long)]
         pristine: Option<PathBuf>,
+        /// ZIP compression: default, fast (Deflate level 1), or store (larger ZIP)
+        #[arg(long, default_value = "default")]
+        compression: locust_core::patch::PatchCompression,
         #[command(flatten)]
         identity: PatchIdentityArgs,
     },
@@ -527,8 +530,18 @@ async fn run() -> anyhow::Result<()> {
             output,
             astro,
             pristine,
+            compression,
             identity,
-        } => patch::cmd_patch(game_path, project, lang, output, astro, pristine, identity)?,
+        } => patch::cmd_patch(
+            game_path,
+            project,
+            lang,
+            output,
+            astro,
+            pristine,
+            identity,
+            compression,
+        )?,
         Commands::Apply {
             game_path,
             zip,

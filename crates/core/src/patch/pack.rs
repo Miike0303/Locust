@@ -6,13 +6,54 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::database::{paths_identical, sha256_file, Database, InjectionRecording};
 use crate::error::{LocustError, Result};
 use crate::patch::manifest::{FingerprintEntry, GameIdentity, PatchFileEntry, PatchManifest};
 use crate::patch::store::PatchStore;
 use crate::patch::stream::{stream_bounded, StreamError};
+
+/// ZIP policy for every entry in a patch. Omission preserves the legacy writer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PatchCompression {
+    #[default]
+    Default,
+    /// Deflate level 1: less compression work, usually a larger ZIP.
+    Fast,
+    /// Store bytes without compression.
+    Store,
+}
+
+impl std::str::FromStr for PatchCompression {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "fast" => Ok(Self::Fast),
+            "store" => Ok(Self::Store),
+            _ => Err(format!(
+                "unknown compression {value:?}; expected default, fast, or store"
+            )),
+        }
+    }
+}
+
+impl PatchCompression {
+    fn file_options(self) -> zip::write::SimpleFileOptions {
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        match self {
+            // Keep the exact former options, including the library's level.
+            Self::Default => deflated,
+            Self::Fast => deflated.compression_level(Some(1)),
+            Self::Store => zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        }
+    }
+}
 
 /// Options for [`pack_injection_recording`].
 #[derive(Debug, Clone)]
@@ -35,6 +76,29 @@ pub struct PackOptions {
     pub require_pristine: bool,
     /// Optional catalog metadata. Its fingerprint is filled from pristine files.
     pub game: Option<GameIdentity>,
+}
+
+/// Optional writer settings, separate so existing `PackOptions` literals and
+/// callers continue to use exactly the legacy compression configuration.
+#[derive(Debug, Clone)]
+pub struct PackConfiguration {
+    options: PackOptions,
+    compression: PatchCompression,
+}
+
+impl PackOptions {
+    pub fn with_compression(self, compression: PatchCompression) -> PackConfiguration {
+        PackConfiguration {
+            options: self,
+            compression,
+        }
+    }
+}
+
+impl From<PackOptions> for PackConfiguration {
+    fn from(options: PackOptions) -> Self {
+        options.with_compression(PatchCompression::Default)
+    }
 }
 
 /// Catalog identity actually embedded in the finished archive.
@@ -157,8 +221,11 @@ pub fn ensure_pack_output_outside(output: &Path, protected_root: &Path) -> Resul
 }
 
 /// Pack a patch zip from the injection recording stored in `db`.
-pub fn pack_injection_recording(db: &Database, opts: PackOptions) -> Result<PackReport> {
-    pack_recording(db, opts, None)
+pub fn pack_injection_recording(
+    db: &Database,
+    opts: impl Into<PackConfiguration>,
+) -> Result<PackReport> {
+    pack_recording(db, opts.into(), None)
 }
 
 #[cfg(test)]
@@ -193,11 +260,15 @@ fn run_selection_hook(db: &Database) {
 /// Explicit pristine trees take precedence. Missing recorded backups fail closed.
 pub fn pack_with_pristine_backup(
     db: &Database,
-    mut opts: PackOptions,
+    opts: impl Into<PackConfiguration>,
     fallback_store: &crate::backup::BackupManager,
     requested_backup: Option<&str>,
     use_recorded_backup: bool,
 ) -> Result<PackReport> {
+    let PackConfiguration {
+        options: mut opts,
+        compression,
+    } = opts.into();
     if requested_backup.is_some() && opts.pristine.is_some() {
         return Err(pack_err("choose either a backup ID or a pristine folder"));
     }
@@ -250,10 +321,22 @@ pub fn pack_with_pristine_backup(
                 }
             }
             opts.pristine = Some(tree.root().to_path_buf());
-            pack_selected_recording(db, opts, &recording, translated, Some(&tree))
+            pack_selected_recording(
+                db,
+                opts.with_compression(compression),
+                &recording,
+                translated,
+                Some(&tree),
+            )
         })
     } else {
-        pack_selected_recording(db, opts, &recording, translated, None)
+        pack_selected_recording(
+            db,
+            opts.with_compression(compression),
+            &recording,
+            translated,
+            None,
+        )
     }
 }
 
@@ -261,18 +344,18 @@ pub fn pack_with_pristine_backup(
 /// injection must not pair new output files with a previous generation's backup.
 pub fn pack_recorded_generation(
     db: &Database,
-    opts: PackOptions,
+    opts: impl Into<PackConfiguration>,
     expected: &crate::database::InjectionRecording,
 ) -> Result<PackReport> {
-    pack_recording(db, opts, Some(expected))
+    pack_recording(db, opts.into(), Some(expected))
 }
 
 fn pack_recording(
     db: &Database,
-    opts: PackOptions,
+    opts: PackConfiguration,
     expected: Option<&crate::database::InjectionRecording>,
 ) -> Result<PackReport> {
-    let (recording, translated) = select_pack_recording(db, &opts)?;
+    let (recording, translated) = select_pack_recording(db, &opts.options)?;
     if expected.is_some_and(|expected| expected != &recording) {
         return Err(pack_err(
             "injection recording changed while selecting its backup; reopen Pack and retry",
@@ -476,11 +559,15 @@ fn load_registration_originals(
 
 fn pack_selected_recording(
     db: &Database,
-    opts: PackOptions,
+    opts: PackConfiguration,
     recording: &InjectionRecording,
     translated: usize,
     verified_pristine: Option<&crate::backup::VerifiedPristine<'_>>,
 ) -> Result<PackReport> {
+    let PackConfiguration {
+        options: opts,
+        compression,
+    } = opts;
     let game_path = opts.game_path;
     let lang = opts.lang;
     let mut messages = Vec::new();
@@ -533,8 +620,7 @@ fn pack_selected_recording(
     let zip_file = std::fs::File::create_new(&tmp)?;
     let mut tmp_guard = TempFileGuard::new(&tmp);
     let mut zip = zip::ZipWriter::new(zip_file);
-    let zip_opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let zip_opts = compression.file_options();
 
     let pristine_root: Option<PathBuf> = if let Some(p) = opts.pristine {
         if !p.is_dir() {
@@ -804,6 +890,37 @@ impl Drop for TempFileGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compression_keeps_zip64_streaming_headers_readable() {
+        use std::io::{Cursor, Read, Write};
+
+        for policy in [
+            super::PatchCompression::Default,
+            super::PatchCompression::Fast,
+            super::PatchCompression::Store,
+        ] {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            writer
+                .start_file("payload", policy.file_options().large_file(true))
+                .unwrap();
+            writer.write_all(b"streamed payload").unwrap();
+            let bytes = writer.finish().unwrap().into_inner();
+            // Local ZIP64 extra field (id=1, length=16), even for this small
+            // fixture, exercises the same streaming option used at >=4 GiB.
+            let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+            let extra = 30 + name_len;
+            assert_eq!(&bytes[extra..extra + 4], &[1, 0, 16, 0]);
+            let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+            let mut content = String::new();
+            archive
+                .by_name("payload")
+                .unwrap()
+                .read_to_string(&mut content)
+                .unwrap();
+            assert_eq!(content, "streamed payload");
+        }
+    }
+
     #[test]
     fn registration_originals_use_verified_pre_registration_bytes() {
         use crate::database::{sha256_hex, Database, RecordedBackup};

@@ -1,6 +1,6 @@
 import { Archive, FileArchive, FolderOpen } from "lucide-react";
 import type { Dispatch, RefObject, SetStateAction } from "react";
-import { type PatchPackResult } from "../../lib/api";
+import type { PatchCompression, PatchPackResult } from "../../lib/api";
 import type { TranslateFn } from "../../lib/i18n";
 import { publishCommand } from "../../lib/patchPublish";
 import {
@@ -9,6 +9,18 @@ import {
 	packLangFromRecording,
 	type RecordedLang,
 } from "../../lib/patchRecordings";
+
+// Keep this presentational tab from initializing the desktop transport. The
+// parent already loads it; selection updates resolve before the next UI event.
+let selectedCompression: PatchCompression | undefined;
+function compressionPreference(): PatchCompression {
+	if (selectedCompression !== undefined) return selectedCompression;
+	try {
+		const saved = localStorage.getItem("locust.patch.compression");
+		if (saved === "fast" || saved === "store") return saved;
+	} catch { /* Preferences are optional when storage is unavailable. */ }
+	return "default";
+}
 
 interface PatchPackTabProps {
 	t: TranslateFn;
@@ -142,6 +154,29 @@ export default function PatchPackTab({
 				)}
 				<p className="text-caption text-text-muted mt-1">
 					{t("patch.languagesHint")}
+				</p>
+			</div>
+
+			<div>
+				<label className="block text-body font-medium">
+					{t("patch.compression")}
+					<select
+						defaultValue={compressionPreference()}
+						onChange={async (e) => {
+							selectedCompression = e.target.value as PatchCompression;
+							const { setPatchCompression } = await import("../../lib/api");
+							setPatchCompression(selectedCompression);
+						}}
+						aria-describedby="patch-compression-hint"
+						className="block mt-1 p-2 border border-border rounded bg-surface text-body text-text focus:outline-none focus:ring-2 focus:ring-accent-fg focus:border-accent-fg"
+					>
+						<option value="default">{t("patch.compressionDefault")}</option>
+						<option value="fast">{t("patch.compressionFast")}</option>
+						<option value="store">{t("patch.compressionStore")}</option>
+					</select>
+				</label>
+				<p id="patch-compression-hint" className="text-caption text-text-muted mt-1">
+					{t("patch.compressionHint")}
 				</p>
 			</div>
 

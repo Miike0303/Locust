@@ -1063,7 +1063,28 @@ export const patchRollback = (params: PatchPathsParams): Promise<PatchRollbackRe
 export const patchStatus = (params: Pick<PatchPathsParams, "game_path">): Promise<PatchStatusResult> =>
   request("/patch/status", { method: "POST", body: JSON.stringify(params) });
 
+export type PatchCompression = "default" | "fast" | "store";
+
+let patchCompressionPreference: PatchCompression | undefined;
+
+/** User's opt-in pack preference; a fresh profile keeps the original writer. */
+export function getPatchCompression(): PatchCompression {
+  if (patchCompressionPreference !== undefined) return patchCompressionPreference;
+  try {
+    const saved = localStorage.getItem("locust.patch.compression");
+    if (saved === "fast" || saved === "store") return patchCompressionPreference = saved;
+  } catch { /* Storage is optional. */ }
+  return patchCompressionPreference = "default";
+}
+
+export function setPatchCompression(compression: PatchCompression): void {
+  patchCompressionPreference = compression;
+  try { localStorage.setItem("locust.patch.compression", compression); }
+  catch { /* Keep the selection for this session when storage is unavailable. */ }
+}
+
 export interface PatchPackParams {
+  compression?: PatchCompression;
   rj_code?: string;
   store_ids?: string[];
   game_version?: string;
@@ -1102,7 +1123,10 @@ export interface PatchPackResult {
 }
 
 export const patchPack = (params: PatchPackParams): Promise<PatchPackResult> =>
-  request("/patch/pack", { method: "POST", body: JSON.stringify(params) });
+  request("/patch/pack", {
+    method: "POST",
+    body: JSON.stringify({ ...params, compression: params.compression ?? getPatchCompression() }),
+  });
 
 export const patchIdentity = (gamePath: string): Promise<{ detected_dlsite_code: string | null }> =>
   request(`/patch/identity?${new URLSearchParams({ game_path: gamePath })}`);
